@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "basics": [
+      {
+        "name": "intro",
+        "type": "Microsoft.Common.InfoBox",
+        "visible": true,
+        "options": {
+          "icon": "Info",
+          "text": "Deploys Photostore with Microsoft Entra sign-in. Two things this deployment needs: (1) your account can register apps and grant admin consent in this directory (a tenant admin can), and (2) a region with Azure Container Apps capacity — if a deploy fails with a capacity error, retry in another region."
+        }
+      },
+      {
+        "name": "appName",
+        "type": "Microsoft.Common.TextBox",
+        "label": "App name",
+        "defaultValue": "photostore",
+        "toolTip": "Used as a prefix for all resource names. 3-17 lowercase letters/numbers, starting with a letter.",
+        "constraints": {
+          "required": true,
+          "regex": "^[a-z][a-z0-9]{2,16}$",
+          "validationMessage": "3-17 characters, lowercase letters and numbers, starting with a letter."
+        }
+      }
+    ],
+    "steps": [],
+    "outputs": {
+      "appName": "[basics('appName')]",
+      "location": "[location()]"
+    }
+  }
+}

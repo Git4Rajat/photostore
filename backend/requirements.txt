@@ -1,0 +1,25 @@
+azure-functions
+azure-core
+Flask
+azure-storage-file-share
+azure-storage-blob
+azure-storage-queue
+azure-data-tables
+azure-identity
+# Pillow processes untrusted user-uploaded images; keep at/above the patched
+# release (12.3.0 fixes multiple image-parsing CVEs).
+Pillow>=12.3.0
+pillow-heif
+imagehash
+numpy
+scikit-learn
+geopy
+cryptography>=44.0.1,<49.0.0
+gunicorn
+requests
+piexif
+PyJWT
+pytest
+rawpy
+onnxruntime
+opencv-python-headless>=4.10,<5

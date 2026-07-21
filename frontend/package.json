@@ -1,0 +1,49 @@
+{
+  "name": "storage-spa-app",
+  "version": "1.0.0",
+  "description": "A single-page application for managing storage accounts.",
+  "type": "module",
+  "main": "src/index.tsx",
+  "scripts": {
+    "start": "vite",
+    "dev": "vite",
+    "sync:blazeface-model": "node scripts/sync-blazeface-model.mjs",
+    "sync:browser-ai-runtime": "node scripts/sync-browser-ai-runtime.mjs",
+    "prebuild": "npm run sync:blazeface-model && npm run sync:browser-ai-runtime",
+    "build": "vite build && chmod -R a+rX build/models",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "face:calibrate": "node scripts/calibrate-face-folder.mjs",
+    "postinstall": "node -e \"const fs=require('fs'); const path=require('path'); const target=path.join(process.cwd(),'node_modules','protobufjs','cli','node_modules','underscore','underscore-min.js'); fs.mkdirSync(path.dirname(target),{recursive:true}); fs.writeFileSync(target,'module.exports = {};\\n');\""
+  },
+  "dependencies": {
+    "@azure/msal-browser": "^5.10.1",
+    "@azure/storage-blob": "^12.32.0",
+    "@heroicons/react": "^2.2.0",
+    "@tensorflow-models/blazeface": "^0.1.0",
+    "@tensorflow/tfjs-backend-cpu": "^4.22.0",
+    "@tensorflow/tfjs-backend-webgl": "^4.22.0",
+    "@tensorflow/tfjs-converter": "^4.22.0",
+    "@tensorflow/tfjs-core": "^4.22.0",
+    "@xenova/transformers": "^2.0.1",
+    "axios": "^1.6.0",
+    "face-api.js": "^0.22.2",
+    "jszip": "^3.10.1",
+    "onnxruntime-web": "^1.27.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.15.0"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.1.0",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^5.0.0",
+    "jsdom": "^29.1.1",
+    "typescript": "^4.9.5",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8"
+  }
+}

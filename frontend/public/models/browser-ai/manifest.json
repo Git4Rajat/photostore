@@ -1,0 +1,85 @@
+{
+  "manifestVersion": "browser-ai-face-v10",
+  "runtime": "transformers-js@2.17.2/onnx-wasm",
+  "task": "zero-shot-image-classification",
+  "model": "Xenova/clip-vit-base-patch32",
+  "faceTask": "object-detection",
+  "faceModel": "Xenova/yolov8n-face",
+  "faceEmbeddingTask": "face-recognition",
+  "faceEmbeddingModel": "ArcFace + face-api hybrid",
+  "faceEmbeddingModelVersion": "arcfaceresnet100-8-512d-v1+face-recognition-128d-v1",
+  "faceEmbeddingModelTaxonomyVersion": "browser-hybrid-arcface-faceapi-v1",
+  "faceEmbeddingDescriptorDimensions": 640,
+  "faceEmbeddingModelUrl": "/models/browser-ai/models/arcface/model.onnx",
+  "modelVersion": "clip-vit-base-patch32-transformers-js-2.17.2",
+  "modelTaxonomyVersion": "photostore-browser-clip-openvocab-v1",
+  "tagVocabularyUrl": "/models/browser-ai/vocab/tag-vocabulary.v1.json",
+  "allowLocalModels": false,
+  "allowRemoteModels": true,
+  "enableLocalVisionFallback": true,
+  "localModelPath": "/models/browser-ai/models/",
+  "wasmPath": "/models/browser-ai/runtime/",
+  "vocabTopK": 15,
+  "personScoreThreshold": 0.2,
+  "faceScoreThreshold": 0.12,
+  "assets": [
+    {
+      "path": "runtime/ort-wasm.wasm",
+      "bytes": 9223228,
+      "sha256": "bbdcb6b3c7d294577d806077630460be4e13ca35a345acb5e81188e9649fa74a"
+    },
+    {
+      "path": "runtime/ort-wasm-simd.wasm",
+      "bytes": 10014674,
+      "sha256": "9bd07bababc65f53d061f457233eeae501be7ceb8a2adb9eef52d87fe776d865"
+    },
+    {
+      "path": "runtime/ort-wasm-threaded.wasm",
+      "bytes": 9149637,
+      "sha256": "2ee2f715093aaacc0344bfb1610313eb49a3474e8afde5e4635f30ddfc7615c8"
+    },
+    {
+      "path": "runtime/ort-wasm-simd-threaded.wasm",
+      "bytes": 13479978,
+      "sha256": "d1ab1b94b16a65b29d710d0b587b29e7bed336827577623913479b8afe8113e6"
+    },
+    {
+      "path": "runtime/ort-wasm-simd-threaded.mjs",
+      "bytes": 24180,
+      "sha256": "0a1e718d99c41b22c21f2520ff4f9e883a6b5533856e398d21816ee8eb8185d3"
+    },
+    {
+      "path": "runtime/ort-wasm-simd-threaded.asyncify.mjs",
+      "bytes": 47507,
+      "sha256": "7236653b8565da4046e459cd0e274123419a1d9f1f8f18fd36c28058346ca655"
+    },
+    {
+      "path": "runtime/ort-wasm-simd-threaded.asyncify.wasm",
+      "bytes": 24254953,
+      "sha256": "7e83cd6cee77e478bc96a7e91b198144fb5e4126287daf1f9b54bb195ebcd55a"
+    },
+    {
+      "path": "runtime/ort-wasm-simd-threaded.jsep.mjs",
+      "bytes": 46614,
+      "sha256": "3ee381d20a80f51a788a1c4a5872f6f1d047538dd4342f4af00062de5f9ea4c6"
+    },
+    {
+      "path": "runtime/ort-wasm-simd-threaded.jsep.wasm",
+      "bytes": 26827543,
+      "sha256": "78feeeb3d08f6bcee94d938ed322f69073bb8076b5f9d34697a574ffba8deb48"
+    },
+    {
+      "path": "runtime/ort-wasm-simd-threaded.jspi.mjs",
+      "bytes": 44523,
+      "sha256": "47f5232865f07cc6a11e825cac8dfd9b75bdf5f4a0889bde077e753ae93d3913"
+    },
+    {
+      "path": "runtime/ort-wasm-simd-threaded.jspi.wasm",
+      "bytes": 15046878,
+      "sha256": "7c28cdb40958a998f5aa0981d5cb8e57ac1e7e9b4d2f18a7d74e00dd9629d7a3"
+    },
+    {
+      "path": "models/arcface/model.onnx"
+    }
+  ]
+}
