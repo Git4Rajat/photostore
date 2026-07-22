@@ -8,7 +8,7 @@ Licensed under [AGPL-3.0](LICENSE).
 
 ## Deploy your own (one click, no coding)
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2Fazuredeploy.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2Fazuredeploy.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2FcreateUiDefinition.json)
 
 This provisions the whole app into your own Azure subscription from prebuilt
 public container images — no build step required. The template lives at
