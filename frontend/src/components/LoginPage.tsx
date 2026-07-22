@@ -2,19 +2,89 @@ import React, { useState } from 'react';
 import { ArrowLeftIcon, ArrowRightOnRectangleIcon } from '@heroicons/react/24/outline';
 import { Link, useNavigate } from 'react-router-dom';
 import { setUserId } from '../services/apiClient';
+import { getRuntimeConfig } from '../config/appConfig';
+import * as passwordAuth from '../services/passwordAuthClient';
 
 interface LoginPageProps {
     authEnabled: boolean;
     authReady: boolean;
     displayName: string;
     onSignIn: () => Promise<void>;
+    // Called after a successful password login so the app can refresh auth state.
+    onAuthenticated?: () => Promise<void>;
 }
 
-const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayName, onSignIn }) => {
+const isPasswordMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
+
+const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ onAuthenticated }) => {
+    const [password, setPassword] = useState('');
+    const [pending, setPending] = useState(false);
+    const [errorMessage, setErrorMessage] = useState('');
+    const [resetSent, setResetSent] = useState(false);
+    const navigate = useNavigate();
+
+    const handleLogin = async (event: React.FormEvent) => {
+        event.preventDefault();
+        setErrorMessage('');
+        setPending(true);
+        try {
+            await passwordAuth.login(password);
+            setPassword('');
+            if (onAuthenticated) {
+                await onAuthenticated();
+            }
+            navigate('/');
+        } catch (error) {
+            setErrorMessage(error instanceof Error ? error.message : 'Sign in failed.');
+        } finally {
+            setPending(false);
+        }
+    };
+
+    const handleForgot = async () => {
+        setErrorMessage('');
+        try {
+            await passwordAuth.requestPasswordReset();
+        } finally {
+            // Always show the same confirmation regardless of outcome.
+            setResetSent(true);
+        }
+    };
+
+    return (
+        <form className="local-login" onSubmit={handleLogin}>
+            <label htmlFor="owner-password">Password</label>
+            <input
+                id="owner-password"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoFocus
+            />
+            {errorMessage && <p className="status error">{errorMessage}</p>}
+            {resetSent && (
+                <p className="status success">
+                    If password recovery is set up and an email is on file, a reset link is on its way.
+                    Check your inbox (and spam folder).
+                </p>
+            )}
+            <button type="submit" className="btn btn-primary" disabled={pending || !password}>
+                {pending ? 'Signing in…' : 'Sign in'}
+            </button>
+            <button type="button" className="btn btn-link auth-page-link" onClick={handleForgot} disabled={pending}>
+                Forgot password?
+            </button>
+        </form>
+    );
+};
+
+const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayName, onSignIn, onAuthenticated }) => {
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
     const [localUser, setLocalUser] = useState('');
     const navigate = useNavigate();
+    const passwordMode = isPasswordMode();
 
     const handleSignIn = async () => {
         setErrorMessage('');
@@ -39,7 +109,20 @@ const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayNa
         <section className="auth-page card-glass">
             <p className="additional-kicker">ACCESS</p>
             <h2 className="auth-page-title">Login</h2>
-            {!authEnabled ? (
+            {passwordMode ? (
+                <>
+                    {authReady && displayName ? (
+                        <p className="status success">You are signed in as {displayName}.</p>
+                    ) : (
+                        <p className="status">Enter your password to continue to your photo library.</p>
+                    )}
+                    <PasswordLogin onAuthenticated={onAuthenticated} />
+                    <Link className="btn btn-soft icon-btn auth-page-link" to="/" aria-label="Back to gallery">
+                        <ArrowLeftIcon className="toolbar-icon" />
+                        <span className="sr-only">Back to gallery</span>
+                    </Link>
+                </>
+            ) : !authEnabled ? (
                 <>
                     <p className="status">Authentication is currently disabled for this deployment. Use local sign-in below.</p>
                     <div className="local-login">

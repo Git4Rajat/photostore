@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "12182282923181319105"
+      "templateHash": "16945517476914711837"
     }
   },
   "parameters": {
@@ -30,6 +30,32 @@
       "defaultValue": "[deployment().location]",
       "metadata": {
         "description": "Azure region for the resource group and all resources."
+      }
+    },
+    "adminEmail": {
+      "type": "string",
+      "metadata": {
+        "description": "Your login email. Used to sign in and to receive password-reset emails."
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "minLength": 8,
+      "metadata": {
+        "description": "Your login password (at least 8 characters). You can change it later inside the app."
+      }
+    },
+    "emailDataLocation": {
+      "type": "string",
+      "defaultValue": "United States",
+      "allowedValues": [
+        "United States",
+        "Europe",
+        "Australia",
+        "United Kingdom"
+      ],
+      "metadata": {
+        "description": "Where Azure Communication Services stores email data. Pick the option closest to you."
       }
     },
     "backendImage": {
@@ -71,6 +97,15 @@
           "location": {
             "value": "[parameters('location')]"
           },
+          "adminEmail": {
+            "value": "[parameters('adminEmail')]"
+          },
+          "adminPassword": {
+            "value": "[parameters('adminPassword')]"
+          },
+          "emailDataLocation": {
+            "value": "[parameters('emailDataLocation')]"
+          },
           "backendImage": {
             "value": "[parameters('backendImage')]"
           },
@@ -80,13 +115,12 @@
         },
         "template": {
           "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-          "languageVersion": "2.0",
           "contentVersion": "1.0.0.0",
           "metadata": {
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "9603768908194159127"
+              "templateHash": "8409487853033079764"
             }
           },
           "parameters": {
@@ -106,6 +140,32 @@
                 "description": "Azure region for all resources. Defaults to the resource group location."
               }
             },
+            "adminEmail": {
+              "type": "string",
+              "metadata": {
+                "description": "Your login email. Used to sign in and to receive password-reset emails."
+              }
+            },
+            "adminPassword": {
+              "type": "securestring",
+              "minLength": 8,
+              "metadata": {
+                "description": "Your login password (at least 8 characters). You can change it later inside the app."
+              }
+            },
+            "emailDataLocation": {
+              "type": "string",
+              "defaultValue": "United States",
+              "allowedValues": [
+                "United States",
+                "Europe",
+                "Australia",
+                "United Kingdom"
+              ],
+              "metadata": {
+                "description": "Where Azure Communication Services stores email data. Pick the option closest to you."
+              }
+            },
             "backendImage": {
               "type": "string",
               "defaultValue": "ghcr.io/git4rajat/photostore-backend:latest",
@@ -119,10 +179,18 @@
               "metadata": {
                 "description": "Public frontend image. Override only if you publish your own fork's images."
               }
+            },
+            "sessionSecretParam": {
+              "type": "securestring",
+              "defaultValue": "[format('{0}{1}', newGuid(), newGuid())]",
+              "metadata": {
+                "description": "Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time."
+              }
             }
           },
           "variables": {
             "suffix": "[uniqueString(resourceGroup().id)]",
+            "sessionSecret": "[parameters('sessionSecretParam')]",
             "storageAccountName": "[take(toLower(replace(format('{0}{1}', parameters('appName'), variables('suffix')), '-', '')), 24)]",
             "environmentName": "[format('{0}-env', parameters('appName'))]",
             "backendAppName": "[format('{0}-backend', parameters('appName'))]",
@@ -137,104 +205,47 @@
               "[variables('roleTableContributor')]",
               "[variables('roleQueueContributor')]",
               "[variables('roleBlobDelegator')]"
-            ],
-            "apiScopeId": "[guid(resourceGroup().id, 'api-writer-scope')]",
-            "authTenantId": "[tenant().tenantId]"
+            ]
           },
-          "imports": {
-            "microsoftGraphV1": {
-              "provider": "MicrosoftGraph",
-              "version": "0.1.8-preview"
-            }
-          },
-          "resources": {
-            "backendApp": {
-              "import": "microsoftGraphV1",
-              "type": "Microsoft.Graph/applications@v1.0",
+          "resources": [
+            {
+              "type": "Microsoft.Communication/emailServices",
+              "apiVersion": "2023-04-01",
+              "name": "[format('{0}-email', parameters('appName'))]",
+              "location": "global",
               "properties": {
-                "uniqueName": "[format('{0}-backend-api-{1}', parameters('appName'), variables('suffix'))]",
-                "displayName": "[format('{0}-backend-api', parameters('appName'))]",
-                "signInAudience": "AzureADMyOrg",
-                "api": {
-                  "oauth2PermissionScopes": [
-                    {
-                      "id": "[variables('apiScopeId')]",
-                      "value": "API.Writer",
-                      "type": "User",
-                      "isEnabled": true,
-                      "adminConsentDisplayName": "Access the Photostore API",
-                      "adminConsentDescription": "Allow the app to access the Photostore API on behalf of the signed-in user.",
-                      "userConsentDisplayName": "Access the Photostore API",
-                      "userConsentDescription": "Allow the app to access the Photostore API on your behalf."
-                    }
-                  ]
-                }
+                "dataLocation": "[parameters('emailDataLocation')]"
               }
             },
-            "backendSp": {
-              "import": "microsoftGraphV1",
-              "type": "Microsoft.Graph/servicePrincipals@v1.0",
+            {
+              "type": "Microsoft.Communication/emailServices/domains",
+              "apiVersion": "2023-04-01",
+              "name": "[format('{0}/{1}', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
+              "location": "global",
               "properties": {
-                "appId": "[reference('backendApp').appId]"
+                "domainManagement": "AzureManaged",
+                "userEngagementTracking": "Disabled"
               },
               "dependsOn": [
-                "backendApp"
+                "[resourceId('Microsoft.Communication/emailServices', format('{0}-email', parameters('appName')))]"
               ]
             },
-            "frontendApp": {
-              "import": "microsoftGraphV1",
-              "type": "Microsoft.Graph/applications@v1.0",
+            {
+              "type": "Microsoft.Communication/communicationServices",
+              "apiVersion": "2023-04-01",
+              "name": "[format('{0}-comm', parameters('appName'))]",
+              "location": "global",
               "properties": {
-                "uniqueName": "[format('{0}-frontend-spa-{1}', parameters('appName'), variables('suffix'))]",
-                "displayName": "[format('{0}-frontend-spa', parameters('appName'))]",
-                "signInAudience": "AzureADMyOrg",
-                "spa": {
-                  "redirectUris": [
-                    "[format('https://{0}.{1}', variables('frontendAppName'), reference('managedEnvironment').defaultDomain)]"
-                  ]
-                },
-                "requiredResourceAccess": [
-                  {
-                    "resourceAppId": "[reference('backendApp').appId]",
-                    "resourceAccess": [
-                      {
-                        "id": "[variables('apiScopeId')]",
-                        "type": "Scope"
-                      }
-                    ]
-                  }
+                "dataLocation": "[parameters('emailDataLocation')]",
+                "linkedDomains": [
+                  "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]"
                 ]
               },
               "dependsOn": [
-                "backendApp",
-                "managedEnvironment"
+                "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]"
               ]
             },
-            "frontendSp": {
-              "import": "microsoftGraphV1",
-              "type": "Microsoft.Graph/servicePrincipals@v1.0",
-              "properties": {
-                "appId": "[reference('frontendApp').appId]"
-              },
-              "dependsOn": [
-                "frontendApp"
-              ]
-            },
-            "apiGrant": {
-              "import": "microsoftGraphV1",
-              "type": "Microsoft.Graph/oauth2PermissionGrants@v1.0",
-              "properties": {
-                "clientId": "[reference('frontendSp').id]",
-                "resourceId": "[reference('backendSp').id]",
-                "consentType": "AllPrincipals",
-                "scope": "API.Writer"
-              },
-              "dependsOn": [
-                "backendSp",
-                "frontendSp"
-              ]
-            },
-            "storage": {
+            {
               "type": "Microsoft.Storage/storageAccounts",
               "apiVersion": "2023-05-01",
               "name": "[variables('storageAccountName')]",
@@ -252,7 +263,7 @@
                 "allowSharedKeyAccess": false
               }
             },
-            "blobService": {
+            {
               "type": "Microsoft.Storage/storageAccounts/blobServices",
               "apiVersion": "2023-05-01",
               "name": "[format('{0}/{1}', variables('storageAccountName'), 'default')]",
@@ -261,7 +272,7 @@
                   "corsRules": [
                     {
                       "allowedOrigins": [
-                        "[format('https://{0}.{1}', variables('frontendAppName'), reference('managedEnvironment').defaultDomain)]"
+                        "[format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)]"
                       ],
                       "allowedMethods": [
                         "GET",
@@ -282,11 +293,11 @@
                 }
               },
               "dependsOn": [
-                "managedEnvironment",
-                "storage"
+                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
               ]
             },
-            "containers": {
+            {
               "copy": {
                 "name": "containers",
                 "count": "[length(createArray('images', 'thumbnails', 'covers'))]"
@@ -298,17 +309,17 @@
                 "publicAccess": "None"
               },
               "dependsOn": [
-                "blobService"
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices', variables('storageAccountName'), 'default')]"
               ]
             },
-            "managedEnvironment": {
+            {
               "type": "Microsoft.App/managedEnvironments",
               "apiVersion": "2024-03-01",
               "name": "[variables('environmentName')]",
               "location": "[parameters('location')]",
               "properties": {}
             },
-            "backend": {
+            {
               "type": "Microsoft.App/containerApps",
               "apiVersion": "2024-03-01",
               "name": "[variables('backendAppName')]",
@@ -329,7 +340,21 @@
                         "weight": 100
                       }
                     ]
-                  }
+                  },
+                  "secrets": [
+                    {
+                      "name": "owner-password",
+                      "value": "[parameters('adminPassword')]"
+                    },
+                    {
+                      "name": "session-secret",
+                      "value": "[variables('sessionSecret')]"
+                    },
+                    {
+                      "name": "acs-connection-string",
+                      "value": "[listKeys(resourceId('Microsoft.Communication/communicationServices', format('{0}-comm', parameters('appName'))), '2023-04-01').primaryConnectionString]"
+                    }
+                  ]
                 },
                 "template": {
                   "containers": [
@@ -340,7 +365,7 @@
                         "cpu": "[json('0.5')]",
                         "memory": "1Gi"
                       },
-                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'proxy'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'entra'), createObject('name', 'AZURE_AD_TENANT_ID', 'value', variables('authTenantId')), createObject('name', 'AZURE_AD_CLIENT_ID', 'value', reference('backendApp').appId), createObject('name', 'AZURE_AD_API_AUDIENCE', 'value', reference('backendApp').appId), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference('managedEnvironment').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference('managedEnvironment').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'BROWSER_ONLY_PROCESSING', 'value', 'true'), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-hybrid-arcface-faceapi-v1'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '640'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'strictest'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'backend'), createObject('name', 'GUNICORN_WORKERS', 'value', '4')))]"
+                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'proxy'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'BROWSER_ONLY_PROCESSING', 'value', 'true'), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-hybrid-arcface-faceapi-v1'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '640'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'strictest'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'backend'), createObject('name', 'GUNICORN_WORKERS', 'value', '4'), createObject('name', 'OWNER_PASSWORD', 'secretRef', 'owner-password'), createObject('name', 'SESSION_SECRET', 'secretRef', 'session-secret'), createObject('name', 'ACS_CONNECTION_STRING', 'secretRef', 'acs-connection-string')))]"
                     }
                   ],
                   "scale": {
@@ -350,11 +375,12 @@
                 }
               },
               "dependsOn": [
-                "backendApp",
-                "managedEnvironment"
+                "[resourceId('Microsoft.Communication/communicationServices', format('{0}-comm', parameters('appName')))]",
+                "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
+                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
               ]
             },
-            "frontend": {
+            {
               "type": "Microsoft.App/containerApps",
               "apiVersion": "2024-03-01",
               "name": "[variables('frontendAppName')]",
@@ -386,31 +412,19 @@
                       "env": [
                         {
                           "name": "APP_CONFIG_API_BASE_URL",
-                          "value": "[format('https://{0}', reference('backend').configuration.ingress.fqdn)]"
+                          "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('backendAppName')), '2024-03-01').configuration.ingress.fqdn)]"
                         },
                         {
                           "name": "APP_CONFIG_UPLOAD_BASE_URL",
-                          "value": "[format('https://{0}', reference('backend').configuration.ingress.fqdn)]"
+                          "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('backendAppName')), '2024-03-01').configuration.ingress.fqdn)]"
                         },
                         {
                           "name": "APP_CONFIG_SPA_BASE_URL",
-                          "value": "[format('https://{0}.{1}', variables('frontendAppName'), reference('managedEnvironment').defaultDomain)]"
+                          "value": "[format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)]"
                         },
                         {
                           "name": "APP_CONFIG_AUTH_MODE",
-                          "value": "entra"
-                        },
-                        {
-                          "name": "APP_CONFIG_AZURE_AD_TENANT_ID",
-                          "value": "[variables('authTenantId')]"
-                        },
-                        {
-                          "name": "APP_CONFIG_AZURE_AD_CLIENT_ID",
-                          "value": "[reference('frontendApp').appId]"
-                        },
-                        {
-                          "name": "APP_CONFIG_AZURE_AD_API_SCOPE",
-                          "value": "[format('{0}/.default', reference('backendApp').appId)]"
+                          "value": "password"
                         },
                         {
                           "name": "APP_CONFIG_FACE_API_MODEL_URL",
@@ -426,13 +440,11 @@
                 }
               },
               "dependsOn": [
-                "backend",
-                "backendApp",
-                "frontendApp",
-                "managedEnvironment"
+                "[resourceId('Microsoft.App/containerApps', variables('backendAppName'))]",
+                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
               ]
             },
-            "worker": {
+            {
               "type": "Microsoft.App/containerApps",
               "apiVersion": "2024-03-01",
               "name": "[variables('workerAppName')]",
@@ -452,7 +464,7 @@
                         "cpu": "[json('0.5')]",
                         "memory": "1Gi"
                       },
-                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'proxy'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'entra'), createObject('name', 'AZURE_AD_TENANT_ID', 'value', variables('authTenantId')), createObject('name', 'AZURE_AD_CLIENT_ID', 'value', reference('backendApp').appId), createObject('name', 'AZURE_AD_API_AUDIENCE', 'value', reference('backendApp').appId), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference('managedEnvironment').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference('managedEnvironment').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'BROWSER_ONLY_PROCESSING', 'value', 'true'), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-hybrid-arcface-faceapi-v1'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '640'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'strictest'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'worker'), createObject('name', 'CLUSTERING_WORKER_POLL_SECONDS', 'value', '2')))]"
+                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'proxy'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'BROWSER_ONLY_PROCESSING', 'value', 'true'), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-hybrid-arcface-faceapi-v1'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '640'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'strictest'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'worker'), createObject('name', 'CLUSTERING_WORKER_POLL_SECONDS', 'value', '2')))]"
                     }
                   ],
                   "scale": {
@@ -462,11 +474,11 @@
                 }
               },
               "dependsOn": [
-                "backendApp",
-                "managedEnvironment"
+                "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
+                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
               ]
             },
-            "backendStorageRoles": {
+            {
               "copy": {
                 "name": "backendStorageRoles",
                 "count": "[length(variables('storageRoleIds'))]"
@@ -477,15 +489,15 @@
               "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.App/containerApps', variables('backendAppName')), variables('storageRoleIds')[copyIndex()])]",
               "properties": {
                 "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageRoleIds')[copyIndex()])]",
-                "principalId": "[reference('backend', '2024-03-01', 'full').identity.principalId]",
+                "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('backendAppName')), '2024-03-01', 'full').identity.principalId]",
                 "principalType": "ServicePrincipal"
               },
               "dependsOn": [
-                "backend",
-                "storage"
+                "[resourceId('Microsoft.App/containerApps', variables('backendAppName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
               ]
             },
-            "workerStorageRoles": {
+            {
               "copy": {
                 "name": "workerStorageRoles",
                 "count": "[length(variables('storageRoleIds'))]"
@@ -496,29 +508,29 @@
               "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.App/containerApps', variables('workerAppName')), variables('storageRoleIds')[copyIndex()])]",
               "properties": {
                 "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageRoleIds')[copyIndex()])]",
-                "principalId": "[reference('worker', '2024-03-01', 'full').identity.principalId]",
+                "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('workerAppName')), '2024-03-01', 'full').identity.principalId]",
                 "principalType": "ServicePrincipal"
               },
               "dependsOn": [
-                "storage",
-                "worker"
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+                "[resourceId('Microsoft.App/containerApps', variables('workerAppName'))]"
               ]
             }
-          },
+          ],
           "outputs": {
             "appUrl": {
               "type": "string",
               "metadata": {
                 "description": "Open this URL in your browser to use Photostore."
               },
-              "value": "[format('https://{0}.{1}', variables('frontendAppName'), reference('managedEnvironment').defaultDomain)]"
+              "value": "[format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)]"
             },
             "apiUrl": {
               "type": "string",
               "metadata": {
                 "description": "Backend API URL."
               },
-              "value": "[format('https://{0}', reference('backend').configuration.ingress.fqdn)]"
+              "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('backendAppName')), '2024-03-01').configuration.ingress.fqdn)]"
             }
           }
         }

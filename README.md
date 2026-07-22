@@ -16,7 +16,27 @@ public container images — no build step required. The template lives at
 
 The template deploys at **subscription scope** and **creates its own resource
 group** (`<appName>-rg` by default), so you're only asked for a subscription,
-a region, and an app name — no need to pick or create a resource group first.
+a region, and a few details — no need to pick or create a resource group first.
+
+### Sign-in — just set an email and password
+
+In the deploy form you set a **login email** and **password**. That's your
+sign-in — no Microsoft account, app registrations, or admin consent required.
+When the deployment finishes, open the app URL and log in.
+
+- **Forgot your password?** Use "Forgot password?" on the login screen. A reset
+  link is emailed to you via Azure Communication Services (provisioned by the
+  template with an Azure-managed sender domain — no DNS setup). Reset emails may
+  land in your spam folder.
+- **Break-glass reset:** you can always reset by updating the `owner-password`
+  secret on the `<appName>-backend` Container App in the Azure Portal.
+- **Change your password** anytime from inside the app.
+
+> **Advanced: Microsoft Entra SSO.** Prefer enterprise single sign-on instead of
+> a password? Deploy, then run [`deploy/setup-auth.sh`](deploy/setup-auth.sh) in
+> [Azure Cloud Shell](https://portal.azure.com) to create Entra app
+> registrations and switch the app to `AUTH_MODE=entra`. This requires rights to
+> register apps and grant admin consent in your directory.
 
 > **Note:** the button pulls the public images
 > `ghcr.io/git4rajat/photostore-backend:latest` and `-frontend:latest`. These

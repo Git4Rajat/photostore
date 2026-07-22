@@ -1,11 +1,12 @@
 import React, { useEffect, useLayoutEffect, useState } from 'react';
-import { BrowserRouter as Router, NavLink, Navigate, Routes, Route, useLocation } from 'react-router-dom';
+import { BrowserRouter as Router, Link, NavLink, Navigate, Routes, Route, useLocation } from 'react-router-dom';
 import {
     ArrowPathIcon,
     ArrowLeftOnRectangleIcon,
     ArrowRightOnRectangleIcon,
     ComputerDesktopIcon,
     CpuChipIcon,
+    KeyIcon,
     MoonIcon,
     PlusIcon,
     SunIcon,
@@ -13,6 +14,9 @@ import {
 } from '@heroicons/react/24/outline';
 import { AppServicesProvider, NotificationBell, useAppServices } from './components/AppServicesProvider';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
+import { getRuntimeConfig } from './config/appConfig';
+
+const isPasswordMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
 
 const loadPhotoGalleryPage = () => import('./components/PhotoGallery');
 const loadAlbumsPage = () => import('./components/AlbumsPage');
@@ -29,6 +33,8 @@ const LazyCorruptedUploadsPage = React.lazy(() => import('./components/Corrupted
 const LazyPublicAlbumPage = React.lazy(() => import('./components/PublicAlbumPage'));
 const LazyLoginPage = React.lazy(() => import('./components/LoginPage'));
 const LazyLogoutPage = React.lazy(() => import('./components/LogoutPage'));
+const LazyResetPasswordPage = React.lazy(() => import('./components/ResetPasswordPage'));
+const LazyChangePasswordPage = React.lazy(() => import('./components/ChangePasswordPage'));
 
 const PRIVATE_TAB_PRELOADERS = [
     loadPhotoGalleryPage,
@@ -176,7 +182,7 @@ const AppContent: React.FC = () => {
     const appServices = useAppServices();
     const authEnabled = isAuthEnabled();
     const isPublicAlbumRoute = location.pathname.startsWith('/public/album/');
-    const isAuthRoute = location.pathname === '/login' || location.pathname === '/logout';
+    const isAuthRoute = location.pathname === '/login' || location.pathname === '/logout' || location.pathname === '/reset-password' || location.pathname === '/change-password';
     const [authReady, setAuthReady] = useState<boolean>(false);
     const [displayName, setDisplayName] = useState<string>('');
     const [themePreference, setThemePreference] = useState<ThemePreference>(getStoredThemePreference);
@@ -334,6 +340,16 @@ const AppContent: React.FC = () => {
                                 {displayName ? (
                                     <>
                                         <span className="auth-user">{displayName}</span>
+                                        {isPasswordMode() && (
+                                            <Link
+                                                to="/change-password"
+                                                className="btn btn-soft icon-btn"
+                                                aria-label="Change password"
+                                            >
+                                                <KeyIcon className="toolbar-icon" />
+                                                <span className="sr-only">Change password</span>
+                                            </Link>
+                                        )}
                                         <button
                                             type="button"
                                             className="btn btn-soft icon-btn"
@@ -475,11 +491,20 @@ const AppContent: React.FC = () => {
                                             authReady={authReady}
                                             displayName={displayName}
                                             onSignIn={handleSignIn}
+                                            onAuthenticated={refreshAuthState}
                                         />,
                                         'Loading sign in...',
                                     )
                                 )
                             }
+                        />
+                        <Route
+                            path="/reset-password"
+                            element={renderLazyPage(<LazyResetPasswordPage />, 'Loading reset...')}
+                        />
+                        <Route
+                            path="/change-password"
+                            element={renderLazyPage(<LazyChangePasswordPage />, 'Loading...')}
                         />
                         <Route
                             path="/logout"

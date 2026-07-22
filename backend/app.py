@@ -23,6 +23,8 @@ from azure.storage.blob import BlobSasPermissions, BlobServiceClient, generate_b
 from azure.storage.queue import QueueServiceClient
 from flask import Flask, Response, jsonify, make_response, request
 from auth_utils import get_request_user_id as resolve_request_user_id
+import password_auth
+import email_utils
 from image_utils import (
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
@@ -216,6 +218,20 @@ AZURE_AD_TENANT_ID = os.getenv('AZURE_AD_TENANT_ID', '').strip()
 AZURE_AD_CLIENT_ID = os.getenv('AZURE_AD_CLIENT_ID', '').strip()
 AZURE_AD_API_AUDIENCE = os.getenv('AZURE_AD_API_AUDIENCE', '').strip()
 AUTH_REQUIRED = os.getenv('AUTH_REQUIRED', 'false').lower() in ('1', 'true', 'yes')
+# Auth mode: 'password' (single-owner email + password, the simple self-host default)
+# or 'entra' (Microsoft Entra SSO, for advanced/enterprise deployments).
+AUTH_MODE = os.getenv('AUTH_MODE', 'password').strip().lower()
+# Single-owner password-mode configuration.
+OWNER_EMAIL = os.getenv('OWNER_EMAIL', '').strip()
+OWNER_PASSWORD = os.getenv('OWNER_PASSWORD', '')
+CONFIG_TABLE = os.getenv('CONFIG_TABLE', 'photostoreconfig')
+# Secret used to sign stateless session tokens. Falls back to a per-process random
+# value so the app still runs, but sessions then invalidate on restart / across
+# replicas — set it explicitly (a Container App secret) in production.
+SESSION_SECRET = os.getenv('SESSION_SECRET', '') or secrets.token_hex(32)
+SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(30 * 24 * 3600)))
+# Base URL of the web app, used to build password-reset links in emails.
+PUBLIC_APP_BASE_URL = os.getenv('PUBLIC_APP_BASE_URL', '').strip() or SPA_BASE_URL
 # When false (the default), the unauthenticated `X-User-ID` header is never trusted as
 # an identity. It may only be used as a local development convenience by explicitly
 # opting in AND leaving auth un-enforced. Any enforced deployment ignores it entirely.
@@ -305,6 +321,7 @@ albums_table_client = None
 face_table_client = None
 person_table_client = None
 merge_table_client = None
+config_table_client = None
 clustering_queue_client = None
 queue_service_client = None
 
@@ -328,6 +345,7 @@ def _init_storage_clients():
     global account_name, credential
     global metadata_table_client
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
+    global config_table_client
     global clustering_queue_client, queue_service_client
 
     account_name = STORAGE_ACCOUNT_NAME or os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
@@ -340,6 +358,7 @@ def _init_storage_clients():
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
+        config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
 
         if BLOB_CONNECTION_STRING:
             blob_service_client_local = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
@@ -373,9 +392,11 @@ def _init_storage_clients():
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
+        config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
 
     # assign to globals
     metadata_table_client = metadata_table_client_local
+    config_table_client = config_table_client_local
     blob_service_client = blob_service_client_local
     albums_table_client = albums_table_client_local
     face_table_client = face_table_client_local
@@ -388,6 +409,19 @@ def _init_storage_clients():
         clustering_queue_client.create_queue()
     except Exception as exc:
         app.logger.debug('Queue ensure skipped for %s: %s', CLUSTERING_QUEUE_NAME, exc)
+
+    # Password-mode: ensure the config table exists and seed the initial owner
+    # credential from OWNER_EMAIL/OWNER_PASSWORD on first boot (no-op afterwards).
+    if AUTH_MODE == 'password':
+        try:
+            config_table_client.create_table()
+        except Exception as exc:
+            app.logger.debug('Config table ensure skipped for %s: %s', CONFIG_TABLE, exc)
+        try:
+            if password_auth.seed_owner_if_missing(config_table_client, OWNER_EMAIL, OWNER_PASSWORD):
+                app.logger.info('Seeded initial owner credential for %s', OWNER_EMAIL or '(no email)')
+        except Exception as exc:
+            app.logger.warning('Owner credential seeding failed: %s', exc)
 
     # Configure storage_utils (do not pass account keys or SAS keys)
     configure_storage(
@@ -820,6 +854,17 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
 
 
 def _require_user_id(require_auth: bool = False):
+    # Password mode: resolve the single owner identity from a signed session token.
+    if AUTH_MODE == 'password':
+        must_auth = AUTH_REQUIRED or require_auth
+        user_id, error = password_auth.resolve_password_user_id(request.headers, SESSION_SECRET)
+        if user_id:
+            return user_id, None
+        if not must_auth:
+            # Auth not enforced (e.g. local dev): fall back to the owner identity.
+            return password_auth.OWNER_USER_ID, None
+        return None, (jsonify({'error': error or 'Authentication required.'}), 401)
+
     try:
         user_id = resolve_request_user_id(
             request.headers,
@@ -4058,6 +4103,103 @@ def health_check():
         'storage_account': account_name,
         'uses_managed_identity': credential is not None,
     })
+
+
+# ---------------------------------------------------------------------------
+# Single-owner password authentication endpoints (AUTH_MODE=password).
+# ---------------------------------------------------------------------------
+def _password_mode_guard():
+    if AUTH_MODE != 'password':
+        return jsonify({'error': 'Password authentication is not enabled on this deployment.'}), 400
+    return None
+
+
+@app.route('/auth/config', methods=['GET'])
+@app.route('/api/auth/config', methods=['GET'])
+def auth_config():
+    """Public: what the sign-in UI needs to render (no secrets)."""
+    return jsonify({
+        'authMode': AUTH_MODE,
+        'authRequired': AUTH_REQUIRED,
+        'passwordResetAvailable': AUTH_MODE == 'password' and email_utils.is_configured(),
+    })
+
+
+@app.route('/auth/login', methods=['POST'])
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    guard = _password_mode_guard()
+    if guard:
+        return guard
+    data = request.get_json(silent=True) or {}
+    password = str(data.get('password', '') or '')
+    if not password:
+        return jsonify({'error': 'Password is required.'}), 400
+    if not password_auth.verify_owner_password(config_table_client, password):
+        return jsonify({'error': 'Incorrect password.'}), 401
+    email = password_auth.owner_email(config_table_client)
+    token = password_auth.issue_session_token(SESSION_SECRET, email, SESSION_TTL_SECONDS)
+    return jsonify({'token': token, 'email': email, 'expiresIn': SESSION_TTL_SECONDS})
+
+
+@app.route('/auth/change-password', methods=['POST'])
+@app.route('/api/auth/change-password', methods=['POST'])
+def auth_change_password():
+    guard = _password_mode_guard()
+    if guard:
+        return guard
+    _, error = _require_user_id(require_auth=True)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    current = str(data.get('currentPassword', '') or '')
+    new_password = str(data.get('newPassword', '') or '')
+    if len(new_password) < 8:
+        return jsonify({'error': 'New password must be at least 8 characters.'}), 400
+    if not password_auth.verify_owner_password(config_table_client, current):
+        return jsonify({'error': 'Current password is incorrect.'}), 401
+    password_auth.set_owner_password(config_table_client, new_password)
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/auth/forgot', methods=['POST'])
+@app.route('/api/auth/forgot', methods=['POST'])
+def auth_forgot():
+    guard = _password_mode_guard()
+    if guard:
+        return guard
+    # Always return success to avoid revealing whether email is configured or
+    # which address is on file (this is a single-owner app, but keep the habit).
+    generic = jsonify({'status': 'ok'})
+    if not email_utils.is_configured():
+        return generic
+    email = password_auth.owner_email(config_table_client)
+    if not email:
+        return generic
+    try:
+        raw_token = password_auth.create_reset_token(config_table_client, ttl_seconds=3600)
+        base = (PUBLIC_APP_BASE_URL or '').rstrip('/')
+        reset_url = f'{base}/reset-password?token={raw_token}'
+        email_utils.send_password_reset_email(email, reset_url)
+    except Exception as exc:
+        app.logger.warning('Password reset email failed: %s', exc)
+    return generic
+
+
+@app.route('/auth/reset', methods=['POST'])
+@app.route('/api/auth/reset', methods=['POST'])
+def auth_reset():
+    guard = _password_mode_guard()
+    if guard:
+        return guard
+    data = request.get_json(silent=True) or {}
+    token = str(data.get('token', '') or '')
+    new_password = str(data.get('newPassword', '') or '')
+    if len(new_password) < 8:
+        return jsonify({'error': 'New password must be at least 8 characters.'}), 400
+    if not password_auth.reset_password_with_token(config_table_client, token, new_password):
+        return jsonify({'error': 'This reset link is invalid or has expired. Please request a new one.'}), 400
+    return jsonify({'status': 'ok'})
 
 
 @app.route('/api/photos/thumbnail/<path:filename>', methods=['GET'])

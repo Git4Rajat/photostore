@@ -1,14 +1,28 @@
 import { AccountInfo, AuthenticationResult, PublicClientApplication } from '@azure/msal-browser';
 import { getRuntimeConfig } from '../config/appConfig';
+import * as passwordAuth from './passwordAuthClient';
 
 const env = import.meta.env as Record<string, string | undefined>;
 const runtimeConfig = getRuntimeConfig();
+
+// 'password' = single-owner email/password auth; anything else falls back to
+// the Microsoft Entra (MSAL) flow below.
+const isPasswordMode = (runtimeConfig.authMode || '').toLowerCase() === 'password';
 
 const tenantId = runtimeConfig.azureAdTenantId || env.VITE_AZURE_AD_TENANT_ID || env.REACT_APP_AZURE_AD_TENANT_ID || '';
 const clientId = runtimeConfig.azureAdClientId || env.VITE_AZURE_AD_CLIENT_ID || env.REACT_APP_AZURE_AD_CLIENT_ID || '';
 const apiScope = runtimeConfig.azureAdApiScope || env.VITE_AZURE_AD_API_SCOPE || env.REACT_APP_AZURE_AD_API_SCOPE || (clientId ? `api://${clientId}/access_as_user` : '');
 
 const enabled = Boolean(tenantId && clientId && apiScope);
+
+// A minimal AccountInfo-shaped object for password mode (only name/username are read).
+const passwordAccount = (): AccountInfo | null => {
+    if (!passwordAuth.hasValidSession()) {
+        return null;
+    }
+    const email = passwordAuth.getEmailFromToken() || 'Owner';
+    return { name: email, username: email } as AccountInfo;
+};
 
 let msalApp: PublicClientApplication | null = null;
 let initialized = false;
@@ -22,9 +36,12 @@ const getRedirectUri = (): string => {
 
 const getAuthority = (): string => `https://login.microsoftonline.com/${tenantId}`;
 
-export const isAuthEnabled = (): boolean => enabled;
+export const isAuthEnabled = (): boolean => isPasswordMode || enabled;
 
 export const initAuth = async (): Promise<void> => {
+    if (isPasswordMode) {
+        return; // nothing to bootstrap; session lives in localStorage
+    }
     if (!enabled || initialized) {
         return;
     }
@@ -58,6 +75,9 @@ const ensureInitialized = async (): Promise<void> => {
 };
 
 export const getActiveAccount = (): AccountInfo | null => {
+    if (isPasswordMode) {
+        return passwordAccount();
+    }
     if (!enabled || !msalApp) {
         return null;
     }
@@ -74,6 +94,9 @@ export const getActiveAccount = (): AccountInfo | null => {
 };
 
 export const signIn = async (): Promise<void> => {
+    if (isPasswordMode) {
+        return; // the password login form drives sign-in, not a redirect
+    }
     if (!enabled) {
         return;
     }
@@ -89,6 +112,10 @@ export const signIn = async (): Promise<void> => {
 };
 
 export const signOut = async (): Promise<void> => {
+    if (isPasswordMode) {
+        passwordAuth.logout();
+        return;
+    }
     if (!enabled || !msalApp) {
         return;
     }
@@ -97,6 +124,9 @@ export const signOut = async (): Promise<void> => {
 };
 
 export const getAccessToken = async (): Promise<string | null> => {
+    if (isPasswordMode) {
+        return passwordAuth.getToken();
+    }
     if (!enabled) {
         return null;
     }

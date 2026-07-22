@@ -13,8 +13,9 @@
 //   - backend, frontend, and worker container apps
 //   - role assignments so the apps reach storage via managed identity
 //
-// Authentication is OFF by default, so the app runs immediately. See the
-// README for how to add Microsoft Entra sign-in later.
+// Sign-in uses a single owner email + password that you set right here in the
+// deploy form. Password recovery is emailed via Azure Communication Services
+// (provisioned below, no DNS setup required).
 
 @description('Base name used as a prefix for resources. Lowercase letters and numbers work best.')
 @minLength(3)
@@ -24,15 +25,38 @@ param appName string = 'photostore'
 @description('Azure region for all resources. Defaults to the resource group location.')
 param location string = resourceGroup().location
 
+@description('Your login email. Used to sign in and to receive password-reset emails.')
+param adminEmail string
+
+@description('Your login password (at least 8 characters). You can change it later inside the app.')
+@minLength(8)
+@secure()
+param adminPassword string
+
+@description('Where Azure Communication Services stores email data. Pick the option closest to you.')
+@allowed([
+  'United States'
+  'Europe'
+  'Australia'
+  'United Kingdom'
+])
+param emailDataLocation string = 'United States'
+
 @description('Public backend image. Override only if you publish your own fork\'s images.')
 param backendImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
 @description('Public frontend image. Override only if you publish your own fork\'s images.')
 param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 
-extension microsoftGraphV1
+@description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
+@secure()
+param sessionSecretParam string = '${newGuid()}${newGuid()}'
 
 var suffix = uniqueString(resourceGroup().id)
+// Secret used to sign login sessions. High-entropy random value (two GUIDs,
+// ~244 bits) generated once at deploy time — NOT derived from uniqueString,
+// which is deterministic and predictable from public resource metadata.
+var sessionSecret = sessionSecretParam
 var storageAccountName = take(toLower(replace('${appName}${suffix}', '-', '')), 24)
 
 var environmentName = '${appName}-env'
@@ -57,68 +81,40 @@ var storageRoleIds = [
 var frontendUrl = 'https://${frontendAppName}.${managedEnvironment.properties.defaultDomain}'
 
 // ---------------------------------------------------------------------------
-// Microsoft Entra sign-in. The template creates the backend API + frontend SPA
-// app registrations, wires the SPA's redirect URI to the app URL, and
-// admin-consents the frontend->backend permission — all in this one deployment.
-// Requires the deploying identity to be able to register apps and grant consent.
+// Azure Communication Services — email for password recovery.
+// Uses an Azure-managed sender domain (donotreply@<generated>.azurecomm.net),
+// so there is NO DNS to configure. The backend sends via the connection string.
 // ---------------------------------------------------------------------------
-var apiScopeId = guid(resourceGroup().id, 'api-writer-scope')
-
-resource backendApp 'Microsoft.Graph/applications@v1.0' = {
-  uniqueName: '${appName}-backend-api-${suffix}'
-  displayName: '${appName}-backend-api'
-  signInAudience: 'AzureADMyOrg'
-  api: {
-    oauth2PermissionScopes: [
-      {
-        id: apiScopeId
-        value: 'API.Writer'
-        type: 'User'
-        isEnabled: true
-        adminConsentDisplayName: 'Access the Photostore API'
-        adminConsentDescription: 'Allow the app to access the Photostore API on behalf of the signed-in user.'
-        userConsentDisplayName: 'Access the Photostore API'
-        userConsentDescription: 'Allow the app to access the Photostore API on your behalf.'
-      }
-    ]
+resource emailService 'Microsoft.Communication/emailServices@2023-04-01' = {
+  name: '${appName}-email'
+  location: 'global'
+  properties: {
+    dataLocation: emailDataLocation
   }
 }
 
-resource backendSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
-  appId: backendApp.appId
-}
-
-resource frontendApp 'Microsoft.Graph/applications@v1.0' = {
-  uniqueName: '${appName}-frontend-spa-${suffix}'
-  displayName: '${appName}-frontend-spa'
-  signInAudience: 'AzureADMyOrg'
-  spa: {
-    redirectUris: [ frontendUrl ]
+resource emailDomain 'Microsoft.Communication/emailServices/domains@2023-04-01' = {
+  parent: emailService
+  name: 'AzureManagedDomain'
+  location: 'global'
+  properties: {
+    domainManagement: 'AzureManaged'
+    userEngagementTracking: 'Disabled'
   }
-  requiredResourceAccess: [
-    {
-      resourceAppId: backendApp.appId
-      resourceAccess: [ { id: apiScopeId, type: 'Scope' } ]
-    }
-  ]
 }
 
-resource frontendSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
-  appId: frontendApp.appId
+resource communicationService 'Microsoft.Communication/communicationServices@2023-04-01' = {
+  name: '${appName}-comm'
+  location: 'global'
+  properties: {
+    dataLocation: emailDataLocation
+    linkedDomains: [ emailDomain.id ]
+  }
 }
 
-resource apiGrant 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = {
-  clientId: frontendSp.id
-  resourceId: backendSp.id
-  consentType: 'AllPrincipals'
-  scope: 'API.Writer'
-}
-
-// Auth values fed into the container apps.
-var authTenantId = tenant().tenantId
-var authBackendClientId = backendApp.appId
-var authFrontendClientId = frontendApp.appId
-var authApiScope = '${backendApp.appId}/.default'
+// Sender address on the auto-provisioned managed domain.
+var acsSenderAddress = 'DoNotReply@${emailDomain.properties.fromSenderDomain}'
+var acsConnectionString = communicationService.listKeys().primaryConnectionString
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
@@ -190,10 +186,9 @@ var backendEnv = [
   { name: 'PUBLIC_ALBUM_ATTEMPTS_TABLE', value: 'publicalbumattempts' }
   { name: 'ALLOWED_ORIGINS', value: '*' }
   { name: 'AUTH_REQUIRED', value: 'true' }
-  { name: 'AUTH_MODE', value: 'entra' }
-  { name: 'AZURE_AD_TENANT_ID', value: authTenantId }
-  { name: 'AZURE_AD_CLIENT_ID', value: authBackendClientId }
-  { name: 'AZURE_AD_API_AUDIENCE', value: authBackendClientId }
+  { name: 'AUTH_MODE', value: 'password' }
+  { name: 'OWNER_EMAIL', value: adminEmail }
+  { name: 'ACS_SENDER_ADDRESS', value: acsSenderAddress }
   { name: 'PUBLIC_APP_BASE_URL', value: frontendUrl }
   { name: 'SPA_BASE_URL', value: frontendUrl }
   { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
@@ -222,6 +217,11 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           { latestRevision: true, weight: 100 }
         ]
       }
+      secrets: [
+        { name: 'owner-password', value: adminPassword }
+        { name: 'session-secret', value: sessionSecret }
+        { name: 'acs-connection-string', value: acsConnectionString }
+      ]
     }
     template: {
       containers: [
@@ -235,6 +235,9 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
             { name: 'GUNICORN_WORKERS', value: '4' }
+            { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
           ])
         }
       ]
@@ -274,10 +277,7 @@ resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'APP_CONFIG_API_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_UPLOAD_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_SPA_BASE_URL', value: frontendUrl }
-            { name: 'APP_CONFIG_AUTH_MODE', value: 'entra' }
-            { name: 'APP_CONFIG_AZURE_AD_TENANT_ID', value: authTenantId }
-            { name: 'APP_CONFIG_AZURE_AD_CLIENT_ID', value: authFrontendClientId }
-            { name: 'APP_CONFIG_AZURE_AD_API_SCOPE', value: authApiScope }
+            { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
             { name: 'APP_CONFIG_FACE_API_MODEL_URL', value: '/models/face-api' }
           ]
         }

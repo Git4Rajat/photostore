@@ -22,6 +22,23 @@ param resourceGroupName string = '${appName}-rg'
 @description('Azure region for the resource group and all resources.')
 param location string = deployment().location
 
+@description('Your login email. Used to sign in and to receive password-reset emails.')
+param adminEmail string
+
+@description('Your login password (at least 8 characters). You can change it later inside the app.')
+@minLength(8)
+@secure()
+param adminPassword string
+
+@description('Where Azure Communication Services stores email data. Pick the option closest to you.')
+@allowed([
+  'United States'
+  'Europe'
+  'Australia'
+  'United Kingdom'
+])
+param emailDataLocation string = 'United States'
+
 @description('Public backend image. Override only if you publish your own fork\'s images.')
 param backendImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
@@ -41,6 +58,9 @@ module app 'resources.bicep' = {
   params: {
     appName: appName
     location: location
+    adminEmail: adminEmail
+    adminPassword: adminPassword
+    emailDataLocation: emailDataLocation
     backendImage: backendImage
     frontendImage: frontendImage
   }
