@@ -20,6 +20,18 @@ RUN test -f public/models/browser-ai/models/blazeface/model.json && \
     test -f public/models/browser-ai/models/blazeface/group1-shard1of1.bin && \
     test -f public/models/browser-ai/models/arcface/model.onnx && \
     test -f public/models/browser-ai/models/arcface/LICENSE
+# Fail loudly if the ArcFace model is a Git LFS pointer (~130 B) rather than the
+# real ~261 MB binary. Without this, a build where LFS did not materialize ships
+# a pointer that nginx serves as HTTP 200, and ONNX Runtime fails to parse it
+# ("model asset unavailable") with no network/console error to explain it.
+RUN onnx=public/models/browser-ai/models/arcface/model.onnx; \
+    bytes=$(wc -c < "$onnx"); \
+    if [ "$bytes" -lt 1000000 ]; then \
+        echo "ERROR: $onnx is $bytes bytes — looks like a Git LFS pointer, not the real model."; \
+        echo "The checkout did not materialize LFS. Ensure 'git lfs pull' / checkout lfs:true succeeded."; \
+        head -c 200 "$onnx"; \
+        exit 1; \
+    fi
 RUN node -e 'const fs=require("fs"); const ts=new Date().toISOString(); const content = `window.__APP_CONFIG__ = { apiBaseUrl: "", uploadBaseUrl: "", spaBaseUrl: "", azureAdTenantId: "", azureAdClientId: "", azureAdApiScope: "", authMode: "entra", blazeFaceModelUrl: "/models/browser-ai/models/blazeface/model.json", arcFaceModelUrl: "/models/browser-ai/models/arcface/model.onnx", arcFaceWasmPath: "/models/browser-ai/runtime/", buildTimestamp: "${ts}" };`; try{fs.writeFileSync("public/env.js", content)}catch(e){console.error("failed to write public/env.js",e); process.exit(1);} '
 RUN npm run build
 RUN chmod -R a+rX build/models
