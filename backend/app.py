@@ -4460,6 +4460,45 @@ def proxy_image(filename: str):
         return jsonify({'error': 'Failed to retrieve image'}), 503
 
 
+@app.route('/api/photos/cover/<path:filename>', methods=['GET'])
+def proxy_cover(filename: str):
+    """Serve a face cover crop from the 'cover' container.
+
+    Cover blobs are named '<sha256(user_id)[:16]>/<face_id>.jpg' (see face_crop),
+    so the filename here is a two-segment blob path, not a photo filename. We
+    validate the user-hash prefix against the caller so covers can't be read
+    across accounts, then stream the bytes.
+    """
+    user_id, error = _require_user_id()
+    if error:
+        return error
+
+    parts = filename.split('/')
+    if len(parts) != 2:
+        return jsonify({'error': 'Invalid cover path'}), 400
+    user_hash, leaf = parts
+    expected_hash = hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:16]
+    if user_hash != expected_hash:
+        return jsonify({'error': 'Not found'}), 404
+    safe_leaf = secure_filename(leaf)
+    if not safe_leaf or safe_leaf != leaf:
+        return jsonify({'error': 'Invalid cover path'}), 400
+
+    cover_blob = f'{user_hash}/{safe_leaf}'
+    try:
+        props = get_media_properties('cover', cover_blob)
+        content_type = props.get('content_type') or 'image/jpeg'
+        data = download_media_bytes('cover', cover_blob)
+        resp = Response(data, mimetype=content_type)
+        resp.headers['Cache-Control'] = 'private, max-age=3600'
+        return resp
+    except Exception as e:
+        if '404' in str(e) or 'ResourceNotFound' in str(e) or 'does not exist' in str(e).lower():
+            return jsonify({'error': 'File not found in storage'}), 404
+        print(f"Unexpected error serving cover for {cover_blob}: {str(e)}", flush=True)
+        return jsonify({'error': 'Failed to retrieve cover'}), 503
+
+
 @app.route('/api/persons/cluster', methods=['POST'])
 def trigger_clustering():
     try:

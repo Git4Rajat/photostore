@@ -100,6 +100,21 @@ const fetchProcessingBlob = async (url: string): Promise<Blob> => {
     return response.blob();
 };
 
+// Whether we can currently produce an Authorization header. When auth is
+// enabled (password or entra mode) but the user has not logged in yet, there is
+// no token, so automatic background calls like the browser-processing scheduler
+// must not fire — otherwise they hit the backend and get a 401 before login.
+const canAuthenticateRequests = async (): Promise<boolean> => {
+    if (!isAuthEnabled()) {
+        return true;
+    }
+    if (typeof window !== 'undefined'
+        && window.localStorage.getItem('photostore.passwordAuthToken')) {
+        return true;
+    }
+    return Boolean(await getAccessToken());
+};
+
 interface PendingUploadSummary {
     fileCount: number;
     failedCount: number;
@@ -807,6 +822,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const startBrowserProcessing = useCallback(async (options: BrowserProcessingStartOptions = {}) => {
         if (browserProcessingStartInFlightRef.current) {
+            return 0;
+        }
+        // Don't pull pending work before the user is authenticated; the request
+        // would 401 and the scheduler would log a spurious failure on every tick.
+        if (!(await canAuthenticateRequests())) {
             return 0;
         }
         browserProcessingStartInFlightRef.current = true;
