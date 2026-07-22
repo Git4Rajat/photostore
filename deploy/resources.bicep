@@ -35,7 +35,6 @@ extension microsoftGraphV1
 var suffix = uniqueString(resourceGroup().id)
 var storageAccountName = take(toLower(replace('${appName}${suffix}', '-', '')), 24)
 
-var logWorkspaceName = '${appName}-logs'
 var environmentName = '${appName}-env'
 var backendAppName = '${appName}-backend'
 var frontendAppName = '${appName}-frontend'
@@ -171,29 +170,10 @@ resource containers 'Microsoft.Storage/storageAccounts/blobServices/containers@2
   }
 ]
 
-resource logWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
-  name: logWorkspaceName
-  location: location
-  properties: {
-    sku: {
-      name: 'PerGB2018'
-    }
-    retentionInDays: 30
-  }
-}
-
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: environmentName
   location: location
-  properties: {
-    appLogsConfiguration: {
-      destination: 'log-analytics'
-      logAnalyticsConfiguration: {
-        customerId: logWorkspace.properties.customerId
-        sharedKey: logWorkspace.listKeys().primarySharedKey
-      }
-    }
-  }
+  properties: {}
 }
 
 // Shared backend/worker environment variables.

@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "9790190867850965018"
+      "templateHash": "12182282923181319105"
     }
   },
   "parameters": {
@@ -86,7 +86,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "5076147538908835685"
+              "templateHash": "9603768908194159127"
             }
           },
           "parameters": {
@@ -124,7 +124,6 @@
           "variables": {
             "suffix": "[uniqueString(resourceGroup().id)]",
             "storageAccountName": "[take(toLower(replace(format('{0}{1}', parameters('appName'), variables('suffix')), '-', '')), 24)]",
-            "logWorkspaceName": "[format('{0}-logs', parameters('appName'))]",
             "environmentName": "[format('{0}-env', parameters('appName'))]",
             "backendAppName": "[format('{0}-backend', parameters('appName'))]",
             "frontendAppName": "[format('{0}-frontend', parameters('appName'))]",
@@ -302,35 +301,12 @@
                 "blobService"
               ]
             },
-            "logWorkspace": {
-              "type": "Microsoft.OperationalInsights/workspaces",
-              "apiVersion": "2023-09-01",
-              "name": "[variables('logWorkspaceName')]",
-              "location": "[parameters('location')]",
-              "properties": {
-                "sku": {
-                  "name": "PerGB2018"
-                },
-                "retentionInDays": 30
-              }
-            },
             "managedEnvironment": {
               "type": "Microsoft.App/managedEnvironments",
               "apiVersion": "2024-03-01",
               "name": "[variables('environmentName')]",
               "location": "[parameters('location')]",
-              "properties": {
-                "appLogsConfiguration": {
-                  "destination": "log-analytics",
-                  "logAnalyticsConfiguration": {
-                    "customerId": "[reference('logWorkspace').customerId]",
-                    "sharedKey": "[listKeys('logWorkspace', '2023-09-01').primarySharedKey]"
-                  }
-                }
-              },
-              "dependsOn": [
-                "logWorkspace"
-              ]
+              "properties": {}
             },
             "backend": {
               "type": "Microsoft.App/containerApps",
