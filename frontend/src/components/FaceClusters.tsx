@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowsRightLeftIcon, ArrowRightIcon, CheckIcon, ExclamationTriangleIcon, MagnifyingGlassIcon, SparklesIcon, TrashIcon, UserCircleIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import faceService from '../services/faceService';
 import { getUploadJson, resolveApiUrl } from '../services/apiClient';
+import { fetchProtectedBlobUrl } from '../services/imageClient';
 import { showToast } from '../services/toast';
 import { isAuthEnabled } from '../services/authClient';
 import { useNavigate } from 'react-router-dom';
@@ -11,6 +12,23 @@ const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
 const isSuspiciousFace = (face?: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
 const getFaceFallbackPath = (filename?: string | null) => filename ? `/api/photos/access/thumbnail/${encodeURIComponent(filename)}` : '';
 const getFaceProxyThumbnailPath = (filename?: string | null) => filename ? `/api/photos/thumbnail/${encodeURIComponent(filename)}` : '';
+
+// Turn a URL returned by the backend into one an <img> can actually load.
+// data: URLs and absolute SAS URLs load directly, but a relative backend proxy
+// path (e.g. /api/photos/cover/...) is auth-protected and an <img> tag can't
+// attach the bearer token — so those are fetched into a blob URL instead.
+const toDisplayableUrl = async (rawUrl: string): Promise<string> => {
+    if (!rawUrl) {
+        return '';
+    }
+    if (rawUrl.startsWith('data:') || /^https?:\/\//i.test(rawUrl)) {
+        return rawUrl;
+    }
+    if (isAuthEnabled()) {
+        return await fetchProtectedBlobUrl(rawUrl);
+    }
+    return resolveApiUrl(rawUrl);
+};
 
 const getFaceObjectPosition = (rep?: PersonFace) => {
     const bbox = rep?.bbox;
@@ -57,17 +75,27 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
 
     useEffect(() => {
         let active = true;
+        const createdBlobUrls: string[] = [];
         if (!shouldLoad || !filename) {
             setCropUrl('');
             setFallbackUrl('');
             return undefined;
         }
+        const track = (url: string) => {
+            if (url.startsWith('blob:')) {
+                createdBlobUrls.push(url);
+            }
+            return url;
+        };
         void (async () => {
             if (rep?.faceId) {
                 try {
                     const result = await getUploadJson(`/api/faces/crop/${encodeURIComponent(rep.faceId)}`);
-                    if (active && typeof result?.url === 'string') {
-                        setCropUrl(resolveApiUrl(result.url));
+                    if (typeof result?.url === 'string') {
+                        const displayable = await toDisplayableUrl(result.url);
+                        if (active) {
+                            setCropUrl(track(displayable));
+                        }
                     }
                 } catch {
                     if (active) {
@@ -77,19 +105,29 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
             }
             try {
                 const result = await getUploadJson(`/api/photos/access/thumbnail/${encodeURIComponent(filename)}`);
-                if (active && typeof result?.url === 'string') {
-                    setFallbackUrl(result.url);
-                } else if (active) {
-                    setFallbackUrl(proxyFallbackPath || '');
+                const rawFallback = typeof result?.url === 'string' && result.url
+                    ? result.url
+                    : (proxyFallbackPath || '');
+                const displayable = rawFallback ? await toDisplayableUrl(rawFallback) : '';
+                if (active) {
+                    setFallbackUrl(track(displayable));
                 }
             } catch {
-                if (active) {
-                    setFallbackUrl(proxyFallbackPath || '');
+                try {
+                    const displayable = proxyFallbackPath ? await toDisplayableUrl(proxyFallbackPath) : '';
+                    if (active) {
+                        setFallbackUrl(track(displayable));
+                    }
+                } catch {
+                    if (active) {
+                        setFallbackUrl('');
+                    }
                 }
             }
         })();
         return () => {
             active = false;
+            createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
         };
     }, [filename, proxyFallbackPath, rep?.faceId, shouldLoad]);
 
