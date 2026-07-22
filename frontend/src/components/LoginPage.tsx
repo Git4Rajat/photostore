@@ -17,6 +17,7 @@ interface LoginPageProps {
 const isPasswordMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
 
 const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ onAuthenticated }) => {
+    const [email, setEmail] = useState(() => passwordAuth.getEmailHint());
     const [password, setPassword] = useState('');
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
@@ -28,7 +29,7 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
         setErrorMessage('');
         setPending(true);
         try {
-            await passwordAuth.login(password);
+            await passwordAuth.login(email.trim(), password);
             setPassword('');
             if (onAuthenticated) {
                 await onAuthenticated();
@@ -53,6 +54,16 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
 
     return (
         <form className="local-login" onSubmit={handleLogin}>
+            <label htmlFor="owner-email">Email</label>
+            <input
+                id="owner-email"
+                className="field"
+                type="email"
+                autoComplete="username"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoFocus={!email}
+            />
             <label htmlFor="owner-password">Password</label>
             <input
                 id="owner-password"
@@ -61,7 +72,7 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
                 autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                autoFocus
+                autoFocus={Boolean(email)}
             />
             {errorMessage && <p className="status error">{errorMessage}</p>}
             {resetSent && (

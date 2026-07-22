@@ -8,6 +8,29 @@
 import { getRuntimeConfig } from '../config/appConfig';
 
 const TOKEN_KEY = 'photostore.passwordAuthToken';
+// A non-sensitive hint (the owner's email) kept across logout so the login form
+// can always show and pre-fill the email field instead of relying on the
+// browser's password-manager autofill, which only appears once a credential is
+// saved and disappears when the cache is cleared.
+const EMAIL_HINT_KEY = 'photostore.ownerEmail';
+
+export const getEmailHint = (): string => {
+    try {
+        return window.localStorage.getItem(EMAIL_HINT_KEY) || '';
+    } catch {
+        return '';
+    }
+};
+
+const setEmailHint = (email: string): void => {
+    try {
+        if (email) {
+            window.localStorage.setItem(EMAIL_HINT_KEY, email);
+        }
+    } catch {
+        // ignore storage failures
+    }
+};
 
 const apiBase = (): string => (getRuntimeConfig().apiBaseUrl || '').replace(/\/$/, '');
 
@@ -82,11 +105,11 @@ const parseError = async (response: Response, fallback: string): Promise<string>
     }
 };
 
-export const login = async (password: string): Promise<void> => {
+export const login = async (email: string, password: string): Promise<void> => {
     const response = await fetch(url('/auth/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ email, password }),
     });
     if (!response.ok) {
         throw new Error(await parseError(response, 'Incorrect password.'));
@@ -96,6 +119,9 @@ export const login = async (password: string): Promise<void> => {
         throw new Error('Login did not return a session token.');
     }
     setToken(body.token);
+    // Remember the authoritative owner email the backend resolved (falling back
+    // to what the user typed) so the field stays pre-filled on the next visit.
+    setEmailHint(String(body.email || email || ''));
 };
 
 export const logout = (): void => {
