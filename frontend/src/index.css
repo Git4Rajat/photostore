@@ -635,8 +635,126 @@ a {
   gap: 8px;
 }
 
+.auth-page-actions .btn,
+.auth-page-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.auth-page-back {
+  margin-top: 10px;
+  width: 100%;
+}
+
 .auth-page-link {
   text-decoration: none;
+}
+
+.local-login {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.local-login label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  margin-bottom: -4px;
+}
+
+.local-login input {
+  width: 100%;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-md);
+  background: var(--lg-surface);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  color: var(--text);
+  font: inherit;
+  min-height: var(--tap-min);
+  padding: 10px 14px;
+  transition: border-color var(--dur-quick) ease, box-shadow var(--dur-quick) ease, background-color var(--dur-quick) ease;
+}
+
+.local-login input:focus-visible {
+  outline: none;
+  border-color: rgba(30, 106, 225, 0.4);
+  box-shadow: var(--focus-ring);
+}
+
+.local-login .btn {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.local-login .status {
+  margin: 2px 0;
+}
+
+.btn-link {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--accent);
+  min-height: auto;
+  padding: 6px 4px;
+  text-decoration: none;
+}
+
+.btn-link:hover {
+  text-decoration: underline;
+}
+
+.local-login .btn-link {
+  width: auto;
+  justify-self: center;
+  margin-top: 0;
+}
+
+/* Shared styling for the sign-in / change-password / reset-password forms so
+   they match the rest of the app's fields and buttons instead of rendering as
+   bare browser inputs. */
+.local-login {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 16px;
+  max-width: 380px;
+}
+
+.local-login label {
+  margin-top: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Use the app-wide .field input styling; only widen to fill the auth form. */
+.local-login .field {
+  width: 100%;
+}
+
+.local-login .status {
+  margin: 8px 0 0;
+}
+
+.local-login .btn-primary {
+  margin-top: 18px;
+  width: 100%;
+  justify-content: center;
+}
+
+.local-login .btn-link {
+  margin-top: 8px;
+  align-self: center;
+  min-height: auto;
+  padding: 4px 8px;
 }
 
 .additional-info-wrap {

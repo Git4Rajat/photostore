@@ -56,6 +56,7 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
             <label htmlFor="owner-password">Password</label>
             <input
                 id="owner-password"
+                className="field"
                 type="password"
                 autoComplete="current-password"
                 value={password}
@@ -117,9 +118,9 @@ const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayNa
                         <p className="status">Enter your password to continue to your photo library.</p>
                     )}
                     <PasswordLogin onAuthenticated={onAuthenticated} />
-                    <Link className="btn btn-soft icon-btn auth-page-link" to="/" aria-label="Back to gallery">
+                    <Link className="btn btn-soft auth-page-link auth-page-back" to="/">
                         <ArrowLeftIcon className="toolbar-icon" />
-                        <span className="sr-only">Back to gallery</span>
+                        <span>Back to gallery</span>
                     </Link>
                 </>
             ) : !authEnabled ? (
@@ -127,7 +128,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayNa
                     <p className="status">Authentication is currently disabled for this deployment. Use local sign-in below.</p>
                     <div className="local-login">
                         <label htmlFor="local-user">Username</label>
-                        <input id="local-user" type="text" value={localUser} onChange={(e) => setLocalUser(e.target.value)} />
+                        <input id="local-user" className="field" type="text" value={localUser} onChange={(e) => setLocalUser(e.target.value)} />
                         <button type="button" className="btn btn-primary" onClick={handleSignIn} disabled={pending}>
                             Continue
                         </button>
@@ -135,20 +136,20 @@ const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayNa
                 </>
             ) : (
                 <>
-                    {!authReady && <p className="status">Preparing sign-in flow...</p>}
+                    {!authReady && <p className="status">Preparing sign-in flow…</p>}
                     {authReady && displayName && (
                         <p className="status success">You are signed in as {displayName}.</p>
                     )}
-                    {authReady && !displayName && <p className="status">Sign in to continue to your photo library.</p>}
+                    {authReady && !displayName && <p className="status">Sign in with your Microsoft account to continue to your photo library.</p>}
                     {errorMessage && <p className="status error">{errorMessage}</p>}
                     <div className="auth-page-actions">
-                        <button type="button" className="btn btn-primary icon-btn" onClick={handleSignIn} disabled={!authReady || pending} aria-label="Sign in with Microsoft">
+                        <button type="button" className="btn btn-primary" onClick={handleSignIn} disabled={!authReady || pending}>
                             <ArrowRightOnRectangleIcon className="toolbar-icon" />
-                            <span className="sr-only">{pending ? 'Signing in' : 'Sign in with Microsoft'}</span>
+                            <span>{pending ? 'Signing in…' : displayName ? 'Use a different account' : 'Sign in with Microsoft'}</span>
                         </button>
-                        <Link className="btn btn-soft icon-btn auth-page-link" to="/" aria-label="Back to gallery">
+                        <Link className="btn btn-soft auth-page-link" to="/">
                             <ArrowLeftIcon className="toolbar-icon" />
-                            <span className="sr-only">Back to gallery</span>
+                            <span>Back to gallery</span>
                         </Link>
                     </div>
                 </>

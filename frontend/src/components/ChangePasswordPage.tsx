@@ -51,6 +51,7 @@ const ChangePasswordPage: React.FC = () => {
                     <label htmlFor="current-password">Current password</label>
                     <input
                         id="current-password"
+                        className="field"
                         type="password"
                         autoComplete="current-password"
                         value={currentPassword}
@@ -59,6 +60,7 @@ const ChangePasswordPage: React.FC = () => {
                     <label htmlFor="new-password">New password</label>
                     <input
                         id="new-password"
+                        className="field"
                         type="password"
                         autoComplete="new-password"
                         value={newPassword}
@@ -67,6 +69,7 @@ const ChangePasswordPage: React.FC = () => {
                     <label htmlFor="confirm-password">Confirm new password</label>
                     <input
                         id="confirm-password"
+                        className="field"
                         type="password"
                         autoComplete="new-password"
                         value={confirm}

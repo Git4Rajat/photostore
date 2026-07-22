@@ -1,10 +1,108 @@
 # Photostore
 
-An open-source, self-hostable photo gallery you can deploy into your own
-Azure subscription — with ratings, likes, tagging, face/people clustering,
-semantic search, and duplicate detection.
+Photostore is your own private photo library — a place to upload, browse, and
+rediscover your photos without handing them to a big-tech cloud. It runs
+entirely in *your* Azure subscription, so your memories stay yours.
 
-Licensed under [AGPL-3.0](LICENSE).
+Once your photos are in, Photostore does the tedious work for you: it makes
+fast-loading previews, reads text and locations off your pictures, tags what's
+in them, recognizes the people who show up again and again, and lets you search
+your whole library in plain language. You organize the rest into albums — by
+hand or automatically — and share them with a link.
+
+It's open source and self-hostable, licensed under [AGPL-3.0](LICENSE).
+
+## What you can do
+
+- **Browse & upload** your whole library in a fast, responsive gallery, with
+  automatic thumbnails and support for both photos and videos.
+- **Search in plain language** — type *"beach at sunset"* or *"birthday cake"*
+  and Photostore finds matching photos, not just filename matches.
+- **Rate, like, and tag** photos, and filter the gallery down to exactly what
+  you want (minimum rating, likes, media type, and more).
+- **Organize into albums** — build them by hand or let Photostore create *smart
+  albums* automatically by place, date, person, or what's in the picture.
+- **Find your people** — Photostore groups faces into people you can name, so
+  you can pull up everyone of a given person in a tap.
+- **Share albums** with a public link (optionally protected by an access code),
+  and let visitors download the photos.
+- **Stay tidy** — Photostore flags exact and near-duplicate uploads and surfaces
+  corrupted files so your library stays clean.
+
+Much of the heavy lifting (thumbnails, text extraction, tagging, face
+detection) happens right in your browser, so your photos aren't shipped off to
+a third-party AI service to be understood.
+
+## The main pages
+
+### 📸 Gallery — your whole library
+
+The gallery is the home for every photo and video you've uploaded. From here you
+can:
+
+- **Upload** new photos and videos, with automatic thumbnail generation and
+  duplicate warnings if a file already exists (exact or visually similar).
+- **Search your library in natural language** — semantic search understands what
+  a photo *is* of, so "*dog in the snow*" works even when nothing is named that.
+- **Filter** by minimum rating, minimum likes, and media type (all / photos /
+  videos), and combine filters to narrow things down.
+- **Rate ⭐, like ❤️, and tag 🏷️** photos as you go.
+- **Select photos** to download in bulk or turn straight into a new album.
+
+### 🗂️ Albums — organize and share
+
+Albums are collections you curate on top of your library. On the Albums page you
+can:
+
+- **Create albums by hand** — name an album and add any photos you've selected.
+- **Create smart albums automatically**, where Photostore fills the album for you
+  from a rule:
+  - **By Location** — places across your library
+  - **By Recent Upload** — your latest upload window
+  - **By Person** — matched people from face clustering
+  - **By Event/Time** — a capture-date window
+  - **By Tag/Object** — AI tags and detected objects
+- **Search and filter within an album** (by name, minimum rating, liked-only) to
+  find a specific shot fast.
+- **Share an album as a public link** — optionally locked behind an access code —
+  so anyone with the link can view and download the photos, read-only.
+- **Download** an entire album (or a selection) as a batch.
+
+### 🧰 Tools — see how your photos were processed
+
+The Tools page is the behind-the-scenes view of everything Photostore does to
+each photo after upload. Every photo runs through a set of processing stages:
+
+- **Thumbnails** — browser-created previews
+- **EXIF** — capture date and GPS metadata
+- **OCR** — text extracted from the image, in your browser
+- **AI vision** — tags and captions generated in your browser
+- **Map tagging** — reverse-geocoding GPS into place names
+- **Face detection** — detecting and clustering faces, in your browser
+
+For each photo you can see the status of every stage at a glance, and **filter**
+to find work that still needs doing — e.g. photos that *failed* a stage or that
+have *no data* for a particular process (thumbnail, EXIF, OCR, AI vision, map,
+or face). It's where you go to check that processing is complete or to chase
+down anything that got stuck. Related: the **Corrupted uploads** view surfaces
+files that couldn't be processed at all.
+
+### 👥 People — faces, grouped and named
+
+Photostore detects faces and clusters photos of the same person together. On the
+People page you can:
+
+- **Browse the people** it has found, each as a cluster of face crops.
+- **Name a person** so you can recognize and search for them.
+- **Search** across your people, and **assign unclustered faces** that haven't
+  been grouped yet.
+- **Merge clusters** that are actually the same person (with an undo), and
+  **split** faces that were grouped by mistake into their own cluster.
+- **Confirm or reject** individual faces — mark a low-confidence detection as
+  correct, or flag something that isn't really a face.
+
+All face detection and clustering runs in your browser, so faces are recognized
+without sending your photos to an outside service.
 
 ## Deploy your own (one click, no coding)
 
@@ -43,134 +141,130 @@ When the deployment finishes, open the app URL and log in.
 > must be published (via the [Publish images workflow](.github/workflows/publish-images.yml))
 > and set to **Public** in GHCR before a deploy can succeed.
 
-## Repository Layout
+## How to use the app
 
-- [`frontend/`](frontend/) — React + TypeScript + Vite frontend
-- [`backend/`](backend/) — Flask backend (containerized API + worker)
-- [`deploy/`](deploy/) — Azure ARM/Bicep one-click deployment template
+This is a quick, task-by-task guide to getting the most out of Photostore once
+you're signed in.
 
-## Features
+### Uploading photos
 
-### Photo Management
-- Upload, organize, and manage photos
-- Automatic thumbnail generation
-- Batch delete operations
-- Search by filename
+1. Go to the **Gallery** and click **Upload**.
+2. Pick one or more photos or videos (you can drag them in).
+3. Photostore uploads each file and immediately starts processing it in the
+   background — you'll see thumbnails appear as they're ready.
+4. If a file is an **exact or near-duplicate** of something already in your
+   library, you'll get a warning before it's added, so you can skip it.
 
-### Metadata & Engagement
-- ⭐ **Rate photos** (1-5 stars)
-- ❤️ **Like/unlike photos** with count tracking
-- 🏷️ **Tag photos** with custom labels
-- 📍 **Add location metadata** (latitude, longitude, address)
+Processing (thumbnails, text, tags, faces, location) keeps running after upload —
+you don't have to wait on it. Check progress any time on the **Tools** page.
 
-### Smart Filtering
-- Filter by minimum rating
-- Filter by minimum likes
-- Filter by location (geospatial)
-- Combine multiple filters
+### What the icons mean
 
-### Duplicate Detection
-- **Exact duplicates**: SHA256 hash comparison
-- **Similar images**: Perceptual hashing (pixel-level comparison)
-- Automatic warnings on upload
+You'll see the same icons throughout the gallery and on individual photos:
 
-## Architecture
+- **⭐ Stars — rating.** Click a star to rate a photo from 1 to 5. Click the same
+  star again to clear the rating.
+- **❤️ Heart — like.** Click to like a photo; click again to unlike. Likes are a
+  quick "favorite" flag, separate from the star rating.
+- **🏷️ Tag — tags.** Shows the tags on a photo. AI-generated tags appear
+  automatically; you can also add your own.
+- **⬇️ Download** — save the photo (or your current selection) to your device.
+- **🗑️ Trash — delete** the photo from your library.
+- **☑️ Select** — tick photos to act on several at once (bulk download, delete,
+  or "make an album from these").
 
-### Tech Stack
-- **Frontend**: React + TypeScript + Vite
-- **Backend**: Flask + Python
-- **Storage**: Azure Blob Storage (images) + Azure Table Storage (metadata)
-- **Auth**: Microsoft Entra ID (Azure AD)
-- **Deployment**: Azure Container Apps
+### Filtering the gallery
 
-### Storage Strategy
-- **Photos**: Azure Blob Storage (`images` container)
-- **Thumbnails**: Azure Blob Storage (`thumbnails` container)
-- **Metadata**: Azure Table Storage (`photometadata` table)
-  - Per-user organization (partition by user ID)
-  - Indexed queries for fast filtering
-  - Extremely cost-effective (~$0.01 per 100K transactions)
+Use the filter controls at the top of the Gallery to narrow things down:
 
-## Local Development
+- **Minimum rating** — show only photos at or above a star level.
+- **Liked only** — show only photos you've hearted.
+- **Media type** — all, photos only, or videos only.
+- **Search** — type in plain language (*"beach at sunset"*, *"birthday cake"*)
+  and Photostore finds matching photos by what's *in* them, not just filenames.
 
-> **Prerequisite:** this repo stores the face-recognition model (`*.onnx`) via
-> [Git LFS](https://git-lfs.com). Install it before cloning
-> (`git lfs install`) so the model is pulled, not left as a pointer file. If
-> you already cloned without it, run `git lfs pull`.
+Filters combine, so you can, for example, show only liked videos rated 4+.
 
-### Backend Setup
-```bash
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+### Working with People
 
-Copy `.env.example` to `.env` and fill in your values (storage account,
-allowed origins, optional auth), then run the Flask backend locally:
-```bash
-cp .env.example .env
-flask run --port 5001
-```
+The **People** page groups faces that belong to the same person into a cluster
+of face crops. From here you can:
 
-### Frontend Setup
-```bash
-cd frontend
-npm install
-cp .env.example .env   # point the API base URL at your backend
-npm run dev
-```
+- **Name a person** — click a cluster and give it a name. Once named, you can
+  search for that person and use them in smart albums.
+- **Assign unclustered faces** — faces that weren't confidently grouped show up
+  separately; assign them to the right person.
+- **Merge clusters** — if two clusters are actually the same person, merge them
+  (there's an **undo** if you merge by mistake).
+- **Split a cluster** — if faces were grouped together wrongly, split the odd
+  ones out into their own cluster.
+- **Confirm or reject faces** — confirm a low-confidence face as correct, or
+  reject something that isn't really a face.
+- **Search people** by name to jump straight to someone.
 
-## API Endpoints
+### Using the Tools page (and re-running AI actions)
 
-### Photos
-- `GET /photos` - List photos with pagination
-- `POST /upload/init` + `POST /upload/finalize` - Direct-to-blob upload flow (with duplicate detection)
-- `POST /photos/delete` - Batch delete photos
+The **Tools** page shows every processing stage each photo goes through:
 
-### Metadata
-- `POST /photos/{filename}/rating` - Rate a photo (1-5)
-- `POST /photos/{filename}/like` - Like/unlike a photo
-- `GET /photos/{filename}/metadata` - Get full metadata
+- **Thumbnails** — fast-loading previews
+- **EXIF** — capture date and GPS location
+- **OCR** — text read out of the image
+- **AI vision** — tags and captions describing the photo
+- **Map tagging** — turning GPS into a place name
+- **Face detection** — finding and grouping faces
 
-### Filtering
-- `GET /photos/filter` - Filter by rating, likes, location
+For each photo you can see the status of every stage at a glance. Use the
+**filters** to find work that still needs doing — for example, photos that
+**failed** a stage or have **no data** for a given process.
 
-## Environment Variables
+**Re-running a stage:** if a photo failed or gave a bad result (a missing tag, a
+face that wasn't detected, wrong location), filter to the affected photos and
+**re-run** that processing stage on them. This kicks off the AI action again for
+those photos without touching anything else. The **Corrupted uploads** view
+lists files that couldn't be processed at all.
 
-Backend and frontend configuration is documented in their respective
-`.env.example` files:
+### Working with Albums
 
-- Backend: [`backend/.env.example`](backend/.env.example)
-- Frontend: [`frontend/.env.example`](frontend/.env.example)
+Albums are collections you build on top of your library.
 
-Key backend variables:
+**Create an album by hand:**
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `STORAGE_ACCOUNT_NAME` | Storage account name used with managed identity (DefaultAzureCredential) | Required |
-| `ALLOWED_ORIGINS` | Comma-separated allowed frontend origins | Required |
-| `BLOB_IMAGE_CONTAINER` | Blob container for full images | `images` |
-| `BLOB_THUMBNAIL_CONTAINER` | Blob container for thumbnails | `thumbnails` |
-| `METADATA_TABLE` | Table Storage name for metadata | `photometadata` |
-| `AUTH_REQUIRED` | Require authentication for API access | `false` |
+1. In the **Gallery**, select the photos you want (☑️).
+2. Choose **Create album** (or "make an album from selection").
+3. Give it a name — your new album now holds those photos.
 
-## Cost Estimate
+**Create a smart album** (Photostore fills it automatically from a rule) — on the
+**Albums** page choose **New smart album** and pick a rule:
 
-For **500,000 photos**:
-- Blob Storage: ~$7.50/month
-- Table Storage: ~$5/month
-- **Total**: ~$12.50/month (excluding Container Apps compute)
+- **By Location** — a place from your library
+- **By Recent Upload** — your latest upload window
+- **By Person** — a named person from the People page
+- **By Event/Time** — a capture-date window
+- **By Tag/Object** — an AI tag or detected object
 
-## Security
+**Add or remove photos in an existing album:**
 
-- SAS tokens for blob access (short expiry)
-- Azure Entra ID authentication (optional)
-- Server-side validation of all operations
-- Secure filename handling
+- **To add:** open the album (or select photos in the Gallery) and use **Add to
+  album** to drop the selected photos in.
+- **To remove:** open the album, select the photos you want out, and choose
+  **Remove from album**. Removing a photo from an album does **not** delete it
+  from your library — it only leaves that album.
 
-## Limitations
+**Search within an album** by name, minimum rating, or liked-only to find a
+specific shot fast, and **download** the whole album (or a selection) as a batch.
 
-- Table Storage max entity size: 1MB (metadata only)
-- Query performance depends on partition key distribution
-- Perceptual hashing ~50-150ms per image
+### Sharing an album
+
+1. Open the album you want to share.
+2. Choose **Share** to create a **public link**.
+3. Optionally set an **access code** so only people with the code can open it.
+4. Send the link. Visitors get a **read-only** view — they can browse and
+   **download** the photos, but can't change anything.
+
+To stop sharing, open the album's share settings and revoke the link.
+
+### Changing your password
+
+You can change your password any time from inside the app (see your account
+settings). Forgot it? Use **Forgot password?** on the login screen to get a
+reset link by email — check your spam folder if it doesn't arrive.
