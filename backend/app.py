@@ -4135,8 +4135,14 @@ def auth_login():
     password = str(data.get('password', '') or '')
     if not password:
         return jsonify({'error': 'Password is required.'}), 400
+    # Brute-force protection: the endpoint is unauthenticated, so lock it out
+    # after repeated failures rather than let an attacker try passwords freely.
+    if not password_auth.login_attempt_allowed(config_table_client):
+        return jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
     if not password_auth.verify_owner_password(config_table_client, password):
+        password_auth.record_login_failure(config_table_client)
         return jsonify({'error': 'Incorrect password.'}), 401
+    password_auth.record_login_success(config_table_client)
     email = password_auth.owner_email(config_table_client)
     token = password_auth.issue_session_token(SESSION_SECRET, email, SESSION_TTL_SECONDS)
     return jsonify({'token': token, 'email': email, 'expiresIn': SESSION_TTL_SECONDS})
@@ -4175,6 +4181,10 @@ def auth_forgot():
         return generic
     email = password_auth.owner_email(config_table_client)
     if not email:
+        return generic
+    # Throttle the unauthenticated send path so it can't be used to email-bomb
+    # the owner or burn ACS email quota. Still return the same generic 200.
+    if not password_auth.reset_email_allowed(config_table_client):
         return generic
     try:
         raw_token = password_auth.create_reset_token(config_table_client, ttl_seconds=3600)

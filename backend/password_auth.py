@@ -38,6 +38,8 @@ OWNER_USER_ID = 'owner'
 _AUTH_PARTITION = 'auth'
 _OWNER_ROW = 'owner'
 _RESET_ROW = 'owner-reset'
+_RESET_THROTTLE_ROW = 'owner-reset-throttle'
+_LOGIN_THROTTLE_ROW = 'owner-login-throttle'
 
 # scrypt parameters (interactive-login appropriate; ~tens of ms).
 _SCRYPT_N = 16384
@@ -178,6 +180,98 @@ def create_reset_token(table_client, ttl_seconds: int = 3600) -> str:
     }
     table_client.upsert_entity(entity)
     return raw
+
+
+def reset_email_allowed(table_client, *, min_interval_seconds: int = 60, max_per_hour: int = 5) -> bool:
+    """Return True (and record the send) if a reset email may go out now.
+
+    The /auth/forgot endpoint is unauthenticated by necessity, so without a
+    throttle an attacker who knows the backend URL could hammer it to email-bomb
+    the owner and burn Azure Communication Services quota/cost. This enforces a
+    minimum interval between sends AND a rolling hourly cap. It's single-owner,
+    so one global throttle row is enough (no per-address bookkeeping needed).
+    """
+    now = int(time.time())
+    try:
+        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=_RESET_THROTTLE_ROW)
+    except Exception:
+        entity = {'PartitionKey': _AUTH_PARTITION, 'RowKey': _RESET_THROTTLE_ROW}
+    last_sent = int(entity.get('lastSentAt', 0) or 0)
+    window_start = int(entity.get('windowStart', 0) or 0)
+    window_count = int(entity.get('windowCount', 0) or 0)
+    if now - last_sent < int(min_interval_seconds):
+        return False
+    if now - window_start >= 3600:
+        window_start = now
+        window_count = 0
+    if window_count >= int(max_per_hour):
+        return False
+    entity['lastSentAt'] = now
+    entity['windowStart'] = window_start
+    entity['windowCount'] = window_count + 1
+    try:
+        table_client.upsert_entity(entity)
+    except Exception:
+        # If we can't record the send, fail closed (skip the email) rather than
+        # risk an unthrottled flood.
+        return False
+    return True
+
+
+def login_attempt_allowed(table_client) -> bool:
+    """Return True if a login attempt may proceed (not currently locked out)."""
+    now = int(time.time())
+    try:
+        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=_LOGIN_THROTTLE_ROW)
+    except Exception:
+        return True
+    return now >= int(entity.get('lockedUntil', 0) or 0)
+
+
+def record_login_failure(
+    table_client,
+    *,
+    free_attempts: int = 5,
+    base_lock_seconds: int = 30,
+    max_lock_seconds: int = 900,
+    reset_window_seconds: int = 3600,
+) -> None:
+    """Count a failed login and apply exponential-backoff lockout.
+
+    /auth/login is unauthenticated, so without this an attacker who knows the
+    backend URL could brute-force the owner password at full speed. After a few
+    free attempts each further failure locks the endpoint for an exponentially
+    growing window (capped). The counter resets once failures stop for a while
+    so a legitimate owner is never permanently locked out.
+    """
+    now = int(time.time())
+    try:
+        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=_LOGIN_THROTTLE_ROW)
+    except Exception:
+        entity = {'PartitionKey': _AUTH_PARTITION, 'RowKey': _LOGIN_THROTTLE_ROW}
+    last_fail = int(entity.get('lastFailAt', 0) or 0)
+    prev = int(entity.get('failCount', 0) or 0)
+    if now - last_fail > int(reset_window_seconds):
+        prev = 0
+    fail_count = prev + 1
+    entity['failCount'] = fail_count
+    entity['lastFailAt'] = now
+    if fail_count > int(free_attempts):
+        over = fail_count - int(free_attempts)
+        lock = min(int(base_lock_seconds) * (2 ** (over - 1)), int(max_lock_seconds))
+        entity['lockedUntil'] = now + int(lock)
+    try:
+        table_client.upsert_entity(entity)
+    except Exception:
+        pass
+
+
+def record_login_success(table_client) -> None:
+    """Clear the login-failure counter after a successful sign-in."""
+    try:
+        table_client.delete_entity(partition_key=_AUTH_PARTITION, row_key=_LOGIN_THROTTLE_ROW)
+    except Exception:
+        pass
 
 
 def consume_reset_token(table_client, raw: str) -> bool:
