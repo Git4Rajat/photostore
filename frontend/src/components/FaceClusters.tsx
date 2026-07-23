@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowsRightLeftIcon, ArrowRightIcon, CheckIcon, ExclamationTriangleIcon, MagnifyingGlassIcon, SparklesIcon, TrashIcon, UserCircleIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArrowsRightLeftIcon, ArrowRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, ExclamationTriangleIcon, FaceSmileIcon, MagnifyingGlassIcon, NoSymbolIcon, SparklesIcon, Squares2X2Icon, TrashIcon, UserCircleIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import faceService from '../services/faceService';
 import { getUploadJson, resolveApiUrl } from '../services/apiClient';
 import { fetchProtectedBlobUrl } from '../services/imageClient';
@@ -9,6 +9,8 @@ import { useNavigate } from 'react-router-dom';
 import type { MergeHistoryItem, PersonFace, PersonSummary, SuggestionItem } from '../types/people';
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
+const PERSONS_PER_PAGE = 4;
+type PeopleView = 'cluster' | 'face';
 const isSuspiciousFace = (face?: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
 const getFaceFallbackPath = (filename?: string | null) => filename ? `/api/photos/access/thumbnail/${encodeURIComponent(filename)}` : '';
 const getFaceProxyThumbnailPath = (filename?: string | null) => filename ? `/api/photos/thumbnail/${encodeURIComponent(filename)}` : '';
@@ -165,8 +167,18 @@ const FaceClusters: React.FC = () => {
     const [status, setStatus] = useState<string>('');
     const [merges, setMerges] = useState<MergeHistoryItem[]>([]);
     const [suggestions, setSuggestions] = useState<SuggestionItem[]>([]);
+    const [view, setView] = useState<PeopleView>('cluster');
+    const [page, setPage] = useState(1);
+    const [personFaces, setPersonFaces] = useState<Record<string, PersonFace[]>>({});
+    const faceRequestsRef = useRef<Set<string>>(new Set());
     const navigate = useNavigate();
     const busy = initialLoading || actionLoading;
+
+    const totalPages = Math.max(1, Math.ceil(persons.length / PERSONS_PER_PAGE));
+    const pagedPersons = useMemo(
+        () => persons.slice((page - 1) * PERSONS_PER_PAGE, page * PERSONS_PER_PAGE),
+        [persons, page],
+    );
     const formatMergeId = (mergeId: string) => {
         if (!mergeId) return '';
         return mergeId.length > 12 ? `${mergeId.slice(0, 6)}…${mergeId.slice(-4)}` : mergeId;
@@ -232,6 +244,7 @@ const FaceClusters: React.FC = () => {
         try {
             const res = await faceService.listPersons(q || '');
             setPersons((res.persons || []) as PersonSummary[]);
+            setPersonFaces({});
         } catch (e: unknown) {
             setStatus(String(e));
         } finally {
@@ -256,9 +269,23 @@ const FaceClusters: React.FC = () => {
 
     const getSuggestionPersonId = (value?: string) => value || '';
 
+    const getSuggestionFace = (suggestion: SuggestionItem, side: 'source' | 'target'): PersonFace | undefined => {
+        const direct = side === 'source' ? suggestion.sourceFace : suggestion.targetFace;
+        if (direct?.filename) {
+            return direct;
+        }
+        const personId = side === 'source' ? suggestion.sourcePersonId : suggestion.targetPersonId;
+        return persons.find((p) => p.personId === personId)?.representativeFace;
+    };
+
     const removePersonsFromState = (personIds: string[]) => {
         const removeSet = new Set(personIds);
         setPersons(prev => prev.filter(person => !removeSet.has(person.personId)));
+        setPersonFaces(prev => {
+            const next = { ...prev };
+            personIds.forEach(personId => delete next[personId]);
+            return next;
+        });
         setSelected(prev => {
             const next = { ...prev };
             personIds.forEach(personId => delete next[personId]);
@@ -291,6 +318,7 @@ const FaceClusters: React.FC = () => {
         });
         setSelected({});
         setMergeTarget(null);
+        setPersonFaces({});
         setSuggestions(prev => prev.filter((suggestion) => (
             suggestion.sourcePersonId !== targetId
             && suggestion.targetPersonId !== targetId
@@ -305,10 +333,79 @@ const FaceClusters: React.FC = () => {
             void refreshSupportData();
         })();
     }, []);
+
+    // Keep the current page within range as the person list shrinks (deletes/merges/search).
+    useEffect(() => {
+        setPage((prev) => Math.min(prev, totalPages));
+    }, [totalPages]);
+
+    // In face view, lazily fetch the individual faces for the persons on the current page.
+    useEffect(() => {
+        if (view !== 'face') {
+            return;
+        }
+        pagedPersons.forEach((person) => {
+            const personId = person.personId;
+            if (!personId || personId in personFaces || faceRequestsRef.current.has(personId)) {
+                return;
+            }
+            faceRequestsRef.current.add(personId);
+            void (async () => {
+                try {
+                    const res = await faceService.getPerson(personId);
+                    const faces = Array.isArray(res?.faces) ? (res.faces as PersonFace[]) : [];
+                    setPersonFaces((prev) => ({ ...prev, [personId]: faces }));
+                } catch {
+                    setPersonFaces((prev) => ({ ...prev, [personId]: [] }));
+                } finally {
+                    faceRequestsRef.current.delete(personId);
+                }
+            })();
+        });
+    }, [view, pagedPersons, personFaces]);
+
     const handleSearch = async () => {
         setStatus('Searching...');
+        setPage(1);
         await loadPersons(searchQuery.trim());
         void refreshSupportData();
+    };
+
+    const handleNotFaceInView = async (personId: string, faceId: string) => {
+        if (!personId || !faceId) return;
+        setActionLoading(true);
+        try {
+            const res = await faceService.markNotFace(personId, faceId);
+            setPersonFaces((prev) => ({
+                ...prev,
+                [personId]: (prev[personId] || []).filter((face) => face.faceId !== faceId),
+            }));
+            if (res?.personDeleted) {
+                removePersonsFromState([personId]);
+                setPersonFaces((prev) => {
+                    const next = { ...prev };
+                    delete next[personId];
+                    return next;
+                });
+                showToast('False positive removed');
+            } else {
+                setPersons((prev) => prev.map((person) => (
+                    person.personId === personId
+                        ? {
+                            ...person,
+                            faceIds: (person.faceIds || []).filter((id) => id !== faceId),
+                            faceCount: Math.max(0, (person.faceCount ?? (person.faceIds || []).length) - 1),
+                        }
+                        : person
+                )));
+                showToast('Marked as not a face');
+            }
+            void refreshSupportData();
+        } catch (e: unknown) {
+            showToast(String(e));
+        } finally {
+            setActionLoading(false);
+        }
     };
 
     const handleAssignUnclustered = async () => {
@@ -501,7 +598,7 @@ const FaceClusters: React.FC = () => {
                             <button
                                 className="people-icon-btn"
                                 aria-label="Clear search"
-                                onClick={() => { setSearchQuery(''); void loadPersons(); void refreshSupportData(); }}
+                                onClick={() => { setSearchQuery(''); setPage(1); void loadPersons(); void refreshSupportData(); }}
                                 type="button"
                             >
                                 <XMarkIcon />
@@ -520,6 +617,31 @@ const FaceClusters: React.FC = () => {
             {status && <p className="status people-status">{status}</p>}
 
             {persons.length > 0 && (
+                <div className="people-view-toggle" role="tablist" aria-label="People view">
+                    <button
+                        className={`people-view-tab ${view === 'cluster' ? 'is-active' : ''}`}
+                        onClick={() => setView('cluster')}
+                        role="tab"
+                        aria-selected={view === 'cluster'}
+                        type="button"
+                    >
+                        <Squares2X2Icon />
+                        <span>Clusters</span>
+                    </button>
+                    <button
+                        className={`people-view-tab ${view === 'face' ? 'is-active' : ''}`}
+                        onClick={() => setView('face')}
+                        role="tab"
+                        aria-selected={view === 'face'}
+                        type="button"
+                    >
+                        <FaceSmileIcon />
+                        <span>Faces</span>
+                    </button>
+                </div>
+            )}
+
+            {persons.length > 0 && view === 'cluster' && (
                 <div className="people-merge-strip">
                     <div className="people-merge-count">{selectedCount} selected</div>
                     <button
@@ -572,90 +694,209 @@ const FaceClusters: React.FC = () => {
                 </div>
             )}
 
-            <div className="people-grid">
-                {initialLoading && persons.length === 0 && <div className="people-empty">Loading...</div>}
-                {!initialLoading && persons.length === 0 && <div className="people-empty">No people yet.</div>}
-                {persons.map((p, index: number) => {
-                    const suspiciousRepresentative = isSuspiciousFace(p.representativeFace);
-                    return (
-                        <div key={p.personId} className={`person-tile ${selected[p.personId] ? 'is-selected' : ''} ${suspiciousRepresentative ? 'has-suspicious-face' : ''}`} style={{ ['--stagger' as string]: `${Math.min(index, 18) * 24}ms` }}>
-                            <button className="person-tile-main" onClick={() => navigate(`/people/${p.personId}`)} type="button">
-                                <div className="person-avatar" style={getAvatarStyle(p.personId)}>
-                                    {p.representativeFace?.filename ? (
-                                        <PersonAvatarMedia
-                                            rep={p.representativeFace}
-                                            alt={p.name || 'Person'}
-                                        />
-                                    ) : (
-                                        <span>{getInitials(p.name, p.personId)}</span>
-                                    )}
-                                    {suspiciousRepresentative && (
-                                        <span className="person-avatar-review-badge" title="Needs review" aria-label="Needs review">
-                                            <ExclamationTriangleIcon />
-                                        </span>
-                                    )}
+            {initialLoading && persons.length === 0 && <div className="people-empty">Loading...</div>}
+            {!initialLoading && persons.length === 0 && <div className="people-empty">No people yet.</div>}
+
+            {persons.length > 0 && view === 'cluster' && (
+                <div className="people-grid">
+                    {pagedPersons.map((p, index: number) => {
+                        const suspiciousRepresentative = isSuspiciousFace(p.representativeFace);
+                        return (
+                            <div key={p.personId} className={`person-tile ${selected[p.personId] ? 'is-selected' : ''} ${suspiciousRepresentative ? 'has-suspicious-face' : ''}`} style={{ ['--stagger' as string]: `${Math.min(index, 18) * 24}ms` }}>
+                                <button className="person-tile-main" onClick={() => navigate(`/people/${p.personId}`)} type="button">
+                                    <div className="person-avatar" style={getAvatarStyle(p.personId)}>
+                                        {p.representativeFace?.filename ? (
+                                            <PersonAvatarMedia
+                                                rep={p.representativeFace}
+                                                alt={p.name || 'Person'}
+                                            />
+                                        ) : (
+                                            <span>{getInitials(p.name, p.personId)}</span>
+                                        )}
+                                        {suspiciousRepresentative && (
+                                            <span className="person-avatar-review-badge" title="Needs review" aria-label="Needs review">
+                                                <ExclamationTriangleIcon />
+                                            </span>
+                                        )}
+                                    </div>
+                                </button>
+                                <label className="person-select">
+                                    <input
+                                        type="checkbox"
+                                        checked={!!selected[p.personId]}
+                                        onChange={(e) => setSelected(prev => ({ ...prev, [p.personId]: e.target.checked }))}
+                                    />
+                                    <span className="person-select-indicator">
+                                        <CheckIcon />
+                                    </span>
+                                </label>
+                                <div className="person-meta">
+                                    <div className="person-name">{p.name || 'Unnamed'}</div>
+                                    <div className="person-count">{p.faceCount ?? (p.faceIds || []).length}</div>
                                 </div>
-                            </button>
-                            <label className="person-select">
-                                <input
-                                    type="checkbox"
-                                    checked={!!selected[p.personId]}
-                                    onChange={(e) => setSelected(prev => ({ ...prev, [p.personId]: e.target.checked }))}
-                                />
-                                <span className="person-select-indicator">
-                                    <CheckIcon />
-                                </span>
-                            </label>
-                            <div className="person-meta">
-                                <div className="person-name">{p.name || 'Unnamed'}</div>
-                                <div className="person-count">{p.faceCount ?? (p.faceIds || []).length}</div>
+                                <button className="person-open" aria-label="Open person" onClick={() => navigate(`/people/${p.personId}`)} type="button">
+                                    <ArrowRightIcon />
+                                </button>
+                                <button
+                                    className="person-open person-delete"
+                                    aria-label="Delete cluster"
+                                    onClick={() => void handleDeletePerson(p.personId, p.name || 'Unnamed')}
+                                    type="button"
+                                    disabled={busy}
+                                >
+                                    <TrashIcon />
+                                </button>
                             </div>
-                            <button className="person-open" aria-label="Open person" onClick={() => navigate(`/people/${p.personId}`)} type="button">
-                                <ArrowRightIcon />
-                            </button>
-                            <button
-                                className="person-open person-delete"
-                                aria-label="Delete cluster"
-                                onClick={() => void handleDeletePerson(p.personId, p.name || 'Unnamed')}
-                                type="button"
-                                disabled={busy}
-                            >
-                                <TrashIcon />
-                            </button>
-                        </div>
-                    );
-                })}
-            </div>
+                        );
+                    })}
+                </div>
+            )}
+
+            {persons.length > 0 && view === 'face' && (
+                <div className="people-face-view">
+                    {pagedPersons.map((p) => {
+                        const loadedFaces = personFaces[p.personId];
+                        const facesReady = Array.isArray(loadedFaces);
+                        return (
+                            <div key={p.personId} className="people-face-person">
+                                <div className="people-face-person-head">
+                                    <div className="people-face-person-avatar" style={getAvatarStyle(p.personId)}>
+                                        {p.representativeFace?.filename ? (
+                                            <PersonAvatarMedia rep={p.representativeFace} alt={p.name || 'Person'} />
+                                        ) : (
+                                            <span>{getInitials(p.name, p.personId)}</span>
+                                        )}
+                                    </div>
+                                    <div className="people-face-person-info">
+                                        <div className="person-name">{p.name || 'Unnamed'}</div>
+                                        <div className="person-count">
+                                            {facesReady ? loadedFaces.length : (p.faceCount ?? (p.faceIds || []).length)} faces
+                                        </div>
+                                    </div>
+                                    <button className="people-icon-btn" aria-label="Open person" onClick={() => navigate(`/people/${p.personId}`)} type="button">
+                                        <ArrowRightIcon />
+                                    </button>
+                                </div>
+                                {!facesReady ? (
+                                    <div className="people-face-empty">Loading faces…</div>
+                                ) : loadedFaces.length === 0 ? (
+                                    <div className="people-face-empty">No faces remaining.</div>
+                                ) : (
+                                    <div className="people-face-strip">
+                                        {loadedFaces.map((face) => {
+                                            const faceId = face.faceId || '';
+                                            const suspicious = isSuspiciousFace(face);
+                                            return (
+                                                <div key={faceId || `${face.filename}-${face.bbox?.left}-${face.bbox?.top}`} className={`people-face-cell ${suspicious ? 'is-suspicious-face' : ''}`}>
+                                                    <div className="people-face-crop">
+                                                        <PersonAvatarMedia rep={face} alt={face.filename || 'Face'} />
+                                                        {suspicious && (
+                                                            <span className="person-avatar-review-badge" title="Needs review" aria-label="Needs review">
+                                                                <ExclamationTriangleIcon />
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <button
+                                                        className="people-face-notface"
+                                                        onClick={() => faceId && void handleNotFaceInView(p.personId, faceId)}
+                                                        disabled={!faceId || busy}
+                                                        type="button"
+                                                        title="Not a face"
+                                                    >
+                                                        <NoSymbolIcon />
+                                                        <span>Not a face</span>
+                                                    </button>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+
+            {persons.length > 0 && totalPages > 1 && (
+                <div className="people-pagination">
+                    <button
+                        className="people-icon-btn"
+                        onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+                        disabled={page <= 1}
+                        aria-label="Previous page"
+                        type="button"
+                    >
+                        <ChevronLeftIcon />
+                    </button>
+                    <span className="people-pagination-info">Page {page} of {totalPages}</span>
+                    <button
+                        className="people-icon-btn"
+                        onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+                        disabled={page >= totalPages}
+                        aria-label="Next page"
+                        type="button"
+                    >
+                        <ChevronRightIcon />
+                    </button>
+                </div>
+            )}
 
             {suggestions.length > 0 && (
                 <div className="people-panel people-suggestions">
                     <div className="people-panel-header">
                         <div className="people-panel-title">Suggestions</div>
-                        <div className="people-panel-meta">Potential duplicates</div>
+                        <div className="people-panel-meta">Faces suggested to merge</div>
                     </div>
                     <div className="people-suggestion-list">
                         {suggestions.map((s) => {
                             const sourceLabel = getPersonLabel(s.sourcePersonId);
                             const targetLabel = getPersonLabel(s.targetPersonId);
+                            const sourceFace = getSuggestionFace(s, 'source');
+                            const targetFace = getSuggestionFace(s, 'target');
                             const score = typeof s.similarity === 'number' ? s.similarity : 0;
                             return (
                                 <div key={`${s.sourcePersonId}-${s.targetPersonId}`} className="people-suggestion-row">
-                                    <div className="people-suggestion-main">
-                                        <div className="people-suggestion-title">
+                                    <div className="people-suggestion-faces">
+                                        <button
+                                            className="people-suggestion-face"
+                                            onClick={() => s.sourcePersonId && navigate(`/people/${s.sourcePersonId}`)}
+                                            type="button"
+                                            title={sourceLabel}
+                                        >
+                                            <span className="people-suggestion-face-avatar" style={getAvatarStyle(s.sourcePersonId)}>
+                                                {sourceFace?.filename ? (
+                                                    <PersonAvatarMedia rep={sourceFace} alt={sourceLabel} />
+                                                ) : (
+                                                    <span>{getInitials(s.sourceName, s.sourcePersonId)}</span>
+                                                )}
+                                            </span>
                                             <span className="people-suggestion-name">{sourceLabel}</span>
-                                            <span className="people-suggestion-arrow">→</span>
+                                        </button>
+                                        <ArrowsRightLeftIcon className="people-suggestion-arrow" />
+                                        <button
+                                            className="people-suggestion-face"
+                                            onClick={() => s.targetPersonId && navigate(`/people/${s.targetPersonId}`)}
+                                            type="button"
+                                            title={targetLabel}
+                                        >
+                                            <span className="people-suggestion-face-avatar" style={getAvatarStyle(s.targetPersonId)}>
+                                                {targetFace?.filename ? (
+                                                    <PersonAvatarMedia rep={targetFace} alt={targetLabel} />
+                                                ) : (
+                                                    <span>{getInitials(s.targetName, s.targetPersonId)}</span>
+                                                )}
+                                            </span>
                                             <span className="people-suggestion-name">{targetLabel}</span>
-                                        </div>
-                                        <div className="people-suggestion-meta">
-                                            <span className="people-merge-chip">{s.sourceFaceCount || 0}</span>
-                                            <span className="people-merge-chip">{(score * 100).toFixed(1)}%</span>
-                                        </div>
+                                        </button>
+                                    </div>
+                                    <div className="people-suggestion-meta">
+                                        <span className="people-merge-chip">{(score * 100).toFixed(1)}% match</span>
                                     </div>
                                     <div className="people-suggestion-actions">
                                         <button
                                             className="people-merge-btn"
                                             disabled={busy}
-                                onClick={() => handleMergeSuggestion(s.targetPersonId || '', s.sourcePersonId || '', sourceLabel)}
+                                            onClick={() => handleMergeSuggestion(s.targetPersonId || '', s.sourcePersonId || '', sourceLabel)}
                                             type="button"
                                             aria-label="Merge suggestion"
                                         >

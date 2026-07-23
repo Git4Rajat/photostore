@@ -1,5 +1,4 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { BellIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { get, getUpload, post, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
@@ -334,77 +333,48 @@ export const NotificationBell: React.FC = () => {
         markAllNotificationsRead,
     } = useAppServices();
     const [showNotifications, setShowNotifications] = useState<boolean>(false);
-    const bellButtonRef = useRef<HTMLButtonElement | null>(null);
-    const [notificationAnchorStyle, setNotificationAnchorStyle] = useState<React.CSSProperties>({});
+    const wrapRef = useRef<HTMLDivElement | null>(null);
 
     const closeNotifications = useCallback(() => {
         setShowNotifications(false);
     }, []);
 
+    // Close the pane when clicking outside of it or pressing Escape. The pane
+    // itself is anchored to the bell in normal flow, so it scrolls along with
+    // the header rather than floating over the page.
     useEffect(() => {
-        if (!showNotifications || typeof window === 'undefined') {
+        if (!showNotifications || typeof document === 'undefined') {
             return undefined;
         }
 
-        let frameId = 0;
-
-        const updateAnchor = () => {
-            const button = bellButtonRef.current;
-            if (!button) {
-                return;
+        const handlePointerDown = (event: MouseEvent) => {
+            if (wrapRef.current && !wrapRef.current.contains(event.target as Node)) {
+                closeNotifications();
             }
-
-            const rect = button.getBoundingClientRect();
-            const preferredLeft = rect.right - 360;
-            const clampedLeft = Math.min(
-                Math.max(10, preferredLeft),
-                Math.max(10, window.innerWidth - 10 - 360),
-            );
-
-            setNotificationAnchorStyle({
-                '--notification-anchor-top': `${Math.max(rect.bottom + 8, 88)}px`,
-                '--notification-anchor-left': `${clampedLeft}px`,
-            } as React.CSSProperties);
         };
 
-        const scheduleUpdate = () => {
-            window.cancelAnimationFrame(frameId);
-            frameId = window.requestAnimationFrame(updateAnchor);
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                closeNotifications();
+            }
         };
 
-        updateAnchor();
-        window.addEventListener('scroll', scheduleUpdate, true);
-        window.addEventListener('resize', scheduleUpdate);
-
-        const button = bellButtonRef.current;
-        const resizeObserver = button ? new ResizeObserver(scheduleUpdate) : null;
-        if (button && resizeObserver) {
-            resizeObserver.observe(button);
-        }
+        document.addEventListener('mousedown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
 
         return () => {
-            window.cancelAnimationFrame(frameId);
-            window.removeEventListener('scroll', scheduleUpdate, true);
-            window.removeEventListener('resize', scheduleUpdate);
-            resizeObserver?.disconnect();
+            document.removeEventListener('mousedown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
         };
-    }, [showNotifications]);
+    }, [showNotifications, closeNotifications]);
 
-    const overlay = showNotifications && typeof document !== 'undefined'
-        ? createPortal(
-            <>
-                <button
-                    type="button"
-                    className="notification-backdrop"
-                    aria-label="Close notifications"
-                    onClick={closeNotifications}
-                />
-                <div
-                    className="notification-pane card-glass"
-                    role="dialog"
-                    aria-label="Notifications"
-                    style={notificationAnchorStyle}
-                >
+    const overlay = showNotifications
+        ? (
+            <div
+                className="notification-pane card-glass"
+                role="dialog"
+                aria-label="Notifications"
+            >
                     <div className="notification-head">
                         <h3 className="toolbar-title">Notifications</h3>
                         <div className="notification-actions">
@@ -466,16 +436,13 @@ export const NotificationBell: React.FC = () => {
                             ))}
                         </div>
                     )}
-                </div>
-            </>,
-            document.body,
+            </div>
         )
         : null;
 
     return (
-        <div className="notification-wrap">
+        <div className="notification-wrap" ref={wrapRef}>
             <button
-                ref={bellButtonRef}
                 type="button"
                 onClick={() => {
                     setShowNotifications((prev) => {

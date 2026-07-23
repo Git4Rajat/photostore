@@ -3994,6 +3994,8 @@ def _compute_people_suggestions(
         except Exception:
             face_ids = []
         active_face_ids = []
+        rep_face = None
+        rep_face_score = None
         for face_id in face_ids:
             try:
                 face = face_by_id.get(str(face_id))
@@ -4005,6 +4007,10 @@ def _compute_people_suggestions(
                     and not _face_is_rejected(face)
                 ):
                     active_face_ids.append(face_id)
+                    score = _face_preview_priority(face)
+                    if rep_face is None or rep_face_score is None or score > rep_face_score:
+                        rep_face = _face_summary_for_person_list(str(face_id), face)
+                        rep_face_score = score
             except Exception:
                 continue
         if not active_face_ids:
@@ -4014,6 +4020,7 @@ def _compute_people_suggestions(
             'name': row.get('name', ''),
             'faceCount': len(active_face_ids),
             'repEmbedding': rep,
+            'representativeFace': rep_face,
         })
 
     if len(people) < 2:
@@ -4059,9 +4066,11 @@ def _compute_people_suggestions(
                 'sourcePersonId': source.get('personId'),
                 'sourceName': source.get('name', ''),
                 'sourceFaceCount': source.get('faceCount', 0),
+                'sourceFace': source.get('representativeFace'),
                 'targetPersonId': target.get('personId'),
                 'targetName': target.get('name', ''),
                 'targetFaceCount': target.get('faceCount', 0),
+                'targetFace': target.get('representativeFace'),
                 'similarity': score,
             })
             if len(suggestions) >= limit:

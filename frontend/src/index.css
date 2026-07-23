@@ -1500,6 +1500,277 @@ a {
   font-weight: 500;
 }
 
+/* People view toggle (Clusters / Faces) */
+.people-view-toggle {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--lg-edge);
+  background: var(--lg-surface);
+  width: fit-content;
+}
+
+.people-view-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  min-height: var(--tap-min);
+  border: none;
+  background: transparent;
+  border-radius: var(--r-md);
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--dur-quick) ease, color var(--dur-quick) ease;
+}
+
+.people-view-tab svg {
+  width: 18px;
+  height: 18px;
+}
+
+.people-view-tab.is-active {
+  background: var(--lg-surface-strong);
+  color: var(--text);
+  box-shadow: var(--lg-shadow-resting);
+}
+
+.people-view-tab:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* People pagination */
+.people-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.people-pagination-info {
+  font-size: 0.85rem;
+  color: var(--muted);
+  min-width: 92px;
+  text-align: center;
+}
+
+.people-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.people-icon-btn:disabled:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+/* People face view */
+.people-face-view {
+  display: grid;
+  gap: 14px;
+}
+
+.people-face-person {
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-lg);
+  background: var(--lg-surface-strong);
+  padding: 12px;
+  box-shadow: var(--lg-shadow-resting);
+}
+
+.people-face-person-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.people-face-person-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--lg-specular-soft);
+  color: rgba(30, 30, 30, 0.85);
+  font-weight: 600;
+}
+
+.people-face-person-info {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.people-face-person-info .person-name {
+  font-weight: 600;
+}
+
+.people-face-person-info .person-count {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.people-face-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 10px;
+}
+
+.people-face-cell {
+  display: grid;
+  gap: 6px;
+}
+
+.people-face-crop {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: #f3f4f6;
+  border: 1px solid var(--lg-edge);
+}
+
+.people-face-cell.is-suspicious-face .people-face-crop {
+  box-shadow: inset 0 0 0 2px rgba(202, 138, 4, 0.55);
+  border-color: rgba(202, 138, 4, 0.45);
+}
+
+.people-face-crop img,
+.people-face-person-avatar img,
+.people-suggestion-face-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.people-face-notface {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 6px 8px;
+  border-radius: var(--r-md);
+  border: 1px solid rgba(220, 38, 38, 0.3);
+  background: rgba(220, 38, 38, 0.08);
+  color: rgb(185, 28, 28);
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color var(--dur-quick) ease;
+}
+
+.people-face-notface svg {
+  width: 15px;
+  height: 15px;
+}
+
+.people-face-notface:hover:not(:disabled) {
+  background: rgba(220, 38, 38, 0.16);
+}
+
+.people-face-notface:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.people-face-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+/* Suggestions shown as merge-candidate photos */
+.people-suggestion-list {
+  display: grid;
+  gap: 10px;
+}
+
+.people-suggestion-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-md);
+  background: var(--lg-surface);
+}
+
+.people-suggestion-faces {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.people-suggestion-face {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text);
+  min-width: 0;
+}
+
+.people-suggestion-face-avatar {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--lg-specular-soft);
+  color: rgba(30, 30, 30, 0.85);
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.people-suggestion-face .people-suggestion-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 140px;
+}
+
+.people-suggestion-face:hover .people-suggestion-name {
+  text-decoration: underline;
+}
+
+.people-suggestion-arrow {
+  width: 20px;
+  height: 20px;
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.people-suggestion-meta {
+  display: inline-flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.people-suggestion-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 @keyframes peopleTileIn {
   from {
     opacity: 0;
@@ -1759,11 +2030,7 @@ a {
 
 .notification-wrap {
   position: relative;
-  z-index: 40;
-}
-
-.notification-backdrop {
-  display: none;
+  z-index: 60;
 }
 
 .notification-bell {
@@ -1910,9 +2177,10 @@ a {
 }
 
 .notification-pane {
-  position: fixed;
-  top: var(--notification-anchor-top, 88px);
-  left: var(--notification-anchor-left, auto);
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  left: auto;
   width: min(360px, 92vw);
   max-height: 460px;
   padding: 12px;
@@ -4094,25 +4362,11 @@ video.photo-preview-media {
   }
 
   .notification-pane {
-    position: fixed;
-    top: var(--notification-anchor-top, 88px);
-    left: max(10px, env(safe-area-inset-left));
-    width: auto;
+    right: 0;
+    left: auto;
+    width: min(360px, 86vw);
     max-height: min(460px, calc(100vh - 112px));
     z-index: 80;
-  }
-
-  .notification-backdrop {
-    display: block;
-    position: fixed;
-    inset: 0;
-    z-index: 70;
-    border: 0;
-    padding: 0;
-    margin: 0;
-    background: rgba(10, 10, 14, 0.12);
-    backdrop-filter: blur(1px);
-    -webkit-backdrop-filter: blur(1px);
   }
 
   .notification-close {

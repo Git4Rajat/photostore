@@ -39,6 +39,11 @@ export interface SuggestionItem {
     targetPersonId?: string;
     similarity?: number;
     sourceFaceCount?: number;
+    targetFaceCount?: number;
+    sourceName?: string;
+    targetName?: string;
+    sourceFace?: PersonFace;
+    targetFace?: PersonFace;
 }
 
 export interface PersonDetailModel extends PersonSummary {
