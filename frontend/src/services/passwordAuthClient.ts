@@ -111,6 +111,16 @@ export const getSubjectFromToken = (): string => {
     return String(decodePayload(token)?.sub || '');
 };
 
+// The active library id (`lib` claim). Used to scope client-side caches so
+// switching libraries doesn't replay the previous library's cached photos.
+export const getActiveLibraryFromToken = (): string => {
+    const token = getToken();
+    if (!token) {
+        return '';
+    }
+    return String(decodePayload(token)?.lib || '');
+};
+
 const parseError = async (response: Response, fallback: string): Promise<string> => {
     try {
         const body = await response.json();

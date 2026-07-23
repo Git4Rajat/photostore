@@ -721,7 +721,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const invalidatePhotoCache = useCallback(() => {
         try {
-            localStorage.removeItem(PHOTO_CACHE_STORAGE_KEY);
+            // Boot caches are scoped per library (`${base}.${libraryId}`); clear
+            // the base key and every per-library variant so none lingers stale.
+            for (let i = localStorage.length - 1; i >= 0; i -= 1) {
+                const key = localStorage.key(i);
+                if (key && (key === PHOTO_CACHE_STORAGE_KEY || key.startsWith(`${PHOTO_CACHE_STORAGE_KEY}.`))) {
+                    localStorage.removeItem(key);
+                }
+            }
         } catch {
             // Cache invalidation should not block upload completion.
         }

@@ -14,6 +14,7 @@ import {
 } from '@heroicons/react/24/outline';
 import { AppServicesProvider, NotificationBell, useAppServices } from './components/AppServicesProvider';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
+import { getMine } from './services/libraryClient';
 import { getRuntimeConfig } from './config/appConfig';
 
 const isPasswordMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
@@ -187,6 +188,7 @@ const AppContent: React.FC = () => {
     const isAuthRoute = location.pathname === '/login' || location.pathname === '/logout' || location.pathname === '/reset-password' || location.pathname === '/change-password' || location.pathname === '/accept-invite';
     const [authReady, setAuthReady] = useState<boolean>(false);
     const [displayName, setDisplayName] = useState<string>('');
+    const [libraryTitle, setLibraryTitle] = useState<string>('Library');
     const [themePreference, setThemePreference] = useState<ThemePreference>(getStoredThemePreference);
     const isPrivateArea = !isPublicAlbumRoute && !isAuthRoute;
     const isSignedIntoPrivateArea = isPrivateArea && (!authEnabled || (authReady && Boolean(displayName)));
@@ -278,6 +280,34 @@ const AppContent: React.FC = () => {
         };
     }, [authEnabled]);
 
+    // Reflect the active library in the header title. Default personal libraries
+    // are named after the owner's email, which we don't want to show, so fall
+    // back to "Library" unless the owner gave the library a distinct name.
+    useEffect(() => {
+        if (!isSignedIntoPrivateArea) {
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            try {
+                const mine = await getMine();
+                const active = mine.libraries.find((lib) => lib.libraryId === mine.activeLibraryId);
+                const name = (active?.name || '').trim();
+                const ownEmail = (getActiveAccount()?.username || '').trim().toLowerCase();
+                if (!cancelled) {
+                    setLibraryTitle(name && name.toLowerCase() !== ownEmail ? name : 'Library');
+                }
+            } catch {
+                if (!cancelled) {
+                    setLibraryTitle('Library');
+                }
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [isSignedIntoPrivateArea, displayName]);
+
     useEffect(() => {
         if (!isSignedIntoPrivateArea) {
             return undefined;
@@ -328,7 +358,7 @@ const AppContent: React.FC = () => {
                 <header className="ios-header reveal-up">
                     <div>
                         <p className="ios-kicker">PHOTO STORE</p>
-                        <h1 className="ios-title">Library</h1>
+                        <h1 className="ios-title">{libraryTitle}</h1>
                         <p className="ios-subtitle">An elegant home for your memories.</p>
                     </div>
                     <div className="app-header-actions">

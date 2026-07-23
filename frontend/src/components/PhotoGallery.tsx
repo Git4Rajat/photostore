@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react'
 import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, HeartIcon, InformationCircleIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon } from '@heroicons/react/24/outline';
 import { useLocation } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
+import { getActiveLibraryFromToken } from '../services/passwordAuthClient';
 import {
     ARCFACE_EMBEDDING_DIMENSIONS,
     ARCFACE_EMBEDDING_VERSION,
@@ -3463,9 +3464,17 @@ interface PersistedPhotoCache {
     captureEndDate: string;
 }
 
+// Scope the boot cache to the active library so switching libraries never
+// replays the previous library's photos. Falls back to the base key when there
+// is no session (local dev / unauthenticated).
+const photoCacheKey = (): string => {
+    const lib = getActiveLibraryFromToken();
+    return lib ? `${PHOTO_CACHE_STORAGE_KEY}.${lib}` : PHOTO_CACHE_STORAGE_KEY;
+};
+
 const loadPhotoCache = (): PersistedPhotoCache | null => {
     try {
-        const raw = localStorage.getItem(PHOTO_CACHE_STORAGE_KEY);
+        const raw = localStorage.getItem(photoCacheKey());
         if (!raw) {
             return null;
         }
@@ -3484,7 +3493,13 @@ const loadPhotoCache = (): PersistedPhotoCache | null => {
 
 const writePhotoCache = (cache: PersistedPhotoCache) => {
     try {
-        localStorage.setItem(PHOTO_CACHE_STORAGE_KEY, JSON.stringify(cache));
+        const key = photoCacheKey();
+        // Purge the pre-scoping global cache entry (written before caches were
+        // scoped per library) so it can never be replayed under another library.
+        if (key !== PHOTO_CACHE_STORAGE_KEY) {
+            localStorage.removeItem(PHOTO_CACHE_STORAGE_KEY);
+        }
+        localStorage.setItem(key, JSON.stringify(cache));
     } catch {
         // Ignore storage quota or serialization errors.
     }
