@@ -2788,6 +2788,10 @@ export const runBrowserProcessing = async (
 ): Promise<ClientProcessingResult> => {
     const clientProcessing: Record<string, any> = partialResult?.clientProcessing || {};
     const clientProcessingReport: ClientProcessingReportItem[] = partialResult?.clientProcessingReport || [];
+    // On-device AI (OCR, vision, face) only runs once the user has loaded browser AI.
+    // Until then these steps are left untouched so they stay pending and get
+    // backfilled when the model is loaded; thumbnails/EXIF/geocode still run.
+    const browserAiReady = browserAiModelState?.status === 'available';
 
     if (isVideoFile(file)) {
         // Videos only get a poster-frame thumbnail in the browser; EXIF metadata
@@ -2966,7 +2970,13 @@ export const runBrowserProcessing = async (
     }
 
     startedAt = performance.now();
-    if (visionSource.imageSource) {
+    if (visionSource.imageSource && !browserAiReady) {
+        clientProcessingReport.push(makeClientReport(clientAssetId, 'ocr', 'skipped', 'model_unavailable', startedAt, {
+            runtime: 'tesseract.js',
+            detail: 'browser_ai_not_loaded',
+            ...sourceFields,
+        }));
+    } else if (visionSource.imageSource) {
         try {
             const ocrText = await withTimeout(runBrowserOcr(visionSource.imageSource), CLIENT_BROWSER_STEP_BUDGET_MS);
             const normalizedOcr = String(ocrText || '').trim().slice(0, 2048);
@@ -3070,6 +3080,28 @@ export const runBrowserProcessing = async (
                 detail: isBackgroundThrottled ? 'browser_background_throttled' : faceSkipReason,
                 faceFailureStage,
                 faceFailureDetail: isBackgroundThrottled ? 'browser_background_throttled' : faceSkipReason,
+                ...sourceFields,
+            }));
+        } else if (!browserAiReady) {
+            // Browser AI isn't loaded yet: don't spin up BlazeFace/ArcFace. Leave the
+            // face step untouched so it stays pending and is backfilled once loaded.
+            clientProcessing.face = {
+                hasData: false,
+                faces: [],
+                source: 'browser',
+                embeddingsReady: false,
+                faceModelReady: false,
+                deferredReason: 'browser_ai_not_loaded',
+                faceFailureStage: 'unsupported_runtime',
+                faceFailureDetail: 'browser_ai_not_loaded',
+                ...sourceFields,
+            };
+            clientProcessingReport.push(makeClientReport(clientAssetId, 'face', 'skipped', 'model_unavailable', startedAt, {
+                runtime: 'browser-face-detector',
+                reason: 'model_unavailable',
+                detail: 'browser_ai_not_loaded',
+                faceFailureStage: 'unsupported_runtime',
+                faceFailureDetail: 'browser_ai_not_loaded',
                 ...sourceFields,
             }));
         } else {

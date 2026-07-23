@@ -9,7 +9,9 @@ import { useNavigate } from 'react-router-dom';
 import type { MergeHistoryItem, PersonFace, PersonSummary, SuggestionItem } from '../types/people';
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
-const PERSONS_PER_PAGE = 4;
+const CLUSTER_PER_PAGE = 15;
+const FACE_PER_PAGE = 4;
+const SUGGESTIONS_PER_PAGE = 5;
 type PeopleView = 'cluster' | 'face';
 const isSuspiciousFace = (face?: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
 const getFaceFallbackPath = (filename?: string | null) => filename ? `/api/photos/access/thumbnail/${encodeURIComponent(filename)}` : '';
@@ -169,15 +171,22 @@ const FaceClusters: React.FC = () => {
     const [suggestions, setSuggestions] = useState<SuggestionItem[]>([]);
     const [view, setView] = useState<PeopleView>('cluster');
     const [page, setPage] = useState(1);
+    const [suggestionPage, setSuggestionPage] = useState(1);
     const [personFaces, setPersonFaces] = useState<Record<string, PersonFace[]>>({});
     const faceRequestsRef = useRef<Set<string>>(new Set());
     const navigate = useNavigate();
     const busy = initialLoading || actionLoading;
 
-    const totalPages = Math.max(1, Math.ceil(persons.length / PERSONS_PER_PAGE));
+    const personsPerPage = view === 'cluster' ? CLUSTER_PER_PAGE : FACE_PER_PAGE;
+    const totalPages = Math.max(1, Math.ceil(persons.length / personsPerPage));
     const pagedPersons = useMemo(
-        () => persons.slice((page - 1) * PERSONS_PER_PAGE, page * PERSONS_PER_PAGE),
-        [persons, page],
+        () => persons.slice((page - 1) * personsPerPage, page * personsPerPage),
+        [persons, page, personsPerPage],
+    );
+    const suggestionTotalPages = Math.max(1, Math.ceil(suggestions.length / SUGGESTIONS_PER_PAGE));
+    const pagedSuggestions = useMemo(
+        () => suggestions.slice((suggestionPage - 1) * SUGGESTIONS_PER_PAGE, suggestionPage * SUGGESTIONS_PER_PAGE),
+        [suggestions, suggestionPage],
     );
     const formatMergeId = (mergeId: string) => {
         if (!mergeId) return '';
@@ -339,6 +348,11 @@ const FaceClusters: React.FC = () => {
         setPage((prev) => Math.min(prev, totalPages));
     }, [totalPages]);
 
+    // Keep the suggestion page within range as suggestions are declined/merged away.
+    useEffect(() => {
+        setSuggestionPage((prev) => Math.min(prev, suggestionTotalPages));
+    }, [suggestionTotalPages]);
+
     // In face view, lazily fetch the individual faces for the persons on the current page.
     useEffect(() => {
         if (view !== 'face') {
@@ -443,6 +457,23 @@ const FaceClusters: React.FC = () => {
             applyMergeToState(targetId, [sourceId]);
             showToast('Merge completed');
             void refreshSupportData();
+        } catch (e: any) {
+            setStatus(String(e));
+            showToast(String(e));
+        } finally {
+            setActionLoading(false);
+        }
+    };
+
+    const handleDeclineSuggestion = async (sourceId: string, targetId: string) => {
+        if (!sourceId || !targetId) return;
+        setActionLoading(true);
+        try {
+            await faceService.declineSuggestion(sourceId, targetId);
+            setSuggestions((prev) => prev.filter((s) => (
+                !(getSuggestionPersonId(s.sourcePersonId) === sourceId && getSuggestionPersonId(s.targetPersonId) === targetId)
+            )));
+            showToast('Suggestion declined');
         } catch (e: any) {
             setStatus(String(e));
             showToast(String(e));
@@ -848,7 +879,7 @@ const FaceClusters: React.FC = () => {
                         <div className="people-panel-meta">Faces suggested to merge</div>
                     </div>
                     <div className="people-suggestion-list">
-                        {suggestions.map((s) => {
+                        {pagedSuggestions.map((s) => {
                             const sourceLabel = getPersonLabel(s.sourcePersonId);
                             const targetLabel = getPersonLabel(s.targetPersonId);
                             const sourceFace = getSuggestionFace(s, 'source');
@@ -906,11 +937,44 @@ const FaceClusters: React.FC = () => {
                                         <button className="people-icon-btn" onClick={() => s.targetPersonId && navigate(`/people/${s.targetPersonId}`)} aria-label="Review suggestion" type="button">
                                             <ArrowRightIcon />
                                         </button>
+                                        <button
+                                            className="people-icon-btn people-suggestion-decline"
+                                            disabled={busy}
+                                            onClick={() => void handleDeclineSuggestion(s.sourcePersonId || '', s.targetPersonId || '')}
+                                            aria-label="Decline suggestion"
+                                            title="Decline suggestion"
+                                            type="button"
+                                        >
+                                            <NoSymbolIcon />
+                                        </button>
                                     </div>
                                 </div>
                             );
                         })}
                     </div>
+                    {suggestionTotalPages > 1 && (
+                        <div className="people-pagination">
+                            <button
+                                className="people-icon-btn"
+                                onClick={() => setSuggestionPage((prev) => Math.max(1, prev - 1))}
+                                disabled={suggestionPage <= 1}
+                                aria-label="Previous suggestions page"
+                                type="button"
+                            >
+                                <ChevronLeftIcon />
+                            </button>
+                            <span className="people-pagination-info">Page {suggestionPage} of {suggestionTotalPages}</span>
+                            <button
+                                className="people-icon-btn"
+                                onClick={() => setSuggestionPage((prev) => Math.min(suggestionTotalPages, prev + 1))}
+                                disabled={suggestionPage >= suggestionTotalPages}
+                                aria-label="Next suggestions page"
+                                type="button"
+                            >
+                                <ChevronRightIcon />
+                            </button>
+                        </div>
+                    )}
                 </div>
             )}
 

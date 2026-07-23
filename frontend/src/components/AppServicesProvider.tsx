@@ -26,10 +26,7 @@ import {
     formatBytes,
     formatMegabytesPerSecond,
     getAdaptiveUploadProfile,
-    getBrowserAiNetworkGate,
     getBrowserAiUnsupportedReason,
-    isBrowserAiAutoLoadAllowed,
-    isBrowserAiNetworkRetryReason,
     isUploadStoppedError,
 } from './browserAiShared';
 import { FILE_ACCEPT_FILTER, requiresBackendPreview } from '../utils/photoDisplay';
@@ -197,6 +194,24 @@ const browserProcessingActionSteps: Record<BrowserProcessingAction, string[]> = 
     vision: ['ai_vision'],
     map: ['map_detection'],
     faces: ['face'],
+};
+
+// On-device AI steps that require the user to have loaded browser AI. Until then
+// only baseline steps (thumbnail, exif, map geocode) run; these stay pending so
+// they can be backfilled once the model is loaded.
+const BROWSER_AI_GATED_STEPS = new Set(['ocr', 'ai_vision', 'face']);
+const ALL_BROWSER_PROCESSING_STEPS = ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
+
+// Restrict the steps a processing pass may run to what the current model state allows.
+// When browser AI is available this is a no-op (returns the request unchanged, where
+// null means "all steps"). When it isn't loaded, gated (on-device AI) steps are dropped
+// so only baseline steps run; the gated steps stay pending for backfill once loaded.
+const restrictStepsForModel = (requestedSteps: Set<string> | null, modelAvailable: boolean): Set<string> | null => {
+    if (modelAvailable) {
+        return requestedSteps;
+    }
+    const base = requestedSteps ? Array.from(requestedSteps) : ALL_BROWSER_PROCESSING_STEPS;
+    return new Set(base.filter((step) => !BROWSER_AI_GATED_STEPS.has(step)));
 };
 
 const normalizeRotationDegrees = (value: unknown): number => {
@@ -582,7 +597,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const autoResumeAttemptedRef = useRef<boolean>(false);
     const browserAiModelStateRef = useRef<SharedBrowserAiModelState>(browserAiModelState);
     const browserAiLoadInFlightRef = useRef<boolean>(false);
-    const browserAiAutoLoadAttemptedRef = useRef<boolean>(false);
     const uploadCompletionHandlersRef = useRef<Set<() => void | Promise<void>>>(new Set());
     const uploadErrorHandlerRef = useRef<((message: string | null) => void) | null>(null);
     const browserProcessingStartInFlightRef = useRef<boolean>(false);
@@ -846,9 +860,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (!filename) {
                     continue;
                 }
+                // Only run the steps the current model state allows. When browser AI
+                // isn't loaded, on-device AI steps are dropped and left pending. A null
+                // result means "all steps" (browser AI available); an empty set means
+                // nothing runnable right now (only gated steps were requested).
+                const effectiveSteps = restrictStepsForModel(requestedSteps, browserAiModelStateRef.current.status === 'available');
+                if (effectiveSteps && effectiveSteps.size === 0) {
+                    continue;
+                }
                 if (!options.force) {
                     const statuses = item?.statuses || {};
-                    if (!hasRunnableBrowserStep(statuses, requestedSteps) && requestedFilenames.length === 0) {
+                    if (!hasRunnableBrowserStep(statuses, effectiveSteps) && requestedFilenames.length === 0) {
                         continue;
                     }
                 }
@@ -856,7 +878,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 try {
                     claim = await post('/upload/processing/claim', {
                         filename,
-                        steps: requestedSteps ? Array.from(requestedSteps) : undefined,
+                        steps: effectiveSteps ? Array.from(effectiveSteps) : undefined,
                     });
                 } catch (err) {
                     if (shouldSuppressLeaseWarning(err)) {
@@ -896,17 +918,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         }
                     }
                     await post('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
-                    const statuses = item?.statuses || {};
-                    const needsBrowserAi = hasRunnableBrowserStep(statuses, new Set(['ai_vision']));
-                    if (needsBrowserAi && browserAiModelStateRef.current.status !== 'available') {
-                        const gate = getBrowserAiNetworkGate();
-                        if (gate.allowed && isBrowserAiAutoLoadAllowed()) {
-                            setBrowserAiModelState(browserAiLoadingState(browserAiModelStateRef.current));
-                            const modelState = await acquireBrowserAiModel();
-                            browserAiModelStateRef.current = modelState;
-                            setBrowserAiModelState(modelState);
-                        }
-                    }
                     const result = await runBrowserProcessing(
                         file,
                         `browser-${filename}`,
@@ -922,8 +933,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             convertedPreview,
                         },
                     );
-                    const filteredResult = filterBrowserProcessingResult(result, requestedSteps);
-                    const faceDeferred = requestedSteps?.has('face') && isBackgroundThrottledFaceResult(filteredResult);
+                    const filteredResult = filterBrowserProcessingResult(result, effectiveSteps);
+                    const faceDeferred = effectiveSteps?.has('face') && isBackgroundThrottledFaceResult(filteredResult);
                     let thumbnailAlreadyUploaded = false;
                     if (filteredResult?.clientProcessing?.thumbnail) {
                         try {
@@ -981,7 +992,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
                     browserProcessingNotification.failedCount += 1;
                     const statuses = item?.statuses || {};
-                    const failureReport = buildBrowserProcessingFailureReport(filename, statuses, requestedSteps, processingStartedAt);
+                    const failureReport = buildBrowserProcessingFailureReport(filename, statuses, effectiveSteps, processingStartedAt);
                     if (failureReport.length > 0) {
                         await postUpload('/upload/client-processing', {
                             filename,
@@ -1043,23 +1054,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         browserAiModelStateRef.current = browserAiModelState;
     }, [browserAiModelState]);
 
-    useEffect(() => {
-        const hasRequestIdleCallback = typeof window.requestIdleCallback === 'function';
-        const schedule = hasRequestIdleCallback
-            ? window.requestIdleCallback(() => {
-                preloadNativeFaceModels();
-            }, { timeout: 5000 })
-            : window.setTimeout(() => {
-                preloadNativeFaceModels();
-            }, 5000);
-        return () => {
-            if (hasRequestIdleCallback) {
-                window.cancelIdleCallback(schedule);
-            } else {
-                window.clearTimeout(schedule);
-            }
-        };
-    }, []);
 
     useEffect(() => {
         const refreshLightweightBrowserAiState = () => {
@@ -1093,6 +1087,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         browserAiLoadInFlightRef.current = true;
         setBrowserAiModelState(browserAiLoadingState(current));
+        // Warm the native face models (BlazeFace/ArcFace) alongside the vision worker
+        // so all on-device AI is ready together once the user opts in.
+        preloadNativeFaceModels();
         const notificationId = addNotification('Loading browser AI', 'Checking model manifest, cache, runtime, and warm-up.');
         try {
             const result = await acquireBrowserAiModel();
@@ -1102,6 +1099,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     title: 'Browser AI ready',
                     details: `Model loaded${result.modelVersion ? ` (${result.modelVersion})` : ''}.`,
                 });
+                // Drain any photos that were uploaded while AI was off (backfill).
+                window.setTimeout(() => { void startBrowserProcessing(); }, 0);
             } else {
                 updateNotification(notificationId, {
                     title: result.status === 'unsupported' ? 'Browser AI unsupported' : 'Browser AI unavailable',
@@ -1128,7 +1127,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             browserAiLoadInFlightRef.current = false;
         }
         return browserAiModelStateRef.current;
-    }, [addNotification, updateNotification]);
+    }, [addNotification, updateNotification, startBrowserProcessing]);
 
     useEffect(() => {
         if (browserAiModelState.status !== 'available' || browserProcessingDeferredRef.current.size === 0) {
@@ -1143,21 +1142,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [browserAiModelState.status, startBrowserProcessing]);
 
     useEffect(() => {
+        // Flush faces that were deferred (e.g. background-throttled) when the tab
+        // regains focus. Only runs when browser AI is already loaded; we never
+        // auto-load the model here — that stays a manual, user-initiated action.
         const retryDeferredBrowserFaces = () => {
             if (document.visibilityState !== 'visible' || browserProcessingDeferredRef.current.size === 0) {
                 return;
             }
             if (browserAiModelStateRef.current.status !== 'available') {
-                void loadBrowserAiModel().finally(() => {
-                    if (browserAiModelStateRef.current.status === 'available' && browserProcessingDeferredRef.current.size > 0) {
-                        const items = Array.from(browserProcessingDeferredRef.current.entries()).map(([filename, rotation]) => ({
-                            filename,
-                            rotation,
-                        }));
-                        browserProcessingDeferredRef.current.clear();
-                        void startBrowserProcessing({ actions: ['faces'], items, force: true });
-                    }
-                });
                 return;
             }
             const items = Array.from(browserProcessingDeferredRef.current.entries()).map(([filename, rotation]) => ({
@@ -1173,45 +1165,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             window.removeEventListener('visibilitychange', retryDeferredBrowserFaces);
             window.removeEventListener('focus', retryDeferredBrowserFaces);
         };
-    }, [loadBrowserAiModel, startBrowserProcessing]);
-
-    useEffect(() => {
-        const tryAutoLoadBrowserAi = () => {
-            const unsupportedDetail = getBrowserAiUnsupportedReason();
-            if (unsupportedDetail) {
-                setBrowserAiModelState(browserAiUnsupportedState(unsupportedDetail));
-                return;
-            }
-            const gate = getBrowserAiNetworkGate();
-            const testRuntime = import.meta.env.MODE === 'test';
-            if (testRuntime || !gate.allowed || !isBrowserAiAutoLoadAllowed()) {
-                const current = browserAiModelStateRef.current;
-                if (current.status === 'checking') {
-                    setBrowserAiModelState(browserAiIdleState(testRuntime ? 'Browser AI auto-load is disabled in tests' : gate.detail));
-                }
-                return;
-            }
-            const current = browserAiModelStateRef.current;
-            const canAutoLoad = current.status === 'idle'
-                || (current.status === 'unavailable' && isBrowserAiNetworkRetryReason(current.reason));
-            if (!canAutoLoad || browserAiAutoLoadAttemptedRef.current || browserAiLoadInFlightRef.current) {
-                return;
-            }
-            browserAiAutoLoadAttemptedRef.current = true;
-            void loadBrowserAiModel();
-        };
-
-        tryAutoLoadBrowserAi();
-        const connection = (navigator as Navigator & { connection?: EventTarget }).connection;
-        window.addEventListener('online', tryAutoLoadBrowserAi);
-        window.addEventListener('offline', tryAutoLoadBrowserAi);
-        connection?.addEventListener?.('change', tryAutoLoadBrowserAi);
-        return () => {
-            window.removeEventListener('online', tryAutoLoadBrowserAi);
-            window.removeEventListener('offline', tryAutoLoadBrowserAi);
-            connection?.removeEventListener?.('change', tryAutoLoadBrowserAi);
-        };
-    }, [browserAiModelState.status, loadBrowserAiModel]);
+    }, [startBrowserProcessing]);
 
     const uploadFileInChunks = useCallback(async (
         file: File,

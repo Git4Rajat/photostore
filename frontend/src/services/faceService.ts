@@ -96,6 +96,10 @@ const listSuggestions = async () => {
     return await get<SuggestionListResponse>('/api/persons/suggestions');
 };
 
+const declineSuggestion = async (sourcePersonId: string, targetPersonId: string) => {
+    return await post('/api/persons/suggestions/decline', { sourcePersonId, targetPersonId });
+};
+
 export default {
     assignUnclusteredFaces,
     listPersons,
@@ -110,4 +114,5 @@ export default {
     deletePerson,
     deletePersons,
     listSuggestions,
+    declineSuggestion,
 };

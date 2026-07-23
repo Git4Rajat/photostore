@@ -4015,12 +4015,18 @@ def _compute_people_suggestions(
                 continue
         if not active_face_ids:
             continue
+        try:
+            declined = json.loads(row.get('declinedSuggestions', '[]') or '[]')
+            declined = {str(pid) for pid in declined} if isinstance(declined, list) else set()
+        except Exception:
+            declined = set()
         people.append({
             'personId': row.get('RowKey'),
             'name': row.get('name', ''),
             'faceCount': len(active_face_ids),
             'repEmbedding': rep,
             'representativeFace': rep_face,
+            'declined': declined,
         })
 
     if len(people) < 2:
@@ -4052,6 +4058,8 @@ def _compute_people_suggestions(
             if score < threshold:
                 break
             other = people[int(j)]
+            if str(other['personId']) in person['declined'] or str(person['personId']) in other['declined']:
+                continue
             pair_key = "::".join(sorted([str(person['personId']), str(other['personId'])]))
             if pair_key in used_pairs:
                 continue
@@ -4080,6 +4088,33 @@ def _compute_people_suggestions(
 
     suggestions.sort(key=lambda s: s.get('similarity', 0.0), reverse=True)
     return suggestions
+
+
+def _add_declined_suggestion(user_id: str, person_id: str, other_person_id: str) -> bool:
+    """Record that ``person_id`` should no longer be suggested to merge with
+    ``other_person_id``. The declined partner list is stored on the person
+    entity so declined pairs stay hidden across future suggestion recomputes."""
+    if person_table_client is None or not person_id or not other_person_id:
+        return False
+    try:
+        entity = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+    except Exception:
+        return False
+    try:
+        declined = json.loads(entity.get('declinedSuggestions', '[]') or '[]')
+        if not isinstance(declined, list):
+            declined = []
+    except Exception:
+        declined = []
+    declined = [str(pid) for pid in declined]
+    if str(other_person_id) not in declined:
+        declined.append(str(other_person_id))
+    entity['declinedSuggestions'] = json.dumps(declined)
+    try:
+        person_table_client.upsert_entity(entity)
+        return True
+    except Exception:
+        return False
 
 
 def _albums_feature_available() -> bool:
@@ -5281,6 +5316,31 @@ def list_person_suggestions():
     except Exception as exc:
         app.logger.exception('List person suggestions endpoint failed')
         return jsonify({'error': 'List person suggestions failed', 'detail': str(exc)}), 500
+
+
+@app.route('/api/persons/suggestions/decline', methods=['POST'])
+def decline_person_suggestion():
+    try:
+        user_id, error = _require_user_id()
+        if error:
+            return error
+        if not _people_features_available():
+            return jsonify({'error': 'People features not configured'}), 503
+        data = request.get_json(silent=True) or {}
+        source_id = str(data.get('sourcePersonId') or '').strip()
+        target_id = str(data.get('targetPersonId') or '').strip()
+        if not source_id or not target_id:
+            return jsonify({'error': 'sourcePersonId and targetPersonId required'}), 400
+        # Store the decline on both persons so the pair stays hidden regardless
+        # of which one ends up being the source next time suggestions run.
+        ok_source = _add_declined_suggestion(user_id, source_id, target_id)
+        ok_target = _add_declined_suggestion(user_id, target_id, source_id)
+        if not (ok_source or ok_target):
+            return jsonify({'error': 'Not found'}), 404
+        return jsonify({'success': True})
+    except Exception as exc:
+        app.logger.exception('Decline person suggestion endpoint failed')
+        return jsonify({'error': 'Decline person suggestion failed', 'detail': str(exc)}), 500
 
 
 @app.route('/api/persons/<person_id>/label', methods=['POST'])
