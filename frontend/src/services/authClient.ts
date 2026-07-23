@@ -119,11 +119,38 @@ export const signOut = async (): Promise<void> => {
     if (!enabled || !msalApp) {
         return;
     }
+    // Drop the exchanged Photostore session token too, so a later sign-in mints a
+    // fresh one rather than reusing a stale active-library.
+    passwordAuth.clearToken();
     const account = getActiveAccount();
     await msalApp.logoutRedirect({ account: account || undefined });
 };
 
+const apiBase = (): string => (runtimeConfig.apiBaseUrl || '').replace(/\/$/, '');
+
+// Entra mode: exchange the Microsoft access token for a Photostore session
+// token that carries the active library + token version. The backend resolver
+// validates OUR token (not Microsoft's), so every API call must send this.
+const exchangeEntraToken = async (msToken: string): Promise<string | null> => {
+    const response = await fetch(`${apiBase()}/auth/exchange`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${msToken}` },
+    });
+    if (!response.ok) {
+        return null;
+    }
+    const body = await response.json();
+    const token = body?.token ? String(body.token) : '';
+    if (!token) {
+        return null;
+    }
+    passwordAuth.setSessionToken(token);
+    return token;
+};
+
 export const getAccessToken = async (): Promise<string | null> => {
+    // Both modes attach the Photostore-issued session token. In Entra mode we
+    // first obtain it by exchanging a freshly-acquired Microsoft access token.
     if (isPasswordMode) {
         return passwordAuth.getToken();
     }
@@ -141,12 +168,20 @@ export const getAccessToken = async (): Promise<string | null> => {
         return null;
     }
 
+    // Reuse a still-valid exchanged session token ONLY if it belongs to the
+    // account currently signed in — otherwise switching Microsoft accounts (e.g.
+    // "Use a different account") without signing out would keep acting as, and
+    // exposing the library of, the previous user.
+    if (passwordAuth.hasValidSession() && passwordAuth.getSubjectFromToken() === account.localAccountId) {
+        return passwordAuth.getToken();
+    }
+
     try {
         const result: AuthenticationResult = await msalApp.acquireTokenSilent({
             account,
             scopes: [apiScope],
         });
-        return result.accessToken;
+        return await exchangeEntraToken(result.accessToken);
     } catch {
         await msalApp.acquireTokenRedirect({
             account,

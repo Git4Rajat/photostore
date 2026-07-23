@@ -35,6 +35,8 @@ const LazyLoginPage = React.lazy(() => import('./components/LoginPage'));
 const LazyLogoutPage = React.lazy(() => import('./components/LogoutPage'));
 const LazyResetPasswordPage = React.lazy(() => import('./components/ResetPasswordPage'));
 const LazyChangePasswordPage = React.lazy(() => import('./components/ChangePasswordPage'));
+const LazyAcceptInvitePage = React.lazy(() => import('./components/AcceptInvitePage'));
+const LazyLibraryPage = React.lazy(() => import('./components/LibraryPage'));
 
 const PRIVATE_TAB_PRELOADERS = [
     loadPhotoGalleryPage,
@@ -182,7 +184,7 @@ const AppContent: React.FC = () => {
     const appServices = useAppServices();
     const authEnabled = isAuthEnabled();
     const isPublicAlbumRoute = location.pathname.startsWith('/public/album/');
-    const isAuthRoute = location.pathname === '/login' || location.pathname === '/logout' || location.pathname === '/reset-password' || location.pathname === '/change-password';
+    const isAuthRoute = location.pathname === '/login' || location.pathname === '/logout' || location.pathname === '/reset-password' || location.pathname === '/change-password' || location.pathname === '/accept-invite';
     const [authReady, setAuthReady] = useState<boolean>(false);
     const [displayName, setDisplayName] = useState<string>('');
     const [themePreference, setThemePreference] = useState<ThemePreference>(getStoredThemePreference);
@@ -404,6 +406,12 @@ const AppContent: React.FC = () => {
                     >
                         People
                     </NavLink>
+                    <NavLink
+                        to="/library"
+                        className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
+                    >
+                        Sharing
+                    </NavLink>
                     <span className="ios-tab-spacer" aria-hidden="true" />
                     <NavLink
                         to="/corrupted"
@@ -505,6 +513,14 @@ const AppContent: React.FC = () => {
                         <Route
                             path="/change-password"
                             element={renderLazyPage(<LazyChangePasswordPage />, 'Loading...')}
+                        />
+                        <Route
+                            path="/accept-invite"
+                            element={renderLazyPage(<LazyAcceptInvitePage />, 'Loading invitation...')}
+                        />
+                        <Route
+                            path="/library"
+                            element={renderProtectedLazyPage(<LazyLibraryPage />, 'Loading library...')}
                         />
                         <Route
                             path="/logout"

@@ -23,8 +23,10 @@ from azure.storage.blob import BlobSasPermissions, BlobServiceClient, generate_b
 from azure.storage.queue import QueueServiceClient
 from flask import Flask, Response, jsonify, make_response, request
 from auth_utils import get_request_user_id as resolve_request_user_id
+from auth_utils import validate_bearer_token as validate_entra_bearer_token
 import password_auth
 import email_utils
+import library_utils
 from image_utils import (
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
@@ -57,6 +59,7 @@ from storage_utils import (
     upload_media_file,
     prime_available_vector_indexes,
     refresh_user_vector_index,
+    invalidate_user_vector_index_cache,
     touch_user_vector_index_state,
     vector_search_candidates,
     LOCAL_VISION_FALLBACK_MODEL,
@@ -212,6 +215,12 @@ ALBUMS_TABLE = os.getenv('ALBUMS_TABLE', 'photoalbums')
 PEOPLE_TABLE = os.getenv('PEOPLE_TABLE', 'photopeople')
 FACE_TABLE = os.getenv('FACE_TABLE', 'photofaces')
 MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
+# Multi-tenant library sharing (accounts, libraries, memberships, invites, audit).
+USERS_TABLE = os.getenv('USERS_TABLE', 'photousers')
+LIBRARIES_TABLE = os.getenv('LIBRARIES_TABLE', 'photolibraries')
+MEMBERSHIPS_TABLE = os.getenv('MEMBERSHIPS_TABLE', 'photomemberships')
+INVITES_TABLE = os.getenv('INVITES_TABLE', 'photoinvites')
+AUDIT_TABLE = os.getenv('AUDIT_TABLE', 'photoaudit')
 ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,http://localhost:5173')
 SPA_BASE_URL = os.getenv('SPA_BASE_URL', '').strip()
 AZURE_AD_TENANT_ID = os.getenv('AZURE_AD_TENANT_ID', '').strip()
@@ -322,6 +331,12 @@ face_table_client = None
 person_table_client = None
 merge_table_client = None
 config_table_client = None
+users_table_client = None
+libraries_table_client = None
+memberships_table_client = None
+invites_table_client = None
+audit_table_client = None
+library_store = None
 clustering_queue_client = None
 queue_service_client = None
 
@@ -341,11 +356,52 @@ def _prime_vector_indexes_on_startup() -> None:
     thread.start()
 
 
+def _bootstrap_owner_account() -> None:
+    """Idempotently mirror the seeded password-mode owner into the account and
+    library tables, giving them ``user_id == library_id == OWNER_USER_ID``.
+
+    Prep for multi-account password auth: the credential hash is copied into the
+    ``photousers`` row and an email->id lookup created so login-by-email works,
+    while the legacy config-table credential remains the source of truth until
+    the multi-account cutover. No-op after the first run.
+    """
+    if library_store is None or AUTH_MODE != 'password':
+        return
+    try:
+        cred = password_auth.get_owner_credential(config_table_client) or {}
+        # Prefer an explicitly-configured OWNER_EMAIL so an operator can set it
+        # after the fact to recover login-by-email; fall back to the seeded value.
+        email = OWNER_EMAIL or str(cred.get('email') or '')
+        owner = library_store.get_user(password_auth.OWNER_USER_ID)
+        if owner is None:
+            library_store.create_user(
+                email=email,
+                password_hash=str(cred.get('passwordHash') or '') or None,
+                user_id=password_auth.OWNER_USER_ID,
+            )
+        elif email and library_utils.normalize_email(owner.get('emailNorm')) != library_utils.normalize_email(email):
+            # Reconcile a changed/newly-set OWNER_EMAIL onto the existing account.
+            library_store.set_user_email(password_auth.OWNER_USER_ID, email)
+        library_store.ensure_personal_library(
+            password_auth.OWNER_USER_ID,
+            name=email or 'My Library',
+        )
+        if not email:
+            app.logger.warning(
+                'Owner account has no email; login-by-email will fail until '
+                'OWNER_EMAIL is set. Set OWNER_EMAIL and restart to enable sign-in.'
+            )
+    except Exception as exc:
+        app.logger.warning('Owner account bootstrap failed: %s', exc)
+
+
 def _init_storage_clients():
     global account_name, credential
     global metadata_table_client
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
     global config_table_client
+    global users_table_client, libraries_table_client, memberships_table_client
+    global invites_table_client, audit_table_client, library_store
     global clustering_queue_client, queue_service_client
 
     account_name = STORAGE_ACCOUNT_NAME or os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
@@ -359,6 +415,11 @@ def _init_storage_clients():
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
+        users_table_client_local = tbl_svc.get_table_client(USERS_TABLE)
+        libraries_table_client_local = tbl_svc.get_table_client(LIBRARIES_TABLE)
+        memberships_table_client_local = tbl_svc.get_table_client(MEMBERSHIPS_TABLE)
+        invites_table_client_local = tbl_svc.get_table_client(INVITES_TABLE)
+        audit_table_client_local = tbl_svc.get_table_client(AUDIT_TABLE)
 
         if BLOB_CONNECTION_STRING:
             blob_service_client_local = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
@@ -393,6 +454,11 @@ def _init_storage_clients():
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
+        users_table_client_local = tbl_svc.get_table_client(USERS_TABLE)
+        libraries_table_client_local = tbl_svc.get_table_client(LIBRARIES_TABLE)
+        memberships_table_client_local = tbl_svc.get_table_client(MEMBERSHIPS_TABLE)
+        invites_table_client_local = tbl_svc.get_table_client(INVITES_TABLE)
+        audit_table_client_local = tbl_svc.get_table_client(AUDIT_TABLE)
 
     # assign to globals
     metadata_table_client = metadata_table_client_local
@@ -402,8 +468,28 @@ def _init_storage_clients():
     face_table_client = face_table_client_local
     person_table_client = person_table_client_local
     merge_table_client = merge_table_client_local
+    users_table_client = users_table_client_local
+    libraries_table_client = libraries_table_client_local
+    memberships_table_client = memberships_table_client_local
+    invites_table_client = invites_table_client_local
+    audit_table_client = audit_table_client_local
     clustering_queue_client = clustering_queue_client_local
     queue_service_client = queue_service_client_local
+
+    # Ensure the multi-tenant tables exist and wire up the library store.
+    for tbl in (users_table_client, libraries_table_client, memberships_table_client,
+                invites_table_client, audit_table_client):
+        try:
+            tbl.create_table()
+        except Exception as exc:
+            app.logger.debug('Library table ensure skipped: %s', exc)
+    library_store = library_utils.LibraryStore(
+        users_table=users_table_client,
+        libraries_table=libraries_table_client,
+        memberships_table=memberships_table_client,
+        invites_table=invites_table_client,
+        audit_table=audit_table_client,
+    )
 
     try:
         clustering_queue_client.create_queue()
@@ -422,6 +508,11 @@ def _init_storage_clients():
                 app.logger.info('Seeded initial owner credential for %s', OWNER_EMAIL or '(no email)')
         except Exception as exc:
             app.logger.warning('Owner credential seeding failed: %s', exc)
+
+    # Backfill the account + library tables so existing single-owner data maps to
+    # a library whose id equals the legacy user id (no photo/face/album data moves).
+    # Entra users are bootstrapped lazily on first authenticated request instead.
+    _bootstrap_owner_account()
 
     # Configure storage_utils (do not pass account keys or SAS keys)
     configure_storage(
@@ -853,30 +944,112 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
     }
 
 
-def _require_user_id(require_auth: bool = False):
-    # Password mode: resolve the single owner identity from a signed session token.
-    if AUTH_MODE == 'password':
-        must_auth = AUTH_REQUIRED or require_auth
-        user_id, error = password_auth.resolve_password_user_id(request.headers, SESSION_SECRET)
-        if user_id:
-            return user_id, None
-        if not must_auth:
-            # Auth not enforced (e.g. local dev): fall back to the owner identity.
-            return password_auth.OWNER_USER_ID, None
-        return None, (jsonify({'error': error or 'Authentication required.'}), 401)
+def _ensure_account_bootstrapped(user_id: str, email: Optional[str] = None) -> Optional[Dict]:
+    """Idempotently ensure an account + its personal library/membership exist,
+    returning the account row.
 
+    Password-mode accounts are created at invite acceptance; Entra users are
+    bootstrapped here on first authenticated request (they have no prior row).
+    An existing account implies its personal library/membership already exist
+    (they are created together), so this reads once and writes only on first use.
+    """
+    if library_store is None or not user_id:
+        return None
     try:
-        user_id = resolve_request_user_id(
-            request.headers,
-            AUTH_REQUIRED or require_auth,
-            AZURE_AD_TENANT_ID,
-            AZURE_AD_CLIENT_ID,
-            AZURE_AD_API_AUDIENCE,
-            trust_user_header=TRUST_USER_HEADER and not AUTH_REQUIRED,
-        )
-        return user_id, None
+        account = library_store.get_user(user_id)
+        if account is None:
+            library_store.create_user(email=email or '', user_id=user_id)
+            library_store.ensure_personal_library(user_id, name=(email or 'My Library'))
+            account = library_store.get_user(user_id)
+        return account
     except Exception as exc:
-        return None, (jsonify({'error': str(exc)}), 401)
+        app.logger.warning('Account bootstrap failed for %s: %s', user_id, exc)
+        return None
+
+
+def _resolve_session_payload(require_auth: bool):
+    """Validate the Photostore-issued session token (both auth modes).
+
+    Returns (payload|None, error_response|None). ``payload is None`` with no
+    error means no token was presented and auth is not being enforced (the
+    local-dev convenience path).
+    """
+    auth_header = str(request.headers.get('Authorization', '') or '')
+    if auth_header.lower().startswith('bearer '):
+        token = auth_header.split(' ', 1)[1].strip()
+        try:
+            return password_auth.validate_session_token(SESSION_SECRET, token), None
+        except Exception as exc:
+            return None, (jsonify({'error': f'Invalid or expired session: {exc}'}), 401)
+    if AUTH_REQUIRED or require_auth:
+        return None, (jsonify({'error': 'Authorization token is required.'}), 401)
+    return None, None
+
+
+def _require_library_context(require_auth: bool = False):
+    """The single tenant-isolation boundary.
+
+    Resolves the authenticated account and its *active* library from the signed
+    session token, then, per request: (1) enforces the token version so a reset/
+    removal kills outstanding tokens, and (2) confirms the caller is a live
+    member of the active library, so access revocation is immediate. The active
+    library is taken ONLY from the signed token (``lib`` claim) — never from
+    client input — so a caller cannot point requests at a library they are not a
+    member of.
+
+    Returns (account_user_id, library_id, None) or (None, None, error_response).
+    """
+    payload, error = _resolve_session_payload(require_auth)
+    if error:
+        return None, None, error
+
+    if payload is None:
+        # Unauthenticated dev convenience: behave as the single owner identity.
+        if AUTH_MODE == 'password':
+            uid = password_auth.OWNER_USER_ID
+            _ensure_account_bootstrapped(uid, email=None)
+            return uid, uid, None
+        return None, None, (jsonify({'error': 'Authorization token is required.'}), 401)
+
+    user_id = str(payload.get('sub') or '').strip()
+    if not user_id:
+        return None, None, (jsonify({'error': 'Invalid session (no subject).'}), 401)
+
+    # Accounts are created at login / token-exchange / invite-acceptance, not
+    # here: a valid token whose account row is gone means the account was
+    # deleted, so reject rather than silently resurrecting it from the token.
+    account = library_store.get_user(user_id) if library_store is not None else None
+    if library_store is not None and account is None:
+        return None, None, (jsonify({'error': 'This account no longer exists. Please sign in again.'}), 401)
+
+    # Session-kill: the token's version must match the account's current version.
+    token_ver = payload.get('ver')
+    if token_ver is not None and account is not None:
+        current_ver = int(account.get('tokenVersion', 1) or 1)
+        if int(token_ver) != current_ver:
+            return None, None, (jsonify({'error': 'Session expired. Please sign in again.'}), 401)
+
+    library_id = str(payload.get('lib') or user_id).strip() or user_id
+
+    # Membership check: the caller must currently belong to the active library.
+    # A user's own personal-library membership is never removed while the account
+    # exists, so we only need the lookup when acting in a *different* library.
+    if library_id != user_id and library_store is not None:
+        if not library_store.is_member(user_id, library_id):
+            return None, None, (jsonify({'error': 'You no longer have access to this library.'}), 403)
+
+    return user_id, library_id, None
+
+
+def _require_user_id(require_auth: bool = False):
+    """Compatibility shim: returns the *active library id* (the data partition
+    key) for the current request, so every data endpoint transparently operates
+    on the active library. Use _require_library_context() where the account
+    identity (attribution, permissions, audit actor) is needed."""
+    _account_id, library_id, error = _require_library_context(require_auth=require_auth)
+    if error:
+        return None, error
+    return library_id, None
 
 
 def _resolve_user_role(user_id: str) -> str:
@@ -887,13 +1060,39 @@ def _resolve_user_role(user_id: str) -> str:
 
 
 def _require_admin(require_auth: bool = True):
-    """Return (user_id, None) for admins, or (None, error_response) otherwise."""
-    user_id, error = _require_user_id(require_auth=require_auth)
+    """Return (library_id, None) for admins, or (None, error_response) otherwise.
+
+    The admin allow-list is checked against the authenticated *account* id, but
+    the returned id is the active library so admin data operations stay scoped.
+    """
+    account_id, library_id, error = _require_library_context(require_auth=require_auth)
     if error:
         return None, error
-    if _resolve_user_role(user_id) != 'admin':
+    if _resolve_user_role(account_id) != 'admin':
         return None, (jsonify({'error': 'Administrator privileges are required.'}), 403)
-    return user_id, None
+    return library_id, None
+
+
+def _issue_session_for(
+    user_id: str,
+    *,
+    library_id: Optional[str] = None,
+    email: str = '',
+    mode: str = 'password',
+    ttl_seconds: Optional[int] = None,
+) -> str:
+    """Mint a session token for a user, defaulting the active library to their
+    own and stamping the account's current token version."""
+    ver = library_store.token_version(user_id) if library_store is not None else 1
+    return password_auth.issue_session_token(
+        SESSION_SECRET,
+        user_id=user_id,
+        library_id=library_id or user_id,
+        token_version=ver or 1,
+        email=email,
+        mode=mode,
+        ttl_seconds=SESSION_TTL_SECONDS if ttl_seconds is None else ttl_seconds,
+    )
 
 
 def _get_metadata_entity(user_id: str, filename: str) -> Optional[Dict]:
@@ -4132,19 +4331,52 @@ def auth_login():
     if guard:
         return guard
     data = request.get_json(silent=True) or {}
+    email_in = library_utils.normalize_email(data.get('email'))
     password = str(data.get('password', '') or '')
-    if not password:
-        return jsonify({'error': 'Password is required.'}), 400
-    # Brute-force protection: the endpoint is unauthenticated, so lock it out
-    # after repeated failures rather than let an attacker try passwords freely.
-    if not password_auth.login_attempt_allowed(config_table_client):
+    if not email_in or not password:
+        return jsonify({'error': 'Email and password are required.'}), 400
+    # Brute-force protection is scoped per email so one targeted account can't
+    # lock everyone else out of a shared deployment.
+    throttle_row = f'login-throttle:{email_in}'
+    if not password_auth.login_attempt_allowed(config_table_client, throttle_row):
         return jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
-    if not password_auth.verify_owner_password(config_table_client, password):
-        password_auth.record_login_failure(config_table_client)
-        return jsonify({'error': 'Incorrect password.'}), 401
-    password_auth.record_login_success(config_table_client)
-    email = password_auth.owner_email(config_table_client)
-    token = password_auth.issue_session_token(SESSION_SECRET, email, SESSION_TTL_SECONDS)
+    account = library_store.get_user_by_email(email_in) if library_store else None
+    stored_hash = str((account or {}).get('passwordHash') or '')
+    if not account or not stored_hash or not password_auth.verify_password(password, stored_hash):
+        password_auth.record_login_failure(config_table_client, row_key=throttle_row)
+        return jsonify({'error': 'Incorrect email or password.'}), 401
+    password_auth.record_login_success(config_table_client, throttle_row)
+    uid = str(account.get('RowKey'))
+    email = str(account.get('email') or email_in)
+    token = _issue_session_for(uid, email=email, mode='password')
+    return jsonify({'token': token, 'email': email, 'expiresIn': SESSION_TTL_SECONDS})
+
+
+@app.route('/auth/exchange', methods=['POST'])
+@app.route('/api/auth/exchange', methods=['POST'])
+def auth_exchange():
+    """Entra mode: exchange a validated Microsoft access token for a Photostore
+    session token that carries the active library + token version. We can't stamp
+    those claims into Microsoft's token, so both modes converge on a token we
+    sign. Called once by the SPA after MSAL sign-in."""
+    if AUTH_MODE != 'entra':
+        return jsonify({'error': 'Token exchange is only available in Entra mode.'}), 400
+    auth_header = str(request.headers.get('Authorization', '') or '')
+    if not auth_header.lower().startswith('bearer '):
+        return jsonify({'error': 'Authorization token is required.'}), 401
+    ms_token = auth_header.split(' ', 1)[1].strip()
+    try:
+        payload = validate_entra_bearer_token(
+            ms_token, AZURE_AD_TENANT_ID, AZURE_AD_CLIENT_ID, AZURE_AD_API_AUDIENCE,
+        )
+    except Exception as exc:
+        return jsonify({'error': f'Invalid Microsoft token: {exc}'}), 401
+    user_id = str(payload.get('oid') or payload.get('sub') or payload.get('preferred_username') or '').strip()
+    if not user_id:
+        return jsonify({'error': 'Token does not contain a usable user identifier claim.'}), 401
+    email = str(payload.get('preferred_username') or payload.get('email') or payload.get('upn') or '').strip()
+    _ensure_account_bootstrapped(user_id, email=email)
+    token = _issue_session_for(user_id, email=email, mode='entra')
     return jsonify({'token': token, 'email': email, 'expiresIn': SESSION_TTL_SECONDS})
 
 
@@ -4154,7 +4386,7 @@ def auth_change_password():
     guard = _password_mode_guard()
     if guard:
         return guard
-    _, error = _require_user_id(require_auth=True)
+    account_id, _library_id, error = _require_library_context(require_auth=True)
     if error:
         return error
     data = request.get_json(silent=True) or {}
@@ -4162,10 +4394,16 @@ def auth_change_password():
     new_password = str(data.get('newPassword', '') or '')
     if len(new_password) < 8:
         return jsonify({'error': 'New password must be at least 8 characters.'}), 400
-    if not password_auth.verify_owner_password(config_table_client, current):
+    account = library_store.get_user(account_id) if library_store else None
+    stored_hash = str((account or {}).get('passwordHash') or '')
+    if not account or not stored_hash or not password_auth.verify_password(current, stored_hash):
         return jsonify({'error': 'Current password is incorrect.'}), 401
-    password_auth.set_owner_password(config_table_client, new_password)
-    return jsonify({'status': 'ok'})
+    library_store.set_user_password(account_id, password_auth.hash_password(new_password))
+    # Session-kill: invalidate every outstanding token, then hand this session a
+    # fresh one so the user who just changed their password stays signed in here.
+    library_store.bump_token_version(account_id)
+    token = _issue_session_for(account_id, email=str(account.get('email') or ''), mode='password')
+    return jsonify({'status': 'ok', 'token': token, 'expiresIn': SESSION_TTL_SECONDS})
 
 
 @app.route('/auth/forgot', methods=['POST'])
@@ -4174,23 +4412,26 @@ def auth_forgot():
     guard = _password_mode_guard()
     if guard:
         return guard
-    # Always return success to avoid revealing whether email is configured or
-    # which address is on file (this is a single-owner app, but keep the habit).
+    # Always return success to avoid revealing whether an account exists for the
+    # supplied address (no account enumeration).
+    data = request.get_json(silent=True) or {}
+    email_in = library_utils.normalize_email(data.get('email'))
     generic = jsonify({'status': 'ok'})
-    if not email_utils.is_configured():
+    if not email_utils.is_configured() or not email_in or library_store is None:
         return generic
-    email = password_auth.owner_email(config_table_client)
-    if not email:
+    account = library_store.get_user_by_email(email_in)
+    if not account:
         return generic
-    # Throttle the unauthenticated send path so it can't be used to email-bomb
-    # the owner or burn ACS email quota. Still return the same generic 200.
-    if not password_auth.reset_email_allowed(config_table_client):
+    account_id = str(account.get('RowKey'))
+    # Throttle the unauthenticated send path (per account) so it can't be used to
+    # email-bomb a user or burn ACS email quota. Still return the same 200.
+    if not library_store.reset_email_allowed(account_id):
         return generic
     try:
-        raw_token = password_auth.create_reset_token(config_table_client, ttl_seconds=3600)
+        raw_token = library_store.create_reset_token(account_id, ttl_seconds=3600)
         base = (PUBLIC_APP_BASE_URL or '').rstrip('/')
         reset_url = f'{base}/reset-password?token={raw_token}'
-        email_utils.send_password_reset_email(email, reset_url)
+        email_utils.send_password_reset_email(str(account.get('email') or email_in), reset_url)
     except Exception as exc:
         app.logger.warning('Password reset email failed: %s', exc)
     return generic
@@ -4207,8 +4448,352 @@ def auth_reset():
     new_password = str(data.get('newPassword', '') or '')
     if len(new_password) < 8:
         return jsonify({'error': 'New password must be at least 8 characters.'}), 400
-    if not password_auth.reset_password_with_token(config_table_client, token, new_password):
+    user_id = library_store.consume_reset_token(token) if library_store else None
+    if not user_id:
         return jsonify({'error': 'This reset link is invalid or has expired. Please request a new one.'}), 400
+    library_store.set_user_password(user_id, password_auth.hash_password(new_password))
+    library_store.bump_token_version(user_id)  # session-kill any existing tokens
+    return jsonify({'status': 'ok'})
+
+
+# ---------------------------------------------------------------------------
+# Shared-library membership: invites, acceptance, switching, and management.
+# All owner-gated actions operate on the caller's *active* library and require
+# the caller to be that library's owner.
+# ---------------------------------------------------------------------------
+def _require_owner_context(require_auth: bool = True):
+    """(account_id, library_id, None) if the caller owns their active library,
+    else (None, None, error_response)."""
+    account_id, library_id, error = _require_library_context(require_auth=require_auth)
+    if error:
+        return None, None, error
+    if library_store is None or not library_store.is_owner(account_id, library_id):
+        return None, None, (jsonify({'error': 'Only the library owner can do that.'}), 403)
+    return account_id, library_id, None
+
+
+def _member_view(library_id: str, account_id: str) -> List[Dict]:
+    members = library_store.list_library_members(library_id)
+    out = []
+    for m in members:
+        account = library_store.get_user(m['userId']) or {}
+        out.append({
+            'userId': m['userId'],
+            'email': str(account.get('email') or ''),
+            'isOwner': m['isOwner'],
+            'isSelf': m['userId'] == account_id,
+        })
+    out.sort(key=lambda m: (not m['isOwner'], m['email'].lower()))
+    return out
+
+
+@app.route('/api/library/mine', methods=['GET'])
+def library_mine():
+    """Libraries the caller belongs to (for the switcher) + the active one."""
+    account_id, active_library_id, error = _require_library_context(require_auth=True)
+    if error:
+        return error
+    if library_store is None:
+        return jsonify({'activeLibraryId': active_library_id, 'libraries': []})
+    return jsonify({
+        'activeLibraryId': active_library_id,
+        'libraries': library_store.list_user_libraries(account_id),
+        'maxMembers': library_utils.MAX_LIBRARY_MEMBERS,
+    })
+
+
+@app.route('/api/library/members', methods=['GET'])
+def library_members():
+    account_id, library_id, error = _require_library_context(require_auth=True)
+    if error:
+        return error
+    if library_store is None:
+        return jsonify({'members': []})
+    meta = library_store.get_library(library_id) or {}
+    is_owner = library_store.is_owner(account_id, library_id)
+    body = {
+        'libraryId': library_id,
+        'name': str(meta.get('name') or ''),
+        'ownerUserId': str(meta.get('ownerUserId') or ''),
+        'isOwner': is_owner,
+        'members': _member_view(library_id, account_id),
+        'maxMembers': library_utils.MAX_LIBRARY_MEMBERS,
+    }
+    if is_owner:
+        # Only the owner (who controls membership) sees outstanding invites.
+        body['pendingInvites'] = [
+            {
+                'inviteId': str(inv.get('RowKey') or ''),
+                'email': email_utils.masked_recipient(inv.get('emailNorm')),
+                'targetType': str(inv.get('targetType') or ''),
+                'expiresAt': int(inv.get('expiresAt', 0) or 0),
+            }
+            for inv in library_store.pending_invites(library_id)
+        ]
+    return jsonify(body)
+
+
+@app.route('/api/library/invite', methods=['POST'])
+def library_invite():
+    account_id, library_id, error = _require_owner_context()
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    email = library_utils.normalize_email(data.get('email'))
+    target_type = 'fresh' if str(data.get('targetType') or 'join') == 'fresh' else 'join'
+    if not email or '@' not in email:
+        return jsonify({'error': 'A valid email address is required.'}), 400
+    # Invites are delivered only by email; without it the invitee would never get
+    # the link, so refuse up front rather than reserving a seat for a dead invite.
+    if not email_utils.is_configured():
+        return jsonify({'error': 'Email delivery is not configured, so invitations cannot be sent.'}), 503
+    if target_type == 'join' and not library_store.has_capacity(library_id):
+        return jsonify({'error': f'This library is full (max {library_utils.MAX_LIBRARY_MEMBERS}).'}), 409
+    if target_type == 'join' and library_store.is_member_email(email, library_id):
+        return jsonify({'error': 'That person is already a member of this library.'}), 409
+    if library_store.find_pending_invite_for_email(library_id, email):
+        return jsonify({'error': 'An invite is already pending for that email.'}), 409
+    if not library_store.invite_send_allowed(library_id):
+        return jsonify({'error': 'Too many invites sent recently. Please wait and try again.'}), 429
+
+    raw = library_store.create_invite(
+        library_id=library_id, email=email, target_type=target_type, invited_by=account_id,
+    )
+    meta = library_store.get_library(library_id) or {}
+    inviter_email = str((library_store.get_user(account_id) or {}).get('email') or '')
+    base = (PUBLIC_APP_BASE_URL or '').rstrip('/')
+    invite_url = f'{base}/accept-invite?token={raw}'
+    try:
+        email_utils.send_invite_email(
+            email, invite_url,
+            library_name=str(meta.get('name') or '') if target_type == 'join' else '',
+            inviter=inviter_email,
+        )
+    except Exception as exc:
+        app.logger.warning('Invite email failed: %s', exc)
+        # The link never went out; free the reserved seat rather than leave a
+        # dangling pending invite the owner believes was delivered.
+        invite = library_store.find_pending_invite_for_email(library_id, email)
+        if invite:
+            library_store.revoke_invite(library_id, str(invite.get('RowKey') or ''))
+        return jsonify({'error': 'The invitation email could not be sent. Please try again.'}), 502
+    library_store.audit(library_id, actor=account_id, action=f'invite:{target_type}', target=email)
+    # Uniform response: never reveal whether the email already had an account.
+    return jsonify({'status': 'sent'})
+
+
+@app.route('/api/library/invite/revoke', methods=['POST'])
+def library_invite_revoke():
+    account_id, library_id, error = _require_owner_context()
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    invite_id = str(data.get('inviteId', '') or '').strip()
+    if not invite_id:
+        return jsonify({'error': 'inviteId is required.'}), 400
+    if not library_store.revoke_invite(library_id, invite_id):
+        return jsonify({'error': 'That invitation is no longer pending.'}), 404
+    library_store.audit(library_id, actor=account_id, action='invite-revoked', target=invite_id)
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/library/invite/info', methods=['GET'])
+def library_invite_info():
+    """Public: minimal, non-sensitive details so the accept page can render.
+
+    Reveals only what the recipient already knows (they hold the emailed link):
+    the target library name and whether they must set a password (new account).
+    """
+    token = str(request.args.get('token', '') or '')
+    invite = library_store.get_invite_by_token(token) if library_store else None
+    if not invite:
+        return jsonify({'valid': False}), 404
+    library_id = str(invite.get('PartitionKey') or '')
+    target_type = str(invite.get('targetType') or 'join')
+    meta = library_store.get_library(library_id) or {}
+    email = str(invite.get('emailNorm') or '')
+    needs_password = not library_store.user_exists_for_email(email) and AUTH_MODE == 'password'
+    return jsonify({
+        'valid': True,
+        'email': email,
+        'targetType': target_type,
+        'libraryName': str(meta.get('name') or '') if target_type == 'join' else '',
+        'accountExists': library_store.user_exists_for_email(email),
+        'needsPassword': needs_password,
+    })
+
+
+@app.route('/api/library/invite/accept', methods=['POST'])
+def library_invite_accept():
+    data = request.get_json(silent=True) or {}
+    token = str(data.get('token', '') or '')
+    invite = library_store.get_invite_by_token(token) if library_store else None
+    if not invite:
+        return jsonify({'error': 'This invitation is invalid or has expired.'}), 400
+    email = library_utils.normalize_email(invite.get('emailNorm'))
+    target_type = str(invite.get('targetType') or 'join')
+    library_id = str(invite.get('PartitionKey') or '')
+
+    existing = library_store.get_user_by_email(email)
+    if existing is not None:
+        # Existing account: require the caller to be signed in AS that account
+        # (email binding + explicit consent click). Works in both auth modes.
+        account_id, _active, auth_error = _require_library_context(require_auth=True)
+        if auth_error:
+            return jsonify({'error': f'Please sign in as {email} to accept this invitation.'}), 401
+        if library_utils.normalize_email((library_store.get_user(account_id) or {}).get('email')) != email:
+            return jsonify({'error': 'This invitation is for a different account.'}), 403
+        new_account = False
+    else:
+        # New account: only self-service in password mode. In Entra mode the
+        # invitee must first sign in with Microsoft (which creates the account),
+        # then the existing-account branch above applies.
+        if AUTH_MODE != 'password':
+            return jsonify({'error': 'Please sign in first, then open this invitation link again.'}), 401
+        password = str(data.get('password', '') or '')
+        if len(password) < 8:
+            return jsonify({'error': 'Please choose a password of at least 8 characters.'}), 400
+        account_id = library_utils.new_user_id()
+        library_store.create_user(email=email, password_hash=password_auth.hash_password(password), user_id=account_id)
+        library_store.ensure_personal_library(account_id, name=email)
+        new_account = True
+
+    if target_type == 'join':
+        if not library_store.is_member(account_id, library_id):
+            # This invitee's own reserved (pending) seat is about to convert into
+            # a membership, so gate on accepted members only — using has_capacity
+            # here would double-count the pending invite and wrongly reject the
+            # member that fills the final slot.
+            if library_store.member_count(library_id) >= library_utils.MAX_LIBRARY_MEMBERS:
+                return jsonify({'error': f'This library is now full (max {library_utils.MAX_LIBRARY_MEMBERS}).'}), 409
+            library_store.add_membership(account_id, library_id, is_owner=False)
+    library_store.mark_invite_accepted(invite)
+    library_store.audit(library_id, actor=account_id, action='invite-accepted', target=email)
+
+    active_library = library_id if target_type == 'join' else account_id
+    token_out = _issue_session_for(account_id, library_id=active_library, email=email, mode=AUTH_MODE)
+    return jsonify({
+        'status': 'accepted',
+        'token': token_out,
+        'activeLibraryId': active_library,
+        'newAccount': new_account,
+        'expiresIn': SESSION_TTL_SECONDS,
+    })
+
+
+@app.route('/api/library/switch', methods=['POST'])
+def library_switch():
+    account_id, _active, error = _require_library_context(require_auth=True)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    target = str(data.get('libraryId', '') or '').strip()
+    if not target or not library_store.is_member(account_id, target):
+        return jsonify({'error': 'You are not a member of that library.'}), 403
+    email = str((library_store.get_user(account_id) or {}).get('email') or '')
+    token = _issue_session_for(account_id, library_id=target, email=email, mode=AUTH_MODE)
+    return jsonify({'token': token, 'activeLibraryId': target, 'expiresIn': SESSION_TTL_SECONDS})
+
+
+@app.route('/api/library/rename', methods=['POST'])
+def library_rename():
+    account_id, library_id, error = _require_owner_context()
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name', '') or '').strip()[:100]
+    library_store.rename_library(library_id, name)
+    library_store.audit(library_id, actor=account_id, action='rename', target=name)
+    return jsonify({'status': 'ok', 'name': name})
+
+
+@app.route('/api/library/members/remove', methods=['POST'])
+def library_remove_member():
+    account_id, library_id, error = _require_owner_context()
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    target = str(data.get('userId', '') or '').strip()
+    if not target:
+        return jsonify({'error': 'userId is required.'}), 400
+    if target == account_id:
+        return jsonify({'error': "You can't remove yourself; delete the library instead."}), 400
+    if not library_store.is_member(target, library_id):
+        return jsonify({'error': 'That person is not a member of this library.'}), 404
+    library_store.remove_membership(target, library_id)
+    # No token-version bump needed: the per-request membership check makes the
+    # removal take effect immediately for this library, without disturbing the
+    # removed user's access to their *own* library.
+    library_store.audit(library_id, actor=account_id, action='remove-member', target=target)
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/library/leave', methods=['POST'])
+def library_leave():
+    account_id, _active, error = _require_library_context(require_auth=True)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    target_library = str(data.get('libraryId', '') or '').strip()
+    if not target_library:
+        return jsonify({'error': 'libraryId is required.'}), 400
+    if target_library == account_id or library_store.library_owner_id(target_library) == account_id:
+        return jsonify({'error': "You can't leave a library you own."}), 400
+    if not library_store.is_member(account_id, target_library):
+        return jsonify({'error': 'You are not a member of that library.'}), 404
+    library_store.remove_membership(account_id, target_library)
+    library_store.audit(target_library, actor=account_id, action='leave', target=account_id)
+    # Drop the caller back into their own library.
+    email = str((library_store.get_user(account_id) or {}).get('email') or '')
+    token = _issue_session_for(account_id, library_id=account_id, email=email, mode=AUTH_MODE)
+    return jsonify({'status': 'ok', 'token': token, 'activeLibraryId': account_id})
+
+
+def _purge_library_data(library_id: str) -> None:
+    """Best-effort delete of every data row in a library's partition across the
+    photo tables. Image/thumbnail blobs are content-addressed (and may be shared
+    across libraries), so they are intentionally left to a separate GC pass."""
+    pk = _escape_odata(library_id)
+    for client in (metadata_table_client, face_table_client, person_table_client,
+                   albums_table_client, merge_table_client):
+        if client is None:
+            continue
+        try:
+            for row in list(client.query_entities(f"PartitionKey eq '{pk}'")):
+                try:
+                    client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+                except Exception:
+                    pass
+        except Exception as exc:
+            app.logger.warning('Purge skipped a table for %s: %s', library_id, exc)
+
+
+@app.route('/api/library', methods=['DELETE'])
+def library_delete():
+    account_id, library_id, error = _require_owner_context()
+    if error:
+        return error
+    # The primary owner is the deployment root (recreated from the deploy seed),
+    # so it can't self-delete; invited users may delete their own library.
+    if library_id == password_auth.OWNER_USER_ID:
+        return jsonify({'error': 'The primary owner account cannot be deleted.'}), 400
+    others = [m for m in library_store.list_library_members(library_id) if m['userId'] != account_id]
+    if others:
+        return jsonify({'error': 'Remove all other members before deleting this library.'}), 409
+
+    library_store.audit(library_id, actor=account_id, action='delete-library', target=library_id)
+    library_store.delete_all_invites(library_id)
+    library_store.delete_all_memberships(library_id)
+    library_store.delete_library(library_id)
+    # Account deletion. The resolver rejects tokens whose account row is gone
+    # (rather than re-creating it), so the caller's active session stops working
+    # on its next request.
+    library_store.delete_user(account_id)
+    _purge_library_data(library_id)
+    try:
+        invalidate_user_vector_index_cache(library_id)
+    except Exception:
+        pass
     return jsonify({'status': 'ok'})
 
 
@@ -5500,7 +6085,7 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
 @app.route('/api/upload/finalize', methods=['POST'])
 @app.route('/api/upload/finalize/', methods=['POST'])
 def finalize_direct_upload():
-    user_id, error = _require_user_id()
+    account_id, user_id, error = _require_library_context()
     if error:
         return error
     data = request.get_json(silent=True) or {}
@@ -5530,6 +6115,12 @@ def finalize_direct_upload():
     except Exception as exc:
         app.logger.exception('Direct upload finalization failed for %s', filename)
         return jsonify({'error': 'Upload finalization failed', 'detail': str(exc)}), 500
+    # Attribution: record which account added this photo to the library.
+    try:
+        if account_id:
+            _update_metadata_entity_fields(user_id, final_name, {'uploadedBy': account_id})
+    except Exception:
+        app.logger.debug('Could not stamp uploadedBy for %s', final_name)
     metadata = None
     try:
         metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=final_name)

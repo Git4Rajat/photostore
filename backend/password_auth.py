@@ -27,7 +27,7 @@ import hashlib
 import hmac
 import secrets
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import jwt
 
@@ -136,16 +136,35 @@ def verify_owner_password(table_client, password: str) -> bool:
 # ---------------------------------------------------------------------------
 # Session tokens (stateless, signed)
 # ---------------------------------------------------------------------------
-def issue_session_token(secret: str, email: str, ttl_seconds: int) -> str:
+def issue_session_token(
+    secret: str,
+    *,
+    user_id: str,
+    library_id: str,
+    token_version: int,
+    email: str = '',
+    mode: str = 'password',
+    ttl_seconds: int,
+) -> str:
+    """Mint a Photostore-signed session token used by BOTH auth modes.
+
+    The token carries the authenticated account (``sub``), the *active* library
+    (``lib``) whose partition the request operates on, and the account's
+    ``ver`` (token version) so a password reset / removal can invalidate all
+    outstanding tokens. Entra clients obtain one of these by exchanging their
+    Microsoft access token; password clients get one at login.
+    """
     if not secret:
         raise RuntimeError('SESSION_SECRET is not configured.')
     now = int(time.time())
     payload = {
-        'sub': OWNER_USER_ID,
+        'sub': str(user_id),
+        'lib': str(library_id),
+        'ver': int(token_version),
         'email': email or '',
         'iat': now,
         'exp': now + int(ttl_seconds),
-        'mode': 'password',
+        'mode': mode,
     }
     return jwt.encode(payload, secret, algorithm=_SESSION_ALGO)
 
@@ -153,13 +172,10 @@ def issue_session_token(secret: str, email: str, ttl_seconds: int) -> str:
 def validate_session_token(secret: str, token: str) -> Dict:
     if not secret:
         raise RuntimeError('SESSION_SECRET is not configured.')
-    payload = jwt.decode(
+    return jwt.decode(
         token, secret, algorithms=[_SESSION_ALGO],
         options={'require': ['exp', 'iat', 'sub']},
     )
-    if payload.get('mode') != 'password' or payload.get('sub') != OWNER_USER_ID:
-        raise RuntimeError('Not a valid owner session token.')
-    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +234,15 @@ def reset_email_allowed(table_client, *, min_interval_seconds: int = 60, max_per
     return True
 
 
-def login_attempt_allowed(table_client) -> bool:
-    """Return True if a login attempt may proceed (not currently locked out)."""
+def login_attempt_allowed(table_client, row_key: str = _LOGIN_THROTTLE_ROW) -> bool:
+    """Return True if a login attempt may proceed (not currently locked out).
+
+    ``row_key`` scopes the lockout: callers pass a per-account key (e.g. by
+    email) so a brute-force against one account cannot lock everyone else out.
+    """
     now = int(time.time())
     try:
-        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=_LOGIN_THROTTLE_ROW)
+        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=row_key)
     except Exception:
         return True
     return now >= int(entity.get('lockedUntil', 0) or 0)
@@ -231,6 +251,7 @@ def login_attempt_allowed(table_client) -> bool:
 def record_login_failure(
     table_client,
     *,
+    row_key: str = _LOGIN_THROTTLE_ROW,
     free_attempts: int = 5,
     base_lock_seconds: int = 30,
     max_lock_seconds: int = 900,
@@ -239,16 +260,16 @@ def record_login_failure(
     """Count a failed login and apply exponential-backoff lockout.
 
     /auth/login is unauthenticated, so without this an attacker who knows the
-    backend URL could brute-force the owner password at full speed. After a few
-    free attempts each further failure locks the endpoint for an exponentially
+    backend URL could brute-force a password at full speed. After a few free
+    attempts each further failure locks that account for an exponentially
     growing window (capped). The counter resets once failures stop for a while
-    so a legitimate owner is never permanently locked out.
+    so a legitimate user is never permanently locked out.
     """
     now = int(time.time())
     try:
-        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=_LOGIN_THROTTLE_ROW)
+        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=row_key)
     except Exception:
-        entity = {'PartitionKey': _AUTH_PARTITION, 'RowKey': _LOGIN_THROTTLE_ROW}
+        entity = {'PartitionKey': _AUTH_PARTITION, 'RowKey': row_key}
     last_fail = int(entity.get('lastFailAt', 0) or 0)
     prev = int(entity.get('failCount', 0) or 0)
     if now - last_fail > int(reset_window_seconds):
@@ -266,10 +287,10 @@ def record_login_failure(
         pass
 
 
-def record_login_success(table_client) -> None:
+def record_login_success(table_client, row_key: str = _LOGIN_THROTTLE_ROW) -> None:
     """Clear the login-failure counter after a successful sign-in."""
     try:
-        table_client.delete_entity(partition_key=_AUTH_PARTITION, row_key=_LOGIN_THROTTLE_ROW)
+        table_client.delete_entity(partition_key=_AUTH_PARTITION, row_key=row_key)
     except Exception:
         pass
 
@@ -303,19 +324,3 @@ def reset_password_with_token(table_client, raw_token: str, new_password: str) -
         return False
     set_owner_password(table_client, new_password)
     return True
-
-
-def resolve_password_user_id(headers, secret: str) -> Tuple[Optional[str], Optional[str]]:
-    """Resolve the owner identity from a session bearer token.
-
-    Returns (user_id, None) on success or (None, error_message) on failure.
-    """
-    auth_header = str(headers.get('Authorization', '') or '')
-    if not auth_header.lower().startswith('bearer '):
-        return None, 'Authorization token is required.'
-    token = auth_header.split(' ', 1)[1].strip()
-    try:
-        validate_session_token(secret, token)
-        return OWNER_USER_ID, None
-    except Exception as exc:
-        return None, f'Invalid or expired session: {exc}'

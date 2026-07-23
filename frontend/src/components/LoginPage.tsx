@@ -16,6 +16,10 @@ interface LoginPageProps {
 
 const isPasswordMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
 
+// Lightweight email format check (the backend is single-owner and doesn't
+// validate the address, so guard it on the client).
+const isValidEmail = (value: string): boolean => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value.trim());
+
 const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ onAuthenticated }) => {
     const [email, setEmail] = useState(() => passwordAuth.getEmailHint());
     const [password, setPassword] = useState('');
@@ -27,6 +31,10 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
     const handleLogin = async (event: React.FormEvent) => {
         event.preventDefault();
         setErrorMessage('');
+        if (!isValidEmail(email)) {
+            setErrorMessage('Enter a valid email address.');
+            return;
+        }
         setPending(true);
         try {
             await passwordAuth.login(email.trim(), password);
@@ -44,10 +52,16 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
 
     const handleForgot = async () => {
         setErrorMessage('');
+        setResetSent(false);
+        if (!isValidEmail(email)) {
+            setErrorMessage('Enter a valid email above first, then tap "Forgot password?".');
+            return;
+        }
         try {
-            await passwordAuth.requestPasswordReset();
+            await passwordAuth.requestPasswordReset(email.trim());
         } finally {
-            // Always show the same confirmation regardless of outcome.
+            // Always show the same confirmation regardless of outcome so we
+            // never reveal whether an address is actually on file.
             setResetSent(true);
         }
     };

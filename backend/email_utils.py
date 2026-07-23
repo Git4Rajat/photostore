@@ -15,6 +15,7 @@ If neither a connection string nor an endpoint is set, email is considered
 
 from __future__ import annotations
 
+import html
 import os
 from typing import Optional
 
@@ -80,6 +81,60 @@ def send_password_reset_email(to_address: str, reset_url: str, app_name: str = '
             'subject': f'Reset your {app_name} password',
             'plainText': plain,
             'html': html,
+        },
+    }
+    poller = client.begin_send(message)
+    poller.result()  # wait for the send to be accepted
+
+
+def send_invite_email(
+    to_address: str,
+    invite_url: str,
+    *,
+    library_name: str = '',
+    inviter: str = '',
+    app_name: str = 'Photostore',
+) -> None:
+    """Send a library invitation email. Raises on misconfiguration or failure.
+
+    ``library_name`` and ``inviter`` are owner-supplied and are HTML-escaped
+    before being embedded, so a malicious library name can't inject markup into
+    the email body (stored-XSS-in-email defense).
+    """
+    if not is_configured():
+        raise RuntimeError('Email sending is not configured on this deployment.')
+    if not to_address:
+        raise ValueError('Recipient address is required.')
+
+    sender = _sender_address()
+    client = _build_client()
+
+    safe_lib = html.escape(library_name or '')
+    safe_inviter = html.escape(inviter or '') or 'Someone'
+    where_html = f' to <strong>{safe_lib}</strong>' if safe_lib else ''
+    where_plain = f' to {library_name}' if library_name else ''
+
+    html_body = (
+        f'<p>Hello,</p>'
+        f'<p>{safe_inviter} has invited you{where_html} on {app_name}. '
+        f'Click the link below to accept. This link expires in 72 hours and can '
+        f'be used once.</p>'
+        f'<p><a href="{invite_url}">Accept your invitation</a></p>'
+        f'<p>If you were not expecting this, you can safely ignore this email.</p>'
+    )
+    plain = (
+        f'{safe_inviter} has invited you{where_plain} on {app_name}.\n'
+        f'Open this link to accept (expires in 72 hours, single use):\n{invite_url}\n\n'
+        f'If you were not expecting this, ignore this email.'
+    )
+
+    message = {
+        'senderAddress': sender,
+        'recipients': {'to': [{'address': to_address}]},
+        'content': {
+            'subject': f'You have been invited to {app_name}',
+            'plainText': plain,
+            'html': html_body,
         },
     }
     poller = client.begin_send(message)

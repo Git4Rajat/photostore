@@ -129,6 +129,21 @@ When the deployment finishes, open the app URL and log in.
 - **Break-glass reset:** you can always reset by updating the `owner-password`
   secret on the `<appName>-backend` Container App in the Azure Portal.
 - **Change your password** anytime from inside the app.
+- **Your email is your sign-in identity.** Set the login **email** (`OWNER_EMAIL`)
+  in the deploy form — password-mode sign-in is by email + password, so an empty
+  email leaves the owner unable to log in. If you deployed without one, set
+  `OWNER_EMAIL` on the `<appName>-backend` Container App and restart; the account
+  reconciles to that address on the next boot.
+
+### Sharing your library
+
+From the **Sharing** tab you can invite other people by email. Choose whether
+they **join your library** (they see the same photos, as an equal member — up to
+15 people including you) or **start their own** fresh library. Invitees get an
+email link (valid 72 hours) to set a password and sign in. Only the library
+owner can invite or remove members; any member can leave, and switching between
+libraries you belong to happens from the same tab. (Sharing requires the reset
+email transport above to be configured, since invites are delivered by email.)
 
 > **Advanced: Microsoft Entra SSO.** Prefer enterprise single sign-on instead of
 > a password? Deploy, then run [`deploy/setup-auth.sh`](deploy/setup-auth.sh) in

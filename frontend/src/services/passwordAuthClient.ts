@@ -52,6 +52,11 @@ const setToken = (token: string): void => {
     }
 };
 
+// Shared session-token setter used by the library endpoints (switch/leave/
+// accept/change-password) and the Entra token exchange, all of which re-issue
+// the Photostore session token that every API call attaches as its Bearer.
+export const setSessionToken = (token: string): void => setToken(token);
+
 export const clearToken = (): void => {
     try {
         window.localStorage.removeItem(TOKEN_KEY);
@@ -96,6 +101,16 @@ export const getEmailFromToken = (): string => {
     return String(decodePayload(token)?.email || '');
 };
 
+// The account id (`sub` claim) the current session token belongs to. Used to
+// detect when a cached token no longer matches the signed-in account.
+export const getSubjectFromToken = (): string => {
+    const token = getToken();
+    if (!token) {
+        return '';
+    }
+    return String(decodePayload(token)?.sub || '');
+};
+
 const parseError = async (response: Response, fallback: string): Promise<string> => {
     try {
         const body = await response.json();
@@ -128,12 +143,14 @@ export const logout = (): void => {
     clearToken();
 };
 
-export const requestPasswordReset = async (): Promise<void> => {
-    // The backend always responds 200 to avoid leaking configuration/state.
+export const requestPasswordReset = async (email = ''): Promise<void> => {
+    // The backend is single-owner and always responds 200 to avoid leaking
+    // configuration/state; the email is sent for parity but the server resolves
+    // the owner address itself.
     await fetch(url('/auth/forgot'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify(email ? { email } : {}),
     });
 };
 
@@ -160,5 +177,15 @@ export const changePassword = async (currentPassword: string, newPassword: strin
     });
     if (!response.ok) {
         throw new Error(await parseError(response, 'Could not change password.'));
+    }
+    // The server bumps the account's token version (invalidating other sessions)
+    // and returns a fresh token for THIS session so the user stays signed in.
+    try {
+        const body = await response.json();
+        if (body?.token) {
+            setToken(String(body.token));
+        }
+    } catch {
+        // No token in the response is fine; the current one remains valid.
     }
 };
