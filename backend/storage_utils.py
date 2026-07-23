@@ -23,6 +23,8 @@ from image_utils import (
     create_video_thumbnail_data,
     extract_raw_preview_bytes,
     is_video_file,
+    RAW_EXTENSIONS_CINEMA,
+    RAW_EXTENSIONS_RAWPY,
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from search_utils import MAX_TAGS_STORED, build_semantic_layers, build_semantic_text, curate_tag_records, normalize_tags
@@ -1107,12 +1109,22 @@ def _looks_like_jpeg_bytes(data: bytes) -> bool:
 def _create_server_thumbnail_for_upload(image_bytes: bytes, filename: str) -> Optional[bytes]:
     if is_video_file(filename):
         return create_video_thumbnail_data(image_bytes, filename)
-    if _filename_extension(filename) not in HEIF_EXTENSIONS:
-        return None
-    preview_bytes = convert_image_to_jpeg(image_bytes, filename)
-    if not _looks_like_jpeg_bytes(preview_bytes):
-        return None
-    return create_thumbnail_data(preview_bytes)
+    ext = _filename_extension(filename)
+    if ext in HEIF_EXTENSIONS:
+        preview_bytes = convert_image_to_jpeg(image_bytes, filename)
+        if not _looks_like_jpeg_bytes(preview_bytes):
+            return None
+        return create_thumbnail_data(preview_bytes)
+    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
+        # RAW thumbnails are normally produced in-browser, but the browser cannot
+        # decode every RAW (e.g. DNG that stores its raw data as a lossless JPEG),
+        # so generate one server-side too. extract_raw_preview_bytes tries the
+        # embedded JPEG, then rawpy/exiftool, yielding a decodable preview.
+        preview_bytes = extract_raw_preview_bytes(image_bytes, filename)
+        if not preview_bytes or not _looks_like_jpeg_bytes(preview_bytes):
+            return None
+        return create_thumbnail_data(preview_bytes)
+    return None
 
 
 def _parse_json_list(value) -> List[str]:
@@ -1893,9 +1905,15 @@ def finalize_uploaded_file(
         thumbnail_bytes = _create_server_thumbnail_for_upload(image_bytes, final_filename)
         if thumbnail_bytes:
             upload_media_file('thumbnail', final_filename, thumbnail_bytes, 'image/jpeg')
+            if file_is_video:
+                thumbnail_reason = 'video_browser_unsupported'
+            elif _filename_extension(final_filename) in HEIF_EXTENSIONS:
+                thumbnail_reason = 'heif_browser_unsupported'
+            else:
+                thumbnail_reason = 'raw_browser_unsupported'
             mark_step_done(user_id, final_filename, 'thumbnail', result={
                 'source': 'server',
-                'reason': 'video_browser_unsupported' if file_is_video else 'heif_browser_unsupported',
+                'reason': thumbnail_reason,
             })
     except Exception:
         pass

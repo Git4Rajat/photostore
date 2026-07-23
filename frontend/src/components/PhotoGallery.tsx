@@ -2058,6 +2058,12 @@ const findLargestEmbeddedJpegRange = async (file: File): Promise<{ start: number
     const deadline = performance.now() + CLIENT_RAW_PREVIEW_SCAN_BUDGET_MS;
     let previousByte = -1;
     let activeStart = -1;
+    // Whether the JPEG currently being scanned has a browser-decodable
+    // Start-of-Frame. DNG (and some other RAWs) embed their raw sensor data as a
+    // *lossless* JPEG (SOF3) which also runs 0xFFD8…0xFFD9 and is far larger than
+    // the real preview; without this guard the scanner picks that undecodable
+    // stream, so the tile falls back to a "RAW preview unavailable" placeholder.
+    let activeHasDecodableSof = false;
     let bestStart = -1;
     let bestEnd = -1;
     let bestLength = 0;
@@ -2077,15 +2083,23 @@ const findLargestEmbeddedJpegRange = async (file: File): Promise<{ start: number
                 const markerStart = offset + index - 1;
                 if (value === 0xd8 && activeStart < 0) {
                     activeStart = markerStart;
+                    activeHasDecodableSof = false;
                 } else if (value === 0xd9 && activeStart >= 0) {
                     const candidateEnd = offset + index + 1;
                     const length = candidateEnd - activeStart;
-                    if (length > bestLength && length > 1024) {
+                    // Only accept ranges that carry a decodable SOF (see above).
+                    if (activeHasDecodableSof && length > bestLength && length > 1024) {
                         bestStart = activeStart;
                         bestEnd = candidateEnd;
                         bestLength = length;
                     }
                     activeStart = -1;
+                    activeHasDecodableSof = false;
+                } else if (activeStart >= 0 && (value === 0xc0 || value === 0xc1 || value === 0xc2)) {
+                    // SOF0 baseline / SOF1 extended-sequential / SOF2 progressive —
+                    // the frame types a browser can actually render (unlike SOF3
+                    // lossless). 0xC4 (DHT), 0xC8 (JPG), 0xCC (DAC) are not SOFs.
+                    activeHasDecodableSof = true;
                 }
             }
             previousByte = value;

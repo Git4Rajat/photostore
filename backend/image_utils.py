@@ -486,8 +486,15 @@ def extract_embedded_jpeg(raw_bytes: bytes) -> Optional[bytes]:
     if not candidates:
         return None
 
-    best = max(candidates, key=len)
-    return _normalize_preview_bytes(best)
+    # Prefer the largest segment that is actually a decodable JPEG. DNG (and some
+    # other RAWs) store their raw sensor data as a lossless JPEG that is larger
+    # than the embedded preview but cannot be decoded, so picking "largest" alone
+    # yields an undecodable stream; fall through to the next-largest instead.
+    for segment in sorted(candidates, key=len, reverse=True):
+        normalized = _normalize_preview_bytes(segment)
+        if normalized:
+            return normalized
+    return None
 
 
 def extract_embedded_jpeg_from_path(path: str) -> Optional[bytes]:

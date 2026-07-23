@@ -653,9 +653,18 @@ def _origin_is_allowed(origin: str) -> bool:
     request_parts = request_host.split('.')
     if len(origin_parts) < 5 or len(request_parts) < 5:
         return False
+    # A frontend/backend pair from the same deployment shares an identical host
+    # except that the app-name label contains 'frontend' vs 'backend' (e.g.
+    # `<appName>-frontend` and `<appName>-backend`). Accept the origin when
+    # swapping that token reproduces this backend's own host, regardless of the
+    # chosen app-name prefix/suffix. The rest of the host — the Container Apps
+    # environment subdomain (unique per environment) and region — must match, so
+    # an attacker cannot forge a matching origin under a different environment.
+    origin_label = origin_parts[0]
+    if 'frontend' not in origin_label:
+        return False
     return (
-        origin_parts[0].startswith('photostore-frontend-')
-        and request_parts[0].startswith('photostore-backend-')
+        origin_label.replace('frontend', 'backend') == request_parts[0]
         and origin_parts[1:] == request_parts[1:]
     )
 
