@@ -100,18 +100,31 @@ const fetchPublicBlobUrl = async (path: string): Promise<string> => {
 
 const formatPreviewError = (filename: string, detail?: string) => {
     const kind = getMediaKind(filename);
-    if (!detail) {
-        return kind === 'RAW'
-            ? 'RAW preview is not available yet.'
-            : 'Image preview is not available.';
+    const normalized = detail?.trim();
+    if (normalized) {
+        return normalized;
     }
-    const normalized = detail.trim();
-    if (!normalized) {
-        return kind === 'RAW'
-            ? 'RAW preview is not available yet.'
-            : 'Image preview is not available.';
+    return kind === 'RAW'
+        ? 'We couldn’t build a preview for this RAW file — its format has no usable embedded preview or couldn’t be decoded on the server.'
+        : 'We couldn’t build a preview for this image.';
+};
+
+// The backend returns a JSON body ({ error, reason, detail }) on preview failures.
+// fetchProtectedBlobUrl surfaces that body as the thrown Error's message, so parse it
+// back out to show the specific, human-readable reason instead of a raw JSON string.
+const describePreviewFailure = (filename: string, rawMessage?: string | null): string => {
+    const message = rawMessage?.trim();
+    if (message) {
+        try {
+            const parsed = JSON.parse(message);
+            if (parsed && typeof parsed.detail === 'string' && parsed.detail.trim()) {
+                return parsed.detail.trim();
+            }
+        } catch {
+            // Not JSON (e.g. a network/transport error) — fall through to the generic text.
+        }
     }
-    return kind === 'RAW' ? `RAW preview is not available yet. ${normalized}` : normalized;
+    return formatPreviewError(filename);
 };
 
 const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onIndexChange, useProtectedMedia = true, onRotationSave }) => {
@@ -156,8 +169,12 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
     const rotationChanged = activePhoto ? rotationDraft !== savedRotation : false;
     const canSaveRotation = Boolean(onRotationSave && activePhoto);
     const isQuarterTurn = rotationDraft % 180 !== 0;
+    // The media normally fills the stage (width/height: 100% + object-fit: contain). For a
+    // quarter-turn we swap the element's width and height to the stage's content box, so
+    // that once it's rotated 90° the contained image maps back onto the full stage instead
+    // of overflowing. stageSize is the stage content box (padding excluded).
     const rotationFitStyle = isQuarterTurn && stageSize.width > 0 && stageSize.height > 0
-        ? { maxWidth: `${stageSize.height}px`, maxHeight: `${stageSize.width}px` }
+        ? { width: `${stageSize.height}px`, height: `${stageSize.width}px` }
         : undefined;
     const imageUrl = activePhoto && mainMediaPath
         ? (shouldProtect
@@ -185,7 +202,6 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
     );
 
     useEffect(() => {
-        let active = true;
         if (!activePhoto || !shouldProtect) {
             setScopedMediaUrls({});
             scopedResolvedRef.current.clear();
@@ -205,7 +221,14 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         pushTarget(primaryMediaPath, activePhoto.filename);
         pushTarget(activePhoto.thumbnailUrl, activePhoto.filename);
         pushTarget(activePhoto.previewUrl, activePhoto.filename);
-        pushTarget(activePhoto.url, activePhoto.filename);
+        // Only pre-sign/warm the original when the browser can actually decode it. For
+        // RAW/HEIC the lightbox displays the backend preview proxy (primaryMediaPath),
+        // never the original — warming activePhoto.url here would download the full
+        // source file (often tens of MB) into an <img> that can never render, wasting
+        // bandwidth and starving the real preview request.
+        if (!requiresBackendPreview(activePhoto.filename)) {
+            pushTarget(activePhoto.url, activePhoto.filename);
+        }
         previewPreloadIndexes.forEach((photoIndex) => {
             const neighbor = photos[photoIndex];
             if (neighbor && !isVideoFilename(neighbor.filename || '')) {
@@ -226,6 +249,10 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         }
         pending.forEach(({ path }) => scopedResolvedRef.current.add(path));
 
+        // Gates only the surfacing of a failure message: a superseded run must still
+        // commit its resolved URLs (see below), but it must not flash an error for a
+        // photo the user has already navigated away from.
+        let runCurrent = true;
         void (async () => {
             const entries = await Promise.all(pending.map(async ({ path, filename }) => {
                 try {
@@ -235,12 +262,12 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                     });
                     const url = typeof result?.urls?.[filename] === 'string' ? result.urls[filename] : '';
                     if (!url) {
-                        return [path, ''] as const;
+                        return { path, url: '', error: '' };
                     }
                     if (isProtectedProxyPath(url)) {
                         const objectUrl = await fetchProtectedBlobUrl(url);
                         objectUrlsRef.current.push(objectUrl);
-                        return [path, objectUrl] as const;
+                        return { path, url: objectUrl, error: '' };
                     }
                     // Direct signed storage URL: warm the bytes so the eventual <img src>
                     // (identical URL string) is served from cache without a visible reload.
@@ -250,23 +277,34 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                     } catch {
                         /* image warming is best-effort */
                     }
-                    return [path, url] as const;
-                } catch {
-                    return [path, ''] as const;
+                    return { path, url, error: '' };
+                } catch (err) {
+                    return { path, url: '', error: err instanceof Error ? err.message : '' };
                 }
             }));
-            if (!active) {
-                return;
-            }
-            const resolved = entries.filter(([, url]) => Boolean(url));
-            // Allow failed paths to be retried on a later pass.
-            entries.filter(([, url]) => !url).forEach(([path]) => scopedResolvedRef.current.delete(path));
+            // Always commit, even if this run was superseded by fast navigation. The
+            // paths were already claimed in scopedResolvedRef (so they won't be
+            // re-requested), and scopedMediaUrls is a path-keyed cache merged into prior
+            // state — dropping a superseded run's results would leave the photo it
+            // resolved marked "resolved" but with no URL, stranding it on the loading
+            // spinner forever. Failed paths are released so a later pass can retry them.
+            const resolved = entries.filter((entry) => Boolean(entry.url)).map((entry) => [entry.path, entry.url] as const);
+            entries.filter((entry) => !entry.url).forEach((entry) => scopedResolvedRef.current.delete(entry.path));
             if (resolved.length > 0) {
                 setScopedMediaUrls((prev) => ({ ...prev, ...Object.fromEntries(resolved) }));
             }
+            // If the media the viewer is currently showing failed to resolve, replace the
+            // indefinite loading spinner with a specific, actionable failure message.
+            if (runCurrent) {
+                const primaryFailure = entries.find((entry) => entry.path === primaryMediaPath && !entry.url);
+                if (primaryFailure) {
+                    setMediaLoading(false);
+                    setMediaError(describePreviewFailure(activePhoto.filename, primaryFailure.error));
+                }
+            }
         })();
         return () => {
-            active = false;
+            runCurrent = false;
         };
     }, [activePhoto, primaryMediaPath, shouldProtect, previewPreloadIndexes, photos]);
 
@@ -618,9 +656,15 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         }
 
         const updateStageSize = () => {
+            // Report the content box (excluding padding) so it matches the area the media
+            // actually fills via width/height: 100%, and so quarter-turn swapping lands the
+            // rotated image on the same region rather than under the nav arrows.
+            const styles = window.getComputedStyle(stage);
+            const padX = parseFloat(styles.paddingLeft) + parseFloat(styles.paddingRight);
+            const padY = parseFloat(styles.paddingTop) + parseFloat(styles.paddingBottom);
             setStageSize({
-                width: stage.clientWidth,
-                height: stage.clientHeight,
+                width: Math.max(0, stage.clientWidth - padX),
+                height: Math.max(0, stage.clientHeight - padY),
             });
         };
         updateStageSize();
@@ -846,9 +890,19 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                         </div>
                     )}
                     {mediaError && (
-                        <div className="photo-preview-loading" role="alert">
+                        <div className="photo-preview-loading photo-preview-error-panel" role="alert">
                             <InformationCircleIcon className="photo-preview-loading-icon" />
-                            <span>{mediaError}</span>
+                            <div className="photo-preview-error-body">
+                                <span>{mediaError}</span>
+                                <button
+                                    type="button"
+                                    className="btn btn-soft photo-preview-download-original"
+                                    onClick={(e) => { e.stopPropagation(); void downloadCurrentPhoto(); }}
+                                >
+                                    <ArrowDownTrayIcon className="toolbar-icon" />
+                                    Download original
+                                </button>
+                            </div>
                         </div>
                     )}
                     {imageUrl && !mediaError && (activeIsVideo ? (

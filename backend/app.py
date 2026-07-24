@@ -4899,6 +4899,28 @@ def _looks_like_jpeg(data: bytes) -> bool:
     return bool(data) and data.startswith(b'\xff\xd8')
 
 
+def _preview_failure_payload(filename: str) -> dict:
+    """Build a structured, user-facing explanation for why a preview could not be made."""
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+    if ext in {'heic', 'heif'}:
+        reason = 'heic_decode_failed'
+        detail = ('This HEIC/HEIF image could not be converted into a viewable preview. '
+                  'It may be damaged or use an unsupported variant.')
+    elif ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
+        reason = 'raw_decode_failed'
+        detail = (f'This .{ext.upper()} file is a RAW format with no usable embedded preview, and it '
+                  'could not be decoded on the server, so a preview could not be generated.')
+    else:
+        reason = 'preview_failed'
+        detail = 'This image could not be converted into a viewable preview.'
+    return {
+        'error': 'Preview not available',
+        'reason': reason,
+        'detail': detail,
+        'canDownloadOriginal': True,
+    }
+
+
 PHOTO_ACCESS_KINDS = {'thumbnail', 'image', 'preview'}
 
 
@@ -5055,18 +5077,25 @@ def proxy_preview(filename: str):
     try:
         image_bytes = download_media_bytes('image', safe_name)
         preview_bytes = convert_image_to_jpeg(image_bytes, safe_name)
-        if not preview_bytes:
-            return jsonify({'error': 'Preview not available'}), 404
-        if _filename_requires_backend_preview(safe_name) and not _looks_like_jpeg(preview_bytes):
-            return jsonify({'error': 'Preview not available'}), 404
+        if not preview_bytes or (_filename_requires_backend_preview(safe_name) and not _looks_like_jpeg(preview_bytes)):
+            return jsonify(_preview_failure_payload(safe_name)), 422
         resp = Response(preview_bytes, mimetype='image/jpeg')
         resp.headers['Cache-Control'] = 'private, max-age=3600'
         return resp
     except Exception as exc:
         if _is_missing_media_error(exc):
-            return jsonify({'error': 'File not found in storage'}), 404
+            return jsonify({
+                'error': 'File not found in storage',
+                'reason': 'missing',
+                'detail': 'The original file could not be found in storage.',
+            }), 404
         app.logger.exception('Failed to create preview for %s', safe_name)
-        return jsonify({'error': 'Failed to create preview', 'detail': str(exc)}), 503
+        return jsonify({
+            'error': 'Failed to create preview',
+            'reason': 'server_error',
+            'detail': 'The server hit an error while building this preview. Please try again.',
+            'canDownloadOriginal': True,
+        }), 503
 
 
 @app.route('/api/photos/image/<path:filename>', methods=['GET'])
@@ -8016,18 +8045,20 @@ def public_preview(token: str, filename: str):
     try:
         image_bytes = download_media_bytes('image', safe_name)
         preview_bytes = convert_image_to_jpeg(image_bytes, safe_name)
-        if not preview_bytes:
-            return jsonify({'error': 'Preview not available'}), 404
-        if _filename_requires_backend_preview(safe_name) and not _looks_like_jpeg(preview_bytes):
-            return jsonify({'error': 'Preview not available'}), 404
+        if not preview_bytes or (_filename_requires_backend_preview(safe_name) and not _looks_like_jpeg(preview_bytes)):
+            return jsonify(_preview_failure_payload(safe_name)), 422
         resp = Response(preview_bytes, mimetype='image/jpeg')
         resp.headers['Cache-Control'] = 'public, max-age=3600'
         return resp
     except Exception as exc:
         if _is_missing_media_error(exc):
-            return jsonify({'error': 'File not found in storage'}), 404
+            return jsonify({'error': 'File not found in storage', 'reason': 'missing'}), 404
         app.logger.exception('Failed to create public preview for %s', safe_name)
-        return jsonify({'error': 'Failed to create preview'}), 503
+        return jsonify({
+            'error': 'Failed to create preview',
+            'reason': 'server_error',
+            'detail': 'The server hit an error while building this preview.',
+        }), 503
 
 
 @app.route('/public/albums/<token>/download', methods=['POST'])
