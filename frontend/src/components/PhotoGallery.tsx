@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, HeartIcon, InformationCircleIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, HeartIcon, InformationCircleIcon, MagnifyingGlassIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon } from '@heroicons/react/24/outline';
 import { useLocation } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
 import { getActiveLibraryFromToken } from '../services/passwordAuthClient';
@@ -19,6 +19,8 @@ import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import MetricCard from './shared/MetricCard';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
+import { EmptyState } from './shared/EmptyState';
+import { ErrorState } from './shared/ErrorState';
 import type {
     BrowserAiModelCacheStatus,
     BrowserAiModelState as SharedBrowserAiModelState,
@@ -4291,14 +4293,26 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             )}
 
             {loading && <p className="status">Loading photos...</p>}
-            {error && <p className="status error">{error}</p>}
+            {error && <ErrorState title="Couldn't load your photos" message={error} />}
             {!loading && !error && searchNotice && <p className="status">{searchNotice}</p>}
             {!loading && !error && filteredPhotos.length === 0 && photos.length > 0 && mediaFilter !== 'all' && (
                 <p className="empty">{mediaFilter === 'videos' ? 'No videos in the loaded results.' : 'No photos in the loaded results.'}</p>
             )}
-            {!loading && !error && filteredPhotos.length === 0 && photos.length === 0 && searchQuery && <p className="empty">No photos match your search.</p>}
+            {!loading && !error && filteredPhotos.length === 0 && photos.length === 0 && searchQuery && (
+                <EmptyState
+                    icon={<MagnifyingGlassIcon />}
+                    title="No matches"
+                    message="No photos match your search. Try different or broader terms."
+                />
+            )}
             {!loading && !error && filteredPhotos.length === 0 && photos.length === 0 && !searchQuery && hasCaptureFilter && <p className="empty">No photos found in the selected capture date range.</p>}
-            {!loading && !error && filteredPhotos.length === 0 && photos.length === 0 && !searchQuery && !hasCaptureFilter && <p className="empty">No photos uploaded yet. Use Upload to add your first memories.</p>}
+            {!loading && !error && filteredPhotos.length === 0 && photos.length === 0 && !searchQuery && !hasCaptureFilter && (
+                <EmptyState
+                    icon={<PhotoIcon />}
+                    title="Your library is empty"
+                    message="Upload your first photos and videos to start building your Keepsake — thumbnails, search, and people appear automatically."
+                />
+            )}
 
             {filteredPhotos.length > 0 && (
                 <div className="selection-bar">

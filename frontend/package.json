@@ -1,7 +1,7 @@
 {
-  "name": "storage-spa-app",
+  "name": "keepsake",
   "version": "1.0.0",
-  "description": "A single-page application for managing storage accounts.",
+  "description": "Keepsake — your own private, self-hosted photo library.",
   "type": "module",
   "main": "src/index.tsx",
   "scripts": {

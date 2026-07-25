@@ -1,7 +1,10 @@
 import React, { useEffect, useState } from 'react';
+import { CheckCircleIcon } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
+import { EmptyState } from './shared/EmptyState';
+import { ErrorState } from './shared/ErrorState';
 
 interface CorruptedUpload {
     filename: string;
@@ -82,9 +85,13 @@ const CorruptedUploadsPage: React.FC = () => {
             </div>
 
             {loading && <p className="status">Loading corrupted uploads...</p>}
-            {error && <p className="status error">{error}</p>}
+            {error && <ErrorState title="Couldn't check uploads" message={error} />}
             {!loading && !error && items.length === 0 && (
-                <p className="status">No corrupted uploads detected.</p>
+                <EmptyState
+                    icon={<CheckCircleIcon />}
+                    title="All clear"
+                    message="No corrupted uploads detected — every file in your library looks healthy."
+                />
             )}
 
             {!loading && !error && items.length > 0 && (

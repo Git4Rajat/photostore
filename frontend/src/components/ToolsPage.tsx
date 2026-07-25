@@ -20,6 +20,7 @@ import { useAppServices } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
+import { EmptyState } from './shared/EmptyState';
 
 interface Photo {
     filename: string;
@@ -772,7 +773,13 @@ const ToolsPage: React.FC = () => {
                 </div>
                 {queueLoadWarning && <p className="status">{queueLoadWarning}</p>}
                 {loading && <p className="status">Loading photos...</p>}
-                {!loading && photos.length === 0 && <p className="empty">No photos found.</p>}
+                {!loading && photos.length === 0 && (
+                    <EmptyState
+                        icon={<PhotoIcon />}
+                        title="No photos yet"
+                        message="Upload photos from the Gallery and their processing status will appear here."
+                    />
+                )}
                 {!loading && photos.length > 0 && overviewPhotos.length === 0 && <p className="empty">No photos match the current filters.</p>}
                 <div className="tools-selection-actions">
                     <button
@@ -961,7 +968,9 @@ const ToolsPage: React.FC = () => {
                     </div>
 
                     {loading && <p className="status">Loading photos...</p>}
-                    {!loading && workbenchPhotos.length === 0 && <p className="empty">No photos found.</p>}
+                    {!loading && workbenchPhotos.length === 0 && (
+                        <EmptyState icon={<PhotoIcon />} title="Nothing to work on" message="No photos match this view right now." />
+                    )}
 
                     <div className="gallery-grid">
                         {workbenchPhotos.map((photo, index) => {

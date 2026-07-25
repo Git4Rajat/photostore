@@ -255,7 +255,10 @@ html[data-theme='dark'] {
   .photo-preview-icon,
   .photo-preview-nav,
   .theme-switcher,
-  .theme-option {
+  .theme-option,
+  .account-menu-pane,
+  .app-menu-panel,
+  .app-menu-backdrop {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
@@ -620,6 +623,294 @@ a {
 .ios-main {
   display: grid;
   gap: 18px;
+}
+
+/* ---- Header title block + hamburger (mobile nav trigger) ---- */
+.ios-header-title {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Only surfaced on narrow screens, where the tab bar collapses into the
+   slide-in navigation drawer. */
+.ios-menu-toggle {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  padding: 9px 11px;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-md);
+  color: var(--text);
+  background: var(--lg-surface);
+  box-shadow: var(--lg-shadow-resting);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  cursor: pointer;
+  transition: background-color var(--dur-quick) ease, transform var(--dur-quick) ease;
+}
+
+.ios-menu-toggle:hover {
+  background: var(--lg-surface-strong);
+}
+
+.ios-menu-toggle:active {
+  transform: scale(0.97);
+}
+
+.ios-menu-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* ---- Account + appearance overflow menu ---- */
+.account-menu {
+  position: relative;
+  display: inline-flex;
+  z-index: 50;
+}
+
+.account-menu-trigger {
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  padding: 9px 11px;
+}
+
+.account-menu-pane {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  left: auto;
+  width: min(268px, 92vw);
+  padding: 12px;
+  z-index: 60;
+  display: grid;
+  gap: 12px;
+  border-radius: var(--r-lg);
+  background: var(--lg-surface-strong);
+  border: 1px solid var(--lg-edge);
+  box-shadow: var(--lg-shadow-floating);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+}
+
+.account-menu-pane .theme-switcher {
+  display: flex;
+  width: 100%;
+}
+
+.account-menu-pane .theme-options {
+  width: 100%;
+  min-width: 0;
+}
+
+.account-menu-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--lg-edge);
+}
+
+.account-menu-avatar {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  color: var(--muted);
+}
+
+.account-menu-user {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-menu-section {
+  display: grid;
+  gap: 8px;
+}
+
+.account-menu-section-actions {
+  padding-top: 12px;
+  border-top: 1px solid var(--lg-edge);
+}
+
+.account-menu-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.account-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px;
+  border: 0;
+  border-radius: var(--r-md);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  text-decoration: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--dur-quick) ease;
+}
+
+.account-menu-item:hover {
+  background: var(--lg-surface);
+}
+
+.account-menu-item:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.account-menu-item-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  color: var(--muted);
+}
+
+/* ---- Slide-in navigation drawer (mobile).
+   Kept mounted for the slide transition; the `open` modifier toggles both
+   visibility and interactivity. Lives outside .ios-container so its fixed
+   positioning resolves against the viewport. ---- */
+.app-menu-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.app-menu-drawer.open {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.app-menu-backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  background: rgba(12, 15, 24, 0.44);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity var(--dur-base) var(--ease-glass);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+
+.app-menu-drawer.open .app-menu-backdrop {
+  opacity: 1;
+}
+
+.app-menu-panel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: min(300px, 84vw);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding:
+    max(20px, env(safe-area-inset-top)) 16px max(20px, env(safe-area-inset-bottom))
+    max(16px, env(safe-area-inset-left));
+  background: var(--lg-surface-strong);
+  border-right: 1px solid var(--lg-edge);
+  box-shadow: var(--lg-shadow-floating);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  transform: translateX(-100%);
+  transition: transform var(--dur-base) var(--ease-glass);
+  overflow-y: auto;
+}
+
+.app-menu-drawer.open .app-menu-panel {
+  transform: translateX(0);
+}
+
+.app-menu-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.app-menu-kicker {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+
+.app-menu-title {
+  margin: 2px 0 0;
+  font-size: 1.35rem;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-family: "Fraunces", "Manrope", sans-serif;
+  color: var(--text);
+}
+
+.app-menu-section {
+  display: grid;
+  gap: 4px;
+}
+
+.app-menu-section-title {
+  margin: 14px 4px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.app-menu-link {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  min-height: var(--tap-min);
+  border-radius: var(--r-md);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--muted);
+  text-decoration: none;
+  transition: color var(--dur-quick) ease, background-color var(--dur-quick) ease;
+}
+
+.app-menu-link:hover {
+  color: var(--text);
+  background: var(--lg-surface);
+}
+
+.app-menu-link.active {
+  color: var(--text);
+  background: var(--lg-surface);
+  box-shadow: var(--lg-shadow-resting);
+}
+
+.app-menu-link-icon {
+  width: 20px;
+  height: 20px;
+  flex: none;
 }
 
 .auth-page {
@@ -2848,6 +3139,74 @@ html[data-theme='light'] .notification-item.unread {
   display: block;
 }
 
+/* Thumbnails fade in once loaded; a shimmer skeleton fills the space until then.
+   Scoped to --fade so it never hides face crops that reuse .photo-media. */
+.photo-media--fade {
+  opacity: 0;
+  transition: opacity var(--dur-base) ease, transform var(--dur-base) ease;
+}
+
+.photo-media--fade.is-loaded {
+  opacity: 1;
+}
+
+.photo-media-skeleton {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, var(--lg-surface) 25%, var(--lg-surface-strong) 50%, var(--lg-surface) 75%);
+  background-size: 220% 100%;
+  animation: keepsake-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes keepsake-shimmer {
+  0% { background-position: 220% 0; }
+  100% { background-position: -220% 0; }
+}
+
+/* Subtle zoom on hover for gallery tiles (rotated thumbnails keep their inline
+   transform, so they simply don't zoom — no conflict). */
+.photo-card:hover .photo-media--fade.is-loaded {
+  transform: scale(1.045);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .photo-media-skeleton { animation: none; }
+  .photo-media--fade { transition: opacity var(--dur-base) ease; }
+  .photo-card:hover .photo-media--fade.is-loaded { transform: none; }
+}
+
+/* ---- Global polish: text selection + scrollbars ---- */
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--lg-edge-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--lg-edge-strong);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 .photo-video-overlay {
   position: absolute;
   inset: 0;
@@ -3441,6 +3800,182 @@ video.photo-preview-media {
   margin: 12px 0;
   color: var(--muted);
   font-size: 14px;
+}
+
+/* ---- Brand logo lockup (header + auth screens) ---- */
+.logo-lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-lockup-text {
+  display: inline-flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
+.logo-wordmark {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.logo-tagline {
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.ios-header-logo {
+  flex: none;
+  border-radius: 11px;
+  box-shadow: 0 4px 14px rgba(20, 80, 192, 0.28);
+}
+
+.auth-logo {
+  justify-content: center;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 560px) {
+  .ios-header-logo {
+    width: 34px;
+    height: 34px;
+  }
+}
+
+/* ---- Branded empty states (zero-data views) ---- */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  padding: 44px 24px;
+  margin: 16px 0;
+  border-radius: var(--r-lg);
+  border: 1px dashed var(--lg-edge);
+  background: var(--lg-surface-wash);
+}
+
+.empty-state-icon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: 4px;
+  border-radius: 16px;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.empty-state-icon svg {
+  width: 28px;
+  height: 28px;
+}
+
+.empty-state-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.empty-state-message {
+  margin: 0;
+  max-width: 44ch;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.empty-state-action {
+  margin-top: 8px;
+}
+
+.error-state-icon {
+  color: var(--danger);
+  background: rgba(210, 75, 90, 0.12);
+}
+
+/* ---- Public shared-album branding ---- */
+.public-banner-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.public-banner-brand .ios-header-logo,
+.public-banner-brand svg {
+  flex: none;
+}
+
+.public-album-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px solid var(--lg-edge);
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.public-album-footer strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
+/* ---- Branded loading indicator (route/Suspense fallbacks) ---- */
+.loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: var(--muted);
+}
+
+.loading-state--page {
+  min-height: 42vh;
+  padding: 40px 20px;
+}
+
+.loading-mark {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+}
+
+.loading-spinner {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 3px solid var(--accent-soft);
+  border-top-color: var(--accent);
+  animation: keepsake-spin 0.8s linear infinite;
+}
+
+.loading-label {
+  font-size: 14px;
+}
+
+@keyframes keepsake-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-spinner {
+    animation-duration: 2.4s;
+  }
 }
 
 .status.error {
@@ -4334,14 +4869,41 @@ video.photo-preview-media {
     padding: max(24px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) max(30px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
   }
 
+  /* Slim, single-row header: hamburger + truncated title + compact actions.
+     The tab bar is replaced by the slide-in drawer at this width. */
   .ios-header {
-    flex-direction: column;
-    align-items: stretch;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    padding: 2px 2px 12px;
+  }
+
+  .ios-menu-toggle {
+    display: inline-flex;
+  }
+
+  .ios-kicker,
+  .ios-subtitle {
+    display: none;
+  }
+
+  .ios-title {
+    margin: 0;
+    font-size: clamp(1.25rem, 6vw, 1.6rem);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .app-header-actions {
-    width: 100%;
-    justify-content: space-between;
+    width: auto;
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .ios-tabs {
+    display: none;
   }
 
   .public-theme-row {
@@ -4503,27 +5065,6 @@ video.photo-preview-media {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .ios-tabs {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
-    gap: 4px;
-    margin: 0 2px 16px;
-    padding: 4px;
-    overflow: hidden;
-  }
-
-  .ios-tab-spacer {
-    display: none;
-  }
-
-  .ios-tab {
-    min-width: 0;
-    padding: 8px 6px;
-    font-size: 13px;
-    line-height: 1.12;
-    white-space: normal;
-  }
-
   .gallery-banner,
   .public-banner {
     padding: 12px;
@@ -4535,33 +5076,17 @@ video.photo-preview-media {
 }
 
 @media (max-width: 600px) {
+  /* Keep the header actions as a compact icon row; overflow controls live in
+     the account menu and the drawer rather than stacking down the page. */
   .app-header-actions {
-    width: 100%;
-    flex-direction: column;
-    align-items: stretch;
+    width: auto;
+    flex-direction: row;
+    align-items: center;
   }
 
   .root-service-actions {
-    width: 100%;
-    justify-content: flex-start;
-  }
-
-  .auth-actions {
-    width: 100%;
-    justify-content: flex-start;
-  }
-
-  .theme-switcher {
     width: auto;
-    align-self: flex-start;
-  }
-
-  .theme-options {
-    min-width: 144px;
-  }
-
-  .theme-option {
-    min-width: 44px;
+    justify-content: flex-end;
   }
 
   .tools-hero-pills {
@@ -4698,11 +5223,6 @@ video.photo-preview-media {
 }
 
 @media (max-width: 380px) {
-  .ios-tabs {
-    margin: 0 2px 14px;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .people-grid,
   .gallery-grid {
     grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));

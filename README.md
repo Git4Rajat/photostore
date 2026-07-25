@@ -1,10 +1,10 @@
-# Photostore
+# Keepsake
 
-Photostore is your own private photo library — a place to upload, browse, and
+Keepsake is your own private photo library — a place to upload, browse, and
 rediscover your photos without handing them to a big-tech cloud. It runs
 entirely in *your* Azure subscription, so your memories stay yours.
 
-Once your photos are in, Photostore does the tedious work for you: it makes
+Once your photos are in, Keepsake does the tedious work for you: it makes
 fast-loading previews, reads text and locations off your pictures, tags what's
 in them, recognizes the people who show up again and again, and lets you search
 your whole library in plain language. You organize the rest into albums — by
@@ -17,16 +17,16 @@ It's open source and self-hostable, licensed under [AGPL-3.0](LICENSE).
 - **Browse & upload** your whole library in a fast, responsive gallery, with
   automatic thumbnails and support for both photos and videos.
 - **Search in plain language** — type *"beach at sunset"* or *"birthday cake"*
-  and Photostore finds matching photos, not just filename matches.
+  and Keepsake finds matching photos, not just filename matches.
 - **Rate, like, and tag** photos, and filter the gallery down to exactly what
   you want (minimum rating, likes, media type, and more).
-- **Organize into albums** — build them by hand or let Photostore create *smart
+- **Organize into albums** — build them by hand or let Keepsake create *smart
   albums* automatically by place, date, person, or what's in the picture.
-- **Find your people** — Photostore groups faces into people you can name, so
+- **Find your people** — Keepsake groups faces into people you can name, so
   you can pull up everyone of a given person in a tap.
 - **Share albums** with a public link (optionally protected by an access code),
   and let visitors download the photos.
-- **Stay tidy** — Photostore flags exact and near-duplicate uploads and surfaces
+- **Stay tidy** — Keepsake flags exact and near-duplicate uploads and surfaces
   corrupted files so your library stays clean.
 
 Much of the heavy lifting (thumbnails, text extraction, tagging, face
@@ -55,7 +55,7 @@ Albums are collections you curate on top of your library. On the Albums page you
 can:
 
 - **Create albums by hand** — name an album and add any photos you've selected.
-- **Create smart albums automatically**, where Photostore fills the album for you
+- **Create smart albums automatically**, where Keepsake fills the album for you
   from a rule:
   - **By Location** — places across your library
   - **By Recent Upload** — your latest upload window
@@ -70,7 +70,7 @@ can:
 
 ### 🧰 Tools — see how your photos were processed
 
-The Tools page is the behind-the-scenes view of everything Photostore does to
+The Tools page is the behind-the-scenes view of everything Keepsake does to
 each photo after upload. Every photo runs through a set of processing stages:
 
 - **Thumbnails** — browser-created previews
@@ -89,7 +89,7 @@ files that couldn't be processed at all.
 
 ### 👥 People — faces, grouped and named
 
-Photostore detects faces and clusters photos of the same person together. On the
+Keepsake detects faces and clusters photos of the same person together. On the
 People page you can:
 
 - **Browse the people** it has found, each as a cluster of face crops.
@@ -158,14 +158,14 @@ email transport above to be configured, since invites are delivered by email.)
 
 ## How to use the app
 
-This is a quick, task-by-task guide to getting the most out of Photostore once
+This is a quick, task-by-task guide to getting the most out of Keepsake once
 you're signed in.
 
 ### Uploading photos
 
 1. Go to the **Gallery** and click **Upload**.
 2. Pick one or more photos or videos (you can drag them in).
-3. Photostore uploads each file and immediately starts processing it in the
+3. Keepsake uploads each file and immediately starts processing it in the
    background — you'll see thumbnails appear as they're ready.
 4. If a file is an **exact or near-duplicate** of something already in your
    library, you'll get a warning before it's added, so you can skip it.
@@ -196,7 +196,7 @@ Use the filter controls at the top of the Gallery to narrow things down:
 - **Liked only** — show only photos you've hearted.
 - **Media type** — all, photos only, or videos only.
 - **Search** — type in plain language (*"beach at sunset"*, *"birthday cake"*)
-  and Photostore finds matching photos by what's *in* them, not just filenames.
+  and Keepsake finds matching photos by what's *in* them, not just filenames.
 
 Filters combine, so you can, for example, show only liked videos rated 4+.
 
@@ -248,7 +248,7 @@ Albums are collections you build on top of your library.
 2. Choose **Create album** (or "make an album from selection").
 3. Give it a name — your new album now holds those photos.
 
-**Create a smart album** (Photostore fills it automatically from a rule) — on the
+**Create a smart album** (Keepsake fills it automatically from a rule) — on the
 **Albums** page choose **New smart album** and pick a rule:
 
 - **By Location** — a place from your library

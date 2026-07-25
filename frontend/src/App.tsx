@@ -1,23 +1,57 @@
-import React, { useEffect, useLayoutEffect, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { BrowserRouter as Router, Link, NavLink, Navigate, Routes, Route, useLocation } from 'react-router-dom';
 import {
     ArrowPathIcon,
     ArrowLeftOnRectangleIcon,
     ArrowRightOnRectangleIcon,
+    Bars3Icon,
     ComputerDesktopIcon,
     CpuChipIcon,
+    EllipsisHorizontalIcon,
+    ExclamationTriangleIcon,
+    InformationCircleIcon,
     KeyIcon,
     MoonIcon,
+    PhotoIcon,
     PlusIcon,
+    RectangleStackIcon,
+    ShareIcon,
     SunIcon,
+    UserCircleIcon,
+    UsersIcon,
+    WrenchScrewdriverIcon,
     XMarkIcon,
 } from '@heroicons/react/24/outline';
 import { AppServicesProvider, BackgroundActivityIndicator, NotificationBell, useAppServices } from './components/AppServicesProvider';
+import { Logo } from './components/shared/Logo';
+import { Loading } from './components/shared/Loading';
+import NotFoundPage from './components/NotFoundPage';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
 import { getMine } from './services/libraryClient';
 import { getRuntimeConfig } from './config/appConfig';
 
 const isPasswordMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
+
+const APP_NAME = 'Keepsake';
+
+// Maps the current route to a human page name for the browser tab title, so
+// tabs and bookmarks read "Gallery · Keepsake" instead of a bare "Keepsake".
+const pageTitleFor = (pathname: string): string => {
+    if (pathname === '/') return 'Gallery';
+    if (pathname.startsWith('/albums')) return 'Albums';
+    if (pathname.startsWith('/tools')) return 'Tools';
+    if (pathname.startsWith('/people')) return 'People';
+    if (pathname.startsWith('/library')) return 'Sharing';
+    if (pathname.startsWith('/corrupted')) return 'Corrupted uploads';
+    if (pathname.startsWith('/additional')) return 'Additional info';
+    if (pathname === '/login') return 'Sign in';
+    if (pathname === '/logout') return 'Sign out';
+    if (pathname === '/reset-password') return 'Reset password';
+    if (pathname === '/change-password') return 'Change password';
+    if (pathname === '/accept-invite') return 'Accept invitation';
+    if (pathname.startsWith('/public/album/')) return 'Shared album';
+    return '';
+};
 
 const loadPhotoGalleryPage = () => import('./components/PhotoGallery');
 const loadAlbumsPage = () => import('./components/AlbumsPage');
@@ -69,6 +103,30 @@ const THEME_OPTIONS: Array<{ value: ThemePreference; label: string }> = [
 const isThemePreference = (value: string | null): value is ThemePreference => (
     value === 'system' || value === 'light' || value === 'dark'
 );
+
+interface NavItem {
+    to: string;
+    label: string;
+    end?: boolean;
+    Icon: React.FC<React.SVGProps<SVGSVGElement>>;
+}
+
+// Primary destinations, surfaced as the desktop tab bar and the top group of the
+// mobile navigation drawer.
+const PRIMARY_NAV_ITEMS: NavItem[] = [
+    { to: '/', label: 'Gallery', end: true, Icon: PhotoIcon },
+    { to: '/albums', label: 'Albums', Icon: RectangleStackIcon },
+    { to: '/tools', label: 'Tools', Icon: WrenchScrewdriverIcon },
+    { to: '/people', label: 'People', Icon: UsersIcon },
+    { to: '/library', label: 'Sharing', Icon: ShareIcon },
+];
+
+// Rarely-used utilities, kept out of the way (right of the tab-bar spacer on
+// desktop, a separate group in the drawer on mobile).
+const UTILITY_NAV_ITEMS: NavItem[] = [
+    { to: '/corrupted', label: 'Corrupted', Icon: ExclamationTriangleIcon },
+    { to: '/additional', label: 'Additional Info', Icon: InformationCircleIcon },
+];
 
 const getSystemTheme = (): ResolvedTheme => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
@@ -182,6 +240,208 @@ const RootServiceActions: React.FC = () => {
     );
 };
 
+interface NavDrawerProps {
+    open: boolean;
+    onClose: () => void;
+    libraryTitle: string;
+}
+
+// Slide-in navigation drawer used on narrow screens in place of the tab bar.
+// Kept mounted so it can transition; visibility is driven by the `open` class.
+const NavDrawer: React.FC<NavDrawerProps> = ({ open, onClose, libraryTitle }) => {
+    useEffect(() => {
+        if (!open || typeof document === 'undefined') {
+            return undefined;
+        }
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                onClose();
+            }
+        };
+        document.addEventListener('keydown', handleKeyDown);
+        return () => document.removeEventListener('keydown', handleKeyDown);
+    }, [open, onClose]);
+
+    const renderLink = ({ to, label, end, Icon }: NavItem) => (
+        <NavLink
+            key={to}
+            to={to}
+            end={end}
+            onClick={onClose}
+            className={({ isActive }) => `app-menu-link${isActive ? ' active' : ''}`}
+        >
+            <Icon className="app-menu-link-icon" aria-hidden="true" />
+            <span>{label}</span>
+        </NavLink>
+    );
+
+    return (
+        <div className={`app-menu-drawer${open ? ' open' : ''}`} aria-hidden={!open}>
+            <button
+                type="button"
+                className="app-menu-backdrop"
+                aria-label="Close navigation menu"
+                tabIndex={open ? 0 : -1}
+                onClick={onClose}
+            />
+            <nav className="app-menu-panel" aria-label="Primary navigation">
+                <div className="app-menu-head">
+                    <div className="app-menu-head-text">
+                        <p className="app-menu-kicker">PHOTO STORE</p>
+                        <p className="app-menu-title">{libraryTitle}</p>
+                    </div>
+                    <button
+                        type="button"
+                        className="btn btn-soft icon-btn app-menu-close"
+                        onClick={onClose}
+                        aria-label="Close navigation menu"
+                    >
+                        <XMarkIcon className="toolbar-icon" />
+                        <span className="sr-only">Close navigation menu</span>
+                    </button>
+                </div>
+                <div className="app-menu-section">
+                    {PRIMARY_NAV_ITEMS.map(renderLink)}
+                </div>
+                <p className="app-menu-section-title">Utilities</p>
+                <div className="app-menu-section">
+                    {UTILITY_NAV_ITEMS.map(renderLink)}
+                </div>
+            </nav>
+        </div>
+    );
+};
+
+interface AccountMenuProps {
+    themePreference: ThemePreference;
+    onPreferenceChange: (preference: ThemePreference) => void;
+    authEnabled: boolean;
+    authReady: boolean;
+    isAuthRoute: boolean;
+    displayName: string;
+    onSignIn: () => void;
+    onSignOut: () => void;
+}
+
+// Consolidates appearance + account controls behind a single overflow button so
+// the header stays tidy at every width instead of wrapping into extra rows.
+const AccountMenu: React.FC<AccountMenuProps> = ({
+    themePreference,
+    onPreferenceChange,
+    authEnabled,
+    authReady,
+    isAuthRoute,
+    displayName,
+    onSignIn,
+    onSignOut,
+}) => {
+    const [open, setOpen] = useState<boolean>(false);
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+    const close = useCallback(() => setOpen(false), []);
+
+    useEffect(() => {
+        if (!open || typeof document === 'undefined') {
+            return undefined;
+        }
+        const handlePointerDown = (event: MouseEvent) => {
+            if (wrapRef.current && !wrapRef.current.contains(event.target as Node)) {
+                close();
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                close();
+            }
+        };
+        document.addEventListener('mousedown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('mousedown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [open, close]);
+
+    const showAuth = authEnabled && authReady && !isAuthRoute;
+
+    return (
+        <div className="account-menu" ref={wrapRef}>
+            <button
+                type="button"
+                className="btn btn-soft icon-btn account-menu-trigger"
+                aria-haspopup="menu"
+                aria-expanded={open}
+                onClick={() => setOpen((prev) => !prev)}
+                aria-label="Settings and account"
+                title="Settings and account"
+            >
+                <EllipsisHorizontalIcon className="toolbar-icon" />
+                <span className="sr-only">Settings and account</span>
+            </button>
+
+            {open && (
+                <div className="account-menu-pane" role="dialog" aria-label="Settings and account">
+                    {showAuth && displayName && (
+                        <div className="account-menu-identity">
+                            <UserCircleIcon className="account-menu-avatar" aria-hidden="true" />
+                            <span className="account-menu-user">{displayName}</span>
+                        </div>
+                    )}
+
+                    <div className="account-menu-section">
+                        <p className="account-menu-label">Appearance</p>
+                        <ThemeSwitcher
+                            preference={themePreference}
+                            onPreferenceChange={onPreferenceChange}
+                        />
+                    </div>
+
+                    {showAuth && (
+                        <div className="account-menu-section account-menu-section-actions">
+                            {displayName ? (
+                                <>
+                                    {isPasswordMode() && (
+                                        <Link
+                                            to="/change-password"
+                                            className="account-menu-item"
+                                            onClick={close}
+                                        >
+                                            <KeyIcon className="account-menu-item-icon" aria-hidden="true" />
+                                            <span>Change password</span>
+                                        </Link>
+                                    )}
+                                    <button
+                                        type="button"
+                                        className="account-menu-item"
+                                        onClick={() => {
+                                            close();
+                                            onSignOut();
+                                        }}
+                                    >
+                                        <ArrowLeftOnRectangleIcon className="account-menu-item-icon" aria-hidden="true" />
+                                        <span>Sign out</span>
+                                    </button>
+                                </>
+                            ) : (
+                                <button
+                                    type="button"
+                                    className="account-menu-item"
+                                    onClick={() => {
+                                        close();
+                                        onSignIn();
+                                    }}
+                                >
+                                    <ArrowRightOnRectangleIcon className="account-menu-item-icon" aria-hidden="true" />
+                                    <span>Sign in</span>
+                                </button>
+                            )}
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+};
+
 const AppContent: React.FC = () => {
     const location = useLocation();
     const appServices = useAppServices();
@@ -192,11 +452,17 @@ const AppContent: React.FC = () => {
     const [displayName, setDisplayName] = useState<string>('');
     const [libraryTitle, setLibraryTitle] = useState<string>('Library');
     const [themePreference, setThemePreference] = useState<ThemePreference>(getStoredThemePreference);
+    const [menuOpen, setMenuOpen] = useState<boolean>(false);
     const isPrivateArea = !isPublicAlbumRoute && !isAuthRoute;
     const isSignedIntoPrivateArea = isPrivateArea && (!authEnabled || (authReady && Boolean(displayName)));
 
-    const renderLazyPage = (element: JSX.Element, fallback = 'Loading...') => (
-        <React.Suspense fallback={<p className="status">{fallback}</p>}>
+    useEffect(() => {
+        const page = pageTitleFor(location.pathname);
+        document.title = page ? `${page} · ${APP_NAME}` : APP_NAME;
+    }, [location.pathname]);
+
+    const renderLazyPage = (element: JSX.Element, fallback = 'Loading…') => (
+        <React.Suspense fallback={<Loading label={fallback} />}>
             {element}
         </React.Suspense>
     );
@@ -236,6 +502,12 @@ const AppContent: React.FC = () => {
         }
         return element;
     };
+
+    // Dismiss the mobile navigation drawer whenever the route changes so it never
+    // lingers open over freshly navigated content.
+    useEffect(() => {
+        setMenuOpen(false);
+    }, [location.pathname]);
 
     useLayoutEffect(() => {
         applyThemePreference(themePreference);
@@ -358,105 +630,63 @@ const AppContent: React.FC = () => {
 
                 {!isPublicAlbumRoute && (
                 <header className="ios-header reveal-up">
-                    <div>
-                        <p className="ios-kicker">PHOTO STORE</p>
+                    {isSignedIntoPrivateArea && (
+                        <button
+                            type="button"
+                            className="ios-menu-toggle"
+                            onClick={() => setMenuOpen(true)}
+                            aria-label="Open navigation menu"
+                            aria-expanded={menuOpen}
+                        >
+                            <Bars3Icon className="toolbar-icon" />
+                            <span className="sr-only">Open navigation menu</span>
+                        </button>
+                    )}
+                    <Logo size={40} className="ios-header-logo" />
+                    <div className="ios-header-title">
+                        <p className="ios-kicker">KEEPSAKE</p>
                         <h1 className="ios-title">{libraryTitle}</h1>
                         <p className="ios-subtitle">An elegant home for your memories.</p>
                     </div>
                     <div className="app-header-actions">
-                        <ThemeSwitcher
-                            preference={themePreference}
-                            onPreferenceChange={setThemePreference}
-                        />
                         {isSignedIntoPrivateArea && <RootServiceActions />}
-                        {authEnabled && authReady && !isAuthRoute && (
-                            <div className="auth-actions">
-                                {displayName ? (
-                                    <>
-                                        <span className="auth-user">{displayName}</span>
-                                        {isPasswordMode() && (
-                                            <Link
-                                                to="/change-password"
-                                                className="btn btn-soft icon-btn"
-                                                aria-label="Change password"
-                                            >
-                                                <KeyIcon className="toolbar-icon" />
-                                                <span className="sr-only">Change password</span>
-                                            </Link>
-                                        )}
-                                        <button
-                                            type="button"
-                                            className="btn btn-soft icon-btn"
-                                            onClick={handleSignOut}
-                                            aria-label="Sign out"
-                                        >
-                                            <ArrowLeftOnRectangleIcon className="toolbar-icon" />
-                                            <span className="sr-only">Sign out</span>
-                                        </button>
-                                    </>
-                                ) : (
-                                    <button
-                                        type="button"
-                                        className="btn btn-primary icon-btn"
-                                        onClick={handleSignIn}
-                                        aria-label="Sign in"
-                                    >
-                                        <ArrowRightOnRectangleIcon className="toolbar-icon" />
-                                        <span className="sr-only">Sign in</span>
-                                    </button>
-                                )}
-                            </div>
-                        )}
+                        <AccountMenu
+                            themePreference={themePreference}
+                            onPreferenceChange={setThemePreference}
+                            authEnabled={authEnabled}
+                            authReady={authReady}
+                            isAuthRoute={isAuthRoute}
+                            displayName={displayName}
+                            onSignIn={handleSignIn}
+                            onSignOut={handleSignOut}
+                        />
                     </div>
                 </header>
                 )}
 
                 {!isPublicAlbumRoute && (
                 <nav className="ios-tabs reveal-up delay-1" aria-label="Primary navigation">
-                    <NavLink
-                        to="/"
-                        end
-                        className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                    >
-                        Gallery
-                    </NavLink>
-                    <NavLink
-                        to="/albums"
-                        className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                    >
-                        Albums
-                    </NavLink>
-                    <NavLink
-                        to="/tools"
-                        className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                    >
-                        Tools
-                    </NavLink>
-                    <NavLink
-                        to="/people"
-                        className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                    >
-                        People
-                    </NavLink>
-                    <NavLink
-                        to="/library"
-                        className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                    >
-                        Sharing
-                    </NavLink>
+                    {PRIMARY_NAV_ITEMS.map(({ to, label, end }) => (
+                        <NavLink
+                            key={to}
+                            to={to}
+                            end={end}
+                            className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
+                        >
+                            {label}
+                        </NavLink>
+                    ))}
                     <span className="ios-tab-spacer" aria-hidden="true" />
-                    <NavLink
-                        to="/corrupted"
-                        className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                    >
-                        Corrupted
-                    </NavLink>
-                    <NavLink
-                        to="/additional"
-                        className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                    >
-                        Additional Info
-                    </NavLink>
+                    {UTILITY_NAV_ITEMS.map(({ to, label, end }) => (
+                        <NavLink
+                            key={to}
+                            to={to}
+                            end={end}
+                            className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
+                        >
+                            {label}
+                        </NavLink>
+                    ))}
                 </nav>
                 )}
 
@@ -571,11 +801,24 @@ const AppContent: React.FC = () => {
                             element={renderLazyPage(<LazyPublicAlbumPage />, 'Loading public album...')}
                         />
                         <Route path="/faces" element={<Navigate to="/people" replace />} />
-                        <Route path="/people" element={renderLazyPage(<LazyPeoplePage />, 'Loading people...')} />
-                        <Route path="/people/:personId" element={renderLazyPage(<LazyPersonDetail />, 'Loading person details...')} />
+                        <Route path="/people" element={renderLazyPage(<LazyPeoplePage />, 'Loading people…')} />
+                        <Route path="/people/:personId" element={renderLazyPage(<LazyPersonDetail />, 'Loading person details…')} />
+                        <Route path="*" element={<NotFoundPage />} />
                     </Routes>
                 </main>
             </div>
+
+            {/* Rendered outside .ios-container: that element sets
+                container-type: inline-size, which would otherwise become the
+                containing block for this fixed drawer and break full-viewport
+                positioning. */}
+            {isSignedIntoPrivateArea && (
+                <NavDrawer
+                    open={menuOpen}
+                    onClose={() => setMenuOpen(false)}
+                    libraryTitle={libraryTitle}
+                />
+            )}
         </div>
     );
 };

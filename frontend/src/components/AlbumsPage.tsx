@@ -15,6 +15,7 @@ import {
     MinusCircleIcon,
     PencilSquareIcon,
     PlusIcon,
+    RectangleStackIcon,
     SparklesIcon,
     TagIcon,
     TrashIcon,
@@ -24,6 +25,7 @@ import {
 import { get, post } from '../services/apiClient';
 import { getMediaKind } from '../utils/photoDisplay';
 import MetricCard from './shared/MetricCard';
+import { EmptyState } from './shared/EmptyState';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
@@ -1154,11 +1156,15 @@ const AlbumsPage: React.FC = () => {
                     {photosLoading && <p className="status">Loading photos...</p>}
 
                     {!photosLoading && filteredPhotos.length === 0 && (
-                        <p className="empty">
-                            {activeAlbum && !showAddFromGallery
-                                ? 'No photos in this album yet. Use Add from Gallery to include more photos.'
-                                : 'No photos available for this view.'}
-                        </p>
+                        <EmptyState
+                            icon={<RectangleStackIcon />}
+                            title={activeAlbum && !showAddFromGallery ? 'This album is empty' : 'Nothing to show here'}
+                            message={
+                                activeAlbum && !showAddFromGallery
+                                    ? 'Use “Add from Gallery” to gather photos into this album.'
+                                    : 'No photos available for this view.'
+                            }
+                        />
                     )}
 
                     <div className="gallery-grid albums-photo-grid">

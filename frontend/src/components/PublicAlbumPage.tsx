@@ -1,10 +1,13 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowDownTrayIcon, CheckIcon, LockOpenIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, CheckIcon, LockOpenIcon, PhotoIcon } from '@heroicons/react/24/outline';
 import { useParams } from 'react-router-dom';
 import { get, post, resolveApiUrl } from '../services/apiClient';
 import MetricCard from './shared/MetricCard';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
+import { Logo } from './shared/Logo';
+import { EmptyState } from './shared/EmptyState';
+import { ErrorState } from './shared/ErrorState';
 import { getMediaKind } from '../utils/photoDisplay';
 
 interface PublicPhoto {
@@ -134,14 +137,17 @@ const PublicAlbumPage: React.FC = () => {
     return (
         <section className="gallery-wrap card-glass reveal-up delay-1 public-album-shell public-album-studio">
             <div className="public-banner">
-                <div>
-                    <p className="additional-kicker">SHARED VIEW</p>
-                    <h2 className="gallery-banner-title">Public Album</h2>
-                    {album ? (
-                        <p className="photo-meta">{album.name} • {album.photoCount} photos</p>
-                    ) : (
-                        <p className="photo-meta">Read-only shared collection</p>
-                    )}
+                <div className="public-banner-brand">
+                    <Logo size={42} />
+                    <div>
+                        <p className="additional-kicker">SHARED VIEW</p>
+                        <h2 className="gallery-banner-title">{album ? album.name : 'Public Album'}</h2>
+                        {album ? (
+                            <p className="photo-meta">{album.photoCount} photos • Read-only</p>
+                        ) : (
+                            <p className="photo-meta">Read-only shared collection</p>
+                        )}
+                    </div>
                 </div>
                 <div className="albums-metrics">
                     <MetricCard value={photos.length} label="Visible Photos" />
@@ -197,7 +203,8 @@ const PublicAlbumPage: React.FC = () => {
             </form>
 
             {loading && <p className="status">Loading public album...</p>}
-            {!loading && error && <p className="status error">{error}</p>}
+            {!loading && error && !codeRequired && <ErrorState title="Album unavailable" message={error} />}
+            {!loading && error && codeRequired && <p className="status error">{error}</p>}
             {!loading && codeRequired && (
                 <div className="toolbar-left public-album-lock">
                     <input
@@ -224,7 +231,9 @@ const PublicAlbumPage: React.FC = () => {
             {!loading && codeRequired && retryAfterSeconds !== null && retryAfterSeconds > 0 && (
                 <p className="status">Retry available in {retryAfterSeconds}s.</p>
             )}
-            {!loading && !error && photos.length === 0 && <p className="empty">No photos available in this album.</p>}
+            {!loading && !error && photos.length === 0 && (
+                <EmptyState icon={<PhotoIcon />} title="Nothing here yet" message="This shared album doesn't have any photos in it right now." />
+            )}
 
             {!loading && !error && photos.length > 0 && viewerIndex === null && (
                 <div className="gallery-grid public-gallery-grid">
@@ -287,6 +296,11 @@ const PublicAlbumPage: React.FC = () => {
                     useProtectedMedia={false}
                 />
             )}
+
+            <footer className="public-album-footer">
+                <Logo size={20} />
+                <span>Powered by <strong>Keepsake</strong> — your own private photo library</span>
+            </footer>
         </section>
     );
 };

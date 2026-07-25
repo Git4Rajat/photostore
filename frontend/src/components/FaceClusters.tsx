@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowsRightLeftIcon, ArrowRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, ExclamationTriangleIcon, FaceSmileIcon, MagnifyingGlassIcon, NoSymbolIcon, SparklesIcon, Squares2X2Icon, TrashIcon, UserCircleIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { EmptyState } from './shared/EmptyState';
+import { ArrowsRightLeftIcon, ArrowRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, ExclamationTriangleIcon, FaceSmileIcon, MagnifyingGlassIcon, NoSymbolIcon, SparklesIcon, Squares2X2Icon, TrashIcon, UserCircleIcon, UsersIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import faceService from '../services/faceService';
 import { getUploadJson, resolveApiUrl } from '../services/apiClient';
 import { fetchProtectedBlobUrl } from '../services/imageClient';
@@ -726,7 +727,13 @@ const FaceClusters: React.FC = () => {
             )}
 
             {initialLoading && persons.length === 0 && <div className="people-empty">Loading...</div>}
-            {!initialLoading && persons.length === 0 && <div className="people-empty">No people yet.</div>}
+            {!initialLoading && persons.length === 0 && (
+                <EmptyState
+                    icon={<UsersIcon />}
+                    title="No people yet"
+                    message="As Keepsake finishes processing your photos, faces are grouped into people you can name and search for."
+                />
+            )}
 
             {persons.length > 0 && view === 'cluster' && (
                 <div className="people-grid">

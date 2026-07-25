@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { setUserId } from '../services/apiClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import * as passwordAuth from '../services/passwordAuthClient';
+import { LogoLockup } from './shared/Logo';
 
 interface LoginPageProps {
     authEnabled: boolean;
@@ -133,8 +134,9 @@ const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayNa
 
     return (
         <section className="auth-page card-glass">
+            <LogoLockup size={46} tagline className="auth-logo" />
             <p className="additional-kicker">ACCESS</p>
-            <h2 className="auth-page-title">Login</h2>
+            <h2 className="auth-page-title">Welcome back</h2>
             {passwordMode ? (
                 <>
                     {authReady && displayName ? (

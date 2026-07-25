@@ -1,7 +1,7 @@
 import React from 'react';
 import { getUploadJson, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { PlayCircleIcon } from '@heroicons/react/24/solid';
 import { isVideoFilename, requiresBackendPreview } from '../../utils/photoDisplay';
 
@@ -31,7 +31,17 @@ interface PhotoTileProps {
     useProtectedMedia?: boolean;
 }
 
-const PLACEHOLDER_THUMBNAIL = 'data:image/svg+xml;charset=UTF-8,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 640 480%22%3E%3Crect width=%22640%22 height=%22480%22 fill=%22%23111827%22/%3E%3Crect x=%2260%22 y=%2260%22 width=%22520%22 height=%22360%22 rx=%2228%22 fill=%22%231f2937%22 stroke=%22%23334155%22 stroke-width=%2212%22/%3E%3Cpath d=%22M200 312l78-92 70 74 46-48 126 132H200z%22 fill=%22%233b82f6%22 opacity=%220.88%22/%3E%3Ccircle cx=%22434%22 cy=%22198%22 r=%2234%22 fill=%22%23fbbf24%22/%3E%3Ctext x=%22320%22 y=%22390%22 text-anchor=%22middle%22 fill=%22%239ca3af%22 font-family=%22Arial,%20sans-serif%22 font-size=%2232%22%3EPending thumbnail%3C/text%3E%3C/svg%3E';
+// Neutral placeholder for photos whose thumbnail hasn't been generated yet.
+// Theme-adaptive via an embedded prefers-color-scheme query so it doesn't flash
+// a dark box in light mode (SVG-in-<img> follows the OS color scheme).
+const PLACEHOLDER_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480">' +
+    '<style>.bg{fill:#eceae4}.ic{fill:#c9c3b8}' +
+    '@media(prefers-color-scheme:dark){.bg{fill:#191920}.ic{fill:#3a3a44}}</style>' +
+    '<rect class="bg" width="640" height="480"/>' +
+    '<g class="ic"><circle cx="404" cy="196" r="26"/>' +
+    '<path d="M232 330l86-104 58 62 50-54 84 96z"/></g></svg>',
+)}`;
 
 const isHttpUrl = (value?: string) => Boolean(value && value.startsWith('http'));
 
@@ -78,6 +88,8 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
 
     const shouldUseProtectedMedia = useProtectedMedia && isAuthEnabled();
     const [scopedThumbnailUrl, setScopedThumbnailUrl] = useState<string | undefined>(undefined);
+    const [imgLoaded, setImgLoaded] = useState(false);
+    const imgElRef = useRef<HTMLImageElement | null>(null);
     const fallbackThumbnailUrl = resolveThumbnailSource(photo.thumbnailUrl);
 
     useEffect(() => {
@@ -139,30 +151,43 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
         </span>
     ) : null;
 
+    // Reset the fade when the source changes; catch already-cached images whose
+    // load event may have fired before the handler was attached.
+    useEffect(() => {
+        setImgLoaded(false);
+        const el = imgElRef.current;
+        if (el && el.complete && el.naturalWidth > 0) {
+            setImgLoaded(true);
+        }
+    }, [resolvedThumbnailUrl]);
+
+    const renderMedia = (attachClick: boolean) => (
+        <>
+            {!imgLoaded && <span className="photo-media-skeleton" aria-hidden="true" />}
+            <img
+                ref={imgElRef}
+                src={resolvedThumbnailUrl || undefined}
+                alt={photo.filename}
+                className={`${mediaClassName} photo-media--fade${imgLoaded ? ' is-loaded' : ''}`}
+                style={mediaStyle}
+                loading="lazy"
+                onLoad={() => setImgLoaded(true)}
+                onError={() => setImgLoaded(true)}
+                onClick={attachClick ? onMediaClick : undefined}
+            />
+            {videoOverlay}
+        </>
+    );
+
     return (
         <div className={classes} style={style} onClick={onCardClick}>
             {openOriginal ? (
                 <a href={resolvedPhotoUrl} target="_blank" rel="noreferrer" title={linkTitle} onClick={onImageClick} className="photo-media-wrap">
-                    <img
-                        src={resolvedThumbnailUrl || undefined}
-                        alt={photo.filename}
-                        className={mediaClassName}
-                        style={mediaStyle}
-                        loading="lazy"
-                    />
-                    {videoOverlay}
+                    {renderMedia(false)}
                 </a>
             ) : (
                 <span className="photo-media-wrap">
-                    <img
-                        src={resolvedThumbnailUrl || undefined}
-                        alt={photo.filename}
-                        className={mediaClassName}
-                        style={mediaStyle}
-                        loading="lazy"
-                        onClick={onMediaClick}
-                    />
-                    {videoOverlay}
+                    {renderMedia(true)}
                 </span>
             )}
 

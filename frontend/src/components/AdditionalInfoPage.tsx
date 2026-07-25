@@ -32,7 +32,7 @@ const AdditionalInfoPage: React.FC = () => {
         <section className="card-glass additional-info-wrap">
             <header className="additional-hero">
                 <p className="additional-kicker">OPEN SOURCE AND SELF HOSTED</p>
-                <h2 className="additional-title">PhotoStore Capabilities</h2>
+                <h2 className="additional-title">Keepsake Capabilities</h2>
                 <p className="additional-subtitle">
                     A self-hosted photo backup and discovery workspace built on Azure Container Apps and Azure Storage.
                 </p>
@@ -42,7 +42,7 @@ const AdditionalInfoPage: React.FC = () => {
                 <article className="additional-card">
                     <h3>What It Does Today</h3>
                     <p>
-                        PhotoStore keeps original photos in your own Azure Storage account, generates thumbnails, extracts
+                        Keepsake keeps original photos in your own Azure Storage account, generates thumbnails, extracts
                         metadata, and gives the gallery fast ways to browse, search, organize, and recover files later.
                     </p>
                     <p>

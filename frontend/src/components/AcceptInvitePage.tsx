@@ -68,7 +68,7 @@ const AcceptInvitePage: React.FC = () => {
     const targetLabel = info?.libraryName
         ? `join ${info.libraryName}`
         : info?.targetType === 'fresh'
-            ? 'start using Photostore'
+            ? 'start using Keepsake'
             : 'join this library';
 
     return (
@@ -83,7 +83,7 @@ const AcceptInvitePage: React.FC = () => {
                 <p className="status error">This invitation is invalid or has expired. Ask for a new one.</p>
             ) : done ? (
                 <>
-                    <p className="status success">You're all set. Welcome to Photostore!</p>
+                    <p className="status success">You're all set. Welcome to Keepsake!</p>
                     {/* Hard navigation so the app re-bootstraps auth state from the
                         session token the acceptance just stored. */}
                     <button type="button" className="btn btn-primary" onClick={() => { window.location.href = '/'; }}>
