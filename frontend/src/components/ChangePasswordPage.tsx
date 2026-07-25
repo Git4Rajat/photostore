@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import * as passwordAuth from '../services/passwordAuthClient';
+import { LogoLockup } from './shared/Logo';
 
 // In-app password change for the single owner (AUTH_MODE=password), reached at
 // /change-password while signed in.
@@ -37,6 +38,7 @@ const ChangePasswordPage: React.FC = () => {
 
     return (
         <section className="auth-page card-glass">
+            <LogoLockup size={46} className="auth-logo" />
             <p className="additional-kicker">ACCOUNT</p>
             <h2 className="auth-page-title">Change your password</h2>
             {done ? (

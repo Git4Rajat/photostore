@@ -24,8 +24,11 @@ import {
 } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
 import { getMediaKind } from '../utils/photoDisplay';
+import { plural } from '../utils/format';
+import { confirmDialog, promptDialog } from './shared/dialogs';
 import MetricCard from './shared/MetricCard';
 import { EmptyState } from './shared/EmptyState';
+import { Loading } from './shared/Loading';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
@@ -489,9 +492,12 @@ const AlbumsPage: React.FC = () => {
         const albumIds = Array.from(selectedAlbumIds);
         if (albumIds.length === 0) return;
 
-        const confirmed = window.confirm(
-            `Delete ${albumIds.length} album(s)? This cannot be undone.`
-        );
+        const confirmed = await confirmDialog({
+            title: 'Delete albums',
+            message: `Delete ${plural(albumIds.length, 'album')}? This cannot be undone.`,
+            confirmLabel: 'Delete',
+            danger: true,
+        });
         if (!confirmed) return;
 
         setError('');
@@ -544,7 +550,7 @@ const AlbumsPage: React.FC = () => {
                 setShowAddFromGallery(false);
                 setSelectedPhotos(new Set());
                 setSmartCreateOpen(false);
-                setStatus(`Created smart album "${created.name}" with ${created.photoCount} photo(s).`);
+                setStatus(`Created smart album "${created.name}" with ${plural(created.photoCount, 'photo')}.`);
             } else {
                 setStatus(response?.message || 'No new matching smart album could be created for this rule.');
             }
@@ -572,7 +578,7 @@ const AlbumsPage: React.FC = () => {
             });
             setSelectedPhotos(new Set());
             setShowAddFromGallery(false);
-            setStatus(`Added ${selectedPhotos.size} photo(s) to album.`);
+            setStatus(`Added ${plural(selectedPhotos.size, 'photo')} to album.`);
         } catch {
             setError('Failed to add photos to album.');
         }
@@ -589,7 +595,7 @@ const AlbumsPage: React.FC = () => {
             await post(`/albums/${activeAlbumId}/photos/remove`, { filenames });
             syncAlbumFilenames(filenames, 'remove');
             setSelectedPhotos(new Set());
-            setStatus(`Removed ${selectedPhotos.size} photo(s) from album.`);
+            setStatus(`Removed ${plural(selectedPhotos.size, 'photo')} from album.`);
         } catch {
             setError('Failed to remove photos from album.');
         }
@@ -606,13 +612,13 @@ const AlbumsPage: React.FC = () => {
 
         setDownloading(true);
         setError('');
-        setStatus(`Downloading ${files.length} photo(s)...`);
+        setStatus(`Downloading ${plural(files.length, 'photo')}…`);
         try {
             await downloadPhotosAsZip(
                 files.map((photo) => ({ filename: photo.filename, url: photo.url })),
-                `photostore-albums-${new Date().toISOString().slice(0, 10)}.zip`
+                `keepsake-albums-${new Date().toISOString().slice(0, 10)}.zip`
             );
-            setStatus(`Downloaded ${files.length} photo(s).`);
+            setStatus(`Downloaded ${plural(files.length, 'photo')}.`);
         } catch (err) {
             setError(typeof err === 'string' ? err : 'Failed to download selected photos.');
         } finally {
@@ -626,9 +632,12 @@ const AlbumsPage: React.FC = () => {
         }
 
         const deleteCount = selectedPhotos.size;
-        const confirmed = window.confirm(
-            `Delete ${deleteCount} photo(s) from the gallery? This will also remove them from all albums and cannot be undone.`
-        );
+        const confirmed = await confirmDialog({
+            title: 'Delete photos',
+            message: `Delete ${plural(deleteCount, 'photo')} from the gallery? This will also remove them from all albums and cannot be undone.`,
+            confirmLabel: 'Delete',
+            danger: true,
+        });
         if (!confirmed) {
             return;
         }
@@ -644,7 +653,7 @@ const AlbumsPage: React.FC = () => {
             setSelectedPhotos(new Set());
 
             if (errorsList.length > 0 && deleted.length > 0) {
-                setStatus(`Deleted ${deleted.length} photo(s) with ${errorsList.length} error(s).`);
+                setStatus(`Deleted ${plural(deleted.length, 'photo')} with ${plural(errorsList.length, 'error')}.`);
                 setError(errorsList.join(' • '));
                 return;
             }
@@ -654,7 +663,7 @@ const AlbumsPage: React.FC = () => {
                 return;
             }
 
-            setStatus(`Deleted ${deleted.length || deleteCount} photo(s) from gallery and albums.`);
+            setStatus(`Deleted ${plural(deleted.length || deleteCount, 'photo')} from gallery and albums.`);
         } catch {
             setError('Failed to delete selected photos.');
         }
@@ -666,7 +675,13 @@ const AlbumsPage: React.FC = () => {
             return;
         }
 
-        const expiresInput = window.prompt('Public link expiry in days (0 for no expiry):', '7');
+        const expiresInput = await promptDialog({
+            title: 'Share album',
+            message: 'How long should the public link stay active? Use 0 for a link that never expires.',
+            label: 'Expiry (days)',
+            defaultValue: '7',
+            confirmLabel: 'Continue',
+        });
         if (expiresInput === null) {
             return;
         }
@@ -677,7 +692,13 @@ const AlbumsPage: React.FC = () => {
             return;
         }
 
-        const accessCodeInput = window.prompt('Optional access code (leave blank for no code):', '');
+        const accessCodeInput = await promptDialog({
+            title: 'Share album',
+            message: 'Optionally protect the link with an access code. Leave blank to share without one.',
+            label: 'Access code (optional)',
+            defaultValue: '',
+            confirmLabel: 'Create link',
+        });
         if (accessCodeInput === null) {
             return;
         }
@@ -727,7 +748,12 @@ const AlbumsPage: React.FC = () => {
         if (!activeAlbumId) {
             return;
         }
-        const confirmed = window.confirm('Revoke this public link now?');
+        const confirmed = await confirmDialog({
+            title: 'Revoke link',
+            message: 'Revoke this public link now? Anyone who has it will lose access.',
+            confirmLabel: 'Revoke',
+            danger: true,
+        });
         if (!confirmed) {
             return;
         }
@@ -751,7 +777,12 @@ const AlbumsPage: React.FC = () => {
             if (!activeAlbumId) return;
 
             const current = activeAlbum?.name || '';
-            const input = window.prompt('Rename album:', current);
+            const input = await promptDialog({
+                title: 'Rename album',
+                label: 'Album name',
+                defaultValue: current,
+                confirmLabel: 'Rename',
+            });
             if (input === null) return;
             const trimmed = input.trim();
             if (!trimmed || trimmed === current) return;
@@ -777,9 +808,12 @@ const AlbumsPage: React.FC = () => {
             return;
         }
 
-        const confirmed = window.confirm(
-            `Delete album "${activeAlbum?.name || ''}"? This cannot be undone.`
-        );
+        const confirmed = await confirmDialog({
+            title: 'Delete album',
+            message: `Delete album "${activeAlbum?.name || ''}"? This cannot be undone.`,
+            confirmLabel: 'Delete',
+            danger: true,
+        });
         if (!confirmed) {
             return;
         }
@@ -876,7 +910,7 @@ const AlbumsPage: React.FC = () => {
                                     >
                                         <Icon className="toolbar-icon" />
                                         <span>
-                                            <span className="smart-album-rule-label">{busy ? 'Creating...' : label}</span>
+                                            <span className="smart-album-rule-label">{busy ? 'Creating…' : label}</span>
                                             <span className="smart-album-rule-meta">{description}</span>
                                         </span>
                                     </button>
@@ -916,7 +950,7 @@ const AlbumsPage: React.FC = () => {
                                 >
                                     <p className="album-list-name">{album.name}</p>
                                     <p className="album-list-meta">
-                                        {album.photoCount} photo(s)
+                                        {plural(album.photoCount, 'photo')} 
                                         {album.isPublic ? ' • Public' : ''}
                                         {album.hasAccessCode ? ' • Protected' : ''}
                                     </p>
@@ -932,7 +966,7 @@ const AlbumsPage: React.FC = () => {
                                     title={selectedAlbumIds.has(album.id) ? 'Deselect album' : 'Select album'}
                                 >
                                     {selectedAlbumIds.has(album.id) ? (
-                                        <CheckCircleIcon className="toolbar-icon" style={{ color: 'var(--accent-color, #4f46e5)' }} />
+                                        <CheckCircleIcon className="toolbar-icon" style={{ color: 'var(--accent)' }} />
                                     ) : (
                                         <CheckIcon className="toolbar-icon" />
                                     )}
@@ -948,7 +982,7 @@ const AlbumsPage: React.FC = () => {
                         <div>
                             <h3 className="toolbar-title">{activeAlbum ? activeAlbum.name : 'All Photos'}</h3>
                             <p className="photo-meta">
-                                {filteredPhotos.length} photo(s)
+                                {plural(filteredPhotos.length, 'photo')} 
                                 {filteredPhotos.length !== visiblePhotos.length
                                     ? ` (filtered from ${visiblePhotos.length})`
                                     : ''}
@@ -956,7 +990,7 @@ const AlbumsPage: React.FC = () => {
                                     ? (showAddFromGallery ? ' • Gallery photos available to add' : ' • Album photos only')
                                     : ''}
                                 {activeAlbum?.publicExpiresAt ? ` • Expires ${activeAlbum.publicExpiresAt}` : ''}
-                                {semanticLoading ? ' • AI searching...' : ''}
+                                {semanticLoading ? ' • AI searching…' : ''}
                             </p>
                         </div>
 
@@ -1153,7 +1187,7 @@ const AlbumsPage: React.FC = () => {
                             </button>
                         </div>
                     )}
-                    {photosLoading && <p className="status">Loading photos...</p>}
+                    {photosLoading && <Loading label="Loading photos…" fullPage={false} />}
 
                     {!photosLoading && filteredPhotos.length === 0 && (
                         <EmptyState
@@ -1211,7 +1245,7 @@ const AlbumsPage: React.FC = () => {
                         <div ref={loadMoreRef} className="load-more-trigger" aria-hidden="true" />
                     )}
 
-                    {loadingMore && (showAddFromGallery || !activeAlbumId) && <p className="status">Loading more photos...</p>}
+                    {loadingMore && (showAddFromGallery || !activeAlbumId) && <p className="status">Loading more photos…</p>}
                     {viewerIndex === null ? null : (
                         <PhotoViewer
                             photos={filteredPhotos}

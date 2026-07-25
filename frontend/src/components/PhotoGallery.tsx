@@ -15,11 +15,14 @@ import {
 } from '../services/arcFaceEmbeddingRuntime';
 import { loadFaceApiRuntimeBundle } from '../services/faceApiRuntime';
 import { getFileExtension, getMediaKind, isRawFilename, isVideoFilename } from '../utils/photoDisplay';
+import { plural } from '../utils/format';
+import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import MetricCard from './shared/MetricCard';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { EmptyState } from './shared/EmptyState';
+import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
 import type {
     BrowserAiModelCacheStatus,
@@ -3699,7 +3702,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             ));
             addNotification(
                 response.liked ? 'Photo liked' : 'Like removed',
-                `${getDisplayName(filename)} now has ${response.likes || 0} like(s).`
+                `${getDisplayName(filename)} now has ${plural(response.likes || 0, 'like')}.`
             );
         } catch (err) {
             setError('Failed to toggle like');
@@ -3821,9 +3824,12 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         if (selectedPhotos.size === 0) return;
 
         const deleteCount = selectedPhotos.size;
-        const confirmDelete = window.confirm(
-            `Delete ${deleteCount} photo(s)? This will permanently remove them from the gallery and any albums.`
-        );
+        const confirmDelete = await confirmDialog({
+            title: 'Delete photos',
+            message: `Delete ${plural(deleteCount, 'photo')}? This will permanently remove them from the gallery and any albums.`,
+            confirmLabel: 'Delete',
+            danger: true,
+        });
         if (!confirmDelete) return;
 
         setDeleting(true);
@@ -3835,14 +3841,14 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 setPhotos(prev => prev.filter(p => !selectedPhotos.has(p.filename)));
                 setSelectedPhotos(new Set());
                 setError(null);
-                addNotification('Photos deleted', `Deleted ${deleteCount} photo(s) from your gallery.`);
+                addNotification('Photos deleted', `Deleted ${plural(deleteCount, 'photo')} from your gallery.`);
             } else if (response.errors && response.errors.length > 0) {
                 setError(`Failed to delete some photos: ${response.errors.join(', ')}`);
-                addNotification('Delete had issues', `Some photos could not be deleted (${response.errors.length} error(s)).`);
+                addNotification('Delete had issues', `Some photos could not be deleted (${plural(response.errors.length, 'error')}).`);
             }
         } catch (err) {
             setError(typeof err === 'string' ? err : 'Failed to delete photos.');
-            addNotification('Delete failed', `Could not delete ${deleteCount} photo(s).`);
+            addNotification('Delete failed', `Could not delete ${plural(deleteCount, 'photo')}.`);
         } finally {
             setDeleting(false);
         }
@@ -3854,7 +3860,12 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         }
 
         const suggestedName = `Album ${new Date().toLocaleDateString()}`;
-        const input = window.prompt('Album name:', suggestedName);
+        const input = await promptDialog({
+            title: 'Create album',
+            label: 'Album name',
+            defaultValue: suggestedName,
+            confirmLabel: 'Create',
+        });
         if (input === null) {
             return;
         }
@@ -3874,7 +3885,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             }
 
             await post(`/albums/${newAlbumId}/photos/add`, { filenames });
-            addNotification('Album created', `Created "${albumName}" with ${filenames.length} photo(s).`);
+            addNotification('Album created', `Created "${albumName}" with ${plural(filenames.length, 'photo')}.`);
             setSelectedPhotos(new Set());
         } catch (err) {
             setError(typeof err === 'string' ? err : 'Failed to create album from selection.');
@@ -3892,10 +3903,10 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         try {
             await downloadPhotosAsZip(
                 files.map((photo) => ({ filename: photo.filename, url: photo.url })),
-                `photostore-gallery-${new Date().toISOString().slice(0, 10)}.zip`,
+                `keepsake-gallery-${new Date().toISOString().slice(0, 10)}.zip`,
                 setDownloadProgress
             );
-            addNotification('Download ready', `Downloaded ${files.length} photo(s).`);
+            addNotification('Download ready', `Downloaded ${plural(files.length, 'photo')}.`);
         } catch (err) {
             setError(typeof err === 'string' ? err : 'Failed to download selected photos.');
         } finally {
@@ -4071,7 +4082,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         <p className="photo-meta">Search by meaning, sort by intent, and curate from capture metadata.</p>
                     </div>
                     <div className="albums-metrics">
-                        <MetricCard value={loading && !serverTotalLoaded ? '...' : totalPhotos} label={serverTotalLoaded ? 'Total Photos' : 'Cached Total'} />
+                        <MetricCard value={loading && !serverTotalLoaded ? '…' : totalPhotos} label={serverTotalLoaded ? 'Total Photos' : 'Cached Total'} />
                         <MetricCard value={showingPhotos} label="Current View" />
                         <MetricCard value={selectedCount} label="Selected" />
                     </div>
@@ -4289,10 +4300,10 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             )}
 
             {downloading && downloadProgress && (
-                <p className="status">Downloading {downloadProgress.completed}/{downloadProgress.total}...</p>
+                <p className="status">Downloading {downloadProgress.completed}/{downloadProgress.total}…</p>
             )}
 
-            {loading && <p className="status">Loading photos...</p>}
+            {loading && <Loading label="Loading photos…" fullPage={false} />}
             {error && <ErrorState title="Couldn't load your photos" message={error} />}
             {!loading && !error && searchNotice && <p className="status">{searchNotice}</p>}
             {!loading && !error && filteredPhotos.length === 0 && photos.length > 0 && mediaFilter !== 'all' && (
@@ -4442,7 +4453,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                     {expandedExif.has(photo.filename) && (
                                         <div className="exif-panel" onClick={(e) => e.stopPropagation()}>
                                             {loadingExif.has(photo.filename) ? (
-                                                <p className="status">Loading EXIF...</p>
+                                                <p className="status">Loading EXIF…</p>
                                             ) : (
                                                 <>
                                                     {photo.exifSummary?.camera && (
@@ -4512,7 +4523,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         <span className="sr-only">Load more</span>
                     </button>
                 )}
-                {loadingMore && <p className="status">Loading more photos...</p>}
+                {loadingMore && <p className="status">Loading more photos…</p>}
             </div>
         </section>
     );

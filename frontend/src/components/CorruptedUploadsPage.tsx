@@ -4,6 +4,7 @@ import { get, post } from '../services/apiClient';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { EmptyState } from './shared/EmptyState';
+import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
 
 interface CorruptedUpload {
@@ -84,7 +85,7 @@ const CorruptedUploadsPage: React.FC = () => {
                 </div>
             </div>
 
-            {loading && <p className="status">Loading corrupted uploads...</p>}
+            {loading && <Loading label="Checking your uploads…" fullPage={false} />}
             {error && <ErrorState title="Couldn't check uploads" message={error} />}
             {!loading && !error && items.length === 0 && (
                 <EmptyState
@@ -124,7 +125,7 @@ const CorruptedUploadsPage: React.FC = () => {
                                         disabled={clearing === item.filename}
                                         onClick={() => void clearCorruption(item.filename)}
                                     >
-                                        {clearing === item.filename ? 'Clearing...' : 'Mark not corrupted'}
+                                        {clearing === item.filename ? 'Clearing…' : 'Mark not corrupted'}
                                     </button>
                                 </>
                             }

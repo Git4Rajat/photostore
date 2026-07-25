@@ -7,6 +7,7 @@ import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { Logo } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
+import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
 import { getMediaKind } from '../utils/photoDisplay';
 
@@ -202,7 +203,7 @@ const PublicAlbumPage: React.FC = () => {
                 <input type="hidden" name="filenames" defaultValue="" />
             </form>
 
-            {loading && <p className="status">Loading public album...</p>}
+            {loading && <Loading label="Loading shared album…" fullPage={false} />}
             {!loading && error && !codeRequired && <ErrorState title="Album unavailable" message={error} />}
             {!loading && error && codeRequired && <p className="status error">{error}</p>}
             {!loading && codeRequired && (

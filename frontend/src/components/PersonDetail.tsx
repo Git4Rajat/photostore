@@ -5,6 +5,7 @@ import faceService from '../services/faceService';
 import { resolveApiUrl } from '../services/apiClient';
 import { showToast } from '../services/toast';
 import { useProtectedBlobUrls } from '../services/imageClient';
+import { confirmDialog } from './shared/dialogs';
 import type { PersonDetailModel, PersonFace, PersonSummary } from '../types/people';
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
@@ -262,7 +263,11 @@ const PersonDetail: React.FC = () => {
         if (!personId) return;
         const toMerge = Object.keys(selectedMerge).filter(id => selectedMerge[id]);
         if (toMerge.length === 0) return;
-        if (!window.confirm(`Merge ${toMerge.length} persons into this person?`)) return;
+        if (!(await confirmDialog({
+            title: 'Merge people',
+            message: `Merge ${toMerge.length} persons into this person?`,
+            confirmLabel: 'Merge',
+        }))) return;
         setLoading(true);
         try {
             const res = await faceService.mergePersons(personId, toMerge);
@@ -313,7 +318,7 @@ const PersonDetail: React.FC = () => {
                 </div>
             </div>
 
-            {loading && <div className="people-status">Loading...</div>}
+            {loading && <div className="people-status">Loading…</div>}
 
             {person && (
                 <div className="person-detail-body">
@@ -424,7 +429,7 @@ const PersonDetail: React.FC = () => {
                                 )}
                             </div>
                         </div>
-                        {mergeCandidatesLoading && <div className="people-empty">Loading merge options...</div>}
+                        {mergeCandidatesLoading && <div className="people-empty">Loading merge options…</div>}
                         {!mergeCandidatesLoading && otherPersons.length === 0 && <div className="people-empty">No other persons available.</div>}
                         {otherPersons.length > 0 && (
                             <div className="person-merge-list">

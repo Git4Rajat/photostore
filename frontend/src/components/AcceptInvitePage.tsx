@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import * as library from '../services/libraryClient';
+import { LogoLockup } from './shared/Logo';
 
 // Public page reached from the "accept your invitation" link in an invite email:
 //   /accept-invite?token=<token>
@@ -73,6 +74,7 @@ const AcceptInvitePage: React.FC = () => {
 
     return (
         <section className="auth-page card-glass">
+            <LogoLockup size={46} className="auth-logo" />
             <p className="additional-kicker">INVITATION</p>
             <h2 className="auth-page-title">Accept your invitation</h2>
             {!token ? (

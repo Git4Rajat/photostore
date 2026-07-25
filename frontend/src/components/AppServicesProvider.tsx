@@ -30,6 +30,7 @@ import {
     isUploadStoppedError,
 } from './browserAiShared';
 import { FILE_ACCEPT_FILTER, requiresBackendPreview } from '../utils/photoDisplay';
+import { plural } from '../utils/format';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 
@@ -566,7 +567,7 @@ const formatBrowserProcessingNotificationDetails = (
     if (status) {
         details.push(status.endsWith('.') ? status : `${status}.`);
     }
-    details.push(`Processed ${processedCount}/${totalCount} photo(s).`);
+    details.push(`Processed ${processedCount}/${plural(totalCount, 'photo')}.`);
     if (failedCount > 0) {
         details.push(`Failed ${failedCount}.`);
     }
@@ -1449,7 +1450,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
         const notificationId = options.notificationId || addNotification(
             options.resumed ? 'Upload resumed' : 'Upload started',
-            options.resumed ? `Processing ${totalCount} persisted file(s).` : `Uploading ${totalCount} file(s) with ${uploadProfile.fileParallelism} lane(s).`,
+            options.resumed ? `Processing ${plural(totalCount, 'persisted file')}.` : `Uploading ${plural(totalCount, 'file')} with ${plural(uploadProfile.fileParallelism, 'lane')}.`,
             {
                 uploadedCount: totalUploaded,
                 totalCount,
@@ -1461,7 +1462,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (options.notificationId) {
             updateNotification(notificationId, {
                 title: options.resumed ? 'Upload resumed' : 'Upload started',
-                details: options.resumed ? `Processing ${totalCount} persisted file(s).` : `Uploading ${totalCount} file(s) with ${uploadProfile.fileParallelism} lane(s).`,
+                details: options.resumed ? `Processing ${plural(totalCount, 'persisted file')}.` : `Uploading ${plural(totalCount, 'file')} with ${plural(uploadProfile.fileParallelism, 'lane')}.`,
                 progress: {
                     uploadedCount: totalUploaded,
                     totalCount,
@@ -1625,7 +1626,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
                     updateNotification(notificationId, {
                         title: 'Upload in progress',
-                        details: `Uploaded ${totalUploaded}/${totalCount} file(s). Skipped duplicates: ${totalSkippedDuplicates}.`,
+                        details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
                         progress: {
                             uploadedCount: totalUploaded,
                             totalCount,
@@ -1648,7 +1649,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 setPendingUploadSession(null);
                 updateNotification(notificationId, {
                     title: 'Upload stopped',
-                    details: `Stopped after uploading ${totalUploaded}/${totalCount} file(s).`,
+                    details: `Stopped after uploading ${totalUploaded}/${plural(totalCount, 'file')}.`,
                     progress: {
                         uploadedCount: totalUploaded,
                         totalCount,
@@ -1671,7 +1672,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (totalFailed === 0 && !hasPending) {
                 updateNotification(notificationId, {
                     title: 'Upload complete',
-                    details: `Uploaded ${totalUploaded} file(s) successfully. Skipped duplicates: ${totalSkippedDuplicates}.`,
+                    details: `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}.`,
                 });
                 setUploadError(null);
             } else {
@@ -1680,7 +1681,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
                 updateNotification(notificationId, {
                     title: 'Upload paused',
-                    details: `Uploaded ${totalUploaded}/${totalCount} file(s), failed ${totalFailed}, skipped duplicates ${totalSkippedDuplicates}. Reselect any missing files to retry.`,
+                    details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}, failed ${totalFailed}, skipped duplicates ${totalSkippedDuplicates}. Reselect any missing files to retry.`,
                 });
                 setUploadError(totalFailed > 0
                     ? 'Some files failed to upload. Retry cached files or reselect missing files.'
@@ -1698,7 +1699,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 setPendingUploadSession(null);
                 updateNotification(notificationId, {
                     title: 'Upload stopped',
-                    details: `Stopped after uploading ${totalUploaded}/${totalCount} file(s).`,
+                    details: `Stopped after uploading ${totalUploaded}/${plural(totalCount, 'file')}.`,
                     progress: {
                         uploadedCount: totalUploaded,
                         totalCount,
@@ -1792,12 +1793,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const missingCachedFiles = cacheChecks.filter((item) => !item.hasCachedBlob).map((item) => item.file);
         const retryableFiles = cacheChecks.filter((item) => item.hasCachedBlob).map((item) => item.file);
         if (retryableFiles.length === 0) {
-            addNotification('Reselect files', `${missingCachedFiles.length} file(s) need to be selected again before retry.`);
+            addNotification('Reselect files', `${plural(missingCachedFiles.length, 'file')} need to be selected again before retry.`);
             setUploadError('Upload files are no longer cached. Use Upload to reselect those files, then retry.');
             return;
         }
         if (missingCachedFiles.length > 0) {
-            addNotification('Partial retry', `${retryableFiles.length} cached file(s) will retry. ${missingCachedFiles.length} file(s) still need reselecting.`);
+            addNotification('Partial retry', `${plural(retryableFiles.length, 'cached file')} will retry. Still to reselect: ${plural(missingCachedFiles.length, 'file')}.`);
         }
         uploadStopRequestedRef.current = false;
         const retryableKeys = new Set(retryableFiles.map((file) => file.key));
@@ -1867,7 +1868,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const uploadProfile = getAdaptiveUploadProfile(filesToUpload);
         const preparingNotificationId = addNotification(
             'Preparing upload',
-            `Preparing ${filesToUpload.length} file(s), ${formatBytes(totalBytes)}. ${uploadProfile.fileParallelism} upload lane(s), ${formatBytes(uploadProfile.chunkSizeBytes)} chunks: ${uploadProfile.reason}.`,
+            `Preparing ${plural(filesToUpload.length, 'file')}, ${formatBytes(totalBytes)}. ${plural(uploadProfile.fileParallelism, 'upload lane')}, ${formatBytes(uploadProfile.chunkSizeBytes)} chunks: ${uploadProfile.reason}.`,
             {
                 uploadedCount: 0,
                 totalCount: filesToUpload.length,
@@ -1958,7 +1959,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         setUploadError('Selected files did not match the paused upload. Choose the original files to retry.');
                         return;
                     }
-                    addNotification('Files reselected', `${matchedCount} file(s) reattached to the paused upload.`);
+                    addNotification('Files reselected', `${plural(matchedCount, 'file')} reattached to the paused upload.`);
                     await retryPersistedUploadSession();
                 })();
             } else {
@@ -1991,7 +1992,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
         persistSession(restored);
         setPendingUploadSession(restored);
-        addNotification('Upload paused', `${restored.files.filter((file) => file.status !== 'done').length} file(s) need retry approval.`);
+        addNotification('Upload paused', `${plural(restored.files.filter((file) => file.status !== 'done').length, 'file')} need retry approval.`);
         if (!autoResumeAttemptedRef.current) {
             autoResumeAttemptedRef.current = true;
             void retryPersistedUploadSession();

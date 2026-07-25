@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { ArrowLeftIcon, ArrowLeftOnRectangleIcon } from '@heroicons/react/24/outline';
 import { Link, useNavigate } from 'react-router-dom';
 import { setUserId } from '../services/apiClient';
+import { LogoLockup } from './shared/Logo';
 
 interface LogoutPageProps {
     authEnabled: boolean;
@@ -35,6 +36,7 @@ const LogoutPage: React.FC<LogoutPageProps> = ({ authEnabled, authReady, display
 
     return (
         <section className="auth-page card-glass">
+            <LogoLockup size={46} className="auth-logo" />
             <p className="additional-kicker">ACCESS</p>
             <h2 className="auth-page-title">Logout</h2>
             {!authEnabled ? (

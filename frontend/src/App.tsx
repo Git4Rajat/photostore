@@ -26,6 +26,7 @@ import { AppServicesProvider, BackgroundActivityIndicator, NotificationBell, use
 import { Logo } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
 import NotFoundPage from './components/NotFoundPage';
+import { DialogHost } from './components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
 import { getMine } from './services/libraryClient';
 import { getRuntimeConfig } from './config/appConfig';
@@ -467,7 +468,7 @@ const AppContent: React.FC = () => {
         </React.Suspense>
     );
 
-    const renderProtectedLazyPage = (element: JSX.Element, fallback = 'Loading...') => (
+    const renderProtectedLazyPage = (element: JSX.Element, fallback = 'Loading…') => (
         guardPrivateRoute(renderLazyPage(element, fallback))
     );
 
@@ -495,7 +496,7 @@ const AppContent: React.FC = () => {
             return element;
         }
         if (!authReady) {
-            return <p className="status">Preparing sign-in flow...</p>;
+            return <p className="status">Preparing sign-in flow…</p>;
         }
         if (!displayName) {
             return <Navigate to="/login" replace state={{ from: `${location.pathname}${location.search}` }} />;
@@ -733,18 +734,18 @@ const AppContent: React.FC = () => {
                                         registerUploadCompletionHandler={appServices.registerUploadCompletionHandler}
                                         registerUploadErrorHandler={appServices.registerUploadErrorHandler}
                                     />,
-                                    'Loading library...',
+                                    'Loading library…',
                                 ),
                             },
-                            { path: '/albums', element: renderProtectedLazyPage(<LazyAlbumsPage />, 'Loading albums...') },
-                            { path: '/tools/*', element: renderProtectedLazyPage(<LazyToolsPage />, 'Loading tools...') },
+                            { path: '/albums', element: renderProtectedLazyPage(<LazyAlbumsPage />, 'Loading albums…') },
+                            { path: '/tools/*', element: renderProtectedLazyPage(<LazyToolsPage />, 'Loading tools…') },
                             {
                                 path: '/corrupted',
-                                element: renderProtectedLazyPage(<LazyCorruptedUploadsPage />, 'Loading corrupted uploads...'),
+                                element: renderProtectedLazyPage(<LazyCorruptedUploadsPage />, 'Loading corrupted uploads…'),
                             },
                             {
                                 path: '/additional',
-                                element: renderProtectedLazyPage(<LazyAdditionalInfoPage />, 'Loading additional info...'),
+                                element: renderProtectedLazyPage(<LazyAdditionalInfoPage />, 'Loading additional info…'),
                             },
                         ].map(({ path, element }) => (
                             <Route key={path} path={path} element={element} />
@@ -763,26 +764,26 @@ const AppContent: React.FC = () => {
                                             onSignIn={handleSignIn}
                                             onAuthenticated={refreshAuthState}
                                         />,
-                                        'Loading sign in...',
+                                        'Loading sign in…',
                                     )
                                 )
                             }
                         />
                         <Route
                             path="/reset-password"
-                            element={renderLazyPage(<LazyResetPasswordPage />, 'Loading reset...')}
+                            element={renderLazyPage(<LazyResetPasswordPage />, 'Loading reset…')}
                         />
                         <Route
                             path="/change-password"
-                            element={renderLazyPage(<LazyChangePasswordPage />, 'Loading...')}
+                            element={renderLazyPage(<LazyChangePasswordPage />, 'Loading…')}
                         />
                         <Route
                             path="/accept-invite"
-                            element={renderLazyPage(<LazyAcceptInvitePage />, 'Loading invitation...')}
+                            element={renderLazyPage(<LazyAcceptInvitePage />, 'Loading invitation…')}
                         />
                         <Route
                             path="/library"
-                            element={renderProtectedLazyPage(<LazyLibraryPage />, 'Loading library...')}
+                            element={renderProtectedLazyPage(<LazyLibraryPage />, 'Loading library…')}
                         />
                         <Route
                             path="/logout"
@@ -793,12 +794,12 @@ const AppContent: React.FC = () => {
                                     displayName={displayName}
                                     onSignOut={handleSignOut}
                                 />,
-                                'Loading sign out...',
+                                'Loading sign out…',
                             )}
                         />
                         <Route
                             path="/public/album/:token"
-                            element={renderLazyPage(<LazyPublicAlbumPage />, 'Loading public album...')}
+                            element={renderLazyPage(<LazyPublicAlbumPage />, 'Loading public album…')}
                         />
                         <Route path="/faces" element={<Navigate to="/people" replace />} />
                         <Route path="/people" element={renderLazyPage(<LazyPeoplePage />, 'Loading people…')} />
@@ -819,6 +820,9 @@ const AppContent: React.FC = () => {
                     libraryTitle={libraryTitle}
                 />
             )}
+
+            {/* Styled confirm/prompt dialogs (replaces window.confirm/prompt). */}
+            <DialogHost />
         </div>
     );
 };

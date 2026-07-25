@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import * as passwordAuth from '../services/passwordAuthClient';
+import { LogoLockup } from './shared/Logo';
 
 // Public page reached from the "reset your password" link in a recovery email:
 //   /reset-password?token=<token>
@@ -38,6 +39,7 @@ const ResetPasswordPage: React.FC = () => {
 
     return (
         <section className="auth-page card-glass">
+            <LogoLockup size={46} className="auth-logo" />
             <p className="additional-kicker">RESET</p>
             <h2 className="auth-page-title">Choose a new password</h2>
             {!token ? (

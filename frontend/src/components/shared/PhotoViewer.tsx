@@ -891,7 +891,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                     {mediaLoading && (
                         <div className="photo-preview-loading" role="status">
                             <ArrowPathIcon className="photo-preview-loading-icon" />
-                            <span>Loading preview...</span>
+                            <span>Loading preview…</span>
                         </div>
                     )}
                     {mediaError && (

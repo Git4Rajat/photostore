@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { EmptyState } from './shared/EmptyState';
+import { confirmDialog } from './shared/dialogs';
+import { Loading } from './shared/Loading';
 import { ArrowsRightLeftIcon, ArrowRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, ExclamationTriangleIcon, FaceSmileIcon, MagnifyingGlassIcon, NoSymbolIcon, SparklesIcon, Squares2X2Icon, TrashIcon, UserCircleIcon, UsersIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import faceService from '../services/faceService';
 import { getUploadJson, resolveApiUrl } from '../services/apiClient';
@@ -153,7 +155,7 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
                     }}
                 />
             ) : (
-                <div className="person-avatar-loading">Loading...</div>
+                <div className="person-avatar-loading">Loading…</div>
             )}
         </div>
     );
@@ -380,7 +382,7 @@ const FaceClusters: React.FC = () => {
     }, [view, pagedPersons, personFaces]);
 
     const handleSearch = async () => {
-        setStatus('Searching...');
+        setStatus('Searching…');
         setPage(1);
         await loadPersons(searchQuery.trim());
         void refreshSupportData();
@@ -424,7 +426,7 @@ const FaceClusters: React.FC = () => {
     };
 
     const handleAssignUnclustered = async () => {
-        setStatus('Assigning unclustered faces...');
+        setStatus('Assigning unclustered faces…');
         setActionLoading(true);
         try {
             const response = await faceService.assignUnclusteredFaces();
@@ -450,7 +452,11 @@ const FaceClusters: React.FC = () => {
 
     const handleMergeSuggestion = async (targetId: string, sourceId: string, label: string) => {
         if (!targetId || !sourceId) return;
-        if (!window.confirm(`Merge ${label} into ${getPersonLabel(targetId)}?`)) return;
+        if (!(await confirmDialog({
+            title: 'Merge people',
+            message: `Merge ${label} into ${getPersonLabel(targetId)}?`,
+            confirmLabel: 'Merge',
+        }))) return;
         setActionLoading(true);
         try {
             const res = await faceService.mergePersons(targetId, [sourceId]);
@@ -484,9 +490,14 @@ const FaceClusters: React.FC = () => {
     };
 
     const handleDeletePerson = async (personId: string, label: string) => {
-        if (!window.confirm(`Delete cluster ${label}? Photos and detected faces will stay, but this person assignment will be removed.`)) return;
+        if (!(await confirmDialog({
+            title: 'Delete cluster',
+            message: `Delete cluster ${label}? Photos and detected faces will stay, but this person assignment will be removed.`,
+            confirmLabel: 'Delete',
+            danger: true,
+        }))) return;
         setActionLoading(true);
-        setStatus('Deleting cluster...');
+        setStatus('Deleting cluster…');
         try {
             await faceService.deletePerson(personId);
             removePersonsFromState([personId]);
@@ -521,12 +532,17 @@ const FaceClusters: React.FC = () => {
             setStatus('Select at least one cluster to delete.');
             return;
         }
-        if (!window.confirm(`Delete ${personIds.length} selected cluster${personIds.length === 1 ? '' : 's'}? Photos and detected faces will stay, but these person assignments will be removed.`)) {
+        if (!(await confirmDialog({
+            title: 'Delete clusters',
+            message: `Delete ${personIds.length} selected cluster${personIds.length === 1 ? '' : 's'}? Photos and detected faces will stay, but these person assignments will be removed.`,
+            confirmLabel: 'Delete',
+            danger: true,
+        }))) {
             return;
         }
         setActionLoading(true);
-        setStatus(`Deleting ${personIds.length} cluster${personIds.length === 1 ? '' : 's'}...`);
-        showToast('Deleting selected clusters...');
+        setStatus(`Deleting ${personIds.length} cluster${personIds.length === 1 ? '' : 's'}…`);
+        showToast('Deleting selected clusters…');
         try {
             const result = await faceService.deletePersons(personIds);
             const deletedCount = result.deletedPersonIds.length;
@@ -558,11 +574,15 @@ const FaceClusters: React.FC = () => {
             setStatus('No other persons selected to merge.');
             return;
         }
-        if (!window.confirm(`Merge ${mergeIds.length} persons into ${getPersonLabel(mergeTarget)}? This cannot be easily undone.`)) {
+        if (!(await confirmDialog({
+            title: 'Merge people',
+            message: `Merge ${mergeIds.length} persons into ${getPersonLabel(mergeTarget)}? This cannot be easily undone.`,
+            confirmLabel: 'Merge',
+        }))) {
             return;
         }
-        setStatus('Merging...');
-        showToast('Merging profiles...');
+        setStatus('Merging…');
+        showToast('Merging profiles…');
         setActionLoading(true);
         try {
             const res = await faceService.mergePersons(mergeTarget, mergeIds);
@@ -580,8 +600,13 @@ const FaceClusters: React.FC = () => {
     };
 
     const handleUndoMerge = async (mergeId: string) => {
-        if (!mergeId || !window.confirm('Undo this merge?')) return;
-        setStatus('Undoing merge...');
+        if (!mergeId) return;
+        if (!(await confirmDialog({
+            title: 'Undo merge',
+            message: 'Undo this merge and restore the separate people?',
+            confirmLabel: 'Undo merge',
+        }))) return;
+        setStatus('Undoing merge…');
         showToast('Undoing merge');
         setActionLoading(true);
         try {
@@ -726,7 +751,7 @@ const FaceClusters: React.FC = () => {
                 </div>
             )}
 
-            {initialLoading && persons.length === 0 && <div className="people-empty">Loading...</div>}
+            {initialLoading && persons.length === 0 && <Loading label="Loading people…" fullPage={false} />}
             {!initialLoading && persons.length === 0 && (
                 <EmptyState
                     icon={<UsersIcon />}

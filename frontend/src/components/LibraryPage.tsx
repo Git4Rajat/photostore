@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import * as library from '../services/libraryClient';
+import { Loading } from './shared/Loading';
+import { confirmDialog } from './shared/dialogs';
 
 // Manage shared libraries: switch between the ones you belong to, and (for the
 // owner) invite people, see members, and rename/delete the library.
@@ -66,7 +68,7 @@ const LibraryPage: React.FC = () => {
     };
 
     if (loading) {
-        return <section className="card-glass"><p className="status">Loading libraries…</p></section>;
+        return <section className="card-glass"><Loading label="Loading libraries…" /></section>;
     }
 
     const activeId = mine?.activeLibraryId || '';
@@ -245,8 +247,14 @@ const LibraryPage: React.FC = () => {
                             className="btn btn-soft danger"
                             disabled={busy || memberCount > 1}
                             title={memberCount > 1 ? 'Remove all other members first' : undefined}
-                            onClick={() => {
-                                if (window.confirm('Delete this library and all its photos? This cannot be undone.')) {
+                            onClick={async () => {
+                                const confirmed = await confirmDialog({
+                                    title: 'Delete library',
+                                    message: 'Delete this library and all its photos? This cannot be undone.',
+                                    confirmLabel: 'Delete forever',
+                                    danger: true,
+                                });
+                                if (confirmed) {
                                     run(async () => { await library.deleteLibrary(); }, 'Library deleted.');
                                 }
                             }}

@@ -3449,6 +3449,7 @@ html[data-theme='light'] .notification-item.unread {
   z-index: 2;
   min-height: calc(100vh - 160px);
   color: #fff;
+  animation: photo-preview-in var(--dur-base) var(--ease-glass) both;
 }
 
 .photo-preview-panel {
@@ -3465,6 +3466,25 @@ html[data-theme='light'] .notification-item.unread {
   border: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: var(--lg-shadow-floating);
   overflow: hidden;
+  animation: photo-preview-pop var(--dur-slow) var(--ease-glass) both;
+}
+
+/* Lightbox open: fade the surface, pop the panel up with a subtle zoom. */
+@keyframes photo-preview-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes photo-preview-pop {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .photo-preview,
+  .photo-preview-panel {
+    animation: none;
+  }
 }
 
 .photo-preview-top {
@@ -3930,6 +3950,126 @@ video.photo-preview-media {
   font-weight: 650;
 }
 
+/* ---- Toasts (services/toast.ts) ---- */
+.app-toast-stack {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.app-toast {
+  max-width: min(340px, calc(100vw - 32px));
+  padding: 10px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--lg-edge-strong);
+  border-left: 3px solid var(--accent);
+  background: var(--lg-surface-strong);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.4;
+  box-shadow: var(--lg-shadow-raised);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  opacity: 0;
+  transform: translateX(12px);
+  transition: opacity var(--dur-base) var(--ease-glass), transform var(--dur-base) var(--ease-glass);
+}
+
+.app-toast.is-visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-toast {
+    transform: none;
+    transition: opacity var(--dur-base) ease;
+  }
+}
+
+/* ---- Styled dialogs (components/shared/dialogs.tsx) ---- */
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(8, 8, 12, 0.45);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: photo-preview-in var(--dur-base) var(--ease-glass) both;
+}
+
+.dialog-card {
+  width: min(420px, 100%);
+  padding: 22px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--lg-edge-strong);
+  background: var(--lg-surface-strong);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  box-shadow: var(--lg-shadow-floating);
+  animation: photo-preview-pop var(--dur-base) var(--ease-glass) both;
+}
+
+.dialog-title {
+  margin: 0 0 8px;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.dialog-message {
+  margin: 0 0 6px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.dialog-label {
+  display: block;
+  margin: 10px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.dialog-form .field {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.btn-danger {
+  background: var(--danger);
+  border-color: transparent;
+  color: #fff;
+}
+
+.btn-danger:hover {
+  filter: brightness(1.08);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dialog-backdrop,
+  .dialog-card {
+    animation: none;
+  }
+}
+
 /* ---- Branded loading indicator (route/Suspense fallbacks) ---- */
 .loading-state {
   display: flex;
@@ -3937,6 +4077,7 @@ video.photo-preview-media {
   align-items: center;
   justify-content: center;
   gap: 14px;
+  padding: 28px 16px;
   color: var(--muted);
 }
 

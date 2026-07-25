@@ -16,11 +16,14 @@ import {
     UsersIcon,
 } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
+import { plural } from '../utils/format';
+import { confirmDialog } from './shared/dialogs';
 import { useAppServices } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { EmptyState } from './shared/EmptyState';
+import { Loading } from './shared/Loading';
 
 interface Photo {
     filename: string;
@@ -457,7 +460,7 @@ const ToolsPage: React.FC = () => {
             || Boolean(exifSummary?.lens);
         return (
             <div className="tools-photo-info" onClick={(event) => event.stopPropagation()}>
-                {loadingInfo.has(photo.filename) && <span className="tools-info-muted">Loading...</span>}
+                {loadingInfo.has(photo.filename) && <span className="tools-info-muted">Loading…</span>}
                 {!loadingInfo.has(photo.filename) && (
                     <>
                         {tags.length > 0 && (
@@ -535,7 +538,7 @@ const ToolsPage: React.FC = () => {
                     return;
                 }
             }
-            setMessage(`Starting browser processing for ${filenames.length} photo(s)...`);
+            setMessage(`Starting browser processing for ${plural(filenames.length, 'photo')}…`);
             const processed = await startBrowserProcessing({
                 actions: [action],
                 filenames,
@@ -553,11 +556,16 @@ const ToolsPage: React.FC = () => {
     };
 
     const runReclusterPeople = async () => {
-        if (!window.confirm('Run protected people recluster repair? Current assignments will be snapshotted first, but this should only be used for admin recovery.')) {
+        if (!(await confirmDialog({
+            title: 'Recovery action',
+            message: 'Run protected people recluster repair? Current assignments will be snapshotted first, but this should only be used for admin recovery.',
+            confirmLabel: 'Run repair',
+            danger: true,
+        }))) {
             return;
         }
         setRunning('peopleIndex');
-        setMessage('Preparing protected people repair...');
+        setMessage('Preparing protected people repair…');
         try {
             const response = await post('/api/admin/people/recluster', {
                 queue: true,
@@ -581,11 +589,15 @@ const ToolsPage: React.FC = () => {
     };
 
     const runRebuildVectorIndex = async () => {
-        if (!window.confirm('Rebuild the cached vector index for this account? This refreshes the on-disk .npz file from the latest face embeddings.')) {
+        if (!(await confirmDialog({
+            title: 'Recovery action',
+            message: 'Rebuild the cached vector index for this account? This refreshes the on-disk index from the latest face embeddings.',
+            confirmLabel: 'Rebuild index',
+        }))) {
             return;
         }
         setRunning('vectorIndex');
-        setMessage('Rebuilding vector index...');
+        setMessage('Rebuilding vector index…');
         try {
             const response = await post('/api/admin/vector-index/rebuild', {
                 confirm: 'REBUILD_VECTOR_INDEX',
@@ -772,7 +784,7 @@ const ToolsPage: React.FC = () => {
                     {renderWorkbenchViewToggle()}
                 </div>
                 {queueLoadWarning && <p className="status">{queueLoadWarning}</p>}
-                {loading && <p className="status">Loading photos...</p>}
+                {loading && <Loading label="Loading photos…" fullPage={false} />}
                 {!loading && photos.length === 0 && (
                     <EmptyState
                         icon={<PhotoIcon />}
@@ -967,7 +979,7 @@ const ToolsPage: React.FC = () => {
                         </div>
                     </div>
 
-                    {loading && <p className="status">Loading photos...</p>}
+                    {loading && <Loading label="Loading photos…" fullPage={false} />}
                     {!loading && workbenchPhotos.length === 0 && (
                         <EmptyState icon={<PhotoIcon />} title="Nothing to work on" message="No photos match this view right now." />
                     )}
@@ -1101,7 +1113,7 @@ const ToolsPage: React.FC = () => {
             {isQueueStatusPage && renderQueueStatusPage()}
             {isBrowserWorkbenchPage && renderBrowserWorkbenchPage()}
             {isRecoveryPage && renderRecoveryPage()}
-            {running && <p className="status">Queueing '{running}'...</p>}
+            {running && <p className="status">Queueing '{running}'…</p>}
             {message && <p className={`status ${message.includes('failed') ? 'error' : 'success'}`}>{message}</p>}
         </section>
     );
