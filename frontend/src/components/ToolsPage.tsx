@@ -155,6 +155,33 @@ const queueStageCards: QueueStageConfig[] = [
     { key: 'face', label: 'Face detection', description: 'Browser detection + clustering', icon: processingStageIcons.face },
 ];
 
+const browserActionButtons: Array<{ action: BrowserProcessingAction; label: string; icon: React.ComponentType<React.SVGProps<SVGSVGElement>> }> = [
+    { action: 'thumbnails', label: 'Thumbnails', icon: processingStageIcons.thumbnail },
+    { action: 'exif', label: 'EXIF', icon: processingStageIcons.exif },
+    { action: 'ocr', label: 'OCR', icon: processingStageIcons.ocr },
+    { action: 'vision', label: 'AI vision', icon: processingStageIcons.aiVision },
+    { action: 'map', label: 'Map tagging', icon: processingStageIcons.mapDetection },
+    { action: 'faces', label: 'Faces', icon: processingStageIcons.face },
+];
+
+const runningActionLabels: Record<ToolAction, string> = {
+    thumbnails: 'thumbnail generation',
+    exif: 'EXIF extraction',
+    ocr: 'OCR',
+    vision: 'AI vision',
+    map: 'map tagging',
+    faces: 'face detection',
+    peopleIndex: 'people recluster',
+    vectorIndex: 'vector index rebuild',
+};
+
+const toolsSubnavItems: Array<{ key: ToolsPageKey; to: string; label: string; note: string }> = [
+    { key: 'overview', to: '/tools', label: 'Overview', note: 'Queues, quick actions, photos' },
+    { key: 'browser-workbench', to: '/tools/browser-workbench', label: 'Workbench', note: 'Bulk re-run processing steps' },
+    { key: 'queue-status', to: '/tools/queue-status', label: 'Queue status', note: 'Live pipeline counters' },
+    { key: 'recovery', to: '/tools/recovery', label: 'Recovery', note: 'Snapshot-backed repairs' },
+];
+
 const getProcessingStatus = (photo: Photo, step: ChipStepKey) => {
     const value = photo.processing?.[step as keyof NonNullable<Photo['processing']>];
     if (step === 'face' && value && typeof value === 'object') {
@@ -223,6 +250,7 @@ const ToolsPage: React.FC = () => {
     const [infoByFile, setInfoByFile] = useState<Record<string, ToolPhotoMetadata>>({});
     const [loadingInfo, setLoadingInfo] = useState<Set<string>>(new Set());
     const [queueStatus, setQueueStatus] = useState<QueueStatus>({});
+    const [queueUpdatedAt, setQueueUpdatedAt] = useState<Date | null>(null);
     const [isQueueStatusExpanded, setIsQueueStatusExpanded] = useState<boolean>(true);
     const [forceRun, setForceRun] = useState<boolean>(false);
     const [runAll, setRunAll] = useState<boolean>(false);
@@ -284,6 +312,7 @@ const ToolsPage: React.FC = () => {
                 map_detection: response?.map_detection,
                 face: response?.face,
             });
+            setQueueUpdatedAt(new Date());
             setQueueLoadWarning('');
         } catch (err) {
             setQueueLoadWarning(`Queue status unavailable: ${String(err)}`);
@@ -510,7 +539,7 @@ const ToolsPage: React.FC = () => {
     };
 
     const runBrowserAction = async (action: BrowserProcessingAction) => {
-        const actionPhotos = isBrowserWorkbenchPage ? workbenchPhotos : previewPhotos;
+        const actionPhotos = isBrowserWorkbenchPage ? workbenchPhotos : photos;
         const useAllMatching = isBrowserWorkbenchPage && runAll;
         const selectedPhotos = useAllMatching
             ? actionPhotos
@@ -519,8 +548,8 @@ const ToolsPage: React.FC = () => {
             setMessage(useAllMatching
                 ? 'No photos match the current filters.'
                 : (isBrowserWorkbenchPage
-                    ? 'Select photos or switch the scope to all filtered photos before starting browser processing.'
-                    : 'Select photos in Preview before starting browser processing.'));
+                    ? 'Select photos below, or switch the scope to all filtered photos.'
+                    : 'Select photos below first, then run a step.'));
             return;
         }
         const filenames = selectedPhotos.map((photo) => photo.filename);
@@ -538,14 +567,14 @@ const ToolsPage: React.FC = () => {
                     return;
                 }
             }
-            setMessage(`Starting browser processing for ${plural(filenames.length, 'photo')}…`);
+            setMessage(`Running ${runningActionLabels[action]} on ${plural(filenames.length, 'photo')}…`);
             const processed = await startBrowserProcessing({
                 actions: [action],
                 filenames,
                 items,
                 force: forceRun,
             });
-            setMessage(`Browser processing finished. processed=${processed}, requested=${filenames.length}`);
+            setMessage(`Finished ${runningActionLabels[action]}: ${processed} of ${plural(filenames.length, 'photo')} processed.`);
             await loadPhotos();
             await loadQueueStatus();
         } catch (err) {
@@ -618,6 +647,119 @@ const ToolsPage: React.FC = () => {
         }
     };
 
+    const queueUpdatedLabel = queueUpdatedAt
+        ? queueUpdatedAt.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+        : '';
+
+    const renderToolsHeader = () => (
+        <>
+            <header className="tools-header">
+                <div>
+                    <h1 className="tools-title">Tools</h1>
+                    <p className="tools-subtitle">
+                        Keepsake processes photos on your device — thumbnails, EXIF, OCR, AI vision, map tagging, and faces.
+                        Watch the queues and re-run steps here.
+                    </p>
+                </div>
+            </header>
+            <nav className="tools-subnav" aria-label="Tools sections">
+                {toolsSubnavItems.map((item) => (
+                    <Link
+                        key={item.key}
+                        to={item.to}
+                        className={`tools-subnav-link${activeToolsPage === item.key ? ' active' : ''}`}
+                        aria-current={activeToolsPage === item.key ? 'page' : undefined}
+                    >
+                        <span className="tools-subnav-label">{item.label}</span>
+                        <span className="tools-subnav-note">{item.note}</span>
+                    </Link>
+                ))}
+            </nav>
+        </>
+    );
+
+    const statusText = message || (running ? `Running ${runningActionLabels[running]}…` : '');
+    const isErrorStatus = /fail|unavailable|not available/i.test(statusText);
+
+    const renderStatusArea = () => (
+        <div className="tools-status-area" role="status" aria-live="polite">
+            {statusText && (
+                <p className={`status ${isErrorStatus ? 'error' : 'success'}`}>{statusText}</p>
+            )}
+        </div>
+    );
+
+    const renderQueueGrid = () => (
+        <div className="tools-queue-grid">
+            {queueStageCards.map((item) => {
+                const summary = queueStatus[item.key] || {};
+                const counts = [
+                    { label: 'waiting', value: Number(summary.pendingTotal ?? 0), icon: ClockIcon, tone: '' },
+                    { label: 'running', value: Number(summary.running ?? 0), icon: ArrowPathIcon, tone: '' },
+                    { label: 'no data', value: Number(summary.noData ?? 0), icon: InformationCircleIcon, tone: 'warning' },
+                    { label: 'failed', value: Number(summary.failed ?? 0), icon: ExclamationTriangleIcon, tone: 'bad' },
+                ];
+                return (
+                    <div key={item.key} className="tools-queue-card">
+                        <div className="tools-queue-card-top">
+                            <span className="tools-queue-icon" aria-hidden="true">
+                                <item.icon className="tools-queue-icon-svg" />
+                            </span>
+                            <div className="tools-queue-card-copy">
+                                <span className="tools-queue-card-title">{item.label}</span>
+                                <span className="tools-queue-card-desc">{item.description}</span>
+                            </div>
+                        </div>
+                        <div className="tools-queue-counts">
+                            {counts.map((count) => (
+                                <span
+                                    key={count.label}
+                                    className={`tools-queue-chip${count.value === 0 ? ' is-zero' : count.tone ? ` tone-${count.tone}` : ''}`}
+                                    title={`${item.label}: ${count.value} ${count.label}`}
+                                >
+                                    <count.icon className="tools-queue-chip-icon" aria-hidden="true" />
+                                    <span className="tools-queue-chip-value">{count.value}</span>
+                                    <span className="tools-queue-chip-label">{count.label}</span>
+                                </span>
+                            ))}
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    );
+
+    const renderBrowserActionButtons = () => (
+        <div className="tools-action-grid" aria-label="Processing steps">
+            {browserActionButtons.map((item) => (
+                <button
+                    key={item.action}
+                    type="button"
+                    className="btn btn-soft tools-action-button"
+                    onClick={() => void runBrowserAction(item.action)}
+                    disabled={!!running}
+                    aria-busy={running === item.action}
+                >
+                    <item.icon className="toolbar-icon" aria-hidden="true" />
+                    {running === item.action ? 'Running…' : item.label}
+                </button>
+            ))}
+        </div>
+    );
+
+    const renderForceToggle = () => (
+        <button
+            type="button"
+            className={`btn btn-soft tools-force-button${forceRun ? ' active' : ''}`}
+            onClick={() => setForceRun((value) => !value)}
+            aria-pressed={forceRun}
+            title="Re-run steps even on photos that already have results"
+        >
+            <BoltIcon className="toolbar-icon" aria-hidden="true" />
+            {forceRun ? 'Force re-run: on' : 'Force re-run: off'}
+        </button>
+    );
+
     const renderProcessingFilters = () => (
         <div className="tools-filter-row" aria-label="Processing filters">
             <select
@@ -663,6 +805,27 @@ const ToolsPage: React.FC = () => {
         </div>
     );
 
+    const renderPhotoStatusRow = (photo: Photo, index: number, withOpenButton: boolean) => (
+        <div className="tools-photo-status-row" aria-label={`Processing status for ${photo.filename}`}>
+            <PhotoProcessingChip label="Thumbnail" status={getProcessingStatus(photo, 'thumbnail')} step="thumbnail" />
+            <PhotoProcessingChip label="EXIF" status={getProcessingStatus(photo, 'exif')} step="exif" />
+            <PhotoProcessingChip label="OCR" status={getProcessingStatus(photo, 'ocr')} step="ocr" />
+            <PhotoProcessingChip label="Vision" status={getProcessingStatus(photo, 'aiVision')} step="aiVision" />
+            <PhotoProcessingChip label="Map" status={getProcessingStatus(photo, 'mapDetection')} step="mapDetection" />
+            <PhotoProcessingChip label="Face" status={getProcessingStatus(photo, 'face')} step="face" />
+            <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.stopPropagation(); void toggleInfo(photo.filename); }} aria-label={`Toggle info for ${photo.filename}`} title={`Toggle info for ${photo.filename}`}>
+                <InformationCircleIcon className="toolbar-icon" />
+                <span className="sr-only">Toggle info for {photo.filename}</span>
+            </button>
+            {withOpenButton && (
+                <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.stopPropagation(); setViewerIndex(index); }} aria-label={`Open ${photo.filename}`} title={`Open ${photo.filename}`}>
+                    <MagnifyingGlassIcon className="toolbar-icon" />
+                    <span className="sr-only">Open {photo.filename}</span>
+                </button>
+            )}
+        </div>
+    );
+
     const renderOverviewPage = () => (
         <>
             <details
@@ -673,117 +836,59 @@ const ToolsPage: React.FC = () => {
                 <summary className="tools-panel-header tools-queue-summary">
                     <div>
                         <h2 className="tools-panel-title">Queue status</h2>
+                        <p className="tools-panel-meta">
+                            {queueUpdatedLabel ? `Updated ${queueUpdatedLabel} · ` : ''}refreshes every 30 seconds
+                        </p>
                     </div>
-                    <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.preventDefault(); void loadQueueStatus(); }} disabled={!!running} aria-label="Refresh queue status" title="Refresh queue status">
+                    <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.preventDefault(); void loadQueueStatus(); }} aria-label="Refresh queue status" title="Refresh queue status">
                         <ArrowPathIcon className="toolbar-icon" />
                         <span className="sr-only">Refresh queue status</span>
                     </button>
                 </summary>
-                <div className="tools-queue-grid">
-                    {queueStageCards.map((item) => {
-                        const summary = queueStatus[item.key] || {};
-                        const waitingTotal = Number(summary.pendingTotal ?? 0);
-                        return (
-                            <div key={item.key} className="tools-queue-card">
-                                <div className="tools-queue-card-top">
-                                    <span className="tools-queue-icon" aria-hidden="true">
-                                        <item.icon className="tools-queue-icon-svg" />
-                                    </span>
-                                </div>
-                                <div className="tools-queue-counts">
-                                    <span className="tools-queue-chip" aria-label={`Remaining ${waitingTotal}`} title={`Remaining ${waitingTotal}`}>
-                                        <ClockIcon className="tools-queue-chip-icon" aria-hidden="true" />
-                                        <span className="tools-queue-chip-value">{waitingTotal}</span>
-                                    </span>
-                                    <span className="tools-queue-chip" aria-label={`Running ${summary.running ?? 0}`} title={`Running ${summary.running ?? 0}`}>
-                                        <ArrowPathIcon className="tools-queue-chip-icon" aria-hidden="true" />
-                                        <span className="tools-queue-chip-value">{summary.running ?? 0}</span>
-                                    </span>
-                                    <span className="tools-queue-chip" aria-label={`No data ${summary.noData ?? 0}`} title={`No data ${summary.noData ?? 0}`}>
-                                        <InformationCircleIcon className="tools-queue-chip-icon" aria-hidden="true" />
-                                        <span className="tools-queue-chip-value">{summary.noData ?? 0}</span>
-                                    </span>
-                                    <span className="tools-queue-chip" aria-label={`Failed ${summary.failed ?? 0}`} title={`Failed ${summary.failed ?? 0}`}>
-                                        <ExclamationTriangleIcon className="tools-queue-chip-icon" aria-hidden="true" />
-                                        <span className="tools-queue-chip-value">{summary.failed ?? 0}</span>
-                                    </span>
-                                </div>
-                            </div>
-                        );
-                    })}
-                </div>
+                {queueLoadWarning && <p className="status error tools-queue-warning">{queueLoadWarning}</p>}
+                {renderQueueGrid()}
             </details>
 
             <div className="tools-panel tools-actions-panel">
                 <div className="tools-panel-header">
                     <div>
-                        <h2 className="tools-panel-title">Actions</h2>
+                        <h2 className="tools-panel-title">Run processing</h2>
+                        <p className="tools-panel-meta">
+                            {selected.size > 0
+                                ? `Runs on the ${plural(selected.size, 'selected photo')} below.`
+                                : 'Select photos below, then choose a step to run in this browser.'}
+                        </p>
                     </div>
+                    {renderForceToggle()}
                 </div>
-                <div className="tools-action-grid tools-icon-action-grid" aria-label="Tools actions">
-                    <button
-                        type="button"
-                        className={`btn btn-soft icon-btn tools-action-button${forceRun ? ' active' : ''}`}
-                        onClick={() => setForceRun((value) => !value)}
-                        aria-label="Force for all"
-                        aria-pressed={forceRun}
-                        title={forceRun ? 'Force for all on' : 'Force for all off'}
-                    >
-                        <BoltIcon className="toolbar-icon" />
-                        <span className="sr-only">{forceRun ? 'Force for all on' : 'Force for all off'}</span>
-                    </button>
-                    <button type="button" className="btn btn-soft icon-btn tools-action-button" onClick={() => void runBrowserAction('thumbnails')} aria-label="Run thumbnails" title="Run thumbnails">
-                        <PhotoIcon className="toolbar-icon" />
-                        <span className="sr-only">Run thumbnails</span>
-                    </button>
-                    <button type="button" className="btn btn-soft icon-btn tools-action-button" onClick={() => void runBrowserAction('ocr')} aria-label="Run OCR" title="Run OCR">
-                        <DocumentTextIcon className="toolbar-icon" />
-                        <span className="sr-only">Run OCR</span>
-                    </button>
-                    <button type="button" className="btn btn-soft icon-btn tools-action-button" onClick={() => void runBrowserAction('vision')} aria-label="Run vision" title="Run vision">
-                        <EyeIcon className="toolbar-icon" />
-                        <span className="sr-only">Run vision</span>
-                    </button>
-                    <button type="button" className="btn btn-soft icon-btn tools-action-button" onClick={() => void runBrowserAction('exif')} aria-label="Run exif" title="Run exif">
-                        <InformationCircleIcon className="toolbar-icon" />
-                        <span className="sr-only">Run exif</span>
-                    </button>
-                    <button type="button" className="btn btn-soft icon-btn tools-action-button" onClick={() => void runBrowserAction('map')} aria-label="Run geo" title="Run geo">
-                        <MapIcon className="toolbar-icon" />
-                        <span className="sr-only">Run geo</span>
-                    </button>
-                    <button type="button" className="btn btn-soft icon-btn tools-action-button" onClick={() => void runBrowserAction('faces')} aria-label="Run face" title="Run face">
-                        <UserCircleIcon className="toolbar-icon" />
-                        <span className="sr-only">Run face</span>
-                    </button>
-                <button type="button" className="btn btn-soft icon-btn tools-action-button" onClick={() => void runRebuildVectorIndex()} aria-label="Run vector rebuild" title="Run vector rebuild">
-                        <MagnifyingGlassIcon className="toolbar-icon" />
-                        <span className="sr-only">Run vector rebuild</span>
-                    </button>
-                    <button type="button" className="btn btn-soft icon-btn tools-action-button" onClick={() => void runReclusterPeople()} aria-label="Run reclustering" title="Run reclustering">
-                        <UsersIcon className="toolbar-icon" />
-                        <span className="sr-only">Run reclustering</span>
-                    </button>
-                </div>
-            </div>
-
-            <div className="tools-panel tools-filter-panel">
-                <div className="tools-panel-header">
-                    <div>
-                        <h2 className="tools-panel-title">Filters</h2>
-                    </div>
-                </div>
-                {renderProcessingFilters()}
+                {renderBrowserActionButtons()}
             </div>
 
             <div className="tools-panel tools-gallery-panel">
                 <div className="tools-panel-header">
                     <div>
-                        <h2 className="tools-panel-title">Preview</h2>
+                        <h2 className="tools-panel-title">Photos</h2>
+                        <p className="tools-panel-meta">{plural(overviewPhotos.length, 'photo')} shown · {selected.size} selected</p>
                     </div>
                     {renderWorkbenchViewToggle()}
                 </div>
-                {queueLoadWarning && <p className="status">{queueLoadWarning}</p>}
+                <div className="tools-filter-panel">
+                    {renderProcessingFilters()}
+                    <div className="tools-selection-actions">
+                        <button
+                            type="button"
+                            className="btn btn-soft"
+                            onClick={selectAllPreview}
+                            disabled={overviewPhotos.length === 0}
+                            aria-label={`Select all ${workbenchViewLabels[viewMode].toLowerCase()}`}
+                        >
+                            Select shown
+                        </button>
+                        <button type="button" className="btn btn-soft" onClick={clearSelection} disabled={selected.size === 0}>
+                            Clear selection
+                        </button>
+                    </div>
+                </div>
                 {loading && <Loading label="Loading photos…" fullPage={false} />}
                 {!loading && photos.length === 0 && (
                     <EmptyState
@@ -793,25 +898,6 @@ const ToolsPage: React.FC = () => {
                     />
                 )}
                 {!loading && photos.length > 0 && overviewPhotos.length === 0 && <p className="empty">No photos match the current filters.</p>}
-                <div className="tools-selection-actions">
-                    <button
-                        type="button"
-                        className="btn btn-soft"
-                        onClick={selectAllPreview}
-                        disabled={overviewPhotos.length === 0}
-                        aria-label={`Select all ${workbenchViewLabels[viewMode].toLowerCase()}`}
-                    >
-                        Select all
-                    </button>
-                    <button type="button" className="btn btn-soft" onClick={clearSelection} disabled={selected.size === 0}>
-                        Clear selection
-                    </button>
-                    <span className="tools-panel-meta">Selected photos: {selected.size}</span>
-                </div>
-                <div className="tools-panel-header tools-section-header">
-                    <h3 className="tools-panel-title">{workbenchViewLabels[viewMode]}</h3>
-                    <span className="tools-panel-meta">{overviewPhotos.length} shown</span>
-                </div>
                 <div className="gallery-grid">
                     {overviewPhotos.map((photo, index) => (
                         <PhotoTile
@@ -832,18 +918,7 @@ const ToolsPage: React.FC = () => {
                             onCardClick={() => setViewerIndex(index)}
                             bodyContent={(
                                 <>
-                                    <div className="tools-photo-status-row" aria-label={`Processing status for ${photo.filename}`}>
-                                        <PhotoProcessingChip label="Thumbnail" status={getProcessingStatus(photo, 'thumbnail')} step="thumbnail" />
-                                        <PhotoProcessingChip label="EXIF" status={getProcessingStatus(photo, 'exif')} step="exif" />
-                                        <PhotoProcessingChip label="OCR" status={getProcessingStatus(photo, 'ocr')} step="ocr" />
-                                        <PhotoProcessingChip label="VISION" status={getProcessingStatus(photo, 'aiVision')} step="aiVision" />
-                                        <PhotoProcessingChip label="MAP" status={getProcessingStatus(photo, 'mapDetection')} step="mapDetection" />
-                                        <PhotoProcessingChip label="FACE" status={getProcessingStatus(photo, 'face')} step="face" />
-                                        <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.stopPropagation(); void toggleInfo(photo.filename); }} aria-label={`Toggle info for ${photo.filename}`} title={`Toggle info for ${photo.filename}`}>
-                                            <InformationCircleIcon className="toolbar-icon" />
-                                            <span className="sr-only">Toggle info for {photo.filename}</span>
-                                        </button>
-                                    </div>
+                                    {renderPhotoStatusRow(photo, index, false)}
                                     {renderPhotoInfo(photo)}
                                 </>
                             )}
@@ -879,242 +954,196 @@ const ToolsPage: React.FC = () => {
             <div className="tools-panel-header">
                 <div>
                     <h2 className="tools-panel-title">Queue status</h2>
+                    <p className="tools-panel-meta">
+                        {queueUpdatedLabel ? `Updated ${queueUpdatedLabel} · ` : ''}refreshes every 30 seconds
+                    </p>
                 </div>
+                <button type="button" className="btn btn-soft icon-btn" onClick={() => void loadQueueStatus()} aria-label="Refresh queue status" title="Refresh queue status">
+                    <ArrowPathIcon className="toolbar-icon" />
+                    <span className="sr-only">Refresh queue status</span>
+                </button>
             </div>
-            <div className="tools-queue-grid">
-                {queueStageCards.map((item) => {
-                    const summary = queueStatus[item.key] || {};
-                    const waitingTotal = Number(summary.pendingTotal ?? 0);
-                    return (
-                        <div key={item.key} className="tools-queue-card">
-                            <div className="tools-queue-card-top">
-                                <span className="tools-queue-icon" aria-hidden="true">
-                                    <item.icon className="tools-queue-icon-svg" />
-                                </span>
-                            </div>
-                            <div className="tools-queue-counts">
-                                <span className="tools-queue-chip" aria-label={`Remaining ${waitingTotal}`} title={`Remaining ${waitingTotal}`}>
-                                    <ClockIcon className="tools-queue-chip-icon" aria-hidden="true" />
-                                    <span className="tools-queue-chip-value">{waitingTotal}</span>
-                                </span>
-                                <span className="tools-queue-chip" aria-label={`Running ${summary.running ?? 0}`} title={`Running ${summary.running ?? 0}`}>
-                                    <ArrowPathIcon className="tools-queue-chip-icon" aria-hidden="true" />
-                                    <span className="tools-queue-chip-value">{summary.running ?? 0}</span>
-                                </span>
-                                <span className="tools-queue-chip" aria-label={`No data ${summary.noData ?? 0}`} title={`No data ${summary.noData ?? 0}`}>
-                                    <InformationCircleIcon className="tools-queue-chip-icon" aria-hidden="true" />
-                                    <span className="tools-queue-chip-value">{summary.noData ?? 0}</span>
-                                </span>
-                                <span className="tools-queue-chip" aria-label={`Failed ${summary.failed ?? 0}`} title={`Failed ${summary.failed ?? 0}`}>
-                                    <ExclamationTriangleIcon className="tools-queue-chip-icon" aria-hidden="true" />
-                                    <span className="tools-queue-chip-value">{summary.failed ?? 0}</span>
-                                </span>
-                            </div>
-                        </div>
-                    );
-                })}
-            </div>
+            {queueLoadWarning && <p className="status error">{queueLoadWarning}</p>}
+            {renderQueueGrid()}
         </div>
     );
 
-    const renderBrowserWorkbenchPage = () => {
-        const selectedScopeLabel = runAll ? `all filtered photos` : 'selected photos';
-        const selectedCountLabel = runAll ? workbenchPhotos.length : selectedVisibleCount;
-        return (
-            <>
-                <div className="tools-panel tools-workbench-panel">
-                    <div className="tools-panel-header">
-                        <div>
-                            <h2 className="tools-panel-title">Browser workbench</h2>
+    const renderBrowserWorkbenchPage = () => (
+        <>
+            <div className="tools-panel tools-workbench-panel">
+                <div className="tools-panel-header">
+                    <div>
+                        <h2 className="tools-panel-title">Browser workbench</h2>
+                        <p className="tools-panel-meta">Re-run processing steps on many photos at once.</p>
+                    </div>
+                </div>
+
+                <div className="tools-controls-grid">
+                    <div className="tools-control-group">
+                        <span className="tools-control-label">Scope</span>
+                        <div className="tools-scope-group" role="group" aria-label="Processing scope">
+                            <button
+                                type="button"
+                                className={`btn btn-soft tools-scope-button${!runAll ? ' active' : ''}`}
+                                onClick={() => setRunAll(false)}
+                                aria-pressed={!runAll}
+                            >
+                                Selected ({selectedVisibleCount})
+                            </button>
+                            <button
+                                type="button"
+                                className={`btn btn-soft tools-scope-button${runAll ? ' active' : ''}`}
+                                onClick={() => setRunAll(true)}
+                                aria-pressed={runAll}
+                            >
+                                All in view ({workbenchPhotos.length})
+                            </button>
                         </div>
-                        <div className="tools-selection-actions">
-                            <button type="button" className="btn btn-soft" onClick={() => setRunAll((value) => !value)} aria-pressed={runAll}>
-                                {runAll ? `Selected photos (${selectedVisibleCount})` : `All filtered photos (${workbenchPhotos.length})`}
-                            </button>
-                            <button type="button" className="btn btn-soft" onClick={() => setForceRun((value) => !value)} aria-pressed={forceRun}>
-                                {forceRun ? 'Force rerun enabled' : 'Force rerun disabled'}
-                            </button>
+                        {!runAll && selectedOutsideViewCount > 0 && (
+                            <p className="tools-control-note">
+                                {plural(selectedOutsideViewCount, 'selected photo')} hidden by the current view will be skipped.
+                            </p>
+                        )}
+                    </div>
+                    <div className="tools-control-group">
+                        <span className="tools-control-label">Options</span>
+                        <div className="tools-control-row">
+                            {renderForceToggle()}
                             <button type="button" className="btn btn-soft" onClick={clearSelection} disabled={selected.size === 0}>
                                 Clear selection
                             </button>
                         </div>
                     </div>
-
-                    <div className="tools-selection-actions" aria-label="Browser processing actions">
-                        <button type="button" className="btn btn-soft" onClick={() => void runBrowserAction('thumbnails')} disabled={!!running}>
-                            Run thumbnails on {selectedScopeLabel}
-                        </button>
-                        <button type="button" className="btn btn-soft" onClick={() => void runBrowserAction('exif')} disabled={!!running}>
-                            Run EXIF on {selectedScopeLabel}
-                        </button>
-                        <button type="button" className="btn btn-soft" onClick={() => void runBrowserAction('ocr')} disabled={!!running}>
-                            Run OCR on {selectedScopeLabel}
-                        </button>
-                        <button type="button" className="btn btn-soft" onClick={() => void runBrowserAction('vision')} disabled={!!running}>
-                            Run AI vision on {selectedScopeLabel}
-                        </button>
-                        <button type="button" className="btn btn-soft" onClick={() => void runBrowserAction('map')} disabled={!!running}>
-                            Run map tagging on {selectedScopeLabel}
-                        </button>
-                        <button type="button" className="btn btn-soft" onClick={() => void runBrowserAction('faces')} disabled={!!running}>
-                            Run face detection on {selectedScopeLabel}
-                        </button>
-                    </div>
-
-                    <div className="tools-panel-meta">
-                        Scope count: {selectedCountLabel}
-                        {selectedOutsideViewCount > 0 ? ` · ${selectedOutsideViewCount} selected outside this view` : ''}
-                    </div>
-
-                    <div className="tools-filter-panel">
+                    <div className="tools-control-group">
+                        <span className="tools-control-label">View</span>
                         {renderWorkbenchViewToggle()}
+                    </div>
+                    <div className="tools-control-group">
+                        <span className="tools-control-label">Filters</span>
                         {renderProcessingFilters()}
                     </div>
                 </div>
 
-                <div className="tools-panel tools-gallery-panel">
-                    <div className="tools-panel-header">
-                        <div>
-                            <h2 className="tools-panel-title">Gallery</h2>
-                        </div>
-                    </div>
-
-                    {loading && <Loading label="Loading photos…" fullPage={false} />}
-                    {!loading && workbenchPhotos.length === 0 && (
-                        <EmptyState icon={<PhotoIcon />} title="Nothing to work on" message="No photos match this view right now." />
-                    )}
-
-                    <div className="gallery-grid">
-                        {workbenchPhotos.map((photo, index) => {
-                            const selectedFlag = selected.has(photo.filename);
-                            return (
-                                <PhotoTile
-                                    key={photo.filename}
-                                    photo={photo}
-                                    title={photo.filename}
-                                    selected={selectedFlag}
-                                    onCardClick={() => toggleOne(photo.filename)}
-                                    selectableOverlay={(
-                                        <input
-                                            type="checkbox"
-                                            aria-label={`Toggle ${photo.filename}`}
-                                            checked={selectedFlag}
-                                            onChange={() => toggleOne(photo.filename)}
-                                        />
-                                    )}
-                            bodyContent={(
-                                        <>
-                                            <div className="tools-photo-status-row" aria-label={`Processing status for ${photo.filename}`}>
-                                                <PhotoProcessingChip label="Thumbnail" status={getProcessingStatus(photo, 'thumbnail')} step="thumbnail" />
-                                                <PhotoProcessingChip label="EXIF" status={getProcessingStatus(photo, 'exif')} step="exif" />
-                                                <PhotoProcessingChip label="OCR" status={getProcessingStatus(photo, 'ocr')} step="ocr" />
-                                                <PhotoProcessingChip label="VISION" status={getProcessingStatus(photo, 'aiVision')} step="aiVision" />
-                                                <PhotoProcessingChip label="MAP" status={getProcessingStatus(photo, 'mapDetection')} step="mapDetection" />
-                                                <PhotoProcessingChip label="FACE" status={getProcessingStatus(photo, 'face')} step="face" />
-                                                <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.stopPropagation(); void toggleInfo(photo.filename); }} aria-label={`Toggle info for ${photo.filename}`} title={`Toggle info for ${photo.filename}`}>
-                                                    <InformationCircleIcon className="toolbar-icon" />
-                                                    <span className="sr-only">Toggle info for {photo.filename}</span>
-                                                </button>
-                                                <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.stopPropagation(); setViewerIndex(index); }} aria-label={`Open ${photo.filename}`} title={`Open ${photo.filename}`}>
-                                                    <MagnifyingGlassIcon className="toolbar-icon" />
-                                                    <span className="sr-only">Open {photo.filename}</span>
-                                                </button>
-                                            </div>
-                                            {renderPhotoInfo(photo)}
-                                        </>
-                                    )}
-                                />
-                            );
-                        })}
-                    </div>
-                    {hasMorePhotos && viewMode !== 'recent' && (
-                        <div className="tools-load-more">
-                            <button
-                                type="button"
-                                className="btn btn-soft"
-                                onClick={() => void loadMorePhotos()}
-                                disabled={loadingMore}
-                            >
-                                {loadingMore ? 'Loading…' : `Load more (${photos.length} of ${photosTotal})`}
-                            </button>
-                        </div>
-                    )}
+                <div className="tools-control-group">
+                    <span className="tools-control-label">Run a step</span>
+                    {renderBrowserActionButtons()}
                 </div>
+            </div>
 
-                {viewerIndex !== null && workbenchPhotos[viewerIndex] && (
-                    <PhotoViewer
-                        photos={workbenchPhotos}
-                        index={viewerIndex}
-                        onClose={() => setViewerIndex(null)}
-                        onIndexChange={(index: number) => setViewerIndex(index)}
-                    />
-                )}
-            </>
-        );
-    };
-
-    const renderRecoveryPage = () => (
-        <>
-            <div className="tools-panel">
+            <div className="tools-panel tools-gallery-panel">
                 <div className="tools-panel-header">
                     <div>
-                        <h2 className="tools-panel-title">Recovery checklist</h2>
-                    </div>
-                    <div className="tools-hero-actions">
-                        <Link to="/tools/queue-status" className="btn btn-soft">
-                            Queue status
-                        </Link>
+                        <h2 className="tools-panel-title">Photos</h2>
+                        <p className="tools-panel-meta">{plural(workbenchPhotos.length, 'photo')} in view · {selectedVisibleCount} selected</p>
                     </div>
                 </div>
+
+                {loading && <Loading label="Loading photos…" fullPage={false} />}
+                {!loading && workbenchPhotos.length === 0 && (
+                    <EmptyState icon={<PhotoIcon />} title="Nothing to work on" message="No photos match this view right now." />
+                )}
+
+                <div className="gallery-grid">
+                    {workbenchPhotos.map((photo, index) => {
+                        const selectedFlag = selected.has(photo.filename);
+                        return (
+                            <PhotoTile
+                                key={photo.filename}
+                                photo={photo}
+                                title={photo.filename}
+                                selected={selectedFlag}
+                                onCardClick={() => toggleOne(photo.filename)}
+                                selectableOverlay={(
+                                    <input
+                                        type="checkbox"
+                                        aria-label={`Toggle ${photo.filename}`}
+                                        checked={selectedFlag}
+                                        onClick={(event) => event.stopPropagation()}
+                                        onChange={() => toggleOne(photo.filename)}
+                                    />
+                                )}
+                                bodyContent={(
+                                    <>
+                                        {renderPhotoStatusRow(photo, index, true)}
+                                        {renderPhotoInfo(photo)}
+                                    </>
+                                )}
+                            />
+                        );
+                    })}
+                </div>
+                {hasMorePhotos && viewMode !== 'recent' && (
+                    <div className="tools-load-more">
+                        <button
+                            type="button"
+                            className="btn btn-soft"
+                            onClick={() => void loadMorePhotos()}
+                            disabled={loadingMore}
+                        >
+                            {loadingMore ? 'Loading…' : `Load more (${photos.length} of ${photosTotal})`}
+                        </button>
+                    </div>
+                )}
             </div>
 
-            <details open className="tools-panel tools-admin">
-                <summary className="tools-admin-summary">
-                    <div>
-                        <div className="tools-panel-title">Recovery</div>
-                    </div>
-                    <span className="tools-admin-summary-badge">Use sparingly</span>
-                </summary>
-                <div className="tools-admin-body">
-                    <div className="tools-admin-callout">
-                        <ExclamationTriangleIcon className="tools-admin-callout-icon" />
-                        <p>
-                            Only use repair actions when clustering or the vector index needs a snapshot-backed reset.
-                        </p>
-                    </div>
-                    <div className="tools-admin-grid">
-                        <button type="button" className="btn btn-soft icon-btn tools-admin-button" onClick={() => void runReclusterPeople()} disabled={!!running} aria-label="Protected people recluster repair" title="Protected people recluster repair">
-                            <UsersIcon className="toolbar-icon" />
-                            <span className="sr-only">Protected people recluster repair</span>
-                        </button>
-                        <button type="button" className="btn btn-soft icon-btn tools-admin-button" onClick={() => void runRebuildVectorIndex()} disabled={!!running} aria-label="Rebuild vector index" title="Rebuild vector index">
-                            <ArrowPathIcon className="toolbar-icon" />
-                            <span className="sr-only">Rebuild vector index</span>
-                        </button>
-                        <Link to="/people" className="btn btn-soft icon-btn tools-admin-link" aria-label="Open People page" title="Open People page">
-                            <UserCircleIcon className="toolbar-icon" />
-                            <span className="sr-only">Open People page</span>
-                        </Link>
-                    </div>
-                </div>
-            </details>
-
-            <div className="tools-workbench-footnote">
-                <div className="tools-selection-actions">
-                    <Link to="/tools/queue-status" className="tools-inline-link">Open queue status</Link>
-                </div>
-            </div>
+            {viewerIndex !== null && workbenchPhotos[viewerIndex] && (
+                <PhotoViewer
+                    photos={workbenchPhotos}
+                    index={viewerIndex}
+                    onClose={() => setViewerIndex(null)}
+                    onIndexChange={(index: number) => setViewerIndex(index)}
+                />
+            )}
         </>
+    );
+
+    const renderRecoveryPage = () => (
+        <div className="tools-panel">
+            <div className="tools-panel-header">
+                <div>
+                    <h2 className="tools-panel-title">Recovery actions</h2>
+                    <p className="tools-panel-meta">Snapshot-backed repairs for face clustering and search indexes.</p>
+                </div>
+                <span className="tools-admin-summary-badge">Use sparingly</span>
+            </div>
+            <div className="tools-recovery-body">
+                <div className="tools-admin-callout">
+                    <ExclamationTriangleIcon className="tools-admin-callout-icon" />
+                    <p>
+                        Only use repair actions when clustering or the vector index needs a snapshot-backed reset.
+                        Each action asks for confirmation before it runs.
+                    </p>
+                </div>
+                <button type="button" className="btn btn-soft tools-admin-button" onClick={() => void runReclusterPeople()} disabled={!!running}>
+                    <UsersIcon className="toolbar-icon" aria-hidden="true" />
+                    <span className="tools-admin-button-copy">
+                        <strong>Repair people clusters</strong>
+                        <span>Snapshots current assignments, then re-clusters detected faces.</span>
+                    </span>
+                </button>
+                <button type="button" className="btn btn-soft tools-admin-button" onClick={() => void runRebuildVectorIndex()} disabled={!!running}>
+                    <ArrowPathIcon className="toolbar-icon" aria-hidden="true" />
+                    <span className="tools-admin-button-copy">
+                        <strong>Rebuild vector index</strong>
+                        <span>Refreshes the on-disk index from the latest face embeddings.</span>
+                    </span>
+                </button>
+                <Link to="/people" className="btn btn-soft tools-admin-link">
+                    <UserCircleIcon className="toolbar-icon" aria-hidden="true" />
+                    <span>Review people after a repair</span>
+                </Link>
+            </div>
+        </div>
     );
 
     return (
         <section className="gallery-wrap card-glass tools-wrap">
+            {renderToolsHeader()}
+            {renderStatusArea()}
             {isOverviewPage && renderOverviewPage()}
             {isQueueStatusPage && renderQueueStatusPage()}
             {isBrowserWorkbenchPage && renderBrowserWorkbenchPage()}
             {isRecoveryPage && renderRecoveryPage()}
-            {running && <p className="status">Queueing '{running}'…</p>}
-            {message && <p className={`status ${message.includes('failed') ? 'error' : 'success'}`}>{message}</p>}
         </section>
     );
 };
