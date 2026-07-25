@@ -31,6 +31,7 @@ import {
 } from './browserAiShared';
 import { FILE_ACCEPT_FILTER, requiresBackendPreview } from '../utils/photoDisplay';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
+import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 
 type PhotoGalleryRuntime = typeof import('./PhotoGallery');
 type BlockBlobClientCtor = typeof import('@azure/storage-blob')['BlockBlobClient'];
@@ -187,6 +188,9 @@ const getUploadErrorMessage = (err: unknown, fallback: string): string => {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const WARMUP_POLL_INTERVAL_MS = 5000;
 const BACKEND_KEEPALIVE_INTERVAL_MS = 30000;
+// While a batch is draining, the keep-alive heartbeat worker drives the loop at
+// this cadence so it keeps running at full speed in a hidden/minimized tab.
+const BROWSER_PROCESSING_HEARTBEAT_INTERVAL_MS = 1000;
 const browserProcessingActionSteps: Record<BrowserProcessingAction, string[]> = {
     thumbnails: ['thumbnail'],
     exif: ['exif'],
@@ -604,6 +608,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const browserProcessingTimerRef = useRef<number | null>(null);
     const browserProcessingDeferredRef = useRef<Map<string, number>>(new Map());
     const browserProcessingNotificationRef = useRef<BrowserProcessingNotificationState | null>(null);
+    const keepAliveRef = useRef<BackgroundKeepAlive | null>(null);
+    const pumpBrowserProcessingRef = useRef<(() => void) | null>(null);
 
     const addNotification = useCallback((title: string, details: string, progress?: UploadProgress) => {
         const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -842,7 +848,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 : await get('/upload/processing/pending?limit=1');
             const pending = Array.isArray(pendingResponse?.pending) ? pendingResponse.pending : [];
             if (pending.length === 0) {
+                // Queue drained: release the background keep-alive so the tab stops
+                // holding a wake lock / silent audio while idle. Any faces that were
+                // deferred (a rare genuine throttle/failure) are retried when the tab
+                // next becomes visible.
+                keepAliveRef.current?.stop();
                 return 0;
+            }
+            // There is work to drain: keep the tab processing at full speed even
+            // when it is hidden/minimized. Only meaningful once on-device AI is on.
+            if (browserAiModelStateRef.current.status === 'available') {
+                keepAliveRef.current?.start();
             }
             const pendingTotal = Number(pendingResponse?.totalPending);
             const isAutomaticPull = requestedFilenames.length === 0;
@@ -1086,6 +1102,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return current;
         }
         browserAiLoadInFlightRef.current = true;
+        // Enabling browser AI is a user gesture -- unlock the silent-audio keep-alive
+        // now so it can later resume (outside a gesture) to defeat background-tab
+        // throttling while photos are processed.
+        keepAliveRef.current?.primeAudio();
         setBrowserAiModelState(browserAiLoadingState(current));
         // Warm the native face models (BlazeFace/ArcFace) alongside the vision worker
         // so all on-device AI is ready together once the user opts in.
@@ -1128,6 +1148,30 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         return browserAiModelStateRef.current;
     }, [addNotification, updateNotification, startBrowserProcessing]);
+
+    // Driven by the keep-alive heartbeat worker on every tick. startBrowserProcessing
+    // self-guards against overlapping runs, so a no-op tick is cheap.
+    const pumpBrowserProcessing = useCallback(() => {
+        void startBrowserProcessing();
+    }, [startBrowserProcessing]);
+
+    useEffect(() => {
+        pumpBrowserProcessingRef.current = pumpBrowserProcessing;
+    }, [pumpBrowserProcessing]);
+
+    // Own a single keep-alive controller for the lifetime of the provider. It is
+    // started/stopped from startBrowserProcessing as the queue gains/loses work.
+    useEffect(() => {
+        const keepAlive = new BackgroundKeepAlive({
+            onTick: () => pumpBrowserProcessingRef.current?.(),
+            intervalMs: BROWSER_PROCESSING_HEARTBEAT_INTERVAL_MS,
+        });
+        keepAliveRef.current = keepAlive;
+        return () => {
+            keepAlive.dispose();
+            keepAliveRef.current = null;
+        };
+    }, []);
 
     useEffect(() => {
         if (browserAiModelState.status !== 'available' || browserProcessingDeferredRef.current.size === 0) {

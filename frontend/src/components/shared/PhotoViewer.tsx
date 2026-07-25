@@ -631,7 +631,12 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         setZoom(1);
         setPan({ x: 0, y: 0 });
         setIsPanning(false);
-    }, [activePhoto]);
+        // Key on the photo identity, not the object reference: a metadata-only update such
+        // as saving a rotation replaces the photo object while keeping the same filename and
+        // media URL. Re-running this reset then would flip mediaLoading back on without the
+        // <img> (whose src is unchanged) ever firing onLoad to clear it, leaving the preview
+        // stuck under the loading overlay until you navigate away and back.
+    }, [activePhoto?.filename]);
 
     useEffect(() => {
         if (!activePhoto || !imageUrl) {
@@ -639,7 +644,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         }
         setMediaLoading(true);
         setMediaError(null);
-    }, [activePhoto, imageUrl]);
+    }, [activePhoto?.filename, imageUrl]);
 
     useEffect(() => () => {
         objectUrlsRef.current.forEach((url) => {
