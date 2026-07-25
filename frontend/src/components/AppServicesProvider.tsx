@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { BellIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { BellIcon, SpeakerWaveIcon, SpeakerXMarkIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { get, getUpload, post, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import type {
@@ -32,6 +32,19 @@ import {
 import { FILE_ACCEPT_FILTER, requiresBackendPreview } from '../utils/photoDisplay';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
+
+// Persist the user's keep-alive mute choice across reloads. Default (no key) is
+// unmuted, so the anti-throttling audio works out of the box; users who dislike
+// the faint tone can silence it.
+const KEEPALIVE_MUTE_STORAGE_KEY = 'photostore.backgroundKeepAlive.muted';
+const readKeepAliveMutedPreference = (): boolean => {
+    try {
+        return typeof localStorage !== 'undefined'
+            && localStorage.getItem(KEEPALIVE_MUTE_STORAGE_KEY) === '1';
+    } catch {
+        return false;
+    }
+};
 
 type PhotoGalleryRuntime = typeof import('./PhotoGallery');
 type BlockBlobClientCtor = typeof import('@azure/storage-blob')['BlockBlobClient'];
@@ -146,6 +159,9 @@ interface AppServicesContextValue {
     registerUploadCompletionHandler: (handler: () => void | Promise<void>) => () => void;
     registerUploadErrorHandler: (handler: (message: string | null) => void) => () => void;
     startBrowserProcessing: (options?: BrowserProcessingStartOptions) => Promise<number>;
+    backgroundKeepAliveActive: boolean;
+    backgroundKeepAliveMuted: boolean;
+    setBackgroundKeepAliveMuted: (muted: boolean) => void;
 }
 
 export type BrowserProcessingAction = 'thumbnails' | 'exif' | 'ocr' | 'vision' | 'map' | 'faces';
@@ -483,6 +499,40 @@ export const NotificationBell: React.FC = () => {
     );
 };
 
+// Shown only while a batch is draining on-device (keep-alive active). Signals
+// that processing keeps running in a hidden/minimized tab, and exposes a toggle
+// to mute the near-silent audio that secures that (at the cost of possible
+// throttling once hidden).
+export const BackgroundActivityIndicator: React.FC = () => {
+    const { backgroundKeepAliveActive, backgroundKeepAliveMuted, setBackgroundKeepAliveMuted } = useAppServices();
+    if (!backgroundKeepAliveActive) {
+        return null;
+    }
+    const muteLabel = backgroundKeepAliveMuted
+        ? 'Unmute background processing audio'
+        : 'Mute background processing audio';
+    return (
+        <div className="bg-activity" role="status" aria-live="polite">
+            <span className="bg-activity-pulse" aria-hidden="true" />
+            <span className="bg-activity-label">Processing in background</span>
+            <button
+                type="button"
+                onClick={() => setBackgroundKeepAliveMuted(!backgroundKeepAliveMuted)}
+                className="btn btn-soft icon-btn bg-activity-mute"
+                aria-label={muteLabel}
+                title={backgroundKeepAliveMuted
+                    ? 'Keep-alive audio is muted — a hidden tab may be throttled. Click to unmute.'
+                    : 'Playing near-silent audio so processing keeps running in background tabs. Click to mute.'}
+            >
+                {backgroundKeepAliveMuted
+                    ? <SpeakerXMarkIcon className="toolbar-icon" />
+                    : <SpeakerWaveIcon className="toolbar-icon" />}
+                <span className="sr-only">{muteLabel}</span>
+            </button>
+        </div>
+    );
+};
+
 const shouldRetryBrowserFaceProcessing = (statuses: Record<string, unknown>): boolean => {
     const faceStatus = String(statuses?.face || statuses?.face_status || '').trim().toLowerCase();
     const faceDeferredReason = String(statuses?.faceDeferredReason || statuses?.clientFaceDeferredReason || '').trim().toLowerCase();
@@ -610,6 +660,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const browserProcessingNotificationRef = useRef<BrowserProcessingNotificationState | null>(null);
     const keepAliveRef = useRef<BackgroundKeepAlive | null>(null);
     const pumpBrowserProcessingRef = useRef<(() => void) | null>(null);
+    const [backgroundKeepAliveActive, setBackgroundKeepAliveActive] = useState<boolean>(false);
+    const [backgroundKeepAliveMuted, setBackgroundKeepAliveMuted] = useState<boolean>(readKeepAliveMutedPreference);
 
     const addNotification = useCallback((title: string, details: string, progress?: UploadProgress) => {
         const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -843,6 +895,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     : [];
             const requestedFilenames = requestedItems.map((item) => item.filename);
             const requestedSteps = buildRequestedBrowserProcessingSteps(options.actions);
+            const isAutomaticPull = requestedFilenames.length === 0;
+            // When browser AI isn't loaded, skip the automatic background pull: it
+            // would download pending images just to run baseline (thumbnail/EXIF/
+            // geocode) steps. Explicit, user-initiated requests still run so on-demand
+            // actions work regardless of model state; automatic backfill (including
+            // baseline steps) resumes once the model becomes available.
+            if (isAutomaticPull && browserAiModelStateRef.current.status !== 'available') {
+                keepAliveRef.current?.stop();
+                return 0;
+            }
             const pendingResponse = requestedFilenames.length > 0
                 ? { pending: requestedItems.map((item) => ({ ...item, statuses: {} })) }
                 : await get('/upload/processing/pending?limit=1');
@@ -861,7 +923,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 keepAliveRef.current?.start();
             }
             const pendingTotal = Number(pendingResponse?.totalPending);
-            const isAutomaticPull = requestedFilenames.length === 0;
             const totalCount = isAutomaticPull && Number.isFinite(pendingTotal)
                 ? Math.max(pending.length, pendingTotal)
                 : pending.length;
@@ -1165,12 +1226,36 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const keepAlive = new BackgroundKeepAlive({
             onTick: () => pumpBrowserProcessingRef.current?.(),
             intervalMs: BROWSER_PROCESSING_HEARTBEAT_INTERVAL_MS,
+            onStateChange: (state) => {
+                setBackgroundKeepAliveActive(state.active);
+                setBackgroundKeepAliveMuted(state.muted);
+            },
         });
+        // Apply the persisted mute preference before any batch can start.
+        keepAlive.setMuted(readKeepAliveMutedPreference());
         keepAliveRef.current = keepAlive;
         return () => {
             keepAlive.dispose();
             keepAliveRef.current = null;
         };
+    }, []);
+
+    const setBackgroundKeepAliveMutedPreference = useCallback((muted: boolean) => {
+        try {
+            if (typeof localStorage !== 'undefined') {
+                if (muted) {
+                    localStorage.setItem(KEEPALIVE_MUTE_STORAGE_KEY, '1');
+                } else {
+                    localStorage.removeItem(KEEPALIVE_MUTE_STORAGE_KEY);
+                }
+            }
+        } catch {
+            // Persistence is best-effort; ignore quota/availability failures.
+        }
+        // setMuted fires onStateChange when it changes; also set here so the UI
+        // stays correct even if the controller isn't mounted yet.
+        keepAliveRef.current?.setMuted(muted);
+        setBackgroundKeepAliveMuted(muted);
     }, []);
 
     useEffect(() => {
@@ -1993,6 +2078,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         registerUploadCompletionHandler,
         registerUploadErrorHandler,
         startBrowserProcessing,
+        backgroundKeepAliveActive,
+        backgroundKeepAliveMuted,
+        setBackgroundKeepAliveMuted: setBackgroundKeepAliveMutedPreference,
     }), [
         notifications,
         unreadCount,
@@ -2015,6 +2103,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         registerUploadCompletionHandler,
         registerUploadErrorHandler,
         startBrowserProcessing,
+        backgroundKeepAliveActive,
+        backgroundKeepAliveMuted,
+        setBackgroundKeepAliveMutedPreference,
     ]);
 
     return (

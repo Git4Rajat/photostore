@@ -27,6 +27,17 @@ type WakeLockNavigator = Navigator & {
 
 type AudioContextCtor = typeof AudioContext;
 
+// Peak amplitude of the keep-alive tone. It must sit ABOVE the level
+// Chromium/Edge treat as "audible" (~ -72 dBFS in the AudioPowerMonitor),
+// because those browsers grant the background-timer throttling exemption ONLY
+// while the tab is audible -- i.e. only while they show the tab's audio icon.
+// A truly inaudible tone (the previous 0.0001 ~ -80 dBFS) is classified as
+// silence and earns no exemption at all, so the audio leg did nothing. 0.01
+// (~ -40 dBFS) clears the threshold with wide margin while staying extremely
+// quiet. The tab's audio icon appearing is the definitive check that the
+// exemption is in force; tune here if a browser needs a higher/lower level.
+const KEEPALIVE_AUDIO_GAIN = 0.01;
+
 const getAudioContextCtor = (): AudioContextCtor | null => {
     if (typeof window === 'undefined') {
         return null;
@@ -38,19 +49,33 @@ const getAudioContextCtor = (): AudioContextCtor | null => {
     return scoped.AudioContext || scoped.webkitAudioContext || null;
 };
 
+// Observable state, surfaced to the UI (a "processing in background" indicator
+// and a mute toggle) via onStateChange.
+export type BackgroundKeepAliveState = {
+    // A batch is draining, so the keep-alive mechanisms are engaged.
+    active: boolean;
+    // The user silenced the anti-throttling audio. Everything else still runs,
+    // but a hidden tab may be throttled after ~5 min without the audio exemption.
+    muted: boolean;
+};
+
 export type BackgroundKeepAliveOptions = {
     // Invoked on every heartbeat tick while the controller is active. Should be
     // cheap and self-guarding against re-entrancy (the processing loop already
     // ignores overlapping calls via an in-flight ref).
     onTick: () => void;
     intervalMs?: number;
+    // Invoked whenever active/muted state changes so the UI can reflect it.
+    onStateChange?: (state: BackgroundKeepAliveState) => void;
 };
 
 export class BackgroundKeepAlive {
     private readonly onTick: () => void;
     private readonly intervalMs: number;
+    private readonly onStateChange?: (state: BackgroundKeepAliveState) => void;
 
     private active = false;
+    private muted = false;
     private worker: Worker | null = null;
     private fallbackTimer: number | null = null;
 
@@ -63,10 +88,41 @@ export class BackgroundKeepAlive {
     constructor(options: BackgroundKeepAliveOptions) {
         this.onTick = options.onTick;
         this.intervalMs = Math.max(250, options.intervalMs ?? 1000);
+        this.onStateChange = options.onStateChange;
     }
 
     isActive(): boolean {
         return this.active;
+    }
+
+    isMuted(): boolean {
+        return this.muted;
+    }
+
+    getState(): BackgroundKeepAliveState {
+        return { active: this.active, muted: this.muted };
+    }
+
+    // Silence (or restore) the anti-throttling audio without affecting the
+    // heartbeat worker or wake lock. Persisting the preference is the caller's
+    // job. Safe to call whether or not a batch is currently active.
+    setMuted(muted: boolean): void {
+        if (this.muted === muted) {
+            return;
+        }
+        this.muted = muted;
+        if (this.active) {
+            if (muted) {
+                this.suspendAudio();
+            } else {
+                this.resumeAudio();
+            }
+        }
+        this.emitState();
+    }
+
+    private emitState(): void {
+        this.onStateChange?.(this.getState());
     }
 
     // Must be called from within a user gesture (e.g. the "enable browser AI"
@@ -80,9 +136,9 @@ export class BackgroundKeepAlive {
                 return;
             }
             void context.resume().then(() => {
-                // Leave it suspended until a batch actually starts, unless one is
-                // already running.
-                if (!this.active && context.state === 'running') {
+                // Leave it suspended until a batch actually starts (and stay
+                // suspended while muted), unless one is already running unmuted.
+                if ((!this.active || this.muted) && context.state === 'running') {
                     void context.suspend().catch(() => undefined);
                 }
             }).catch(() => undefined);
@@ -97,9 +153,11 @@ export class BackgroundKeepAlive {
         }
         this.active = true;
         this.startHeartbeat();
+        // resumeAudio() is a no-op while muted.
         this.resumeAudio();
         void this.acquireWakeLock();
         this.bindVisibilityListener();
+        this.emitState();
     }
 
     stop(): void {
@@ -111,6 +169,7 @@ export class BackgroundKeepAlive {
         this.suspendAudio();
         void this.releaseWakeLock();
         this.unbindVisibilityListener();
+        this.emitState();
     }
 
     // Full teardown for unmount: also disposes the audio graph and worker.
@@ -202,10 +261,10 @@ export class BackgroundKeepAlive {
         }
         const context = new Ctor();
         const gain = context.createGain();
-        // Well below the threshold of human hearing (~ -80dB) but still a real,
-        // non-zero signal so the tab registers as "producing audio" and earns
-        // the throttling exemption.
-        gain.gain.value = 0.0001;
+        // Above Chromium/Edge's audibility threshold so the tab counts as
+        // "producing audio" and earns the throttling exemption (see
+        // KEEPALIVE_AUDIO_GAIN), yet still extremely quiet.
+        gain.gain.value = KEEPALIVE_AUDIO_GAIN;
         const oscillator = context.createOscillator();
         oscillator.frequency.value = 440;
         oscillator.connect(gain);
@@ -215,6 +274,9 @@ export class BackgroundKeepAlive {
     }
 
     private resumeAudio(): void {
+        if (this.muted) {
+            return;
+        }
         try {
             this.ensureAudioGraph();
             if (this.audioContext && this.audioContext.state !== 'running') {

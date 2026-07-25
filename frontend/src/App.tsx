@@ -12,7 +12,7 @@ import {
     SunIcon,
     XMarkIcon,
 } from '@heroicons/react/24/outline';
-import { AppServicesProvider, NotificationBell, useAppServices } from './components/AppServicesProvider';
+import { AppServicesProvider, BackgroundActivityIndicator, NotificationBell, useAppServices } from './components/AppServicesProvider';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
 import { getMine } from './services/libraryClient';
 import { getRuntimeConfig } from './config/appConfig';
@@ -174,6 +174,8 @@ const RootServiceActions: React.FC = () => {
                     <span className="sr-only">Stop upload</span>
                 </button>
             )}
+
+            <BackgroundActivityIndicator />
 
             <NotificationBell />
         </div>
