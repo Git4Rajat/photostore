@@ -50,6 +50,23 @@ export const PHOTO_CACHE_STORAGE_KEY = 'photostore.photo.cache.v1';
 const PHOTO_CACHE_MAX_AGE_MS = 1000 * 60 * 30;
 const PHOTO_LIST_REQUEST_TIMEOUT_MS = 15000;
 
+// A scale-to-zero backend can take up to a minute to answer the first request
+// after inactivity. Those failures look like timeouts / network errors / 5xx
+// gateway errors, so we retry them a few times behind a "waking up" message
+// instead of dumping the raw axios error on the user.
+const COLD_START_RETRY_PATTERN = /timeout|timed out|network error|econnaborted|err_network|failed to fetch|socket hang up|502|503|504|gateway|unavailable/i;
+const COLD_START_MAX_RETRIES = 5;
+const coldStartRetryDelayMs = (attempt: number) => Math.min(2000 * attempt, 8000);
+const isColdStartError = (err: unknown): boolean => {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        return true;
+    }
+    const message = typeof err === 'string'
+        ? err
+        : (err instanceof Error ? err.message : String((err as { message?: unknown })?.message ?? err ?? ''));
+    return COLD_START_RETRY_PATTERN.test(message);
+};
+
 export const formatBytes = (bytes: number) => {
     if (!Number.isFinite(bytes) || bytes <= 0) {
         return '0 B';
@@ -3623,6 +3640,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [loading, setLoading] = useState<boolean>(false);
     const [loadingMore, setLoadingMore] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
+    const [warmingUp, setWarmingUp] = useState<boolean>(false);
     const [searchNotice, setSearchNotice] = useState<string | null>(null);
     const [sortBy, setSortBy] = useState<string>(cachedBoot?.sortBy || 'date');
     const [offset, setOffset] = useState<number>(cachedBoot?.offset || 0);
@@ -3653,7 +3671,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             if (normalized.includes('401') || normalized.includes('unauthorized')) {
                 return 'Please sign in to view photos.';
             }
+            if (isColdStartError(err)) {
+                return 'The server is taking longer than usual to respond — it may be waking up after a period of inactivity. Please try again in a moment.';
+            }
             return err;
+        }
+        if (isColdStartError(err)) {
+            return 'The server is taking longer than usual to respond — it may be waking up after a period of inactivity. Please try again in a moment.';
         }
         return 'Unable to load photos.';
     };
@@ -3714,31 +3738,56 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             setError(null);
             setHasMore(true);
             setServerTotalLoaded(false);
+            setWarmingUp(false);
         } else {
             setLoadingMore(true);
         }
 
-        try {
-            let response;
-            const trimmedQuery = queryText.trim();
-            const captureQuery = buildCaptureQuery();
+        const trimmedQuery = queryText.trim();
+        const captureQuery = buildCaptureQuery();
+        const requestPhotoPage = () => {
             if (trimmedQuery) {
-                response = await get(
+                return get(
                     `/photos/search?q=${encodeURIComponent(trimmedQuery)}&offset=${nextOffset}&limit=${PAGE_SIZE}${captureQuery}`,
                     { timeout: PHOTO_LIST_REQUEST_TIMEOUT_MS },
                 );
-            } else if (filters.minRating > 0 || filters.minLikes > 0) {
-                response = await get(
+            }
+            if (filters.minRating > 0 || filters.minLikes > 0) {
+                return get(
                     `/photos/filter?minRating=${filters.minRating}&minLikes=${filters.minLikes}&offset=${nextOffset}&limit=${PAGE_SIZE}${captureQuery}`,
                     { timeout: PHOTO_LIST_REQUEST_TIMEOUT_MS },
                 );
-            } else {
-                response = await get(
-                    `/photos?sort=${sort}&offset=${nextOffset}&limit=${PAGE_SIZE}${captureQuery}`,
-                    { timeout: PHOTO_LIST_REQUEST_TIMEOUT_MS },
-                );
             }
-            
+            return get(
+                `/photos?sort=${sort}&offset=${nextOffset}&limit=${PAGE_SIZE}${captureQuery}`,
+                { timeout: PHOTO_LIST_REQUEST_TIMEOUT_MS },
+            );
+        };
+
+        try {
+            let response;
+            // Retry cold-start failures (the backend waking from scale-to-zero)
+            // behind a "waking up" message rather than surfacing the raw timeout.
+            for (let attempt = 0; ; attempt += 1) {
+                try {
+                    response = await requestPhotoPage();
+                    break;
+                } catch (err) {
+                    if (requestSeq !== photoListRequestSeqRef.current) {
+                        return;
+                    }
+                    if (!isInitialLoad || attempt >= COLD_START_MAX_RETRIES || !isColdStartError(err)) {
+                        throw err;
+                    }
+                    setWarmingUp(true);
+                    await new Promise((resolve) => window.setTimeout(resolve, coldStartRetryDelayMs(attempt + 1)));
+                    if (requestSeq !== photoListRequestSeqRef.current) {
+                        return;
+                    }
+                }
+            }
+            setWarmingUp(false);
+
             if (requestSeq !== photoListRequestSeqRef.current) {
                 return;
             }
@@ -3757,6 +3806,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             if (requestSeq !== photoListRequestSeqRef.current) {
                 return;
             }
+            setWarmingUp(false);
             setError(getUserFacingFetchError(err));
             // Prevent infinite-scroll from hammering the API when requests are failing.
             setHasMore(false);
@@ -4246,8 +4296,21 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 <p className="status">Downloading {downloadProgress.completed}/{downloadProgress.total}…</p>
             )}
 
-            {loading && <Loading label="Loading photos…" fullPage={false} />}
-            {error && <ErrorState title="Couldn't load your photos" message={error} />}
+            {loading && (
+                <Loading
+                    label={warmingUp
+                        ? 'Waking up the server… this can take up to a minute after inactivity.'
+                        : 'Loading photos…'}
+                    fullPage={false}
+                />
+            )}
+            {error && (
+                <ErrorState
+                    title="Couldn't load your photos"
+                    message={error}
+                    onRetry={() => fetchPhotos(sortBy, 0, false, searchQuery)}
+                />
+            )}
             {!loading && !error && searchNotice && <p className="status">{searchNotice}</p>}
             {!loading && !error && filteredPhotos.length === 0 && photos.length > 0 && mediaFilter !== 'all' && (
                 <p className="empty">{mediaFilter === 'videos' ? 'No videos in the loaded results.' : 'No photos in the loaded results.'}</p>

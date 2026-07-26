@@ -203,6 +203,48 @@ const getUploadErrorMessage = (err: unknown, fallback: string): string => {
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---- Turbo mode --------------------------------------------------------------
+// On-device processing normally drains one photo at a time to keep resource use
+// gentle. Turbo trades that for throughput: it processes several photos at once,
+// each running its own AI worker, so a multi-core machine finishes a backlog far
+// faster at the cost of higher CPU/GPU/memory use. Opt-in and persisted.
+const BROWSER_PROCESSING_TURBO_KEY = 'keepsake.browserProcessingTurbo';
+
+export const isBrowserProcessingTurboEnabled = (): boolean => {
+    try {
+        return window.localStorage.getItem(BROWSER_PROCESSING_TURBO_KEY) === '1';
+    } catch {
+        return false;
+    }
+};
+
+export const setBrowserProcessingTurbo = (enabled: boolean): void => {
+    try {
+        window.localStorage.setItem(BROWSER_PROCESSING_TURBO_KEY, enabled ? '1' : '0');
+    } catch {
+        // Ignore storage failures (private mode / disabled storage); turbo simply
+        // stays at its previous value for this session.
+    }
+};
+
+// How many photos to process concurrently. Capped by both core count and device
+// memory so a low-end device can't spawn enough concurrent model instances to
+// crash the tab. Returns 1 (the original serial behaviour) when turbo is off.
+export const getBrowserProcessingConcurrency = (): number => {
+    if (!isBrowserProcessingTurboEnabled()) {
+        return 1;
+    }
+    const nav = navigator as Navigator & { deviceMemory?: number };
+    const cores = typeof navigator.hardwareConcurrency === 'number' && navigator.hardwareConcurrency > 0
+        ? navigator.hardwareConcurrency
+        : 4;
+    const memoryGb = typeof nav.deviceMemory === 'number' && nav.deviceMemory > 0 ? nav.deviceMemory : 4;
+    const byCores = Math.min(Math.max(cores - 1, 2), 6);
+    const byMemory = memoryGb <= 4 ? 2 : (memoryGb <= 8 ? 4 : 6);
+    return Math.max(1, Math.min(byCores, byMemory));
+};
+
 const WARMUP_POLL_INTERVAL_MS = 5000;
 const BACKEND_KEEPALIVE_INTERVAL_MS = 30000;
 // While a batch is draining, the keep-alive heartbeat worker drives the loop at
@@ -897,6 +939,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const requestedFilenames = requestedItems.map((item) => item.filename);
             const requestedSteps = buildRequestedBrowserProcessingSteps(options.actions);
             const isAutomaticPull = requestedFilenames.length === 0;
+            // Turbo processes several photos at once; pull enough pending work to
+            // keep every concurrent slot fed. Off (concurrency 1) preserves the
+            // original one-at-a-time drain exactly.
+            const concurrency = getBrowserProcessingConcurrency();
             // When browser AI isn't loaded, skip the automatic background pull: it
             // would download pending images just to run baseline (thumbnail/EXIF/
             // geocode) steps. Explicit, user-initiated requests still run so on-demand
@@ -908,7 +954,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             const pendingResponse = requestedFilenames.length > 0
                 ? { pending: requestedItems.map((item) => ({ ...item, statuses: {} })) }
-                : await get('/upload/processing/pending?limit=1');
+                : await get(`/upload/processing/pending?limit=${Math.max(1, concurrency)}`);
             const pending = Array.isArray(pendingResponse?.pending) ? pendingResponse.pending : [];
             if (pending.length === 0) {
                 // Queue drained: release the background keep-alive so the tab stops
@@ -929,14 +975,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 : pending.length;
             const browserProcessingNotification = ensureBrowserProcessingNotification(totalCount);
             browserProcessingNotification.totalCount = Math.max(browserProcessingNotification.totalCount, totalCount);
-            for (const item of pending) {
+            const processOnePendingItem = async (item: any): Promise<void> => {
                 if (browserProcessingCancelRef.current) {
-                    break;
+                    return;
                 }
                 const filename = String(item?.filename || '');
                 const itemRotation = normalizeRotationDegrees(item?.rotation || 0);
                 if (!filename) {
-                    continue;
+                    return;
                 }
                 // Only run the steps the current model state allows. When browser AI
                 // isn't loaded, on-device AI steps are dropped and left pending. A null
@@ -944,12 +990,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 // nothing runnable right now (only gated steps were requested).
                 const effectiveSteps = restrictStepsForModel(requestedSteps, browserAiModelStateRef.current.status === 'available');
                 if (effectiveSteps && effectiveSteps.size === 0) {
-                    continue;
+                    return;
                 }
                 if (!options.force) {
                     const statuses = item?.statuses || {};
                     if (!hasRunnableBrowserStep(statuses, effectiveSteps) && requestedFilenames.length === 0) {
-                        continue;
+                        return;
                     }
                 }
                 let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null = null;
@@ -960,12 +1006,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     });
                 } catch (err) {
                     if (shouldSuppressLeaseWarning(err)) {
-                        continue;
+                        return;
                     }
                     throw err;
                 }
                 if (!claim?.claimed) {
-                    continue;
+                    return;
                 }
                 const processingStartedAt = performance.now();
                 try {
@@ -1049,7 +1095,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     if (faceDeferred) {
                         browserProcessingDeferredRef.current.set(filename, itemRotation);
                         syncBrowserProcessingNotification(browserProcessingNotification, `Deferred ${filename} for later face retry`);
-                        continue;
+                        return;
                     }
                     processedCount += 1;
                     browserProcessingNotification.processedCount += 1;
@@ -1066,7 +1112,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         browserProcessingDeferredRef.current.set(filename, itemRotation);
                         updatePersistedFile(filename, { status: 'pending', error: undefined });
                         syncBrowserProcessingNotification(browserProcessingNotification, `Deferred ${filename} for later face retry`);
-                        continue;
+                        return;
                     }
                     browserProcessingNotification.failedCount += 1;
                     const statuses = item?.statuses || {};
@@ -1088,7 +1134,24 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 } finally {
                     await post('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
                 }
-            }
+            };
+            // Drain `pending` with up to `concurrency` items in flight at once. Each
+            // worker pulls the next index and processes it; with concurrency 1 this is
+            // exactly the original serial drain. Items are independent (each holds its
+            // own server-side lease), so distinct filenames never collide.
+            let nextIndex = 0;
+            const runDrainWorker = async (): Promise<void> => {
+                while (!browserProcessingCancelRef.current) {
+                    const index = nextIndex;
+                    nextIndex += 1;
+                    if (index >= pending.length) {
+                        return;
+                    }
+                    await processOnePendingItem(pending[index]);
+                }
+            };
+            const workerCount = Math.max(1, Math.min(concurrency, pending.length));
+            await Promise.all(Array.from({ length: workerCount }, () => runDrainWorker()));
             const hasDeferredWork = browserProcessingDeferredRef.current.size > 0;
             const hasObservedWork = browserProcessingNotification.processedCount > 0
                 || browserProcessingNotification.failedCount > 0
