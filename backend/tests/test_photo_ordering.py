@@ -67,16 +67,43 @@ def test_order_is_independent_of_input_row_order():
         assert _order('capture', entries=shuffled) == _order('capture')
 
 
-def test_processing_updates_do_not_reshuffle_gallery():
-    # Regression for the root bug: the upload-date sort key must ignore
-    # last_processing_update, which is rewritten on every background-processing
-    # step. Stamping every row with a churning value must not change the order.
-    baseline = _order('date')
+def test_processing_updates_do_not_reshuffle_dated_photos():
+    # Regression for the root bug: for any row with a stable upload signal
+    # (uploadDate or upload_started_at), last_processing_update churn from
+    # background processing must not affect its position. Only p_d.jpg — a
+    # legacy row with no date fields at all — may pick up the churned value
+    # (that is the documented last-resort fallback).
+    baseline = [name for name in _order('date') if name != 'p_d.jpg']
     churned = {
         name: {**row, 'last_processing_update': f'2026-07-26T10:{idx:02d}:00+00:00'}
         for idx, (name, row) in enumerate(DATASET.items())
     }
-    assert ordering_utils.order_photo_entries(ENTRIES, churned, 'date') == baseline
+    reordered = ordering_utils.order_photo_entries(ENTRIES, churned, 'date')
+    assert [name for name in reordered if name != 'p_d.jpg'] == baseline
+
+
+def test_legacy_rows_sort_chronologically_via_processing_fallback():
+    # Rows uploaded before finalize persisted uploadDate have only
+    # last_processing_update. They must still order newest-first rather than
+    # collapsing into filename order (the "gallery shows oldest to newest" bug).
+    legacy = {
+        'img_001.jpg': {'last_processing_update': '2023-05-01T00:00:00+00:00'},
+        'img_002.jpg': {'last_processing_update': '2025-05-01T00:00:00+00:00'},
+        'img_003.jpg': {'last_processing_update': '2024-05-01T00:00:00+00:00'},
+    }
+    names = list(legacy.keys())
+    expected = ['img_002.jpg', 'img_003.jpg', 'img_001.jpg']
+    assert ordering_utils.order_photo_entries(names, legacy, 'date') == expected
+    # capture falls back to the upload chain too, so same chronology.
+    assert ordering_utils.order_photo_entries(names, legacy, 'capture') == expected
+
+
+def test_newest_first_directionality():
+    # Explicit guard for sort direction: the most recent timestamp must be the
+    # FIRST item for both 'date' and 'capture', never the last.
+    assert _order('date')[0] == 'p_b.jpg'    # newest uploadDate in DATASET
+    assert _order('capture')[0] == 'p_e.jpg'  # newest effective capture date
+    assert _order('date')[-1] == 'p_d.jpg'    # dateless sinks to the bottom
 
 
 def test_upload_date_preferred_over_upload_started_at():

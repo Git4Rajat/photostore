@@ -325,6 +325,9 @@ def _face_embedding_allowed_versions() -> set:
     }
 PHOTO_TABLE_SCAN_PAGE_SIZE = int(os.getenv('PHOTO_TABLE_SCAN_PAGE_SIZE', '1000'))
 PHOTO_TABLE_SCAN_MAX_ROWS = int(os.getenv('PHOTO_TABLE_SCAN_MAX_ROWS', '250000'))
+# Max legacy rows to stamp with a derived uploadDate per /photos request; the
+# backfill converges over a few loads without slowing any single one down much.
+UPLOAD_DATE_BACKFILL_MAX_PER_REQUEST = int(os.getenv('UPLOAD_DATE_BACKFILL_MAX_PER_REQUEST', '100'))
 
 # Module-level storage/credential defaults (set during startup if available)
 account_name = None
@@ -6811,6 +6814,27 @@ def list_photos():
         metadata_map = {row['RowKey']: row for row in metadata_rows if row.get('RowKey')}
     except Exception as exc:
         return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+
+    # Backfill: rows uploaded before finalize persisted uploadDate sort via the
+    # volatile last_processing_update fallback. Stamp the derived value as their
+    # permanent uploadDate (best-effort, capped per request) so their position
+    # can never shift again — e.g. when a legacy photo gets reprocessed.
+    backfilled = 0
+    for name in entries:
+        if backfilled >= UPLOAD_DATE_BACKFILL_MAX_PER_REQUEST:
+            break
+        row = metadata_map.get(name) or {}
+        if row.get('uploadDate'):
+            continue
+        derived = str(row.get('upload_started_at') or row.get('last_processing_update') or '')
+        if not derived:
+            continue
+        try:
+            _update_metadata_entity_fields(user_id, name, {'uploadDate': derived})
+            row['uploadDate'] = derived
+            backfilled += 1
+        except Exception:
+            break  # storage hiccup: stop backfilling, listing still works
 
     # Deterministic ordering with a filename tie-break so the gallery returns an
     # identical sequence on every load (see ordering_utils.order_photo_entries).

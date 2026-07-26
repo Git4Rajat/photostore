@@ -6,10 +6,12 @@ stack. ``app.py`` imports and re-uses these helpers so production and tests
 exercise exactly the same code.
 
 The gallery bug this module fixes: photo order used to churn between loads
-because the "upload date" sort key fell back to ``last_processing_update`` (a
+because the "upload date" sort key preferred ``last_processing_update`` (a
 field rewritten on every background-processing step) whenever a row had no
 persisted ``uploadDate``, and ties had no deterministic ordering. These helpers
-sort only on stable fields and always break ties by filename.
+sort on stable fields first (``last_processing_update`` remains only as a
+last-resort fallback for legacy rows that predate persisted upload dates) and
+always break ties by filename.
 """
 from __future__ import annotations
 
@@ -79,16 +81,25 @@ def parse_capture_date(exif_data: Dict[str, str]) -> Optional[datetime]:
 
 
 def metadata_upload_datetime(metadata: Dict) -> Optional[datetime]:
-    """Return a *stable* upload time for a photo, or None if truly unknown.
+    """Return the upload time for a photo, or None if truly unknown.
 
-    Prefers the persisted ``uploadDate``, then ``upload_started_at`` (written
-    once at upload init). It deliberately never falls back to
-    ``last_processing_update``: that field is rewritten on every processing step,
-    so using it as a sort key made the gallery reorder itself on each load while
-    background processing was in flight.
+    Prefers the stable fields: the persisted ``uploadDate``, then
+    ``upload_started_at`` (written once at upload init). Only when neither
+    exists — legacy rows uploaded before finalize started persisting
+    ``uploadDate`` — does it fall back to ``last_processing_update``. That field
+    is rewritten on every processing step, so it must never outrank the stable
+    fields (that caused the gallery to reshuffle while processing ran), but for
+    legacy rows whose processing finished long ago it is static and roughly
+    matches the upload time; without it they would all collapse to DATE_MIN and
+    degrade into filename order (which reads as oldest-to-newest).
     """
     return parse_iso_date(
-        str(metadata.get('uploadDate') or metadata.get('upload_started_at') or '')
+        str(
+            metadata.get('uploadDate')
+            or metadata.get('upload_started_at')
+            or metadata.get('last_processing_update')
+            or ''
+        )
     )
 
 
