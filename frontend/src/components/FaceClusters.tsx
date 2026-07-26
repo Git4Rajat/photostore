@@ -166,6 +166,7 @@ const FaceClusters: React.FC = () => {
     const [actionLoading, setActionLoading] = useState(false);
     const [persons, setPersons] = useState<PersonSummary[]>([]);
     const [searchQuery, setSearchQuery] = useState<string>('');
+    const [searchOpen, setSearchOpen] = useState<boolean>(false);
     const [selected, setSelected] = useState<Record<string, boolean>>({});
     const [mergeTarget, setMergeTarget] = useState<string | null>(null);
     const [lastMergeId, setLastMergeId] = useState<string | null>(null);
@@ -642,29 +643,45 @@ const FaceClusters: React.FC = () => {
                     </div>
                 </div>
                 <div className="people-hero-actions">
-                    <div className="people-searchbar">
-                        <MagnifyingGlassIcon className="people-search-icon" />
-                        <input
-                            type="text"
-                            placeholder="Search"
-                            value={searchQuery}
-                            onChange={(e) => setSearchQuery(e.target.value)}
-                            onKeyDown={(e) => { if (e.key === 'Enter') { void handleSearch(); } }}
-                        />
-                        {searchQuery && (
+                    {searchOpen ? (
+                        <div className="people-searchbar">
+                            <MagnifyingGlassIcon className="people-search-icon" />
+                            <input
+                                type="text"
+                                placeholder="Search people…"
+                                value={searchQuery}
+                                autoFocus
+                                onChange={(e) => setSearchQuery(e.target.value)}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter') { void handleSearch(); }
+                                    else if (e.key === 'Escape') { setSearchOpen(false); }
+                                }}
+                            />
                             <button
                                 className="people-icon-btn"
-                                aria-label="Clear search"
-                                onClick={() => { setSearchQuery(''); setPage(1); void loadPersons(); void refreshSupportData(); }}
+                                aria-label={searchQuery ? 'Clear search' : 'Close search'}
+                                onClick={() => {
+                                    const hadQuery = Boolean(searchQuery);
+                                    setSearchQuery('');
+                                    setSearchOpen(false);
+                                    if (hadQuery) { setPage(1); void loadPersons(); void refreshSupportData(); }
+                                }}
                                 type="button"
                             >
                                 <XMarkIcon />
                             </button>
-                        )}
-                    </div>
-                    <button className="people-icon-btn" aria-label="Search" onClick={() => void handleSearch()} disabled={busy} type="button">
-                        <MagnifyingGlassIcon />
-                    </button>
+                        </div>
+                    ) : (
+                        <button
+                            className={`people-icon-btn ${searchQuery ? 'is-active' : ''}`}
+                            aria-label="Search"
+                            title={searchQuery ? `Searching: ${searchQuery}` : 'Search'}
+                            onClick={() => setSearchOpen(true)}
+                            type="button"
+                        >
+                            <MagnifyingGlassIcon />
+                        </button>
+                    )}
                     <button className="people-icon-btn" aria-label="Assign unclustered faces" title="Assign unclustered faces" onClick={handleAssignUnclustered} disabled={busy} type="button">
                         <SparklesIcon />
                     </button>

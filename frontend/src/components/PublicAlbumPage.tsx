@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowDownTrayIcon, CheckIcon, LockOpenIcon, PhotoIcon } from '@heroicons/react/24/outline';
 import { useParams } from 'react-router-dom';
 import { get, post, resolveApiUrl } from '../services/apiClient';
-import MetricCard from './shared/MetricCard';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { Logo } from './shared/Logo';
@@ -137,22 +136,19 @@ const PublicAlbumPage: React.FC = () => {
 
     return (
         <section className="gallery-wrap card-glass reveal-up delay-1 public-album-shell public-album-studio">
-            <div className="public-banner">
+            <div className="public-banner public-banner-compact">
                 <div className="public-banner-brand">
-                    <Logo size={42} />
+                    <Logo size={38} />
                     <div>
                         <p className="additional-kicker">SHARED VIEW</p>
-                        <h2 className="gallery-banner-title">{album ? album.name : 'Public Album'}</h2>
-                        {album ? (
-                            <p className="photo-meta">{album.photoCount} photos • Read-only</p>
-                        ) : (
-                            <p className="photo-meta">Read-only shared collection</p>
-                        )}
+                        <h2 className="page-topline-title">{album ? album.name : 'Public Album'}</h2>
+                        <p className="gallery-meta-line">
+                            <span className="gallery-meta-count">{photos.length}</span>
+                            <span> photos</span>
+                            <span className="gallery-meta-dim"> · read-only</span>
+                            {codeRequired && <span className="gallery-meta-dim"> · code required</span>}
+                        </p>
                     </div>
-                </div>
-                <div className="albums-metrics">
-                    <MetricCard value={photos.length} label="Visible Photos" />
-                    <MetricCard value={codeRequired ? 'Yes' : 'No'} label="Access Code" />
                 </div>
             </div>
 
@@ -238,54 +234,54 @@ const PublicAlbumPage: React.FC = () => {
 
             {!loading && !error && photos.length > 0 && viewerIndex === null && (
                 <div className="gallery-grid public-gallery-grid">
-                    {photos.map((photo, index) => (
-                        <PhotoTile
-                            key={photo.filename}
-                            photo={photo}
-                            selected={selectedPhotos.has(photo.filename)}
-                            animationDelayMs={(index % 8) * 36}
-                            title={photo.filename}
-                            kind={getMediaKind(photo.filename)}
-                            linkTitle={`${photo.filename}\n${getMediaKind(photo.filename)}`}
-                            openOriginal={false}
-                            useProtectedMedia={false}
-                            onCardClick={() => {
-                                setSelectedPhotos((current) => {
-                                    const next = new Set(current);
-                                    if (next.has(photo.filename)) {
-                                        next.delete(photo.filename);
-                                    } else {
-                                        next.add(photo.filename);
-                                    }
-                                    return next;
-                                });
-                            }}
-                            selectableOverlay={(
-                                <input
-                                    type="checkbox"
-                                    checked={selectedPhotos.has(photo.filename)}
-                                    onChange={() => {
-                                        setSelectedPhotos((current) => {
-                                            const next = new Set(current);
-                                            if (next.has(photo.filename)) {
-                                                next.delete(photo.filename);
-                                            } else {
-                                                next.add(photo.filename);
-                                            }
-                                            return next;
-                                        });
-                                    }}
-                                    onClick={(e) => e.stopPropagation()}
-                                    aria-label={`Select ${photo.filename}`}
-                                />
-                            )}
-                            onMediaClick={(e) => {
-                                e.stopPropagation();
-                                e.preventDefault();
-                                setViewerIndex(index);
-                            }}
-                        />
-                    ))}
+                    {photos.map((photo, index) => {
+                        const isSelected = selectedPhotos.has(photo.filename);
+                        const toggle = () => {
+                            setSelectedPhotos((current) => {
+                                const next = new Set(current);
+                                if (next.has(photo.filename)) {
+                                    next.delete(photo.filename);
+                                } else {
+                                    next.add(photo.filename);
+                                }
+                                return next;
+                            });
+                        };
+                        return (
+                            <PhotoTile
+                                key={photo.filename}
+                                photo={photo}
+                                selected={isSelected}
+                                animationDelayMs={(index % 8) * 36}
+                                title={photo.filename}
+                                linkTitle={`${photo.filename}\n${getMediaKind(photo.filename)}`}
+                                openOriginal={false}
+                                showBody={false}
+                                useProtectedMedia={false}
+                                mediaOverlay={(
+                                    <label
+                                        className={`tile-select ${isSelected ? 'is-on' : ''}`}
+                                        onClick={(e) => e.stopPropagation()}
+                                        title={isSelected ? 'Selected' : 'Select photo'}
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            className="tile-select-input"
+                                            checked={isSelected}
+                                            onChange={toggle}
+                                            aria-label={`Select ${photo.filename}`}
+                                        />
+                                        <CheckIcon className="tile-select-icon" aria-hidden="true" />
+                                    </label>
+                                )}
+                                onMediaClick={(e) => {
+                                    e.stopPropagation();
+                                    e.preventDefault();
+                                    setViewerIndex(index);
+                                }}
+                            />
+                        );
+                    })}
                 </div>
             )}
             {viewerIndex !== null && (

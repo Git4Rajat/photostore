@@ -22,6 +22,10 @@ interface PhotoTileProps {
     className?: string;
     selectableOverlay?: React.ReactNode;
     bodyContent?: React.ReactNode;
+    // Layer rendered on top of the thumbnail (badges, selection affordances).
+    mediaOverlay?: React.ReactNode;
+    // When false, the text body under the thumbnail is omitted entirely.
+    showBody?: boolean;
     onCardClick?: (event: React.MouseEvent<HTMLDivElement>) => void;
     onBodyClick?: (event: React.MouseEvent<HTMLDivElement>) => void;
     openOriginal?: boolean;
@@ -65,6 +69,8 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     className = '',
     selectableOverlay,
     bodyContent,
+    mediaOverlay,
+    showBody = true,
     onCardClick,
     onBodyClick,
     openOriginal = true,
@@ -176,6 +182,7 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
                 onClick={attachClick ? onMediaClick : undefined}
             />
             {videoOverlay}
+            {mediaOverlay}
         </>
     );
 
@@ -191,16 +198,18 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
                 </span>
             )}
 
-            <div className="photo-body" onClick={onBodyClick}>
-                <div className="photo-body-head">
-                    {selectableOverlay}
-                    <div className="photo-title-row">
-                        <p className="photo-name">{title}</p>
-                        {kind && <p className="photo-kind">{kind}</p>}
+            {showBody && (
+                <div className="photo-body" onClick={onBodyClick}>
+                    <div className="photo-body-head">
+                        {selectableOverlay}
+                        <div className="photo-title-row">
+                            <p className="photo-name">{title}</p>
+                            {kind && <p className="photo-kind">{kind}</p>}
+                        </div>
                     </div>
+                    {bodyContent}
                 </div>
-                {bodyContent}
-            </div>
+            )}
         </div>
     );
 };

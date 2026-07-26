@@ -297,7 +297,6 @@ html[data-theme='dark'] {
   .person-avatar,
   .people-hero-icon,
   .albums-metric-card,
-  .albums-banner,
   .public-banner,
   .additional-card,
   .theme-switcher {
@@ -1290,6 +1289,12 @@ a {
   outline: none;
   border-color: rgba(30, 106, 225, 0.4);
   box-shadow: var(--focus-ring);
+}
+
+.people-icon-btn.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
 }
 
 .people-icon-btn svg {
@@ -2742,31 +2747,6 @@ html[data-theme='light'] .notification-item.unread {
   gap: 16px;
 }
 
-.albums-banner {
-  border: 1px solid var(--lg-edge);
-  border-radius: var(--r-xl);
-  padding: 14px;
-  background:
-    linear-gradient(120deg, rgba(10, 132, 255, 0.08), var(--lg-surface)),
-    radial-gradient(520px 180px at 85% -50%, rgba(47, 152, 255, 0.22), rgba(47, 152, 255, 0));
-  box-shadow: var(--lg-shadow-resting);
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.albums-banner-copy {
-  min-width: 230px;
-}
-
-.albums-banner-title {
-  margin: 6px 0 4px;
-  font-size: clamp(1.35rem, 2.8vw, 2rem);
-  letter-spacing: -0.02em;
-}
-
 .albums-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(100px, 1fr));
@@ -2817,6 +2797,12 @@ html[data-theme='light'] .notification-item.unread {
   align-items: center;
   gap: 8px;
   margin-bottom: 10px;
+}
+
+/* Lift the toolbar (and its filter/search popovers) above the photo grid. */
+.albums-canvas-toolbar {
+  position: relative;
+  z-index: 20;
 }
 
 .albums-list {
@@ -2878,38 +2864,340 @@ html[data-theme='light'] .notification-item.unread {
   gap: 14px;
 }
 
-.gallery-banner {
-  border: 1px solid var(--lg-edge);
-  border-radius: var(--r-xl);
-  padding: 14px 16px;
-  background: var(--lg-surface-strong);
-  box-shadow: var(--lg-shadow-resting);
-  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
-  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.gallery-banner-copy {
-  min-width: 260px;
-}
-
-.gallery-banner-title {
-  margin: 6px 0 4px;
-  font-size: clamp(1.35rem, 2.8vw, 2rem);
-  letter-spacing: -0.02em;
-}
-
 .gallery-controls-surface {
+  position: relative;
+  /* Lift the surface (and its sort/search popovers) above the photo grid,
+     which follows in the DOM and would otherwise paint over the menu. */
+  z-index: 30;
   border: 1px solid var(--lg-edge);
   border-radius: var(--r-lg);
   background: var(--lg-surface);
   backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
   -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  padding: 8px 10px;
+}
+
+.gallery-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* Compact page header used in place of the old full banners. */
+.page-topline {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 2px;
+}
+
+.page-topline-title {
+  margin: 0;
+  font-size: clamp(1.2rem, 2.6vw, 1.5rem);
+  letter-spacing: -0.01em;
+}
+
+.page-topline .gallery-meta-line {
+  margin-left: auto;
+}
+
+.gallery-meta-line {
+  margin: 0;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gallery-meta-count {
+  font-weight: 750;
+  color: var(--text);
+}
+
+.gallery-meta-dim {
+  color: var(--muted);
+}
+
+.gallery-tool-cluster {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  margin-left: auto;
+}
+
+.gallery-search-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+}
+
+.gallery-search-open .gallery-search-icon {
+  position: absolute;
+  left: 10px;
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.gallery-search-field {
+  width: min(320px, 60vw);
+  padding-left: 32px;
+}
+
+.gallery-menu-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.gallery-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  display: grid;
+  gap: 6px;
+  min-width: 220px;
   padding: 10px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--lg-edge);
+  background: var(--lg-surface-strong);
+  box-shadow: var(--lg-shadow-floating);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+}
+
+.gallery-menu-label {
+  margin: 2px 2px 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.gallery-menu-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.gallery-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  justify-content: center;
+}
+
+.gallery-menu-btn .toolbar-icon {
+  width: 15px;
+  height: 15px;
+}
+
+.gallery-menu-filters {
+  min-width: 260px;
+}
+
+.gallery-filter-field {
+  display: grid;
+  gap: 4px;
+}
+
+.gallery-filter-field input[type="range"] {
+  width: 100%;
+}
+
+.gallery-filter-field .field-date {
+  width: 100%;
+}
+
+/* ---- Gallery tile overlays (selection + rating/like indicators) ---- */
+.tile-select {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  border: 1.5px solid rgba(255, 255, 255, 0.9);
+  background: rgba(20, 22, 28, 0.42);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  cursor: pointer;
+  opacity: 0;
+  transform: scale(0.9);
+  transition: opacity var(--dur-quick) ease, transform var(--dur-quick) ease, background-color var(--dur-quick) ease;
+}
+
+.photo-card:hover .tile-select,
+.photo-card:focus-within .tile-select,
+.tile-select.is-on {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.tile-select.is-on {
+  background: var(--accent);
+  border-color: #fff;
+}
+
+/* Touch devices have no hover, so the selection control must stay visible. */
+@media (hover: none) {
+  .tile-select {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.tile-select-input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.tile-select-icon {
+  width: 15px;
+  height: 15px;
+  color: #fff;
+  opacity: 0;
+  transition: opacity var(--dur-quick) ease;
+}
+
+.tile-select.is-on .tile-select-icon {
+  opacity: 1;
+}
+
+.tile-badges {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(20, 22, 28, 0.28), rgba(20, 22, 28, 0.52));
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
+.tile-star {
+  position: relative;
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  line-height: 0;
+}
+
+.tile-star-track {
+  width: 15px;
+  height: 15px;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.tile-star-fill {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  display: inline-block;
+}
+
+.tile-star-front {
+  width: 15px;
+  height: 15px;
+  color: #ffcf4a;
+}
+
+.tile-like-icon {
+  width: 15px;
+  height: 15px;
+  color: #ff5c7a;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+}
+
+/* ---- Preview: interactive rating + like ---- */
+.photo-preview-engage {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--lg-edge);
+}
+
+.photo-preview-rate {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.photo-preview-star {
+  border: none;
+  background: transparent;
+  padding: 2px;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.32);
+  transition: color var(--dur-quick) ease, transform var(--dur-quick) ease;
+}
+
+.photo-preview-star:hover {
+  transform: scale(1.12);
+}
+
+.photo-preview-star.is-on {
+  color: #ffcf4a;
+}
+
+.photo-preview-like {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--lg-edge);
+  background: var(--lg-surface);
+  color: inherit;
+  font-weight: 650;
+  cursor: pointer;
+  transition: transform var(--dur-quick) ease, color var(--dur-quick) ease, border-color var(--dur-quick) ease, background-color var(--dur-quick) ease;
+}
+
+.photo-preview-like:active {
+  transform: scale(0.95);
+}
+
+.photo-preview-like.is-liked {
+  color: #ff5c7a;
+  border-color: rgba(255, 92, 122, 0.4);
+  background: rgba(255, 92, 122, 0.12);
+}
+
+.photo-preview-like .toolbar-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.selection-count {
+  font-weight: 700;
 }
 
 .public-album-studio {
@@ -2928,6 +3216,15 @@ html[data-theme='light'] .notification-item.unread {
   justify-content: space-between;
   align-items: flex-end;
   gap: 10px;
+}
+
+.public-banner-compact {
+  padding: 10px 12px;
+  align-items: center;
+}
+
+.public-banner-compact .gallery-meta-line {
+  white-space: normal;
 }
 
 .date-range-inline {
@@ -5250,10 +5547,14 @@ video.photo-preview-media {
   }
 
   .notification-pane {
-    right: 0;
-    left: auto;
-    width: min(360px, 86vw);
-    max-height: min(460px, calc(100vh - 112px));
+    /* Anchor to the viewport, not the bell: on a wrapped header the bell can
+       sit mid-row, and a wrap-anchored pane then overflows off the left edge. */
+    position: fixed;
+    top: 64px;
+    right: 10px;
+    left: 10px;
+    width: auto;
+    max-height: min(460px, calc(100vh - 96px));
     z-index: 80;
   }
 
@@ -5274,7 +5575,6 @@ video.photo-preview-media {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .gallery-banner,
   .public-banner {
     padding: 12px;
   }

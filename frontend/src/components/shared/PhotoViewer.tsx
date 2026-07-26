@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, InformationCircleIcon, MagnifyingGlassMinusIcon, MagnifyingGlassPlusIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, HeartIcon, InformationCircleIcon, MagnifyingGlassMinusIcon, MagnifyingGlassPlusIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { postUploadJson, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl } from '../../services/imageClient';
@@ -20,6 +20,9 @@ export interface ViewerPhoto {
         address?: string;
     };
     tags?: string[];
+    rating?: number;
+    likes?: number;
+    liked?: boolean;
 }
 
 interface PhotoViewerProps {
@@ -29,6 +32,8 @@ interface PhotoViewerProps {
     onIndexChange: (index: number) => void;
     useProtectedMedia?: boolean;
     onRotationSave?: (filename: string, rotation: number) => Promise<void> | void;
+    onRate?: (filename: string, rating: number) => Promise<void> | void;
+    onToggleLike?: (filename: string) => Promise<void> | void;
 }
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
@@ -127,7 +132,7 @@ const describePreviewFailure = (filename: string, rawMessage?: string | null): s
     return formatPreviewError(filename);
 };
 
-const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onIndexChange, useProtectedMedia = true, onRotationSave }) => {
+const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onIndexChange, useProtectedMedia = true, onRotationSave, onRate, onToggleLike }) => {
     const [zoom, setZoom] = useState(1);
     const [pan, setPan] = useState({ x: 0, y: 0 });
     const [isPanning, setIsPanning] = useState(false);
@@ -1011,6 +1016,38 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                     })}
                 </div>
                 <div className="photo-preview-details">
+                    {(onRate || onToggleLike) && (
+                        <div className="photo-preview-engage" onClick={(event) => event.stopPropagation()}>
+                            {onRate && (
+                                <div className="photo-preview-rate" role="group" aria-label="Rate photo">
+                                    {[1, 2, 3, 4, 5].map((star) => (
+                                        <button
+                                            key={star}
+                                            type="button"
+                                            className={`photo-preview-star ${star <= Math.round(activePhoto.rating || 0) ? 'is-on' : ''}`}
+                                            onClick={() => { void onRate(activePhoto.filename, star); }}
+                                            aria-label={`Rate ${star} ${star === 1 ? 'star' : 'stars'}`}
+                                            title={`Rate ${star}/5`}
+                                        >
+                                            ★
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+                            {onToggleLike && (
+                                <button
+                                    type="button"
+                                    className={`photo-preview-like ${activePhoto.liked ? 'is-liked' : ''}`}
+                                    onClick={() => { void onToggleLike(activePhoto.filename); }}
+                                    aria-pressed={Boolean(activePhoto.liked)}
+                                    aria-label={activePhoto.liked ? 'Remove like' : 'Like photo'}
+                                >
+                                    <HeartIcon className="toolbar-icon" />
+                                    <span>{activePhoto.likes || 0}</span>
+                                </button>
+                            )}
+                        </div>
+                    )}
                     <div>
                         <span className="photo-preview-label">Kind</span>
                         <span>{getMediaKind(activePhoto.filename)}</span>

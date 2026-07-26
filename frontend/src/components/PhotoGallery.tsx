@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, HeartIcon, InformationCircleIcon, MagnifyingGlassIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { useLocation } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
 import { getActiveLibraryFromToken } from '../services/passwordAuthClient';
@@ -18,7 +19,6 @@ import { getFileExtension, getMediaKind, isRawFilename, isVideoFilename } from '
 import { plural } from '../utils/format';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
-import MetricCard from './shared/MetricCard';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { EmptyState } from './shared/EmptyState';
@@ -41,7 +41,7 @@ import type {
     ClientProcessingStep,
     UploadProgress,
 } from '../types/browserProcessing';
-import type { Photo, PhotoMetadata } from '../types/uiTypes';
+import type { Photo } from '../types/uiTypes';
 
 export const UPLOAD_SESSION_STORAGE_KEY = 'photostore.upload.session.v1';
 const UPLOAD_DB_NAME = 'photostore-upload-db';
@@ -3634,11 +3634,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [filters, setFilters] = useState<FilterOptions>(cachedBoot?.filters || { minRating: 0, minLikes: 0 });
     const [mediaFilter, setMediaFilter] = useState<'all' | 'photos' | 'videos'>('all');
     const [showFilters, setShowFilters] = useState<boolean>(false);
-    const [ratingPhoto, setRatingPhoto] = useState<string | null>(null);
-    const [expandedExif, setExpandedExif] = useState<Set<string>>(new Set());
-    const [photoExifData, setPhotoExifData] = useState<Record<string, Record<string, string>>>({});
-    const [photoTags, setPhotoTags] = useState<Record<string, string[]>>({});
-    const [loadingExif, setLoadingExif] = useState<Set<string>>(new Set());
+    const [showSortMenu, setShowSortMenu] = useState<boolean>(false);
+    const [searchOpen, setSearchOpen] = useState<boolean>(false);
     const [captureStartDate, setCaptureStartDate] = useState<string>(cachedBoot?.captureStartDate || '');
     const [captureEndDate, setCaptureEndDate] = useState<string>(cachedBoot?.captureEndDate || '');
     const [downloading, setDownloading] = useState<boolean>(false);
@@ -3681,7 +3678,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         try {
             await post(`/photos/${filename}/rating`, { rating });
             setPhotos(prev => prev.map(p => p.filename === filename ? { ...p, rating } : p));
-            setRatingPhoto(null);
             addNotification('Rating updated', `${getDisplayName(filename)} rated ${rating}/5.`);
         } catch (err) {
             setError('Failed to save rating');
@@ -3929,39 +3925,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         setHasMore(true);
     };
 
-    const toggleExif = async (filename: string) => {
-        if (!expandedExif.has(filename)) {
-            setExpandedExif(prev => new Set(prev).add(filename));
-            if (photoExifData[filename] || loadingExif.has(filename)) {
-                return;
-            }
-
-            setLoadingExif(prev => new Set(prev).add(filename));
-            try {
-                const response = (await get(`/photos/${filename}/metadata`)) as PhotoMetadata;
-                setPhotoExifData(prev => ({ ...prev, [filename]: response.exifData || {} }));
-                if (response.tags && response.tags.length > 0) {
-                    setPhotoTags(prev => ({ ...prev, [filename]: response.tags! }));
-                }
-            } catch {
-                setError('Failed to load EXIF data');
-            } finally {
-                setLoadingExif(prev => {
-                    const updated = new Set(prev);
-                    updated.delete(filename);
-                    return updated;
-                });
-            }
-            return;
-        }
-
-        setExpandedExif(prev => {
-            const updated = new Set(prev);
-            updated.delete(filename);
-            return updated;
-        });
-    };
-
     useEffect(() => {
         observerRef.current = new IntersectionObserver(entries => {
             if (entries[0].isIntersecting && hasMore && !loadingMore && !loading && !error) {
@@ -4000,8 +3963,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         fetchPhotos(sortBy, 0, false, searchQuery);
     }, [captureStartDate, captureEndDate, sortBy, searchQuery, fetchPhotos]);
 
-    const submitSearch = useCallback(() => {
-        const nextQuery = searchInput.trim();
+    const submitSearch = useCallback((override?: string) => {
+        const nextQuery = (override ?? searchInput).trim();
         setSearchQuery(nextQuery);
         setOffset(0);
         setHasMore(true);
@@ -4050,23 +4013,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         setLightboxIndex(index);
     }, [filteredPhotos.length]);
 
-    const StarRating: React.FC<{ filename: string; rating: number }> = ({ filename, rating }) => (
-        <div className="star-row" role="group" aria-label="Rate photo">
-            {[1, 2, 3, 4, 5].map(star => (
-                <button
-                    key={star}
-                    type="button"
-                    className={`star-btn ${star <= rating ? 'active' : ''}`}
-                    onClick={() => handleRatePhoto(filename, star)}
-                    title={`Rate ${star} stars`}
-                    aria-label={`Rate ${star} stars`}
-                >
-                    ★
-                </button>
-            ))}
-        </div>
-    );
-
     const location = useLocation();
     const hideDiscovery = location.pathname && location.pathname.startsWith('/people');
 
@@ -4075,228 +4021,225 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     return (
         <section className={sectionClass}>
             {!hideDiscovery && (
-                <div className="gallery-banner">
-                    <div className="gallery-banner-copy">
-                        <p className="additional-kicker">DISCOVERY WORKSPACE</p>
-                        <h2 className="gallery-banner-title">Moments</h2>
-                        <p className="photo-meta">Search by meaning, sort by intent, and curate from capture metadata.</p>
-                    </div>
-                    <div className="albums-metrics">
-                        <MetricCard value={loading && !serverTotalLoaded ? '…' : totalPhotos} label={serverTotalLoaded ? 'Total Photos' : 'Cached Total'} />
-                        <MetricCard value={showingPhotos} label="Current View" />
-                        <MetricCard value={selectedCount} label="Selected" />
-                    </div>
-                </div>
-            )}
-
-            {!hideDiscovery && (
             <div className="gallery-controls-surface">
-                <div className="toolbar">
-                    <div className="toolbar-right">
-                        <input
-                            type="text"
-                            placeholder="AI Search"
-                            value={searchInput}
-                            onChange={(e) => setSearchInput(e.target.value)}
-                            onKeyDown={(e) => {
-                                if (e.key === 'Enter') {
-                                    submitSearch();
-                                }
-                            }}
-                            enterKeyHint="search"
-                            className="field"
-                        />
+                <div className="gallery-toolbar">
+                    <p className="gallery-meta-line" aria-live="polite">
+                        <span className="gallery-meta-count">{loading && !serverTotalLoaded ? '…' : totalPhotos}</span>
+                        <span className="gallery-meta-sep"> {serverTotalLoaded ? 'photos' : 'cached'}</span>
+                        <span className="gallery-meta-dim"> · {showingPhotos} shown</span>
+                        {selectedCount > 0 && <span className="gallery-meta-dim"> · {selectedCount} selected</span>}
+                    </p>
 
-                        <div className="toolbar-left">
+                    <div className="gallery-tool-cluster">
+                        {searchOpen ? (
+                            <div className="gallery-search-open">
+                                <MagnifyingGlassIcon className="toolbar-icon gallery-search-icon" aria-hidden="true" />
+                                <input
+                                    type="text"
+                                    placeholder="Search by meaning…"
+                                    value={searchInput}
+                                    autoFocus
+                                    onChange={(e) => setSearchInput(e.target.value)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                            submitSearch();
+                                        } else if (e.key === 'Escape') {
+                                            setSearchOpen(false);
+                                        }
+                                    }}
+                                    enterKeyHint="search"
+                                    className="field gallery-search-field"
+                                    aria-label="Search photos"
+                                />
+                                <button
+                                    type="button"
+                                    onClick={() => { setSearchInput(''); if (searchQuery) submitSearch(''); setSearchOpen(false); }}
+                                    className="btn btn-soft icon-btn"
+                                    aria-label="Close search"
+                                    title="Close search"
+                                >
+                                    <XMarkIcon className="toolbar-icon" />
+                                    <span className="sr-only">Close search</span>
+                                </button>
+                            </div>
+                        ) : (
                             <button
                                 type="button"
-                                onClick={() => handleSortChange('date')}
-                                className={`sort-btn icon-btn ${sortBy === 'date' ? 'active' : ''}`}
-                                aria-label="Recent uploads"
-                                title="Recent uploads"
+                                onClick={() => setSearchOpen(true)}
+                                className={`btn icon-btn ${searchQuery ? 'btn-primary' : 'btn-soft'}`}
+                                aria-label="Search"
+                                title={searchQuery ? `Searching: ${searchQuery}` : 'Search'}
                             >
-                                <ClockIcon className="toolbar-icon" />
-                                <span className="sr-only">Recent uploads</span>
+                                <MagnifyingGlassIcon className="toolbar-icon" />
+                                <span className="sr-only">Search</span>
                             </button>
+                        )}
+
+                        <div className="gallery-menu-anchor">
                             <button
                                 type="button"
-                                onClick={() => handleSortChange('capture')}
-                                className={`sort-btn icon-btn ${sortBy === 'capture' ? 'active' : ''}`}
-                                aria-label="Captured date"
-                                title="Captured date"
+                                onClick={() => setShowSortMenu((prev) => !prev)}
+                                className={`btn icon-btn ${showSortMenu ? 'btn-primary' : 'btn-soft'}`}
+                                aria-label="Sort and view options"
+                                aria-expanded={showSortMenu}
+                                title="Sort & view"
                             >
-                                <CalendarDaysIcon className="toolbar-icon" />
-                                <span className="sr-only">Captured date</span>
+                                <AdjustmentsHorizontalIcon className="toolbar-icon" />
+                                <span className="sr-only">Sort and view options</span>
                             </button>
+                            {showSortMenu && (
+                                <div className="gallery-menu" role="menu" aria-label="Sort and view">
+                                    <p className="gallery-menu-label">Sort by</p>
+                                    <div className="gallery-menu-row">
+                                        <button type="button" onClick={() => handleSortChange('date')} className={`btn btn-soft gallery-menu-btn ${sortBy === 'date' ? 'active' : ''}`}>
+                                            <ClockIcon className="toolbar-icon" /> Recent
+                                        </button>
+                                        <button type="button" onClick={() => handleSortChange('capture')} className={`btn btn-soft gallery-menu-btn ${sortBy === 'capture' ? 'active' : ''}`}>
+                                            <CalendarDaysIcon className="toolbar-icon" /> Captured
+                                        </button>
+                                    </div>
+                                    <p className="gallery-menu-label">Show</p>
+                                    <div className="gallery-menu-row">
+                                        <button type="button" onClick={() => setMediaFilter('all')} className={`btn btn-soft gallery-menu-btn ${mediaFilter === 'all' ? 'active' : ''}`}>
+                                            <Squares2X2Icon className="toolbar-icon" /> All
+                                        </button>
+                                        <button type="button" onClick={() => setMediaFilter('photos')} className={`btn btn-soft gallery-menu-btn ${mediaFilter === 'photos' ? 'active' : ''}`}>
+                                            <PhotoIcon className="toolbar-icon" /> Photos
+                                        </button>
+                                        <button type="button" onClick={() => setMediaFilter('videos')} className={`btn btn-soft gallery-menu-btn ${mediaFilter === 'videos' ? 'active' : ''}`}>
+                                            <VideoCameraIcon className="toolbar-icon" /> Videos
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
                         </div>
 
-                        <div className="toolbar-left" role="group" aria-label="Media type">
+                        <div className="gallery-menu-anchor">
                             <button
                                 type="button"
-                                onClick={() => setMediaFilter('all')}
-                                className={`sort-btn icon-btn ${mediaFilter === 'all' ? 'active' : ''}`}
-                                aria-label="All media"
-                                title="All media"
+                                onClick={() => setShowFilters(!showFilters)}
+                                className={`btn icon-btn ${showFilters || filters.minRating > 0 || filters.minLikes > 0 || hasCaptureFilter ? 'btn-primary' : 'btn-soft'}`}
+                                aria-label="Filters"
+                                aria-expanded={showFilters}
+                                title="Filters"
                             >
-                                <Squares2X2Icon className="toolbar-icon" />
-                                <span className="sr-only">All media</span>
+                                <FunnelIcon className="toolbar-icon" />
+                                <span className="sr-only">Filters</span>
                             </button>
-                            <button
-                                type="button"
-                                onClick={() => setMediaFilter('photos')}
-                                className={`sort-btn icon-btn ${mediaFilter === 'photos' ? 'active' : ''}`}
-                                aria-label="Photos only"
-                                title="Photos only"
-                            >
-                                <PhotoIcon className="toolbar-icon" />
-                                <span className="sr-only">Photos only</span>
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setMediaFilter('videos')}
-                                className={`sort-btn icon-btn ${mediaFilter === 'videos' ? 'active' : ''}`}
-                                aria-label="Videos only"
-                                title="Videos only"
-                            >
-                                <VideoCameraIcon className="toolbar-icon" />
-                                <span className="sr-only">Videos only</span>
-                            </button>
+                            {showFilters && (
+                                <div className="gallery-menu gallery-menu-filters" role="menu" aria-label="Filters">
+                                    <div className="gallery-filter-field">
+                                        <label className="gallery-menu-label" htmlFor="flt-rating">Minimum rating: {filters.minRating}</label>
+                                        <input
+                                            id="flt-rating"
+                                            type="range"
+                                            min="0"
+                                            max="5"
+                                            value={filters.minRating}
+                                            onChange={(e) => setFilters({ ...filters, minRating: parseInt(e.target.value) })}
+                                        />
+                                    </div>
+                                    <div className="gallery-filter-field">
+                                        <label className="gallery-menu-label" htmlFor="flt-likes">Minimum likes: {filters.minLikes}</label>
+                                        <input
+                                            id="flt-likes"
+                                            type="range"
+                                            min="0"
+                                            max="100"
+                                            value={filters.minLikes}
+                                            onChange={(e) => setFilters({ ...filters, minLikes: parseInt(e.target.value) })}
+                                        />
+                                    </div>
+                                    <div className="gallery-filter-field">
+                                        <label className="gallery-menu-label" htmlFor="capture-start">Captured from</label>
+                                        <input
+                                            id="capture-start"
+                                            type="date"
+                                            className="field field-date"
+                                            value={captureStartDate}
+                                            onChange={(e) => setCaptureStartDate(e.target.value)}
+                                        />
+                                    </div>
+                                    <div className="gallery-filter-field">
+                                        <label className="gallery-menu-label" htmlFor="capture-end">Captured to</label>
+                                        <input
+                                            id="capture-end"
+                                            type="date"
+                                            className="field field-date"
+                                            value={captureEndDate}
+                                            onChange={(e) => setCaptureEndDate(e.target.value)}
+                                        />
+                                    </div>
+                                    <div className="gallery-menu-row">
+                                        <button
+                                            type="button"
+                                            onClick={() => { handleApplyFilters(); setShowFilters(false); }}
+                                            className="btn btn-primary gallery-menu-btn"
+                                        >
+                                            <CheckIcon className="toolbar-icon" /> Apply
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={handleResetFilters}
+                                            className="btn btn-soft gallery-menu-btn"
+                                        >
+                                            <ArrowUturnLeftIcon className="toolbar-icon" /> Reset
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
                         </div>
 
                         <button
                             type="button"
                             onClick={() => fetchPhotos(sortBy, 0, false, searchQuery)}
-                            className="btn btn-primary icon-btn"
+                            className="btn btn-soft icon-btn"
                             aria-label="Refresh"
+                            title="Refresh"
                         >
                             <ArrowPathIcon className="toolbar-icon" />
                             <span className="sr-only">Refresh</span>
                         </button>
 
-                        <button
-                            type="button"
-                            onClick={() => setShowFilters(!showFilters)}
-                            className={`btn icon-btn ${showFilters ? 'btn-primary' : 'btn-soft'}`}
-                            aria-label="Filters"
-                        >
-                            <FunnelIcon className="toolbar-icon" />
-                            <span className="sr-only">Filters</span>
-                        </button>
-
                         {selectedCount > 0 && (
-                            <button
-                                type="button"
-                                onClick={handleCreateAlbumFromSelected}
-                                className="btn btn-soft icon-btn"
-                                aria-label={`Create album (${selectedCount})`}
-                            >
-                                <PlusIcon className="toolbar-icon" />
-                                <span className="sr-only">Create album ({selectedCount})</span>
-                            </button>
-                        )}
-
-                        {selectedCount > 0 && (
-                            <button
-                                type="button"
-                                onClick={handleDownloadSelected}
-                                disabled={downloading}
-                                className="btn btn-soft icon-btn"
-                                aria-label={`Download selected (${selectedCount})`}
-                            >
-                                <ArrowDownTrayIcon className="toolbar-icon" />
-                                <span className="sr-only">Download selected ({selectedCount})</span>
-                            </button>
-                        )}
-
-                        {selectedCount > 0 && (
-                            <button
-                                type="button"
-                                onClick={handleDeletePhotos}
-                                disabled={deleting}
-                                className="btn btn-danger icon-btn"
-                                aria-label={`Delete selected (${selectedCount})`}
-                            >
-                                <TrashIcon className="toolbar-icon" />
-                                <span className="sr-only">Delete selected ({selectedCount})</span>
-                            </button>
+                            <>
+                                <button
+                                    type="button"
+                                    onClick={handleCreateAlbumFromSelected}
+                                    className="btn btn-soft icon-btn"
+                                    aria-label={`Create album (${selectedCount})`}
+                                    title={`Create album (${selectedCount})`}
+                                >
+                                    <PlusIcon className="toolbar-icon" />
+                                    <span className="sr-only">Create album ({selectedCount})</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleDownloadSelected}
+                                    disabled={downloading}
+                                    className="btn btn-soft icon-btn"
+                                    aria-label={`Download selected (${selectedCount})`}
+                                    title={`Download selected (${selectedCount})`}
+                                >
+                                    <ArrowDownTrayIcon className="toolbar-icon" />
+                                    <span className="sr-only">Download selected ({selectedCount})</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleDeletePhotos}
+                                    disabled={deleting}
+                                    className="btn btn-danger icon-btn"
+                                    aria-label={`Delete selected (${selectedCount})`}
+                                    title={`Delete selected (${selectedCount})`}
+                                >
+                                    <TrashIcon className="toolbar-icon" />
+                                    <span className="sr-only">Delete selected ({selectedCount})</span>
+                                </button>
+                            </>
                         )}
                     </div>
                 </div>
             </div>
-            )}
-
-            {showFilters && (
-                <div className="filters">
-                    <h4 className="toolbar-title">Filter Library</h4>
-                    <div className="filters-grid">
-                        <div className="filter-item">
-                            <label>
-                                Minimum Rating: {filters.minRating}
-                            </label>
-                            <input
-                                type="range"
-                                min="0"
-                                max="5"
-                                value={filters.minRating}
-                                onChange={(e) => setFilters({ ...filters, minRating: parseInt(e.target.value) })}
-                            />
-                        </div>
-
-                        <div className="filter-item">
-                            <label>
-                                Minimum Likes: {filters.minLikes}
-                            </label>
-                            <input
-                                type="range"
-                                min="0"
-                                max="100"
-                                value={filters.minLikes}
-                                onChange={(e) => setFilters({ ...filters, minLikes: parseInt(e.target.value) })}
-                            />
-                        </div>
-
-                        <button
-                            type="button"
-                            onClick={handleApplyFilters}
-                            className="btn btn-primary icon-btn"
-                            aria-label="Apply filters"
-                        >
-                            <CheckIcon className="toolbar-icon" />
-                            <span className="sr-only">Apply filters</span>
-                        </button>
-                        <button
-                            type="button"
-                            onClick={handleResetFilters}
-                            className="btn btn-soft icon-btn"
-                            aria-label="Reset filters"
-                        >
-                            <ArrowUturnLeftIcon className="toolbar-icon" />
-                            <span className="sr-only">Reset filters</span>
-                        </button>
-
-                        <div className="filter-item date-range-inline">
-                            <label htmlFor="capture-start">Captured Start</label>
-                            <input
-                                id="capture-start"
-                                type="date"
-                                className="field field-date"
-                                value={captureStartDate}
-                                onChange={(e) => setCaptureStartDate(e.target.value)}
-                            />
-                        </div>
-
-                        <div className="filter-item date-range-inline">
-                            <label htmlFor="capture-end">Captured End</label>
-                            <input
-                                id="capture-end"
-                                type="date"
-                                className="field field-date"
-                                value={captureEndDate}
-                                onChange={(e) => setCaptureEndDate(e.target.value)}
-                            />
-                        </div>
-                    </div>
-                </div>
             )}
 
             {downloading && downloadProgress && (
@@ -4325,180 +4268,88 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 />
             )}
 
-            {filteredPhotos.length > 0 && (
+            {selectedCount > 0 && (
                 <div className="selection-bar">
                     <div className="selection-bar-actions">
-                        <label className="selection-toggle">
-                            <input
-                                type="checkbox"
-                                checked={selectedPhotos.size > 0 && selectedPhotos.size === filteredPhotos.length}
-                                onChange={handleSelectAll}
-                            />
-                            <span>
-                                {selectedPhotos.size > 0 && selectedPhotos.size === filteredPhotos.length
-                                    ? `Deselect all (${filteredPhotos.length})`
-                                    : `Select all (${filteredPhotos.length})`}
-                            </span>
-                        </label>
-
-                        {selectedCount > 0 && (
-                            <>
-                                <button
-                                    type="button"
-                                    onClick={handleCreateAlbumFromSelected}
-                                    className="btn btn-soft icon-btn"
-                                    aria-label={`Create album (${selectedCount})`}
-                                >
-                                    <PlusIcon className="toolbar-icon" />
-                                    <span className="sr-only">Create album ({selectedCount})</span>
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={handleDeletePhotos}
-                                    disabled={deleting}
-                                    className="btn btn-danger icon-btn"
-                                    aria-label={`Delete selected (${selectedCount})`}
-                                >
-                                    <TrashIcon className="toolbar-icon" />
-                                    <span className="sr-only">Delete selected ({selectedCount})</span>
-                                </button>
-                            </>
-                        )}
+                        <span className="selection-count">{selectedCount} selected</span>
+                        <button
+                            type="button"
+                            className="btn btn-soft selection-select-all"
+                            onClick={handleSelectAll}
+                        >
+                            {selectedPhotos.size === filteredPhotos.length
+                                ? `Deselect all (${filteredPhotos.length})`
+                                : `Select all (${filteredPhotos.length})`}
+                        </button>
                     </div>
                 </div>
             )}
 
             {lightboxIndex === null ? (
                 <div className="gallery-grid">
-                    {filteredPhotos.map((photo, index) => (
-                        <PhotoTile
-                            key={photo.filename}
-                            photo={photo}
-                            selected={selectedPhotos.has(photo.filename)}
-                            animationDelayMs={(index % 8) * 36}
-                            title={photo.filename}
-                            kind={getMediaKind(photo.filename)}
-                            openOriginal={false}
-                            linkTitle={`${photo.filename}\n${getMediaKind(photo.filename)}`}
-                            onMediaClick={(e) => {
-                                e.stopPropagation();
-                                openLightboxAt(index);
-                            }}
-                            onBodyClick={(e) => {
-                                const target = e.target as HTMLElement;
-                                if (target.closest('button, input, .exif-panel, .rating-display')) {
-                                    return;
-                                }
-                                handlePhotoSelect(photo.filename, true);
-                            }}
-                            selectableOverlay={(
-                                <input
-                                    type="checkbox"
-                                    className="photo-body-check"
-                                    checked={selectedPhotos.has(photo.filename)}
-                                    onChange={() => {}}
-                                    onClick={(e: React.MouseEvent<HTMLInputElement>) => {
-                                        e.stopPropagation();
-                                        handlePhotoSelect(photo.filename, true);
-                                    }}
-                                />
-                            )}
-                            bodyContent={(
-                                <>
-                                    {ratingPhoto === photo.filename ? (
-                                        <div className="photo-row">
-                                            <StarRating filename={photo.filename} rating={photo.rating || 0} />
-                                        </div>
-                                    ) : (
-                                        <div
-                                            onClick={(e) => {
-                                                e.stopPropagation();
-                                                setRatingPhoto(photo.filename);
-                                            }}
-                                            className="rating-display"
-                                            title="Click to rate"
+                    {filteredPhotos.map((photo, index) => {
+                        const isSelected = selectedPhotos.has(photo.filename);
+                        const rating = Math.max(0, Math.min(5, Math.round(photo.rating || 0)));
+                        return (
+                            <PhotoTile
+                                key={photo.filename}
+                                photo={photo}
+                                selected={isSelected}
+                                animationDelayMs={(index % 8) * 36}
+                                title={photo.filename}
+                                openOriginal={false}
+                                showBody={false}
+                                linkTitle={`${photo.filename}\n${getMediaKind(photo.filename)}`}
+                                onMediaClick={(e) => {
+                                    e.stopPropagation();
+                                    openLightboxAt(index);
+                                }}
+                                mediaOverlay={(
+                                    <>
+                                        <label
+                                            className={`tile-select ${isSelected ? 'is-on' : ''}`}
+                                            onClick={(e) => e.stopPropagation()}
+                                            title={isSelected ? 'Selected' : 'Select photo'}
                                         >
-                                            {photo.rating ? '★'.repeat(photo.rating) : '☆'} {photo.rating || 0}/5
-                                        </div>
-                                    )}
-
-                                    <div className="photo-row">
-                                        <button
-                                            type="button"
-                                            onClick={(e) => {
-                                                e.stopPropagation();
-                                                handleToggleLike(photo.filename);
-                                            }}
-                                            className={`like-btn ${photo.liked ? 'active' : ''}`}
-                                            title={`${photo.likes || 0} likes`}
-                                            aria-label={`${photo.likes || 0} likes`}
-                                        >
-                                            <HeartIcon className="toolbar-icon" />
-                                            <span className="sr-only">{photo.likes || 0} likes</span>
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={(e) => {
-                                                e.stopPropagation();
-                                                void toggleExif(photo.filename);
-                                            }}
-                                            className="btn btn-soft icon-btn"
-                                            aria-label={expandedExif.has(photo.filename) ? 'Hide details' : 'Show details'}
-                                        >
-                                            <InformationCircleIcon className="toolbar-icon" />
-                                            <span className="sr-only">{expandedExif.has(photo.filename) ? 'Hide details' : 'Show details'}</span>
-                                        </button>
-                                    </div>
-
-                                    {expandedExif.has(photo.filename) && (
-                                        <div className="exif-panel" onClick={(e) => e.stopPropagation()}>
-                                            {loadingExif.has(photo.filename) ? (
-                                                <p className="status">Loading EXIF…</p>
-                                            ) : (
-                                                <>
-                                                    {photo.exifSummary?.camera && (
-                                                        <p className="photo-meta">Camera: {photo.exifSummary.camera}</p>
-                                                    )}
-                                                    {photo.exifSummary?.capturedAt && (
-                                                        <p className="photo-meta">Captured: {photo.exifSummary.capturedAt}</p>
-                                                    )}
-                                                    {(photoTags[photo.filename] || photo.tags || []).length > 0 && (
-                                                        <div className="exif-tags">
-                                                            <span className="exif-key">AI Tags</span>
-                                                            <div className="tag-chips">
-                                                                {(photoTags[photo.filename] || photo.tags || []).map((tag) => (
-                                                                    <span key={tag} className="tag-chip">{tag}</span>
-                                                                ))}
-                                                            </div>
-                                                        </div>
-                                                    )}
-                                                    <div className="exif-grid">
-                                                        {Object.entries(photoExifData[photo.filename] || {})
-                                                            .filter(([key]) => key !== 'GPSInfo')
-                                                            .sort(([a], [b]) => a.localeCompare(b))
-                                                            .map(([key, value]) => (
-                                                                <div key={key} className="exif-row">
-                                                                    <span className="exif-key">{key}</span>
-                                                                    <span className="exif-value">{value}</span>
-                                                                </div>
-                                                            ))}
-                                                    </div>
-                                                    {!!photoExifData[photo.filename]?.GPSInfo &&
-                                                        !(photo.location?.latitude || photo.location?.longitude || photo.location?.address) && (
-                                                        <p className="status">GPS metadata detected, but this file does not expose readable coordinates.</p>
-                                                    )}
-                                                    {Object.keys(photoExifData[photo.filename] || {}).length === 0 &&
-                                                        (photoTags[photo.filename] || photo.tags || []).length === 0 && (
-                                                        <p className="status">No additional metadata available.</p>
-                                                    )}
-                                                </>
-                                            )}
-                                        </div>
-                                    )}
-                                </>
-                            )}
-                        />
-                    ))}
+                                            <input
+                                                type="checkbox"
+                                                className="tile-select-input"
+                                                checked={isSelected}
+                                                onChange={() => handlePhotoSelect(photo.filename, true)}
+                                                aria-label={`Select ${photo.filename}`}
+                                            />
+                                            <CheckIcon className="tile-select-icon" aria-hidden="true" />
+                                        </label>
+                                        {(rating > 0 || photo.liked) && (
+                                            <div className="tile-badges" aria-hidden="false">
+                                                {rating > 0 && (
+                                                    <span
+                                                        className="tile-star"
+                                                        title={`Rated ${rating}/5`}
+                                                        aria-label={`Rated ${rating} out of 5`}
+                                                    >
+                                                        <StarSolidIcon className="tile-star-track" />
+                                                        <span className="tile-star-fill" style={{ width: `${(rating / 5) * 100}%` }}>
+                                                            <StarSolidIcon className="tile-star-front" />
+                                                        </span>
+                                                    </span>
+                                                )}
+                                                {photo.liked && (
+                                                    <span
+                                                        className="tile-like"
+                                                        title={`${photo.likes || 0} ${photo.likes === 1 ? 'like' : 'likes'}`}
+                                                        aria-label={`Liked, ${photo.likes || 0} likes`}
+                                                    >
+                                                        <HeartSolidIcon className="tile-like-icon" />
+                                                    </span>
+                                                )}
+                                            </div>
+                                        )}
+                                    </>
+                                )}
+                            />
+                        );
+                    })}
                 </div>
             ) : (
                 <PhotoViewer
@@ -4508,6 +4359,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                     onIndexChange={setLightboxIndex}
                     useProtectedMedia={true}
                     onRotationSave={handleSaveRotation}
+                    onRate={handleRatePhoto}
+                    onToggleLike={handleToggleLike}
                 />
             )}
 

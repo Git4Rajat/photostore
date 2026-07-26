@@ -75,15 +75,14 @@ const CorruptedUploadsPage: React.FC = () => {
 
     return (
         <section className="card-glass gallery-wrap">
-            <div className="gallery-banner">
-                <div className="gallery-banner-copy">
-                    <p className="ios-kicker">UPLOAD HEALTH</p>
-                    <h2 className="gallery-banner-title">Corrupted uploads</h2>
-                    <p className="ios-subtitle">
-                        Items that failed verification are listed here so you can re-upload or replace them.
-                    </p>
-                </div>
-            </div>
+            <header className="page-topline">
+                <h2 className="page-topline-title">Corrupted uploads</h2>
+                <p className="gallery-meta-line">
+                    <span className="gallery-meta-count">{items.length}</span>
+                    <span> {items.length === 1 ? 'item' : 'items'}</span>
+                    <span className="gallery-meta-dim"> · failed verification</span>
+                </p>
+            </header>
 
             {loading && <Loading label="Checking your uploads…" fullPage={false} />}
             {error && <ErrorState title="Couldn't check uploads" message={error} />}
