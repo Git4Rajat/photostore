@@ -101,7 +101,10 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     useEffect(() => {
         let active = true;
         if (!shouldUseProtectedMedia || !shouldFetchScopedThumbnail(photo.filename, photo.thumbnailUrl)) {
-            setScopedThumbnailUrl(PLACEHOLDER_THUMBNAIL);
+            // Listings hand out absolute SAS URLs the <img> can load directly —
+            // no per-tile access round-trip needed. Anything else non-fetchable
+            // renders the placeholder.
+            setScopedThumbnailUrl(isHttpUrl(photo.thumbnailUrl) ? photo.thumbnailUrl : PLACEHOLDER_THUMBNAIL);
             return undefined;
         }
         setScopedThumbnailUrl(undefined);

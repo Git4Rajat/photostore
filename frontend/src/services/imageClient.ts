@@ -7,7 +7,11 @@ const DEFAULT_MAX_PROTECTED_IMAGE_REQUESTS = 4;
 export const fetchProtectedBlobUrl = async (path: string): Promise<string> => {
   const url = resolveApiUrl(path);
   const headers: Record<string, string> = {};
-  if (isAuthEnabled()) {
+  // Absolute URLs are signed storage URLs (SAS): the signature in the query
+  // string IS the auth, and Azure rejects requests carrying both a SAS and an
+  // Authorization header. Only backend-relative paths need the bearer token.
+  const isSignedStorageUrl = /^https?:\/\//i.test(path);
+  if (!isSignedStorageUrl && isAuthEnabled()) {
     const token = await getAccessToken();
     if (!token) {
       throw new Error('Authentication required for protected image fetch');

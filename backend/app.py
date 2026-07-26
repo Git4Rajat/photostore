@@ -16,10 +16,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from azure.core.exceptions import AzureError
+from azure.core.exceptions import AzureError, ResourceExistsError
 from azure.data.tables import TableServiceClient
 from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobSasPermissions, BlobServiceClient, generate_blob_sas
+from azure.storage.blob import BlobSasPermissions, BlobServiceClient, UserDelegationKey, generate_blob_sas
 from azure.storage.queue import QueueServiceClient
 from flask import Flask, Response, jsonify, make_response, request
 from auth_utils import get_request_user_id as resolve_request_user_id
@@ -262,6 +262,11 @@ BLOB_CONNECTION_STRING = os.getenv('BLOB_CONNECTION_STRING', '').strip()
 BLOB_IMAGE_CONTAINER = os.getenv('BLOB_IMAGE_CONTAINER', IMAGE_CONTAINER).strip()
 BLOB_THUMBNAIL_CONTAINER = os.getenv('BLOB_THUMBNAIL_CONTAINER', THUMBNAIL_CONTAINER).strip()
 BLOB_COVER_CONTAINER = os.getenv('BLOB_COVER_CONTAINER', 'covers').strip()
+# 'sas' hands the browser day-stable read SAS URLs pointing straight at blob
+# storage so media bytes never stream through this container; 'proxy' serves
+# every byte through the backend. 'sas' silently degrades to proxy URLs when
+# minting is impossible (no AAD credential, e.g. Azurite/local dev).
+MEDIA_URL_MODE = os.getenv('MEDIA_URL_MODE', 'sas').strip().lower()
 BLOB_VECTOR_INDEX_CONTAINER = os.getenv('BLOB_VECTOR_INDEX_CONTAINER', 'vector-index').strip()
 VECTOR_INDEX_PRIME_ON_STARTUP = os.getenv('VECTOR_INDEX_PRIME_ON_STARTUP', 'true').lower() in ('1', 'true', 'yes')
 VECTOR_INDEX_PRIME_MAX_USERS = max(0, int(os.getenv('VECTOR_INDEX_PRIME_MAX_USERS', '200')))
@@ -887,19 +892,20 @@ def _normalize_rotation(value) -> int:
 
 
 def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
-    """Return a thumbnail proxy URL when a real thumbnail or backend preview can be served."""
-    if (
-        str((metadata or {}).get('thumbnail_status') or '').strip().lower() != 'done'
-        and not _filename_requires_backend_preview(filename)
-    ):
+    """Return a thumbnail URL when a real thumbnail or backend preview can be served."""
+    if str((metadata or {}).get('thumbnail_status') or '').strip().lower() != 'done':
+        if _filename_requires_backend_preview(filename):
+            # No thumbnail blob exists yet; the proxy route falls through to the
+            # server-side RAW/HEIC preview converter, which a direct blob URL can't.
+            return make_proxy_url(filename, 'thumbnail')
         return ''
-    return make_proxy_url(filename, 'thumbnail')
+    return make_media_url(filename, 'thumbnail')
 
 
 def _private_photo_media_urls(filename: str) -> Dict[str, str]:
     return {
-        'url': make_proxy_url(filename, 'image'),
-        'thumbnailUrl': make_proxy_url(filename, 'thumbnail'),
+        'url': make_media_url(filename, 'image'),
+        'thumbnailUrl': make_media_url(filename, 'thumbnail'),
     }
 
 
@@ -1347,6 +1353,7 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         try:
             metadata_table_client.upsert_entity(entity)
+            _invalidate_metadata_scan_cache(user_id)
             if any(key in {
                 'tags', 'objects', 'caption', 'ocrText', 'address', 'locationCity', 'locationCountry',
                 'semanticText', 'semanticEmbedding', 'semanticEmbeddingVersion', 'faceCount', 'faces',
@@ -1500,6 +1507,65 @@ def _count_processing_statuses(user_id: str, steps: List[str]) -> Dict[str, Dict
     except Exception:
         return counts
     return counts
+
+
+# Short-TTL cache + coalescing for full metadata scans. Listing endpoints
+# (/photos, search, filter, …) each scan the user's entire metadata partition;
+# back-to-back or concurrent calls used to repeat that scan and starve the
+# server. The first request performs the scan while identical concurrent
+# requests wait on a per-user lock and reuse the result; writes invalidate the
+# user's entry, and the TTL bounds staleness for anything invalidation misses.
+METADATA_SCAN_CACHE_TTL_SECONDS = float(os.getenv('METADATA_SCAN_CACHE_TTL_SECONDS', '20'))
+_metadata_scan_cache: Dict[str, Tuple[float, List[Dict]]] = {}
+_metadata_scan_locks: Dict[str, threading.Lock] = {}
+_metadata_scan_cache_guard = threading.Lock()
+
+
+def _metadata_scan_lock_for_user(user_id: str) -> threading.Lock:
+    with _metadata_scan_cache_guard:
+        lock = _metadata_scan_locks.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            _metadata_scan_locks[user_id] = lock
+        return lock
+
+
+def _invalidate_metadata_scan_cache(user_id: str) -> None:
+    with _metadata_scan_cache_guard:
+        _metadata_scan_cache.pop(user_id, None)
+
+
+def _cached_metadata_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
+    """Full metadata scan for a user, served from the short-TTL cache when fresh.
+
+    Each caller gets its own shallow copy of the rows so request handlers can
+    annotate them (e.g. the uploadDate backfill) without mutating shared state.
+    """
+    def _fresh_rows() -> Optional[List[Dict]]:
+        with _metadata_scan_cache_guard:
+            entry = _metadata_scan_cache.get(user_id)
+        if entry and entry[0] > time.monotonic():
+            return [dict(row) for row in entry[1]]
+        return None
+
+    cached = _fresh_rows()
+    if cached is not None:
+        return cached
+
+    lock = _metadata_scan_lock_for_user(user_id)
+    with lock:
+        # Re-check after acquiring: another request may have scanned while we waited.
+        cached = _fresh_rows()
+        if cached is not None:
+            return cached
+        rows = _query_metadata_rows_for_user(user_id, purpose=purpose)
+        if METADATA_SCAN_CACHE_TTL_SECONDS > 0:
+            with _metadata_scan_cache_guard:
+                _metadata_scan_cache[user_id] = (
+                    time.monotonic() + METADATA_SCAN_CACHE_TTL_SECONDS,
+                    [dict(row) for row in rows],
+                )
+        return rows
 
 
 def _query_metadata_rows_for_user(user_id: str, select: Optional[List[str]] = None, purpose: str = 'metadata') -> List[Dict]:
@@ -4293,12 +4359,15 @@ def _public_photo_urls(token: str, filename: str) -> Dict[str, str]:
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
     preview_required = ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA or ext in {'heic', 'heif'}
     preview_url = f'/public/photos/{token}/preview/{filename}' if preview_required else ''
+    # Day-stable SAS so shared-album thumbnails stay browser-cacheable; the
+    # album link itself is the long-lived bearer secret, so a day-scoped blob
+    # URL doesn't widen exposure.
     try:
-        image_url, _ = _create_scoped_blob_url(BLOB_IMAGE_CONTAINER, filename, minutes=10)
+        image_url, _ = _create_stable_read_sas_url(BLOB_IMAGE_CONTAINER, filename)
     except Exception:
         image_url = f'/public/photos/{token}/image/{filename}'
     try:
-        thumbnail_url, _ = _create_scoped_blob_url(BLOB_THUMBNAIL_CONTAINER, filename, minutes=10)
+        thumbnail_url, _ = _create_stable_read_sas_url(BLOB_THUMBNAIL_CONTAINER, filename)
     except Exception:
         thumbnail_url = f'/public/photos/{token}/thumbnail/{filename}'
     return {
@@ -4952,35 +5021,28 @@ def _photo_access_container(kind: str) -> Optional[str]:
     return None
 
 
-def _thumbnail_access_fallback(safe_name: str, *, batch: bool = False) -> Optional[Dict]:
-    try:
-        get_media_properties('thumbnail', safe_name)
+def _thumbnail_access_response(safe_name: str, metadata: Optional[Dict]) -> Optional[Dict]:
+    """Route to preview/proxy when no real thumbnail blob exists yet.
+
+    Decided from metadata already in hand (thumbnail_status) rather than a blob
+    HEAD per file — the HEAD round-trips were the bulk of the cost of the
+    access endpoints on large grids.
+    """
+    if str((metadata or {}).get('thumbnail_status') or '').strip().lower() == 'done':
         return None
-    except Exception as exc:
-        if _filename_requires_backend_preview(safe_name) and _is_missing_media_error(exc):
-            return {
-                'url': _preview_proxy_url(safe_name),
-                'expiresAt': '',
-                'filename': safe_name,
-                'kind': 'preview',
-            }
-        if batch:
-            app.logger.warning('Thumbnail access batch inspection failed for %s; falling back to backend proxy: %s', safe_name, exc)
-        else:
-            app.logger.warning('Thumbnail access inspection failed for %s; falling back to backend proxy: %s', safe_name, exc)
+    if _filename_requires_backend_preview(safe_name):
         return {
-            'url': make_proxy_url(safe_name, 'thumbnail'),
+            'url': _preview_proxy_url(safe_name),
             'expiresAt': '',
             'filename': safe_name,
-            'kind': 'thumbnail',
+            'kind': 'preview',
         }
-
-
-def _thumbnail_access_response(safe_name: str, *, batch: bool = False) -> Optional[Dict]:
-    fallback = _thumbnail_access_fallback(safe_name, batch=batch)
-    if fallback is not None:
-        return fallback
-    return None
+    return {
+        'url': make_proxy_url(safe_name, 'thumbnail'),
+        'expiresAt': '',
+        'filename': safe_name,
+        'kind': 'thumbnail',
+    }
 
 
 def _access_url_response(url: str, expires_at: str, filename: str, kind: str) -> Dict:
@@ -5000,7 +5062,8 @@ def photo_access_url(kind: str, filename: str):
     safe_name = secure_filename(filename)
     if not safe_name or not allowed_file(safe_name) or safe_name != filename:
         return jsonify({'error': 'Invalid filename'}), 400
-    if not _get_metadata_entity(user_id, safe_name):
+    metadata = _get_metadata_entity(user_id, safe_name)
+    if not metadata:
         return jsonify({'error': 'Not found'}), 404
     if not _is_supported_photo_access_kind(kind):
         return jsonify({'error': 'Invalid media kind'}), 400
@@ -5009,14 +5072,14 @@ def photo_access_url(kind: str, filename: str):
     if kind == 'preview':
         return jsonify(_access_url_response(_preview_proxy_url(safe_name), '', safe_name, kind))
     if kind == 'thumbnail':
-        fallback = _thumbnail_access_response(safe_name)
+        fallback = _thumbnail_access_response(safe_name, metadata)
         if fallback is not None:
             return jsonify(fallback)
     container = _photo_access_container(kind)
     if container is None:
         return jsonify({'error': 'Invalid media kind'}), 400
     try:
-        url, expires_at = _create_scoped_blob_url(container, safe_name)
+        url, expires_at = _create_stable_read_sas_url(container, safe_name)
         return jsonify(_access_url_response(url, expires_at, safe_name, kind))
     except Exception as exc:
         app.logger.exception('Failed to mint %s access URL for %s', kind, safe_name)
@@ -5046,7 +5109,8 @@ def photo_access_url_batch():
         safe_name = secure_filename(str(raw_name or ''))
         if not safe_name or not allowed_file(safe_name):
             continue
-        if not _get_metadata_entity(user_id, safe_name):
+        metadata = _get_metadata_entity(user_id, safe_name)
+        if not metadata:
             continue
         if kind == 'preview':
             urls[safe_name] = _preview_proxy_url(safe_name)
@@ -5055,12 +5119,12 @@ def photo_access_url_batch():
         if container is None:
             continue
         if kind == 'thumbnail':
-            fallback = _thumbnail_access_response(safe_name, batch=True)
+            fallback = _thumbnail_access_response(safe_name, metadata)
             if fallback is not None:
                 urls[safe_name] = fallback['url']
                 continue
         try:
-            url, expires_at = _create_scoped_blob_url(container, safe_name, minutes=15)
+            url, expires_at = _create_stable_read_sas_url(container, safe_name)
             urls[safe_name] = url
         except Exception:
             continue
@@ -5075,6 +5139,136 @@ def photo_access_url_batch():
 def make_proxy_url(filename: str, kind: str = 'thumbnail') -> str:
     """Return a backend proxy URL instead of a SAS URL."""
     return f'/api/photos/{kind}/{filename}'
+
+
+# ---------------------------------------------------------------------------
+# Direct-to-blob media URLs (MEDIA_URL_MODE='sas').
+#
+# Streaming media bytes through this container dominated its compute bill, so
+# in 'sas' mode the browser gets read SAS URLs pointing straight at blob
+# storage. Two properties keep this cheap:
+#   - the user-delegation key is minted once per UTC day and cached (in-process
+#     plus a shared row in the metadata table so every worker/replica signs
+#     with the SAME key), instead of one key round-trip per URL;
+#   - SAS start/expiry are day-aligned, so a given blob's URL is byte-identical
+#     across requests all day and the browser HTTP cache keeps working.
+# The window is [day start - 15min, day start + 48h]: a URL minted just before
+# midnight is still valid for a full day after.
+# ---------------------------------------------------------------------------
+
+_MEDIA_DELEGATION_KEY_PARTITION = '__system__'
+_delegation_key_lock = threading.Lock()
+_delegation_key_cached: Optional[Tuple[datetime, 'UserDelegationKey', datetime, datetime]] = None
+# After a mint failure (e.g. Azurite has no user-delegation keys), fall back to
+# proxy URLs without re-attempting SAS on every single URL for a while.
+_media_sas_retry_after = 0.0
+
+
+def _delegation_key_to_row(key: 'UserDelegationKey') -> Dict[str, str]:
+    return {
+        'signed_oid': key.signed_oid,
+        'signed_tid': key.signed_tid,
+        'signed_start': key.signed_start,
+        'signed_expiry': key.signed_expiry,
+        'signed_service': key.signed_service,
+        'signed_version': key.signed_version,
+        'value': key.value,
+    }
+
+
+def _delegation_key_from_row(entity: Dict) -> 'UserDelegationKey':
+    key = UserDelegationKey()
+    for field in ('signed_oid', 'signed_tid', 'signed_start', 'signed_expiry',
+                  'signed_service', 'signed_version', 'value'):
+        setattr(key, field, entity[field])
+    return key
+
+
+def _stable_delegation_key() -> Tuple['UserDelegationKey', datetime, datetime]:
+    """Return (key, starts_on, expires_on) for the current UTC day, cached."""
+    global _delegation_key_cached
+    if blob_service_client is None:
+        raise RuntimeError('Blob storage is not configured')
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cached = _delegation_key_cached
+    if cached and cached[0] == day_start:
+        return cached[1], cached[2], cached[3]
+    with _delegation_key_lock:
+        cached = _delegation_key_cached
+        if cached and cached[0] == day_start:
+            return cached[1], cached[2], cached[3]
+        starts_on = day_start - timedelta(minutes=15)
+        expires_on = day_start + timedelta(hours=48)
+        row_key = f"media_delegation_key_{day_start.strftime('%Y%m%d')}"
+        key = None
+        if metadata_table_client is not None:
+            try:
+                entity = metadata_table_client.get_entity(_MEDIA_DELEGATION_KEY_PARTITION, row_key)
+                key = _delegation_key_from_row(entity)
+            except Exception:
+                key = None
+        if key is None:
+            key = blob_service_client.get_user_delegation_key(starts_on, expires_on)
+            if metadata_table_client is not None:
+                try:
+                    metadata_table_client.create_entity({
+                        'PartitionKey': _MEDIA_DELEGATION_KEY_PARTITION,
+                        'RowKey': row_key,
+                        **_delegation_key_to_row(key),
+                    })
+                except ResourceExistsError:
+                    # Another replica won the race; sign with its key so URLs
+                    # stay identical cluster-wide.
+                    try:
+                        entity = metadata_table_client.get_entity(_MEDIA_DELEGATION_KEY_PARTITION, row_key)
+                        key = _delegation_key_from_row(entity)
+                    except Exception:
+                        pass
+                except Exception:
+                    app.logger.warning('Could not persist shared media delegation key', exc_info=True)
+        _delegation_key_cached = (day_start, key, starts_on, expires_on)
+        return key, starts_on, expires_on
+
+
+def _create_stable_read_sas_url(container_name: str, filename: str) -> Tuple[str, str]:
+    """Read-only SAS with day-aligned validity, deterministic for the whole day."""
+    if not account_name:
+        raise RuntimeError('Storage account name is not configured')
+    key, starts_on, expires_on = _stable_delegation_key()
+    sas = generate_blob_sas(
+        account_name=account_name,
+        container_name=container_name,
+        blob_name=filename,
+        user_delegation_key=key,
+        permission=BlobSasPermissions(read=True),
+        start=starts_on,
+        expiry=expires_on,
+    )
+    blob_client = blob_service_client.get_blob_client(container=container_name, blob=filename)
+    return f'{blob_client.url}?{sas}', expires_on.isoformat()
+
+
+_MEDIA_KIND_CONTAINERS = {
+    'thumbnail': lambda: BLOB_THUMBNAIL_CONTAINER,
+    'image': lambda: BLOB_IMAGE_CONTAINER,
+    'cover': lambda: BLOB_COVER_CONTAINER,
+}
+
+
+def make_media_url(filename: str, kind: str = 'thumbnail') -> str:
+    """Best URL for the browser to fetch a media blob: direct SAS, else proxy."""
+    global _media_sas_retry_after
+    if MEDIA_URL_MODE == 'sas' and blob_service_client is not None and account_name:
+        container_getter = _MEDIA_KIND_CONTAINERS.get(kind)
+        if container_getter and time.monotonic() >= _media_sas_retry_after:
+            try:
+                url, _ = _create_stable_read_sas_url(container_getter(), filename)
+                return url
+            except Exception as exc:
+                _media_sas_retry_after = time.monotonic() + 300
+                app.logger.warning('SAS media URL minting failed; serving proxy URLs for 5 minutes: %s', exc)
+    return make_proxy_url(filename, kind)
 
 
 @app.route('/api/photos/preview/<path:filename>', methods=['GET'])
@@ -5466,7 +5660,7 @@ def face_crop(face_id: str):
     try:
         props = get_media_properties('cover', cover_blob)
         if props:
-            return jsonify({'url': make_proxy_url(cover_blob, 'cover')})
+            return jsonify({'url': make_media_url(cover_blob, 'cover')})
     except Exception:
         pass
 
@@ -5518,7 +5712,7 @@ def face_crop(face_id: str):
         cover_bytes = buf.read()
         try:
             upload_media_file('cover', cover_blob, cover_bytes, 'image/jpeg')
-            return jsonify({'url': make_proxy_url(cover_blob, 'cover')})
+            return jsonify({'url': make_media_url(cover_blob, 'cover')})
         except Exception:
             data_url = 'data:image/jpeg;base64,' + base64.b64encode(cover_bytes).decode('ascii')
 
@@ -6118,7 +6312,15 @@ def _create_blob_sas_url(
         raise RuntimeError('Storage account name is not configured')
     starts_on = datetime.now(timezone.utc) - timedelta(minutes=5)
     expires_on = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-    delegation_key = blob_service_client.get_user_delegation_key(starts_on, expires_on)
+    # Reuse the cached day key when it covers the requested window (it always
+    # extends >=24h out, so every standard lifetime fits); only unusually long
+    # expiries pay for a dedicated key round-trip.
+    try:
+        delegation_key, _, key_expires_on = _stable_delegation_key()
+        if expires_on > key_expires_on:
+            delegation_key = blob_service_client.get_user_delegation_key(starts_on, expires_on)
+    except Exception:
+        delegation_key = blob_service_client.get_user_delegation_key(starts_on, expires_on)
     sas = generate_blob_sas(
         account_name=account_name,
         container_name=container_name,
@@ -6239,6 +6441,10 @@ def finalize_direct_upload():
     except Exception as exc:
         app.logger.exception('Direct upload finalization failed for %s', filename)
         return jsonify({'error': 'Upload finalization failed', 'detail': str(exc)}), 500
+    # finalize_uploaded_file writes metadata via storage_utils (bypassing
+    # _update_metadata_entity_fields), so drop the scan cache explicitly: the
+    # gallery refetches right after an upload and must see the new photo.
+    _invalidate_metadata_scan_cache(user_id)
     # Attribution: record which account added this photo to the library.
     try:
         if account_id:
@@ -6317,6 +6523,10 @@ def upload_client_processing_results():
         if 'deleted' in message.lower():
             return jsonify({'error': 'Photo has been deleted'}), 410
         return jsonify({'error': 'Client processing update failed', 'detail': str(exc)}), 500
+
+    # apply_client_processing_results_for_file writes via storage_utils,
+    # bypassing _update_metadata_entity_fields.
+    _invalidate_metadata_scan_cache(user_id)
 
     try:
         _queue_people_clustering_after_face_processing(user_id, filename, metadata)
@@ -6809,7 +7019,7 @@ def list_photos():
     if error:
         return error
     try:
-        metadata_rows = _query_metadata_rows_for_user(user_id, purpose='photos.list')
+        metadata_rows = _cached_metadata_rows_for_user(user_id, purpose='photos.list')
         entries = [row['RowKey'] for row in metadata_rows if row.get('RowKey')]
         metadata_map = {row['RowKey']: row for row in metadata_rows if row.get('RowKey')}
     except Exception as exc:
@@ -6861,7 +7071,7 @@ def list_corrupted_uploads():
     if error:
         return error
     try:
-        rows = _query_metadata_rows_for_user(user_id, purpose='uploads.corrupted')
+        rows = _cached_metadata_rows_for_user(user_id, purpose='uploads.corrupted')
     except Exception as exc:
         return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
 
@@ -6937,6 +7147,7 @@ def clear_corrupted_upload(filename: str):
     if metadata.get('verification_status') == 'failed':
         metadata['verification_status'] = 'pending'
     metadata_table_client.upsert_entity(metadata)
+    _invalidate_metadata_scan_cache(user_id)
 
     return jsonify({
         'filename': safe_name,
@@ -6976,7 +7187,7 @@ def search_photos():
         return error
 
     try:
-        rows = _query_metadata_rows_for_user(user_id, purpose='photos.search')
+        rows = _cached_metadata_rows_for_user(user_id, purpose='photos.search')
     except Exception as exc:
         return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
 
@@ -7234,6 +7445,11 @@ def delete_multiple_photos():
         else:
             errors.append(f'{filename}: Not found')
 
+    if deleted:
+        # Deletions bypass _update_metadata_entity_fields; drop the scan cache so
+        # the next gallery load doesn't resurrect deleted photos.
+        _invalidate_metadata_scan_cache(user_id)
+
     return jsonify({'deleted': deleted, 'errors': errors, 'success': len(deleted) > 0})
 
 
@@ -7485,7 +7701,7 @@ def autocreate_albums():
         }), 400
 
     try:
-        metadata_rows = _query_metadata_rows_for_user(user_id, purpose='albums.smart_create')
+        metadata_rows = _cached_metadata_rows_for_user(user_id, purpose='albums.smart_create')
     except Exception as exc:
         return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
 
@@ -8204,7 +8420,9 @@ def toggle_like_photo(filename: str):
         return jsonify({
             'success': True,
             'filename': filename,
-            'likes': metadata['likes'],
+            # len(liked_by) is the post-toggle count; metadata['likes'] held the
+            # pre-update value (and raised KeyError → 500 on rows without it).
+            'likes': len(liked_by),
             'liked': user_id in liked_by,
         })
     except Exception as e:
@@ -8319,7 +8537,7 @@ def filter_photos():
     capture_end = _parse_capture_filter(request.args.get('captureEnd', '') or '')
 
     try:
-        all_photos = _query_metadata_rows_for_user(user_id, purpose='photos.filter')
+        all_photos = _cached_metadata_rows_for_user(user_id, purpose='photos.filter')
     except Exception as exc:
         return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
 

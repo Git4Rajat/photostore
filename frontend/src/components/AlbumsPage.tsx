@@ -238,14 +238,25 @@ const AlbumsPage: React.FC = () => {
     };
 
     const handleSaveRotation = async (filename: string, rotation: number) => {
-        await post(`/photos/${encodeURIComponent(filename)}/rotation`, { rotation });
-        const applyRotation = (photo: Photo) => (
-            photo.filename === filename ? { ...photo, rotation } : photo
+        // Optimistic: rotate in the UI immediately, roll back if the save fails.
+        const previousRotation = [...photos, ...(semanticPhotos || []), ...activeAlbumPhotos]
+            .find((photo) => photo.filename === filename)?.rotation ?? 0;
+        const applyRotation = (value: number) => (photo: Photo) => (
+            photo.filename === filename ? { ...photo, rotation: value } : photo
         );
-        setPhotos((prev) => prev.map(applyRotation));
-        setSemanticPhotos((prev) => (prev ? prev.map(applyRotation) : prev));
-        setActiveAlbumPhotos((prev) => prev.map(applyRotation));
+        const patchAll = (value: number) => {
+            setPhotos((prev) => prev.map(applyRotation(value)));
+            setSemanticPhotos((prev) => (prev ? prev.map(applyRotation(value)) : prev));
+            setActiveAlbumPhotos((prev) => prev.map(applyRotation(value)));
+        };
+        patchAll(rotation);
         setStatus(`Saved rotation for ${filename}.`);
+        try {
+            await post(`/photos/${encodeURIComponent(filename)}/rotation`, { rotation });
+        } catch (err) {
+            patchAll(previousRotation);
+            setStatus(`Could not save rotation for ${filename}.`);
+        }
     };
 
     const visiblePhotos = useMemo(() => {
@@ -556,17 +567,23 @@ const AlbumsPage: React.FC = () => {
         setStatus('');
         const filenames = Array.from(selectedPhotos);
         const addedPhotos = visiblePhotos.filter((photo) => selectedPhotos.has(photo.filename));
+        // Optimistic: reflect the membership change immediately; undo it (the
+        // exact reverse operation) if the server rejects the request.
+        syncAlbumFilenames(filenames, 'add');
+        setActiveAlbumPhotos((prev) => {
+            const seen = new Set(prev.map((photo) => photo.filename));
+            return [...prev, ...addedPhotos.filter((photo) => !seen.has(photo.filename))];
+        });
+        setSelectedPhotos(new Set());
+        setShowAddFromGallery(false);
+        setStatus(`Added ${plural(filenames.length, 'photo')} to album.`);
         try {
             await post(`/albums/${activeAlbumId}/photos/add`, { filenames });
-            syncAlbumFilenames(filenames, 'add');
-            setActiveAlbumPhotos((prev) => {
-                const seen = new Set(prev.map((photo) => photo.filename));
-                return [...prev, ...addedPhotos.filter((photo) => !seen.has(photo.filename))];
-            });
-            setSelectedPhotos(new Set());
-            setShowAddFromGallery(false);
-            setStatus(`Added ${plural(selectedPhotos.size, 'photo')} to album.`);
         } catch {
+            syncAlbumFilenames(filenames, 'remove');
+            const added = new Set(addedPhotos.map((photo) => photo.filename));
+            setActiveAlbumPhotos((prev) => prev.filter((photo) => !added.has(photo.filename)));
+            setStatus('');
             setError('Failed to add photos to album.');
         }
     };
@@ -578,12 +595,15 @@ const AlbumsPage: React.FC = () => {
         setError('');
         setStatus('');
         const filenames = Array.from(selectedPhotos);
+        // Optimistic removal with reverse-operation rollback.
+        syncAlbumFilenames(filenames, 'remove');
+        setSelectedPhotos(new Set());
+        setStatus(`Removed ${plural(filenames.length, 'photo')} from album.`);
         try {
             await post(`/albums/${activeAlbumId}/photos/remove`, { filenames });
-            syncAlbumFilenames(filenames, 'remove');
-            setSelectedPhotos(new Set());
-            setStatus(`Removed ${plural(selectedPhotos.size, 'photo')} from album.`);
         } catch {
+            syncAlbumFilenames(filenames, 'add');
+            setStatus('');
             setError('Failed to remove photos from album.');
         }
     };
@@ -776,16 +796,19 @@ const AlbumsPage: React.FC = () => {
 
             setError('');
             setStatus('');
+            // Optimistic rename: show the new name immediately, revert on failure.
+            updateAlbumList(activeAlbumId, (album) => ({ ...album, name: trimmed }));
+            setStatus(`Renamed album to "${trimmed}".`);
             try {
                 const response = await post(`/albums/${activeAlbumId}/rename`, { name: trimmed });
                 const updated = response?.album as Album | undefined;
                 if (updated) {
+                    // Adopt the server copy (it may normalize the name).
                     updateAlbumList(activeAlbumId, () => updated);
-                    setStatus(`Renamed album to "${trimmed}".`);
-                } else {
-                    setError('Rename succeeded but no album returned.');
                 }
             } catch (err) {
+                updateAlbumList(activeAlbumId, (album) => ({ ...album, name: current }));
+                setStatus('');
                 setError(extractApiErrorMessage(err, 'Failed to rename album.'));
             }
         };

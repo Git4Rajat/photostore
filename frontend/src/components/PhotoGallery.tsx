@@ -3698,33 +3698,54 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         return filename;
     }, []);
 
+    // Optimistic writes: apply the change to local state immediately so the UI
+    // responds on click, send the request in the background, and roll back (with
+    // an error surfaced) only if the server rejects it. Waiting on the backend —
+    // which may be cold-starting or busy — made every tap feel unresponsive.
+    const patchPhoto = useCallback((filename: string, patch: Partial<Photo>) => {
+        setPhotos(prev => prev.map(p => (p.filename === filename ? { ...p, ...patch } : p)));
+    }, []);
+
     const handleRatePhoto = async (filename: string, rating: number) => {
+        const previous = photos.find(p => p.filename === filename);
+        patchPhoto(filename, { rating });
+        addNotification('Rating updated', `${getDisplayName(filename)} rated ${rating}/5.`);
         try {
             await post(`/photos/${filename}/rating`, { rating });
-            setPhotos(prev => prev.map(p => p.filename === filename ? { ...p, rating } : p));
-            addNotification('Rating updated', `${getDisplayName(filename)} rated ${rating}/5.`);
         } catch (err) {
+            patchPhoto(filename, { rating: previous?.rating ?? 0 });
             setError('Failed to save rating');
         }
     };
 
     const handleSaveRotation = async (filename: string, rotation: number) => {
-        await post(`/photos/${encodeURIComponent(filename)}/rotation`, { rotation });
-        setPhotos(prev => prev.map(p => p.filename === filename ? { ...p, rotation } : p));
+        const previous = photos.find(p => p.filename === filename);
+        patchPhoto(filename, { rotation });
         addNotification('Rotation saved', `${getDisplayName(filename)} rotated ${rotation}°.`);
+        try {
+            await post(`/photos/${encodeURIComponent(filename)}/rotation`, { rotation });
+        } catch (err) {
+            patchPhoto(filename, { rotation: previous?.rotation ?? 0 });
+            setError('Failed to save rotation');
+        }
     };
 
     const handleToggleLike = async (filename: string) => {
+        const previous = photos.find(p => p.filename === filename);
+        const optimisticLiked = !(previous?.liked);
+        const optimisticLikes = Math.max(0, (previous?.likes ?? 0) + (optimisticLiked ? 1 : -1));
+        patchPhoto(filename, { liked: optimisticLiked, likes: optimisticLikes });
+        addNotification(
+            optimisticLiked ? 'Photo liked' : 'Like removed',
+            `${getDisplayName(filename)} now has ${plural(optimisticLikes, 'like')}.`
+        );
         try {
             const response = await post(`/photos/${filename}/like`, {});
-            setPhotos(prev => prev.map(p => 
-                p.filename === filename ? { ...p, likes: response.likes, liked: response.liked } : p
-            ));
-            addNotification(
-                response.liked ? 'Photo liked' : 'Like removed',
-                `${getDisplayName(filename)} now has ${plural(response.likes || 0, 'like')}.`
-            );
+            // Reconcile with the authoritative count (another member of a shared
+            // library may have liked the same photo).
+            patchPhoto(filename, { likes: response.likes, liked: response.liked });
         } catch (err) {
+            patchPhoto(filename, { liked: previous?.liked ?? false, likes: previous?.likes ?? 0 });
             setError('Failed to toggle like');
         }
     };
@@ -3969,7 +3990,16 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     };
 
     const handleResetFilters = () => {
+        // Reset every field in the filter panel, not just rating/likes — leaving
+        // the capture-date range set made "Reset" look like it did nothing when a
+        // date filter was active. Clearing the state triggers a refetch via the
+        // capture-date / empty-photos effects (with the cleared values), so the
+        // gallery reloads unfiltered. Note fetchPhotos reads these values from its
+        // closure, so we deliberately let the effects re-run it rather than call
+        // it here with stale filter values.
         setFilters({ minRating: 0, minLikes: 0 });
+        setCaptureStartDate('');
+        setCaptureEndDate('');
         setOffset(0);
         setPhotos([]);
         setHasMore(true);

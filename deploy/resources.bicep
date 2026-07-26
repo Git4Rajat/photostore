@@ -176,7 +176,10 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
 var backendEnv = [
   { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
   { name: 'USE_MANAGED_IDENTITY', value: 'true' }
-  { name: 'MEDIA_URL_MODE', value: 'proxy' }
+  // 'sas': browsers fetch media straight from blob storage via short-lived
+  // read SAS URLs. Proxying media bytes through the backend was the largest
+  // compute cost in the deployment.
+  { name: 'MEDIA_URL_MODE', value: 'sas' }
   { name: 'MAX_UPLOAD_FILE_BYTES', value: '5368709120' }
   { name: 'BLOB_IMAGE_CONTAINER', value: 'images' }
   { name: 'BLOB_THUMBNAIL_CONTAINER', value: 'thumbnails' }
@@ -244,6 +247,20 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
       scale: {
         minReplicas: 0
         maxReplicas: 3
+        rules: [
+          {
+            // Default is 10 concurrent requests per replica, which fans out to
+            // extra replicas on every burst of small API calls. Each replica
+            // runs 4 gunicorn workers x 8 threads, so 50 concurrent requests
+            // is still comfortably inside one replica's capacity.
+            name: 'http-scaler'
+            http: {
+              metadata: {
+                concurrentRequests: '50'
+              }
+            }
+          }
+        ]
       }
     }
   }
@@ -283,14 +300,20 @@ resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
-        minReplicas: 1
+        // Scale-to-zero: nginx serving the SPA cold-starts in a couple of
+        // seconds, and an idle deployment should cost nothing.
+        minReplicas: 0
         maxReplicas: 2
       }
     }
   }
 }
 
-resource worker 'Microsoft.App/containerApps@2024-03-01' = {
+// The worker scales to ZERO and is woken by KEDA when the clustering queue has
+// messages (2025-01-01 API for managed-identity scale rules; the queue itself
+// is created by the backend at startup). An always-on worker polling an almost
+// always-empty queue was the single largest fixed cost in the deployment.
+resource worker 'Microsoft.App/containerApps@2025-01-01' = {
   name: workerAppName
   location: location
   identity: {
@@ -315,8 +338,22 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
-        minReplicas: 1
+        minReplicas: 0
         maxReplicas: 1
+        rules: [
+          {
+            name: 'clustering-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-clustering'
+                queueLength: '1'
+              }
+              identity: 'system'
+            }
+          }
+        ]
       }
     }
   }

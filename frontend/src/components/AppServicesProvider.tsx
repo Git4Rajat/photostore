@@ -2137,10 +2137,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
     }, [addNotification, clearPersistedSession, loadPersistedSession, persistSession]);
 
+    // Keep the backend warm only while work is actually in flight (an upload
+    // batch or browser-side processing). Pinging /health around the clock kept
+    // the scaled-to-zero backend billing 24/7 whenever a tab stayed open; idle
+    // browsing wakes it on demand and the cold-start handling covers the rest.
     useEffect(() => {
+        if (!uploading && !backgroundKeepAliveActive) {
+            stopBackendKeepalive();
+            return undefined;
+        }
         startBackendKeepalive();
         return () => stopBackendKeepalive();
-    }, [startBackendKeepalive, stopBackendKeepalive]);
+    }, [uploading, backgroundKeepAliveActive, startBackendKeepalive, stopBackendKeepalive]);
 
     useEffect(() => {
         void startBrowserProcessing();

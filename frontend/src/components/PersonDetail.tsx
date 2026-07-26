@@ -184,16 +184,17 @@ const PersonDetail: React.FC = () => {
 
     const handleSave = async () => {
         if (!personId) return;
-        setLoading(true);
+        // Optimistic: show the new name at once and roll back if the save fails —
+        // no page-wide loading state for a simple rename.
+        const previousName = person?.name || '';
+        setPerson((prev) => (prev ? { ...prev, name } : prev));
+        showToast('Name saved');
         try {
             await faceService.labelPerson(personId, name);
-            setPerson((prev) => (prev ? { ...prev, name } : prev));
-            setName(name);
-            showToast('Name saved');
         } catch (e: unknown) {
-            // ignore
-        } finally {
-            setLoading(false);
+            setPerson((prev) => (prev ? { ...prev, name: previousName } : prev));
+            setName(previousName);
+            showToast('Could not save name');
         }
     };
 
@@ -223,20 +224,21 @@ const PersonDetail: React.FC = () => {
 
     const handleConfirmFace = async (faceId: string) => {
         if (!personId) return;
-        setLoading(true);
+        // Optimistic: mark confirmed immediately, restore the prior status on failure.
+        const previousStatus = (person?.faces || []).find((face) => face.faceId === faceId)?.reviewStatus;
+        const applyStatus = (status: typeof previousStatus) => setPerson((prev) => (prev ? {
+            ...prev,
+            faces: (prev.faces || []).map((face) => (
+                face.faceId === faceId ? { ...face, reviewStatus: status } : face
+            )),
+        } : prev));
+        applyStatus('confirmed');
+        showToast('Face confirmed');
         try {
             await faceService.confirmFace(personId, faceId);
-            setPerson((prev) => (prev ? {
-                ...prev,
-                faces: (prev.faces || []).map((face) => (
-                    face.faceId === faceId ? { ...face, reviewStatus: 'confirmed' } : face
-                )),
-            } : prev));
-            showToast('Face confirmed');
         } catch (e: unknown) {
+            applyStatus(previousStatus);
             showToast(String(e));
-        } finally {
-            setLoading(false);
         }
     };
 

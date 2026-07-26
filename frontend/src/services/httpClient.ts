@@ -102,6 +102,14 @@ export const createHttpClient = (baseURL: string, timeout = 600000) => {
     return client;
 };
 
+// In-flight GET dedup: identical concurrent GETs (double-fired effects, several
+// components loading the same list, rapid re-clicks) share one network request
+// instead of stacking duplicate calls onto the backend. Entries are removed as
+// soon as the request settles, so this never serves stale data — it only
+// coalesces requests that overlap in time. Requests with abort signals opt out
+// (sharing would let one caller cancel another's request).
+const inFlightGets = new Map<string, Promise<unknown>>();
+
 export const requestJson = async <T = any>(
     client: ReturnType<typeof createHttpClient>,
     method: 'get' | 'post' | 'put' | 'delete',
@@ -109,16 +117,33 @@ export const requestJson = async <T = any>(
     data?: unknown,
     config?: AxiosRequestConfig,
 ): Promise<T> => {
-    try {
-        const response = method === 'get'
-            ? await client.get<T>(normalizePath(url), config)
-            : method === 'post'
-                ? await client.post<T>(normalizePath(url), data, config)
-                : method === 'put'
-                    ? await client.put<T>(normalizePath(url), data, config)
-                    : await client.delete<T>(normalizePath(url), config);
-        return response.data;
-    } catch (error: unknown) {
-        throw getErrorMessage(error);
+    const performRequest = async (): Promise<T> => {
+        try {
+            const response = method === 'get'
+                ? await client.get<T>(normalizePath(url), config)
+                : method === 'post'
+                    ? await client.post<T>(normalizePath(url), data, config)
+                    : method === 'put'
+                        ? await client.put<T>(normalizePath(url), data, config)
+                        : await client.delete<T>(normalizePath(url), config);
+            return response.data;
+        } catch (error: unknown) {
+            throw getErrorMessage(error);
+        }
+    };
+
+    if (method !== 'get' || config?.signal) {
+        return performRequest();
     }
+
+    const dedupeKey = `${client.defaults.baseURL || ''}|${normalizePath(url)}`;
+    const existing = inFlightGets.get(dedupeKey);
+    if (existing) {
+        return existing as Promise<T>;
+    }
+    const request = performRequest().finally(() => {
+        inFlightGets.delete(dedupeKey);
+    });
+    inFlightGets.set(dedupeKey, request);
+    return request;
 };
