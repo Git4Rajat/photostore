@@ -5,6 +5,10 @@ export interface Photo {
     thumbnailRotation?: number;
     size: number;
     lastModified?: string | null;
+    /** When the photo was uploaded (ISO-8601). Drives the "Recent" sort. */
+    uploadDate?: string | null;
+    /** EXIF capture time, or the upload time when no capture date exists (ISO-8601). Drives the "Captured" sort. */
+    captureDate?: string | null;
     rating?: number;
     likes?: number;
     liked?: boolean;

@@ -15,6 +15,7 @@ import {
     PhotoIcon,
     PlusIcon,
     RectangleStackIcon,
+    RocketLaunchIcon,
     ShareIcon,
     SunIcon,
     UserCircleIcon,
@@ -22,7 +23,7 @@ import {
     WrenchScrewdriverIcon,
     XMarkIcon,
 } from '@heroicons/react/24/outline';
-import { AppServicesProvider, BackgroundActivityIndicator, NotificationBell, useAppServices } from './components/AppServicesProvider';
+import { AppServicesProvider, BackgroundActivityIndicator, NotificationBell, useAppServices, getBrowserProcessingConcurrency, isBrowserProcessingTurboEnabled, setBrowserProcessingTurbo } from './components/AppServicesProvider';
 import { Logo } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
 import NotFoundPage from './components/NotFoundPage';
@@ -337,8 +338,10 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
     onSignOut,
 }) => {
     const [open, setOpen] = useState<boolean>(false);
+    const [turbo, setTurbo] = useState<boolean>(() => isBrowserProcessingTurboEnabled());
     const wrapRef = useRef<HTMLDivElement | null>(null);
     const close = useCallback(() => setOpen(false), []);
+    const turboConcurrency = getBrowserProcessingConcurrency();
 
     useEffect(() => {
         if (!open || typeof document === 'undefined') {
@@ -394,6 +397,38 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
                             preference={themePreference}
                             onPreferenceChange={onPreferenceChange}
                         />
+                    </div>
+
+                    <div className="account-menu-section">
+                        <p className="account-menu-label">Processing</p>
+                        <button
+                            type="button"
+                            className={`account-menu-toggle${turbo ? ' is-on' : ''}`}
+                            role="switch"
+                            aria-checked={turbo}
+                            onClick={() => {
+                                setTurbo((value) => {
+                                    const next = !value;
+                                    setBrowserProcessingTurbo(next);
+                                    return next;
+                                });
+                            }}
+                        >
+                            <span className="account-menu-toggle-copy">
+                                <span className="account-menu-toggle-title">
+                                    <RocketLaunchIcon className="account-menu-item-icon" aria-hidden="true" />
+                                    Turbo mode
+                                </span>
+                                <span className="account-menu-toggle-note">
+                                    {turbo
+                                        ? `Processes up to ${turboConcurrency} photos at once — faster, uses more CPU and memory.`
+                                        : 'Processes one photo at a time — gentle on this device.'}
+                                </span>
+                            </span>
+                            <span className="account-menu-switch" aria-hidden="true">
+                                <span className="account-menu-switch-thumb" />
+                            </span>
+                        </button>
                     </div>
 
                     {showAuth && (

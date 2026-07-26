@@ -2,7 +2,6 @@ import io
 import hashlib
 import json
 import os
-import tempfile
 import uuid
 import base64
 import threading
@@ -18,7 +17,6 @@ from werkzeug.utils import secure_filename
 from image_utils import (
     convert_image_to_jpeg,
     compute_file_hash,
-    compute_file_hash_from_path,
     create_thumbnail_data,
     create_video_thumbnail_data,
     extract_raw_preview_bytes,
@@ -1857,6 +1855,18 @@ def apply_client_processing_results_for_file(
     return metadata
 
 
+def _upload_needs_server_bytes(filename: str) -> bool:
+    """True when the backend must read the uploaded bytes to do work the browser
+    cannot: server-side thumbnails for video/HEIF/RAW and video metadata. Ordinary
+    photos are decoded and thumbnailed in the browser, so the backend never needs
+    to pull them back down after a direct-to-blob upload.
+    """
+    if is_video_file(filename):
+        return True
+    ext = _filename_extension(filename)
+    return ext in HEIF_EXTENSIONS or ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA
+
+
 def finalize_uploaded_file(
     user_id: str,
     filename: str,
@@ -1865,22 +1875,56 @@ def finalize_uploaded_file(
     client_processing: Optional[Dict] = None,
     client_processing_report: Optional[List[Dict]] = None,
     client_asset_id: str = '',
+    client_sha256: str = '',
 ) -> Tuple[List[Dict], str]:
-    """Finalize upload and initialize durable browser-only processing state."""
+    """Finalize upload and initialize durable browser-only processing state.
+
+    The file has already been uploaded straight to blob storage by the browser, so
+    this avoids moving the bytes again wherever possible:
+      * ordinary photos never touch the backend — dedup/integrity reuse the SHA-256
+        the browser computed and sent, and no re-upload happens (the blob is
+        already in place);
+      * only video/HEIF/RAW are downloaded, because they need a server-side
+        thumbnail or metadata the browser can't produce;
+      * the blob is only (re)written under a new name in the rare event a
+        cross-tenant filename clash forces a rename.
+    """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
-    with tempfile.TemporaryDirectory() as temp_dir:
-        local_path = os.path.join(temp_dir, secure_filename(filename))
-        with open(local_path, 'wb') as local_file:
-            local_file.write(download_media_bytes('image', filename))
 
-        file_hash = compute_file_hash_from_path(local_path)
-        duplicates = detect_duplicates(user_id, file_hash, perceptual_hash=None)
-        final_filename = _resolve_filename_for_upload(user_id, filename, file_hash)
-        with open(local_path, 'rb') as local_file:
-            image_bytes = local_file.read()
+    needs_server_bytes = _upload_needs_server_bytes(filename)
+
+    # The browser sends the file's hex SHA-256 (same algorithm and bytes as the
+    # server would compute), so we can dedup and stamp fileHash without a download.
+    # Fall back to reading the blob when there is no client hash to trust.
+    image_bytes: Optional[bytes] = None
+    client_hash = str(client_sha256 or '')
+    if needs_server_bytes or not client_hash:
+        image_bytes = download_media_bytes('image', filename)
+        file_hash = hashlib.sha256(image_bytes).hexdigest()
+    else:
+        file_hash = client_hash
+
+    duplicates = detect_duplicates(user_id, file_hash, perceptual_hash=None)
+    final_filename = _resolve_filename_for_upload(user_id, filename, file_hash)
+
+    if final_filename != filename:
+        # Rare: a cross-tenant filename clash forced a unique name, so place the
+        # bytes under it. (Non-renamed uploads are already stored in place, so the
+        # common path moves no image data at all.)
+        if image_bytes is None:
+            image_bytes = download_media_bytes('image', filename)
+        try:
+            upload_media_file('image', final_filename, image_bytes, content_type)
+        except Exception:
+            pass
 
     metadata = get_or_create_metadata(user_id, final_filename)
+    # The metadata row is usually pre-created at /upload/init (which records
+    # upload_started_at but no uploadDate), so get_or_create_metadata returns it
+    # without an uploadDate. Persist one here so the gallery has a stable
+    # "recently uploaded" sort key instead of falling back to a volatile field.
+    metadata.setdefault('uploadDate', datetime.now(timezone.utc).isoformat())
     metadata['fileHash'] = file_hash
     metadata['mimeType'] = content_type
     apply_upload_hash_result(metadata, file_hash)
@@ -1897,31 +1941,30 @@ def finalize_uploaded_file(
     except Exception:
         pass
 
-    try:
-        upload_media_file('image', final_filename, image_bytes, content_type)
-    except Exception:
-        pass
-    try:
-        thumbnail_bytes = _create_server_thumbnail_for_upload(image_bytes, final_filename)
-        if thumbnail_bytes:
-            upload_media_file('thumbnail', final_filename, thumbnail_bytes, 'image/jpeg')
-            if file_is_video:
-                thumbnail_reason = 'video_browser_unsupported'
-            elif _filename_extension(final_filename) in HEIF_EXTENSIONS:
-                thumbnail_reason = 'heif_browser_unsupported'
-            else:
-                thumbnail_reason = 'raw_browser_unsupported'
-            mark_step_done(user_id, final_filename, 'thumbnail', result={
-                'source': 'server',
-                'reason': thumbnail_reason,
-            })
-    except Exception:
-        pass
-    if file_is_video:
+    # Server-side thumbnail / video metadata — only for formats the browser can't
+    # handle, using the bytes we already had to download for them.
+    if needs_server_bytes and image_bytes is not None:
         try:
-            _finalize_video_metadata(user_id, final_filename, image_bytes)
+            thumbnail_bytes = _create_server_thumbnail_for_upload(image_bytes, final_filename)
+            if thumbnail_bytes:
+                upload_media_file('thumbnail', final_filename, thumbnail_bytes, 'image/jpeg')
+                if file_is_video:
+                    thumbnail_reason = 'video_browser_unsupported'
+                elif _filename_extension(final_filename) in HEIF_EXTENSIONS:
+                    thumbnail_reason = 'heif_browser_unsupported'
+                else:
+                    thumbnail_reason = 'raw_browser_unsupported'
+                mark_step_done(user_id, final_filename, 'thumbnail', result={
+                    'source': 'server',
+                    'reason': thumbnail_reason,
+                })
         except Exception:
             pass
+        if file_is_video:
+            try:
+                _finalize_video_metadata(user_id, final_filename, image_bytes)
+            except Exception:
+                pass
     return duplicates, final_filename
 
 

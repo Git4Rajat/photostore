@@ -27,6 +27,11 @@ from auth_utils import validate_bearer_token as validate_entra_bearer_token
 import password_auth
 import email_utils
 import library_utils
+from ordering_utils import (
+    order_photo_entries,
+    metadata_capture_datetime,
+    metadata_upload_datetime,
+)
 from image_utils import (
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
@@ -729,15 +734,15 @@ def _parse_capture_filter(value: str) -> Optional[datetime]:
 
 
 def _metadata_upload_date(metadata: Dict) -> datetime:
-    parsed = _parse_iso_date(str(metadata.get('uploadDate') or metadata.get('last_processing_update') or ''))
-    return parsed or datetime.min.replace(tzinfo=timezone.utc)
+    # Delegates to ordering_utils so listing and any other caller share one
+    # definition of "upload date". The datetime.min fallback keeps callers that
+    # expect a non-optional datetime (e.g. range comparisons) working.
+    return metadata_upload_datetime(metadata) or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _metadata_capture_date(metadata: Dict) -> datetime:
-    captured = _parse_capture_date(parse_exif_data(metadata.get('exifData', '{}')))
-    if captured:
-        return captured  # already UTC-aware from _parse_capture_date
-    return _metadata_upload_date(metadata)
+    # Capture date with upload date as the documented fallback (see ordering_utils).
+    return metadata_capture_datetime(metadata) or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _capture_in_range(metadata: Dict, capture_start: Optional[datetime], capture_end: Optional[datetime]) -> bool:
@@ -923,6 +928,12 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
     if isinstance(client_thumbnail, dict):
         thumbnail_rotation = _normalize_rotation(client_thumbnail.get('rotationDegrees', 0))
 
+    # Dates the gallery sorts and groups by. captureDate follows the documented
+    # fallback rule (EXIF capture time, else upload time) so every photo has a
+    # chronology anchor even without EXIF.
+    upload_dt = metadata_upload_datetime(metadata)
+    capture_dt = _parse_capture_date(exif_data) or upload_dt
+
     media_urls = _private_photo_media_urls(filename)
     return {
         'filename': filename,
@@ -930,6 +941,8 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'thumbnailUrl': _thumbnail_url_from_metadata(metadata, filename),
         'size': size,
         'lastModified': last_modified.isoformat() if last_modified else None,
+        'uploadDate': upload_dt.isoformat() if upload_dt else None,
+        'captureDate': capture_dt.isoformat() if capture_dt else None,
         'rating': metadata.get('rating', 0),
         'likes': metadata.get('likes', 0),
         'liked': user_id in liked_by,
@@ -6218,6 +6231,7 @@ def finalize_direct_upload():
             client_processing=data.get('clientProcessing'),
             client_processing_report=data.get('clientProcessingReport'),
             client_asset_id=str(data.get('clientAssetId') or data.get('uploadId') or ''),
+            client_sha256=str(data.get('sha256') or ''),
         )
     except Exception as exc:
         app.logger.exception('Direct upload finalization failed for %s', filename)
@@ -6798,18 +6812,9 @@ def list_photos():
     except Exception as exc:
         return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
 
-    if sort == 'location':
-        entries.sort(key=lambda name: name.lower())
-    elif sort == 'rating':
-        entries.sort(key=lambda name: metadata_map.get(name, {}).get('rating', 0), reverse=True)
-    elif sort == 'likes':
-        entries.sort(key=lambda name: metadata_map.get(name, {}).get('likes', 0), reverse=True)
-    elif sort == 'capture':
-        entries.sort(key=lambda name: _metadata_capture_date(metadata_map.get(name, {})), reverse=True)
-    elif sort == 'date':
-        entries.sort(key=lambda name: _metadata_upload_date(metadata_map.get(name, {})), reverse=True)
-    else:
-        entries.sort(key=lambda name: _metadata_upload_date(metadata_map.get(name, {})), reverse=True)
+    # Deterministic ordering with a filename tie-break so the gallery returns an
+    # identical sequence on every load (see ordering_utils.order_photo_entries).
+    entries = order_photo_entries(entries, metadata_map, sort)
 
     if capture_start or capture_end:
         entries = [name for name in entries if _capture_in_range(metadata_map.get(name, {}), capture_start, capture_end)]
@@ -8321,7 +8326,14 @@ def filter_photos():
 
             filtered.append(photo)
 
-        filtered.sort(key=lambda p: (-p.get('rating', 0), -p.get('likes', 0)))
+        # Stable multi-pass sort (least to most significant): filename, then most
+        # recently uploaded, then rating/likes. Applied in this order because
+        # Python's sort is stable, so equal rating/likes photos fall back to
+        # recent-first and finally to a filename tie-break — deterministic across
+        # loads instead of depending on the raw scan order.
+        filtered.sort(key=lambda p: p.get('RowKey', ''))
+        filtered.sort(key=lambda p: _metadata_upload_date(p), reverse=True)
+        filtered.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
         selected = filtered[offset:offset + limit]
         photos = []
 

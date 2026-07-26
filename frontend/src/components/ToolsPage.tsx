@@ -12,14 +12,13 @@ import {
     MagnifyingGlassIcon,
     MapIcon,
     PhotoIcon,
-    RocketLaunchIcon,
     UserCircleIcon,
     UsersIcon,
 } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
 import { plural } from '../utils/format';
 import { confirmDialog } from './shared/dialogs';
-import { useAppServices, getBrowserProcessingConcurrency, isBrowserProcessingTurboEnabled, setBrowserProcessingTurbo } from './AppServicesProvider';
+import { useAppServices } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
@@ -254,7 +253,6 @@ const ToolsPage: React.FC = () => {
     const [queueUpdatedAt, setQueueUpdatedAt] = useState<Date | null>(null);
     const [isQueueStatusExpanded, setIsQueueStatusExpanded] = useState<boolean>(true);
     const [forceRun, setForceRun] = useState<boolean>(false);
-    const [turbo, setTurbo] = useState<boolean>(() => isBrowserProcessingTurboEnabled());
     const [runAll, setRunAll] = useState<boolean>(false);
     const [processingFilterState, setProcessingFilterState] = useState<ProcessingFilterState>('all');
     const [processingFilterProcess, setProcessingFilterProcess] = useState<ProcessingFilterProcess>('all');
@@ -762,28 +760,6 @@ const ToolsPage: React.FC = () => {
         </button>
     );
 
-    const turboConcurrency = getBrowserProcessingConcurrency();
-    const renderTurboToggle = () => (
-        <button
-            type="button"
-            className={`btn btn-soft tools-force-button${turbo ? ' active' : ''}`}
-            onClick={() => {
-                setTurbo((value) => {
-                    const next = !value;
-                    setBrowserProcessingTurbo(next);
-                    return next;
-                });
-            }}
-            aria-pressed={turbo}
-            title={turbo
-                ? `Turbo on: processes up to ${turboConcurrency} photos at once (more CPU, GPU, and memory)`
-                : 'Turbo off: processes one photo at a time (gentle on resources)'}
-        >
-            <RocketLaunchIcon className="toolbar-icon" aria-hidden="true" />
-            {turbo ? `Turbo: on (×${turboConcurrency})` : 'Turbo: off'}
-        </button>
-    );
-
     const renderProcessingFilters = () => (
         <div className="tools-filter-row" aria-label="Processing filters">
             <select
@@ -883,10 +859,7 @@ const ToolsPage: React.FC = () => {
                                 : 'Select photos below, then choose a step to run in this browser.'}
                         </p>
                     </div>
-                    <div className="tools-selection-actions">
-                        {renderTurboToggle()}
-                        {renderForceToggle()}
-                    </div>
+                    {renderForceToggle()}
                 </div>
                 {renderBrowserActionButtons()}
             </div>
@@ -1035,7 +1008,6 @@ const ToolsPage: React.FC = () => {
                     <div className="tools-control-group">
                         <span className="tools-control-label">Options</span>
                         <div className="tools-control-row">
-                            {renderTurboToggle()}
                             {renderForceToggle()}
                             <button type="button" className="btn btn-soft" onClick={clearSelection} disabled={selected.size === 0}>
                                 Clear selection

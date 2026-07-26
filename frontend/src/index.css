@@ -782,6 +782,91 @@ a {
   color: var(--muted);
 }
 
+/* ---- Settings toggle (switch row) ---- */
+.account-menu-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-md);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--dur-quick) ease, border-color var(--dur-quick) ease;
+}
+
+.account-menu-toggle:hover {
+  background: var(--lg-surface);
+}
+
+.account-menu-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.account-menu-toggle.is-on {
+  border-color: rgba(30, 106, 225, 0.35);
+  background: var(--accent-soft);
+}
+
+.account-menu-toggle-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.account-menu-toggle-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.account-menu-toggle.is-on .account-menu-toggle-title .account-menu-item-icon {
+  color: var(--accent);
+}
+
+.account-menu-toggle-note {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
+.account-menu-switch {
+  flex: none;
+  width: 40px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--lg-edge-strong);
+  position: relative;
+  transition: background-color var(--dur-base) var(--ease-glass);
+}
+
+.account-menu-toggle.is-on .account-menu-switch {
+  background: var(--accent);
+}
+
+.account-menu-switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+  transition: transform var(--dur-base) var(--ease-glass);
+}
+
+.account-menu-toggle.is-on .account-menu-switch-thumb {
+  transform: translateX(16px);
+}
+
 /* ---- Slide-in navigation drawer (mobile).
    Kept mounted for the slide transition; the `open` modifier toggles both
    visibility and interactivity. Lives outside .ios-container so its fixed
