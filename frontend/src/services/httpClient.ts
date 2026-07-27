@@ -110,6 +110,46 @@ export const createHttpClient = (baseURL: string, timeout = 600000) => {
 // (sharing would let one caller cancel another's request).
 const inFlightGets = new Map<string, Promise<unknown>>();
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// The backend runs scale-to-zero on Azure Container Apps, so after an idle
+// period the first request(s) hit the ingress with no healthy replica. The
+// ingress answers with a 503 (or the connection fails outright) *before* the
+// request ever reaches the app — which also means no CORS headers, so the
+// browser mislabels it as a "CORS policy" error. These failures are transient:
+// the same request wakes the replica and a retry moments later succeeds. We
+// retry only failures that provably never executed server-side, so retrying a
+// mutation (merge, not-face, delete) can't double-apply it:
+//   - no response at all (connection refused / reset / "CORS" network error)
+//   - HTTP 503 from the ingress (no replica available)
+// A 502/504 (gateway reached the app but it timed out) is retried only for
+// idempotent GETs.
+const COLD_START_RETRIES = 4;
+const COLD_START_BASE_DELAY_MS = 800;
+
+const isRetriableColdStart = (error: unknown, method: string): boolean => {
+    if (!axios.isAxiosError(error)) {
+        return false;
+    }
+    if (error.code === 'ERR_CANCELED') {
+        return false;
+    }
+    const status = error.response?.status;
+    if (status === undefined) {
+        // No response: connection failure before reaching the app. Safe to
+        // retry for any method — the request never executed.
+        return true;
+    }
+    if (status === 503) {
+        // Ingress rejected before dispatching to the app: safe for any method.
+        return true;
+    }
+    if (status === 502 || status === 504) {
+        return method === 'get';
+    }
+    return false;
+};
+
 export const requestJson = async <T = any>(
     client: ReturnType<typeof createHttpClient>,
     method: 'get' | 'post' | 'put' | 'delete',
@@ -118,17 +158,25 @@ export const requestJson = async <T = any>(
     config?: AxiosRequestConfig,
 ): Promise<T> => {
     const performRequest = async (): Promise<T> => {
-        try {
-            const response = method === 'get'
-                ? await client.get<T>(normalizePath(url), config)
-                : method === 'post'
-                    ? await client.post<T>(normalizePath(url), data, config)
-                    : method === 'put'
-                        ? await client.put<T>(normalizePath(url), data, config)
-                        : await client.delete<T>(normalizePath(url), config);
-            return response.data;
-        } catch (error: unknown) {
-            throw getErrorMessage(error);
+        for (let attempt = 0; ; attempt += 1) {
+            try {
+                const response = method === 'get'
+                    ? await client.get<T>(normalizePath(url), config)
+                    : method === 'post'
+                        ? await client.post<T>(normalizePath(url), data, config)
+                        : method === 'put'
+                            ? await client.put<T>(normalizePath(url), data, config)
+                            : await client.delete<T>(normalizePath(url), config);
+                return response.data;
+            } catch (error: unknown) {
+                if (attempt < COLD_START_RETRIES && isRetriableColdStart(error, method)) {
+                    // Exponential backoff (0.8s, 1.6s, 3.2s, 6.4s) to span a
+                    // typical cold-start window without hammering the ingress.
+                    await sleep(COLD_START_BASE_DELAY_MS * 2 ** attempt);
+                    continue;
+                }
+                throw getErrorMessage(error);
+            }
         }
     };
 

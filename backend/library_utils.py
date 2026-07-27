@@ -53,6 +53,17 @@ INVITE_TTL_SECONDS = 72 * 3600
 _INVITE_MIN_INTERVAL_SECONDS = 30
 _INVITE_MAX_PER_HOUR = 30
 
+def _is_not_found_error(exc: Exception) -> bool:
+    """True when a table lookup failed because the row does not exist, as opposed
+    to a transient/service error. Matches both the real Azure
+    ``ResourceNotFoundError`` and the in-memory test fake's ``ResourceNotFound``,
+    by type name and message so it needs no azure import."""
+    if type(exc).__name__ in ('ResourceNotFoundError', 'ResourceNotFound'):
+        return True
+    message = str(exc).lower()
+    return '404' in message or 'resourcenotfound' in message or 'does not exist' in message or 'not found' in message
+
+
 # Partition-key namespaces / well-known keys.
 _USER_PK = 'user'
 _EMAIL_PK = 'email'
@@ -131,6 +142,19 @@ class LibraryStore:
             return None
 
     @staticmethod
+    def _get_checked(table, pk: str, rk: str) -> Optional[Dict]:
+        """Like _get, but distinguishes an absent row (returns None) from a
+        lookup failure (raises). Access/tenancy checks must use this so a
+        transient storage error is never mistaken for 'row does not exist' —
+        which would wrongly deny a valid member (403) or a live account (401)."""
+        try:
+            return dict(table.get_entity(partition_key=pk, row_key=rk))
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                return None
+            raise
+
+    @staticmethod
     def _query(table, filter_str: str) -> List[Dict]:
         try:
             return [dict(row) for row in table.query_entities(filter_str)]
@@ -149,6 +173,19 @@ class LibraryStore:
         if not user_id:
             return None
         return self._get(self.users, _USER_PK, str(user_id))
+
+    def get_user_checked(self, user_id: str) -> Optional[Dict]:
+        """get_user that raises on a lookup failure instead of returning None."""
+        if not user_id:
+            return None
+        return self._get_checked(self.users, _USER_PK, str(user_id))
+
+    def get_membership_checked(self, user_id: str, library_id: str) -> Optional[Dict]:
+        """get_membership that raises on a lookup failure instead of returning
+        None (which the auth path would read as 'not a member')."""
+        if not user_id or not library_id:
+            return None
+        return self._get_checked(self.memberships, _MEMBER_LIB_PREFIX + str(library_id), str(user_id))
 
     def get_user_by_email(self, email: str) -> Optional[Dict]:
         norm = normalize_email(email)

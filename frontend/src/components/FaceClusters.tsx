@@ -9,11 +9,11 @@ import { fetchProtectedBlobUrl } from '../services/imageClient';
 import { showToast } from '../services/toast';
 import { isAuthEnabled } from '../services/authClient';
 import { useNavigate } from 'react-router-dom';
-import type { MergeHistoryItem, PersonFace, PersonSummary, SuggestionItem } from '../types/people';
+import type { FlatFace, MergeHistoryItem, PersonFace, PersonSummary, SuggestionItem } from '../types/people';
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
 const CLUSTER_PER_PAGE = 15;
-const FACE_PER_PAGE = 4;
+const FACES_PER_PAGE = 50;
 const SUGGESTIONS_PER_PAGE = 5;
 type PeopleView = 'cluster' | 'face';
 const isSuspiciousFace = (face?: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
@@ -176,16 +176,32 @@ const FaceClusters: React.FC = () => {
     const [view, setView] = useState<PeopleView>('cluster');
     const [page, setPage] = useState(1);
     const [suggestionPage, setSuggestionPage] = useState(1);
-    const [personFaces, setPersonFaces] = useState<Record<string, PersonFace[]>>({});
-    const faceRequestsRef = useRef<Set<string>>(new Set());
+    const [faces, setFaces] = useState<FlatFace[]>([]);
+    const [facesLoaded, setFacesLoaded] = useState(false);
+    const [facesLoading, setFacesLoading] = useState(false);
+    const [selectedFaces, setSelectedFaces] = useState<Record<string, boolean>>({});
     const navigate = useNavigate();
     const busy = initialLoading || actionLoading;
 
-    const personsPerPage = view === 'cluster' ? CLUSTER_PER_PAGE : FACE_PER_PAGE;
-    const totalPages = Math.max(1, Math.ceil(persons.length / personsPerPage));
+    // Face view shows a flat, paginated grid of individual face crops. Filter by
+    // person name so the shared search box narrows faces the same way it narrows
+    // clusters, then page the result 50 at a time.
+    const visibleFaces = useMemo(() => {
+        const q = searchQuery.trim().toLowerCase();
+        if (!q) return faces;
+        return faces.filter((face) => (face.personName || '').toLowerCase().includes(q));
+    }, [faces, searchQuery]);
+
+    const activeItemCount = view === 'face' ? visibleFaces.length : persons.length;
+    const activePerPage = view === 'face' ? FACES_PER_PAGE : CLUSTER_PER_PAGE;
+    const totalPages = Math.max(1, Math.ceil(activeItemCount / activePerPage));
     const pagedPersons = useMemo(
-        () => persons.slice((page - 1) * personsPerPage, page * personsPerPage),
-        [persons, page, personsPerPage],
+        () => persons.slice((page - 1) * CLUSTER_PER_PAGE, page * CLUSTER_PER_PAGE),
+        [persons, page],
+    );
+    const pagedFaces = useMemo(
+        () => visibleFaces.slice((page - 1) * FACES_PER_PAGE, page * FACES_PER_PAGE),
+        [visibleFaces, page],
     );
     const suggestionTotalPages = Math.max(1, Math.ceil(suggestions.length / SUGGESTIONS_PER_PAGE));
     const pagedSuggestions = useMemo(
@@ -220,6 +236,8 @@ const FaceClusters: React.FC = () => {
 
     const selectedCount = useMemo(() => Object.values(selected).filter(Boolean).length, [selected]);
     const selectedPersonIds = useMemo(() => Object.keys(selected).filter(id => selected[id]), [selected]);
+    const selectedFaceCount = useMemo(() => Object.values(selectedFaces).filter(Boolean).length, [selectedFaces]);
+    const selectedFaceIds = useMemo(() => Object.keys(selectedFaces).filter(id => selectedFaces[id]), [selectedFaces]);
 
     const getInitials = (name?: string | null, personId?: string | null) => {
         if (name) {
@@ -257,13 +275,40 @@ const FaceClusters: React.FC = () => {
         try {
             const res = await faceService.listPersons(q || '');
             setPersons((res.persons || []) as PersonSummary[]);
-            setPersonFaces({});
+            // Person membership may have changed; let the face grid refetch lazily
+            // the next time it is shown (or immediately if it is already open).
+            setFacesLoaded(false);
         } catch (e: unknown) {
             setStatus(String(e));
         } finally {
             if (showSpinner) {
                 setInitialLoading(false);
             }
+        }
+    };
+
+    const loadFaces = async () => {
+        setFacesLoading(true);
+        try {
+            const res = await faceService.listFaces();
+            const nextFaces = (res.faces || []) as FlatFace[];
+            setFaces(nextFaces);
+            setFacesLoaded(true);
+            // Drop selections for faces that no longer exist.
+            const liveIds = new Set(nextFaces.map((face) => face.faceId || ''));
+            setSelectedFaces((prev) => {
+                const next: Record<string, boolean> = {};
+                Object.keys(prev).forEach((id) => {
+                    if (prev[id] && liveIds.has(id)) {
+                        next[id] = true;
+                    }
+                });
+                return next;
+            });
+        } catch (e: unknown) {
+            setStatus(String(e));
+        } finally {
+            setFacesLoading(false);
         }
     };
 
@@ -294,11 +339,6 @@ const FaceClusters: React.FC = () => {
     const removePersonsFromState = (personIds: string[]) => {
         const removeSet = new Set(personIds);
         setPersons(prev => prev.filter(person => !removeSet.has(person.personId)));
-        setPersonFaces(prev => {
-            const next = { ...prev };
-            personIds.forEach(personId => delete next[personId]);
-            return next;
-        });
         setSelected(prev => {
             const next = { ...prev };
             personIds.forEach(personId => delete next[personId]);
@@ -331,7 +371,6 @@ const FaceClusters: React.FC = () => {
         });
         setSelected({});
         setMergeTarget(null);
-        setPersonFaces({});
         setSuggestions(prev => prev.filter((suggestion) => (
             suggestion.sourcePersonId !== targetId
             && suggestion.targetPersonId !== targetId
@@ -357,30 +396,14 @@ const FaceClusters: React.FC = () => {
         setSuggestionPage((prev) => Math.min(prev, suggestionTotalPages));
     }, [suggestionTotalPages]);
 
-    // In face view, lazily fetch the individual faces for the persons on the current page.
+    // Lazily fetch the flat face list the first time the Faces view is opened (or
+    // after a cluster change invalidates it) so switching tabs stays instant.
     useEffect(() => {
-        if (view !== 'face') {
+        if (view !== 'face' || facesLoaded || facesLoading) {
             return;
         }
-        pagedPersons.forEach((person) => {
-            const personId = person.personId;
-            if (!personId || personId in personFaces || faceRequestsRef.current.has(personId)) {
-                return;
-            }
-            faceRequestsRef.current.add(personId);
-            void (async () => {
-                try {
-                    const res = await faceService.getPerson(personId);
-                    const faces = Array.isArray(res?.faces) ? (res.faces as PersonFace[]) : [];
-                    setPersonFaces((prev) => ({ ...prev, [personId]: faces }));
-                } catch {
-                    setPersonFaces((prev) => ({ ...prev, [personId]: [] }));
-                } finally {
-                    faceRequestsRef.current.delete(personId);
-                }
-            })();
-        });
-    }, [view, pagedPersons, personFaces]);
+        void loadFaces();
+    }, [view, facesLoaded, facesLoading]);
 
     const handleSearch = async () => {
         setStatus('Searching…');
@@ -389,41 +412,77 @@ const FaceClusters: React.FC = () => {
         void refreshSupportData();
     };
 
-    const handleNotFaceInView = async (personId: string, faceId: string) => {
-        if (!personId || !faceId) return;
+    const toggleFace = (faceId: string) => {
+        if (!faceId) return;
+        setSelectedFaces((prev) => ({ ...prev, [faceId]: !prev[faceId] }));
+    };
+
+    // Select every face on the current page. Page-scoped (rather than the whole
+    // filtered set) keeps a bulk delete predictable when there are many faces.
+    const selectAllVisibleFaces = () => {
+        setSelectedFaces((prev) => {
+            const next = { ...prev };
+            pagedFaces.forEach((face) => {
+                if (face.faceId) {
+                    next[face.faceId] = true;
+                }
+            });
+            return next;
+        });
+    };
+
+    const clearSelectedFaces = () => setSelectedFaces({});
+
+    const performFaceDelete = async (faceIds: string[], label: string) => {
+        const ids = faceIds.filter(Boolean);
+        if (ids.length === 0) {
+            return;
+        }
+        if (!(await confirmDialog({
+            title: ids.length === 1 ? 'Delete face' : 'Delete faces',
+            message: `Delete ${label}? The photo${ids.length === 1 ? '' : 's'} will stay, but ${ids.length === 1 ? 'this face' : 'these faces'} will be removed from People.`,
+            confirmLabel: 'Delete',
+            danger: true,
+        }))) {
+            return;
+        }
         setActionLoading(true);
+        setStatus(`Deleting ${ids.length} face${ids.length === 1 ? '' : 's'}…`);
         try {
-            const res = await faceService.markNotFace(personId, faceId);
-            setPersonFaces((prev) => ({
-                ...prev,
-                [personId]: (prev[personId] || []).filter((face) => face.faceId !== faceId),
-            }));
-            if (res?.personDeleted) {
-                removePersonsFromState([personId]);
-                setPersonFaces((prev) => {
-                    const next = { ...prev };
-                    delete next[personId];
-                    return next;
-                });
-                showToast('False positive removed');
-            } else {
-                setPersons((prev) => prev.map((person) => (
-                    person.personId === personId
-                        ? {
-                            ...person,
-                            faceIds: (person.faceIds || []).filter((id) => id !== faceId),
-                            faceCount: Math.max(0, (person.faceCount ?? (person.faceIds || []).length) - 1),
-                        }
-                        : person
-                )));
-                showToast('Marked as not a face');
+            const result = await faceService.deleteFaces(ids);
+            const deletedSet = new Set(result.deleted);
+            setFaces((prev) => prev.filter((face) => !deletedSet.has(face.faceId || '')));
+            setSelectedFaces((prev) => {
+                const next = { ...prev };
+                result.deleted.forEach((id) => delete next[id]);
+                return next;
+            });
+            if (result.deletedPersonIds.length > 0) {
+                removePersonsFromState(result.deletedPersonIds);
             }
+            const failed = result.errors.length;
+            setStatus(`Deleted ${result.deleted.length} face${result.deleted.length === 1 ? '' : 's'}${failed ? `, ${failed} failed` : ''}.`);
+            showToast(failed ? `Deleted ${result.deleted.length}, ${failed} failed` : 'Faces deleted');
+            // Person face counts changed; refresh clusters and suggestions quietly.
+            void loadPersons(searchQuery.trim(), false);
             void refreshSupportData();
         } catch (e: unknown) {
+            setStatus(String(e));
             showToast(String(e));
         } finally {
             setActionLoading(false);
         }
+    };
+
+    const handleDeleteSingleFace = (faceId: string) => performFaceDelete([faceId], 'this face');
+
+    const handleDeleteSelectedFaces = async () => {
+        const ids = selectedFaceIds;
+        if (ids.length === 0) {
+            setStatus('Select at least one face to delete.');
+            return;
+        }
+        await performFaceDelete(ids, `${ids.length} selected face${ids.length === 1 ? '' : 's'}`);
     };
 
     const handleAssignUnclustered = async () => {
@@ -637,8 +696,8 @@ const FaceClusters: React.FC = () => {
                     <div>
                         <p className="people-hero-kicker">People</p>
                         <div className="people-hero-meta">
-                            <span className="people-hero-count">{persons.length}</span>
-                            <span className="people-hero-label">clusters</span>
+                            <span className="people-hero-count">{view === 'face' ? faces.length : persons.length}</span>
+                            <span className="people-hero-label">{view === 'face' ? 'faces' : 'clusters'}</span>
                         </div>
                     </div>
                 </div>
@@ -694,7 +753,7 @@ const FaceClusters: React.FC = () => {
                 <div className="people-view-toggle" role="tablist" aria-label="People view">
                     <button
                         className={`people-view-tab ${view === 'cluster' ? 'is-active' : ''}`}
-                        onClick={() => setView('cluster')}
+                        onClick={() => { setView('cluster'); setPage(1); }}
                         role="tab"
                         aria-selected={view === 'cluster'}
                         type="button"
@@ -704,7 +763,7 @@ const FaceClusters: React.FC = () => {
                     </button>
                     <button
                         className={`people-view-tab ${view === 'face' ? 'is-active' : ''}`}
-                        onClick={() => setView('face')}
+                        onClick={() => { setView('face'); setPage(1); }}
                         role="tab"
                         aria-selected={view === 'face'}
                         type="button"
@@ -769,7 +828,7 @@ const FaceClusters: React.FC = () => {
             )}
 
             {initialLoading && persons.length === 0 && <Loading label="Loading people…" fullPage={false} />}
-            {!initialLoading && persons.length === 0 && (
+            {!initialLoading && persons.length === 0 && view === 'cluster' && (
                 <EmptyState
                     icon={<UsersIcon />}
                     title="No people yet"
@@ -832,72 +891,100 @@ const FaceClusters: React.FC = () => {
                 </div>
             )}
 
-            {persons.length > 0 && view === 'face' && (
-                <div className="people-face-view">
-                    {pagedPersons.map((p) => {
-                        const loadedFaces = personFaces[p.personId];
-                        const facesReady = Array.isArray(loadedFaces);
-                        return (
-                            <div key={p.personId} className="people-face-person">
-                                <div className="people-face-person-head">
-                                    <div className="people-face-person-avatar" style={getAvatarStyle(p.personId)}>
-                                        {p.representativeFace?.filename ? (
-                                            <PersonAvatarMedia rep={p.representativeFace} alt={p.name || 'Person'} />
-                                        ) : (
-                                            <span>{getInitials(p.name, p.personId)}</span>
-                                        )}
+            {view === 'face' && (
+                <>
+                    {visibleFaces.length > 0 && (
+                        <div className="people-merge-strip face-select-strip">
+                            <div className="people-merge-count">{selectedFaceCount} selected</div>
+                            <button
+                                className="people-secondary-btn"
+                                disabled={busy || pagedFaces.length === 0}
+                                onClick={selectAllVisibleFaces}
+                                type="button"
+                            >
+                                <CheckIcon />
+                                <span>Select page</span>
+                            </button>
+                            <button
+                                className="people-secondary-btn"
+                                disabled={busy || selectedFaceCount === 0}
+                                onClick={clearSelectedFaces}
+                                type="button"
+                            >
+                                <XMarkIcon />
+                                <span>Clear</span>
+                            </button>
+                            <button
+                                className="people-merge-btn people-delete-selected"
+                                disabled={busy || selectedFaceCount === 0}
+                                aria-label="Delete selected faces"
+                                onClick={() => void handleDeleteSelectedFaces()}
+                                type="button"
+                            >
+                                <TrashIcon />
+                                <span>Delete selected</span>
+                            </button>
+                        </div>
+                    )}
+
+                    {facesLoading && faces.length === 0 ? (
+                        <Loading label="Loading faces…" fullPage={false} />
+                    ) : visibleFaces.length === 0 ? (
+                        <EmptyState
+                            icon={<FaceSmileIcon />}
+                            title="No faces to review"
+                            message="Individual face crops show up here once your photos finish processing."
+                        />
+                    ) : (
+                        <div className="face-grid">
+                            {pagedFaces.map((face, index: number) => {
+                                const faceId = face.faceId || '';
+                                const suspicious = isSuspiciousFace(face);
+                                const isSelected = !!selectedFaces[faceId];
+                                return (
+                                    <div
+                                        key={faceId || `${face.filename}-${face.bbox?.left}-${face.bbox?.top}`}
+                                        className={`face-tile ${isSelected ? 'is-selected' : ''} ${suspicious ? 'is-suspicious' : ''}`}
+                                        style={{ ['--stagger' as string]: `${Math.min(index, 24) * 16}ms` }}
+                                    >
+                                        <button
+                                            className="face-tile-main"
+                                            onClick={() => toggleFace(faceId)}
+                                            disabled={!faceId}
+                                            type="button"
+                                            aria-pressed={isSelected}
+                                            title={face.personName ? `Select face • ${face.personName}` : 'Select face'}
+                                        >
+                                            <PersonAvatarMedia rep={face} alt={face.personName || face.filename || 'Face'} />
+                                            {suspicious && (
+                                                <span className="person-avatar-review-badge" title="Needs review" aria-label="Needs review">
+                                                    <ExclamationTriangleIcon />
+                                                </span>
+                                            )}
+                                        </button>
+                                        <span className="face-select-indicator" aria-hidden="true">
+                                            <CheckIcon />
+                                        </span>
+                                        <button
+                                            className="face-tile-delete"
+                                            onClick={() => faceId && void handleDeleteSingleFace(faceId)}
+                                            disabled={!faceId || busy}
+                                            type="button"
+                                            aria-label="Delete face"
+                                            title="Delete face"
+                                        >
+                                            <TrashIcon />
+                                        </button>
+                                        {face.personName && <div className="face-caption">{face.personName}</div>}
                                     </div>
-                                    <div className="people-face-person-info">
-                                        <div className="person-name">{p.name || 'Unnamed'}</div>
-                                        <div className="person-count">
-                                            {facesReady ? loadedFaces.length : (p.faceCount ?? (p.faceIds || []).length)} faces
-                                        </div>
-                                    </div>
-                                    <button className="people-icon-btn" aria-label="Open person" onClick={() => navigate(`/people/${p.personId}`)} type="button">
-                                        <ArrowRightIcon />
-                                    </button>
-                                </div>
-                                {!facesReady ? (
-                                    <div className="people-face-empty">Loading faces…</div>
-                                ) : loadedFaces.length === 0 ? (
-                                    <div className="people-face-empty">No faces remaining.</div>
-                                ) : (
-                                    <div className="people-face-strip">
-                                        {loadedFaces.map((face) => {
-                                            const faceId = face.faceId || '';
-                                            const suspicious = isSuspiciousFace(face);
-                                            return (
-                                                <div key={faceId || `${face.filename}-${face.bbox?.left}-${face.bbox?.top}`} className={`people-face-cell ${suspicious ? 'is-suspicious-face' : ''}`}>
-                                                    <div className="people-face-crop">
-                                                        <PersonAvatarMedia rep={face} alt={face.filename || 'Face'} />
-                                                        {suspicious && (
-                                                            <span className="person-avatar-review-badge" title="Needs review" aria-label="Needs review">
-                                                                <ExclamationTriangleIcon />
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    <button
-                                                        className="people-face-notface"
-                                                        onClick={() => faceId && void handleNotFaceInView(p.personId, faceId)}
-                                                        disabled={!faceId || busy}
-                                                        type="button"
-                                                        title="Not a face"
-                                                    >
-                                                        <NoSymbolIcon />
-                                                        <span>Not a face</span>
-                                                    </button>
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                )}
-                            </div>
-                        );
-                    })}
-                </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </>
             )}
 
-            {persons.length > 0 && totalPages > 1 && (
+            {totalPages > 1 && (
                 <div className="people-pagination">
                     <button
                         className="people-icon-btn"

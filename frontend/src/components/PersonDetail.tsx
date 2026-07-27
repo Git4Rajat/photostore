@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { ArrowLeftIcon, ArrowUturnLeftIcon, ArrowsRightLeftIcon, CheckIcon, ExclamationTriangleIcon, MinusCircleIcon, NoSymbolIcon } from '@heroicons/react/24/outline';
+import { ArrowLeftIcon, ArrowUturnLeftIcon, ArrowsRightLeftIcon, CheckIcon, ExclamationTriangleIcon, MinusCircleIcon, NoSymbolIcon, PlusCircleIcon, SparklesIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { useParams, useNavigate } from 'react-router-dom';
 import faceService from '../services/faceService';
 import { resolveApiUrl } from '../services/apiClient';
@@ -10,6 +10,10 @@ import type { PersonDetailModel, PersonFace, PersonSummary } from '../types/peop
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
 const isSuspiciousFace = (face: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
+
+// A borderline propagation match surfaced for manual review, carrying the
+// similarity of the face to this person's learned representative embedding.
+type ReviewFace = PersonFace & { similarity?: number; currentPersonId?: string };
 
 interface FaceDetectionImageProps {
     face: PersonFace;
@@ -113,6 +117,10 @@ const PersonDetail: React.FC = () => {
     const [mergeCandidatesLoading, setMergeCandidatesLoading] = useState(false);
     const [selectedMerge, setSelectedMerge] = useState<Record<string, boolean>>({});
     const [lastMergeId, setLastMergeId] = useState<string | null>(null);
+    const [findingFaces, setFindingFaces] = useState(false);
+    const [suggestedFaces, setSuggestedFaces] = useState<ReviewFace[]>([]);
+    const [reviewBusy, setReviewBusy] = useState(false);
+    const trimmedName = (name || person?.name || '').trim();
     const displayFaces = useMemo(() => {
         const seen = new Set<string>();
         return (person?.faces || []).filter((face) => {
@@ -138,6 +146,11 @@ const PersonDetail: React.FC = () => {
         .filter((filename): filename is string => Boolean(filename))
         .map((filename) => `/api/photos/thumbnail/${encodeURIComponent(filename)}`);
     const protectedImageUrls = useProtectedBlobUrls(thumbnailPaths);
+    const suggestionThumbnailPaths = useMemo(() => suggestedFaces
+        .map((f) => f.filename)
+        .filter((filename): filename is string => Boolean(filename))
+        .map((filename) => `/api/photos/thumbnail/${encodeURIComponent(filename)}`), [suggestedFaces]);
+    const protectedSuggestionUrls = useProtectedBlobUrls(suggestionThumbnailPaths);
 
     const loadPerson = async () => {
         if (!personId) return;
@@ -176,6 +189,7 @@ const PersonDetail: React.FC = () => {
     useEffect(() => {
         setOtherPersons([]);
         setSelectedMerge({});
+        setSuggestedFaces([]);
         void (async () => {
             await load();
             void loadMergeCandidates();
@@ -190,11 +204,82 @@ const PersonDetail: React.FC = () => {
         setPerson((prev) => (prev ? { ...prev, name } : prev));
         showToast('Name saved');
         try {
-            await faceService.labelPerson(personId, name);
+            const res = await faceService.labelPerson(personId, name);
+            // Naming triggers server-side identity propagation: if it pulled this
+            // person's faces out of unnamed clusters, reflect them right away.
+            const autoAssigned = Number((res as { autoAssignedFaces?: number })?.autoAssignedFaces || 0);
+            if (autoAssigned > 0) {
+                showToast(`Added ${autoAssigned} matching face${autoAssigned === 1 ? '' : 's'}`);
+                await load();
+                void loadMergeCandidates();
+            }
         } catch (e: unknown) {
             setPerson((prev) => (prev ? { ...prev, name: previousName } : prev));
             setName(previousName);
             showToast('Could not save name');
+        }
+    };
+
+    const handleFindFaces = async () => {
+        if (!personId) return;
+        setFindingFaces(true);
+        try {
+            const res = await faceService.findPersonFaces(personId);
+            const autoAssigned = Number(res?.autoAssignedFaces || 0);
+            const review = ((res?.suggestions || []) as unknown as ReviewFace[]);
+            setSuggestedFaces(review);
+            if (autoAssigned > 0) {
+                await load();
+                void loadMergeCandidates();
+            }
+            if (res?.skipped === 'no representative embedding' || res?.skipped === 'not enough anchor faces') {
+                showToast('Add a few confirmed faces first, then try again');
+            } else if (autoAssigned > 0 && review.length > 0) {
+                showToast(`Added ${autoAssigned} face${autoAssigned === 1 ? '' : 's'}; ${review.length} more to review`);
+            } else if (autoAssigned > 0) {
+                showToast(`Added ${autoAssigned} matching face${autoAssigned === 1 ? '' : 's'}`);
+            } else if (review.length > 0) {
+                showToast(`Found ${review.length} face${review.length === 1 ? '' : 's'} to review`);
+            } else {
+                showToast('No more matching faces found');
+            }
+        } catch (e: unknown) {
+            showToast(String(e));
+        } finally {
+            setFindingFaces(false);
+        }
+    };
+
+    const handleAcceptSuggested = async (faceIds: string[]) => {
+        const ids = faceIds.filter(Boolean);
+        if (!personId || ids.length === 0) return;
+        setReviewBusy(true);
+        try {
+            await faceService.acceptSuggestedFaces(personId, ids);
+            const accepted = new Set(ids);
+            setSuggestedFaces((prev) => prev.filter((f) => !accepted.has(f.faceId || '')));
+            await load();
+            void loadMergeCandidates();
+            showToast(`Added ${ids.length} face${ids.length === 1 ? '' : 's'}`);
+        } catch (e: unknown) {
+            showToast(String(e));
+        } finally {
+            setReviewBusy(false);
+        }
+    };
+
+    const handleDeclineSuggested = async (faceIds: string[]) => {
+        const ids = faceIds.filter(Boolean);
+        if (!personId || ids.length === 0) return;
+        setReviewBusy(true);
+        try {
+            await faceService.declineSuggestedFaces(personId, ids);
+            const declined = new Set(ids);
+            setSuggestedFaces((prev) => prev.filter((f) => !declined.has(f.faceId || '')));
+        } catch (e: unknown) {
+            showToast(String(e));
+        } finally {
+            setReviewBusy(false);
         }
     };
 
@@ -278,7 +363,10 @@ const PersonDetail: React.FC = () => {
             setSelectedMerge({});
             await load();
             void loadMergeCandidates();
-            showToast('Merge completed');
+            const autoAssigned = Number((res as { autoAssignedFaces?: number })?.autoAssignedFaces || 0);
+            showToast(autoAssigned > 0
+                ? `Merge completed — added ${autoAssigned} more matching face${autoAssigned === 1 ? '' : 's'}`
+                : 'Merge completed');
         } catch (e: unknown) {
             // ignore
         } finally {
@@ -334,6 +422,16 @@ const PersonDetail: React.FC = () => {
                         <button className="btn btn-primary icon-btn" onClick={handleSave} aria-label="Save name">
                             <CheckIcon className="toolbar-icon" />
                             <span className="sr-only">Save name</span>
+                        </button>
+                        <button
+                            className="btn btn-soft"
+                            onClick={handleFindFaces}
+                            disabled={findingFaces || loading}
+                            aria-label="Find more faces of this person"
+                            title="Scan unnamed clusters for more faces of this person"
+                        >
+                            <SparklesIcon className="toolbar-icon" />
+                            <span>{findingFaces ? 'Finding…' : 'Find more faces'}</span>
                         </button>
                     </div>
 
@@ -409,6 +507,96 @@ const PersonDetail: React.FC = () => {
                                     </div>
                                 );
                             })}
+                        </div>
+                    )}
+
+                    {suggestedFaces.length > 0 && (
+                        <div className="people-panel person-suggested-faces">
+                            <div className="people-panel-header">
+                                <div>
+                                    <p className="people-panel-title">Suggested faces</p>
+                                    <p className="people-panel-meta">
+                                        {`These may be ${trimmedName || 'this person'}. Add the correct ones — dismissed faces won't be suggested again.`}
+                                    </p>
+                                </div>
+                                <div className="person-merge-actions">
+                                    <button
+                                        className="btn btn-primary"
+                                        onClick={() => handleAcceptSuggested(suggestedFaces.map((f) => f.faceId || ''))}
+                                        disabled={reviewBusy}
+                                    >
+                                        Add all
+                                    </button>
+                                    <button
+                                        className="btn btn-link"
+                                        onClick={() => handleDeclineSuggested(suggestedFaces.map((f) => f.faceId || ''))}
+                                        disabled={reviewBusy}
+                                    >
+                                        Dismiss all
+                                    </button>
+                                </div>
+                            </div>
+                            <div className="gallery-grid person-face-grid">
+                                {suggestedFaces.map((f) => {
+                                    const faceId = f.faceId || '';
+                                    const path = f.filename ? `/api/photos/thumbnail/${encodeURIComponent(f.filename)}` : '';
+                                    const thumbSrc = protectedSuggestionUrls[path] || resolveApiUrl(path);
+                                    const matchPct = typeof f.similarity === 'number' ? Math.round(f.similarity * 100) : null;
+                                    return (
+                                        <div key={faceId || `${f.filename}-${f.bbox?.left}-${f.bbox?.top}`} className="photo-card person-face-card">
+                                            <div className="person-face-media">
+                                                {thumbSrc ? (
+                                                    <FaceDetectionImage face={f} src={thumbSrc} />
+                                                ) : (
+                                                    <div
+                                                        className="photo-media"
+                                                        style={{
+                                                            display: 'flex',
+                                                            alignItems: 'center',
+                                                            justifyContent: 'center',
+                                                            color: '#777',
+                                                            background: '#f3f4f6',
+                                                            minHeight: 120,
+                                                        }}
+                                                    >
+                                                        Loading thumbnail...
+                                                    </div>
+                                                )}
+                                            </div>
+                                            <div className="photo-body">
+                                                <div className="photo-title-row">
+                                                    <p className="photo-name">{f.filename}</p>
+                                                    {matchPct !== null && (
+                                                        <p className="photo-kind" title="Similarity to this person">{matchPct}% match</p>
+                                                    )}
+                                                </div>
+                                                <div className="photo-row person-face-actions">
+                                                    <button
+                                                        className="btn btn-primary icon-btn"
+                                                        onClick={() => faceId && handleAcceptSuggested([faceId])}
+                                                        disabled={!faceId || reviewBusy}
+                                                        aria-label="Add to this person"
+                                                        title="Add to this person"
+                                                    >
+                                                        <PlusCircleIcon className="toolbar-icon" />
+                                                        <span className="sr-only">Add to this person</span>
+                                                    </button>
+                                                    <button
+                                                        className="btn btn-link icon-btn"
+                                                        onClick={() => faceId && handleDeclineSuggested([faceId])}
+                                                        disabled={!faceId || reviewBusy}
+                                                        aria-label="Not this person"
+                                                        title="Not this person"
+                                                    >
+                                                        <XMarkIcon className="toolbar-icon" />
+                                                        <span className="sr-only">Not this person</span>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
                         </div>
                     )}
 

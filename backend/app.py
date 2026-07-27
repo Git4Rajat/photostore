@@ -303,6 +303,24 @@ PEOPLE_CLUSTER_ASSIGN_MARGIN = float(_PEOPLE_CLUSTER_CONFIG['assign_margin'])
 PEOPLE_SUGGEST_THRESHOLD = float(os.getenv('PEOPLE_SUGGEST_THRESHOLD', '0.78'))
 PEOPLE_SUGGEST_LIMIT = int(os.getenv('PEOPLE_SUGGEST_LIMIT', '20'))
 PEOPLE_SUGGEST_PER_PERSON = int(os.getenv('PEOPLE_SUGGEST_PER_PERSON', '2'))
+
+# Identity propagation: once a person cluster is named/merged, use its learned
+# representative embedding to pull that person's faces out of *unnamed* clusters.
+# These thresholds are intentionally looser than the strict base-clustering
+# match threshold (which stays high to avoid false merges at detection time),
+# because a named person's confirmed rep is a much stronger, user-vetted anchor.
+# ``AUTO`` faces are moved in automatically; faces between ``REVIEW`` and
+# ``AUTO`` are surfaced as a per-face review queue for manual accept/decline.
+PEOPLE_PROPAGATE_AUTO_THRESHOLD = float(os.getenv('PEOPLE_PROPAGATE_AUTO_THRESHOLD', '0.82'))
+PEOPLE_PROPAGATE_REVIEW_THRESHOLD = float(os.getenv('PEOPLE_PROPAGATE_REVIEW_THRESHOLD', '0.70'))
+# A candidate face must beat its best match to any *other* named person by this
+# margin before it is auto-assigned, so faces ambiguous between two known people
+# are never silently moved.
+PEOPLE_PROPAGATE_MARGIN = float(os.getenv('PEOPLE_PROPAGATE_MARGIN', '0.05'))
+# Require the target person to have at least this many active faces so a single
+# stray face cannot become an over-eager magnet for the whole library.
+PEOPLE_PROPAGATE_MIN_FACES = int(os.getenv('PEOPLE_PROPAGATE_MIN_FACES', '2'))
+PEOPLE_PROPAGATE_MAX_SUGGESTIONS = int(os.getenv('PEOPLE_PROPAGATE_MAX_SUGGESTIONS', '60'))
 SUSPICIOUS_FACE_CONFIDENCE = float(os.getenv('SUSPICIOUS_FACE_CONFIDENCE', '0.60'))
 FACE_MIN_STORE_CONFIDENCE = float(os.getenv('FACE_MIN_STORE_CONFIDENCE', '0.24'))
 FACE_LOW_CONFIDENCE_REJECT_BELOW = float(os.getenv('FACE_LOW_CONFIDENCE_REJECT_BELOW', '0.32'))
@@ -1017,6 +1035,25 @@ def _resolve_session_payload(require_auth: bool):
     return None, None
 
 
+def _auth_lookup_with_retry(fn, attempts: int = 3):
+    """Run an auth-critical table lookup, retrying transient failures with a
+    short backoff. The backend runs several gunicorn threads that share the
+    Azure table clients and managed-identity credential; an occasional storage
+    or token blip under that concurrency should be absorbed here rather than
+    surface as a spurious 401/403. Only raises if every attempt fails; a
+    definitively-absent row returns None without retrying (the *_checked lookups
+    return None for not-found and raise only on real errors)."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                time.sleep(0.05 * (2 ** attempt))
+    raise last_exc if last_exc is not None else RuntimeError('auth lookup failed')
+
+
 def _require_library_context(require_auth: bool = False):
     """The single tenant-isolation boundary.
 
@@ -1049,9 +1086,19 @@ def _require_library_context(require_auth: bool = False):
     # Accounts are created at login / token-exchange / invite-acceptance, not
     # here: a valid token whose account row is gone means the account was
     # deleted, so reject rather than silently resurrecting it from the token.
-    account = library_store.get_user(user_id) if library_store is not None else None
-    if library_store is not None and account is None:
-        return None, None, (jsonify({'error': 'This account no longer exists. Please sign in again.'}), 401)
+    # The *_checked lookups raise on a transient storage error (rather than
+    # returning None), so a storage blip under concurrency can't be mistaken for
+    # "account deleted"/"not a member" — that surfaces as a retryable 503 instead
+    # of a spurious 401/403 that reads as being logged out.
+    account = None
+    if library_store is not None:
+        try:
+            account = _auth_lookup_with_retry(lambda: library_store.get_user_checked(user_id))
+        except Exception:
+            app.logger.warning('Account lookup failed transiently for %s', user_id, exc_info=True)
+            return None, None, (jsonify({'error': 'Account verification is temporarily unavailable. Please retry.'}), 503)
+        if account is None:
+            return None, None, (jsonify({'error': 'This account no longer exists. Please sign in again.'}), 401)
 
     # Session-kill: the token's version must match the account's current version.
     token_ver = payload.get('ver')
@@ -1066,7 +1113,14 @@ def _require_library_context(require_auth: bool = False):
     # A user's own personal-library membership is never removed while the account
     # exists, so we only need the lookup when acting in a *different* library.
     if library_id != user_id and library_store is not None:
-        if not library_store.is_member(user_id, library_id):
+        try:
+            is_member = _auth_lookup_with_retry(
+                lambda: library_store.get_membership_checked(user_id, library_id)
+            ) is not None
+        except Exception:
+            app.logger.warning('Membership lookup failed transiently for %s/%s', user_id, library_id, exc_info=True)
+            return None, None, (jsonify({'error': 'Library access check is temporarily unavailable. Please retry.'}), 503)
+        if not is_member:
             return None, None, (jsonify({'error': 'You no longer have access to this library.'}), 403)
 
     return user_id, library_id, None
@@ -1693,6 +1747,17 @@ def _face_is_rejected(face: Dict) -> bool:
 
 def _face_is_confirmed(face: Dict) -> bool:
     return _coerce_bool(face.get('confirmedByUser', False)) or str(face.get('reviewStatus') or '').lower() == 'confirmed'
+
+
+def _face_is_propagation_assigned(face: Dict) -> bool:
+    """True when a face was auto-attached to a named person by identity
+    propagation. Such assignments are treated as sticky so a later recluster
+    does not scatter faces the user's named-person anchor already pulled in."""
+    return _coerce_bool(face.get('assignedByPropagation', False))
+
+
+def _face_assignment_is_sticky(face: Dict) -> bool:
+    return _face_is_confirmed(face) or _face_is_propagation_assigned(face)
 
 
 def _face_is_suspicious(face: Dict) -> bool:
@@ -3137,7 +3202,7 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
             expected_embedding_dim = len(emb)
         elif len(emb) != expected_embedding_dim:
             continue
-        if row.get('personId') and _coerce_bool(row.get('confirmedByUser', False)) and not allow_reassign_confirmed:
+        if row.get('personId') and _face_assignment_is_sticky(row) and not allow_reassign_confirmed:
             skipped_confirmed += 1
             continue
         embeddings.append(emb)
@@ -4001,6 +4066,11 @@ FACE_SUMMARY_COLUMNS = [
 ]
 
 
+def _is_not_found_error(exc: Exception) -> bool:
+    message = str(exc)
+    return '404' in message or 'ResourceNotFound' in message or 'does not exist' in message.lower()
+
+
 def _load_user_face_summary_by_id(user_id: str) -> Dict[str, Dict]:
     if face_table_client is None:
         return {}
@@ -4197,6 +4267,222 @@ def _add_declined_suggestion(user_id: str, person_id: str, other_person_id: str)
         return True
     except Exception:
         return False
+
+
+def _person_declined_face_ids(person: Dict) -> set:
+    try:
+        declined = json.loads(person.get('declinedFaceSuggestions', '[]') or '[]')
+    except Exception:
+        declined = []
+    return {str(fid) for fid in declined} if isinstance(declined, list) else set()
+
+
+def _add_declined_face_suggestions(user_id: str, person_id: str, face_ids: List[str]) -> int:
+    """Record that ``face_ids`` should no longer be suggested for ``person_id``
+    so a declined per-face suggestion stays hidden across future propagations."""
+    if person_table_client is None or not person_id:
+        return 0
+    try:
+        person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+    except Exception:
+        return 0
+    declined = _person_declined_face_ids(person)
+    before = len(declined)
+    for face_id in face_ids or []:
+        value = str(face_id or '').strip()
+        if value:
+            declined.add(value)
+    if len(declined) == before:
+        return 0
+    person['declinedFaceSuggestions'] = json.dumps(sorted(declined))
+    try:
+        person_table_client.upsert_entity(person)
+    except Exception:
+        return 0
+    return len(declined) - before
+
+
+def _propagate_person_identity(
+    user_id: str,
+    person_id: str,
+    *,
+    apply: bool = True,
+    collect_suggestions: bool = True,
+    auto_threshold: float = PEOPLE_PROPAGATE_AUTO_THRESHOLD,
+    review_threshold: float = PEOPLE_PROPAGATE_REVIEW_THRESHOLD,
+    margin: float = PEOPLE_PROPAGATE_MARGIN,
+    max_suggestions: int = PEOPLE_PROPAGATE_MAX_SUGGESTIONS,
+) -> Dict:
+    """Use a named person's learned representative embedding to reclaim that
+    person's faces from *unnamed* clusters (and truly unclustered faces).
+
+    High-confidence matches (>= ``auto_threshold`` with a margin over the best
+    rival named person) are moved in automatically when ``apply`` is set;
+    borderline matches (>= ``review_threshold``) are returned as a per-face
+    review queue. Faces confirmed to, or owned by, another *named* person are
+    never touched."""
+    empty = {'autoAssigned': [], 'autoAssignedCount': 0, 'suggestions': [], 'candidateFaces': 0}
+    if face_table_client is None or person_table_client is None:
+        return {**empty, 'error': 'People features not configured'}
+    try:
+        import numpy as np
+    except Exception:
+        return {**empty, 'error': 'clustering unavailable'}
+
+    try:
+        target = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+    except Exception:
+        return {**empty, 'error': 'person not found'}
+
+    target_norm = _normalized_embedding(_parse_embedding(target.get('repEmbedding', '[]')), np)
+    if target_norm is None:
+        return {**empty, 'skipped': 'no representative embedding'}
+    target_dim = len(target_norm)
+
+    try:
+        target_face_ids = json.loads(target.get('faceIds', '[]') or '[]')
+    except Exception:
+        target_face_ids = []
+    if len(_active_face_ids_for_person(user_id, person_id, target_face_ids)) < PEOPLE_PROPAGATE_MIN_FACES:
+        return {**empty, 'skipped': 'not enough anchor faces'}
+
+    declined = _person_declined_face_ids(target)
+
+    # Other named people: protect their faces and reject candidates that are a
+    # better match for a different known person.
+    try:
+        person_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        person_rows = []
+    named_person_ids = set()
+    other_named_reps = []
+    for row in person_rows:
+        pid = str(row.get('RowKey') or '')
+        if not pid or _is_unnamed_name(str(row.get('name') or '')):
+            continue
+        named_person_ids.add(pid)
+        if pid == person_id:
+            continue
+        other_norm = _normalized_embedding(_parse_embedding(row.get('repEmbedding', '[]')), np)
+        if other_norm is not None and len(other_norm) == target_dim:
+            other_named_reps.append(other_norm)
+    other_matrix = np.vstack(other_named_reps) if other_named_reps else None
+
+    try:
+        face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        face_rows = []
+
+    candidate_ids: List[str] = []
+    candidate_rows: List[Dict] = []
+    candidate_embeddings: List[List[float]] = []
+    for row in face_rows:
+        face_id = str(row.get('RowKey') or '')
+        if not face_id or face_id in declined:
+            continue
+        owner_id = str(row.get('personId') or '')
+        if owner_id == person_id:
+            continue
+        # Only pull from unclustered faces or *unnamed* clusters; never steal a
+        # face that already belongs to (or was confirmed for) another named person.
+        if owner_id and owner_id in named_person_ids:
+            continue
+        if _face_is_confirmed(row):
+            continue
+        if not _face_is_clusterable(row):
+            continue
+        if not _face_embedding_allowed_for_clustering(row):
+            continue
+        emb = _face_embedding_from_entity(row)
+        if not emb or len(emb) != target_dim:
+            continue
+        candidate_ids.append(face_id)
+        candidate_rows.append(row)
+        candidate_embeddings.append(emb)
+
+    if not candidate_ids:
+        return {**empty, 'candidateFaces': 0}
+
+    X = np.asarray(candidate_embeddings, dtype=_embedding_precision_dtype(np))
+    Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+    target_sim = Xn @ target_norm
+    if other_matrix is not None:
+        other_best = np.max(Xn @ other_matrix.T, axis=1)
+    else:
+        other_best = np.full(target_sim.shape, -1.0)
+
+    auto_face_ids: List[str] = []
+    review_candidates: List[Tuple[str, Dict, float]] = []
+    for idx, face_id in enumerate(candidate_ids):
+        sim = float(target_sim[idx])
+        if sim < review_threshold:
+            continue
+        rival = float(other_best[idx])
+        # A face closer to a different named person belongs to them.
+        if rival >= sim:
+            continue
+        if sim >= auto_threshold and (sim - rival) >= margin:
+            auto_face_ids.append(face_id)
+        elif collect_suggestions:
+            review_candidates.append((face_id, candidate_rows[idx], sim))
+
+    result = {
+        'autoAssigned': [],
+        'autoAssignedCount': len(auto_face_ids),
+        'suggestions': [],
+        'candidateFaces': len(candidate_ids),
+    }
+
+    if apply and auto_face_ids:
+        affected_files = set()
+        applied: List[str] = []
+        for face_id in auto_face_ids:
+            try:
+                face_ent = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+            except Exception:
+                continue
+            # Re-check against the live row: the bulk snapshot may be stale, and we
+            # must never override a face confirmed/rejected in the meantime.
+            if _face_is_confirmed(face_ent) or _face_is_rejected(face_ent):
+                continue
+            old_owner = str(face_ent.get('personId') or '')
+            if old_owner and old_owner != person_id:
+                _remove_face_from_person(user_id, old_owner, face_id)
+            _remove_face_from_other_people(user_id, face_id, person_id)
+            face_ent['personId'] = person_id
+            face_ent['assignedByPropagation'] = True
+            try:
+                face_table_client.upsert_entity(face_ent)
+            except Exception:
+                continue
+            filename = str(face_ent.get('filename') or '')
+            if filename:
+                affected_files.add(filename)
+            applied.append(face_id)
+        if applied:
+            # Batch the target-person membership update so its rep embedding is
+            # recomputed once, not once per newly attached face.
+            try:
+                target_entity = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+                existing_ids = json.loads(target_entity.get('faceIds', '[]') or '[]')
+            except Exception:
+                existing_ids = []
+            merged_ids = _dedupe_face_ids_preserving_order([*existing_ids, *applied])
+            _update_person_entity(user_id, person_id, {'faceIds': json.dumps(merged_ids)})
+            _update_person_rep_embedding(user_id, person_id)
+            _rebuild_metadata_faces_for_filenames(user_id, affected_files)
+        result['autoAssigned'] = applied
+        result['autoAssignedCount'] = len(applied)
+
+    if collect_suggestions and review_candidates:
+        review_candidates.sort(key=lambda item: item[2], reverse=True)
+        for face_id, face_row, sim in review_candidates[:max_suggestions]:
+            summary = _face_summary_for_person_list(face_id, face_row)
+            summary['similarity'] = round(sim, 4)
+            summary['currentPersonId'] = str(face_row.get('personId') or '')
+            result['suggestions'].append(summary)
+
+    return result
 
 
 def _albums_feature_available() -> bool:
@@ -5432,32 +5718,63 @@ def list_persons():
         rows = sorted(rows, key=lambda r: str(r.get('RowKey', '')))
         for row in rows:
             try:
+                person_id = str(row.get('RowKey') or '')
+                if not person_id:
+                    continue
+                try:
+                    face_ids = json.loads(row.get('faceIds', '[]') or '[]')
+                except Exception:
+                    face_ids = []
+                active_face_ids = []
+                rep_face = None
+                rep_face_score = None
+                # Track whether any face's status could not be determined (a
+                # transient lookup error, as opposed to a face that is definitely
+                # rejected/reassigned/deleted). We only auto-remove a cluster when
+                # every face was positively determined inactive, so a storage blip
+                # can never delete a still-valid person.
+                indeterminate = False
+                for rep_face_id in face_ids:
+                    face = face_by_id.get(str(rep_face_id))
+                    if face is None:
+                        # Not in the bulk summary: look it up so we can tell a
+                        # deleted face (definitively inactive) apart from a
+                        # transient error (status unknown -> keep the person).
+                        if face_table_client is None:
+                            indeterminate = True
+                            continue
+                        try:
+                            face = face_table_client.get_entity(partition_key=user_id, row_key=rep_face_id)
+                        except Exception as exc:
+                            if not _is_not_found_error(exc):
+                                indeterminate = True
+                            continue
+                    if _face_is_rejected(face) or not _face_is_owned_by_person(face, person_id):
+                        continue
+                    active_face_ids.append(rep_face_id)
+                    score = _face_preview_priority(face)
+                    if rep_face is None or rep_face_score is None or score > rep_face_score:
+                        rep_face = _face_summary_for_person_list(rep_face_id, face)
+                        rep_face_score = score
+
+                # Auto-remove empty clusters: a person that owns no non-rejected
+                # face anymore is deleted so it stops cluttering the People page.
+                if not active_face_ids and not indeterminate:
+                    try:
+                        person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+                        app.logger.info('Removed empty person cluster %s/%s', user_id, person_id)
+                    except Exception:
+                        pass
+                    continue
+
                 name = str(row.get('name', '') or '').strip()
                 if not name:
                     name = f'Unnamed {unnamed_counter}'
                     unnamed_counter += 1
-                if q and q not in str(name).lower():
+                if q and q not in name.lower():
                     continue
-                face_ids = json.loads(row.get('faceIds', '[]'))
-                active_face_ids = []
-                rep_face = None
-                rep_face_score = None
-                for rep_face_id in face_ids:
-                    try:
-                        face = face_by_id.get(str(rep_face_id))
-                        if face is None:
-                            face = face_table_client.get_entity(partition_key=user_id, row_key=rep_face_id)
-                        if _face_is_rejected(face) or not _face_is_owned_by_person(face, row['RowKey']):
-                            continue
-                        active_face_ids.append(rep_face_id)
-                        score = _face_preview_priority(face)
-                        if rep_face is None or rep_face_score is None or score > rep_face_score:
-                            rep_face = _face_summary_for_person_list(rep_face_id, face)
-                            rep_face_score = score
-                    except Exception:
-                        continue
                 persons.append({
-                    'personId': row['RowKey'],
+                    'personId': person_id,
                     'name': name,
                     'faceIds': active_face_ids,
                     'faceCount': len(active_face_ids),
@@ -5620,7 +5937,18 @@ def label_person(person_id: str):
             continue
     _update_person_rep_embedding(user_id, person_id)
     _rebuild_metadata_faces_for_filenames(user_id, affected_files)
-    return jsonify({'success': True, 'personId': person_id, 'name': name})
+
+    # Naming a cluster is a strong identity signal: use its learned rep to pull
+    # this person's faces out of unnamed clusters automatically. Best-effort so a
+    # propagation hiccup never fails the label action itself.
+    auto_assigned = 0
+    if name.strip() and not _is_unnamed_name(name):
+        try:
+            propagation = _propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
+            auto_assigned = int(propagation.get('autoAssignedCount') or 0)
+        except Exception:
+            app.logger.exception('Identity propagation after label failed for %s', person_id)
+    return jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': auto_assigned})
 
 
 @app.route('/api/faces/crop/<face_id>', methods=['GET'])
@@ -5759,6 +6087,105 @@ def confirm_face(person_id: str):
         _rebuild_metadata_faces_for_filename(user_id, filename)
     _update_person_rep_embedding(user_id, person_id)
     return jsonify({'success': True, 'personId': person_id, 'faceId': face_id})
+
+
+@app.route('/api/persons/<person_id>/find-faces', methods=['POST'])
+def find_person_faces(person_id: str):
+    """Auto-assign high-confidence matches to this named person and return the
+    borderline matches as a per-face review queue."""
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    if not _people_features_available():
+        return jsonify({'error': 'People features not configured'}), 503
+    try:
+        person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+    except Exception:
+        return jsonify({'error': 'person not found'}), 404
+    try:
+        result = _propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=True)
+    except Exception as exc:
+        app.logger.exception('find_person_faces failed for %s', person_id)
+        return jsonify({'error': 'Find faces failed', 'detail': str(exc)}), 500
+    return jsonify({
+        'success': True,
+        'personId': person_id,
+        'autoAssignedFaces': int(result.get('autoAssignedCount') or 0),
+        'autoAssigned': result.get('autoAssigned') or [],
+        'suggestions': result.get('suggestions') or [],
+        'candidateFaces': int(result.get('candidateFaces') or 0),
+        'skipped': result.get('skipped'),
+    })
+
+
+@app.route('/api/persons/<person_id>/suggested-faces/accept', methods=['POST'])
+def accept_suggested_faces(person_id: str):
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    if not _people_features_available():
+        return jsonify({'error': 'People features not configured'}), 503
+    data = request.get_json(silent=True) or {}
+    face_ids = data.get('faceIds', [])
+    if not isinstance(face_ids, list):
+        return jsonify({'error': 'faceIds must be a list'}), 400
+    try:
+        person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+    except Exception:
+        return jsonify({'error': 'person not found'}), 404
+
+    accepted = []
+    affected_files = set()
+    for raw_face_id in face_ids:
+        face_id = str(raw_face_id or '').strip()
+        if not face_id:
+            continue
+        try:
+            face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            continue
+        old_person_id = str(face.get('personId') or '')
+        if old_person_id and old_person_id != person_id:
+            _remove_face_from_person(user_id, old_person_id, face_id)
+        _remove_face_from_other_people(user_id, face_id, person_id)
+        _add_face_to_person(user_id, person_id, face_id)
+        face['personId'] = person_id
+        face['confirmedByUser'] = True
+        face['reviewStatus'] = 'confirmed'
+        face['rejected'] = False
+        face.pop('assignedByPropagation', None)
+        face.pop('suspiciousReason', None)
+        face.pop('rejectedReason', None)
+        face.pop('rejectedAt', None)
+        face['confidence'] = max(float(face.get('confidence', 0.0) or 0.0), 1.0)
+        try:
+            face_table_client.upsert_entity(face)
+        except Exception:
+            continue
+        filename = str(face.get('filename') or '')
+        if filename:
+            affected_files.add(filename)
+        accepted.append(face_id)
+
+    if accepted:
+        _update_person_rep_embedding(user_id, person_id)
+        _rebuild_metadata_faces_for_filenames(user_id, affected_files)
+    return jsonify({'success': True, 'personId': person_id, 'acceptedFaces': len(accepted), 'accepted': accepted})
+
+
+@app.route('/api/persons/<person_id>/suggested-faces/decline', methods=['POST'])
+def decline_suggested_faces(person_id: str):
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    if not _people_features_available():
+        return jsonify({'error': 'People features not configured'}), 503
+    data = request.get_json(silent=True) or {}
+    face_ids = data.get('faceIds', [])
+    if not isinstance(face_ids, list):
+        return jsonify({'error': 'faceIds must be a list'}), 400
+    declined = _add_declined_face_suggestions(user_id, person_id, [str(fid) for fid in face_ids])
+    return jsonify({'success': True, 'personId': person_id, 'declinedFaces': declined})
 
 
 def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bool = True) -> Dict:
@@ -5960,7 +6387,22 @@ def merge_persons(person_id: str):
     except Exception:
         pass
 
-    return jsonify({'success': True, 'personId': person_id, 'mergeId': merge_id})
+    # If the merged-into person is named, reuse its strengthened rep to reclaim
+    # matching faces still sitting in unnamed clusters. Best-effort.
+    auto_assigned = 0
+    try:
+        final_person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+        final_name = str(final_person.get('name') or '').strip()
+    except Exception:
+        final_name = ''
+    if final_name and not _is_unnamed_name(final_name):
+        try:
+            propagation = _propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
+            auto_assigned = int(propagation.get('autoAssignedCount') or 0)
+        except Exception:
+            app.logger.exception('Identity propagation after merge failed for %s', person_id)
+
+    return jsonify({'success': True, 'personId': person_id, 'mergeId': merge_id, 'autoAssignedFaces': auto_assigned})
 
 
 @app.route('/api/persons/merge/<merge_id>/undo', methods=['POST'])
@@ -6135,6 +6577,89 @@ def _mark_face_not_a_face(user_id: str, person_id: str, face_id: str) -> Dict:
     }
 
 
+def _delete_faces_bulk(user_id: str, face_ids: List[str]) -> Dict:
+    """Reject a batch of faces in one pass.
+
+    Mirrors _mark_face_not_a_face for each face but batches the per-person
+    faceIds update, representative-embedding refresh, empty-person cleanup and
+    metadata rebuild so a bulk delete costs one rebuild pass instead of one per
+    face.
+    """
+    if face_table_client is None or person_table_client is None:
+        return {'deleted': [], 'errors': [], 'deletedPersonIds': [], 'status': 503}
+
+    deleted: List[str] = []
+    errors: List[Dict] = []
+    affected_filenames = set()
+    # person_id -> set(faceId) removed from that person in this batch
+    person_face_removals: Dict[str, set] = {}
+    now = datetime.now(timezone.utc).isoformat()
+
+    seen = set()
+    for raw_face_id in face_ids:
+        face_id = str(raw_face_id or '').strip()
+        if not face_id or face_id in seen:
+            continue
+        seen.add(face_id)
+        try:
+            face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            errors.append({'faceId': face_id, 'error': 'face not found'})
+            continue
+        person_id = str(face.get('personId') or '')
+        filename = str(face.get('filename') or '')
+        face['reviewStatus'] = 'rejected'
+        face['rejected'] = True
+        face['rejectedReason'] = 'not_a_face'
+        face['rejectedAt'] = now
+        face.pop('personId', None)
+        face.pop('confirmedByUser', None)
+        try:
+            face_table_client.upsert_entity(face)
+        except Exception as exc:
+            errors.append({'faceId': face_id, 'error': str(exc)})
+            continue
+        deleted.append(face_id)
+        if filename:
+            affected_filenames.add(filename)
+        if person_id:
+            person_face_removals.setdefault(person_id, set()).add(face_id)
+
+    deleted_person_ids: List[str] = []
+    for person_id, removed in person_face_removals.items():
+        try:
+            person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+        except Exception:
+            continue
+        try:
+            existing = json.loads(person.get('faceIds', '[]') or '[]')
+        except Exception:
+            existing = []
+        next_face_ids = [fid for fid in existing if fid not in removed]
+        if next_face_ids:
+            person['faceIds'] = json.dumps(next_face_ids)
+            try:
+                person_table_client.upsert_entity(person)
+                _update_person_rep_embedding(user_id, person_id)
+            except Exception:
+                pass
+        else:
+            try:
+                person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+                deleted_person_ids.append(person_id)
+            except Exception:
+                pass
+
+    if affected_filenames:
+        _rebuild_metadata_faces_for_filenames(user_id, affected_filenames)
+
+    return {
+        'deleted': deleted,
+        'errors': errors,
+        'deletedPersonIds': deleted_person_ids,
+    }
+
+
 def _split_face_into_new_person(user_id: str, person_id: str, face_id: str) -> Dict:
     if person_table_client is None or face_table_client is None:
         return {'success': False, 'error': 'People features not configured', 'status': 503}
@@ -6240,6 +6765,80 @@ def separate_face(person_id: str):
     result = _split_face_into_new_person(user_id, person_id, str(face_id))
     status = int(result.pop('status', 200))
     return jsonify(result), status
+
+
+@app.route('/api/faces', methods=['GET'])
+def list_faces():
+    """Flat list of the user's active faces across every person.
+
+    Powers the Faces grid, which shows individual face crops (rather than the
+    per-person groupings in the Clusters view) so many faces fit in one page.
+    """
+    try:
+        user_id, error = _require_user_id()
+        if error:
+            return error
+        if not _people_features_available():
+            return jsonify({'error': 'People features not configured'}), 503
+        try:
+            person_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        except Exception:
+            person_rows = []
+        person_rows = sorted(person_rows, key=lambda r: str(r.get('RowKey', '')))
+
+        face_by_id = _load_user_face_summary_by_id(user_id)
+        faces = []
+        seen = set()
+        unnamed_counter = 1
+        for person in person_rows:
+            person_id = str(person.get('RowKey') or '')
+            if not person_id:
+                continue
+            name = str(person.get('name', '') or '').strip()
+            if not name:
+                name = f'Unnamed {unnamed_counter}'
+                unnamed_counter += 1
+            try:
+                face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+            except Exception:
+                face_ids = []
+            for face_id in face_ids:
+                fid = str(face_id or '')
+                if not fid or fid in seen:
+                    continue
+                try:
+                    face = face_by_id.get(fid)
+                    if face is None:
+                        face = face_table_client.get_entity(partition_key=user_id, row_key=fid)
+                    if _face_is_rejected(face) or not _face_is_owned_by_person(face, person_id):
+                        continue
+                except Exception:
+                    continue
+                seen.add(fid)
+                summary = _face_summary_for_person_list(fid, face)
+                summary['personId'] = person_id
+                summary['personName'] = name
+                faces.append(summary)
+        return jsonify({'faces': faces})
+    except Exception as exc:
+        app.logger.exception('List faces endpoint failed')
+        return jsonify({'error': 'List faces failed', 'detail': str(exc)}), 500
+
+
+@app.route('/api/faces/delete', methods=['POST'])
+def delete_faces():
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    if not _people_features_available():
+        return jsonify({'error': 'People features not configured'}), 503
+    data = request.get_json(silent=True) or {}
+    face_ids = data.get('faceIds', [])
+    if not isinstance(face_ids, list):
+        return jsonify({'error': 'faceIds must be a list'}), 400
+    result = _delete_faces_bulk(user_id, [str(fid or '') for fid in face_ids])
+    status = int(result.pop('status', 200))
+    return jsonify({'success': len(result.get('errors') or []) == 0, **result}), status
 
 
 @app.route('/upload/init', methods=['POST'])

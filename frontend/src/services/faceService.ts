@@ -12,6 +12,39 @@ type SuggestionListResponse = {
     suggestions?: unknown[];
 };
 
+type SuggestedFace = {
+    faceId: string;
+    filename?: string;
+    bbox?: Record<string, number>;
+    imageWidth?: number;
+    imageHeight?: number;
+    confidence?: number;
+    reviewStatus?: string;
+    similarity?: number;
+    currentPersonId?: string;
+};
+
+type FindFacesResponse = {
+    success?: boolean;
+    personId?: string;
+    autoAssignedFaces?: number;
+    autoAssigned?: string[];
+    suggestions?: SuggestedFace[];
+    candidateFaces?: number;
+    skipped?: string;
+};
+
+type FaceListResponse = {
+    faces?: unknown[];
+};
+
+type BatchDeleteFacesResponse = {
+    deleted?: unknown[];
+    errors?: unknown[];
+    deletedPersonIds?: unknown[];
+    success?: boolean;
+};
+
 type BatchDeleteResponse = {
     deletedPersonIds?: unknown[];
     errors?: unknown[];
@@ -92,6 +125,32 @@ const deletePersons = async (personIds: string[]) => {
     };
 };
 
+const listFaces = async () => {
+    return await get<FaceListResponse>('/api/faces');
+};
+
+const deleteFaces = async (faceIds: string[]) => {
+    const result = await post<BatchDeleteFacesResponse>('/api/faces/delete', { faceIds });
+    return {
+        deleted: Array.isArray(result.deleted) ? result.deleted.filter((id): id is string => typeof id === 'string') : [],
+        deletedPersonIds: Array.isArray(result.deletedPersonIds) ? result.deletedPersonIds.filter((id): id is string => typeof id === 'string') : [],
+        errors: Array.isArray(result.errors) ? result.errors : [],
+        success: result.success !== false,
+    };
+};
+
+const findPersonFaces = async (personId: string) => {
+    return await post<FindFacesResponse>(`/api/persons/${personId}/find-faces`, {});
+};
+
+const acceptSuggestedFaces = async (personId: string, faceIds: string[]) => {
+    return await post(`/api/persons/${personId}/suggested-faces/accept`, { faceIds });
+};
+
+const declineSuggestedFaces = async (personId: string, faceIds: string[]) => {
+    return await post(`/api/persons/${personId}/suggested-faces/decline`, { faceIds });
+};
+
 const listSuggestions = async () => {
     return await get<SuggestionListResponse>('/api/persons/suggestions');
 };
@@ -113,6 +172,13 @@ export default {
     markNotFace,
     deletePerson,
     deletePersons,
+    listFaces,
+    deleteFaces,
+    findPersonFaces,
+    acceptSuggestedFaces,
+    declineSuggestedFaces,
     listSuggestions,
     declineSuggestion,
 };
+
+export type { SuggestedFace, FindFacesResponse };

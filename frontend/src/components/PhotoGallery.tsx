@@ -3664,6 +3664,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const loadMoreRef = useRef<HTMLDivElement | null>(null);
     const photoListRequestSeqRef = useRef<number>(0);
     const hasBootstrappedCaptureRef = useRef<boolean>(false);
+    const didInitialRevalidateRef = useRef<boolean>(false);
     const PAGE_SIZE = 24;
     const getUserFacingFetchError = (err: unknown): string => {
         if (typeof err === 'string') {
@@ -4024,6 +4025,16 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     }, [hasMore, loadingMore, loading, error, fetchPhotos, sortBy, offset, searchQuery]);
 
     useEffect(() => {
+        if (!didInitialRevalidateRef.current) {
+            didInitialRevalidateRef.current = true;
+            // Always revalidate on mount, even when a cache is showing. Otherwise a
+            // returning user keeps seeing the cached photo order (persisted from a
+            // previous load — potentially before an ordering change on the server)
+            // and never sees the current newest-first order until the cache
+            // expires. The cached grid stays visible while this refetches.
+            fetchPhotos(sortBy, 0, false, searchQuery);
+            return;
+        }
         if (photos.length === 0) {
             fetchPhotos(sortBy, 0, false, searchQuery);
         }
@@ -4326,7 +4337,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 <p className="status">Downloading {downloadProgress.completed}/{downloadProgress.total}…</p>
             )}
 
-            {loading && (
+            {loading && filteredPhotos.length === 0 && (
                 <Loading
                     label={warmingUp
                         ? 'Waking up the server… this can take up to a minute after inactivity.'

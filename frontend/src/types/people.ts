@@ -16,6 +16,11 @@ export interface PersonFace {
     confidence?: number;
 }
 
+export interface FlatFace extends PersonFace {
+    personId?: string;
+    personName?: string;
+}
+
 export interface PersonSummary {
     personId: string;
     name?: string;
