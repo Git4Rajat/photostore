@@ -242,10 +242,16 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // numpy/scipy/scikit-learn/Pillow + the Azure SDKs (~250-350 MB
             // each) and primes its own vector-index cache. At 4 workers that
             // baseline alone crowds the 1 GiB limit, so a few concurrent
-            // image/zip requests tipped the replica into an OOM kill. Two
-            // workers keeps CPU-parallelism for image work while leaving real
-            // headroom; concurrency inside a worker comes from GUNICORN_THREADS.
-            { name: 'GUNICORN_WORKERS', value: '2' }
+            // image/zip requests can still tip the replica into an OOM kill.
+            // Keep process fan-out low on 1 GiB replicas; each worker has a
+            // substantial baseline RSS once scientific/image stacks are loaded.
+            { name: 'GUNICORN_WORKERS', value: '1' }
+            // Thread fan-out controls how many heavy media requests can run at
+            // once inside a worker; lower values reduce worst-case memory spikes.
+            { name: 'GUNICORN_THREADS', value: '2' }
+            // Prime vector indexes lazily on demand; eager startup priming can
+            // inflate idle RSS and duplicate index memory across workers.
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
             { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
             { name: 'SESSION_SECRET', secretRef: 'session-secret' }
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
@@ -259,12 +265,12 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           {
             // Default is 10 concurrent requests per replica, which fans out to
             // extra replicas on every burst of small API calls. Each replica
-            // runs 2 gunicorn workers x 8 threads, so 50 concurrent requests
-            // is still comfortably inside one replica's capacity.
+            // runs 1 worker x 2 threads on a 1 GiB container; keep per-replica
+            // concurrency conservative to avoid memory spikes under media load.
             name: 'http-scaler'
             http: {
               metadata: {
-                concurrentRequests: '50'
+                concurrentRequests: '15'
               }
             }
           }

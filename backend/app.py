@@ -269,7 +269,7 @@ BLOB_COVER_CONTAINER = os.getenv('BLOB_COVER_CONTAINER', 'covers').strip()
 # minting is impossible (no AAD credential, e.g. Azurite/local dev).
 MEDIA_URL_MODE = os.getenv('MEDIA_URL_MODE', 'sas').strip().lower()
 BLOB_VECTOR_INDEX_CONTAINER = os.getenv('BLOB_VECTOR_INDEX_CONTAINER', 'vector-index').strip()
-VECTOR_INDEX_PRIME_ON_STARTUP = os.getenv('VECTOR_INDEX_PRIME_ON_STARTUP', 'true').lower() in ('1', 'true', 'yes')
+VECTOR_INDEX_PRIME_ON_STARTUP = os.getenv('VECTOR_INDEX_PRIME_ON_STARTUP', 'false').lower() in ('1', 'true', 'yes')
 VECTOR_INDEX_PRIME_MAX_USERS = max(0, int(os.getenv('VECTOR_INDEX_PRIME_MAX_USERS', '200')))
 SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS = os.getenv(
     'SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS',
@@ -5382,10 +5382,13 @@ def proxy_thumbnail(filename: str):
     try:
         props = get_media_properties('thumbnail', safe_name)
         content_type = props.get('content_type') or 'image/jpeg'
-        data = download_media_bytes('thumbnail', safe_name)
-        resp = Response(data, mimetype=content_type)
-        resp.headers['Cache-Control'] = 'private, max-age=3600'
-        return resp
+        return _stream_media_response(
+            'thumbnail',
+            safe_name,
+            content_type=content_type,
+            cache_control='private, max-age=3600',
+            content_length=props.get('size'),
+        )
     except Exception as e:
         if '404' in str(e) or 'ResourceNotFound' in str(e) or 'does not exist' in str(e).lower():
             if _filename_requires_backend_preview(safe_name):
@@ -5409,6 +5412,47 @@ def _filename_requires_backend_preview(filename: str) -> bool:
 def _is_missing_media_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return '404' in text or 'resourcenotfound' in text or 'does not exist' in text or 'not found' in text
+
+
+def _media_container_for_kind(kind: str) -> str:
+    if kind == 'thumbnail':
+        return BLOB_THUMBNAIL_CONTAINER
+    if kind == 'cover':
+        return BLOB_COVER_CONTAINER
+    return BLOB_IMAGE_CONTAINER
+
+
+def _stream_media_response(
+    kind: str,
+    blob_name: str,
+    *,
+    content_type: str,
+    cache_control: str,
+    content_length: Optional[int] = None,
+):
+    """Stream blob bytes in chunks to avoid buffering whole files in RAM."""
+    container_name = _media_container_for_kind(kind)
+    if not blob_service_client or not container_name:
+        raise RuntimeError(f'{kind} storage is not configured')
+    blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+    downloader = blob_client.download_blob(max_concurrency=1)
+
+    def _iter_chunks():
+        for chunk in downloader.chunks():
+            if chunk:
+                yield chunk
+
+    resp = Response(
+        stream_with_context(_iter_chunks()),
+        mimetype=(content_type or 'application/octet-stream'),
+    )
+    if content_length is not None:
+        try:
+            resp.headers['Content-Length'] = str(max(0, int(content_length)))
+        except Exception:
+            pass
+    resp.headers['Cache-Control'] = cache_control
+    return resp
 
 
 def _looks_like_jpeg(data: bytes) -> bool:
@@ -5765,10 +5809,13 @@ def proxy_image(filename: str):
                 return jsonify({'error': 'File not found in storage'}), 404
             return jsonify({'error': 'Failed to access image metadata'}), 503
 
-        data = download_media_bytes('image', safe_name)
-        resp = Response(data, mimetype=content_type)
-        resp.headers['Cache-Control'] = 'private, max-age=3600'
-        return resp
+        return _stream_media_response(
+            'image',
+            safe_name,
+            content_type=content_type,
+            cache_control='private, max-age=3600',
+            content_length=props.get('size'),
+        )
     except Exception as e:
         # Check if it's a file not found error
         if '404' in str(e) or 'ResourceNotFound' in str(e) or 'does not exist' in str(e).lower():
@@ -5806,10 +5853,13 @@ def proxy_cover(filename: str):
     try:
         props = get_media_properties('cover', cover_blob)
         content_type = props.get('content_type') or 'image/jpeg'
-        data = download_media_bytes('cover', cover_blob)
-        resp = Response(data, mimetype=content_type)
-        resp.headers['Cache-Control'] = 'private, max-age=3600'
-        return resp
+        return _stream_media_response(
+            'cover',
+            cover_blob,
+            content_type=content_type,
+            cache_control='private, max-age=3600',
+            content_length=props.get('size'),
+        )
     except Exception as e:
         if '404' in str(e) or 'ResourceNotFound' in str(e) or 'does not exist' in str(e).lower():
             return jsonify({'error': 'File not found in storage'}), 404
@@ -9140,10 +9190,13 @@ def public_thumbnail(token: str, filename: str):
     try:
         props = get_media_properties('thumbnail', safe_name)
         content_type = props.get('content_type') or 'image/jpeg'
-        data = download_media_bytes('thumbnail', safe_name)
-        resp = Response(data, mimetype=content_type)
-        resp.headers['Cache-Control'] = 'public, max-age=3600'
-        return resp
+        return _stream_media_response(
+            'thumbnail',
+            safe_name,
+            content_type=content_type,
+            cache_control='public, max-age=3600',
+            content_length=props.get('size'),
+        )
     except Exception as exc:
         print(f"Unexpected error serving public thumbnail for {safe_name}: {str(exc)}", flush=True)
         return jsonify({'error': 'Thumbnail not found'}), 404
@@ -9166,12 +9219,17 @@ def public_image(token: str, filename: str):
         try:
             props = get_media_properties('image', safe_name)
             content_type = props.get('content_type') or 'image/jpeg'
+            content_length = props.get('size')
         except Exception:
             content_type = 'image/jpeg'
-        data = download_media_bytes('image', safe_name)
-        resp = Response(data, mimetype=content_type)
-        resp.headers['Cache-Control'] = 'public, max-age=3600'
-        return resp
+            content_length = None
+        return _stream_media_response(
+            'image',
+            safe_name,
+            content_type=content_type,
+            cache_control='public, max-age=3600',
+            content_length=content_length,
+        )
     except Exception as exc:
         if _is_missing_media_error(exc):
             return jsonify({'error': 'File not found in storage'}), 404

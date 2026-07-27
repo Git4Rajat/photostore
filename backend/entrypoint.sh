@@ -15,7 +15,7 @@ WORKERS="${GUNICORN_WORKERS:-1}"
 # sync worker serves exactly one request at a time — every other call queues
 # behind it, so one slow request (a big metadata scan, a video finalize) made
 # the whole API unresponsive and let the request backlog turn into 503s.
-THREADS="${GUNICORN_THREADS:-8}"
+THREADS="${GUNICORN_THREADS:-2}"
 # Recycle each worker after a bounded number of requests (+/- jitter so the
 # workers don't all recycle in lockstep). Image/RAW/video processing fragments
 # the heap and leaves numpy/Pillow allocations that the allocator is slow to

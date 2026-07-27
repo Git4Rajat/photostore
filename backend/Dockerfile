@@ -38,6 +38,7 @@ EXPOSE 5000
 ENV FLASK_APP=app.py
 ENV FLASK_RUN_HOST=0.0.0.0
 ENV GUNICORN_WORKERS=1
+ENV GUNICORN_THREADS=2
 
 # Start the role-aware entrypoint.
 CMD ["/app/entrypoint.sh"]
