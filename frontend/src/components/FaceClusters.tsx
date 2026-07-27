@@ -16,6 +16,7 @@ const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
 const CLUSTER_PER_PAGE = 15;
 const FACES_PER_PAGE = 50;
 const SUGGESTIONS_PER_PAGE = 5;
+const MIN_SUGGESTION_SIMILARITY = 0.98;
 type PeopleView = 'cluster' | 'face';
 const isSuspiciousFace = (face?: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
 const getFaceFallbackPath = (filename?: string | null) => filename ? `/api/photos/access/thumbnail/${encodeURIComponent(filename)}` : '';
@@ -331,7 +332,8 @@ const FaceClusters: React.FC = () => {
                 faceService.listSuggestions(),
             ]);
             setMerges((m.merges || []) as MergeHistoryItem[]);
-            setSuggestions((s.suggestions || []) as SuggestionItem[]);
+            const rawSuggestions = (s.suggestions || []) as SuggestionItem[];
+            setSuggestions(rawSuggestions.filter((item) => Number(item?.similarity || 0) >= MIN_SUGGESTION_SIMILARITY));
         } catch (e: unknown) {
             setStatus(String(e));
         }

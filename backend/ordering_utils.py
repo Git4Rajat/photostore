@@ -68,10 +68,24 @@ def parse_capture_date(exif_data: Dict[str, str]) -> Optional[datetime]:
     )
     if not raw:
         return None
-    # exiftool video dates may carry a timezone offset (e.g. 2024:01:02 10:00:00+05:30).
-    for fmt in ('%Y:%m:%d %H:%M:%S', '%Y:%m:%d %H:%M:%S%z'):
+    raw = str(raw).strip()
+    if not raw:
+        return None
+
+    # exiftool variants can include timezone offsets and/or fractional seconds,
+    # e.g. "2024:01:02 10:00:00+05:30" or
+    # "2024:01:02 10:00:00.123456+00:00".
+    if raw.endswith('Z'):
+        raw = f"{raw[:-1]}+00:00"
+
+    for fmt in (
+        '%Y:%m:%d %H:%M:%S',
+        '%Y:%m:%d %H:%M:%S%z',
+        '%Y:%m:%d %H:%M:%S.%f',
+        '%Y:%m:%d %H:%M:%S.%f%z',
+    ):
         try:
-            parsed = datetime.strptime(raw[:26], fmt)
+            parsed = datetime.strptime(raw, fmt)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             return parsed

@@ -232,6 +232,10 @@ const PersonDetail: React.FC = () => {
         setFindingFaces(true);
         try {
             const res = await faceService.findPersonFaces(personId);
+            if (res?.propagateJobId) {
+                showToast('Finding more faces in the background. Refresh shortly to see updates.');
+                return;
+            }
             const autoAssigned = Number(res?.autoAssignedFaces || 0);
             const review = ((res?.suggestions || []) as unknown as ReviewFace[]);
             setSuggestedFaces(review);

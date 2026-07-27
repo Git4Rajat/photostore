@@ -36,6 +36,9 @@ type SuggestedFace = {
 
 type FindFacesResponse = {
     success?: boolean;
+    queued?: boolean;
+    status?: string;
+    propagateJobId?: string | null;
     personId?: string;
     autoAssignedFaces?: number;
     autoAssigned?: string[];

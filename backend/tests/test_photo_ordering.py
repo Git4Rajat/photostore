@@ -122,3 +122,24 @@ def test_repeated_calls_are_stable():
     first = _order('date')
     for _ in range(5):
         assert _order('date') == first
+
+
+def test_capture_parser_supports_fractional_and_timezone_formats():
+    # Regression: EXIF timestamps with fractional seconds and timezone offsets
+    # used to miss parsing in ordering_utils and collapse rows into fallback
+    # filename order (appearing oldest-first).
+    dataset = {
+        'older.jpg': {'exifData': _exif('2021:01:01 10:00:00.123+00:00')},
+        'newer.jpg': {'exifData': _exif('2024:01:01 10:00:00.456+00:00')},
+    }
+    ordered = ordering_utils.order_photo_entries(list(dataset.keys()), dataset, 'capture')
+    assert ordered == ['newer.jpg', 'older.jpg']
+
+
+def test_capture_parser_supports_fractional_no_timezone_format():
+    dataset = {
+        'older.jpg': {'exifData': _exif('2021:01:01 10:00:00.123')},
+        'newer.jpg': {'exifData': _exif('2024:01:01 10:00:00.456')},
+    }
+    ordered = ordering_utils.order_photo_entries(list(dataset.keys()), dataset, 'capture')
+    assert ordered == ['newer.jpg', 'older.jpg']

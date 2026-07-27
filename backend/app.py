@@ -296,12 +296,17 @@ FACE_PERSON_TAGS = {
 }
 FACE_PERSON_SCORE_THRESHOLD = float(os.getenv('FACE_PERSON_SCORE_THRESHOLD', '0.20'))
 
+# Hard floor for automatic face merges into existing people/clusters.
+MIN_AUTO_FACE_MERGE_SIMILARITY = 0.98
+
 # Keep person matching conservative so clustering does not collapse distinct faces into one cluster.
-PEOPLE_MATCH_THRESHOLD = float(_PEOPLE_CLUSTER_CONFIG['match_threshold'])
+PEOPLE_MATCH_THRESHOLD = max(float(_PEOPLE_CLUSTER_CONFIG['match_threshold']), MIN_AUTO_FACE_MERGE_SIMILARITY)
 PEOPLE_MATCH_MARGIN = float(_PEOPLE_CLUSTER_CONFIG['match_margin'])
-PEOPLE_CLUSTER_ASSIGN_THRESHOLD = float(_PEOPLE_CLUSTER_CONFIG['assign_threshold'])
+PEOPLE_CLUSTER_ASSIGN_THRESHOLD = max(float(_PEOPLE_CLUSTER_CONFIG['assign_threshold']), MIN_AUTO_FACE_MERGE_SIMILARITY)
 PEOPLE_CLUSTER_ASSIGN_MARGIN = float(_PEOPLE_CLUSTER_CONFIG['assign_margin'])
-PEOPLE_SUGGEST_THRESHOLD = float(os.getenv('PEOPLE_SUGGEST_THRESHOLD', '0.78'))
+# Hard floor for merge suggestions shown to users.
+MIN_PEOPLE_SUGGEST_THRESHOLD = 0.98
+PEOPLE_SUGGEST_THRESHOLD = max(float(os.getenv('PEOPLE_SUGGEST_THRESHOLD', '0.98')), MIN_PEOPLE_SUGGEST_THRESHOLD)
 PEOPLE_SUGGEST_LIMIT = int(os.getenv('PEOPLE_SUGGEST_LIMIT', '20'))
 PEOPLE_SUGGEST_PER_PERSON = int(os.getenv('PEOPLE_SUGGEST_PER_PERSON', '2'))
 
@@ -312,7 +317,10 @@ PEOPLE_SUGGEST_PER_PERSON = int(os.getenv('PEOPLE_SUGGEST_PER_PERSON', '2'))
 # because a named person's confirmed rep is a much stronger, user-vetted anchor.
 # ``AUTO`` faces are moved in automatically; faces between ``REVIEW`` and
 # ``AUTO`` are surfaced as a per-face review queue for manual accept/decline.
-PEOPLE_PROPAGATE_AUTO_THRESHOLD = float(os.getenv('PEOPLE_PROPAGATE_AUTO_THRESHOLD', '0.82'))
+PEOPLE_PROPAGATE_AUTO_THRESHOLD = max(
+    float(os.getenv('PEOPLE_PROPAGATE_AUTO_THRESHOLD', '0.82')),
+    MIN_AUTO_FACE_MERGE_SIMILARITY,
+)
 PEOPLE_PROPAGATE_REVIEW_THRESHOLD = float(os.getenv('PEOPLE_PROPAGATE_REVIEW_THRESHOLD', '0.70'))
 # A candidate face must beat its best match to any *other* named person by this
 # margin before it is auto-assigned, so faces ambiguous between two known people
@@ -5998,6 +6006,8 @@ def list_person_suggestions():
             threshold = float(request.args.get('threshold', PEOPLE_SUGGEST_THRESHOLD))
         except ValueError:
             threshold = PEOPLE_SUGGEST_THRESHOLD
+        # Never show suggestions below the configured hard minimum.
+        threshold = max(threshold, MIN_PEOPLE_SUGGEST_THRESHOLD)
         try:
             limit = int(request.args.get('limit', PEOPLE_SUGGEST_LIMIT))
         except ValueError:
@@ -6236,8 +6246,12 @@ def confirm_face(person_id: str):
 
 @app.route('/api/persons/<person_id>/find-faces', methods=['POST'])
 def find_person_faces(person_id: str):
-    """Auto-assign high-confidence matches to this named person and return the
-    borderline matches as a per-face review queue."""
+    """Start (or run) identity propagation for this named person.
+
+    Queue-first: long-running full-table scans run on the background worker when
+    available. If the queue is unavailable (local/dev/no worker), fall back to
+    inline execution so the feature still functions.
+    """
     user_id, error = _require_user_id()
     if error:
         return error
@@ -6247,6 +6261,21 @@ def find_person_faces(person_id: str):
         person_table_client.get_entity(partition_key=user_id, row_key=person_id)
     except Exception:
         return jsonify({'error': 'person not found'}), 404
+
+    queued = _enqueue_propagate_job(user_id, person_id)
+    if queued.get('status') == 'queued':
+        return jsonify({
+            'success': True,
+            'queued': True,
+            'status': 'queued',
+            'personId': person_id,
+            'propagateJobId': queued.get('jobId'),
+            'autoAssignedFaces': 0,
+            'autoAssigned': [],
+            'suggestions': [],
+            'candidateFaces': 0,
+        })
+
     try:
         result = _propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=True)
     except Exception as exc:
@@ -6254,7 +6283,10 @@ def find_person_faces(person_id: str):
         return jsonify({'error': 'Find faces failed', 'detail': str(exc)}), 500
     return jsonify({
         'success': True,
+        'queued': False,
+        'status': 'done',
         'personId': person_id,
+        'propagateJobId': None,
         'autoAssignedFaces': int(result.get('autoAssignedCount') or 0),
         'autoAssigned': result.get('autoAssigned') or [],
         'suggestions': result.get('suggestions') or [],
