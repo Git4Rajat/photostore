@@ -1,7 +1,10 @@
 import { loadFaceApiRuntimeBundle } from './faceApiRuntime';
 
 const FACE_EMBEDDING_DIMENSIONS = 640;
-const FACE_EMBEDDING_VERSION = 'browser-hybrid-arcface-faceapi-v1';
+// v2: fixed ArcFace input preprocessing (feed raw [0,255] pixels; the model
+// normalizes internally). v1 embeddings were double-normalized and are not
+// comparable to v2, so the version string is bumped to fence them off.
+const FACE_EMBEDDING_VERSION = 'browser-hybrid-arcface-faceapi-v2';
 const FACE_EMBEDDING_MODEL_NAME = 'ArcFace + face-api hybrid';
 const FACE_EMBEDDING_MODEL_VERSION = 'arcfaceresnet100-8-512d-v1+face-recognition-128d-v1';
 const FACE_EMBEDDING_RUNTIME = 'onnxruntime-web/wasm+face-api.js';
@@ -204,11 +207,17 @@ const canvasToNchwTensorData = (canvas: HTMLCanvasElement, inputSize: number): F
     const pixels = context.getImageData(0, 0, inputSize, inputSize).data;
     const data = new Float32Array(3 * inputSize * inputSize);
     const planeSize = inputSize * inputSize;
+    // This ArcFace ONNX graph bakes its own preprocessing in as its first two
+    // ops (`_minusscalar0` subtracts 127.5, `_mulscalar0` multiplies by
+    // 1/128), so it expects RAW [0,255] RGB pixels. Do NOT normalize here — a
+    // second (pixel-127.5)/127.5 pass crushes every pixel into a ~0.016-wide
+    // band near -1, wiping out the face and collapsing all embeddings so that
+    // unrelated people score ~0.98 cosine against each other.
     for (let pixelIndex = 0; pixelIndex < inputSize * inputSize; pixelIndex += 1) {
         const rgbaIndex = pixelIndex * 4;
-        data[pixelIndex] = (pixels[rgbaIndex] - 127.5) / 127.5;
-        data[planeSize + pixelIndex] = (pixels[rgbaIndex + 1] - 127.5) / 127.5;
-        data[(planeSize * 2) + pixelIndex] = (pixels[rgbaIndex + 2] - 127.5) / 127.5;
+        data[pixelIndex] = pixels[rgbaIndex];
+        data[planeSize + pixelIndex] = pixels[rgbaIndex + 1];
+        data[(planeSize * 2) + pixelIndex] = pixels[rgbaIndex + 2];
     }
     return data;
 };

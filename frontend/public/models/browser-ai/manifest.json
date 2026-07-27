@@ -8,7 +8,7 @@
   "faceEmbeddingTask": "face-recognition",
   "faceEmbeddingModel": "ArcFace + face-api hybrid",
   "faceEmbeddingModelVersion": "arcfaceresnet100-8-512d-v1+face-recognition-128d-v1",
-  "faceEmbeddingModelTaxonomyVersion": "browser-hybrid-arcface-faceapi-v1",
+  "faceEmbeddingModelTaxonomyVersion": "browser-hybrid-arcface-faceapi-v2",
   "faceEmbeddingDescriptorDimensions": 640,
   "faceEmbeddingModelUrl": "/models/browser-ai/models/arcface/model.onnx",
   "modelVersion": "clip-vit-base-patch32-transformers-js-2.17.2",

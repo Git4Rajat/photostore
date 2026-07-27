@@ -309,6 +309,13 @@ MIN_PEOPLE_SUGGEST_THRESHOLD = 0.98
 PEOPLE_SUGGEST_THRESHOLD = max(float(os.getenv('PEOPLE_SUGGEST_THRESHOLD', '0.98')), MIN_PEOPLE_SUGGEST_THRESHOLD)
 PEOPLE_SUGGEST_LIMIT = int(os.getenv('PEOPLE_SUGGEST_LIMIT', '20'))
 PEOPLE_SUGGEST_PER_PERSON = int(os.getenv('PEOPLE_SUGGEST_PER_PERSON', '2'))
+# Suggestion quality guardrails: only trusted clusters participate in merge
+# suggestions to avoid obvious non-face false positives (e.g. flowers) from
+# polluting representative embeddings.
+PEOPLE_SUGGEST_INCLUDE_UNNAMED = os.getenv('PEOPLE_SUGGEST_INCLUDE_UNNAMED', 'false').lower() in ('1', 'true', 'yes')
+PEOPLE_SUGGEST_MIN_FACES = int(os.getenv('PEOPLE_SUGGEST_MIN_FACES', '2'))
+PEOPLE_SUGGEST_MIN_CONFIRMED_FACES = int(os.getenv('PEOPLE_SUGGEST_MIN_CONFIRMED_FACES', '1'))
+PEOPLE_SUGGEST_MIN_REP_FACE_CONFIDENCE = float(os.getenv('PEOPLE_SUGGEST_MIN_REP_FACE_CONFIDENCE', '0.85'))
 
 # Identity propagation: once a person cluster is named/merged, use its learned
 # representative embedding to pull that person's faces out of *unnamed* clusters.
@@ -342,12 +349,23 @@ FACE_LOW_CONFIDENCE_MAX_AREA_RATIO = float(os.getenv('FACE_LOW_CONFIDENCE_MAX_AR
 FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO = float(os.getenv('FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', '0.42'))
 FACE_CLUSTER_EMBEDDING_VERSION = (
     os.getenv('FACE_CLUSTER_EMBEDDING_VERSION')
-    or 'browser-hybrid-arcface-faceapi-v1'
+    # v2 fixes the browser-side ArcFace double-normalization bug (v1 fed the
+    # model already-normalized pixels on top of its baked-in normalization,
+    # collapsing every embedding so unrelated faces scored ~0.98). v1 stays out
+    # of the allowed set so those corrupt embeddings are ignored for clustering
+    # and matching until the faces are re-embedded under v2.
+    or 'browser-hybrid-arcface-faceapi-v2'
 ).strip()
 FACE_CLUSTER_EMBEDDING_DIMENSIONS = int(os.getenv('FACE_CLUSTER_EMBEDDING_DIMENSIONS', '640'))
 FACE_CLUSTER_LEGACY_EMBEDDING_DIMENSIONS = 512
 FACE_CLUSTER_LEGACY_ARCFACE_VERSION = 'browser-arcface-onnx-model-zoo-v1'
 FACE_CLUSTER_LEGACY_FACE_VERSION = 'browser-face-embedding-v1'
+# When true, a photo whose faces were embedded under an older embedding version
+# is re-queued for browser face processing so its embeddings get recomputed
+# under the current model. This is what makes an embedding-version bump
+# self-healing across an existing library (e.g. the v1 -> v2 fix). Set to false
+# to freeze re-embedding (e.g. to stagger a large reprocessing wave).
+FACE_REEMBED_STALE_VERSION = os.getenv('FACE_REEMBED_STALE_VERSION', 'true').lower() in ('1', 'true', 'yes')
 
 
 def _face_embedding_allowed_versions() -> set:
@@ -4289,6 +4307,12 @@ def _compute_people_suggestions(
     face_by_id = _load_user_face_summary_by_id(user_id)
     people = []
     for row in rows:
+        person_id = str(row.get('RowKey') or '')
+        person_name = str(row.get('name', '') or '')
+        if not person_id:
+            continue
+        if not PEOPLE_SUGGEST_INCLUDE_UNNAMED and _is_unnamed_name(person_name):
+            continue
         try:
             rep = json.loads(row.get('repEmbedding', '[]') or '[]')
         except Exception:
@@ -4300,6 +4324,7 @@ def _compute_people_suggestions(
         except Exception:
             face_ids = []
         active_face_ids = []
+        confirmed_face_count = 0
         rep_face = None
         rep_face_score = None
         for face_id in face_ids:
@@ -4309,17 +4334,29 @@ def _compute_people_suggestions(
                     face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
                 if (
                     face
-                    and _face_is_owned_by_person(face, str(row.get('RowKey') or ''))
+                    and _face_is_owned_by_person(face, person_id)
                     and not _face_is_rejected(face)
                 ):
                     active_face_ids.append(face_id)
+                    if _face_is_confirmed(face):
+                        confirmed_face_count += 1
                     score = _face_preview_priority(face)
                     if rep_face is None or rep_face_score is None or score > rep_face_score:
                         rep_face = _face_summary_for_person_list(str(face_id), face)
                         rep_face_score = score
             except Exception:
                 continue
-        if not active_face_ids:
+        if len(active_face_ids) < PEOPLE_SUGGEST_MIN_FACES:
+            continue
+        if confirmed_face_count < PEOPLE_SUGGEST_MIN_CONFIRMED_FACES:
+            continue
+        if rep_face is None:
+            continue
+        try:
+            rep_confidence = float(rep_face.get('confidence', 0.0) or 0.0)
+        except Exception:
+            rep_confidence = 0.0
+        if rep_confidence < PEOPLE_SUGGEST_MIN_REP_FACE_CONFIDENCE:
             continue
         try:
             declined = json.loads(row.get('declinedSuggestions', '[]') or '[]')
@@ -4327,9 +4364,10 @@ def _compute_people_suggestions(
         except Exception:
             declined = set()
         people.append({
-            'personId': row.get('RowKey'),
-            'name': row.get('name', ''),
+            'personId': person_id,
+            'name': person_name,
             'faceCount': len(active_face_ids),
+            'confirmedFaceCount': confirmed_face_count,
             'repEmbedding': rep,
             'representativeFace': rep_face,
             'declined': declined,
@@ -7682,6 +7720,27 @@ def _raw_ai_vision_no_data_should_retry(entity: Dict) -> bool:
     return False
 
 
+def _browser_processing_face_version_stale(entity: Dict) -> bool:
+    """True when this photo's faces were embedded under an older embedding
+    version than the one currently in force, so they should be recomputed."""
+    if not FACE_REEMBED_STALE_VERSION:
+        return False
+    try:
+        processing_metadata = json.loads(entity.get('processing_metadata') or '{}')
+    except Exception:
+        return False
+    client_face = processing_metadata.get('client_face') if isinstance(processing_metadata, dict) else None
+    if not isinstance(client_face, dict):
+        return False
+    # Only photos that actually stored faces carry a corrupt/stale embedding;
+    # a 'no_data' result (no faces detected) has nothing to re-embed and the
+    # detector output is independent of the embedding model.
+    if not client_face.get('hasData'):
+        return False
+    stored_version = str(client_face.get('modelTaxonomyVersion') or '').strip()
+    return stored_version != FACE_CLUSTER_EMBEDDING_VERSION
+
+
 def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
     filename = str(entity.get('RowKey') or '').strip()
     if not filename:
@@ -7692,6 +7751,7 @@ def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
     statuses = {}
     has_pending_status = False
     lease_expired = _browser_processing_lease_expired(entity)
+    face_version_stale = _browser_processing_face_version_stale(entity)
     for field, payload_key in BROWSER_PROCESSING_STATUS_FIELDS:
         raw_status = entity.get(field)
         status = str(raw_status or '').strip().lower()
@@ -7702,6 +7762,11 @@ def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
             raw_status = 'pending'
             status = 'pending'
         if field == 'ai_vision_status' and status in {'failed', 'no_data', 'skipped', 'timeout'} and _raw_ai_vision_no_data_should_retry(entity):
+            raw_status = 'pending'
+            status = 'pending'
+        # Re-queue face processing when the stored embeddings are on an older
+        # model version so a version bump recomputes them across the library.
+        if field == 'face_status' and face_version_stale and status in BROWSER_PROCESSING_TERMINAL_STATUSES:
             raw_status = 'pending'
             status = 'pending'
         if status:
