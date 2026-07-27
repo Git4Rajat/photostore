@@ -110,11 +110,20 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
                     }
                 }
             }
+            // Prefer the direct-blob SAS thumbnail the listing already provided
+            // (rep.thumbnailUrl) over a per-face access round trip; only hit the
+            // backend when it's absent (RAW/HEIC or non-SAS mode).
+            const inlineThumb = typeof rep?.thumbnailUrl === 'string' && /^https?:\/\//i.test(rep.thumbnailUrl)
+                ? rep.thumbnailUrl
+                : '';
             try {
-                const result = await getUploadJson(`/api/photos/access/thumbnail/${encodeURIComponent(filename)}`);
-                const rawFallback = typeof result?.url === 'string' && result.url
-                    ? result.url
-                    : (proxyFallbackPath || '');
+                let rawFallback = inlineThumb;
+                if (!rawFallback) {
+                    const result = await getUploadJson(`/api/photos/access/thumbnail/${encodeURIComponent(filename)}`);
+                    rawFallback = typeof result?.url === 'string' && result.url
+                        ? result.url
+                        : (proxyFallbackPath || '');
+                }
                 const displayable = rawFallback ? await toDisplayableUrl(rawFallback) : '';
                 if (active) {
                     setFallbackUrl(track(displayable));
@@ -136,7 +145,7 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
             active = false;
             createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
         };
-    }, [filename, proxyFallbackPath, rep?.faceId, shouldLoad]);
+    }, [filename, proxyFallbackPath, rep?.faceId, rep?.thumbnailUrl, shouldLoad]);
 
     const imageUrl = cropUrl || (fallbackPath ? fallbackUrl : proxyFallbackPath);
 

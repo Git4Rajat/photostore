@@ -10,6 +10,9 @@ import type { PersonDetailModel, PersonFace, PersonSummary } from '../types/peop
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
 const isSuspiciousFace = (face: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
+// A direct-blob SAS thumbnail the <img> can load straight from storage (vs a
+// relative backend-proxy path that needs an auth-fetched blob URL).
+const isDirectUrl = (value?: string): value is string => Boolean(value && /^https?:\/\//i.test(value));
 
 // A borderline propagation match surfaced for manual review, carrying the
 // similarity of the face to this person's learned representative embedding.
@@ -141,12 +144,16 @@ const PersonDetail: React.FC = () => {
             return true;
         });
     }, [person?.faces]);
+    // Only proxy-fetch faces WITHOUT a direct-blob thumbnailUrl; the rest load the
+    // SAS URL straight from storage (no per-face round trip through the backend).
     const thumbnailPaths = displayFaces
+        .filter((f) => !isDirectUrl(f.thumbnailUrl))
         .map((f) => f.filename)
         .filter((filename): filename is string => Boolean(filename))
         .map((filename) => `/api/photos/thumbnail/${encodeURIComponent(filename)}`);
     const protectedImageUrls = useProtectedBlobUrls(thumbnailPaths);
     const suggestionThumbnailPaths = useMemo(() => suggestedFaces
+        .filter((f) => !isDirectUrl(f.thumbnailUrl))
         .map((f) => f.filename)
         .filter((filename): filename is string => Boolean(filename))
         .map((filename) => `/api/photos/thumbnail/${encodeURIComponent(filename)}`), [suggestedFaces]);
@@ -442,7 +449,9 @@ const PersonDetail: React.FC = () => {
                             {displayFaces.map((f: PersonFace) => {
                                 const faceId = f.faceId || '';
                                 const path = f.filename ? `/api/photos/thumbnail/${encodeURIComponent(f.filename)}` : '';
-                                const thumbSrc = protectedImageUrls[path] || resolveApiUrl(path);
+                                const thumbSrc = isDirectUrl(f.thumbnailUrl)
+                                    ? f.thumbnailUrl
+                                    : (protectedImageUrls[path] || resolveApiUrl(path));
                                 const suspicious = isSuspiciousFace(f);
                                 const singleFaceCluster = displayFaces.length === 1 && (person?.name || '').toLowerCase().startsWith('unnamed');
                                 return (
@@ -540,7 +549,9 @@ const PersonDetail: React.FC = () => {
                                 {suggestedFaces.map((f) => {
                                     const faceId = f.faceId || '';
                                     const path = f.filename ? `/api/photos/thumbnail/${encodeURIComponent(f.filename)}` : '';
-                                    const thumbSrc = protectedSuggestionUrls[path] || resolveApiUrl(path);
+                                    const thumbSrc = isDirectUrl(f.thumbnailUrl)
+                                        ? f.thumbnailUrl
+                                        : (protectedSuggestionUrls[path] || resolveApiUrl(path));
                                     const matchPct = typeof f.similarity === 'number' ? Math.round(f.similarity * 100) : null;
                                     return (
                                         <div key={faceId || `${f.filename}-${f.bbox?.left}-${f.bbox?.top}`} className="photo-card person-face-card">

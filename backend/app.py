@@ -322,6 +322,11 @@ PEOPLE_PROPAGATE_MARGIN = float(os.getenv('PEOPLE_PROPAGATE_MARGIN', '0.05'))
 # stray face cannot become an over-eager magnet for the whole library.
 PEOPLE_PROPAGATE_MIN_FACES = int(os.getenv('PEOPLE_PROPAGATE_MIN_FACES', '2'))
 PEOPLE_PROPAGATE_MAX_SUGGESTIONS = int(os.getenv('PEOPLE_PROPAGATE_MAX_SUGGESTIONS', '60'))
+# Identity propagation scans the whole face table. Materialising every row (each
+# carries an inline ~512-dim embedding) at once spiked RSS enough to OOM-kill the
+# replica on a large library. Stream the scan and score the embeddings in bounded
+# chunks so peak memory is one batch, not the entire table.
+PEOPLE_PROPAGATE_SCAN_BATCH = int(os.getenv('PEOPLE_PROPAGATE_SCAN_BATCH', '1024'))
 SUSPICIOUS_FACE_CONFIDENCE = float(os.getenv('SUSPICIOUS_FACE_CONFIDENCE', '0.60'))
 FACE_MIN_STORE_CONFIDENCE = float(os.getenv('FACE_MIN_STORE_CONFIDENCE', '0.24'))
 FACE_LOW_CONFIDENCE_REJECT_BELOW = float(os.getenv('FACE_LOW_CONFIDENCE_REJECT_BELOW', '0.32'))
@@ -352,6 +357,10 @@ PHOTO_TABLE_SCAN_MAX_ROWS = int(os.getenv('PHOTO_TABLE_SCAN_MAX_ROWS', '250000')
 # Max legacy rows to stamp with a derived uploadDate per /photos request; the
 # backfill converges over a few loads without slowing any single one down much.
 UPLOAD_DATE_BACKFILL_MAX_PER_REQUEST = int(os.getenv('UPLOAD_DATE_BACKFILL_MAX_PER_REQUEST', '100'))
+# Max legacy rows to stamp with a persisted blob size per /photos request. New
+# uploads get their size stamped at finalize; this converges pre-existing rows so
+# the gallery stops doing a per-photo blob HEAD (24 serial round trips per page).
+PHOTO_PROPS_BACKFILL_MAX_PER_REQUEST = int(os.getenv('PHOTO_PROPS_BACKFILL_MAX_PER_REQUEST', '12'))
 
 # Module-level storage/credential defaults (set during startup if available)
 account_name = None
@@ -928,17 +937,27 @@ def _private_photo_media_urls(filename: str) -> Dict[str, str]:
     }
 
 
-def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_props: bool = True) -> Dict:
-    last_modified = None
+def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_props: bool = True,
+                         head_missing: bool = True) -> Dict:
+    # Prefer the size/last-modified persisted on the metadata row (stamped at
+    # finalize / backfilled). Only fall back to a blob HEAD when a caller allows
+    # it (head_missing) and the value is absent — the gallery list path passes
+    # head_missing=False so it never fans out a HEAD per tile.
     size = 0
-    if include_props:
+    try:
+        size = int(metadata.get('size') or 0)
+    except Exception:
+        size = 0
+    last_modified_iso = metadata.get('lastModified') or None
+    if include_props and head_missing and not size:
         try:
             props = get_media_properties('image', filename)
-            size = props.get('size') or 0
-            last_modified = props.get('last_modified')
+            size = int(props.get('size') or 0)
+            lm = props.get('last_modified')
+            if lm is not None:
+                last_modified_iso = lm.isoformat()
         except Exception:
-            last_modified = None
-            size = 0
+            pass
 
     exif_data = parse_exif_data(metadata.get('exifData', '{}'))
     summary = exif_summary(exif_data) if exif_data else {}
@@ -968,7 +987,7 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'url': media_urls['url'],
         'thumbnailUrl': _thumbnail_url_from_metadata(metadata, filename),
         'size': size,
-        'lastModified': last_modified.isoformat() if last_modified else None,
+        'lastModified': last_modified_iso,
         'uploadDate': upload_dt.isoformat() if upload_dt else None,
         'captureDate': capture_dt.isoformat() if capture_dt else None,
         'rating': metadata.get('rating', 0),
@@ -2221,6 +2240,17 @@ def _is_unnamed_name(name: str) -> bool:
     return bool(re.match(r'^unnamed\s*\d*$', (name or '').strip(), re.IGNORECASE))
 
 
+def _person_entity_is_named(person: Dict) -> bool:
+    """True when the user explicitly named this cluster (not a placeholder).
+
+    Named clusters must never be silently auto-deleted when they transiently
+    lose their last face to a merge / identity-propagation reassignment — that
+    discards the user's naming work. Callers keep such a person (empty) instead.
+    """
+    name = str((person or {}).get('name') or '').strip()
+    return bool(name) and not _is_unnamed_name(name)
+
+
 def _update_person_entity(user_id: str, person_id: str, updates: Dict) -> bool:
     if person_table_client is None:
         return False
@@ -2288,8 +2318,14 @@ def _remove_face_from_person(user_id: str, person_id: str, face_id: str) -> None
         return
     face_ids = [fid for fid in face_ids if fid != face_id]
     if not face_ids:
+        # Keep a user-named cluster even when it loses its last face here (only
+        # remove unnamed clusters); deleting it would silently discard the name.
         try:
-            person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+            if _person_entity_is_named(person):
+                person['faceIds'] = json.dumps([])
+                person_table_client.upsert_entity(person)
+            else:
+                person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
         except Exception:
             pass
         return
@@ -2330,6 +2366,11 @@ def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: s
                 person['faceIds'] = json.dumps(next_face_ids)
                 person_table_client.upsert_entity(person)
                 _update_person_rep_embedding(user_id, person_id)
+            elif _person_entity_is_named(person):
+                # Preserve a user-named cluster that loses its last face to this
+                # reassignment; keep it empty rather than silently deleting it.
+                person['faceIds'] = json.dumps([])
+                person_table_client.upsert_entity(person)
             else:
                 person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
                 deleted_people += 1
@@ -4088,6 +4129,23 @@ def _load_user_face_summary_by_id(user_id: str) -> Dict[str, Dict]:
     return {str(row.get('RowKey') or ''): row for row in rows if row.get('RowKey')}
 
 
+def _face_thumbnail_url(filename: str) -> str:
+    """Direct-blob thumbnail URL for a face's source photo, for the People page.
+
+    A face tile renders the photo's thumbnail cropped to the face bbox, so it can
+    load straight from storage via a read SAS instead of streaming through the
+    backend proxy (the slow, memory-heavy path). Returns '' when no direct URL can
+    be served — RAW/HEIC needs the server-side preview converter, and non-SAS mode
+    yields a proxy path — so the frontend keeps its existing proxy fallback there.
+    """
+    if not filename:
+        return ''
+    if _filename_requires_backend_preview(filename):
+        return ''
+    url = make_media_url(filename, 'thumbnail')
+    return url if url.startswith('http') else ''
+
+
 def _face_summary_for_person_list(face_id: str, face: Dict) -> Dict:
     bbox_value = face.get('bbox', {})
     if isinstance(bbox_value, str):
@@ -4100,6 +4158,7 @@ def _face_summary_for_person_list(face_id: str, face: Dict) -> Dict:
     return {
         'faceId': face_id,
         'filename': face.get('filename'),
+        'thumbnailUrl': _face_thumbnail_url(str(face.get('filename') or '')),
         'bbox': bbox_value,
         'imageWidth': int(face.get('imageWidth', 0) or 0),
         'imageHeight': int(face.get('imageHeight', 0) or 0),
@@ -4369,15 +4428,59 @@ def _propagate_person_identity(
             other_named_reps.append(other_norm)
     other_matrix = np.vstack(other_named_reps) if other_named_reps else None
 
-    try:
-        face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        face_rows = []
+    # Stream the face table and score it in bounded batches. Loading every row at
+    # once (each with an inline embedding) plus the full numpy matrix was the OOM
+    # driver; here peak memory is one PEOPLE_PROPAGATE_SCAN_BATCH chunk. Per-face
+    # decisions are independent, so batching yields identical matches.
+    dtype = _embedding_precision_dtype(np)
+    # Cap the retained review queue so a magnet face can't grow it without bound;
+    # we only ever surface the top ``max_suggestions`` anyway.
+    review_retain_cap = max(max_suggestions * 4, max_suggestions)
 
-    candidate_ids: List[str] = []
-    candidate_rows: List[Dict] = []
-    candidate_embeddings: List[List[float]] = []
-    for row in face_rows:
+    auto_face_ids: List[str] = []
+    review_candidates: List[Tuple[str, Dict, float]] = []
+    candidate_face_count = 0
+
+    batch_ids: List[str] = []
+    batch_rows: List[Optional[Dict]] = []
+    batch_embeddings: List[List[float]] = []
+
+    def _flush_batch() -> None:
+        if not batch_embeddings:
+            return
+        X = np.asarray(batch_embeddings, dtype=dtype)
+        Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+        target_sim = Xn @ target_norm
+        if other_matrix is not None:
+            other_best = np.max(Xn @ other_matrix.T, axis=1)
+        else:
+            other_best = np.full(target_sim.shape, -1.0)
+        for i in range(len(batch_ids)):
+            sim = float(target_sim[i])
+            if sim < review_threshold:
+                continue
+            rival = float(other_best[i])
+            # A face closer to a different named person belongs to them.
+            if rival >= sim:
+                continue
+            if sim >= auto_threshold and (sim - rival) >= margin:
+                auto_face_ids.append(batch_ids[i])
+            elif collect_suggestions:
+                review_candidates.append((batch_ids[i], batch_rows[i], sim))
+        # Release the chunk (and its embeddings) before scanning the next one.
+        batch_ids.clear()
+        batch_rows.clear()
+        batch_embeddings.clear()
+        if collect_suggestions and len(review_candidates) > review_retain_cap:
+            review_candidates.sort(key=lambda item: item[2], reverse=True)
+            del review_candidates[max_suggestions:]
+
+    try:
+        face_iter = face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
+    except Exception:
+        face_iter = []
+
+    for row in face_iter:
         face_id = str(row.get('RowKey') or '')
         if not face_id or face_id in declined:
             continue
@@ -4397,41 +4500,24 @@ def _propagate_person_identity(
         emb = _face_embedding_from_entity(row)
         if not emb or len(emb) != target_dim:
             continue
-        candidate_ids.append(face_id)
-        candidate_rows.append(row)
-        candidate_embeddings.append(emb)
+        candidate_face_count += 1
+        batch_ids.append(face_id)
+        # Only retain the row when suggestions are collected (it feeds the review
+        # summary); the apply path re-reads the live row, so drop it to save RAM.
+        batch_rows.append(row if collect_suggestions else None)
+        batch_embeddings.append(emb)
+        if len(batch_embeddings) >= PEOPLE_PROPAGATE_SCAN_BATCH:
+            _flush_batch()
+    _flush_batch()
 
-    if not candidate_ids:
+    if candidate_face_count == 0:
         return {**empty, 'candidateFaces': 0}
-
-    X = np.asarray(candidate_embeddings, dtype=_embedding_precision_dtype(np))
-    Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
-    target_sim = Xn @ target_norm
-    if other_matrix is not None:
-        other_best = np.max(Xn @ other_matrix.T, axis=1)
-    else:
-        other_best = np.full(target_sim.shape, -1.0)
-
-    auto_face_ids: List[str] = []
-    review_candidates: List[Tuple[str, Dict, float]] = []
-    for idx, face_id in enumerate(candidate_ids):
-        sim = float(target_sim[idx])
-        if sim < review_threshold:
-            continue
-        rival = float(other_best[idx])
-        # A face closer to a different named person belongs to them.
-        if rival >= sim:
-            continue
-        if sim >= auto_threshold and (sim - rival) >= margin:
-            auto_face_ids.append(face_id)
-        elif collect_suggestions:
-            review_candidates.append((face_id, candidate_rows[idx], sim))
 
     result = {
         'autoAssigned': [],
         'autoAssignedCount': len(auto_face_ids),
         'suggestions': [],
-        'candidateFaces': len(candidate_ids),
+        'candidateFaces': candidate_face_count,
     }
 
     if apply and auto_face_ids:
@@ -5758,9 +5844,16 @@ def list_persons():
                         rep_face = _face_summary_for_person_list(rep_face_id, face)
                         rep_face_score = score
 
-                # Auto-remove empty clusters: a person that owns no non-rejected
-                # face anymore is deleted so it stops cluttering the People page.
-                if not active_face_ids and not indeterminate:
+                # Auto-remove empty clusters so they stop cluttering the People
+                # page — BUT never auto-delete a cluster the user explicitly named.
+                # Faces can leave a person temporarily (a merge or identity
+                # propagation reassigning them); silently deleting a *named* person
+                # on a plain list call is data loss — it's how named clusters
+                # "vanished after a refresh", and why re-labelling one then 404s.
+                # Keep it, show it empty, and let the user delete it explicitly.
+                raw_name = str(row.get('name', '') or '').strip()
+                is_named = bool(raw_name) and not _is_unnamed_name(raw_name)
+                if not active_face_ids and not indeterminate and not is_named:
                     try:
                         person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
                         app.logger.info('Removed empty person cluster %s/%s', user_id, person_id)
@@ -5768,7 +5861,7 @@ def list_persons():
                         pass
                     continue
 
-                name = str(row.get('name', '') or '').strip()
+                name = raw_name
                 if not name:
                     name = f'Unnamed {unnamed_counter}'
                     unnamed_counter += 1
@@ -5824,6 +5917,7 @@ def get_person(person_id: str):
             faces.append({
                 'faceId': fid,
                 'filename': face.get('filename'),
+                'thumbnailUrl': _face_thumbnail_url(str(face.get('filename') or '')),
                 'bbox': json.loads(face.get('bbox', '{}')),
                 'imageWidth': int(face.get('imageWidth', 0) or 0),
                 'imageHeight': int(face.get('imageHeight', 0) or 0),
@@ -6294,17 +6388,53 @@ def merge_persons(person_id: str):
         return jsonify({'error': 'base person not found'}), 404
 
     base_snapshot = dict(base)
-    merged_snapshots = []
     face_map = {}
     try:
         base_face_ids = set(json.loads(base.get('faceIds', '[]')))
     except Exception:
         base_face_ids = set()
 
+    # Capture restore snapshots and persist an undo record BEFORE any destructive
+    # change. merge_persons reassigns faces and deletes the merged person rows
+    # in-place; if the worker is killed mid-merge (e.g. an OOM kill) after a
+    # delete, a named cluster would be gone with no undo record to restore it.
+    # Writing base + merged snapshots up front guarantees undo_merge can always
+    # bring the original people (and their names) back; the record is finalised
+    # with the real faceMap once reassignment completes.
+    merge_id = str(uuid.uuid4())
+    merged_snapshots = []
+    for mid in merge_ids:
+        try:
+            merged_snapshots.append(dict(person_table_client.get_entity(partition_key=user_id, row_key=mid)))
+        except Exception:
+            continue
+
+    def _write_merge_record(final_face_map, final_target_name):
+        merged_names = [s['name'] for s in merged_snapshots if isinstance(s, dict) and s.get('name')]
+        try:
+            merge_table_client.upsert_entity({
+                'PartitionKey': user_id,
+                'RowKey': merge_id,
+                'targetPersonId': person_id,
+                'mergedIds': json.dumps(merge_ids),
+                'targetName': final_target_name or '',
+                'mergedNames': json.dumps(merged_names),
+                'payload': json.dumps({
+                    'base': base_snapshot,
+                    'merged': merged_snapshots,
+                    'faceMap': final_face_map,
+                }),
+                'createdAt': None,
+            })
+        except Exception:
+            pass
+
+    # Safety-net write before the destructive phase (faceMap filled in later).
+    _write_merge_record({}, str(base_snapshot.get('name') or ''))
+
     for mid in merge_ids:
         try:
             merged = person_table_client.get_entity(partition_key=user_id, row_key=mid)
-            merged_snapshots.append(dict(merged))
             try:
                 merged_face_ids = json.loads(merged.get('faceIds', '[]'))
             except Exception:
@@ -6362,31 +6492,15 @@ def merge_persons(person_id: str):
     _update_person_rep_embedding(user_id, person_id)
     _rebuild_metadata_faces_for_filenames(user_id, _filenames_for_face_ids(user_id, list(base_face_ids)))
 
-    merge_id = str(uuid.uuid4())
-    payload = {
-        'base': base_snapshot,
-        'merged': merged_snapshots,
-        'faceMap': face_map,
-    }
-    target_name = base_snapshot.get('name') if isinstance(base_snapshot, dict) else None
-    merged_names = []
-    for snap in merged_snapshots:
-        if isinstance(snap, dict) and snap.get('name'):
-            merged_names.append(snap['name'])
-    merge_entry = {
-        'PartitionKey': user_id,
-        'RowKey': merge_id,
-        'targetPersonId': person_id,
-        'mergedIds': json.dumps(merge_ids),
-        'targetName': target_name or '',
-        'mergedNames': json.dumps(merged_names),
-        'payload': json.dumps(payload),
-        'createdAt': None,
-    }
+    # Finalise the restore record written before the destructive phase: same
+    # RowKey (merge_id), now carrying the real faceMap so undo can revert face
+    # ownership exactly, and the base's possibly-adopted name.
     try:
-        merge_table_client.upsert_entity(merge_entry)
+        final_base = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+        final_target_name = str(final_base.get('name') or '')
     except Exception:
-        pass
+        final_target_name = str(base_snapshot.get('name') or '')
+    _write_merge_record(face_map, final_target_name)
 
     # If the merged-into person is named, reuse its strengthened rep to reclaim
     # matching faces still sitting in unnamed clusters. Best-effort.
@@ -6492,39 +6606,50 @@ def list_merges():
         return error
     if not _people_features_available():
         return jsonify({'error': 'People features not configured'}), 503
+    # This partition also holds the people-repair snapshots (recluster / dedupe /
+    # suspicious / membership), which serialize the entire people+faces+metadata
+    # tables into multi-KB `payload` chunk rows (see _create_people_repair_snapshot).
+    # Pulling full entities here materialised every one of those payloads into
+    # memory just to skip them by `kind` on the next line — enough to OOM-kill the
+    # replica on a large library. Project only the small columns the undo list
+    # needs (never `payload`) and stream the rows instead of list()-ing them, so
+    # the snapshot backups are never transferred or held in memory.
+    select_cols = ['RowKey', 'kind', 'targetPersonId', 'mergedIds', 'targetName', 'mergedNames', 'createdAt']
     try:
-        rows = list(merge_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        rows_iter = merge_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'",
+            select=select_cols,
+        )
     except Exception:
         return jsonify({'merges': []})
 
     merges = []
-    for row in rows:
-        try:
-            if str(row.get('kind') or '').startswith(('recluster_snapshot', 'face_dedupe_snapshot', 'suspicious_face_snapshot', 'face_membership_snapshot')):
-                continue
-            target_name = row.get('targetName')
-            merged_names = json.loads(row.get('mergedNames', '[]'))
-            if not target_name or not merged_names:
+    try:
+        for row in rows_iter:
+            try:
+                if str(row.get('kind') or '').startswith(('recluster_snapshot', 'face_dedupe_snapshot', 'suspicious_face_snapshot', 'face_membership_snapshot')):
+                    continue
                 try:
-                    payload = json.loads(row.get('payload', '{}'))
-                    base = payload.get('base') or {}
-                    merged = payload.get('merged') or []
-                    if not target_name:
-                        target_name = base.get('name')
-                    if not merged_names:
-                        merged_names = [m.get('name') for m in merged if isinstance(m, dict) and m.get('name')]
+                    merged_names = json.loads(row.get('mergedNames', '[]') or '[]')
                 except Exception:
-                    pass
-            merges.append({
-                'mergeId': row['RowKey'],
-                'targetPersonId': row.get('targetPersonId'),
-                'mergedIds': json.loads(row.get('mergedIds', '[]')),
-                'targetName': target_name,
-                'mergedNames': merged_names,
-                'createdAt': row.get('createdAt'),
-            })
-        except Exception:
-            continue
+                    merged_names = []
+                try:
+                    merged_ids = json.loads(row.get('mergedIds', '[]') or '[]')
+                except Exception:
+                    merged_ids = []
+                merges.append({
+                    'mergeId': row['RowKey'],
+                    'targetPersonId': row.get('targetPersonId'),
+                    'mergedIds': merged_ids,
+                    'targetName': row.get('targetName'),
+                    'mergedNames': merged_names,
+                    'createdAt': row.get('createdAt'),
+                })
+            except Exception:
+                continue
+    except Exception:
+        # A mid-stream paging error still returns whatever was collected.
+        pass
     return jsonify({'merges': merges})
 
 
@@ -7045,12 +7170,16 @@ def finalize_direct_upload():
     # _update_metadata_entity_fields), so drop the scan cache explicitly: the
     # gallery refetches right after an upload and must see the new photo.
     _invalidate_metadata_scan_cache(user_id)
-    # Attribution: record which account added this photo to the library.
+    # Persist the blob size (validated above) and the adding account in one write:
+    # the size lets the gallery listing skip a per-photo blob HEAD, and uploadedBy
+    # attributes the photo to the library member who added it.
     try:
+        finalize_updates: Dict[str, object] = {'size': total_size}
         if account_id:
-            _update_metadata_entity_fields(user_id, final_name, {'uploadedBy': account_id})
+            finalize_updates['uploadedBy'] = account_id
+        _update_metadata_entity_fields(user_id, final_name, finalize_updates)
     except Exception:
-        app.logger.debug('Could not stamp uploadedBy for %s', final_name)
+        app.logger.debug('Could not stamp finalize metadata for %s', final_name)
     metadata = None
     try:
         metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=final_name)
@@ -7654,10 +7783,40 @@ def list_photos():
         entries = [name for name in entries if _capture_in_range(metadata_map.get(name, {}), capture_start, capture_end)]
 
     selected = entries[offset:offset + limit]
+
+    # Persist blob size for legacy rows that predate finalize-time stamping, so the
+    # gallery stops doing a blob HEAD per tile. Capped per request (converges over
+    # a few page views); after that _build_photo_summary reads size from metadata
+    # with head_missing=False and never HEADs.
+    props_backfilled = 0
+    for name in selected:
+        if props_backfilled >= PHOTO_PROPS_BACKFILL_MAX_PER_REQUEST:
+            break
+        row = metadata_map.get(name) or {}
+        if row.get('size'):
+            continue
+        try:
+            props = get_media_properties('image', name)
+        except Exception:
+            break  # storage hiccup: stop backfilling, listing still works
+        size_val = int(props.get('size') or 0)
+        if not size_val:
+            continue
+        updates: Dict[str, object] = {'size': size_val}
+        lm = props.get('last_modified')
+        if lm is not None:
+            updates['lastModified'] = lm.isoformat()
+        try:
+            _update_metadata_entity_fields(user_id, name, updates)
+            row.update(updates)
+            props_backfilled += 1
+        except Exception:
+            break
+
     photos = []
     for filename in selected:
         metadata = metadata_map.get(filename, {})
-        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True))
+        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False))
 
     return jsonify({'photos': photos, 'total': len(entries)})
 
@@ -7900,7 +8059,9 @@ def search_photos():
 
     photos = []
     for _, filename, metadata in selected:
-        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True))
+        # Read size from the metadata row (stamped at finalize / backfilled by the
+        # main gallery); don't HEAD a blob per search result.
+        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False))
 
     response_payload = {'photos': photos, 'total': total}
     if fallback_notice:
@@ -9218,7 +9379,8 @@ def filter_photos():
 
         for photo in selected:
             name = photo['RowKey']
-            photos.append(_build_photo_summary(user_id, name, photo, include_props=True))
+            # Size comes from the metadata row (no per-result blob HEAD).
+            photos.append(_build_photo_summary(user_id, name, photo, include_props=True, head_missing=False))
 
         return jsonify({'photos': photos, 'total': len(filtered), 'offset': offset, 'limit': limit})
     except Exception as e:
