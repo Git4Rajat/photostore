@@ -26,6 +26,7 @@ import {
 import { AppServicesProvider, BackgroundActivityIndicator, NotificationBell, useAppServices, getBrowserProcessingConcurrency, isBrowserProcessingTurboEnabled, setBrowserProcessingTurbo } from './components/AppServicesProvider';
 import { Logo } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
+import { BackendStatusBanner } from './components/shared/BackendStatusBanner';
 import NotFoundPage from './components/NotFoundPage';
 import { DialogHost } from './components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
@@ -651,6 +652,7 @@ const AppContent: React.FC = () => {
 
     return (
         <div className="ios-shell">
+            <BackendStatusBanner />
             <div className="ios-backdrop ios-backdrop-one" />
             <div className="ios-backdrop ios-backdrop-two" />
 

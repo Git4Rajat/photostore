@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import zipfile
 import time
 import logging
@@ -21,7 +22,7 @@ from azure.data.tables import TableServiceClient
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobSasPermissions, BlobServiceClient, UserDelegationKey, generate_blob_sas
 from azure.storage.queue import QueueServiceClient
-from flask import Flask, Response, jsonify, make_response, request
+from flask import Flask, Response, jsonify, make_response, request, stream_with_context
 from auth_utils import get_request_user_id as resolve_request_user_id
 from auth_utils import validate_bearer_token as validate_entra_bearer_token
 import password_auth
@@ -8905,6 +8906,14 @@ def public_preview(token: str, filename: str):
         }), 503
 
 
+def _remove_file_quietly(path: str) -> None:
+    """Best-effort delete of a temp file; never raise from cleanup paths."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 @app.route('/public/albums/<token>/download', methods=['POST'])
 def public_album_download(token: str):
     entity = _find_public_album_by_token(token)
@@ -8940,22 +8949,51 @@ def public_album_download(token: str):
     if not selected:
         selected = _album_filenames(entity)
 
-    zip_buffer = io.BytesIO()
+    # Build the archive on a temp file on disk rather than in a BytesIO. A whole
+    # album buffered in RAM (and previously copied a second time for the
+    # Response body) could exceed the container's memory limit and OOM-kill the
+    # replica. Spooling to disk keeps peak memory to roughly one photo at a time
+    # (the bytes returned by download_media_bytes), and the response is streamed
+    # straight off disk, then the temp file is removed once the stream drains.
+    tmp = tempfile.NamedTemporaryFile(prefix='album-', suffix='.zip', delete=False)
+    tmp_path = tmp.name
     written_count = 0
-    with zipfile.ZipFile(zip_buffer, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file:
-        for name in selected:
-            try:
-                data_bytes = download_media_bytes('image', name)
-                zip_file.writestr(name, data_bytes)
-                written_count += 1
-            except Exception as exc:
-                print(f"Skipping {name} while creating public album download: {str(exc)}", flush=True)
+    try:
+        with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file:
+            for name in selected:
+                try:
+                    data_bytes = download_media_bytes('image', name)
+                    zip_file.writestr(name, data_bytes)
+                    written_count += 1
+                except Exception as exc:
+                    print(f"Skipping {name} while creating public album download: {str(exc)}", flush=True)
+        tmp.close()
+    except Exception:
+        try:
+            tmp.close()
+        finally:
+            _remove_file_quietly(tmp_path)
+        raise
 
     if written_count == 0:
+        _remove_file_quietly(tmp_path)
         return jsonify({'error': 'No files could be downloaded'}), 404
 
-    zip_buffer.seek(0)
-    resp = Response(zip_buffer.read(), mimetype='application/zip')
+    zip_size = os.path.getsize(tmp_path)
+
+    def _stream_and_cleanup():
+        try:
+            with open(tmp_path, 'rb') as fh:
+                while True:
+                    chunk = fh.read(256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            _remove_file_quietly(tmp_path)
+
+    resp = Response(stream_with_context(_stream_and_cleanup()), mimetype='application/zip')
+    resp.headers['Content-Length'] = str(zip_size)
     resp.headers['Content-Disposition'] = f'attachment; filename=public-album-{token}.zip'
     resp.headers['Cache-Control'] = 'no-store'
     return resp

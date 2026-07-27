@@ -237,7 +237,15 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
-            { name: 'GUNICORN_WORKERS', value: '4' }
+            // Gunicorn workers are separate processes and the app is imported
+            // AFTER fork (no --preload), so every worker loads its own copy of
+            // numpy/scipy/scikit-learn/Pillow + the Azure SDKs (~250-350 MB
+            // each) and primes its own vector-index cache. At 4 workers that
+            // baseline alone crowds the 1 GiB limit, so a few concurrent
+            // image/zip requests tipped the replica into an OOM kill. Two
+            // workers keeps CPU-parallelism for image work while leaving real
+            // headroom; concurrency inside a worker comes from GUNICORN_THREADS.
+            { name: 'GUNICORN_WORKERS', value: '2' }
             { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
             { name: 'SESSION_SECRET', secretRef: 'session-secret' }
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
@@ -251,7 +259,7 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           {
             // Default is 10 concurrent requests per replica, which fans out to
             // extra replicas on every burst of small API calls. Each replica
-            // runs 4 gunicorn workers x 8 threads, so 50 concurrent requests
+            // runs 2 gunicorn workers x 8 threads, so 50 concurrent requests
             // is still comfortably inside one replica's capacity.
             name: 'http-scaler'
             http: {

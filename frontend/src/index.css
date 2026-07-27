@@ -4530,6 +4530,126 @@ video.photo-preview-media {
   }
 }
 
+/* ---- App-wide backend availability banner (BackendStatusBanner.tsx) ---- */
+.backend-status-banner {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9998;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: max-content;
+  max-width: min(600px, calc(100vw - 24px));
+  padding: 10px 14px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--lg-edge-strong);
+  background: var(--lg-surface-strong);
+  color: var(--text);
+  box-shadow: var(--lg-shadow-raised);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  animation: backend-status-in var(--dur-base) var(--ease-glass) both;
+}
+
+.backend-status-banner.is-offline {
+  border-left: 3px solid var(--danger);
+}
+
+.backend-status-banner.is-recovered {
+  border-left: 3px solid var(--success);
+}
+
+.backend-status-icon {
+  width: 20px;
+  height: 20px;
+  flex: none;
+}
+
+.backend-status-banner.is-offline .backend-status-icon {
+  color: var(--danger);
+}
+
+.backend-status-banner.is-recovered .backend-status-icon {
+  color: var(--success);
+}
+
+.backend-status-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.backend-status-text {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.backend-status-sub {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.backend-status-retry {
+  flex: none;
+  padding: 6px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  min-height: 32px;
+  transition: opacity var(--dur-quick) ease, transform var(--dur-quick) ease;
+}
+
+.backend-status-retry:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.backend-status-retry:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.backend-status-retry:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+@keyframes backend-status-in {
+  from { opacity: 0; transform: translate(-50%, -10px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+@media (max-width: 480px) {
+  .backend-status-banner {
+    left: 12px;
+    right: 12px;
+    transform: none;
+    width: auto;
+    max-width: none;
+    /* The slide-in keyframe animates translateX(-50%), which fights the
+       full-width edge-anchored layout used here, so drop it on narrow screens. */
+    animation: none;
+  }
+  .backend-status-sub {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .backend-status-banner {
+    animation: none;
+  }
+}
+
 /* ---- Styled dialogs (components/shared/dialogs.tsx) ---- */
 .dialog-backdrop {
   position: fixed;

@@ -1,5 +1,6 @@
 import { getRuntimeConfig } from '../config/appConfig';
 import { createHttpClient, requestJson } from './httpClient';
+import { configureBackendStatus } from './backendStatus';
 const runtimeConfig = getRuntimeConfig();
 const env = import.meta.env as Record<string, string | undefined>;
 const apiUrl =
@@ -41,6 +42,11 @@ export const resolveApiUrl = (url?: string): string => {
 
 const apiClient = createHttpClient(API_BASE_URL);
 const uploadClient = createHttpClient(UPLOAD_BASE_URL);
+
+// Give the app-wide availability tracker the absolute /health URL so its
+// recovery probes hit the API origin (not the SPA origin) when a base URL is
+// configured, and same-origin in local dev.
+configureBackendStatus({ healthUrl: resolveApiUrl('health') });
 
 // Kept for backwards compatibility.
 const LOCAL_USER_KEY = 'photostore.localUserId';

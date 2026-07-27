@@ -1,5 +1,6 @@
 import axios, { type AxiosHeaders, type AxiosRequestConfig, type InternalAxiosRequestConfig } from 'axios';
 import { getAccessToken, isAuthEnabled } from './authClient';
+import { reportBackendReachable, reportBackendUnreachable } from './backendStatus';
 
 type ErrorLike = {
     message?: unknown;
@@ -150,6 +151,29 @@ const isRetriableColdStart = (error: unknown, method: string): boolean => {
     return false;
 };
 
+// Whether a *terminal* failure (retries already exhausted) means the backend
+// was unreachable, as opposed to an ordinary app error (4xx, or a 5xx the app
+// itself produced). Used to drive the app-wide "backend unavailable" banner.
+// Unlike isRetriableColdStart this treats 502/504 as unreachable for every
+// method — for the banner we only care that the app couldn't be reached, not
+// whether the request was safe to auto-retry.
+const isBackendUnreachable = (error: unknown): boolean => {
+    if (!axios.isAxiosError(error)) {
+        return false;
+    }
+    if (error.code === 'ERR_CANCELED') {
+        return false;
+    }
+    const status = error.response?.status;
+    if (status === undefined) {
+        return true;
+    }
+    return status === 502 || status === 503 || status === 504;
+};
+
+const isCanceled = (error: unknown): boolean =>
+    axios.isAxiosError(error) && error.code === 'ERR_CANCELED';
+
 export const requestJson = async <T = any>(
     client: ReturnType<typeof createHttpClient>,
     method: 'get' | 'post' | 'put' | 'delete',
@@ -167,6 +191,9 @@ export const requestJson = async <T = any>(
                         : method === 'put'
                             ? await client.put<T>(normalizePath(url), data, config)
                             : await client.delete<T>(normalizePath(url), config);
+                // A real response (any status) proves the backend is up; clear
+                // any outstanding "backend unavailable" state immediately.
+                reportBackendReachable();
                 return response.data;
             } catch (error: unknown) {
                 if (attempt < COLD_START_RETRIES && isRetriableColdStart(error, method)) {
@@ -174,6 +201,13 @@ export const requestJson = async <T = any>(
                     // typical cold-start window without hammering the ingress.
                     await sleep(COLD_START_BASE_DELAY_MS * 2 ** attempt);
                     continue;
+                }
+                // Terminal outcome: feed the app-wide availability tracker.
+                if (isBackendUnreachable(error)) {
+                    reportBackendUnreachable(getErrorMessage(error));
+                } else if (!isCanceled(error)) {
+                    // The app answered (an ordinary 4xx/5xx), so it is reachable.
+                    reportBackendReachable();
                 }
                 throw getErrorMessage(error);
             }
