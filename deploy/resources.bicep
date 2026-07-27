@@ -196,7 +196,7 @@ var backendEnv = [
   { name: 'SPA_BASE_URL', value: frontendUrl }
   { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
   { name: 'BROWSER_ONLY_PROCESSING', value: 'true' }
-  { name: 'FACE_CLUSTER_EMBEDDING_VERSION', value: 'browser-hybrid-arcface-faceapi-v1' }
+  { name: 'FACE_CLUSTER_EMBEDDING_VERSION', value: 'browser-hybrid-arcface-faceapi-v2' }
   { name: 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', value: '640' }
   { name: 'PEOPLE_CLUSTER_PRESET', value: 'strictest' }
   { name: 'MAPS_ON_UPLOAD', value: 'false' }
