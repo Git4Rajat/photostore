@@ -2775,6 +2775,40 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     return assignments
 
 
+def _load_existing_people_for_matching(user_id: str) -> List[Dict]:
+    if person_table_client is None:
+        return []
+    try:
+        existing_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        return []
+
+    existing_people = []
+    for row in existing_rows:
+        person_id = str(row.get('RowKey') or '')
+        if not person_id:
+            continue
+        try:
+            face_ids = json.loads(row.get('faceIds', '[]') or '[]')
+        except Exception:
+            face_ids = []
+        active_face_ids = _active_face_ids_for_person(user_id, person_id, face_ids)
+        if not active_face_ids:
+            continue
+        try:
+            rep_embedding = json.loads(row.get('repEmbedding', '[]') or '[]')
+        except Exception:
+            rep_embedding = []
+        existing_people.append({
+            'personId': person_id,
+            'name': row.get('name', ''),
+            'faceIds': active_face_ids,
+            'repEmbedding': rep_embedding,
+            'confirmedFaceCount': _confirmed_face_count(user_id, active_face_ids, person_id),
+        })
+    return existing_people
+
+
 def cluster_user_faces(
     user_id: str,
     eps: Optional[float] = None,
@@ -2849,6 +2883,8 @@ def cluster_user_faces(
         ),
     )
 
+    if preserve_people is None:
+        preserve_people = _load_existing_people_for_matching(user_id)
     match_index = _prepare_existing_people_match(preserve_people, np)
     preserved_face_ids_by_person: Dict[str, List[str]] = {}
     for person in preserve_people or []:
@@ -5459,6 +5495,74 @@ def _looks_like_jpeg(data: bytes) -> bool:
     return bool(data) and data.startswith(b'\xff\xd8')
 
 
+PREVIEW_JOB_TYPE = 'media_preview'
+
+
+def _preview_cache_blob_name(filename: str) -> str:
+    return f'preview/{filename}.jpg'
+
+
+def _stream_cached_preview(filename: str, *, cache_control: str):
+    preview_blob = _preview_cache_blob_name(filename)
+    try:
+        props = get_media_properties('thumbnail', preview_blob)
+    except Exception as exc:
+        if _is_missing_media_error(exc):
+            return None
+        raise
+    content_type = props.get('content_type') or 'image/jpeg'
+    return _stream_media_response(
+        'thumbnail',
+        preview_blob,
+        content_type=content_type,
+        cache_control=cache_control,
+        content_length=props.get('size'),
+    )
+
+
+def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
+    if metadata_table_client is None:
+        return None
+    try:
+        rows = list(metadata_table_client.query_entities("PartitionKey eq 'jobs'"))
+    except Exception:
+        return None
+    for row in rows:
+        if str(row.get('userId') or '') != user_id:
+            continue
+        if str(row.get('jobType') or '') != PREVIEW_JOB_TYPE:
+            continue
+        if str(row.get('filename') or '') != filename:
+            continue
+        if str(row.get('status') or '').lower() in {'queued', 'running'}:
+            return str(row.get('jobId') or '')
+    return None
+
+
+def _enqueue_preview_generation_job(user_id: str, filename: str) -> Dict[str, str]:
+    existing_job_id = _active_preview_job_for_file(user_id, filename)
+    if existing_job_id:
+        return {'status': 'already_queued', 'jobId': existing_job_id}
+    if clustering_queue_client is None:
+        return {'status': 'unavailable', 'jobId': ''}
+    job_id = f'preview:{user_id}:{uuid.uuid4().hex}'
+    payload = {
+        'jobId': job_id,
+        'correlationId': job_id,
+        'user_id': user_id,
+        'type': PREVIEW_JOB_TYPE,
+        'filename': filename,
+    }
+    try:
+        clustering_queue_client.send_message(json.dumps(payload, separators=(',', ':')))
+        _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'queued', filename=filename)
+        _update_metadata_entity_fields(user_id, filename, {'preview_status': 'queued'})
+        return {'status': 'queued', 'jobId': job_id}
+    except Exception:
+        app.logger.exception('Failed to enqueue preview generation for %s', filename)
+        return {'status': 'failed', 'jobId': job_id}
+
+
 def _preview_failure_payload(filename: str) -> dict:
     """Build a structured, user-facing explanation for why a preview could not be made."""
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
@@ -5505,13 +5609,6 @@ def _thumbnail_access_response(safe_name: str, metadata: Optional[Dict]) -> Opti
     """
     if str((metadata or {}).get('thumbnail_status') or '').strip().lower() == 'done':
         return None
-    if _filename_requires_backend_preview(safe_name):
-        return {
-            'url': _preview_proxy_url(safe_name),
-            'expiresAt': '',
-            'filename': safe_name,
-            'kind': 'preview',
-        }
     return {
         'url': make_proxy_url(safe_name, 'thumbnail'),
         'expiresAt': '',
@@ -5559,7 +5656,6 @@ def photo_access_url(kind: str, filename: str):
     except Exception as exc:
         app.logger.exception('Failed to mint %s access URL for %s', kind, safe_name)
         return jsonify({'error': f'Failed to create {kind} access URL', 'detail': str(exc)}), 503
-
 
 @app.route('/api/photos/access-batch', methods=['POST'])
 def photo_access_url_batch():
@@ -5758,6 +5854,37 @@ def proxy_preview(filename: str):
 
     if not _get_metadata_entity(user_id, safe_name):
         return jsonify({'error': 'Not found'}), 404
+
+    if _filename_requires_backend_preview(safe_name):
+        try:
+            cached = _stream_cached_preview(safe_name, cache_control='private, max-age=3600')
+        except Exception:
+            app.logger.exception('Failed to stream cached preview for %s', safe_name)
+            cached = None
+        if cached is not None:
+            return cached
+        queued = _enqueue_preview_generation_job(user_id, safe_name)
+        if queued.get('status') in {'queued', 'already_queued'}:
+            return jsonify({
+                'error': 'Preview is being prepared',
+                'reason': 'preview_queued',
+                'detail': 'The server queued a background preview build for this file. Try again shortly.',
+                'jobId': queued.get('jobId') or '',
+                'canDownloadOriginal': True,
+            }), 503
+        if queued.get('status') == 'unavailable':
+            return jsonify({
+                'error': 'Preview worker unavailable',
+                'reason': 'preview_worker_unavailable',
+                'detail': 'Preview generation worker is unavailable. Please try again later.',
+                'canDownloadOriginal': True,
+            }), 503
+        return jsonify({
+            'error': 'Preview queue failed',
+            'reason': 'preview_queue_failed',
+            'detail': 'Could not queue preview generation. Please try again.',
+            'canDownloadOriginal': True,
+        }), 503
 
     try:
         image_bytes = download_media_bytes('image', safe_name)
@@ -8926,7 +9053,46 @@ def admin_repair_stale_people_memberships():
 
 
 def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, job_type: str) -> None:
-    if not (user_id and job_type in _clustering_job_types() and _people_features_available()):
+    if not user_id:
+        return
+    if job_type == PREVIEW_JOB_TYPE:
+        filename = secure_filename(str(payload.get('filename') or ''))
+        if not filename or not allowed_file(filename):
+            if job_id:
+                _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'failed', error='invalid filename')
+            return
+        metadata = _get_metadata_entity(user_id, filename)
+        if metadata is None:
+            if job_id:
+                _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'failed', error='metadata not found', filename=filename)
+            return
+        if job_id:
+            _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'running', filename=filename)
+        try:
+            image_bytes = download_media_bytes('image', filename)
+            preview_bytes = convert_image_to_jpeg(image_bytes, filename)
+            if not preview_bytes or not _looks_like_jpeg(preview_bytes):
+                raise RuntimeError('preview conversion produced invalid jpeg')
+            preview_blob = _preview_cache_blob_name(filename)
+            upload_media_file('thumbnail', preview_blob, preview_bytes, 'image/jpeg')
+            _update_metadata_entity_fields(user_id, filename, {'preview_status': 'done'})
+            if job_id:
+                _upsert_job_status(
+                    job_id,
+                    user_id,
+                    PREVIEW_JOB_TYPE,
+                    'done',
+                    filename=filename,
+                    result={'previewBlob': preview_blob, 'bytes': len(preview_bytes)},
+                )
+        except Exception as exc:
+            worker_logger.exception('Async preview generation failed for %s', filename)
+            _update_metadata_entity_fields(user_id, filename, {'preview_status': 'failed'})
+            if job_id:
+                _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'failed', error=str(exc), filename=filename)
+        return
+
+    if not (job_type in _clustering_job_types() and _people_features_available()):
         return
     if job_id:
         _upsert_job_status(job_id, user_id, 'clustering', 'running')
@@ -9182,8 +9348,6 @@ def public_thumbnail(token: str, filename: str):
     if safe_name not in _album_filenames(entity):
         return jsonify({'error': 'Not found'}), 404
 
-    if safe_name.lower().endswith(tuple(ext.lower() for ext in RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA)):
-        return public_preview(token, filename)
     if not blob_service_client:
         return jsonify({'error': 'Thumbnail service not configured'}), 503
 
@@ -9198,6 +9362,10 @@ def public_thumbnail(token: str, filename: str):
             content_length=props.get('size'),
         )
     except Exception as exc:
+        if _is_missing_media_error(exc):
+            resp = Response(placeholder_bytes, mimetype='image/jpeg')
+            resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            return resp
         print(f"Unexpected error serving public thumbnail for {safe_name}: {str(exc)}", flush=True)
         return jsonify({'error': 'Thumbnail not found'}), 404
 
@@ -9249,6 +9417,28 @@ def public_preview(token: str, filename: str):
         return jsonify({'error': 'Invalid filename'}), 400
     if safe_name not in _album_filenames(entity):
         return jsonify({'error': 'Not found'}), 404
+
+    if _filename_requires_backend_preview(safe_name):
+        try:
+            cached = _stream_cached_preview(safe_name, cache_control='public, max-age=3600')
+        except Exception:
+            app.logger.exception('Failed to stream cached public preview for %s', safe_name)
+            cached = None
+        if cached is not None:
+            return cached
+        owner_id = str(entity.get('PartitionKey') or '')
+        queued = _enqueue_preview_generation_job(owner_id, safe_name) if owner_id else {'status': 'failed'}
+        if queued.get('status') in {'queued', 'already_queued'}:
+            return jsonify({
+                'error': 'Preview is being prepared',
+                'reason': 'preview_queued',
+                'detail': 'The server queued a background preview build for this file. Try again shortly.',
+            }), 503
+        return jsonify({
+            'error': 'Preview not available yet',
+            'reason': 'preview_unavailable',
+            'detail': 'Preview generation is unavailable right now. Please try again later.',
+        }), 503
 
     try:
         image_bytes = download_media_bytes('image', safe_name)

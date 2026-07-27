@@ -299,6 +299,17 @@ def _store_client_face_entities(user_id: str, filename: str, faces) -> List[str]
         if bbox['width'] <= 0 or bbox['height'] <= 0:
             continue
         face_id = _deterministic_face_id(user_id, filename, face)
+        # Never resurrect a face explicitly rejected/deleted by the user.
+        # Browser late-result replays can arrive after manual curation; if that
+        # deterministic face id is already rejected, keep it rejected.
+        try:
+            existing = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            existing = None
+        if isinstance(existing, dict):
+            existing_rejected = bool(existing.get('rejected', False)) or str(existing.get('reviewStatus') or '').lower() == 'rejected'
+            if existing_rejected:
+                continue
         embedding = face.get('embedding', [])
         if not isinstance(embedding, list):
             embedding = []
