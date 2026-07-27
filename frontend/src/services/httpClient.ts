@@ -1,63 +1,7 @@
 import axios, { type AxiosHeaders, type AxiosRequestConfig, type InternalAxiosRequestConfig } from 'axios';
 import { getAccessToken, isAuthEnabled } from './authClient';
 import { reportBackendReachable, reportBackendUnreachable } from './backendStatus';
-
-type ErrorLike = {
-    message?: unknown;
-    error?: unknown;
-    response?: {
-        data?: unknown;
-        status?: unknown;
-    };
-    code?: unknown;
-};
-
-const formatErrorPayload = (payload: unknown): string => {
-    if (payload == null) {
-        return '';
-    }
-    if (typeof payload === 'string') {
-        return payload;
-    }
-    if (typeof payload === 'number' || typeof payload === 'boolean') {
-        return String(payload);
-    }
-    if (Array.isArray(payload)) {
-        return payload.map((item) => formatErrorPayload(item)).filter(Boolean).join(', ');
-    }
-    if (typeof payload === 'object') {
-        const record = payload as { error?: unknown; message?: unknown };
-        const maybeMessage = record.error || record.message;
-        if (typeof maybeMessage === 'string' && maybeMessage.trim()) {
-            return maybeMessage;
-        }
-        try {
-            return JSON.stringify(payload);
-        } catch {
-            return '[object]';
-        }
-    }
-    return String(payload);
-};
-
-const getErrorMessage = (error: unknown): string => {
-    if (axios.isAxiosError(error)) {
-        return formatErrorPayload(error.response?.data) || error.message;
-    }
-
-    const maybeError = error as ErrorLike;
-    const responseMessage = maybeError?.response?.data;
-    const resolvedResponseMessage = formatErrorPayload(responseMessage);
-    if (resolvedResponseMessage) {
-        return resolvedResponseMessage;
-    }
-
-    if (typeof maybeError?.message === 'string' && maybeError.message.trim()) {
-        return maybeError.message;
-    }
-
-    return formatErrorPayload(error);
-};
+import { classifyApiError, newRequestId } from './apiError';
 
 const normalizePath = (url: string): string => {
     if (/^https?:\/\//i.test(url)) {
@@ -181,6 +125,9 @@ export const requestJson = async <T = any>(
     data?: unknown,
     config?: AxiosRequestConfig,
 ): Promise<T> => {
+    // One correlation id for the whole call, shared across cold-start retries,
+    // so a user-visible "ref" ties to a single logical request.
+    const requestId = newRequestId();
     const performRequest = async (): Promise<T> => {
         for (let attempt = 0; ; attempt += 1) {
             try {
@@ -202,14 +149,16 @@ export const requestJson = async <T = any>(
                     await sleep(COLD_START_BASE_DELAY_MS * 2 ** attempt);
                     continue;
                 }
-                // Terminal outcome: feed the app-wide availability tracker.
+                // Terminal outcome: classify once, then feed the app-wide
+                // availability tracker and throw the typed error to the caller.
+                const apiError = classifyApiError(error, requestId);
                 if (isBackendUnreachable(error)) {
-                    reportBackendUnreachable(getErrorMessage(error));
+                    reportBackendUnreachable(apiError.message);
                 } else if (!isCanceled(error)) {
                     // The app answered (an ordinary 4xx/5xx), so it is reachable.
                     reportBackendReachable();
                 }
-                throw getErrorMessage(error);
+                throw apiError;
             }
         }
     };

@@ -1446,7 +1446,7 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
 
 
 def _clustering_job_types() -> set:
-    return {'people_recluster', 'people_cluster'}
+    return {'people_recluster', 'people_cluster', 'people_propagate'}
 
 
 def _has_active_clustering_job(user_id: str) -> Optional[str]:
@@ -1501,6 +1501,33 @@ def _enqueue_clustering_job(
         app.logger.exception('Failed to enqueue clustering job %s', job_id)
         return {'status': 'failed', 'jobId': job_id}
     _upsert_job_status(job_id, user_id, 'clustering', 'queued', payload=payload or {})
+    return {'status': 'queued', 'jobId': job_id}
+
+
+def _enqueue_propagate_job(user_id: str, person_id: str) -> Dict[str, str]:
+    """Queue an asynchronous identity-propagation pass for a named person.
+
+    Reclaiming a person's faces from unnamed clusters scans the whole face table
+    (a past OOM driver), so it runs on the queue-scaled worker instead of blocking
+    the request that triggered it (e.g. a merge or label).
+    """
+    job_id = f"propagate:{user_id}:{uuid.uuid4().hex}"
+    if clustering_queue_client is None:
+        app.logger.warning('Clustering queue client is unavailable; propagate job %s was not enqueued', job_id)
+        return {'status': 'unavailable', 'jobId': job_id}
+    message = {
+        'jobId': job_id,
+        'correlationId': job_id,
+        'user_id': user_id,
+        'type': 'people_propagate',
+        'personId': person_id,
+    }
+    try:
+        clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
+    except Exception:
+        app.logger.exception('Failed to enqueue propagate job %s', job_id)
+        return {'status': 'failed', 'jobId': job_id}
+    _upsert_job_status(job_id, user_id, 'clustering', 'queued', payload={'personId': person_id})
     return {'status': 'queued', 'jobId': job_id}
 
 
@@ -2264,6 +2291,29 @@ def _update_person_entity(user_id: str, person_id: str, updates: Dict) -> bool:
         return True
     except Exception:
         return False
+
+
+def _batch_upsert_entities(table_client, entities: List[Dict], *, chunk_size: int = 100) -> None:
+    """Upsert entities in transactional batches instead of one round-trip each.
+
+    Azure Table transactions require every entity in a batch to share the same
+    PartitionKey and cap out at 100 operations, so callers must pass entities that
+    all live in one partition. Uses the same MERGE semantics as ``upsert_entity``
+    and falls back to per-entity upserts if a batch is rejected, so a single bad
+    row can never drop the rest.
+    """
+    if table_client is None or not entities:
+        return
+    for start in range(0, len(entities), chunk_size):
+        chunk = entities[start:start + chunk_size]
+        try:
+            table_client.submit_transaction([('upsert', entity) for entity in chunk])
+        except Exception:
+            for entity in chunk:
+                try:
+                    table_client.upsert_entity(entity)
+                except Exception:
+                    pass
 
 
 def _load_searchable_person_name_index(user_id: str) -> Dict[str, str]:
@@ -6432,40 +6482,64 @@ def merge_persons(person_id: str):
     # Safety-net write before the destructive phase (faceMap filled in later).
     _write_merge_record({}, str(base_snapshot.get('name') or ''))
 
+    # Collect every reassignment first, then flush the face writes in transactional
+    # batches (all faces share the user's partition) rather than one round-trip per
+    # face. Two things dominated the old per-face loop and are removed here:
+    #   * unlinking faces from the source clusters via _remove_face_from_person,
+    #     which recomputed each shrinking source's representative embedding once per
+    #     face — O(faces^2) work on clusters that are deleted moments later;
+    #   * a synchronous upsert per face.
+    merge_id_set = set(str(mid) for mid in merge_ids)
+    face_updates: Dict[str, Dict] = {}
+    external_removals: List[Tuple[str, str]] = []
+
     for mid in merge_ids:
         try:
             merged = person_table_client.get_entity(partition_key=user_id, row_key=mid)
-            try:
-                merged_face_ids = json.loads(merged.get('faceIds', '[]'))
-            except Exception:
-                merged_face_ids = []
-            for fid in merged_face_ids:
-                try:
-                    face_ent = face_table_client.get_entity(partition_key=user_id, row_key=fid)
-                    if _face_is_rejected(face_ent):
-                        continue
-                    current_owner = str(face_ent.get('personId') or '')
-                    face_map[fid] = mid
-                    base_face_ids.add(fid)
-                    if current_owner and current_owner != person_id:
-                        _remove_face_from_person(user_id, current_owner, fid)
-                    face_ent['personId'] = person_id
-                    face_ent['confirmedByUser'] = True
-                    face_ent['reviewStatus'] = 'confirmed'
-                    face_ent['rejected'] = False
-                    face_ent.pop('suspiciousReason', None)
-                    face_ent.pop('rejectedReason', None)
-                    face_ent.pop('rejectedAt', None)
-                    face_ent['confidence'] = max(float(face_ent.get('confidence', 0.0) or 0.0), 1.0)
-                    face_table_client.upsert_entity(face_ent)
-                except Exception:
-                    pass
-            try:
-                person_table_client.delete_entity(partition_key=user_id, row_key=mid)
-            except Exception:
-                pass
         except Exception:
             continue
+        try:
+            merged_face_ids = json.loads(merged.get('faceIds', '[]'))
+        except Exception:
+            merged_face_ids = []
+        for fid in merged_face_ids:
+            fid = str(fid)
+            if fid in face_updates:
+                continue
+            try:
+                face_ent = face_table_client.get_entity(partition_key=user_id, row_key=fid)
+            except Exception:
+                continue
+            if _face_is_rejected(face_ent):
+                continue
+            current_owner = str(face_ent.get('personId') or '')
+            face_map[fid] = mid
+            base_face_ids.add(fid)
+            # Only unlink faces that belong to some *other* person outside this
+            # merge. The source clusters (merge_id_set) are deleted wholesale below,
+            # so stripping faces off them individually is wasted work.
+            if current_owner and current_owner != person_id and current_owner not in merge_id_set:
+                external_removals.append((current_owner, fid))
+            face_ent['personId'] = person_id
+            face_ent['confirmedByUser'] = True
+            face_ent['reviewStatus'] = 'confirmed'
+            face_ent['rejected'] = False
+            face_ent.pop('suspiciousReason', None)
+            face_ent.pop('rejectedReason', None)
+            face_ent.pop('rejectedAt', None)
+            face_ent['confidence'] = max(float(face_ent.get('confidence', 0.0) or 0.0), 1.0)
+            face_updates[fid] = face_ent
+
+    for owner_id, fid in external_removals:
+        _remove_face_from_person(user_id, owner_id, fid)
+
+    _batch_upsert_entities(face_table_client, list(face_updates.values()))
+
+    for mid in merge_ids:
+        try:
+            person_table_client.delete_entity(partition_key=user_id, row_key=mid)
+        except Exception:
+            pass
 
     base_name = str(base.get('name') or '').strip()
     if _is_unnamed_name(base_name):
@@ -6503,21 +6577,36 @@ def merge_persons(person_id: str):
     _write_merge_record(face_map, final_target_name)
 
     # If the merged-into person is named, reuse its strengthened rep to reclaim
-    # matching faces still sitting in unnamed clusters. Best-effort.
+    # matching faces still sitting in unnamed clusters. That scans the entire face
+    # table (the slowest part of a merge, and a past OOM driver), so hand it to the
+    # queue-scaled worker instead of blocking this request; the reclaimed faces
+    # surface on the next refresh. If the queue is unavailable, fall back to running
+    # it inline so behaviour is unchanged when there is no worker.
     auto_assigned = 0
+    propagate_job_id = None
     try:
         final_person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
         final_name = str(final_person.get('name') or '').strip()
     except Exception:
         final_name = ''
     if final_name and not _is_unnamed_name(final_name):
-        try:
-            propagation = _propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
-            auto_assigned = int(propagation.get('autoAssignedCount') or 0)
-        except Exception:
-            app.logger.exception('Identity propagation after merge failed for %s', person_id)
+        queued = _enqueue_propagate_job(user_id, person_id)
+        if queued.get('status') == 'queued':
+            propagate_job_id = queued.get('jobId')
+        else:
+            try:
+                propagation = _propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
+                auto_assigned = int(propagation.get('autoAssignedCount') or 0)
+            except Exception:
+                app.logger.exception('Identity propagation after merge failed for %s', person_id)
 
-    return jsonify({'success': True, 'personId': person_id, 'mergeId': merge_id, 'autoAssignedFaces': auto_assigned})
+    return jsonify({
+        'success': True,
+        'personId': person_id,
+        'mergeId': merge_id,
+        'autoAssignedFaces': auto_assigned,
+        'propagateJobId': propagate_job_id,
+    })
 
 
 @app.route('/api/persons/merge/<merge_id>/undo', methods=['POST'])
@@ -7735,7 +7824,9 @@ def cancel_uploads():
 @app.route('/api/photos/', methods=['GET'])
 def list_photos():
     try:
-        sort = request.args.get('sort', 'date')
+        # Default to capture-date order so a request without an explicit sort opens
+        # on the most recently taken photos (matches the gallery's default view).
+        sort = request.args.get('sort', 'capture')
         offset = int(request.args.get('offset', '0'))
         limit = int(request.args.get('limit', '24'))
     except ValueError:
@@ -8814,6 +8905,27 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                         'done',
                         result=result_summary,
                     )
+    elif job_type == 'people_propagate':
+        person_id = str(payload.get('personId') or '')
+        if not person_id:
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'clustering', 'failed', error='missing personId')
+            return
+        try:
+            propagation = _propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
+        except Exception as exc:
+            worker_logger.exception('Async identity propagation failed for %s', person_id)
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'clustering', 'failed', error=str(exc))
+            return
+        if job_id:
+            _upsert_job_status(
+                job_id,
+                user_id,
+                'clustering',
+                'done',
+                result={'autoAssignedFaces': int(propagation.get('autoAssignedCount') or 0)},
+            )
 
 
 def run_clustering_worker() -> None:

@@ -8,6 +8,16 @@ type MergeListResponse = {
     merges?: unknown[];
 };
 
+type MergeResponse = {
+    success?: boolean;
+    personId?: string;
+    mergeId?: string;
+    // Identity propagation (reclaiming the target's faces from unnamed clusters)
+    // now runs asynchronously on the worker; present when that job was queued.
+    propagateJobId?: string | null;
+    autoAssignedFaces?: number;
+};
+
 type SuggestionListResponse = {
     suggestions?: unknown[];
 };
@@ -69,7 +79,7 @@ const labelPerson = async (personId: string, name: string) => {
 };
 
 const mergePersons = async (personId: string, mergeIds: string[]) => {
-    return await post(`/api/persons/${personId}/merge`, { mergeIds });
+    return await post<MergeResponse>(`/api/persons/${personId}/merge`, { mergeIds });
 };
 
 const undoMerge = async (mergeId: string) => {

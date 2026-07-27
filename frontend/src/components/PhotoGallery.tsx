@@ -3,6 +3,8 @@ import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizo
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { useLocation } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
+import { isApiError } from '../services/apiError';
+import { notifyApiError } from '../services/requestFeedback';
 import { getActiveLibraryFromToken } from '../services/passwordAuthClient';
 import {
     ARCFACE_EMBEDDING_DIMENSIONS,
@@ -60,6 +62,10 @@ const coldStartRetryDelayMs = (attempt: number) => Math.min(2000 * attempt, 8000
 const isColdStartError = (err: unknown): boolean => {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
         return true;
+    }
+    // A typed ApiError already tells us the backend was never reached.
+    if (isApiError(err)) {
+        return err.kind === 'unreachable' || err.kind === 'timeout';
     }
     const message = typeof err === 'string'
         ? err
@@ -3642,7 +3648,12 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [error, setError] = useState<string | null>(null);
     const [warmingUp, setWarmingUp] = useState<boolean>(false);
     const [searchNotice, setSearchNotice] = useState<string | null>(null);
-    const [sortBy, setSortBy] = useState<string>(cachedBoot?.sortBy || 'date');
+    // Default to capture-date order ("Captured") so the gallery opens on the most
+    // recently *taken* photos. Upload date ("Recent") is a poor proxy for recency
+    // in a bulk-imported library — every photo finalizes at roughly the same
+    // instant, so that sort collapses to its filename tie-break and reads oldest
+    // first. A returning session still restores whatever sort the user last chose.
+    const [sortBy, setSortBy] = useState<string>(cachedBoot?.sortBy || 'capture');
     const [offset, setOffset] = useState<number>(cachedBoot?.offset || 0);
     const [hasMore, setHasMore] = useState<boolean>(cachedBoot?.hasMore ?? true);
     const [searchInput, setSearchInput] = useState<string>(cachedBoot?.searchQuery || '');
@@ -3667,6 +3678,15 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const didInitialRevalidateRef = useRef<boolean>(false);
     const PAGE_SIZE = 24;
     const getUserFacingFetchError = (err: unknown): string => {
+        if (isApiError(err)) {
+            if (err.status === 401 || err.status === 403) {
+                return 'Please sign in to view photos.';
+            }
+            if (isColdStartError(err)) {
+                return 'The server is taking longer than usual to respond — it may be waking up after a period of inactivity. Please try again in a moment.';
+            }
+            return err.kind === 'server' ? 'Unable to load photos — something went wrong on our end. Please try again.' : err.message;
+        }
         if (typeof err === 'string') {
             const normalized = err.toLowerCase();
             if (normalized.includes('401') || normalized.includes('unauthorized')) {
@@ -3715,7 +3735,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             await post(`/photos/${filename}/rating`, { rating });
         } catch (err) {
             patchPhoto(filename, { rating: previous?.rating ?? 0 });
-            setError('Failed to save rating');
+            notifyApiError(err, { context: 'Couldn’t save rating.', retry: () => handleRatePhoto(filename, rating) });
         }
     };
 
@@ -3727,7 +3747,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             await post(`/photos/${encodeURIComponent(filename)}/rotation`, { rotation });
         } catch (err) {
             patchPhoto(filename, { rotation: previous?.rotation ?? 0 });
-            setError('Failed to save rotation');
+            notifyApiError(err, { context: 'Couldn’t save rotation.', retry: () => handleSaveRotation(filename, rotation) });
         }
     };
 
@@ -3747,7 +3767,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             patchPhoto(filename, { likes: response.likes, liked: response.liked });
         } catch (err) {
             patchPhoto(filename, { liked: previous?.liked ?? false, likes: previous?.likes ?? 0 });
-            setError('Failed to toggle like');
+            notifyApiError(err, { context: 'Couldn’t update like.', retry: () => handleToggleLike(filename) });
         }
     };
 

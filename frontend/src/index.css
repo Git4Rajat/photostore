@@ -2247,6 +2247,20 @@ a {
   background: var(--lg-surface);
 }
 
+.people-suggestion-row.is-selected {
+  border-color: rgba(20, 120, 255, 0.6);
+  box-shadow: 0 0 0 2px rgba(20, 120, 255, 0.16);
+}
+
+/* The row's select checkbox reuses .person-select for its hidden-input +
+   checked-indicator styling, but inside the horizontal suggestion row it must
+   sit inline at the start rather than float absolutely like on a cluster tile. */
+.people-suggestion-row .person-select {
+  position: static;
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+
 .people-suggestion-faces {
   display: flex;
   align-items: center;

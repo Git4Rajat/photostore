@@ -7,6 +7,7 @@ import faceService from '../services/faceService';
 import { getUploadJson, resolveApiUrl } from '../services/apiClient';
 import { fetchProtectedBlobUrl } from '../services/imageClient';
 import { showToast } from '../services/toast';
+import { notifyApiError } from '../services/requestFeedback';
 import { isAuthEnabled } from '../services/authClient';
 import { useNavigate } from 'react-router-dom';
 import type { FlatFace, MergeHistoryItem, PersonFace, PersonSummary, SuggestionItem } from '../types/people';
@@ -189,6 +190,8 @@ const FaceClusters: React.FC = () => {
     const [facesLoaded, setFacesLoaded] = useState(false);
     const [facesLoading, setFacesLoading] = useState(false);
     const [selectedFaces, setSelectedFaces] = useState<Record<string, boolean>>({});
+    // Multi-select for the Suggestions panel, keyed by `${sourceId}::${targetId}`.
+    const [selectedSuggestions, setSelectedSuggestions] = useState<Record<string, boolean>>({});
     const navigate = useNavigate();
     const busy = initialLoading || actionLoading;
 
@@ -345,6 +348,23 @@ const FaceClusters: React.FC = () => {
         return persons.find((p) => p.personId === personId)?.representativeFace;
     };
 
+    const suggestionKey = (suggestion: SuggestionItem) => (
+        `${getSuggestionPersonId(suggestion.sourcePersonId)}::${getSuggestionPersonId(suggestion.targetPersonId)}`
+    );
+
+    const toggleSuggestion = (key: string) => {
+        setSelectedSuggestions((prev) => ({ ...prev, [key]: !prev[key] }));
+    };
+
+    const deselectSuggestion = (key: string) => {
+        setSelectedSuggestions((prev) => {
+            if (!prev[key]) return prev;
+            const next = { ...prev };
+            delete next[key];
+            return next;
+        });
+    };
+
     const removePersonsFromState = (personIds: string[]) => {
         const removeSet = new Set(personIds);
         setPersons(prev => prev.filter(person => !removeSet.has(person.personId)));
@@ -477,7 +497,7 @@ const FaceClusters: React.FC = () => {
             void refreshSupportData();
         } catch (e: unknown) {
             setStatus(String(e));
-            showToast(String(e));
+            notifyApiError(e, { context: 'Couldn’t delete faces.', retry: () => performFaceDelete(faceIds, label) });
         } finally {
             setActionLoading(false);
         }
@@ -519,43 +539,96 @@ const FaceClusters: React.FC = () => {
         }
     };
 
-    const handleMergeSuggestion = async (targetId: string, sourceId: string, label: string) => {
+    // After a merge only the History (for Undo) needs re-fetching. The suggestions
+    // list is updated optimistically, so we deliberately do NOT refetch it here —
+    // that full refetch (refreshSupportData) is what made the whole Suggestions
+    // section visibly reload after every merge.
+    const refreshMergeHistory = async () => {
+        try {
+            const m = await faceService.listMerges();
+            setMerges((m.merges || []) as MergeHistoryItem[]);
+        } catch {
+            // History is non-critical; ignore transient refresh failures.
+        }
+    };
+
+    // Resync suggestions + people from the server. Used only on the rare error
+    // path, to roll back an optimistic change the server ended up rejecting.
+    const resyncAfterSuggestionError = () => {
+        void refreshSupportData();
+        void loadPersons(searchQuery.trim(), false);
+    };
+
+    // Merge one suggestion. Optimistic and non-blocking: the row disappears and the
+    // people list updates immediately, then the network call runs in the background
+    // so the user can keep approving other suggestions without waiting. No global
+    // spinner and no confirm dialog — a suggestion's Merge button IS the
+    // confirmation, and every merge is reversible from History.
+    const handleMergeSuggestion = async (targetId: string, sourceId: string) => {
         if (!targetId || !sourceId) return;
-        if (!(await confirmDialog({
-            title: 'Merge people',
-            message: `Merge ${label} into ${getPersonLabel(targetId)}?`,
-            confirmLabel: 'Merge',
-        }))) return;
-        setActionLoading(true);
+        applyMergeToState(targetId, [sourceId]);
+        deselectSuggestion(`${sourceId}::${targetId}`);
         try {
             const res = await faceService.mergePersons(targetId, [sourceId]);
             setLastMergeId(res.mergeId || null);
-            applyMergeToState(targetId, [sourceId]);
-            showToast('Merge completed');
-            void refreshSupportData();
-        } catch (e: any) {
-            setStatus(String(e));
+            showToast('Merged');
+            void refreshMergeHistory();
+        } catch (e: unknown) {
             showToast(String(e));
-        } finally {
-            setActionLoading(false);
+            resyncAfterSuggestionError();
         }
+    };
+
+    // Approve every selected suggestion at once. Rows are removed up-front and the
+    // merges run concurrently, so the section stays responsive during a batch.
+    const handleApproveSelectedSuggestions = async () => {
+        const chosen = suggestions.filter((s) => selectedSuggestions[suggestionKey(s)]);
+        if (chosen.length === 0) return;
+        chosen.forEach((s) => applyMergeToState(s.targetPersonId || '', [s.sourcePersonId || '']));
+        setSelectedSuggestions({});
+        const results = await Promise.allSettled(
+            chosen.map((s) => faceService.mergePersons(s.targetPersonId || '', [s.sourcePersonId || ''])),
+        );
+        const failed = results.filter((r) => r.status === 'rejected').length;
+        const lastOk = [...results].reverse().find(
+            (r): r is PromiseFulfilledResult<{ mergeId?: string }> => r.status === 'fulfilled',
+        );
+        if (lastOk) setLastMergeId(lastOk.value?.mergeId || null);
+        const done = chosen.length - failed;
+        showToast(failed ? `Merged ${done}, ${failed} failed` : `Merged ${done} suggestion${done === 1 ? '' : 's'}`);
+        void refreshMergeHistory();
+        if (failed) resyncAfterSuggestionError();
     };
 
     const handleDeclineSuggestion = async (sourceId: string, targetId: string) => {
         if (!sourceId || !targetId) return;
-        setActionLoading(true);
+        // Optimistic removal keeps the section responsive; resync on failure.
+        setSuggestions((prev) => prev.filter((s) => (
+            !(getSuggestionPersonId(s.sourcePersonId) === sourceId && getSuggestionPersonId(s.targetPersonId) === targetId)
+        )));
+        deselectSuggestion(`${sourceId}::${targetId}`);
         try {
             await faceService.declineSuggestion(sourceId, targetId);
-            setSuggestions((prev) => prev.filter((s) => (
-                !(getSuggestionPersonId(s.sourcePersonId) === sourceId && getSuggestionPersonId(s.targetPersonId) === targetId)
-            )));
             showToast('Suggestion declined');
-        } catch (e: any) {
-            setStatus(String(e));
+        } catch (e: unknown) {
             showToast(String(e));
-        } finally {
-            setActionLoading(false);
+            void refreshSupportData();
         }
+    };
+
+    const handleDeclineSelectedSuggestions = async () => {
+        const chosen = suggestions.filter((s) => selectedSuggestions[suggestionKey(s)]);
+        if (chosen.length === 0) return;
+        const chosenKeys = new Set(chosen.map((s) => suggestionKey(s)));
+        setSuggestions((prev) => prev.filter((s) => !chosenKeys.has(suggestionKey(s))));
+        setSelectedSuggestions({});
+        const results = await Promise.allSettled(
+            chosen.map((s) => faceService.declineSuggestion(s.sourcePersonId || '', s.targetPersonId || '')),
+        );
+        const failed = results.filter((r) => r.status === 'rejected').length;
+        const done = chosen.length - failed;
+        showToast(failed ? `Declined ${done}, ${failed} failed` : `Declined ${done} suggestion${done === 1 ? '' : 's'}`);
+        if (failed) void refreshSupportData();
     };
 
     const handleDeletePerson = async (personId: string, label: string) => {
@@ -655,7 +728,11 @@ const FaceClusters: React.FC = () => {
         setActionLoading(true);
         try {
             const res = await faceService.mergePersons(mergeTarget, mergeIds);
-            setStatus('Merge completed. You can undo the merge.');
+            // Reclaiming matching faces from unnamed clusters now runs in the
+            // background (see propagateJobId); tell the user to refresh for it.
+            setStatus(res.propagateJobId
+                ? 'Merge completed. Finding more matching faces in the background — refresh shortly to see them. You can undo the merge.'
+                : 'Merge completed. You can undo the merge.');
             showToast('Merge completed');
             setLastMergeId(res.mergeId || null);
             applyMergeToState(mergeTarget, mergeIds);
@@ -693,6 +770,19 @@ const FaceClusters: React.FC = () => {
         } finally {
             setActionLoading(false);
         }
+    };
+
+    const selectedSuggestions_list = suggestions.filter((s) => selectedSuggestions[suggestionKey(s)]);
+    const selectedSuggestionCount = selectedSuggestions_list.length;
+    const allSuggestionsSelected = suggestions.length > 0 && selectedSuggestionCount === suggestions.length;
+    const toggleSelectAllSuggestions = () => {
+        if (allSuggestionsSelected) {
+            setSelectedSuggestions({});
+            return;
+        }
+        const next: Record<string, boolean> = {};
+        suggestions.forEach((s) => { next[suggestionKey(s)] = true; });
+        setSelectedSuggestions(next);
     };
 
     return (
@@ -1023,6 +1113,36 @@ const FaceClusters: React.FC = () => {
                         <div className="people-panel-title">Suggestions</div>
                         <div className="people-panel-meta">Faces suggested to merge</div>
                     </div>
+                    <div className="people-merge-strip">
+                        <div className="people-merge-count">{selectedSuggestionCount} selected</div>
+                        <button
+                            className="people-secondary-btn"
+                            disabled={suggestions.length === 0}
+                            onClick={toggleSelectAllSuggestions}
+                            type="button"
+                        >
+                            <CheckIcon />
+                            <span>{allSuggestionsSelected ? 'Clear all' : 'Select all'}</span>
+                        </button>
+                        <button
+                            className="people-merge-btn"
+                            disabled={selectedSuggestionCount === 0}
+                            onClick={() => void handleApproveSelectedSuggestions()}
+                            type="button"
+                        >
+                            <ArrowsRightLeftIcon />
+                            <span>Approve {selectedSuggestionCount || ''}</span>
+                        </button>
+                        <button
+                            className="people-secondary-btn people-suggestion-decline"
+                            disabled={selectedSuggestionCount === 0}
+                            onClick={() => void handleDeclineSelectedSuggestions()}
+                            type="button"
+                        >
+                            <NoSymbolIcon />
+                            <span>Decline {selectedSuggestionCount || ''}</span>
+                        </button>
+                    </div>
                     <div className="people-suggestion-list">
                         {pagedSuggestions.map((s) => {
                             const sourceLabel = getPersonLabel(s.sourcePersonId);
@@ -1030,8 +1150,19 @@ const FaceClusters: React.FC = () => {
                             const sourceFace = getSuggestionFace(s, 'source');
                             const targetFace = getSuggestionFace(s, 'target');
                             const score = typeof s.similarity === 'number' ? s.similarity : 0;
+                            const rowKey = suggestionKey(s);
                             return (
-                                <div key={`${s.sourcePersonId}-${s.targetPersonId}`} className="people-suggestion-row">
+                                <div key={`${s.sourcePersonId}-${s.targetPersonId}`} className={`people-suggestion-row ${selectedSuggestions[rowKey] ? 'is-selected' : ''}`}>
+                                    <label className="person-select" title="Select suggestion">
+                                        <input
+                                            type="checkbox"
+                                            checked={!!selectedSuggestions[rowKey]}
+                                            onChange={() => toggleSuggestion(rowKey)}
+                                        />
+                                        <span className="person-select-indicator">
+                                            <CheckIcon />
+                                        </span>
+                                    </label>
                                     <div className="people-suggestion-faces">
                                         <button
                                             className="people-suggestion-face"
@@ -1072,7 +1203,7 @@ const FaceClusters: React.FC = () => {
                                         <button
                                             className="people-merge-btn"
                                             disabled={busy}
-                                            onClick={() => handleMergeSuggestion(s.targetPersonId || '', s.sourcePersonId || '', sourceLabel)}
+                                            onClick={() => void handleMergeSuggestion(s.targetPersonId || '', s.sourcePersonId || '')}
                                             type="button"
                                             aria-label="Merge suggestion"
                                         >
