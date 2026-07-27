@@ -93,6 +93,7 @@ const getAccessKindForPath = (path: string): 'image' | 'preview' | 'thumbnail' =
 };
 
 const isProtectedProxyPath = (path: string) => path.startsWith('/api/') || path.startsWith('/public/');
+const isAbsoluteHttpUrl = (path: string) => /^https?:\/\//i.test(path);
 
 const fetchPublicBlobUrl = async (path: string): Promise<string> => {
     const response = await fetch(resolveApiUrl(path), { mode: 'cors', credentials: 'omit' });
@@ -183,7 +184,12 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         : undefined;
     const imageUrl = activePhoto && mainMediaPath
         ? (shouldProtect
-            ? (scopedMediaUrls[mainMediaPath] || resolvedUrls[mainMediaPath])
+            // Signed storage URLs are already directly browser-fetchable and do
+            // not need scoped proxy resolution; using them directly prevents
+            // the viewer from waiting forever on an unresolved cache key.
+            ? (isAbsoluteHttpUrl(mainMediaPath)
+                ? mainMediaPath
+                : (scopedMediaUrls[mainMediaPath] || resolvedUrls[mainMediaPath]))
             : resolveApiUrl(mainMediaPath))
         : '';
 
