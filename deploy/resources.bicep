@@ -1,0 +1,600 @@
+// Photostore — resource module (resource-group scoped).
+//
+// Provisions everything needed to run Photostore, pulling PUBLIC prebuilt
+// container images from GitHub Container Registry (ghcr.io). No build step, no
+// private registry, no CLI required. This module is invoked by main.bicep,
+// which creates the resource group at subscription scope and deploys this into
+// it — so the "Deploy to Azure" button never asks the user to pick a group.
+//
+// Deploys (into the resource group created by main.bicep):
+//   - a Storage account with blob containers (images/thumbnails/covers);
+//     metadata tables are created automatically by the app on first use
+//   - a Container Apps environment (+ Log Analytics workspace)
+//   - backend, frontend, and worker container apps
+//   - role assignments so the apps reach storage via managed identity
+//
+// Sign-in uses a single owner email + password that you set right here in the
+// deploy form. Password recovery is emailed via Azure Communication Services
+// (provisioned below, no DNS setup required).
+
+@description('Base name used as a prefix for resources. Lowercase letters and numbers work best.')
+@minLength(3)
+@maxLength(17)
+param appName string = 'photostore'
+
+@description('Azure region for all resources. Defaults to the resource group location.')
+param location string = resourceGroup().location
+
+@description('Your login email. Used to sign in and to receive password-reset emails.')
+param adminEmail string
+
+@description('Your login password (at least 8 characters). You can change it later inside the app.')
+@minLength(8)
+@secure()
+param adminPassword string
+
+@description('Where Azure Communication Services stores email data. Pick the option closest to you.')
+@allowed([
+  'United States'
+  'Europe'
+  'Australia'
+  'United Kingdom'
+])
+param emailDataLocation string = 'United States'
+
+@description('Public backend image. Override only if you publish your own fork\'s images.')
+param backendImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
+
+@description('Public frontend image. Override only if you publish your own fork\'s images.')
+param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
+
+@description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
+@secure()
+param sessionSecretParam string = '${newGuid()}${newGuid()}'
+
+var suffix = uniqueString(resourceGroup().id)
+// Secret used to sign login sessions. High-entropy random value (two GUIDs,
+// ~244 bits) generated once at deploy time — NOT derived from uniqueString,
+// which is deterministic and predictable from public resource metadata.
+var sessionSecret = sessionSecretParam
+var storageAccountName = take(toLower(replace('${appName}${suffix}', '-', '')), 24)
+
+var environmentName = '${appName}-env'
+var backendAppName = '${appName}-backend'
+var frontendAppName = '${appName}-frontend'
+var workerAppName = '${appName}-worker'
+
+// Built-in role definition IDs for storage data-plane access.
+var roleBlobContributor = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+var roleTableContributor = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+var roleQueueContributor = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
+var roleBlobDelegator = 'db58b8e5-c6ad-4a2a-8342-4190687cbf4a'
+var storageRoleIds = [
+  roleBlobContributor
+  roleTableContributor
+  roleQueueContributor
+  roleBlobDelegator
+]
+
+// Frontend URL is predicted from the environment's default domain so the
+// backend can reference it without a circular dependency.
+var frontendUrl = 'https://${frontendAppName}.${managedEnvironment.properties.defaultDomain}'
+
+// ---------------------------------------------------------------------------
+// Azure Communication Services — email for password recovery.
+// Uses an Azure-managed sender domain (donotreply@<generated>.azurecomm.net),
+// so there is NO DNS to configure. The backend sends via the connection string.
+// ---------------------------------------------------------------------------
+resource emailService 'Microsoft.Communication/emailServices@2023-04-01' = {
+  name: '${appName}-email'
+  location: 'global'
+  properties: {
+    dataLocation: emailDataLocation
+  }
+}
+
+resource emailDomain 'Microsoft.Communication/emailServices/domains@2023-04-01' = {
+  parent: emailService
+  name: 'AzureManagedDomain'
+  location: 'global'
+  properties: {
+    domainManagement: 'AzureManaged'
+    userEngagementTracking: 'Disabled'
+  }
+}
+
+resource communicationService 'Microsoft.Communication/communicationServices@2023-04-01' = {
+  name: '${appName}-comm'
+  location: 'global'
+  properties: {
+    dataLocation: emailDataLocation
+    linkedDomains: [ emailDomain.id ]
+  }
+}
+
+// Sender address on the auto-provisioned managed domain.
+var acsSenderAddress = 'DoNotReply@${emailDomain.properties.fromSenderDomain}'
+var acsConnectionString = communicationService.listKeys().primaryConnectionString
+
+resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: storageAccountName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    accessTier: 'Hot'
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+    allowBlobPublicAccess: false
+    defaultToOAuthAuthentication: true
+    // The app authenticates to storage exclusively via managed identity and
+    // user-delegation SAS, so account/shared keys are never needed. Disabling
+    // them removes an entire class of credential-leak risk.
+    allowSharedKeyAccess: false
+  }
+}
+
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  parent: storage
+  name: 'default'
+  properties: {
+    // The browser uploads files directly to blob storage via a SAS URL, so the
+    // blob endpoint must allow cross-origin PUT/OPTIONS from the frontend only.
+    cors: {
+      corsRules: [
+        {
+          allowedOrigins: [ frontendUrl ]
+          allowedMethods: [ 'GET', 'HEAD', 'PUT', 'OPTIONS', 'POST' ]
+          allowedHeaders: [ '*' ]
+          exposedHeaders: [ '*' ]
+          maxAgeInSeconds: 3600
+        }
+      ]
+    }
+  }
+}
+
+resource containers 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = [
+  for name in ['images', 'thumbnails', 'covers']: {
+    parent: blobService
+    name: name
+    properties: {
+      publicAccess: 'None'
+    }
+  }
+]
+
+resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
+  name: environmentName
+  location: location
+  properties: {}
+}
+
+// Shared backend/worker environment variables.
+var backendEnv = [
+  { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
+  { name: 'USE_MANAGED_IDENTITY', value: 'true' }
+  // 'sas': browsers fetch media straight from blob storage via short-lived
+  // read SAS URLs. Proxying media bytes through the backend was the largest
+  // compute cost in the deployment.
+  { name: 'MEDIA_URL_MODE', value: 'sas' }
+  { name: 'MAX_UPLOAD_FILE_BYTES', value: '5368709120' }
+  { name: 'BLOB_IMAGE_CONTAINER', value: 'images' }
+  { name: 'BLOB_THUMBNAIL_CONTAINER', value: 'thumbnails' }
+  { name: 'BLOB_COVER_CONTAINER', value: 'covers' }
+  { name: 'METADATA_TABLE', value: 'photometadata' }
+  { name: 'ALBUMS_TABLE', value: 'photoalbums' }
+  { name: 'PUBLIC_ALBUM_ATTEMPTS_TABLE', value: 'publicalbumattempts' }
+  { name: 'ALLOWED_ORIGINS', value: '*' }
+  { name: 'AUTH_REQUIRED', value: 'true' }
+  { name: 'AUTH_MODE', value: 'password' }
+  { name: 'OWNER_EMAIL', value: adminEmail }
+  { name: 'ACS_SENDER_ADDRESS', value: acsSenderAddress }
+  { name: 'PUBLIC_APP_BASE_URL', value: frontendUrl }
+  { name: 'SPA_BASE_URL', value: frontendUrl }
+  { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
+  { name: 'BROWSER_ONLY_PROCESSING', value: 'true' }
+  // v3 drops the 128-d face-api descriptor concatenated onto ArcFace's 512-d
+  // output (it diluted ArcFace's signal) and 5-point-landmark-aligns the crop
+  // fed to ArcFace instead of using a plain padded box. v2 stays in the
+  // backend's allowed-versions set (FACE_CLUSTER_LEGACY_HYBRID_VERSION in
+  // backend/app.py) so already-processed v2 faces keep clustering fine while
+  // the library re-embeds via the self-healing stale-version re-embed.
+  // -guarded (2026-07-31): same v3 pipeline, but cropFaceCanvas now rejects a
+  // geometrically-implausible 5-point solve and falls back instead of
+  // trusting it, plus each face is tagged with which alignment tier it got
+  // (alignmentMethod). Old v3 stays allowed
+  // (FACE_CLUSTER_LEGACY_ALIGNED_V3_VERSION) so it keeps clustering during
+  // the transition.
+  // -diag (2026-07-31, same day): real-world testing found alignmentMethod
+  // ='none' on 100% of faces post-guard, with zero visibility into why,
+  // because detectFaceLandmarks silently swallowed its own errors. Removed
+  // that catch and added alignmentFailureReason to capture the real cause.
+  // -fixed (2026-07-31, same day): -diag's captured error was
+  // "faceapi_model_load_failed: No backend found in registry" --
+  // loadFaceApiSession called tf.setBackend('cpu') without ever importing
+  // '@tensorflow/tfjs-backend-cpu' (tfjs backends only self-register via that
+  // import's side effect), silently relying on an unrelated init path (the
+  // browser-AI tagging feature) to have already done it. Fixed by importing
+  // it directly in loadFaceApiSession.
+  // -fixed2 (2026-07-31, same day): -fixed got past that error but hit a new
+  // one one layer deeper, again via alignmentFailureReason: "e.toFloat is
+  // not a function". face-api.js's bundled code (built against
+  // tfjs-core@1.7.0) calls legacy convenience cast methods removed from this
+  // app's deduped tfjs-core@4.22.0 (only .cast(dtype) remains). Added a
+  // one-time compat shim restoring toFloat/toInt/toBool as thin .cast()
+  // wrappers (faceApiRuntime.ts).
+  // -fixed3 (2026-07-31, same day): -fixed2's shim only covered casts; the
+  // very next call in the same chain hit "e.as4D is not a function". Checked
+  // directly: tfjs-core@4.22.0 removed essentially ALL chainable Tensor op
+  // methods (257 of them), not just casts, in favor of top-level functional
+  // calls. faceApiRuntime.ts now generically restores every tf.<op> as an
+  // instance method forwarding to its top-level call, plus explicit mappings
+  // for the few with no same-named equivalent (as1D..as5D -> tf.reshape,
+  // resizeBilinear -> tf.image.resizeBilinear).
+  // -fixed4 (2026-07-31, same day): -fixed3 was verified against a real
+  // production crop before shipping, yet the real deploy still hit a 3rd
+  // error: "Size(136) must match the product of shape" (an empty shape).
+  // Isolated directly: as1D() is called with ZERO args in legacy usage
+  // ("flatten to 1D, infer size"), unlike as2D..as5D which always take
+  // explicit dims -- the generic shim forwarded the empty args array to
+  // tf.reshape(this, []), targeting a scalar instead. Fixed by special-
+  // casing as1D to reshape to [this.size].
+  // -fixed5 (2026-07-31, same day): -fixed4 finally got real landmarks
+  // end-to-end (no more crashes), but 24/25 faces landed on
+  // alignmentMethod='landmark-2pt' rather than 'landmark-5pt'. The
+  // ARC_FACE_MIN_SCALE/MAX_SCALE guard bounds (PhotoGallery.tsx) were
+  // copied from the old 2-point path's different target-eye-distance
+  // convention -- for the 5-point path's actual crop convention (padded
+  // full face bbox, not tight eye-only), a geometrically correct solve
+  // legitimately scores 0.08-0.25, so the guard rejected nearly every real
+  // transform. Confirmed directly against 6 real production faces and
+  // recalibrated to 0.03-0.6.
+  // -fixed6 (2026-07-31, same day): real cross-photo testing on confirmed-
+  // same-person faces showed the 2-point eye-only fallback actively hurts
+  // matches -- mixing it with 5-point-aligned embeddings in the same
+  // clustering pool scored near-zero similarity for genuinely identical
+  // people, purely from the alignment-tier mismatch. Removed the 2-point
+  // fallback from the browser pipeline entirely; backend
+  // _face_embedding_allowed_for_clustering now also requires
+  // alignmentMethod=='landmark-5pt'. One embedding quality tier in the
+  // matching pool.
+  // -fixed7 (2026-07-31, same day): -fixed6's guard (ARC_FACE_MAX_SCALE=0.6)
+  // was too tight -- a confirmed-real, downward-tilted face measured 0.68
+  // and was wrongly rejected. Raised to 0.9. REVERTED in -fixed8 below.
+  // -fixed8 (2026-07-31, same day): -fixed7 was reverted. Real ArcFace
+  // embedding testing (actual model inference via onnxruntime-node locally,
+  // not just checking the transform's numbers look plausible) proved
+  // 5-point alignment for that same downward-tilt case scored only
+  // 0.19-0.28 same-person similarity -- WORSE than a plain unaligned crop
+  // (0.56-0.68) or the 2-point eyes-only fallback (0.51-0.55). Forcing a
+  // severely pitched face into a frontal template distorts it more than
+  // leaving it alone. MAX_SCALE reverted to 0.6, and the 2-point fallback
+  // (PhotoGallery.tsx cropFaceCanvas) is restored as a genuinely separate
+  // quality tier, not a last resort. Backend
+  // _face_embedding_allowed_for_clustering now accepts both landmark-5pt
+  // and landmark-2pt; _build_people_recluster_plan clusters each tier in
+  // its own DBSCAN pass with its own epsilon (PEOPLE_CLUSTER_EPS_2PT=0.60
+  // for 2pt) and never compares the two tiers directly against each other
+  // (cross-tier same-person comparisons measured 0.09-0.56 --
+  // indistinguishable from noise). Still-open TODO: visually validate
+  // ARC_FACE_5POINT_TEMPLATE's target coordinates against real aligned
+  // crops.
+  // -adaface1 (2026-07-31): swapped the embedding model (ArcFace resnet100
+  // -> AdaFace IR-101/WebFace4M, MIT license). Even -fixed8's tier-aware
+  // clustering can't fix a case where the pose gap is real, not an
+  // alignment artifact: a confirmed same-person pair at a genuine
+  // head-turn scored only 0.29 on ArcFace's best (5-point) tier.
+  // Head-to-head on identical crops (onnxruntime-node harness): AdaFace
+  // scored 0.68 on that pair vs ArcFace's 0.31, 0.82-0.85 on a
+  // moderate-pose trio vs 0.56-0.67, while an easy frontal pair stayed
+  // near ceiling for both (0.89 vs 0.86) -- the gain is concentrated in
+  // hard-pose cases. Unlike every prior bump above, this is a different
+  // model producing a different 512-d embedding space, not a different
+  // alignment/guard behavior on the same one -- see the comment on
+  // _face_embedding_allowed_versions() in backend/app.py for why no
+  // ArcFace-family version carries forward this time (same dimension, but
+  // not cosine-comparable). PEOPLE_CLUSTER_EPS/PEOPLE_MATCH_THRESHOLD below
+  // are left as-is for now (untested on AdaFace's real distribution);
+  // recalibrate from live data once the library has re-embedded, same as
+  // every previous embedding-version bump.
+  // -adaface1-fixed (2026-07-31, same day): -adaface1's rollout never took
+  // effect. The browser reads the model URL from window.__APP_CONFIG__.
+  // arcFaceModelUrl, injected at container start by docker-entrypoint.sh,
+  // which falls back to the OLD arcface path unless
+  // APP_CONFIG_ARC_FACE_MODEL_URL is set -- it wasn't pinned below, so the
+  // browser kept loading the old ArcFace model despite the code/version
+  // change. Confirmed directly: faces relabeled to -adaface1 post-deploy had
+  // cosine similarities bit-identical (4 decimals, 4 pairs) to their
+  // pre-swap ArcFace values. Fixed by adding the
+  // APP_CONFIG_ARC_FACE_MODEL_URL pin on the frontend container app (below)
+  // and correcting the Dockerfile/docker-entrypoint.sh hardcoded fallbacks.
+  // Re-bumped rather than just fixing the config, since every face already
+  // carries the -adaface1 label and the staleness check alone would never
+  // trigger a real re-embed.
+  { name: 'FACE_CLUSTER_EMBEDDING_VERSION', value: 'browser-adaface-ir101-v1-fixed' }
+  { name: 'PEOPLE_CLUSTER_EPS_2PT', value: '0.60' }
+  { name: 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', value: '512' }
+  { name: 'SUSPICIOUS_FACE_CONFIDENCE', value: '0.75' }
+  // Lowered from 0.55 (2026-08-01): this was a hard reject floor calibrated for
+  // the pre-YOLOv8n-face detector, never revisited after the swap. YOLO's own
+  // detection threshold is 0.35 (yoloFaceDetectionRuntime.ts) and its real-world
+  // confidence for genuine, visible faces was directly measured (onnxruntime
+  // against actual uploaded bytes) at 0.43-0.57 for a batch of otherwise-normal
+  // photos -- all of which this 0.55 floor was silently hard-rejecting into
+  // face_status='no_data' with zero visibility. 0.55 also inverted the
+  // function's own intended tiering: it sat ABOVE FACE_LOW_CONFIDENCE_REJECT_BELOW
+  // (0.36), making the area/side-ratio "curtain false positive" soft-check in
+  // _client_face_passes_quality_gate permanently unreachable dead code (the hard
+  // floor always resolved the decision first). 0.30 restores min_store <
+  // reject_below and comfortably accepts the measured real-face range.
+  { name: 'FACE_MIN_STORE_CONFIDENCE', value: '0.30' }
+  { name: 'FACE_LOW_CONFIDENCE_REJECT_BELOW', value: '0.36' }
+  { name: 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', value: '0.08' }
+  { name: 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', value: '0.42' }
+  // Face clustering operating point — recalibrated 2026-07-31 against the real
+  // browser-arcface-aligned-v3 (5-point aligned, ArcFace-only) similarity
+  // distribution measured on live data after the v3 embedding rollout: the
+  // different-people ceiling (same-photo pairs, p99) dropped from ~0.59 under
+  // v2 to ~0.46 under v3, and the best genuine cross-day same-person
+  // candidate found rose from 0.613 (v2) to 0.625 (v3) — a real widening of
+  // the gap (~0.02 under v2 vs ~0.15-0.17 under v3). The previous pins
+  // (eps=0.38/absMax=0.36/match=0.66/assign=0.68) were calibrated against the
+  // tighter v2 gap and left that 0.625 candidate un-mergeable: it clears eps
+  // but the TIGHTER absolute_max_pair_distance ceiling (the real bar for a
+  // 2-point cluster, not eps) required sim>=0.64. Loosened below to use the
+  // v3 headroom while keeping a comfortable margin over the new ~0.46 ceiling.
+  // IMPORTANT: these explicit eps/threshold pins are read BEFORE the preset
+  // table in _resolve_people_cluster_config (env var wins over preset
+  // default), so PEOPLE_CLUSTER_PRESET alone does nothing unless the values
+  // below are kept in sync with it. See README "Tuning how aggressively faces
+  // get merged" for the full preset table.
+  // Nudged one more notch looser 2026-07-31 after confirming the first retune
+  // merged a real cross-day pair (0.625 sim) — user spotted a few more
+  // faces that still weren't merging. MIN_AUTO_FACE_MERGE_SIMILARITY (0.60,
+  // below) acts as a hard floor on PEOPLE_MATCH_THRESHOLD, so 0.60 is as low
+  // as match can go without also raising that floor.
+  { name: 'PEOPLE_CLUSTER_PRESET', value: 'loose' }
+  { name: 'PEOPLE_CLUSTER_EPS', value: '0.42' }
+  { name: 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', value: '0.40' }
+  { name: 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', value: '0.40' }
+  { name: 'PEOPLE_MATCH_THRESHOLD', value: '0.60' }
+  { name: 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', value: '0.62' }
+  // Master safety floor that previously clamped EVERY auto path (match / assign /
+  // propagate) up to 0.98 and blocked all automatic merges once v2 embeddings
+  // landed. Lowered so the preset thresholds above actually govern.
+  { name: 'MIN_AUTO_FACE_MERGE_SIMILARITY', value: '0.60' }
+  // Identity propagation: use a named person's rep embedding to pull their faces
+  // out of unnamed clusters (auto-move above AUTO, review queue above REVIEW).
+  // This — NOT PEOPLE_CLUSTER_EPS/PEOPLE_MATCH_THRESHOLD above — is the lever
+  // for "named cluster absorbs an unnamed one": recluster deliberately excludes
+  // named people's own faces from its clustering pool (protects named clusters
+  // from being scattered), so a named person can only grow via "Find more
+  // faces" (this threshold), never via a plain recluster. REVIEW lowered
+  // 2026-07-31 (0.62->0.58) after measuring a real named/unnamed pair at 0.602
+  // that should have surfaced as a review suggestion but didn't.
+  { name: 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', value: '0.74' }
+  { name: 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', value: '0.58' }
+  { name: 'MAPS_ON_UPLOAD', value: 'false' }
+  { name: 'MAPS_QUEUE_ON_UPLOAD', value: 'false' }
+]
+
+resource backend 'Microsoft.App/containerApps@2024-03-01' = {
+  name: backendAppName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      ingress: {
+        external: true
+        targetPort: 5000
+        transport: 'auto'
+        traffic: [
+          { latestRevision: true, weight: 100 }
+        ]
+      }
+      secrets: [
+        { name: 'owner-password', value: adminPassword }
+        { name: 'session-secret', value: sessionSecret }
+        { name: 'acs-connection-string', value: acsConnectionString }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'backend'
+          image: backendImage
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'backend' }
+            // Gunicorn workers are separate processes and the app is imported
+            // AFTER fork (no --preload), so every worker loads its own copy of
+            // numpy/scipy/scikit-learn/Pillow + the Azure SDKs (~250-350 MB
+            // each) and primes its own vector-index cache. At 4 workers that
+            // baseline alone crowds the 1 GiB limit, so a few concurrent
+            // image/zip requests can still tip the replica into an OOM kill.
+            // Keep process fan-out low on 1 GiB replicas; each worker has a
+            // substantial baseline RSS once scientific/image stacks are loaded.
+            { name: 'GUNICORN_WORKERS', value: '1' }
+            // Thread fan-out controls how many heavy media requests can run at
+            // once inside a worker; lower values reduce worst-case memory spikes.
+            { name: 'GUNICORN_THREADS', value: '2' }
+            // Prime vector indexes lazily on demand; eager startup priming can
+            // inflate idle RSS and duplicate index memory across workers.
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
+            { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+          ])
+        }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 3
+        rules: [
+          {
+            // Default is 10 concurrent requests per replica, which fans out to
+            // extra replicas on every burst of small API calls. Each replica
+            // runs 1 worker x 2 threads on a 1 GiB container; keep per-replica
+            // concurrency conservative to avoid memory spikes under media load.
+            name: 'http-scaler'
+            http: {
+              metadata: {
+                concurrentRequests: '15'
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
+resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
+  name: frontendAppName
+  location: location
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      ingress: {
+        external: true
+        targetPort: 80
+        transport: 'auto'
+        traffic: [
+          { latestRevision: true, weight: 100 }
+        ]
+      }
+    }
+    template: {
+      containers: [
+        {
+          name: 'frontend'
+          image: frontendImage
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          env: [
+            { name: 'APP_CONFIG_API_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_UPLOAD_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_SPA_BASE_URL', value: frontendUrl }
+            { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
+            { name: 'APP_CONFIG_FACE_API_MODEL_URL', value: '/models/face-api' }
+            // Explicit pin, added with the AdaFace swap: docker-entrypoint.sh
+            // generates window.__APP_CONFIG__.arcFaceModelUrl at container start
+            // and falls back to the OLD arcface path if this isn't set. The
+            // adaface1 deploy shipped without this pin, so the browser kept
+            // loading the old ArcFace model via that fallback even after the
+            // code/version-string change -- embeddingVersion got relabeled to
+            // adaface1 but the actual embeddings computed were unchanged
+            // (confirmed: identical cosine similarities to pre-swap values).
+            { name: 'APP_CONFIG_ARC_FACE_MODEL_URL', value: '/models/browser-ai/models/adaface/model.onnx' }
+          ]
+        }
+      ]
+      scale: {
+        // Scale-to-zero: nginx serving the SPA cold-starts in a couple of
+        // seconds, and an idle deployment should cost nothing.
+        minReplicas: 0
+        maxReplicas: 2
+      }
+    }
+  }
+}
+
+// The worker scales to ZERO and is woken by KEDA when the clustering queue has
+// messages (2025-01-01 API for managed-identity scale rules; the queue itself
+// is created by the backend at startup). An always-on worker polling an almost
+// always-empty queue was the single largest fixed cost in the deployment.
+resource worker 'Microsoft.App/containerApps@2025-01-01' = {
+  name: workerAppName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      secrets: [
+        { name: 'acs-connection-string', value: acsConnectionString }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'worker'
+          image: backendImage
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'worker' }
+            { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
+            // The worker sends the "cleanup complete" email once a library_clean
+            // job finishes; without this it silently no-ops (is_configured()
+            // false) since ACS_CONNECTION_STRING lived only on the backend's env.
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+          ])
+        }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 1
+        rules: [
+          {
+            name: 'clustering-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-clustering'
+                queueLength: '1'
+              }
+              identity: 'system'
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
+// Grant the backend and worker managed identities data-plane access to storage.
+resource backendStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: {
+    name: guid(storage.id, backend.id, roleId)
+    scope: storage
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+      principalId: backend.identity.principalId
+      principalType: 'ServicePrincipal'
+    }
+  }
+]
+
+resource workerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: {
+    name: guid(storage.id, worker.id, roleId)
+    scope: storage
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+      principalId: worker.identity.principalId
+      principalType: 'ServicePrincipal'
+    }
+  }
+]
+
+@description('Open this URL in your browser to use Photostore.')
+output appUrl string = frontendUrl
+
+@description('Backend API URL.')
+output apiUrl string = 'https://${backend.properties.configuration.ingress.fqdn}'
