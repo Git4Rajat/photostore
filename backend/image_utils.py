@@ -196,6 +196,52 @@ def _encode_preview_for_browser(image_bytes: bytes) -> Optional[bytes]:
 
 RAW_PREVIEW_MIN_VISION_EDGE = 512
 
+# LibRaw's raw.sizes.flip values (0=none, 3=180, 5=90CCW-needed, 6=90CW-needed) mapped to
+# the Pillow transpose that corrects for them. Verified against real CR3 files: the embedded
+# preview/thumbnail JPEGs pulled out of a RAW container (via exiftool, a raw byte scan, or
+# LibRaw's extract_thumb) are sensor-orientation and carry no orientation tag of their own --
+# the largest embedded preview has EXIF Orientation=1 regardless of the shot's actual rotation,
+# so `raw.sizes.flip` (ground truth from LibRaw's header parse) has to be applied explicitly
+# rather than trusting the embedded JPEG's own EXIF.
+_RAW_FLIP_TRANSPOSE = {
+    3: Image.Transpose.ROTATE_180,
+    5: Image.Transpose.ROTATE_90,
+    6: Image.Transpose.ROTATE_270,
+}
+
+
+def _apply_raw_flip(jpeg_bytes: Optional[bytes], flip: int) -> Optional[bytes]:
+    method = _RAW_FLIP_TRANSPOSE.get(flip)
+    if not jpeg_bytes or method is None:
+        return jpeg_bytes
+    try:
+        with Image.open(io.BytesIO(jpeg_bytes)) as image:
+            rotated = image.convert('RGB').transpose(method)
+            output = io.BytesIO()
+            rotated.save(output, format='JPEG', quality=92)
+            return output.getvalue()
+    except Exception:
+        return jpeg_bytes
+
+
+def _raw_container_flip_from_path(path: str) -> int:
+    # Header-only read (no demosaic), so this is cheap to call before picking an extractor.
+    try:
+        import rawpy
+        with rawpy.imread(path) as raw:
+            return raw.sizes.flip
+    except Exception:
+        return 0
+
+
+def _raw_container_flip_from_bytes(image_bytes: bytes) -> int:
+    try:
+        import rawpy
+        with rawpy.imread(io.BytesIO(image_bytes)) as raw:
+            return raw.sizes.flip
+    except Exception:
+        return 0
+
 
 def _preview_score(image_bytes: Optional[bytes]) -> tuple[int, int]:
     if not image_bytes:
@@ -239,13 +285,13 @@ def _run_preview_command(args: list[str]) -> Optional[bytes]:
     return _normalize_preview_bytes(result.stdout)
 
 
-def _extract_exiftool_preview_from_path(path: str) -> Optional[bytes]:
+def _extract_exiftool_preview_from_path(path: str, raw_flip: int = 0) -> Optional[bytes]:
     exiftool = shutil.which('exiftool')
     if not exiftool:
         return None
     candidates = []
     for tag in RAW_PREVIEW_EXIFTOOL_TAGS:
-        preview = _run_preview_command([exiftool, '-b', f'-{tag}', path])
+        preview = _apply_raw_flip(_run_preview_command([exiftool, '-b', f'-{tag}', path]), raw_flip)
         if _preview_good_enough_for_vision(preview):
             return preview
         if preview:
@@ -272,7 +318,7 @@ def _extract_exiftool_preview_from_path(path: str) -> Optional[bytes]:
             for _, candidate_path in sorted(file_candidates, reverse=True):
                 try:
                     with open(candidate_path, 'rb') as candidate_file:
-                        preview = _normalize_preview_bytes(candidate_file.read())
+                        preview = _apply_raw_flip(_normalize_preview_bytes(candidate_file.read()), raw_flip)
                 except Exception:
                     preview = None
                 if _preview_good_enough_for_vision(preview):
@@ -307,17 +353,22 @@ def _extract_ffmpeg_preview_from_path(path: str) -> Optional[bytes]:
     ])
 
 
-def _extract_libraw_preview_from_path(path: str) -> Optional[bytes]:
+def _extract_libraw_preview_from_path(path: str, raw_flip: int = 0) -> Optional[bytes]:
     decoder = shutil.which('dcraw_emu') or shutil.which('dcraw')
     if not decoder:
         return None
     candidates = []
-    for args in (
-        [decoder, '-c', '-e', path],
-        [decoder, '-c', '-w', '-h', path],
-        [decoder, '-c', '-w', '-q', '0', '-H', '1', path],
+    # Only the first (embedded-thumbnail) variant is sensor-orientation and needs raw_flip
+    # applied manually -- the full-decode variants (`-w`) auto-rotate via dcraw's own default
+    # orientation handling, same as rawpy.postprocess()'s default `user_flip`.
+    for args, needs_flip in (
+        ([decoder, '-c', '-e', path], True),
+        ([decoder, '-c', '-w', '-h', path], False),
+        ([decoder, '-c', '-w', '-q', '0', '-H', '1', path], False),
     ):
         preview = _run_preview_command(args)
+        if needs_flip:
+            preview = _apply_raw_flip(preview, raw_flip)
         if _preview_good_enough_for_vision(preview):
             return preview
         if preview:
@@ -358,9 +409,11 @@ def _extract_rawpy_thumbnail(raw, rawpy_module) -> Optional[bytes]:
         return None
     try:
         if thumbnail.format == rawpy_module.ThumbFormat.JPEG:
-            return _normalize_preview_bytes(thumbnail.data)
+            # extract_thumb() pulls the same sensor-orientation embedded JPEG that exiftool/the
+            # raw byte scan would find -- apply the RAW's own detected orientation explicitly.
+            return _apply_raw_flip(_normalize_preview_bytes(thumbnail.data), raw.sizes.flip)
         if thumbnail.format == rawpy_module.ThumbFormat.BITMAP:
-            return _encode_vision_jpeg(Image.fromarray(thumbnail.data))
+            return _apply_raw_flip(_encode_vision_jpeg(Image.fromarray(thumbnail.data)), raw.sizes.flip)
     except Exception:
         return None
     return None
@@ -468,7 +521,7 @@ def create_thumbnail_data_from_path(path: str) -> bytes:
         return create_placeholder_thumbnail()
 
 
-def extract_embedded_jpeg(raw_bytes: bytes) -> Optional[bytes]:
+def extract_embedded_jpeg(raw_bytes: bytes, raw_flip: int = 0) -> Optional[bytes]:
     candidates = []
     start = 0
     while True:
@@ -491,13 +544,13 @@ def extract_embedded_jpeg(raw_bytes: bytes) -> Optional[bytes]:
     # than the embedded preview but cannot be decoded, so picking "largest" alone
     # yields an undecodable stream; fall through to the next-largest instead.
     for segment in sorted(candidates, key=len, reverse=True):
-        normalized = _normalize_preview_bytes(segment)
+        normalized = _apply_raw_flip(_normalize_preview_bytes(segment), raw_flip)
         if normalized:
             return normalized
     return None
 
 
-def extract_embedded_jpeg_from_path(path: str) -> Optional[bytes]:
+def extract_embedded_jpeg_from_path(path: str, raw_flip: int = 0) -> Optional[bytes]:
     best: Optional[bytes] = None
     pending = b''
     scanned = 0
@@ -523,7 +576,7 @@ def extract_embedded_jpeg_from_path(path: str) -> Optional[bytes]:
                         break
                     segment = data[soi:eoi + 2]
                     if len(segment) > 16_384 and (best is None or len(segment) > len(best)):
-                        normalized = _normalize_preview_bytes(segment)
+                        normalized = _apply_raw_flip(_normalize_preview_bytes(segment), raw_flip)
                         if normalized:
                             best = normalized
                     start = eoi + 2
@@ -534,15 +587,22 @@ def extract_embedded_jpeg_from_path(path: str) -> Optional[bytes]:
 
 
 def extract_raw_preview_from_path(path: str) -> Optional[bytes]:
+    # Computed once up front (cheap header-only read) and passed to whichever extractors
+    # return sensor-orientation embedded previews/thumbnails; see _RAW_FLIP_TRANSPOSE.
+    # _extract_rawpy_preview_from_path and _extract_ffmpeg_preview_from_path are excluded:
+    # rawpy applies raw.sizes.flip itself (both in its extract_thumb path and its default
+    # postprocess() orientation), and the ffmpeg preview is too rare/unverified a path to
+    # risk a blind correction on.
+    raw_flip = _raw_container_flip_from_path(path)
     candidates = []
-    for extractor in (
-        _extract_exiftool_preview_from_path,
-        extract_embedded_jpeg_from_path,
-        _extract_rawpy_preview_from_path,
-        _extract_libraw_preview_from_path,
-        _extract_ffmpeg_preview_from_path,
+    for extractor, args in (
+        (_extract_exiftool_preview_from_path, (path, raw_flip)),
+        (extract_embedded_jpeg_from_path, (path, raw_flip)),
+        (_extract_rawpy_preview_from_path, (path,)),
+        (_extract_libraw_preview_from_path, (path, raw_flip)),
+        (_extract_ffmpeg_preview_from_path, (path,)),
     ):
-        preview = extractor(path)
+        preview = extractor(*args)
         if _preview_good_enough_for_vision(preview):
             return preview
         if preview:
@@ -552,7 +612,7 @@ def extract_raw_preview_from_path(path: str) -> Optional[bytes]:
 
 def extract_raw_preview_bytes(image_bytes: bytes, filename: str = '') -> Optional[bytes]:
     candidates = []
-    preview = extract_embedded_jpeg(image_bytes)
+    preview = extract_embedded_jpeg(image_bytes, _raw_container_flip_from_bytes(image_bytes))
     if _preview_good_enough_for_vision(preview):
         return preview
     if preview:
