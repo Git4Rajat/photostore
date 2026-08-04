@@ -144,6 +144,33 @@ const fetchProcessingBlob = async (url: string): Promise<Blob> => {
     return response.blob();
 };
 
+// RAW/HEIC files have no reliable orientation in their own embedded preview (the browser-side
+// byte-scan fallback in resolveBrowserVisionSource/extractEmbeddedJpegPreview finds the same
+// embedded JPEG a RAW container carries but can't correct its orientation the way the backend's
+// extract_raw_preview_bytes does), so always prefer this backend-converted preview for them.
+// Falls back to undefined (letting the caller fall through to the client-side extraction) on any
+// failure -- this must not block thumbnail generation just because the preview endpoint hiccuped.
+const fetchConvertedRawPreview = async (filename: string): Promise<Blob | undefined> => {
+    if (!requiresBackendPreview(filename)) {
+        return undefined;
+    }
+    try {
+        const previewAccess = await get(`/api/photos/access/preview/${encodeURIComponent(filename)}`);
+        const previewUrl = String(previewAccess?.url || '');
+        if (!previewUrl) {
+            return undefined;
+        }
+        const previewBlob = await fetchProcessingBlob(previewUrl);
+        if (/^image\/jpe?g$/i.test(previewBlob.type || '') || previewBlob.size > 0) {
+            return previewBlob;
+        }
+        return undefined;
+    } catch (previewErr) {
+        console.warn(`Converted JPEG preview was not available for ${filename}; falling back to embedded RAW preview.`, previewErr);
+        return undefined;
+    }
+};
+
 // Whether we can currently produce an Authorization header. When auth is
 // enabled (password or entra mode) but the user has not logged in yet, there is
 // no token, so automatic background calls like the browser-processing scheduler
@@ -1373,21 +1400,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
                     const blob = await fetchProcessingBlob(imageUrl);
                     const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
-                    let convertedPreview: Blob | undefined;
-                    if (requiresBackendPreview(filename)) {
-                        try {
-                            const previewAccess = await get(`/api/photos/access/preview/${encodeURIComponent(filename)}`);
-                            const previewUrl = String(previewAccess?.url || '');
-                            if (previewUrl) {
-                                const previewBlob = await fetchProcessingBlob(previewUrl);
-                                if (/^image\/jpe?g$/i.test(previewBlob.type || '') || previewBlob.size > 0) {
-                                    convertedPreview = previewBlob;
-                                }
-                            }
-                        } catch (previewErr) {
-                            console.warn(`Converted JPEG preview was not available for ${filename}; falling back to embedded RAW preview.`, previewErr);
-                        }
-                    }
+                    const convertedPreview = await fetchConvertedRawPreview(filename);
                     await post('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
                     const result = await runBrowserProcessing(
                         file,
@@ -1984,13 +1997,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     if (!claim?.claimed) return;
                     const processingStartedAt = performance.now();
                     try {
+                        const convertedPreview = await fetchConvertedRawPreview(filename);
                         const result = await runBrowserProcessing(
                             file,
                             `browser-${filename}`,
                             processingStartedAt,
                             browserAiModelStateRef.current as Parameters<PhotoGalleryRuntime['runBrowserProcessing']>[3],
                             { clientProcessing: {}, clientProcessingReport: [] },
-                            { thumbnailRotationDegrees: 0, faceRotationDegrees: 0 },
+                            { thumbnailRotationDegrees: 0, faceRotationDegrees: 0, convertedPreview },
                         );
                         const filteredResult = filterBrowserProcessingResult(result, new Set(['thumbnail']));
                         let thumbnailAlreadyUploaded = false;
