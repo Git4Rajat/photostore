@@ -2609,19 +2609,31 @@ def finalize_uploaded_file(
                 })
         except Exception:
             pass
-        if file_is_video:
-            try:
-                _finalize_video_metadata(user_id, final_filename, image_bytes)
-            except Exception:
-                pass
+        # Also extract EXIF eagerly here, for the same reason as the thumbnail
+        # above: RAW capture dates otherwise depend entirely on best-effort
+        # client-side parsing that may run much later (it's deferred until the
+        # browser AI model loads, see startBrowserProcessing) or never, which
+        # left RAW photos sorting by upload date -- i.e. as "just captured" --
+        # until that eventually caught up.
+        try:
+            _finalize_server_side_exif(
+                user_id,
+                final_filename,
+                image_bytes,
+                fallback_for='video_upload' if file_is_video else 'raw_upload',
+            )
+        except Exception:
+            pass
     return duplicates, final_filename
 
 
-def _finalize_video_metadata(user_id: str, filename: str, video_bytes: bytes) -> None:
-    """Extract video metadata (exiftool) server-side so date/location search works."""
+def _finalize_server_side_exif(user_id: str, filename: str, image_bytes: bytes, *, fallback_for: str) -> None:
+    """Extract EXIF (exiftool) server-side so capture-date sort/search works
+    immediately for formats the browser can't reliably self-report (video,
+    RAW), instead of waiting on client-side processing."""
     metadata_table_client = _CTX['metadata_table_client']
     entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    status_updates = _apply_server_exif_fallback(user_id, filename, entity, video_bytes, fallback_for='video_upload')
+    status_updates = _apply_server_exif_fallback(user_id, filename, entity, image_bytes, fallback_for=fallback_for)
     for field, value in status_updates.items():
         entity[field] = value
     entity['exif_status'] = str(status_updates.get('exif_status') or 'no_data')
