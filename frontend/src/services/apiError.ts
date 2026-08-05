@@ -48,6 +48,10 @@ export class ApiError extends Error {
     readonly requestId: string;
     // Original, unclassified message (backend text or axios error string).
     readonly rawMessage: string;
+    // The raw parsed response body (e.g. `{ codeRequired: true }`), when the
+    // backend returned one. Lets call sites read structured fields beyond the
+    // single error string that `message`/`rawMessage` collapse down to.
+    readonly responseData?: unknown;
 
     constructor(params: {
         kind: ApiErrorKind;
@@ -56,6 +60,7 @@ export class ApiError extends Error {
         status?: number;
         retriable: boolean;
         requestId: string;
+        responseData?: unknown;
     }) {
         super(params.message);
         this.name = 'ApiError';
@@ -64,6 +69,7 @@ export class ApiError extends Error {
         this.retriable = params.retriable;
         this.requestId = params.requestId;
         this.rawMessage = params.rawMessage;
+        this.responseData = params.responseData;
         // So `String(err)` yields the friendly message, not "ApiError: …".
         Object.setPrototypeOf(this, ApiError.prototype);
     }
@@ -131,11 +137,11 @@ export const classifyApiError = (error: unknown, requestId: string = newRequestI
             // 502/503/504 mean the gateway never got a healthy reply — treat as
             // unreachable (recoverable, banner-worthy); a plain 500 is the app.
             const kind: ApiErrorKind = status === 502 || status === 503 || status === 504 ? 'unreachable' : 'server';
-            return new ApiError({ kind, message: FRIENDLY_MESSAGE[kind], rawMessage, status, retriable: RETRIABLE_KINDS.has(kind), requestId });
+            return new ApiError({ kind, message: FRIENDLY_MESSAGE[kind], rawMessage, status, retriable: RETRIABLE_KINDS.has(kind), requestId, responseData: error.response?.data });
         }
         // 4xx: prefer the backend's own message; it is usually the useful one.
         const message = rawMessage && !/^request failed/i.test(rawMessage) ? rawMessage : FRIENDLY_MESSAGE.client;
-        return new ApiError({ kind: 'client', message, rawMessage, status, retriable: false, requestId });
+        return new ApiError({ kind: 'client', message, rawMessage, status, retriable: false, requestId, responseData: error.response?.data });
     }
 
     return new ApiError({ kind: 'unknown', message: rawMessage || FRIENDLY_MESSAGE.unknown, rawMessage, retriable: false, requestId });

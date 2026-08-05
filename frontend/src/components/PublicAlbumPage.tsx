@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowDownTrayIcon, CheckIcon, LockOpenIcon, PhotoIcon } from '@heroicons/react/24/outline';
 import { useParams } from 'react-router-dom';
 import { get, post, resolveApiUrl } from '../services/apiClient';
+import { isApiError } from '../services/apiError';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { Logo } from './shared/Logo';
@@ -24,6 +25,17 @@ interface PublicAlbum {
 }
 
 const parsePublicAlbumError = (err: unknown): Record<string, unknown> => {
+    // requestJson() always throws a classified ApiError, never the raw axios
+    // error or JSON body — the structured fields the backend sent (e.g.
+    // `codeRequired`, `retryAfterSeconds`) only survive on `responseData`.
+    if (isApiError(err)) {
+        const data = err.responseData;
+        if (typeof data === 'object' && data !== null) {
+            const payload = data as Record<string, unknown>;
+            return typeof payload.error === 'string' ? payload : { ...payload, error: err.message };
+        }
+        return { error: err.message };
+    }
     if (typeof err === 'object' && err !== null) {
         return err as Record<string, unknown>;
     }
