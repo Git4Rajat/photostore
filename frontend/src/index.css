@@ -3186,6 +3186,31 @@ html[data-theme='light'] .notification-item.unread {
   flex-wrap: wrap;
 }
 
+/* "View in Library" deep-link landing: a single photo pulled in via ?focus=. */
+.gallery-focus-panel {
+  padding: 12px;
+  margin-bottom: 16px;
+  border-radius: var(--r-lg);
+}
+
+.gallery-focus-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.gallery-focus-title {
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.gallery-focus-grid {
+  grid-template-columns: minmax(0, 220px);
+}
+
 /* Compact page header used in place of the old full banners. */
 .page-topline {
   display: flex;
@@ -3472,6 +3497,64 @@ html[data-theme='light'] .notification-item.unread {
   height: 15px;
   color: #ff5c7a;
   filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+}
+
+/* ---- Gallery tile overlay: quick actions (view in library / workbench / cluster) ---- */
+.tile-quick-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity var(--dur-quick) ease, transform var(--dur-quick) ease;
+}
+
+.photo-card:hover .tile-quick-actions,
+.photo-card:focus-within .tile-quick-actions {
+  opacity: 1;
+  transform: none;
+}
+
+@media (hover: none) {
+  .tile-quick-actions {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.tile-quick-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1.5px solid rgba(255, 255, 255, 0.9);
+  border-radius: 999px;
+  background: rgba(20, 22, 28, 0.42);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  cursor: pointer;
+  transition: background-color var(--dur-quick) ease, transform var(--dur-quick) ease;
+}
+
+.tile-quick-action:hover {
+  background: rgba(20, 22, 28, 0.68);
+  transform: scale(1.06);
+}
+
+.tile-quick-action-icon {
+  width: 14px;
+  height: 14px;
+  color: #fff;
+}
+
+.tile-quick-action-menu {
+  min-width: 220px;
+  max-width: 280px;
 }
 
 /* ---- Preview: interactive rating + like ---- */
@@ -4254,6 +4337,15 @@ html[data-theme='light'] .notification-item.unread {
 
 video.photo-preview-media {
   pointer-events: auto;
+}
+
+/* Unlike images, a video must stay visible (and its native controls tappable) even
+   while "loading": iOS/WebKit mobile browsers never fetch any video data — not even
+   metadata — until the user taps play on the native controls. Hiding the element
+   behind opacity:0 until a load event fires would hide the only control that can
+   ever trigger that event, stranding mobile playback on the loading spinner forever. */
+video.photo-preview-media.is-loading {
+  opacity: 1;
 }
 
 .photo-preview-loading {
@@ -6495,7 +6587,12 @@ video.photo-preview-media {
   pointer-events: none;
   white-space: nowrap;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
-  z-index: 5;
+  /* Pops up above .timeline-widget's own box, so it can end up spatially
+     behind .gallery-controls-surface (z-index: 30) sitting right above it.
+     Match .gallery-menu's z-index (the sort/filter popovers that have the
+     same "must float above the controls surface" requirement) rather than a
+     low value that gets silently painted over. */
+  z-index: 40;
 }
 
 .library-clean-actions {

@@ -33,8 +33,10 @@ import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
 import { Loading } from './shared/Loading';
 import PhotoTile from './shared/PhotoTile';
+import PhotoQuickActions, { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoViewer from './shared/PhotoViewer';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
+import type { PhotoPersonLink } from '../types/uiTypes';
 import { classifyApiError, type ApiError } from '../services/apiError';
 import { notifyApiError } from '../services/requestFeedback';
 import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
@@ -60,6 +62,7 @@ interface Photo {
         focalLength?: string;
     };
     faceCount?: number;
+    people?: PhotoPersonLink[];
 }
 
 interface Album {
@@ -1405,6 +1408,11 @@ const AlbumsPage: React.FC = () => {
                                                     )}
                                                 </div>
                                             )}
+                                            <PhotoQuickActions
+                                                libraryHref={libraryFocusHref(photo.filename)}
+                                                workbenchHref={workbenchFilenameHref(photo.filename)}
+                                                people={photo.people}
+                                            />
                                         </>
                                     )}
                                 />

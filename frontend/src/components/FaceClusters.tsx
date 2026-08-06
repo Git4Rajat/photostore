@@ -111,19 +111,29 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
             return undefined;
         }
         let active = true;
+        // A crop cache-hit is fast, so most avatars never need the fallback at
+        // all. But a cache-miss does real server-side image work and can take
+        // seconds — racing the (cheap, pre-generated) fallback in after a
+        // short delay means a slow crop never blocks the avatar from showing
+        // something, without paying for a second request in the common fast
+        // case.
+        const fallbackRaceTimer = window.setTimeout(ensureFallback, 250);
         resolveFaceCropUrl(faceId)
             .then((url) => {
+                window.clearTimeout(fallbackRaceTimer);
                 if (active) {
                     setCropUrl(url);
                 }
             })
             .catch(() => {
+                window.clearTimeout(fallbackRaceTimer);
                 if (active) {
                     ensureFallback();
                 }
             });
         return () => {
             active = false;
+            window.clearTimeout(fallbackRaceTimer);
         };
     }, [shouldLoad, faceId, filename, ensureFallback]);
 

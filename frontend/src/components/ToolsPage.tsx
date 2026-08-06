@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import {
     ArrowPathIcon,
@@ -24,7 +24,9 @@ import { confirmDialog } from './shared/dialogs';
 import { useAppServices } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
 import PhotoTile from './shared/PhotoTile';
+import PhotoQuickActions, { libraryFocusHref } from './shared/PhotoQuickActions';
 import PhotoViewer from './shared/PhotoViewer';
+import type { PhotoPersonLink } from '../types/uiTypes';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { classifyApiError, type ApiError } from '../services/apiError';
@@ -62,6 +64,7 @@ interface Photo {
         camera?: string;
         lens?: string;
     };
+    people?: PhotoPersonLink[];
 }
 
 interface ToolPhotoMetadata {
@@ -285,6 +288,8 @@ const ToolsPage: React.FC = () => {
     const [viewMode, setViewMode] = useState<WorkbenchViewKey>('recent');
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
     const [photosLoadError, setPhotosLoadError] = useState<ApiError | null>(null);
+    const [pendingFocusFilename, setPendingFocusFilename] = useState<string | null>(null);
+    const focusTargetRef = useRef<HTMLDivElement | null>(null);
     const activeToolsPage = getToolsPageKey(location.pathname);
     const isOverviewPage = activeToolsPage === 'overview';
     const isQueueStatusPage = activeToolsPage === 'queue-status';
@@ -357,6 +362,33 @@ const ToolsPage: React.FC = () => {
         }
     }, [activeToolsPage]);
 
+    // "Open in Workbench" deep link from another page: pull that one photo in
+    // (it may not be on the first loaded page), select it, and switch to the
+    // 'all' view so it isn't hidden by the 'recent'/'attention' filters.
+    useEffect(() => {
+        if (!isBrowserWorkbenchPage) {
+            return;
+        }
+        const params = new URLSearchParams(location.search);
+        const target = params.get('filename');
+        if (!target) {
+            return;
+        }
+        setPendingFocusFilename(target);
+        setViewMode('all');
+        setSelected((prev) => (prev.has(target) ? prev : new Set(prev).add(target)));
+        void (async () => {
+            try {
+                const response = await get(`/photos/lookup/${encodeURIComponent(target)}`);
+                if (response?.photo) {
+                    setPhotos((prev) => (prev.some((p) => p.filename === target) ? prev : [response.photo as Photo, ...prev]));
+                }
+            } catch {
+                // Best effort — if the lookup fails the photo simply won't be pre-loaded.
+            }
+        })();
+    }, [isBrowserWorkbenchPage, location.search]);
+
     useEffect(() => {
         const mediaQuery = window.matchMedia('(max-width: 600px)');
         const updateQueueStatusExpanded = () => {
@@ -403,6 +435,17 @@ const ToolsPage: React.FC = () => {
         }
         return items;
     }, [filtered, viewMode]);
+
+    useEffect(() => {
+        if (!pendingFocusFilename || !workbenchPhotos.some((photo) => photo.filename === pendingFocusFilename)) {
+            return undefined;
+        }
+        const timer = window.setTimeout(() => {
+            focusTargetRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 50);
+        return () => window.clearTimeout(timer);
+    }, [pendingFocusFilename, workbenchPhotos]);
+
     const previewPhotos = useMemo(() => {
         const items = [...filtered];
         items.sort((a, b) => {
@@ -1269,7 +1312,7 @@ const ToolsPage: React.FC = () => {
                 <div className="gallery-grid">
                     {workbenchPhotos.map((photo, index) => {
                         const selectedFlag = selected.has(photo.filename);
-                        return (
+                        const tile = (
                             <PhotoTile
                                 key={photo.filename}
                                 photo={photo}
@@ -1291,7 +1334,21 @@ const ToolsPage: React.FC = () => {
                                         {renderPhotoInfo(photo)}
                                     </>
                                 )}
+                                mediaOverlay={(
+                                    <PhotoQuickActions
+                                        libraryHref={libraryFocusHref(photo.filename)}
+                                        people={photo.people}
+                                    />
+                                )}
                             />
+                        );
+                        if (photo.filename !== pendingFocusFilename) {
+                            return tile;
+                        }
+                        return (
+                            <div key={photo.filename} ref={focusTargetRef}>
+                                {tile}
+                            </div>
                         );
                     })}
                 </div>

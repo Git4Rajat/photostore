@@ -23,6 +23,14 @@ const deferred = <T>() => {
     return { promise, resolve, reject };
 };
 
+// resolveFaceCropUrl/resolveFaceFallbackUrl chain several .then()/await hops
+// on top of the raw limiter (toDisplayableUrl, cache writes, in-flight
+// cleanup), so a fixed count of `await Promise.resolve()` isn't reliably
+// enough to flush everything through to the next queued task starting —
+// crossing a real macrotask boundary drains the whole microtask queue first,
+// regardless of how many hops are chained.
+const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 describe('faceMediaCache', () => {
     let mod: FaceMediaCacheModule;
 
@@ -66,7 +74,7 @@ describe('faceMediaCache', () => {
         expect(getUploadJson).toHaveBeenCalledTimes(1);
     });
 
-    it('caps concurrency so no more than 4 crop requests run at once', async () => {
+    it('caps concurrency so no more than 6 crop requests run at once', async () => {
         const pending: Array<{ resolve: (v: { url: string }) => void }> = [];
         let concurrent = 0;
         let maxConcurrent = 0;
@@ -87,19 +95,22 @@ describe('faceMediaCache', () => {
         const faceIds = Array.from({ length: 10 }, (_, i) => `face-v1-${i}`);
         const results = Promise.all(faceIds.map((id) => mod.resolveFaceCropUrl(id)));
 
-        // Let microtasks flush so all initially-permitted requests start.
-        await Promise.resolve();
-        await Promise.resolve();
-        expect(maxConcurrent).toBeLessThanOrEqual(4);
-        expect(pending.length).toBeLessThanOrEqual(4);
+        // Let the initially-permitted requests start.
+        await flushAsync();
+        expect(maxConcurrent).toBeLessThanOrEqual(6);
+        expect(pending.length).toBeLessThanOrEqual(6);
 
         // Drain the queue in batches, re-checking the cap holds throughout.
+        let guard = 0;
         while (pending.length > 0) {
+            guard += 1;
+            if (guard > 20) {
+                throw new Error('drain loop did not converge — pending never reached 0');
+            }
             const batch = pending.splice(0, pending.length);
             batch.forEach((p, i) => p.resolve({ url: `https://sas.example/${i}.jpg` }));
-            await Promise.resolve();
-            await Promise.resolve();
-            expect(maxConcurrent).toBeLessThanOrEqual(4);
+            await flushAsync();
+            expect(maxConcurrent).toBeLessThanOrEqual(6);
         }
 
         await results;
@@ -122,5 +133,35 @@ describe('faceMediaCache', () => {
         getUploadJson.mockRejectedValue(new Error('network error'));
         const url = await mod.resolveFaceFallbackUrl('photo.jpg', '', '/api/photos/thumbnail/photo.jpg');
         expect(url).toBe('resolved:/api/photos/thumbnail/photo.jpg');
+    });
+
+    it('crop and fallback draw from independent pools — a burst of slow crops does not block fallback requests', async () => {
+        // Regression test: crop and fallback used to share one small queue, so a
+        // page full of slow (cache-miss) crop requests could starve every fast,
+        // pre-generated fallback thumbnail behind them, stalling the whole grid.
+        const stuckCrops: Array<{ resolve: (v: { url: string }) => void }> = [];
+        getUploadJson.mockImplementation((url: string) => {
+            if (url.includes('/api/faces/crop/')) {
+                // Stays pending until this test explicitly resolves it below —
+                // simulates a page full of slow (still in-progress) misses.
+                return new Promise((resolve) => stuckCrops.push({ resolve }));
+            }
+            return Promise.resolve({ url: 'https://sas.example/thumb.jpg' });
+        });
+
+        // Saturate the crop pool exactly to its capacity (not beyond — a queued
+        // excess would need draining too, which isn't what this test is about).
+        const cropPromises = Array.from({ length: 6 }, (_, i) => mod.resolveFaceCropUrl(`face-v1-slow-${i}`));
+        await flushAsync();
+        expect(stuckCrops.length).toBe(6);
+
+        // A fallback request for an unrelated photo should still complete promptly,
+        // not queue behind the stuck (pool-saturating) crop requests.
+        const fallbackUrl = await mod.resolveFaceFallbackUrl('other-photo.jpg', '', '/api/photos/thumbnail/other-photo.jpg');
+        expect(fallbackUrl).toBe('https://sas.example/thumb.jpg');
+
+        // Clean up the stuck crop requests so they don't leak into other tests.
+        stuckCrops.forEach((c, i) => c.resolve({ url: `https://sas.example/crop-${i}.jpg` }));
+        await Promise.all(cropPromises);
     });
 });

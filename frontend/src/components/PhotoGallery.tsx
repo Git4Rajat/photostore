@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
-import { useLocation } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
 import { isApiError } from '../services/apiError';
 import { notifyApiError } from '../services/requestFeedback';
@@ -25,6 +25,7 @@ import { plural } from '../utils/format';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import PhotoTile from './shared/PhotoTile';
+import PhotoQuickActions, { workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoViewer from './shared/PhotoViewer';
 import Timeline from './shared/Timeline';
 import { EmptyState } from './shared/EmptyState';
@@ -3743,6 +3744,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     registerUploadCompletionHandler,
     registerUploadErrorHandler,
 }) => {
+    const location = useLocation();
     const cachedBoot = loadPhotoCache();
     const [photos, setPhotos] = useState<Photo[]>(cachedBoot?.photos || []);
     const [totalAvailable, setTotalAvailable] = useState<number>(cachedBoot?.totalAvailable || 0);
@@ -3779,7 +3781,12 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [downloading, setDownloading] = useState<boolean>(false);
     const [downloadProgress, setDownloadProgress] = useState<{ completed: number; total: number } | null>(null);
     const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
-    
+    const [focusedFilename, setFocusedFilename] = useState<string | null>(null);
+    const [focusedPhoto, setFocusedPhoto] = useState<Photo | null>(null);
+    const [focusLoading, setFocusLoading] = useState<boolean>(false);
+    const [focusError, setFocusError] = useState<string | null>(null);
+    const [focusLightboxOpen, setFocusLightboxOpen] = useState<boolean>(false);
+
     const observerRef = useRef<IntersectionObserver | null>(null);
     const loadMoreRef = useRef<HTMLDivElement | null>(null);
     const photoListRequestSeqRef = useRef<number>(0);
@@ -3972,6 +3979,50 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             }
         }
     }, [sortBy, filters, searchQuery, buildCaptureQuery]);
+
+    // Deep link from another page ("view in library" on a photo tile) — an exact
+    // point lookup rather than reusing the fuzzy/semantic search endpoint, so it
+    // reliably resolves regardless of how well the filename tokenizes.
+    useEffect(() => {
+        const params = new URLSearchParams(location.search);
+        const target = params.get('focus');
+        if (!target) {
+            setFocusedFilename(null);
+            setFocusedPhoto(null);
+            setFocusError(null);
+            setFocusLoading(false);
+            return undefined;
+        }
+        setFocusedFilename(target);
+        setFocusedPhoto(null);
+        setFocusError(null);
+        setFocusLoading(true);
+        let cancelled = false;
+        (async () => {
+            try {
+                const response = await get(`/photos/lookup/${encodeURIComponent(target)}`);
+                if (cancelled) {
+                    return;
+                }
+                if (response?.photo) {
+                    setFocusedPhoto(response.photo as Photo);
+                } else {
+                    setFocusError("Couldn't find that photo.");
+                }
+            } catch {
+                if (!cancelled) {
+                    setFocusError("Couldn't find that photo.");
+                }
+            } finally {
+                if (!cancelled) {
+                    setFocusLoading(false);
+                }
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [location.search]);
 
     useEffect(() => {
         if (!registerUploadCompletionHandler) {
@@ -4337,7 +4388,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         setLightboxIndex(index);
     }, [filteredPhotos.length]);
 
-    const location = useLocation();
     const hideDiscovery = location.pathname && location.pathname.startsWith('/people');
 
     const sectionClass = hideDiscovery ? '' : 'gallery-wrap card-glass reveal-up delay-1 gallery-studio';
@@ -4580,6 +4630,41 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             </>
             )}
 
+            {focusedFilename && (
+                <div className="gallery-focus-panel card-glass">
+                    <div className="gallery-focus-header">
+                        <p className="gallery-focus-title">Viewing 1 photo · {focusedFilename}</p>
+                        <Link to="/" className="btn btn-soft" aria-label="Show full library">
+                            Show full library
+                        </Link>
+                    </div>
+                    {focusLoading && <Loading label="Loading photo…" fullPage={false} />}
+                    {!focusLoading && focusError && <p className="empty">{focusError}</p>}
+                    {!focusLoading && focusedPhoto && (
+                        <div className="gallery-grid gallery-focus-grid">
+                            <PhotoTile
+                                photo={focusedPhoto}
+                                title={focusedPhoto.filename}
+                                showBody={false}
+                                onMediaClick={(e) => {
+                                    e.stopPropagation();
+                                    setFocusLightboxOpen(true);
+                                }}
+                            />
+                        </div>
+                    )}
+                    {focusLightboxOpen && focusedPhoto && (
+                        <PhotoViewer
+                            photos={[focusedPhoto]}
+                            index={0}
+                            onClose={() => setFocusLightboxOpen(false)}
+                            onIndexChange={() => {}}
+                            useProtectedMedia={true}
+                        />
+                    )}
+                </div>
+            )}
+
             {downloading && downloadProgress && (
                 <p className="status">Downloading {downloadProgress.completed}/{downloadProgress.total}…</p>
             )}
@@ -4698,6 +4783,10 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                                 )}
                                             </div>
                                         )}
+                                        <PhotoQuickActions
+                                            workbenchHref={workbenchFilenameHref(photo.filename)}
+                                            people={photo.people}
+                                        />
                                     </>
                                 )}
                             />

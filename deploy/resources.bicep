@@ -42,10 +42,10 @@ param adminPassword string
 ])
 param emailDataLocation string = 'United States'
 
-@description('Public backend image. Override only if you publish your own fork\'s images.')
+@description('Public backend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
 param backendImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
-@description('Public frontend image. Override only if you publish your own fork\'s images.')
+@description('Public frontend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above.')
 param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 
 @description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')

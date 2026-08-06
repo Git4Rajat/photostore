@@ -1,3 +1,8 @@
+export interface PhotoPersonLink {
+    personId: string;
+    name: string;
+}
+
 export interface Photo {
     filename: string;
     url: string;
@@ -25,6 +30,8 @@ export interface Photo {
         iso?: string;
         focalLength?: string;
     };
+    /** People identified in this photo, for the "view in cluster" quick action. */
+    people?: PhotoPersonLink[];
 }
 
 export interface PhotoMetadata {

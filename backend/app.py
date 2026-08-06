@@ -1148,8 +1148,23 @@ def _private_photo_media_urls(filename: str, metadata: Optional[Dict] = None) ->
     }
 
 
+def _photo_people_list(metadata: Dict, pid_to_name: Optional[Dict[str, str]]) -> List[Dict[str, str]]:
+    try:
+        people_ids = json.loads(metadata.get('peopleIds', '[]') or '[]')
+    except Exception:
+        people_ids = []
+    names = pid_to_name or {}
+    people = []
+    for pid in people_ids:
+        pid_str = str(pid or '').strip()
+        if not pid_str:
+            continue
+        people.append({'personId': pid_str, 'name': names.get(pid_str, '')})
+    return people
+
+
 def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_props: bool = True,
-                         head_missing: bool = True) -> Dict:
+                         head_missing: bool = True, pid_to_name: Optional[Dict[str, str]] = None) -> Dict:
     # Prefer the size/last-modified persisted on the metadata row (stamped at
     # finalize / backfilled). Only fall back to a blob HEAD when a caller allows
     # it (head_missing) and the value is absent — the gallery list path passes
@@ -1212,6 +1227,7 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'exifSummary': summary,
         'resolution': _resolution_from_exif(exif_data),
         'faceCount': metadata.get('faceCount', 0),
+        'people': _photo_people_list(metadata, pid_to_name),
         'processing': {
             'thumbnail': metadata.get('thumbnail_status'),
             'exif': metadata.get('exif_status'),
@@ -5501,12 +5517,13 @@ def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = Non
 
 
 def _load_photos_for_filenames(user_id: str, filenames: List[str]) -> List[Dict]:
+    pid_to_name, _ = _load_people_name_index(user_id)
     photos = []
     for name in filenames:
         metadata = _get_metadata_entity(user_id, name)
         if metadata is None:
             continue
-        photos.append(_build_photo_summary(user_id, name, metadata, include_props=False))
+        photos.append(_build_photo_summary(user_id, name, metadata, include_props=False, pid_to_name=pid_to_name))
     return photos
 
 
@@ -9591,12 +9608,34 @@ def list_photos():
         except Exception:
             break
 
+    pid_to_name, _ = _load_people_name_index(user_id)
     photos = []
     for filename in selected:
         metadata = metadata_map.get(filename, {})
-        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False))
+        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False, pid_to_name=pid_to_name))
 
     return jsonify({'photos': photos, 'total': len(entries)})
+
+
+@app.route('/photos/lookup/<path:filename>', methods=['GET'])
+@app.route('/photos/lookup/<path:filename>/', methods=['GET'])
+@app.route('/api/photos/lookup/<path:filename>', methods=['GET'])
+@app.route('/api/photos/lookup/<path:filename>/', methods=['GET'])
+def lookup_photo(filename: str):
+    # Exact-filename point lookup for deep links (e.g. "view in library" from a
+    # page that doesn't otherwise share the gallery's paginated listing), so the
+    # caller doesn't need to guess a page offset or rely on fuzzy search ranking.
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    safe_name = secure_filename(filename)
+    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+        return jsonify({'error': 'Invalid filename'}), 400
+    metadata = _get_metadata_entity(user_id, safe_name)
+    if not metadata:
+        return jsonify({'error': 'Not found'}), 404
+    pid_to_name, _ = _load_people_name_index(user_id)
+    return jsonify({'photo': _build_photo_summary(user_id, safe_name, metadata, include_props=False, pid_to_name=pid_to_name)})
 
 
 @app.route('/photos/timeline', methods=['GET'])
@@ -9859,7 +9898,7 @@ def search_photos():
     for _, filename, metadata in selected:
         # Read size from the metadata row (stamped at finalize / backfilled by the
         # main gallery); don't HEAD a blob per search result.
-        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False))
+        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False, pid_to_name=pid_to_name))
 
     response_payload = {'photos': photos, 'total': total}
     if fallback_notice:
@@ -11944,12 +11983,13 @@ def filter_photos():
         filtered.sort(key=lambda p: _metadata_upload_date(p), reverse=True)
         filtered.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
         selected = filtered[offset:offset + limit]
+        pid_to_name, _ = _load_people_name_index(user_id)
         photos = []
 
         for photo in selected:
             name = photo['RowKey']
             # Size comes from the metadata row (no per-result blob HEAD).
-            photos.append(_build_photo_summary(user_id, name, photo, include_props=True, head_missing=False))
+            photos.append(_build_photo_summary(user_id, name, photo, include_props=True, head_missing=False, pid_to_name=pid_to_name))
 
         return jsonify({'photos': photos, 'total': len(filtered), 'offset': offset, 'limit': limit})
     except Exception as e:

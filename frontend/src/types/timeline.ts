@@ -20,5 +20,6 @@ export interface TimelineSummary {
     lastDate: string | null;
     today: string; // ISO date, server's current day — timeline never navigates past this
     undatedCount: number;
+    futureCount: number; // photos with a capture date after "today" (bad camera clock) — excluded from buckets
     totalCount: number;
 }

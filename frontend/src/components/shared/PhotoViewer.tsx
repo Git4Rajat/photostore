@@ -923,9 +923,15 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                             controls
                             playsInline
                             preload="metadata"
-                            poster={shouldProtect ? undefined : (activePhoto.thumbnailUrl ? resolveApiUrl(activePhoto.thumbnailUrl) : undefined)}
+                            poster={shouldProtect
+                                ? resolvedUrls[getThumbnailPath(activePhoto)]
+                                : (activePhoto.thumbnailUrl ? resolveApiUrl(activePhoto.thumbnailUrl) : undefined)}
                             className={`photo-preview-media ${mediaLoading ? 'is-loading' : ''}`}
-                            onLoadedData={(event) => {
+                            // Cleared on loadedmetadata rather than loadeddata: iOS/WebKit mobile
+                            // browsers withhold loadeddata (any actual frame data) until the user
+                            // taps play, but still fire loadedmetadata for preload="metadata". Gating
+                            // on loadeddata would leave mobile stuck on the loading spinner forever.
+                            onLoadedMetadata={(event) => {
                                 event.currentTarget.playbackRate = playbackRate;
                                 setMediaLoading(false);
                             }}

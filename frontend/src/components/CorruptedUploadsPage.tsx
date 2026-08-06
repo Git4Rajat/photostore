@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { CheckCircleIcon } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
 import PhotoTile from './shared/PhotoTile';
+import PhotoQuickActions, { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoViewer from './shared/PhotoViewer';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
@@ -111,6 +112,12 @@ const CorruptedUploadsPage: React.FC = () => {
                                 e.preventDefault();
                                 setViewerIndex(index);
                             }}
+                            mediaOverlay={(
+                                <PhotoQuickActions
+                                    libraryHref={libraryFocusHref(item.filename)}
+                                    workbenchHref={workbenchFilenameHref(item.filename)}
+                                />
+                            )}
                             bodyContent={
                                 <>
                                     <p className="photo-kind">

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { ArrowLeftIcon, ArrowUturnLeftIcon, ArrowsRightLeftIcon, CheckIcon, ExclamationTriangleIcon, MinusCircleIcon, NoSymbolIcon, PlusCircleIcon, SparklesIcon, XMarkIcon } from '@heroicons/react/24/outline';
-import { useParams, useNavigate } from 'react-router-dom';
+import { ArrowLeftIcon, ArrowUturnLeftIcon, ArrowsRightLeftIcon, CheckIcon, ExclamationTriangleIcon, MinusCircleIcon, NoSymbolIcon, PhotoIcon, PlusCircleIcon, SparklesIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { useParams, useNavigate, Link } from 'react-router-dom';
 import faceService from '../services/faceService';
 import { resolveApiUrl } from '../services/apiClient';
 import { showToast } from '../services/toast';
@@ -11,6 +11,7 @@ import { classifyApiError, type ApiError } from '../services/apiError';
 import { notifyApiError } from '../services/requestFeedback';
 import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 import { ErrorState } from './shared/ErrorState';
+import { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
 import type { PersonDetailModel, PersonFace, PersonSummary } from '../types/people';
 import { compareNamedFirstThenAlpha } from '../utils/people';
 
@@ -536,6 +537,18 @@ const PersonDetail: React.FC = () => {
                                                     <MinusCircleIcon className="toolbar-icon" />
                                                     <span className="sr-only">Move face to own cluster</span>
                                                 </button>
+                                                {f.filename && (
+                                                    <>
+                                                        <Link className="btn btn-link icon-btn" to={libraryFocusHref(f.filename)} aria-label="View in Library" title="View in Library">
+                                                            <PhotoIcon className="toolbar-icon" />
+                                                            <span className="sr-only">View in Library</span>
+                                                        </Link>
+                                                        <Link className="btn btn-link icon-btn" to={workbenchFilenameHref(f.filename)} aria-label="Open in Workbench" title="Open in Workbench">
+                                                            <WrenchScrewdriverIcon className="toolbar-icon" />
+                                                            <span className="sr-only">Open in Workbench</span>
+                                                        </Link>
+                                                    </>
+                                                )}
                                             </div>
                                         </div>
                                     </div>
@@ -627,6 +640,18 @@ const PersonDetail: React.FC = () => {
                                                         <XMarkIcon className="toolbar-icon" />
                                                         <span className="sr-only">Not this person</span>
                                                     </button>
+                                                    {f.filename && (
+                                                        <>
+                                                            <Link className="btn btn-link icon-btn" to={libraryFocusHref(f.filename)} aria-label="View in Library" title="View in Library">
+                                                                <PhotoIcon className="toolbar-icon" />
+                                                                <span className="sr-only">View in Library</span>
+                                                            </Link>
+                                                            <Link className="btn btn-link icon-btn" to={workbenchFilenameHref(f.filename)} aria-label="Open in Workbench" title="Open in Workbench">
+                                                                <WrenchScrewdriverIcon className="toolbar-icon" />
+                                                                <span className="sr-only">Open in Workbench</span>
+                                                            </Link>
+                                                        </>
+                                                    )}
                                                 </div>
                                             </div>
                                         </div>

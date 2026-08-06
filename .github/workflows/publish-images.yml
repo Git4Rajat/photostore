@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Additional image tag to publish alongside :latest (optional)'
+        description: 'Additional image tag to publish alongside :latest and the auto date-time tag (optional)'
         required: false
         default: ''
 
@@ -65,6 +65,14 @@ jobs:
         id: owner
         run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
+      # A sortable, human-readable, IMMUTABLE tag. Unlike :latest, deploying
+      # with this tag means an existing revision keeps pulling this exact
+      # image forever (including on scale-to-zero cold-start restarts) —
+      # it never silently drifts to whatever :latest happens to be later.
+      - name: Compute date-time tag
+        id: ts
+        run: echo "tag=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+
       # Use the buildkit container driver; the default docker driver can fail the
       # push to GHCR with "unknown blob".
       - name: Set up Buildx
@@ -90,4 +98,18 @@ jobs:
           tags: |
             ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:latest
             ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ github.sha }}
+            ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ steps.ts.outputs.tag }}
             ${{ inputs.tag != '' && format('ghcr.io/{0}/photostore-{1}:{2}', steps.owner.outputs.owner, matrix.name, inputs.tag) || '' }}
+
+      - name: Summary
+        run: |
+          echo "### photostore-${{ matrix.name }} published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ steps.ts.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "To roll your live deployment onto this exact, pinned image (recommended over :latest — see deploy/resources.bicep param docs):" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "az deployment group create -g <resource-group> -f deploy/resources.bicep \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --parameters backendImage=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-backend:${{ steps.ts.outputs.tag }} \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --parameters frontendImage=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-frontend:${{ steps.ts.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

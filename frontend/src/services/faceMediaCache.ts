@@ -9,7 +9,14 @@ import { fetchProtectedBlobUrl } from './imageClient';
 // backend to 300+ requests/min against a single low-concurrency replica. This
 // module gives every mounted avatar one shared, bounded queue plus a cache so
 // repeat visits (or many faces from the same photo) don't repeat the work.
-const MAX_CONCURRENT_FACE_MEDIA_REQUESTS = 4;
+//
+// Crop and fallback each get their OWN pool rather than sharing one. A crop
+// cache-miss does real server-side work (image decode + re-encode) and can
+// take seconds; a fallback thumbnail is pre-generated and cheap. Sharing one
+// small queue meant a page full of first-time crop misses could starve every
+// fallback fetch behind them too, stalling the whole grid.
+const MAX_CONCURRENT_CROP_REQUESTS = 6;
+const MAX_CONCURRENT_FALLBACK_REQUESTS = 6;
 
 const createLimiter = (maxConcurrent: number) => {
     let active = 0;
@@ -37,7 +44,8 @@ const createLimiter = (maxConcurrent: number) => {
         });
 };
 
-const limit = createLimiter(MAX_CONCURRENT_FACE_MEDIA_REQUESTS);
+const limitCrop = createLimiter(MAX_CONCURRENT_CROP_REQUESTS);
+const limitFallback = createLimiter(MAX_CONCURRENT_FALLBACK_REQUESTS);
 
 // Mirrors FaceClusters.tsx's toDisplayableUrl: data:/absolute SAS URLs load
 // directly, a relative auth-protected path needs a blob fetch.
@@ -90,7 +98,7 @@ export const resolveFaceCropUrl = (faceId: string): Promise<string> => {
     if (inFlight) {
         return inFlight;
     }
-    const promise = limit(async () => {
+    const promise = limitCrop(async () => {
         const result = await getUploadJson(`/api/faces/crop/${encodeURIComponent(faceId)}`);
         if (typeof result?.url !== 'string' || !result.url) {
             throw new Error('No crop url');
@@ -131,7 +139,7 @@ export const resolveFaceFallbackUrl = (
     if (inFlight) {
         return inFlight;
     }
-    const promise = limit(async () => {
+    const promise = limitFallback(async () => {
         try {
             const result = await getUploadJson(`/api/photos/access/thumbnail/${encodeURIComponent(filename)}`);
             const rawFallback = typeof result?.url === 'string' && result.url ? result.url : proxyFallbackPath;

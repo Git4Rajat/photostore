@@ -23,15 +23,18 @@ def build_timeline_summary(metadata_rows: List[Dict], *, now: Optional[datetime]
     but counted separately so the UI can surface them (they remain searchable,
     just not navigable via the timeline).
 
-    Dates after ``now`` (default: real current time) are clamped into today's
-    bucket — a bad camera clock must not extend the timeline into a fantasy
-    future year. ``now`` is injectable so tests can freeze "today".
+    Dates after ``now`` (default: real current time) are a bad camera clock,
+    not a real future photo — they're dropped entirely (counted in
+    ``futureCount``, not folded into today's bucket) so they can't inflate
+    today's count or otherwise distort the timeline. ``now`` is injectable so
+    tests can freeze "today".
     """
     current = now or datetime.now(timezone.utc)
     today = current.date()
 
     years: Dict[str, Dict] = {}
     undated_count = 0
+    future_count = 0
     min_date: Optional[date] = None
     max_date: Optional[date] = None
 
@@ -43,7 +46,8 @@ def build_timeline_summary(metadata_rows: List[Dict], *, now: Optional[datetime]
 
         day = captured.date()
         if day > today:
-            day = today
+            future_count += 1
+            continue
 
         year_key = f'{day.year:04d}'
         month_key = f'{day.month:02d}'
@@ -74,5 +78,6 @@ def build_timeline_summary(metadata_rows: List[Dict], *, now: Optional[datetime]
         'lastDate': max_date.isoformat() if max_date else None,
         'today': today.isoformat(),
         'undatedCount': undated_count,
+        'futureCount': future_count,
         'totalCount': len(metadata_rows),
     }

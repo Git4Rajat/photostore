@@ -33,10 +33,10 @@ const YEAR_LEVEL_MIN_SPAN_DAYS = 2 * 365;
 const MONTH_LEVEL_MIN_SPAN_DAYS = 45;
 const MIN_VISIBLE_SPAN_DAYS = 3;
 
-// "Isolated old years" heuristic (spec: <50 photos, gapped from the main
-// cluster) -- UI-only tuning, never affects what's searchable.
+// "Ignore older years" heuristic: hide the leading run of years (from the
+// very start of the library) with fewer than this many photos -- UI-only
+// tuning, never affects what's searchable.
 const SPARSE_YEAR_THRESHOLD = 50;
-const SPARSE_YEAR_GAP_YEARS = 3;
 
 // Timeline's own "user has settled" debounce before pushing a range up to the
 // parent. Independent from, and composes with, PhotoGallery's existing
@@ -123,23 +123,22 @@ const buildDayBuckets = (summary: TimelineSummary, originMs: number): FlatBucket
 // the year level. Walking newest-to-oldest, the first adjacent pair where the
 // older year is both sparse and separated by a real gap marks the cut --
 // everything older than that is hidden (but still reachable via the manual
-// date inputs, and always still searchable).
+// date inputs, and always still searchable). A mid-timeline dip below the
+// threshold (e.g. one quiet year between two active ones) is left alone --
+// only the leading run right at the start of the library is ever hidden.
 const computeVisibleYears = (
     yearCounts: { year: number; count: number }[],
     threshold = SPARSE_YEAR_THRESHOLD,
-    gapYears = SPARSE_YEAR_GAP_YEARS,
 ): Set<number> => {
     const sorted = [...yearCounts].sort((a, b) => a.year - b.year);
     if (sorted.length === 0) {
         return new Set();
     }
     let cutoffIndex = 0;
-    for (let i = sorted.length - 1; i > 0; i -= 1) {
-        const gap = sorted[i].year - sorted[i - 1].year;
-        if (sorted[i - 1].count < threshold && gap >= gapYears) {
-            cutoffIndex = i;
-            break;
-        }
+    // Never hide every year -- stop one short of the end so the most recent
+    // year always stays visible, even for a brand-new, still-sparse library.
+    while (cutoffIndex < sorted.length - 1 && sorted[cutoffIndex].count < threshold) {
+        cutoffIndex += 1;
     }
     return new Set(sorted.slice(cutoffIndex).map((entry) => entry.year));
 };
@@ -297,7 +296,21 @@ const Timeline: React.FC<TimelineProps> = ({ summary, currentStartISO, currentEn
     const trackRef = useRef<HTMLDivElement | null>(null);
     const hasData = summary.firstDate !== null && summary.lastDate !== null;
 
-    const originMs = useMemo(() => (summary.firstDate ? isoToUtcMs(summary.firstDate) : 0), [summary.firstDate]);
+    const visibleYears = useMemo(() => computeVisibleYears(
+        Object.entries(summary.years).map(([year, bucket]) => ({ year: Number(year), count: bucket.count })),
+    ), [summary]);
+
+    // The navigable domain starts at the first *visible* year, not the raw
+    // firstDate -- an ignored leading run of sparse years gets no timeline
+    // real estate at all (not even a blank stretch with tick labels), so
+    // there's no way to scrub/zoom into it. Those years are still reachable
+    // via the manual date inputs and search, just not via the timeline.
+    const originMs = useMemo(() => {
+        if (visibleYears.size > 0) {
+            return Date.UTC(Math.min(...Array.from(visibleYears)), 0, 1);
+        }
+        return summary.firstDate ? isoToUtcMs(summary.firstDate) : 0;
+    }, [visibleYears, summary.firstDate]);
     const totalSpanDays = useMemo(() => (
         hasData ? Math.max(MIN_VISIBLE_SPAN_DAYS, dayIndexFromISO(summary.lastDate as string, originMs) + 1) : 0
     ), [hasData, summary.lastDate, originMs]);
@@ -305,10 +318,6 @@ const Timeline: React.FC<TimelineProps> = ({ summary, currentStartISO, currentEn
     const yearBuckets = useMemo(() => buildYearBuckets(summary, originMs), [summary, originMs]);
     const monthBuckets = useMemo(() => buildMonthBuckets(summary, originMs), [summary, originMs]);
     const dayBuckets = useMemo(() => buildDayBuckets(summary, originMs), [summary, originMs]);
-
-    const visibleYears = useMemo(() => computeVisibleYears(
-        Object.entries(summary.years).map(([year, bucket]) => ({ year: Number(year), count: bucket.count })),
-    ), [summary]);
 
     const [view, setView] = useState<TimelineViewState>({ startDay: 0, endDay: 0 });
     const viewInitializedRef = useRef(false);

@@ -59,14 +59,21 @@ def test_fully_undated_row_excluded_from_buckets_but_counted():
     assert sum(y['count'] for y in summary['years'].values()) == 1
 
 
-def test_future_dated_exif_clamps_into_today():
+def test_future_dated_exif_excluded_from_buckets():
+    # A bad camera clock must not inflate today's count or otherwise appear
+    # anywhere on the timeline -- it's dropped entirely, counted separately.
     frozen_now = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
-    dataset = [{'exifData': _exif('2031:01:01 00:00:00')}]
+    dataset = [
+        {'exifData': _exif('2031:01:01 00:00:00')},
+        {'exifData': _exif('2026:08:06 09:00:00')},  # a real "today" photo
+    ]
     summary = timeline_metadata.build_timeline_summary(dataset, now=frozen_now)
     assert summary['lastDate'] == '2026-08-06'
     assert summary['years']['2026']['months']['08']['days']['06'] == 1
     assert '2031' not in summary['years']
     assert summary['today'] == '2026-08-06'
+    assert summary['futureCount'] == 1
+    assert summary['totalCount'] == 2
 
 
 def test_multi_year_first_and_last_date():
@@ -87,4 +94,5 @@ def test_empty_input_returns_empty_summary_without_error():
     assert summary['firstDate'] is None
     assert summary['lastDate'] is None
     assert summary['undatedCount'] == 0
+    assert summary['futureCount'] == 0
     assert summary['totalCount'] == 0

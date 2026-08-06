@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "14543089847982166266"
+      "templateHash": "17551297924023971500"
     }
   },
   "parameters": {
@@ -62,14 +62,14 @@
       "type": "string",
       "defaultValue": "ghcr.io/git4rajat/photostore-backend:latest",
       "metadata": {
-        "description": "Public backend image. Override only if you publish your own fork's images."
+        "description": "Public backend image. Defaults to :latest for one-click \"Deploy to Azure\" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to."
       }
     },
     "frontendImage": {
       "type": "string",
       "defaultValue": "ghcr.io/git4rajat/photostore-frontend:latest",
       "metadata": {
-        "description": "Public frontend image. Override only if you publish your own fork's images."
+        "description": "Public frontend image. Defaults to :latest for one-click \"Deploy to Azure\" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above."
       }
     }
   },
@@ -120,7 +120,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "3117868767154745687"
+              "templateHash": "13471733902000941263"
             }
           },
           "parameters": {
@@ -170,14 +170,14 @@
               "type": "string",
               "defaultValue": "ghcr.io/git4rajat/photostore-backend:latest",
               "metadata": {
-                "description": "Public backend image. Override only if you publish your own fork's images."
+                "description": "Public backend image. Defaults to :latest for one-click \"Deploy to Azure\" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to."
               }
             },
             "frontendImage": {
               "type": "string",
               "defaultValue": "ghcr.io/git4rajat/photostore-frontend:latest",
               "metadata": {
-                "description": "Public frontend image. Override only if you publish your own fork's images."
+                "description": "Public frontend image. Defaults to :latest for one-click \"Deploy to Azure\" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above."
               }
             },
             "sessionSecretParam": {
