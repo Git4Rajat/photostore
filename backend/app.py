@@ -34,6 +34,7 @@ from ordering_utils import (
     metadata_capture_datetime,
     metadata_upload_datetime,
 )
+from timeline_metadata import build_timeline_summary
 from image_utils import (
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
@@ -980,9 +981,12 @@ def _metadata_capture_date(metadata: Dict) -> datetime:
 def _capture_in_range(metadata: Dict, capture_start: Optional[datetime], capture_end: Optional[datetime]) -> bool:
     if not capture_start and not capture_end:
         return True
-    exif_data = parse_exif_data(metadata.get('exifData', '{}'))
-    captured = _parse_capture_date(exif_data)
-    if not captured:
+    # Falls back to upload date when EXIF capture date is absent, matching the
+    # gallery's default sort (see _metadata_capture_date) — otherwise undated
+    # photos silently vanish from date-filtered results even though they still
+    # sort into the gallery by the same fallback date.
+    captured = _metadata_capture_date(metadata)
+    if captured == datetime.min.replace(tzinfo=timezone.utc):
         return False
     if capture_start and captured.date() < capture_start.date():
         return False
@@ -9580,6 +9584,26 @@ def list_photos():
         photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False))
 
     return jsonify({'photos': photos, 'total': len(entries)})
+
+
+@app.route('/photos/timeline', methods=['GET'])
+@app.route('/photos/timeline/', methods=['GET'])
+@app.route('/api/photos/timeline', methods=['GET'])
+@app.route('/api/photos/timeline/', methods=['GET'])
+def photos_timeline():
+    # Single compact year/month/day summary for the client-side zoomable
+    # timeline (see timeline_metadata.build_timeline_summary). Reuses the same
+    # cached full-partition scan as /photos, so a newly-uploaded photo appears
+    # here within the same staleness window (METADATA_SCAN_CACHE_TTL_SECONDS)
+    # it appears in the gallery, with no separate cache/invalidation to manage.
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    try:
+        metadata_rows = _cached_metadata_rows_for_user(user_id, purpose='photos.timeline')
+    except Exception as exc:
+        return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+    return jsonify(build_timeline_summary(metadata_rows))
 
 
 @app.route('/uploads/corrupted', methods=['GET'])

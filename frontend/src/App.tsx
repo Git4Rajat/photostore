@@ -24,6 +24,7 @@ import {
     XMarkIcon,
 } from '@heroicons/react/24/outline';
 import { AppServicesProvider, ClusteringActivityIndicator, NotificationBell, useAppServices, getBrowserProcessingConcurrency, isBrowserProcessingTurboEnabled, setBrowserProcessingTurbo } from './components/AppServicesProvider';
+import { TimelineMetadataProvider } from './components/TimelineMetadataProvider';
 import { Logo } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
 import { BackendStatusBanner } from './components/shared/BackendStatusBanner';
@@ -979,9 +980,11 @@ const AppContent: React.FC = () => {
 
 const App = () => (
     <AppServicesProvider>
-        <Router>
-            <AppContent />
-        </Router>
+        <TimelineMetadataProvider>
+            <Router>
+                <AppContent />
+            </Router>
+        </TimelineMetadataProvider>
     </AppServicesProvider>
 );
 

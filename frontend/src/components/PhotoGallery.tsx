@@ -26,9 +26,11 @@ import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
+import Timeline from './shared/Timeline';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
+import { useTimelineMetadata } from './TimelineMetadataProvider';
 import type {
     BrowserAiLoadStage,
     BrowserAiModelCacheStatus,
@@ -3773,6 +3775,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const filterMenuRef = useRef<HTMLDivElement | null>(null);
     const [captureStartDate, setCaptureStartDate] = useState<string>(cachedBoot?.captureStartDate || '');
     const [captureEndDate, setCaptureEndDate] = useState<string>(cachedBoot?.captureEndDate || '');
+    const { summary: timelineSummary, status: timelineStatus } = useTimelineMetadata();
     const [downloading, setDownloading] = useState<boolean>(false);
     const [downloadProgress, setDownloadProgress] = useState<{ completed: number; total: number } | null>(null);
     const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
@@ -4342,6 +4345,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     return (
         <section className={sectionClass}>
             {!hideDiscovery && lightboxIndex === null && (
+            <>
             <div className="gallery-controls-surface">
                 <div className="gallery-toolbar">
                     <p className="gallery-meta-line" aria-live="polite">
@@ -4561,6 +4565,19 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                     </div>
                 </div>
             </div>
+
+            {timelineStatus === 'ready' && timelineSummary && (
+                <Timeline
+                    summary={timelineSummary}
+                    currentStartISO={captureStartDate}
+                    currentEndISO={captureEndDate}
+                    onRangeSettled={(startISO, endISO) => {
+                        setCaptureStartDate(startISO);
+                        setCaptureEndDate(endISO);
+                    }}
+                />
+            )}
+            </>
             )}
 
             {downloading && downloadProgress && (
