@@ -152,6 +152,7 @@ const AlbumsPage: React.FC = () => {
     const [showFilterMenu, setShowFilterMenu] = useState<boolean>(false);
     const [showActionsMenu, setShowActionsMenu] = useState<boolean>(false);
     const actionsMenuRef = useRef<HTMLDivElement | null>(null);
+    const filterMenuRef = useRef<HTMLDivElement | null>(null);
     const searchRef = useRef<HTMLDivElement | null>(null);
     const [lastSharedUrl, setLastSharedUrl] = useState<string>('');
     const [status, setStatus] = useState<string>('');
@@ -486,9 +487,40 @@ const AlbumsPage: React.FC = () => {
                 setShowActionsMenu(false);
             }
         };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowActionsMenu(false);
+            }
+        };
         document.addEventListener('pointerdown', handlePointerDown);
-        return () => document.removeEventListener('pointerdown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('pointerdown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
     }, [showActionsMenu]);
+
+    useEffect(() => {
+        if (!showFilterMenu) {
+            return;
+        }
+        const handlePointerDown = (event: PointerEvent) => {
+            if (filterMenuRef.current && !filterMenuRef.current.contains(event.target as Node)) {
+                setShowFilterMenu(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowFilterMenu(false);
+            }
+        };
+        document.addEventListener('pointerdown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('pointerdown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [showFilterMenu]);
 
     useEffect(() => {
         if (!searchOpen) {
@@ -1077,11 +1109,14 @@ const AlbumsPage: React.FC = () => {
                                 </button>
                             )}
 
-                            <div className="gallery-menu-anchor">
+                            <div className="gallery-menu-anchor" ref={filterMenuRef}>
                                 <button
                                     type="button"
                                     className={`btn icon-btn ${showFilterMenu ? 'btn-primary' : (filterMinRating > 0 || filterLikedOnly ? 'btn-primary' : 'btn-soft')}`}
-                                    onClick={() => setShowFilterMenu((prev) => !prev)}
+                                    onClick={() => {
+                                        setShowActionsMenu(false);
+                                        setShowFilterMenu((prev) => !prev);
+                                    }}
                                     aria-label="Filters"
                                     aria-expanded={showFilterMenu}
                                     title="Filters"
@@ -1165,7 +1200,10 @@ const AlbumsPage: React.FC = () => {
                                 <button
                                     type="button"
                                     className={`btn icon-btn ${(selectedCount > 0 || selectedAlbumIds.size > 0) ? 'btn-primary' : 'btn-soft'}`}
-                                    onClick={() => setShowActionsMenu((prev) => !prev)}
+                                    onClick={() => {
+                                        setShowFilterMenu(false);
+                                        setShowActionsMenu((prev) => !prev);
+                                    }}
                                     aria-label="More actions"
                                     aria-expanded={showActionsMenu}
                                     title="More actions"

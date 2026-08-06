@@ -3769,6 +3769,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [showSortMenu, setShowSortMenu] = useState<boolean>(false);
     const [searchOpen, setSearchOpen] = useState<boolean>(false);
     const searchRef = useRef<HTMLDivElement | null>(null);
+    const sortMenuRef = useRef<HTMLDivElement | null>(null);
+    const filterMenuRef = useRef<HTMLDivElement | null>(null);
     const [captureStartDate, setCaptureStartDate] = useState<string>(cachedBoot?.captureStartDate || '');
     const [captureEndDate, setCaptureEndDate] = useState<string>(cachedBoot?.captureEndDate || '');
     const [downloading, setDownloading] = useState<boolean>(false);
@@ -3778,7 +3780,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const observerRef = useRef<IntersectionObserver | null>(null);
     const loadMoreRef = useRef<HTMLDivElement | null>(null);
     const photoListRequestSeqRef = useRef<number>(0);
-    const hasBootstrappedCaptureRef = useRef<boolean>(false);
+    const hasBootstrappedFiltersRef = useRef<boolean>(false);
     const didInitialRevalidateRef = useRef<boolean>(false);
     const PAGE_SIZE = 24;
     const getUserFacingFetchError = (err: unknown): string => {
@@ -4144,13 +4146,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         }
     };
 
-    const handleApplyFilters = () => {
-        setOffset(0);
-        setPhotos([]);
-        setHasMore(true);
-        fetchPhotos(sortBy, 0, false);
-    };
-
     const handleResetFilters = () => {
         // Reset every field in the filter panel, not just rating/likes — leaving
         // the capture-date range set made "Reset" look like it did nothing when a
@@ -4205,15 +4200,21 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     }, []);
 
     useEffect(() => {
-        if (!hasBootstrappedCaptureRef.current) {
-            hasBootstrappedCaptureRef.current = true;
+        if (!hasBootstrappedFiltersRef.current) {
+            hasBootstrappedFiltersRef.current = true;
             return;
         }
 
-        setOffset(0);
-        setHasMore(true);
-        fetchPhotos(sortBy, 0, false, searchQuery);
-    }, [captureStartDate, captureEndDate, sortBy, searchQuery, fetchPhotos]);
+        // Debounced so dragging the rating/likes sliders (which fire onChange on
+        // every tick, not just on release) doesn't hammer the API — the gallery
+        // still updates live, just ~350ms after the user settles on a value.
+        const timeoutId = window.setTimeout(() => {
+            setOffset(0);
+            setHasMore(true);
+            fetchPhotos(sortBy, 0, false, searchQuery);
+        }, 350);
+        return () => window.clearTimeout(timeoutId);
+    }, [captureStartDate, captureEndDate, filters.minRating, filters.minLikes, sortBy, searchQuery, fetchPhotos]);
 
     const submitSearch = useCallback((override?: string) => {
         const nextQuery = (override ?? searchInput).trim();
@@ -4235,6 +4236,50 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         document.addEventListener('pointerdown', handlePointerDown);
         return () => document.removeEventListener('pointerdown', handlePointerDown);
     }, [searchOpen]);
+
+    useEffect(() => {
+        if (!showSortMenu) {
+            return;
+        }
+        const handlePointerDown = (event: PointerEvent) => {
+            if (sortMenuRef.current && !sortMenuRef.current.contains(event.target as Node)) {
+                setShowSortMenu(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowSortMenu(false);
+            }
+        };
+        document.addEventListener('pointerdown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('pointerdown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [showSortMenu]);
+
+    useEffect(() => {
+        if (!showFilters) {
+            return;
+        }
+        const handlePointerDown = (event: PointerEvent) => {
+            if (filterMenuRef.current && !filterMenuRef.current.contains(event.target as Node)) {
+                setShowFilters(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowFilters(false);
+            }
+        };
+        document.addEventListener('pointerdown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('pointerdown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [showFilters]);
 
     useEffect(() => {
         if (!serverTotalLoaded) {
@@ -4329,10 +4374,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                             </button>
                         )}
 
-                        <div className="gallery-menu-anchor">
+                        <div className="gallery-menu-anchor" ref={sortMenuRef}>
                             <button
                                 type="button"
-                                onClick={() => setShowSortMenu((prev) => !prev)}
+                                onClick={() => {
+                                    setShowFilters(false);
+                                    setShowSortMenu((prev) => !prev);
+                                }}
                                 className={`btn icon-btn ${showSortMenu ? 'btn-primary' : 'btn-soft'}`}
                                 aria-label="Sort and view options"
                                 aria-expanded={showSortMenu}
@@ -4368,10 +4416,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                             )}
                         </div>
 
-                        <div className="gallery-menu-anchor">
+                        <div className="gallery-menu-anchor" ref={filterMenuRef}>
                             <button
                                 type="button"
-                                onClick={() => setShowFilters(!showFilters)}
+                                onClick={() => {
+                                    setShowSortMenu(false);
+                                    setShowFilters((prev) => !prev);
+                                }}
                                 className={`btn icon-btn ${showFilters || filters.minRating > 0 || filters.minLikes > 0 || hasCaptureFilter ? 'btn-primary' : 'btn-soft'}`}
                                 aria-label="Filters"
                                 aria-expanded={showFilters}
@@ -4425,13 +4476,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                         />
                                     </div>
                                     <div className="gallery-menu-row">
-                                        <button
-                                            type="button"
-                                            onClick={() => { handleApplyFilters(); setShowFilters(false); }}
-                                            className="btn btn-primary gallery-menu-btn"
-                                        >
-                                            <CheckIcon className="toolbar-icon" /> Apply
-                                        </button>
                                         <button
                                             type="button"
                                             onClick={handleResetFilters}
