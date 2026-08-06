@@ -7544,7 +7544,14 @@ def face_crop(face_id: str):
     try:
         props = get_media_properties('cover', cover_blob)
         if props:
-            return jsonify({'url': make_media_url(cover_blob, 'cover')})
+            # face_id is content-addressed (hash of filename+bbox, see
+            # _deterministic_face_id) so a persisted cover is immutable for
+            # its lifetime — safe to cache long. SAS URLs are day-aligned and
+            # valid up to 48h (see _create_stable_read_sas_url), so 1h keeps
+            # this well inside that window.
+            resp = jsonify({'url': make_media_url(cover_blob, 'cover')})
+            resp.headers['Cache-Control'] = 'public, max-age=3600, immutable'
+            return resp
     except Exception:
         pass
 
@@ -7599,7 +7606,9 @@ def face_crop(face_id: str):
         cover_bytes = buf.read()
         try:
             upload_media_file('cover', cover_blob, cover_bytes, 'image/jpeg')
-            return jsonify({'url': make_media_url(cover_blob, 'cover')})
+            resp = jsonify({'url': make_media_url(cover_blob, 'cover')})
+            resp.headers['Cache-Control'] = 'public, max-age=3600, immutable'
+            return resp
         except Exception:
             data_url = 'data:image/jpeg;base64,' + base64.b64encode(cover_bytes).decode('ascii')
 
@@ -11574,6 +11583,24 @@ def _remove_file_quietly(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+@app.route('/public/albums/<token>/download-check', methods=['GET'])
+def public_album_download_check(token: str):
+    """Cheap reachability/validity probe the frontend calls before submitting
+    the real download form. The form POST (below) can't be driven through
+    httpClient — a browser form submission gives no programmatic success/
+    failure signal — so this lets a dead backend or an expired/removed album
+    be caught and shown to the user instead of silently opening a blank tab.
+    Deliberately does not re-validate the access code (the album page load
+    already did, and the real download POST re-checks it via the grant
+    cookie): this only needs to answer "is there something to download",
+    which doesn't require credentialed cross-origin CORS.
+    """
+    entity = _find_public_album_by_token(token)
+    if not entity or not _coerce_bool(entity.get('isPublic', False)) or _album_is_expired(entity):
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({'ok': True})
 
 
 @app.route('/public/albums/<token>/download', methods=['POST'])

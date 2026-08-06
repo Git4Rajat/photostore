@@ -27,6 +27,8 @@ import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
+import { classifyApiError, type ApiError } from '../services/apiError';
+import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 
 interface Photo {
     filename: string;
@@ -282,6 +284,7 @@ const ToolsPage: React.FC = () => {
     const [processingFilterProcess, setProcessingFilterProcess] = useState<ProcessingFilterProcess>('all');
     const [viewMode, setViewMode] = useState<WorkbenchViewKey>('recent');
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+    const [photosLoadError, setPhotosLoadError] = useState<ApiError | null>(null);
     const activeToolsPage = getToolsPageKey(location.pathname);
     const isOverviewPage = activeToolsPage === 'overview';
     const isQueueStatusPage = activeToolsPage === 'queue-status';
@@ -291,6 +294,7 @@ const ToolsPage: React.FC = () => {
     const loadPhotos = async (queryText: string = '') => {
         setLoading(true);
         setMessage('');
+        setPhotosLoadError(null);
         try {
             const trimmedQuery = queryText.trim();
             const response = trimmedQuery
@@ -302,10 +306,13 @@ const ToolsPage: React.FC = () => {
             setPhotosOffset(fetched.length);
         } catch (err) {
             setMessage(`Failed to load photos: ${String(err)}`);
+            setPhotosLoadError(classifyApiError(err));
         } finally {
             setLoading(false);
         }
     };
+
+    useBackendRecoveryRetry(photosLoadError, () => { void loadPhotos(); });
 
     const loadMorePhotos = async () => {
         if (loadingMore || loading) return;

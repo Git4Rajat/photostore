@@ -30,10 +30,14 @@ import { get, post } from '../services/apiClient';
 import { plural } from '../utils/format';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { EmptyState } from './shared/EmptyState';
+import { ErrorState } from './shared/ErrorState';
 import { Loading } from './shared/Loading';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
+import { classifyApiError, type ApiError } from '../services/apiError';
+import { notifyApiError } from '../services/requestFeedback';
+import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 
 interface Photo {
     filename: string;
@@ -152,6 +156,7 @@ const AlbumsPage: React.FC = () => {
     const [lastSharedUrl, setLastSharedUrl] = useState<string>('');
     const [status, setStatus] = useState<string>('');
     const [error, setError] = useState<string>('');
+    const [loadError, setLoadError] = useState<ApiError | null>(null);
     const [smartCreateOpen, setSmartCreateOpen] = useState<boolean>(false);
     const [smartCreatingRule, setSmartCreatingRule] = useState<SmartAlbumRule | null>(null);
     const [offset, setOffset] = useState<number>(0);
@@ -326,6 +331,7 @@ const AlbumsPage: React.FC = () => {
         if (isInitialLoad) {
             setPhotosLoading(true);
             setError('');
+            setLoadError(null);
             setHasMore(true);
         } else {
             setLoadingMore(true);
@@ -339,8 +345,11 @@ const AlbumsPage: React.FC = () => {
             setPhotos((prev) => (append ? [...prev, ...list] : list));
             setOffset(nextOffset + list.length);
             setHasMore(list.length === PAGE_SIZE && nextOffset + list.length < total);
-        } catch {
+        } catch (err) {
             setError('Unable to load photos for albums.');
+            if (isInitialLoad) {
+                setLoadError(classifyApiError(err));
+            }
             setHasMore(false);
         } finally {
             if (isInitialLoad) {
@@ -364,9 +373,9 @@ const AlbumsPage: React.FC = () => {
             const response = await get(`/photos/search?q=${encodeURIComponent(trimmedQuery)}&offset=0&limit=500`);
             const list = Array.isArray(response?.photos) ? (response.photos as Photo[]) : [];
             setSemanticPhotos(list);
-        } catch {
+        } catch (err) {
             setSemanticPhotos([]);
-            setError('Unable to run AI search for albums.');
+            notifyApiError(err, { context: 'Unable to run AI search for albums.', retry: () => { void fetchSemanticPhotos(trimmedQuery); } });
         } finally {
             setSemanticLoading(false);
         }
@@ -378,9 +387,9 @@ const AlbumsPage: React.FC = () => {
             const response = await get('/albums');
             const list = Array.isArray(response?.albums) ? (response.albums as Album[]) : [];
             setAlbums(list);
-        } catch {
+        } catch (err) {
             setAlbums([]);
-            setError('Unable to load albums.');
+            notifyApiError(err, { context: 'Unable to load albums.', retry: () => { void loadAlbums(); } });
         } finally {
             setAlbumsLoading(false);
         }
@@ -407,6 +416,8 @@ const AlbumsPage: React.FC = () => {
         void loadAlbums();
         void fetchPhotosPage(0, false);
     }, [loadAlbums, fetchPhotosPage]);
+
+    useBackendRecoveryRetry(loadError, () => { void fetchPhotosPage(0, false); });
 
     useEffect(() => {
         observerRef.current = new IntersectionObserver((entries) => {
@@ -539,7 +550,7 @@ const AlbumsPage: React.FC = () => {
                 setError('Failed to delete selected albums.');
             }
         } catch (err) {
-            setError(extractApiErrorMessage(err, 'Failed to delete selected albums.'));
+            notifyApiError(err, { context: 'Failed to delete selected albums.', retry: () => { void handleDeleteSelectedAlbums(); } });
         }
     };
 
@@ -560,7 +571,7 @@ const AlbumsPage: React.FC = () => {
                 setStatus(`Created album ${trimmed}.`);
             }
         } catch (err) {
-            setError(extractApiErrorMessage(err, 'Failed to create album.'));
+            notifyApiError(err, { context: 'Failed to create album.', retry: () => { void handleCreateAlbum(); } });
         }
     };
 
@@ -583,7 +594,7 @@ const AlbumsPage: React.FC = () => {
                 setStatus(response?.message || 'No new matching smart album could be created for this rule.');
             }
         } catch (err) {
-            setError(extractApiErrorMessage(err, 'Failed to smart create album.'));
+            notifyApiError(err, { context: 'Failed to smart create album.', retry: () => { void handleAutoCreateAlbums(rule); } });
         } finally {
             setSmartCreatingRule(null);
         }
@@ -609,12 +620,12 @@ const AlbumsPage: React.FC = () => {
         setStatus(`Added ${plural(filenames.length, 'photo')} to album.`);
         try {
             await post(`/albums/${activeAlbumId}/photos/add`, { filenames });
-        } catch {
+        } catch (err) {
             syncAlbumFilenames(filenames, 'remove');
             const added = new Set(addedPhotos.map((photo) => photo.filename));
             setActiveAlbumPhotos((prev) => prev.filter((photo) => !added.has(photo.filename)));
             setStatus('');
-            setError('Failed to add photos to album.');
+            notifyApiError(err, { context: 'Failed to add photos to album.' });
         }
     };
 
@@ -631,10 +642,10 @@ const AlbumsPage: React.FC = () => {
         setStatus(`Removed ${plural(filenames.length, 'photo')} from album.`);
         try {
             await post(`/albums/${activeAlbumId}/photos/remove`, { filenames });
-        } catch {
+        } catch (err) {
             syncAlbumFilenames(filenames, 'add');
             setStatus('');
-            setError('Failed to remove photos from album.');
+            notifyApiError(err, { context: 'Failed to remove photos from album.' });
         }
     };
 
@@ -657,7 +668,8 @@ const AlbumsPage: React.FC = () => {
             );
             setStatus(`Downloaded ${plural(files.length, 'photo')}.`);
         } catch (err) {
-            setError(typeof err === 'string' ? err : 'Failed to download selected photos.');
+            setStatus('');
+            notifyApiError(err, { context: 'Failed to download selected photos.', retry: () => { void handleDownloadSelected(); } });
         } finally {
             setDownloading(false);
         }
@@ -701,8 +713,8 @@ const AlbumsPage: React.FC = () => {
             }
 
             setStatus(`Deleted ${plural(deleted.length || deleteCount, 'photo')} from gallery and albums.`);
-        } catch {
-            setError('Failed to delete selected photos.');
+        } catch (err) {
+            notifyApiError(err, { context: 'Failed to delete selected photos.', retry: () => { void handleDeleteSelected(); } });
         }
     };
 
@@ -776,8 +788,8 @@ const AlbumsPage: React.FC = () => {
             } else {
                 setStatus(copied ? 'Public link copied.' : 'Public link generated. Copy it below.');
             }
-        } catch {
-            setError('Failed to create share link.');
+        } catch (err) {
+            notifyApiError(err, { context: 'Failed to create share link.' });
         }
     };
 
@@ -805,8 +817,8 @@ const AlbumsPage: React.FC = () => {
             }
             setLastSharedUrl('');
             setStatus('Public link revoked.');
-        } catch {
-            setError('Failed to revoke public link.');
+        } catch (err) {
+            notifyApiError(err, { context: 'Failed to revoke public link.', retry: () => { void handleRevokeLink(); } });
         }
     };
 
@@ -839,7 +851,7 @@ const AlbumsPage: React.FC = () => {
             } catch (err) {
                 updateAlbumList(activeAlbumId, (album) => ({ ...album, name: current }));
                 setStatus('');
-                setError(extractApiErrorMessage(err, 'Failed to rename album.'));
+                notifyApiError(err, { context: 'Failed to rename album.' });
             }
         };
 
@@ -869,7 +881,7 @@ const AlbumsPage: React.FC = () => {
                 setError(extractApiErrorMessage(response, 'Failed to delete album.'));
             }
         } catch (err) {
-            setError(extractApiErrorMessage(err, 'Failed to delete album.'));
+            notifyApiError(err, { context: 'Failed to delete album.', retry: () => { void handleDeleteAlbum(); } });
         }
     };
 
@@ -1267,7 +1279,15 @@ const AlbumsPage: React.FC = () => {
                     )}
                     {photosLoading && <Loading label="Loading photos…" fullPage={false} />}
 
-                    {!photosLoading && filteredPhotos.length === 0 && (
+                    {!photosLoading && !activeAlbumId && photos.length === 0 && loadError && (
+                        <ErrorState
+                            title="Could not load photos"
+                            message={loadError.message}
+                            onRetry={loadError.retriable ? () => { void fetchPhotosPage(0, false); } : undefined}
+                        />
+                    )}
+
+                    {!photosLoading && filteredPhotos.length === 0 && !(!activeAlbumId && photos.length === 0 && loadError) && (
                         <EmptyState
                             icon={<RectangleStackIcon />}
                             title={activeAlbum && !showAddFromGallery ? 'This album is empty' : 'Nothing to show here'}

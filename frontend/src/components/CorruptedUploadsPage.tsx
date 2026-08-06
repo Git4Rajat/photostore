@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { CheckCircleIcon } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
 import PhotoTile from './shared/PhotoTile';
@@ -6,6 +6,9 @@ import PhotoViewer from './shared/PhotoViewer';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
+import { classifyApiError, type ApiError } from '../services/apiError';
+import { notifyApiError } from '../services/requestFeedback';
+import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 
 interface CorruptedUpload {
     filename: string;
@@ -20,47 +23,37 @@ interface CorruptedUpload {
 const CorruptedUploadsPage: React.FC = () => {
     const [items, setItems] = useState<CorruptedUpload[]>([]);
     const [loading, setLoading] = useState<boolean>(true);
-    const [error, setError] = useState<string | null>(null);
+    const [error, setError] = useState<ApiError | null>(null);
     const [clearing, setClearing] = useState<string | null>(null);
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
 
-    useEffect(() => {
-        let mounted = true;
-        const load = async () => {
-            setLoading(true);
-            setError(null);
-            try {
-                const data = await get('/api/uploads/corrupted');
-                if (!mounted) {
-                    return;
-                }
-                const nextItems = Array.isArray(data?.items) ? data.items : [];
-                setItems(nextItems);
-            } catch (err) {
-                if (!mounted) {
-                    return;
-                }
-                setError(String(err));
-            } finally {
-                if (mounted) {
-                    setLoading(false);
-                }
-            }
-        };
-        void load();
-        return () => {
-            mounted = false;
-        };
+    const load = useCallback(async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const data = await get('/api/uploads/corrupted');
+            const nextItems = Array.isArray(data?.items) ? data.items : [];
+            setItems(nextItems);
+        } catch (err) {
+            setError(classifyApiError(err));
+        } finally {
+            setLoading(false);
+        }
     }, []);
+
+    useEffect(() => {
+        void load();
+    }, [load]);
+
+    useBackendRecoveryRetry(error, load);
 
     const clearCorruption = async (filename: string) => {
         setClearing(filename);
-        setError(null);
         try {
             await post(`/api/uploads/corrupted/${encodeURIComponent(filename)}/clear`, {});
             setItems((current) => current.filter((item) => item.filename !== filename));
         } catch (err) {
-            setError(String(err));
+            notifyApiError(err, { context: "Couldn't mark as not corrupted", retry: () => { void clearCorruption(filename); } });
         } finally {
             setClearing(null);
         }
@@ -85,7 +78,13 @@ const CorruptedUploadsPage: React.FC = () => {
             </header>
 
             {loading && <Loading label="Checking your uploads…" fullPage={false} />}
-            {error && <ErrorState title="Couldn't check uploads" message={error} />}
+            {error && (
+                <ErrorState
+                    title="Couldn't check uploads"
+                    message={error.message}
+                    onRetry={error.retriable ? () => { void load(); } : undefined}
+                />
+            )}
             {!loading && !error && items.length === 0 && (
                 <EmptyState
                     icon={<CheckCircleIcon />}

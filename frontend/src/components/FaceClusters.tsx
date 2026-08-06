@@ -1,11 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EmptyState } from './shared/EmptyState';
 import { confirmDialog } from './shared/dialogs';
 import { Loading } from './shared/Loading';
 import { ArrowsRightLeftIcon, ArrowRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, ExclamationTriangleIcon, FaceSmileIcon, MagnifyingGlassIcon, NoSymbolIcon, SparklesIcon, Squares2X2Icon, TrashIcon, UserCircleIcon, UsersIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import faceService from '../services/faceService';
-import { getUploadJson, resolveApiUrl } from '../services/apiClient';
-import { fetchProtectedBlobUrl } from '../services/imageClient';
+import { resolveFaceCropUrl, resolveFaceFallbackUrl } from '../services/faceMediaCache';
 import { showToast } from '../services/toast';
 import { requestJobPoll } from '../services/jobNotifications';
 import { notifyApiError } from '../services/requestFeedback';
@@ -23,23 +22,6 @@ const isSuspiciousFace = (face?: PersonFace) => face?.reviewStatus === 'suspicio
 const getFaceFallbackPath = (filename?: string | null) => filename ? `/api/photos/access/thumbnail/${encodeURIComponent(filename)}` : '';
 const getFaceProxyThumbnailPath = (filename?: string | null) => filename ? `/api/photos/thumbnail/${encodeURIComponent(filename)}` : '';
 
-// Turn a URL returned by the backend into one an <img> can actually load.
-// data: URLs and absolute SAS URLs load directly, but a relative backend proxy
-// path (e.g. /api/photos/cover/...) is auth-protected and an <img> tag can't
-// attach the bearer token — so those are fetched into a blob URL instead.
-const toDisplayableUrl = async (rawUrl: string): Promise<string> => {
-    if (!rawUrl) {
-        return '';
-    }
-    if (rawUrl.startsWith('data:') || /^https?:\/\//i.test(rawUrl)) {
-        return rawUrl;
-    }
-    if (isAuthEnabled()) {
-        return await fetchProtectedBlobUrl(rawUrl);
-    }
-    return resolveApiUrl(rawUrl);
-};
-
 const getFaceObjectPosition = (rep?: PersonFace) => {
     const bbox = rep?.bbox;
     const width = Number(rep?.imageWidth || 0);
@@ -55,20 +37,37 @@ const getFaceObjectPosition = (rep?: PersonFace) => {
 };
 
 const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, alt }) => {
-    const mediaRef = useRef<HTMLDivElement | null>(null);
+    const wrapperRef = useRef<HTMLDivElement | null>(null);
+    const mountedRef = useRef(true);
+    const fallbackRequestedRef = useRef(false);
     const authEnabled = isAuthEnabled();
     const [shouldLoad, setShouldLoad] = useState(!authEnabled);
     const [cropUrl, setCropUrl] = useState('');
+    const [cropErrored, setCropErrored] = useState(false);
     const [fallbackUrl, setFallbackUrl] = useState('');
     const filename = rep?.filename;
+    const faceId = rep?.faceId;
     const fallbackPath = getFaceFallbackPath(filename);
     const proxyFallbackPath = getFaceProxyThumbnailPath(filename);
+    // Prefer the direct-blob SAS thumbnail the listing already provided
+    // (rep.thumbnailUrl) over a per-face access round trip; only hit the
+    // backend when it's absent (RAW/HEIC or non-SAS mode).
+    const inlineThumb = typeof rep?.thumbnailUrl === 'string' && /^https?:\/\//i.test(rep.thumbnailUrl)
+        ? rep.thumbnailUrl
+        : '';
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+        };
+    }, []);
 
     useEffect(() => {
         if (!authEnabled || shouldLoad) {
             return undefined;
         }
-        const node = mediaRef.current;
+        const node = wrapperRef.current;
         if (!node || typeof IntersectionObserver === 'undefined') {
             setShouldLoad(true);
             return undefined;
@@ -83,87 +82,66 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
         return () => observer.disconnect();
     }, [authEnabled, shouldLoad]);
 
+    // Only fetched when the crop is unavailable/fails — previously this ran
+    // unconditionally alongside the crop fetch, doubling request volume for
+    // every avatar even when the crop loaded fine.
+    const ensureFallback = useCallback(() => {
+        if (fallbackRequestedRef.current || !filename) {
+            return;
+        }
+        fallbackRequestedRef.current = true;
+        void resolveFaceFallbackUrl(filename, inlineThumb, proxyFallbackPath).then((url) => {
+            if (mountedRef.current) {
+                setFallbackUrl(url);
+            }
+        });
+    }, [filename, inlineThumb, proxyFallbackPath]);
+
     useEffect(() => {
-        let active = true;
-        const createdBlobUrls: string[] = [];
+        fallbackRequestedRef.current = false;
+        setCropUrl('');
+        setCropErrored(false);
+        setFallbackUrl('');
         if (!shouldLoad || !filename) {
-            setCropUrl('');
-            setFallbackUrl('');
             return undefined;
         }
-        const track = (url: string) => {
-            if (url.startsWith('blob:')) {
-                createdBlobUrls.push(url);
-            }
-            return url;
-        };
-        void (async () => {
-            if (rep?.faceId) {
-                try {
-                    const result = await getUploadJson(`/api/faces/crop/${encodeURIComponent(rep.faceId)}`);
-                    if (typeof result?.url === 'string') {
-                        const displayable = await toDisplayableUrl(result.url);
-                        if (active) {
-                            setCropUrl(track(displayable));
-                        }
-                    }
-                } catch {
-                    if (active) {
-                        setCropUrl('');
-                    }
-                }
-            }
-            // Prefer the direct-blob SAS thumbnail the listing already provided
-            // (rep.thumbnailUrl) over a per-face access round trip; only hit the
-            // backend when it's absent (RAW/HEIC or non-SAS mode).
-            const inlineThumb = typeof rep?.thumbnailUrl === 'string' && /^https?:\/\//i.test(rep.thumbnailUrl)
-                ? rep.thumbnailUrl
-                : '';
-            try {
-                let rawFallback = inlineThumb;
-                if (!rawFallback) {
-                    const result = await getUploadJson(`/api/photos/access/thumbnail/${encodeURIComponent(filename)}`);
-                    rawFallback = typeof result?.url === 'string' && result.url
-                        ? result.url
-                        : (proxyFallbackPath || '');
-                }
-                const displayable = rawFallback ? await toDisplayableUrl(rawFallback) : '';
+        if (!faceId) {
+            ensureFallback();
+            return undefined;
+        }
+        let active = true;
+        resolveFaceCropUrl(faceId)
+            .then((url) => {
                 if (active) {
-                    setFallbackUrl(track(displayable));
+                    setCropUrl(url);
                 }
-            } catch {
-                try {
-                    const displayable = proxyFallbackPath ? await toDisplayableUrl(proxyFallbackPath) : '';
-                    if (active) {
-                        setFallbackUrl(track(displayable));
-                    }
-                } catch {
-                    if (active) {
-                        setFallbackUrl('');
-                    }
+            })
+            .catch(() => {
+                if (active) {
+                    ensureFallback();
                 }
-            }
-        })();
+            });
         return () => {
             active = false;
-            createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
         };
-    }, [filename, proxyFallbackPath, rep?.faceId, rep?.thumbnailUrl, shouldLoad]);
+    }, [shouldLoad, faceId, filename, ensureFallback]);
 
-    const imageUrl = cropUrl || (fallbackPath ? fallbackUrl : proxyFallbackPath);
+    // Reactive to cropErrored, so once the crop <img> fails this falls through
+    // to fallbackUrl (or the loading placeholder while it's still resolving)
+    // on the next render — no imperative DOM src swap needed.
+    const imageUrl = (!cropErrored && cropUrl) || fallbackUrl || (fallbackPath ? '' : proxyFallbackPath);
 
     return (
-        <div ref={mediaRef} className="person-avatar-media">
+        <div ref={wrapperRef} className="person-avatar-media">
             {shouldLoad && imageUrl ? (
                 <img
                     src={imageUrl}
                     alt={alt}
                     loading="lazy"
                     style={{ objectPosition: getFaceObjectPosition(rep) }}
-                    onError={(e) => {
-                        if (fallbackUrl && e.currentTarget.src !== fallbackUrl) {
-                            e.currentTarget.src = fallbackUrl;
-                        }
+                    onError={() => {
+                        setCropErrored(true);
+                        ensureFallback();
                     }}
                 />
             ) : (
@@ -324,6 +302,7 @@ const FaceClusters: React.FC = () => {
             setFacesLoaded(false);
         } catch (e: unknown) {
             setStatus(String(e));
+            notifyApiError(e, { context: "Couldn't load people", retry: () => { void loadPersons(q, showSpinner); } });
         } finally {
             if (showSpinner) {
                 setInitialLoading(false);
@@ -351,6 +330,7 @@ const FaceClusters: React.FC = () => {
             });
         } catch (e: unknown) {
             setStatus(String(e));
+            notifyApiError(e, { context: "Couldn't load faces", retry: () => { void loadFaces(); } });
         } finally {
             setFacesLoading(false);
         }
@@ -367,6 +347,7 @@ const FaceClusters: React.FC = () => {
             setSuggestions(rawSuggestions);
         } catch (e: unknown) {
             setStatus(String(e));
+            notifyApiError(e, { context: "Couldn't load merge history / suggestions", retry: () => { void refreshSupportData(); } });
         }
     };
 
@@ -568,8 +549,8 @@ const FaceClusters: React.FC = () => {
             await loadPersons(searchQuery.trim(), false);
             void refreshSupportData();
         } catch (e: unknown) {
-            setStatus(String(e));
-            showToast(String(e));
+            setStatus('');
+            notifyApiError(e, { context: "Couldn't assign unclustered faces", retry: () => { void handleAssignUnclustered(); } });
         } finally {
             setActionLoading(false);
         }
@@ -610,7 +591,7 @@ const FaceClusters: React.FC = () => {
             showToast('Merged');
             void refreshMergeHistory();
         } catch (e: unknown) {
-            showToast(String(e));
+            notifyApiError(e, { context: "Couldn't merge" });
             resyncAfterSuggestionError();
         }
     };
@@ -653,7 +634,7 @@ const FaceClusters: React.FC = () => {
             await faceService.declineSuggestion(sourceId, targetId);
             showToast('Suggestion declined');
         } catch (e: unknown) {
-            showToast(String(e));
+            notifyApiError(e, { context: "Couldn't dismiss suggestion" });
             void refreshSupportData();
         }
     };
@@ -688,9 +669,9 @@ const FaceClusters: React.FC = () => {
             showToast('Cluster deleted');
             setStatus('Cluster deleted.');
             void refreshSupportData();
-        } catch (e: any) {
-            setStatus(String(e));
-            showToast(String(e));
+        } catch (e: unknown) {
+            setStatus('');
+            notifyApiError(e, { context: "Couldn't delete cluster", retry: () => { void handleDeletePerson(personId, label); } });
         } finally {
             setActionLoading(false);
         }
@@ -735,9 +716,9 @@ const FaceClusters: React.FC = () => {
             setStatus(`Deleted ${deletedCount} cluster${deletedCount === 1 ? '' : 's'}${errorCount ? `, ${errorCount} failed` : ''}.`);
             showToast(errorCount ? `Deleted ${deletedCount}, ${errorCount} failed` : 'Selected clusters deleted');
             void refreshSupportData();
-        } catch (e: any) {
-            setStatus(String(e));
-            showToast(String(e));
+        } catch (e: unknown) {
+            setStatus('');
+            notifyApiError(e, { context: "Couldn't delete selected clusters", retry: () => { void handleDeleteSelected(); } });
         } finally {
             setActionLoading(false);
         }
@@ -779,9 +760,9 @@ const FaceClusters: React.FC = () => {
             setLastMergeId(res.mergeId || null);
             applyMergeToState(mergeTarget, mergeIds);
             void refreshSupportData();
-        } catch (e: any) {
-            setStatus(String(e));
-            showToast(String(e));
+        } catch (e: unknown) {
+            setStatus('');
+            notifyApiError(e, { context: "Couldn't merge people", retry: () => { void handleMergeSelected(); } });
         } finally {
             setActionLoading(false);
         }
@@ -806,9 +787,9 @@ const FaceClusters: React.FC = () => {
             }
             await loadPersons(searchQuery.trim(), false);
             void refreshSupportData();
-        } catch (e: any) {
-            setStatus(String(e));
-            showToast(String(e));
+        } catch (e: unknown) {
+            setStatus('');
+            notifyApiError(e, { context: "Couldn't undo merge", retry: () => { void handleUndoMerge(mergeId); } });
         } finally {
             setActionLoading(false);
         }

@@ -2,7 +2,11 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowDownTrayIcon, CheckIcon, LockOpenIcon, PhotoIcon } from '@heroicons/react/24/outline';
 import { useParams } from 'react-router-dom';
 import { get, post, resolveApiUrl } from '../services/apiClient';
-import { isApiError } from '../services/apiError';
+import { classifyApiError, isApiError, type ApiError } from '../services/apiError';
+import { notifyApiError } from '../services/requestFeedback';
+import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
+import { getBackendStatusSnapshot } from '../services/backendStatus';
+import { showToast } from '../services/toast';
 import PhotoTile from './shared/PhotoTile';
 import PhotoViewer from './shared/PhotoViewer';
 import { Logo } from './shared/Logo';
@@ -54,6 +58,7 @@ const PublicAlbumPage: React.FC = () => {
     const { token } = useParams();
     const [loading, setLoading] = useState<boolean>(true);
     const [error, setError] = useState<string>('');
+    const [loadError, setLoadError] = useState<ApiError | null>(null);
     const [retryAfterSeconds, setRetryAfterSeconds] = useState<number | null>(null);
     const [codeRequired, setCodeRequired] = useState<boolean>(false);
     const [accessCode, setAccessCode] = useState<string>('');
@@ -72,23 +77,25 @@ const PublicAlbumPage: React.FC = () => {
             }
             setLoading(true);
             setError('');
+            setLoadError(null);
             setRetryAfterSeconds(null);
             try {
                 const response = code.trim()
                     ? await post(`/public/albums/${encodeURIComponent(token)}`, { accessCode: code.trim() })
                     : await get(`/public/albums/${encodeURIComponent(token)}`);
-                
+
                 if (!response || !response.album) {
                     setError('This public album link is invalid or no longer available.');
                     setLoading(false);
                     return;
                 }
-                
+
                 setAlbum(response.album || null);
                 setPhotos(Array.isArray(response.photos) ? response.photos : []);
                 setSelectedPhotos(new Set());
                 setCodeRequired(false);
             } catch (err) {
+                setLoadError(classifyApiError(err));
                 const payload = parsePublicAlbumError(err);
                 if (payload.codeRequired === true) {
                     setCodeRequired(true);
@@ -111,6 +118,8 @@ const PublicAlbumPage: React.FC = () => {
             }
     }, [token]);
 
+    useBackendRecoveryRetry(loadError, () => { void loadPublicAlbum(accessCode); });
+
     const selectedCount = selectedPhotos.size;
     const downloadActionUrl = token
         ? resolveApiUrl(`/public/albums/${encodeURIComponent(token)}/download`)
@@ -120,12 +129,25 @@ const PublicAlbumPage: React.FC = () => {
         const files = selectedCount > 0
             ? photos.filter((photo) => selectedPhotos.has(photo.filename))
             : photos;
-        if (files.length === 0) {
+        if (files.length === 0 || !token) {
             return;
         }
 
         setDownloading(true);
         try {
+            // form.submit() below gives no programmatic success/failure signal (it
+            // opens a plain browser navigation in a new tab), so a dead backend
+            // previously just opened a blank/failing tab with zero feedback. If the
+            // backend is already known offline, skip straight to feedback instead of
+            // waiting out another full cold-start retry cycle just to rediscover it.
+            if (getBackendStatusSnapshot().status === 'offline') {
+                showToast("Can't reach the server right now — try again once it's back.", {
+                    variant: 'error',
+                    action: { label: 'Retry', onClick: () => { void handleDownload(); } },
+                });
+                return;
+            }
+            await get(`/public/albums/${encodeURIComponent(token)}/download-check`);
             const form = downloadFormRef.current;
             if (!form) {
                 return;
@@ -135,12 +157,12 @@ const PublicAlbumPage: React.FC = () => {
                 filenamesInput.value = selectedCount > 0 ? JSON.stringify(files.map((photo) => photo.filename)) : '';
             }
             form.submit();
-        } catch {
-            // Let the browser surface the failure via the current UX.
+        } catch (err) {
+            notifyApiError(err, { context: "Couldn't start the download", retry: () => { void handleDownload(); } });
         } finally {
             setDownloading(false);
         }
-    }, [photos, selectedCount, selectedPhotos]);
+    }, [photos, selectedCount, selectedPhotos, token]);
 
     useEffect(() => {
         void loadPublicAlbum('');
@@ -212,7 +234,13 @@ const PublicAlbumPage: React.FC = () => {
             </form>
 
             {loading && <Loading label="Loading shared album…" fullPage={false} />}
-            {!loading && error && !codeRequired && <ErrorState title="Album unavailable" message={error} />}
+            {!loading && error && !codeRequired && (
+                <ErrorState
+                    title="Album unavailable"
+                    message={error}
+                    onRetry={loadError?.retriable ? () => { void loadPublicAlbum(accessCode); } : undefined}
+                />
+            )}
             {!loading && error && codeRequired && <p className="status error">{error}</p>}
             {!loading && codeRequired && (
                 <div className="toolbar-left public-album-lock">

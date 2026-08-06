@@ -7,6 +7,10 @@ import { showToast } from '../services/toast';
 import { requestJobPoll } from '../services/jobNotifications';
 import { useProtectedBlobUrls } from '../services/imageClient';
 import { confirmDialog } from './shared/dialogs';
+import { classifyApiError, type ApiError } from '../services/apiError';
+import { notifyApiError } from '../services/requestFeedback';
+import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
+import { ErrorState } from './shared/ErrorState';
 import type { PersonDetailModel, PersonFace, PersonSummary } from '../types/people';
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
@@ -124,6 +128,7 @@ const PersonDetail: React.FC = () => {
     const [findingFaces, setFindingFaces] = useState(false);
     const [suggestedFaces, setSuggestedFaces] = useState<ReviewFace[]>([]);
     const [reviewBusy, setReviewBusy] = useState(false);
+    const [loadError, setLoadError] = useState<ApiError | null>(null);
     const trimmedName = (name || person?.name || '').trim();
     const displayFaces = useMemo(() => {
         const seen = new Set<string>();
@@ -166,8 +171,10 @@ const PersonDetail: React.FC = () => {
             const res = await faceService.getPerson(personId);
             setPerson(res as PersonDetailModel);
             setName(res.name || '');
+            setLoadError(null);
         } catch (e: unknown) {
             setPerson(null);
+            setLoadError(classifyApiError(e));
         }
     };
 
@@ -179,6 +186,7 @@ const PersonDetail: React.FC = () => {
             setOtherPersons(((all.persons || []) as PersonSummary[]).filter((pp) => pp.personId !== personId));
         } catch (e: unknown) {
             setOtherPersons([]);
+            notifyApiError(e, { context: "Couldn't load merge candidates", retry: () => { void loadMergeCandidates(); } });
         } finally {
             setMergeCandidatesLoading(false);
         }
@@ -204,6 +212,8 @@ const PersonDetail: React.FC = () => {
         })();
     }, [personId]);
 
+    useBackendRecoveryRetry(loadError, () => { void load(); });
+
     const handleSave = async () => {
         if (!personId) return;
         // Optimistic: show the new name at once and roll back if the save fails —
@@ -224,7 +234,7 @@ const PersonDetail: React.FC = () => {
         } catch (e: unknown) {
             setPerson((prev) => (prev ? { ...prev, name: previousName } : prev));
             setName(previousName);
-            showToast('Could not save name');
+            notifyApiError(e, { context: "Couldn't save name", retry: () => { void handleSave(); } });
         }
     };
 
@@ -257,7 +267,7 @@ const PersonDetail: React.FC = () => {
                 showToast('No more matching faces found');
             }
         } catch (e: unknown) {
-            showToast(String(e));
+            notifyApiError(e, { context: "Couldn't find more faces", retry: () => { void handleFindFaces(); } });
         } finally {
             setFindingFaces(false);
         }
@@ -275,7 +285,7 @@ const PersonDetail: React.FC = () => {
             void loadMergeCandidates();
             showToast(`Added ${ids.length} face${ids.length === 1 ? '' : 's'}`);
         } catch (e: unknown) {
-            showToast(String(e));
+            notifyApiError(e, { context: "Couldn't add face", retry: () => { void handleAcceptSuggested(ids); } });
         } finally {
             setReviewBusy(false);
         }
@@ -290,7 +300,7 @@ const PersonDetail: React.FC = () => {
             const declined = new Set(ids);
             setSuggestedFaces((prev) => prev.filter((f) => !declined.has(f.faceId || '')));
         } catch (e: unknown) {
-            showToast(String(e));
+            notifyApiError(e, { context: "Couldn't dismiss face", retry: () => { void handleDeclineSuggested(ids); } });
         } finally {
             setReviewBusy(false);
         }
@@ -312,7 +322,7 @@ const PersonDetail: React.FC = () => {
             await load();
             void loadMergeCandidates();
         } catch (e: unknown) {
-            showToast(String(e));
+            notifyApiError(e, { context: "Couldn't move face", retry: () => { void handleSeparate(faceId); } });
         } finally {
             if (!navigated) {
                 setLoading(false);
@@ -336,7 +346,7 @@ const PersonDetail: React.FC = () => {
             await faceService.confirmFace(personId, faceId);
         } catch (e: unknown) {
             applyStatus(previousStatus);
-            showToast(String(e));
+            notifyApiError(e, { context: "Couldn't confirm face", retry: () => { void handleConfirmFace(faceId); } });
         }
     };
 
@@ -353,7 +363,7 @@ const PersonDetail: React.FC = () => {
             setPerson((prev) => (prev ? { ...prev, faces: (prev.faces || []).filter((face) => face.faceId !== faceId) } : prev));
             showToast('Marked as not a face');
         } catch (e: unknown) {
-            showToast(String(e));
+            notifyApiError(e, { context: "Couldn't mark as not a face", retry: () => { void handleNotFace(faceId); } });
         } finally {
             setLoading(false);
         }
@@ -386,7 +396,7 @@ const PersonDetail: React.FC = () => {
                 ? `Merge completed — added ${autoAssigned} more matching face${autoAssigned === 1 ? '' : 's'}`
                 : 'Merge completed');
         } catch (e: unknown) {
-            // ignore
+            notifyApiError(e, { context: "Couldn't merge people", retry: () => { void handleMergeSelected(); } });
         } finally {
             setLoading(false);
         }
@@ -402,7 +412,7 @@ const PersonDetail: React.FC = () => {
             void loadMergeCandidates();
             showToast('Merge undone');
         } catch (e: unknown) {
-            // ignore
+            notifyApiError(e, { context: "Couldn't undo merge", retry: () => { void handleUndoMerge(); } });
         } finally {
             setLoading(false);
         }
@@ -662,7 +672,14 @@ const PersonDetail: React.FC = () => {
                 </div>
             )}
 
-            {!person && !loading && <div className="people-empty">Person not found.</div>}
+            {!person && !loading && loadError && (
+                <ErrorState
+                    title={loadError.kind === 'client' ? 'Person not found' : 'Could not load this person'}
+                    message={loadError.message}
+                    onRetry={loadError.retriable ? () => { void load(); } : undefined}
+                />
+            )}
+            {!person && !loading && !loadError && <div className="people-empty">Person not found.</div>}
         </section>
     );
 };
