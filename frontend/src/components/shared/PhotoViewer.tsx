@@ -852,8 +852,8 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
             }}
         >
             <div className="photo-preview-panel">
-                <div className="photo-preview-top">
-                    <div>
+                <div className={`photo-preview-top${activeIsVideo ? ' is-video' : ''}`}>
+                    <div className="photo-preview-meta">
                         <p className="photo-preview-title">{activePhoto.filename}</p>
                         <p className="photo-preview-counter">
                             {index !== null ? `${index + 1}/${photos.length}` : `0/${photos.length}`}

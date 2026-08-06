@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { XMarkIcon } from '@heroicons/react/24/outline';
 import type { TimelineSummary } from '../../types/timeline';
 
 type ZoomLevel = 'year' | 'month' | 'day';
@@ -391,6 +392,23 @@ const Timeline: React.FC<TimelineProps> = ({ summary, currentStartISO, currentEn
         }
     }, []);
 
+    // Zoom/pan (view) and bucket selection are desktop-mouse-friendly (wheel,
+    // right-click, double-click) but touch has only pinch and tap -- tapping
+    // narrows the filter further rather than clearing it, so touch users who
+    // drill into a day/month have no gesture to get back to the full library.
+    // This button is the explicit escape hatch for that, on every input type.
+    const handleClearSelection = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
+        e.stopPropagation();
+        if (settleTimerRef.current !== null) {
+            window.clearTimeout(settleTimerRef.current);
+            settleTimerRef.current = null;
+        }
+        setSelectedDay(null);
+        setView({ startDay: 0, endDay: totalSpanDays });
+        lastEmittedRef.current = null;
+        onRangeSettled('', '');
+    }, [totalSpanDays, onRangeSettled]);
+
     const dragStateRef = useRef<{ pointerId: number; startX: number; startY: number; moved: boolean } | null>(null);
     const pinchStateRef = useRef<Map<number, { x: number; y: number }>>(new Map());
 
@@ -527,8 +545,22 @@ const Timeline: React.FC<TimelineProps> = ({ summary, currentStartISO, currentEn
         ? clamp(((tooltipDay - view.startDay) / spanDays) * 100, 4, 96)
         : 50;
 
+    const hasActiveSelection = Boolean(currentStartISO && currentEndISO);
+
     return (
         <div className={`timeline-widget ${className || ''}`}>
+            {hasActiveSelection && (
+                <button
+                    type="button"
+                    className="timeline-clear-btn"
+                    onClick={handleClearSelection}
+                    aria-label="Clear date selection and show entire library"
+                    title="Show entire library"
+                >
+                    <XMarkIcon className="toolbar-icon" />
+                    Show all
+                </button>
+            )}
             <div
                 ref={trackRef}
                 className="timeline-track"

@@ -213,6 +213,7 @@ interface AppServicesContextValue {
     loadBrowserAiModel: () => Promise<SharedBrowserAiModelState>;
     uploading: boolean;
     pendingUploadSummary: PendingUploadSummary | null;
+    queuedUploadFileCount: number;
     requestUpload: () => void;
     resumeAllPendingUploads: () => Promise<void>;
     stopActiveUpload: () => void;
@@ -794,6 +795,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const uploadSourceFilesRef = useRef<Map<string, File>>(new Map());
     const uploadStopRequestedRef = useRef<boolean>(false);
     const uploadAbortControllersRef = useRef<Set<AbortController>>(new Set());
+    // Files picked (e.g. from a second folder) while a batch is already
+    // uploading. Drained one batch at a time by the effect below once the
+    // active session finishes cleanly -- see queuedUploadBatchesRef usage.
+    const queuedUploadBatchesRef = useRef<File[][]>([]);
+    const [queuedUploadFileCount, setQueuedUploadFileCount] = useState<number>(0);
     const backendKeepaliveTimerRef = useRef<number | null>(null);
     const backendWarmupInFlightRef = useRef<boolean>(false);
     const uploadWarmupInFlightRef = useRef<boolean>(false);
@@ -2324,15 +2330,32 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploadStopRequestedRef.current = true;
         uploadStartInProgressRef.current = false;
         uploadAbortControllersRef.current.forEach((controller) => controller.abort());
-        addNotification('Stopping upload', 'Cancelling active requests and cleaning up unfinished files.');
+        const queuedCount = queuedUploadBatchesRef.current.reduce((sum, batch) => sum + batch.length, 0);
+        queuedUploadBatchesRef.current = [];
+        setQueuedUploadFileCount(0);
+        addNotification(
+            'Stopping upload',
+            queuedCount > 0
+                ? `Cancelling active requests and cleaning up unfinished files. ${plural(queuedCount, 'queued file')} also cleared.`
+                : 'Cancelling active requests and cleaning up unfinished files.',
+        );
     }, [addNotification, uploading]);
 
     const startUpload = useCallback(async (filesToUpload: File[]) => {
         if (filesToUpload.length === 0) {
             return;
         }
-        if (uploadStartInProgressRef.current || uploading || pendingUploadSession) {
+        if (uploadStartInProgressRef.current || pendingUploadSession) {
             addNotification('Upload already starting', 'The selected files are already being prepared or uploaded.');
+            return;
+        }
+        if (uploading) {
+            queuedUploadBatchesRef.current.push(filesToUpload);
+            setQueuedUploadFileCount((count) => count + filesToUpload.length);
+            addNotification(
+                'Upload queued',
+                `${plural(filesToUpload.length, 'file')} queued from another folder. They'll start automatically once the current upload finishes.`,
+            );
             return;
         }
 
@@ -2410,6 +2433,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 uploadingRef.current = false;
                 return;
             }
+            // From here on, `uploading` (already true) plus runUploadSession's
+            // own isResumingUploadRef guard cover re-entrancy for the rest of
+            // the transfer -- clear the "starting" flag now instead of waiting
+            // for this whole (possibly long) session to finish, so requestUpload
+            // can let the picker open again to queue files from another folder.
+            uploadStartInProgressRef.current = false;
             await runUploadSession(session, { notificationId: preparingNotificationId, uploadProfile });
         } catch (err) {
             const message = getUploadErrorMessage(err, 'Upload could not start.');
@@ -2438,11 +2467,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     ]);
 
     const requestUpload = useCallback(() => {
-        if (uploadStartInProgressRef.current || uploading) {
+        if (uploadStartInProgressRef.current) {
             addNotification('Upload already starting', 'Wait for the current upload preparation to finish before selecting more files.');
             return;
         }
-        void pollUntilWarm(warmUpload, uploadWarmupInFlightRef);
+        // While actively uploading, skip the warm-up poll (the backend is
+        // already warm) but still let the picker open so files from another
+        // folder can be queued -- see startUpload's `uploading` branch.
+        if (!uploading) {
+            void pollUntilWarm(warmUpload, uploadWarmupInFlightRef);
+        }
         uploadInputRef.current?.click();
     }, [addNotification, pollUntilWarm, uploading, warmUpload]);
 
@@ -2453,7 +2487,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const handleUploadSelection = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
         const selectedFiles = event.target.files ? Array.from(event.target.files) : [];
         if (selectedFiles.length > 0) {
-            if (pendingUploadSession || loadPersistedSession()) {
+            // loadPersistedSession() reflects the live session while a healthy
+            // upload is actively running too, so gate that fallback on !uploading
+            // -- otherwise files picked from a second folder mid-upload would be
+            // matched against the in-flight session's files (and fail to match)
+            // instead of being queued via startUpload below.
+            if (pendingUploadSession || (!uploading && loadPersistedSession())) {
                 void (async () => {
                     const matchedCount = await attachSelectedFilesToPendingSession(selectedFiles);
                     if (matchedCount === 0) {
@@ -2478,7 +2517,27 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         retryPersistedUploadSession,
         setUploadError,
         startUpload,
+        uploading,
     ]);
+
+    // Drain queued folder/batch selections (queuedUploadBatchesRef) once the
+    // active session is fully clear -- i.e. it finished cleanly and isn't
+    // sitting in a paused/needs-retry state. See startUpload's `uploading`
+    // branch for how batches get queued, and stopActiveUpload for why an
+    // explicit stop clears the queue instead of letting it drain here.
+    useEffect(() => {
+        if (uploading || pendingUploadSession) {
+            return;
+        }
+        if (queuedUploadBatchesRef.current.length === 0) {
+            return;
+        }
+        const nextBatch = queuedUploadBatchesRef.current.shift();
+        if (nextBatch && nextBatch.length > 0) {
+            setQueuedUploadFileCount((count) => Math.max(0, count - nextBatch.length));
+            void startUpload(nextBatch);
+        }
+    }, [uploading, pendingUploadSession, startUpload]);
 
     useEffect(() => {
         const restored = loadPersistedSession();
@@ -2585,6 +2644,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         loadBrowserAiModel,
         uploading,
         pendingUploadSummary,
+        queuedUploadFileCount,
         requestUpload,
         resumeAllPendingUploads,
         stopActiveUpload,
@@ -2612,6 +2672,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         loadBrowserAiModel,
         uploading,
         pendingUploadSummary,
+        queuedUploadFileCount,
         requestUpload,
         resumeAllPendingUploads,
         stopActiveUpload,

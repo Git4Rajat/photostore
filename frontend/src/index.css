@@ -438,6 +438,38 @@ a {
   gap: 8px;
 }
 
+/* Renders as a no-op wrapper (children behave as direct flex items of
+   .root-service-actions) except on narrow screens, where it becomes the
+   collapsible flyout — see the max-width: 720px block below. */
+.root-service-secondary {
+  display: contents;
+}
+
+/* Specificity note: .icon-btn (below) also sets `display`, so this needs a
+   two-class selector to reliably win regardless of source order. */
+.root-service-actions .root-actions-toggle {
+  display: none;
+}
+
+.root-actions-toggle .toolbar-icon {
+  transition: transform var(--dur-quick) ease;
+}
+
+.root-actions-toggle[aria-expanded="true"] .toolbar-icon {
+  transform: rotate(180deg);
+}
+
+.root-actions-toggle-dot {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: linear-gradient(145deg, #f25f5f 0%, #da3b52 100%);
+  box-shadow: 0 0 0 2px var(--lg-surface);
+}
+
 .root-upload-approval-bar {
   margin: 0 8px 16px;
 }
@@ -3412,6 +3444,19 @@ html[data-theme='light'] .notification-item.unread {
   width: 100%;
 }
 
+@media (max-width: 720px) {
+  /* On mobile the toolbar row wraps, and a selection adds enough buttons
+     (+/download/delete) that sort/filter can land near the left edge. A
+     menu still anchored to that small button then hangs off-screen to the
+     left. Dropping the anchor's own positioning context makes the menu's
+     right:0 resolve against the full-width toolbar surface instead (see
+     .gallery-controls-surface / .albums-canvas-toolbar), which always has
+     room on-screen -- same fix as .notification-pane below. */
+  .gallery-menu-anchor {
+    position: static;
+  }
+}
+
 /* ---- Gallery tile overlays (selection + rating/like indicators) ---- */
 .tile-select {
   position: absolute;
@@ -6249,6 +6294,42 @@ video.photo-preview-media.is-loading {
     gap: 8px;
   }
 
+  /* Collapse the secondary root-service icons (AI toggle, stop, clustering,
+     notifications) behind a chevron flyout so the header row can't overflow
+     as conditional buttons (stop upload, clustering indicator) appear. */
+  .root-service-actions {
+    position: relative;
+  }
+
+  .root-service-actions .root-actions-toggle {
+    display: inline-flex;
+  }
+
+  .root-service-secondary {
+    display: none;
+  }
+
+  .root-service-secondary[data-expanded="true"] {
+    display: flex;
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    z-index: 45;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    width: max-content;
+    max-width: min(240px, 80vw);
+    padding: 8px;
+    background: var(--lg-surface-strong);
+    border: 1px solid var(--lg-edge);
+    border-radius: var(--r-lg);
+    box-shadow: var(--lg-shadow-floating);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  }
+
   .ios-tabs {
     display: none;
   }
@@ -6340,6 +6421,28 @@ video.photo-preview-media.is-loading {
   .photo-preview-tools {
     order: -1;
     gap: 6px;
+  }
+
+  /* Video only: the action icons (download, close, ...) move off the top bar
+     onto a vertical rail pinned to the left edge, clear of the native
+     <video> controls (bottom-anchored) and Safari's own AirPlay/fullscreen
+     glyph (top-right) — either of which can otherwise crowd out or hide the
+     custom close button on a phone. The title/counter stay put but gain
+     left padding so the rail (one icon wide, however many are stacked)
+     never sits on top of the filename text. */
+  .photo-preview-top.is-video .photo-preview-tools {
+    position: absolute;
+    top: 14px;
+    left: 14px;
+    order: 0;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    z-index: 5;
+  }
+
+  .photo-preview-top.is-video .photo-preview-meta {
+    padding-left: 50px;
   }
 
   .photo-preview-icon {
@@ -6765,6 +6868,38 @@ video.photo-preview-media.is-loading {
   font-size: 11px;
   color: var(--muted);
   white-space: nowrap;
+}
+
+/* Escape hatch out of a date-narrowed timeline selection -- the only
+   equivalent gesture on touch (pinch back out) is undiscoverable, so this
+   button is the reliable way back to the full library on every input type. */
+.timeline-clear-btn {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border: 1px solid var(--lg-edge);
+  border-radius: 999px;
+  background: var(--lg-surface-strong);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.timeline-clear-btn:hover,
+.timeline-clear-btn:focus-visible {
+  background: var(--accent-soft);
+}
+
+.timeline-clear-btn .toolbar-icon {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
 }
 
 .timeline-tooltip {

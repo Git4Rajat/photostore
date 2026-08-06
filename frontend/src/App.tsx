@@ -5,6 +5,7 @@ import {
     ArrowLeftOnRectangleIcon,
     ArrowRightOnRectangleIcon,
     Bars3Icon,
+    ChevronDownIcon,
     ComputerDesktopIcon,
     CpuChipIcon,
     EllipsisHorizontalIcon,
@@ -196,69 +197,127 @@ const ThemeSwitcher: React.FC<ThemeSwitcherProps> = ({ preference, onPreferenceC
 
 const RootServiceActions: React.FC = () => {
     const appServices = useAppServices();
+    const location = useLocation();
+    const [expanded, setExpanded] = useState<boolean>(false);
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+
+    // Collapse the secondary-actions flyout whenever the route changes so it
+    // never lingers open over freshly navigated content (mirrors NavDrawer).
+    useEffect(() => {
+        setExpanded(false);
+    }, [location.pathname]);
+
+    useEffect(() => {
+        if (!expanded || typeof document === 'undefined') {
+            return undefined;
+        }
+        const handlePointerDown = (event: MouseEvent) => {
+            if (wrapRef.current && !wrapRef.current.contains(event.target as Node)) {
+                setExpanded(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setExpanded(false);
+            }
+        };
+        document.addEventListener('mousedown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('mousedown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [expanded]);
+
+    // On narrow screens the secondary icons (AI toggle, stop, clustering,
+    // notifications) collapse behind this chevron so the header row doesn't
+    // overflow; on wider screens it's hidden and .root-service-secondary
+    // renders inline as before (see index.css).
+    const needsAttention = appServices.uploading || appServices.clusteringActive || appServices.unreadCount > 0;
+    const uploadButtonLabel = appServices.pendingUploadSummary
+        ? 'Reselect upload files'
+        : appServices.uploading
+            ? (appServices.queuedUploadFileCount > 0
+                ? `Uploading — add more files (${appServices.queuedUploadFileCount} queued)`
+                : 'Uploading — add more files')
+            : 'Upload';
 
     return (
-        <div className="root-service-actions" aria-label="Library actions">
+        <div className="root-service-actions" aria-label="Library actions" ref={wrapRef}>
             <button
                 type="button"
                 onClick={appServices.requestUpload}
                 className="btn btn-primary icon-btn"
-                disabled={appServices.uploading}
-                aria-label={appServices.pendingUploadSummary ? 'Reselect upload files' : appServices.uploading ? 'Uploading' : 'Upload'}
-                title={appServices.pendingUploadSummary ? 'Reselect upload files' : appServices.uploading ? 'Uploading' : 'Upload'}
+                aria-label={uploadButtonLabel}
+                title={uploadButtonLabel}
             >
                 <PlusIcon className="toolbar-icon" />
-                <span className="sr-only">{appServices.pendingUploadSummary ? 'Reselect upload files' : appServices.uploading ? 'Uploading' : 'Upload'}</span>
+                <span className="sr-only">{uploadButtonLabel}</span>
             </button>
 
-            {!appServices.clusteringActive && (() => {
-                const loadStage = appServices.browserAiLoadProgress;
-                const isLoading = appServices.browserAiModelState.status === 'loading' || appServices.browserAiModelState.status === 'checking';
-                const browserAiTitle = isLoading && loadStage
-                    ? `${appServices.browserAiButtonLabel} — ${loadStage.label} (${loadStage.index}/${loadStage.total})`
-                    : appServices.browserAiButtonLabel;
-                return (
+            <button
+                type="button"
+                className="btn btn-soft icon-btn root-actions-toggle"
+                onClick={() => setExpanded((prev) => !prev)}
+                aria-expanded={expanded}
+                aria-label={expanded ? 'Fewer actions' : 'More actions'}
+                title={expanded ? 'Fewer actions' : 'More actions'}
+            >
+                <ChevronDownIcon className="toolbar-icon" aria-hidden="true" />
+                {!expanded && needsAttention && <span className="root-actions-toggle-dot" aria-hidden="true" />}
+                <span className="sr-only">{expanded ? 'Fewer actions' : 'More actions'}</span>
+            </button>
+
+            <div className="root-service-secondary" data-expanded={expanded}>
+                {!appServices.clusteringActive && (() => {
+                    const loadStage = appServices.browserAiLoadProgress;
+                    const isLoading = appServices.browserAiModelState.status === 'loading' || appServices.browserAiModelState.status === 'checking';
+                    const browserAiTitle = isLoading && loadStage
+                        ? `${appServices.browserAiButtonLabel} — ${loadStage.label} (${loadStage.index}/${loadStage.total})`
+                        : appServices.browserAiButtonLabel;
+                    return (
+                        <button
+                            type="button"
+                            onClick={() => void appServices.loadBrowserAiModel()}
+                            className={appServices.browserAiButtonClass}
+                            disabled={appServices.browserAiButtonDisabled}
+                            aria-label={browserAiTitle}
+                            title={browserAiTitle}
+                        >
+                            {isLoading ||
+                             (appServices.browserAiModelState.status === 'available' && appServices.browserProcessingActive) ? (
+                                <ArrowPathIcon className="toolbar-icon browser-ai-model-spinner" />
+                            ) : (
+                                <CpuChipIcon className="toolbar-icon" />
+                            )}
+                            {isLoading && loadStage && (
+                                <span
+                                    className="browser-ai-load-progress"
+                                    style={{ width: `${Math.round((loadStage.index / loadStage.total) * 100)}%` }}
+                                />
+                            )}
+                            <span className="sr-only">{browserAiTitle}</span>
+                        </button>
+                    );
+                })()}
+
+                {appServices.uploading && (
                     <button
                         type="button"
-                        onClick={() => void appServices.loadBrowserAiModel()}
-                        className={appServices.browserAiButtonClass}
-                        disabled={appServices.browserAiButtonDisabled}
-                        aria-label={browserAiTitle}
-                        title={browserAiTitle}
+                        onClick={appServices.stopActiveUpload}
+                        className="btn btn-danger icon-btn"
+                        aria-label="Stop upload"
+                        title="Stop upload"
                     >
-                        {isLoading ||
-                         (appServices.browserAiModelState.status === 'available' && appServices.browserProcessingActive) ? (
-                            <ArrowPathIcon className="toolbar-icon browser-ai-model-spinner" />
-                        ) : (
-                            <CpuChipIcon className="toolbar-icon" />
-                        )}
-                        {isLoading && loadStage && (
-                            <span
-                                className="browser-ai-load-progress"
-                                style={{ width: `${Math.round((loadStage.index / loadStage.total) * 100)}%` }}
-                            />
-                        )}
-                        <span className="sr-only">{browserAiTitle}</span>
+                        <XMarkIcon className="toolbar-icon" />
+                        <span className="sr-only">Stop upload</span>
                     </button>
-                );
-            })()}
+                )}
 
-            {appServices.uploading && (
-                <button
-                    type="button"
-                    onClick={appServices.stopActiveUpload}
-                    className="btn btn-danger icon-btn"
-                    aria-label="Stop upload"
-                    title="Stop upload"
-                >
-                    <XMarkIcon className="toolbar-icon" />
-                    <span className="sr-only">Stop upload</span>
-                </button>
-            )}
+                <ClusteringActivityIndicator />
 
-            <ClusteringActivityIndicator />
-
-            <NotificationBell />
+                <NotificationBell />
+            </div>
         </div>
     );
 };
