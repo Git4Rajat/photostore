@@ -459,6 +459,26 @@ const AlbumsPage: React.FC = () => {
         void fetchSemanticPhotos(nextQuery);
     }, [fetchSemanticPhotos, searchInput]);
 
+    // Leaving the box empty (never submitted, or cleared back out after a prior
+    // search) should drop back to the unfiltered gallery rather than leaving a
+    // stale query applied — covers click-away, tab-away (blur), and Escape.
+    const closeSearch = useCallback(() => {
+        if (!searchInput.trim() && searchQuery) {
+            setSearchQuery('');
+            void fetchSemanticPhotos('');
+        }
+        setSearchOpen(false);
+    }, [searchInput, searchQuery, fetchSemanticPhotos]);
+
+    const clearSearch = useCallback(() => {
+        setSearchInput('');
+        if (searchQuery) {
+            setSearchQuery('');
+            void fetchSemanticPhotos('');
+        }
+        setSearchOpen(false);
+    }, [searchQuery, fetchSemanticPhotos]);
+
     useEffect(() => {
         if (!activeAlbumId) {
             setActiveAlbumPhotos([]);
@@ -521,19 +541,6 @@ const AlbumsPage: React.FC = () => {
             document.removeEventListener('keydown', handleKeyDown);
         };
     }, [showFilterMenu]);
-
-    useEffect(() => {
-        if (!searchOpen) {
-            return;
-        }
-        const handlePointerDown = (event: PointerEvent) => {
-            if (searchRef.current && !searchRef.current.contains(event.target as Node)) {
-                setSearchOpen(false);
-            }
-        };
-        document.addEventListener('pointerdown', handlePointerDown);
-        return () => document.removeEventListener('pointerdown', handlePointerDown);
-    }, [searchOpen]);
 
     const selectPhoto = (filename: string) => {
         setSelectedPhotos((prev) => {
@@ -1089,12 +1096,24 @@ const AlbumsPage: React.FC = () => {
                                             if (e.key === 'Enter') {
                                                 submitSearch();
                                             } else if (e.key === 'Escape') {
-                                                setSearchOpen(false);
+                                                closeSearch();
                                             }
                                         }}
+                                        onBlur={closeSearch}
                                         enterKeyHint="search"
                                         aria-label="Search album photos"
                                     />
+                                    {searchInput && (
+                                        <button
+                                            type="button"
+                                            className="gallery-search-clear"
+                                            onMouseDown={(e) => e.preventDefault()}
+                                            onClick={clearSearch}
+                                            aria-label="Clear search"
+                                        >
+                                            <XMarkIcon className="toolbar-icon" />
+                                        </button>
+                                    )}
                                 </div>
                             ) : (
                                 <button

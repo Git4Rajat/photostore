@@ -3242,6 +3242,35 @@ html[data-theme='light'] .notification-item.unread {
 
 .gallery-search-field {
   width: min(320px, 60vw);
+  padding-right: 30px;
+}
+
+.gallery-search-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 999px;
+}
+
+.gallery-search-clear:hover {
+  background: var(--lg-surface-strong);
+  color: var(--text);
+}
+
+.gallery-search-clear .toolbar-icon {
+  width: 14px;
+  height: 14px;
 }
 
 .gallery-menu-anchor {

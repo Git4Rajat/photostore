@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { useLocation } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
@@ -4224,18 +4224,29 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         fetchPhotos(sortBy, 0, false, nextQuery);
     }, [fetchPhotos, searchInput, sortBy]);
 
-    useEffect(() => {
-        if (!searchOpen) {
-            return;
+    // Leaving the box empty (never submitted, or cleared back out after a prior
+    // search) should drop back to the unfiltered gallery rather than leaving a
+    // stale query applied — covers click-away, tab-away (blur), and Escape.
+    const closeSearch = useCallback(() => {
+        if (!searchInput.trim() && searchQuery) {
+            setSearchQuery('');
+            setOffset(0);
+            setHasMore(true);
+            fetchPhotos(sortBy, 0, false, '');
         }
-        const handlePointerDown = (event: PointerEvent) => {
-            if (searchRef.current && !searchRef.current.contains(event.target as Node)) {
-                setSearchOpen(false);
-            }
-        };
-        document.addEventListener('pointerdown', handlePointerDown);
-        return () => document.removeEventListener('pointerdown', handlePointerDown);
-    }, [searchOpen]);
+        setSearchOpen(false);
+    }, [searchInput, searchQuery, fetchPhotos, sortBy]);
+
+    const clearSearch = useCallback(() => {
+        setSearchInput('');
+        if (searchQuery) {
+            setSearchQuery('');
+            setOffset(0);
+            setHasMore(true);
+            fetchPhotos(sortBy, 0, false, '');
+        }
+        setSearchOpen(false);
+    }, [searchQuery, fetchPhotos, sortBy]);
 
     useEffect(() => {
         if (!showSortMenu) {
@@ -4353,13 +4364,25 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                         if (e.key === 'Enter') {
                                             submitSearch();
                                         } else if (e.key === 'Escape') {
-                                            setSearchOpen(false);
+                                            closeSearch();
                                         }
                                     }}
+                                    onBlur={closeSearch}
                                     enterKeyHint="search"
                                     className="field gallery-search-field"
                                     aria-label="Search photos"
                                 />
+                                {searchInput && (
+                                    <button
+                                        type="button"
+                                        className="gallery-search-clear"
+                                        onMouseDown={(e) => e.preventDefault()}
+                                        onClick={clearSearch}
+                                        aria-label="Clear search"
+                                    >
+                                        <XMarkIcon className="toolbar-icon" />
+                                    </button>
+                                )}
                             </div>
                         ) : (
                             <button
