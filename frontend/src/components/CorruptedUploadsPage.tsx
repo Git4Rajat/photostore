@@ -106,7 +106,6 @@ const CorruptedUploadsPage: React.FC = () => {
                             }}
                             title={item.filename}
                             kind={item.mimeType || 'unknown'}
-                            openOriginal={false}
                             onMediaClick={(e) => {
                                 e.stopPropagation();
                                 e.preventDefault();

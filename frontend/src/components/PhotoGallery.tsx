@@ -20,7 +20,7 @@ import {
 import { ARC_FACE_5POINT_TEMPLATE, solveSimilarityTransform } from '../services/faceAlignment';
 import { loadFaceApiRuntimeBundle } from '../services/faceApiRuntime';
 import { preloadYoloFaceModel, detectFacesWithYolo, resetYoloFaceModelStateForTests } from '../services/yoloFaceDetectionRuntime';
-import { getFileExtension, getMediaKind, isHeicFilename, isRawFilename, isVideoFilename } from '../utils/photoDisplay';
+import { getFileExtension, isHeicFilename, isRawFilename, isVideoFilename } from '../utils/photoDisplay';
 import { plural } from '../utils/format';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
@@ -4635,9 +4635,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                 selected={isSelected}
                                 animationDelayMs={(index % 8) * 36}
                                 title={photo.filename}
-                                openOriginal={false}
                                 showBody={false}
-                                linkTitle={`${photo.filename}\n${getMediaKind(photo.filename)}`}
                                 onMediaClick={(e) => {
                                     e.stopPropagation();
                                     openLightboxAt(index);

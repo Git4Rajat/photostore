@@ -28,9 +28,6 @@ interface PhotoTileProps {
     showBody?: boolean;
     onCardClick?: (event: React.MouseEvent<HTMLDivElement>) => void;
     onBodyClick?: (event: React.MouseEvent<HTMLDivElement>) => void;
-    openOriginal?: boolean;
-    linkTitle?: string;
-    onImageClick?: (event: React.MouseEvent<HTMLAnchorElement>) => void;
     onMediaClick?: (event: React.MouseEvent<HTMLImageElement>) => void;
     useProtectedMedia?: boolean;
 }
@@ -73,9 +70,6 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     showBody = true,
     onCardClick,
     onBodyClick,
-    openOriginal = true,
-    linkTitle,
-    onImageClick,
     onMediaClick,
     useProtectedMedia = true,
 }) => {
@@ -138,8 +132,7 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     const resolvedThumbnailUrl = shouldUseProtectedMedia
         ? (scopedThumbnailUrl || PLACEHOLDER_THUMBNAIL)
         : fallbackThumbnailUrl;
-    const resolvedPhotoUrl = resolveApiUrl(photo.url);
-    const mediaClassName = ['photo-media', openOriginal || onMediaClick ? 'interactive' : '']
+    const mediaClassName = ['photo-media', onMediaClick ? 'interactive' : '']
         .filter(Boolean)
         .join(' ');
     const normalizeRotation = (value?: number) => {
@@ -170,36 +163,24 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
         }
     }, [resolvedThumbnailUrl]);
 
-    const renderMedia = (attachClick: boolean) => (
-        <>
-            {!imgLoaded && <span className="photo-media-skeleton" aria-hidden="true" />}
-            <img
-                ref={imgElRef}
-                src={resolvedThumbnailUrl || undefined}
-                alt={photo.filename}
-                className={`${mediaClassName} photo-media--fade${imgLoaded ? ' is-loaded' : ''}`}
-                style={mediaStyle}
-                loading="lazy"
-                onLoad={() => setImgLoaded(true)}
-                onError={() => setImgLoaded(true)}
-                onClick={attachClick ? onMediaClick : undefined}
-            />
-            {videoOverlay}
-            {mediaOverlay}
-        </>
-    );
-
     return (
         <div className={classes} style={style} onClick={onCardClick}>
-            {openOriginal ? (
-                <a href={resolvedPhotoUrl} target="_blank" rel="noreferrer" title={linkTitle} onClick={onImageClick} className="photo-media-wrap">
-                    {renderMedia(false)}
-                </a>
-            ) : (
-                <span className="photo-media-wrap">
-                    {renderMedia(true)}
-                </span>
-            )}
+            <span className="photo-media-wrap">
+                {!imgLoaded && <span className="photo-media-skeleton" aria-hidden="true" />}
+                <img
+                    ref={imgElRef}
+                    src={resolvedThumbnailUrl || undefined}
+                    alt={photo.filename}
+                    className={`${mediaClassName} photo-media--fade${imgLoaded ? ' is-loaded' : ''}`}
+                    style={mediaStyle}
+                    loading="lazy"
+                    onLoad={() => setImgLoaded(true)}
+                    onError={() => setImgLoaded(true)}
+                    onClick={onMediaClick}
+                />
+                {videoOverlay}
+                {mediaOverlay}
+            </span>
 
             {showBody && (
                 <div className="photo-body" onClick={onBodyClick}>

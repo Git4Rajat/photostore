@@ -1366,7 +1366,6 @@ const AlbumsPage: React.FC = () => {
                                     photo={photo}
                                     selected={isSelected}
                                     title={photo.filename}
-                                    openOriginal={false}
                                     showBody={false}
                                     onMediaClick={(e) => {
                                         e.stopPropagation();

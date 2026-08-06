@@ -1129,7 +1129,6 @@ const ToolsPage: React.FC = () => {
                             photo={photo}
                             title={photo.filename}
                             selected={selected.has(photo.filename)}
-                            openOriginal={false}
                             selectableOverlay={(
                                 <input
                                     type="checkbox"

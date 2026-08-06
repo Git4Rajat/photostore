@@ -13,7 +13,6 @@ import { Logo } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
-import { getMediaKind } from '../utils/photoDisplay';
 
 interface PublicPhoto {
     filename: string;
@@ -294,8 +293,6 @@ const PublicAlbumPage: React.FC = () => {
                                 selected={isSelected}
                                 animationDelayMs={(index % 8) * 36}
                                 title={photo.filename}
-                                linkTitle={`${photo.filename}\n${getMediaKind(photo.filename)}`}
-                                openOriginal={false}
                                 showBody={false}
                                 useProtectedMedia={false}
                                 mediaOverlay={(
