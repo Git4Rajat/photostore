@@ -34,6 +34,7 @@ import { ErrorState } from './shared/ErrorState';
 import { Loading } from './shared/Loading';
 import PhotoTile from './shared/PhotoTile';
 import PhotoQuickActions, { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
+import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import type { PhotoPersonLink } from '../types/uiTypes';
@@ -145,6 +146,7 @@ const AlbumsPage: React.FC = () => {
     const [activeAlbumVisibleCount, setActiveAlbumVisibleCount] = useState<number>(PAGE_SIZE);
     const [albumName, setAlbumName] = useState<string>('');
     const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
+    const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
     const [selectedAlbumIds, setSelectedAlbumIds] = useState<Set<string>>(new Set());
     const [showAddFromGallery, setShowAddFromGallery] = useState<boolean>(false);
     const [searchInput, setSearchInput] = useState<string>('');
@@ -555,6 +557,14 @@ const AlbumsPage: React.FC = () => {
             }
             return updated;
         });
+    };
+
+    const handleTileLongPress = (photo: Photo) => {
+        if (selectedPhotos.size > 1 && selectedPhotos.has(photo.filename)) {
+            setActionSheetTarget({ filenames: Array.from(selectedPhotos) });
+        } else {
+            setActionSheetTarget({ filenames: [photo.filename], people: photo.people });
+        }
     };
 
     const toggleAlbumSelection = (albumId: string) => {
@@ -1375,6 +1385,7 @@ const AlbumsPage: React.FC = () => {
                                         e.preventDefault();
                                         setViewerIndex(filteredPhotos.findIndex((item) => item.filename === photo.filename));
                                     }}
+                                    onLongPress={() => handleTileLongPress(photo)}
                                     mediaOverlay={(
                                         <>
                                             <label
@@ -1438,6 +1449,16 @@ const AlbumsPage: React.FC = () => {
                     )}
                 </section>
             </div>
+
+            <PhotoActionSheet
+                open={!!actionSheetTarget}
+                onClose={() => setActionSheetTarget(null)}
+                filenames={actionSheetTarget?.filenames || []}
+                people={actionSheetTarget?.people}
+                onDownload={actionSheetTarget && actionSheetTarget.filenames.length > 1 ? handleDownloadSelected : undefined}
+                onDelete={actionSheetTarget && actionSheetTarget.filenames.length > 1 ? handleDeleteSelected : undefined}
+                onAlbumsChanged={loadAlbums}
+            />
         </section>
     );
 };

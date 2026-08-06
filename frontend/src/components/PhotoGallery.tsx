@@ -26,6 +26,7 @@ import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import PhotoTile from './shared/PhotoTile';
 import PhotoQuickActions, { workbenchFilenameHref } from './shared/PhotoQuickActions';
+import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
 import Timeline from './shared/Timeline';
 import { EmptyState } from './shared/EmptyState';
@@ -3737,6 +3738,12 @@ interface PhotoGalleryProps {
     registerUploadErrorHandler?: (handler: (message: string | null) => void) => () => void;
 }
 
+interface AlbumSummary {
+    id: string;
+    name: string;
+    photoCount: number;
+}
+
 const noopAddNotification = () => '';
 
 const PhotoGallery: React.FC<PhotoGalleryProps> = ({
@@ -3771,10 +3778,15 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [mediaFilter, setMediaFilter] = useState<'all' | 'photos' | 'videos'>('all');
     const [showFilters, setShowFilters] = useState<boolean>(false);
     const [showSortMenu, setShowSortMenu] = useState<boolean>(false);
+    const [showAlbumMenu, setShowAlbumMenu] = useState<boolean>(false);
+    const [albumMenuOptions, setAlbumMenuOptions] = useState<AlbumSummary[] | null>(null);
+    const [albumMenuLoading, setAlbumMenuLoading] = useState<boolean>(false);
+    const [addingToAlbumId, setAddingToAlbumId] = useState<string | null>(null);
     const [searchOpen, setSearchOpen] = useState<boolean>(false);
     const searchRef = useRef<HTMLDivElement | null>(null);
     const sortMenuRef = useRef<HTMLDivElement | null>(null);
     const filterMenuRef = useRef<HTMLDivElement | null>(null);
+    const albumMenuRef = useRef<HTMLDivElement | null>(null);
     const [captureStartDate, setCaptureStartDate] = useState<string>(cachedBoot?.captureStartDate || '');
     const [captureEndDate, setCaptureEndDate] = useState<string>(cachedBoot?.captureEndDate || '');
     const { summary: timelineSummary, status: timelineStatus } = useTimelineMetadata();
@@ -3786,6 +3798,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [focusLoading, setFocusLoading] = useState<boolean>(false);
     const [focusError, setFocusError] = useState<string | null>(null);
     const [focusLightboxOpen, setFocusLightboxOpen] = useState<boolean>(false);
+    const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
 
     const observerRef = useRef<IntersectionObserver | null>(null);
     const loadMoreRef = useRef<HTMLDivElement | null>(null);
@@ -4060,6 +4073,14 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         });
     };
 
+    const handleTileLongPress = (photo: Photo) => {
+        if (selectedPhotos.size > 1 && selectedPhotos.has(photo.filename)) {
+            setActionSheetTarget({ filenames: Array.from(selectedPhotos) });
+        } else {
+            setActionSheetTarget({ filenames: [photo.filename], people: photo.people });
+        }
+    };
+
     const handleSelectAll = () => {
         if (selectedPhotos.size === filteredPhotos.length && filteredPhotos.length > 0) {
             setSelectedPhotos(new Set());
@@ -4139,10 +4160,51 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         }
     };
 
+    const handleToggleAlbumMenu = async () => {
+        setShowSortMenu(false);
+        setShowFilters(false);
+        setShowAlbumMenu((prev) => !prev);
+        if (albumMenuOptions !== null) {
+            return;
+        }
+        setAlbumMenuLoading(true);
+        try {
+            const response = await get('/albums');
+            setAlbumMenuOptions(Array.isArray(response?.albums) ? response.albums : []);
+        } catch {
+            setAlbumMenuOptions([]);
+            setError("Couldn't load albums.");
+        } finally {
+            setAlbumMenuLoading(false);
+        }
+    };
+
+    const handleAddSelectedToAlbum = async (album: AlbumSummary) => {
+        if (selectedPhotos.size === 0) {
+            return;
+        }
+        const filenames = Array.from(selectedPhotos);
+        setAddingToAlbumId(album.id);
+        try {
+            await post(`/albums/${album.id}/photos/add`, { filenames });
+            addNotification('Added to album', `Added ${plural(filenames.length, 'photo')} to "${album.name}".`);
+            setAlbumMenuOptions((prev) => prev
+                ? prev.map((a) => (a.id === album.id ? { ...a, photoCount: a.photoCount + filenames.length } : a))
+                : prev);
+            setSelectedPhotos(new Set());
+            setShowAlbumMenu(false);
+        } catch (err) {
+            setError(typeof err === 'string' ? err : 'Failed to add photos to album.');
+        } finally {
+            setAddingToAlbumId(null);
+        }
+    };
+
     const handleCreateAlbumFromSelected = async () => {
         if (selectedPhotos.size === 0) {
             return;
         }
+        setShowAlbumMenu(false);
 
         const suggestedName = `Album ${new Date().toLocaleDateString()}`;
         const input = await promptDialog({
@@ -4172,6 +4234,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             await post(`/albums/${newAlbumId}/photos/add`, { filenames });
             addNotification('Album created', `Created "${albumName}" with ${plural(filenames.length, 'photo')}.`);
             setSelectedPhotos(new Set());
+            setAlbumMenuOptions(null);
         } catch (err) {
             setError(typeof err === 'string' ? err : 'Failed to create album from selection.');
         }
@@ -4345,6 +4408,34 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             document.removeEventListener('keydown', handleKeyDown);
         };
     }, [showFilters]);
+
+    useEffect(() => {
+        if (!showAlbumMenu) {
+            return;
+        }
+        const handlePointerDown = (event: PointerEvent) => {
+            if (albumMenuRef.current && !albumMenuRef.current.contains(event.target as Node)) {
+                setShowAlbumMenu(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowAlbumMenu(false);
+            }
+        };
+        document.addEventListener('pointerdown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('pointerdown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [showAlbumMenu]);
+
+    useEffect(() => {
+        if (selectedPhotos.size === 0) {
+            setShowAlbumMenu(false);
+        }
+    }, [selectedPhotos]);
 
     useEffect(() => {
         if (!serverTotalLoaded) {
@@ -4578,16 +4669,51 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
 
                         {selectedCount > 0 && (
                             <>
-                                <button
-                                    type="button"
-                                    onClick={handleCreateAlbumFromSelected}
-                                    className="btn btn-soft icon-btn"
-                                    aria-label={`Create album (${selectedCount})`}
-                                    title={`Create album (${selectedCount})`}
-                                >
-                                    <PlusIcon className="toolbar-icon" />
-                                    <span className="sr-only">Create album ({selectedCount})</span>
-                                </button>
+                                <div className="gallery-menu-anchor" ref={albumMenuRef}>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleToggleAlbumMenu()}
+                                        className={`btn icon-btn ${showAlbumMenu ? 'btn-primary' : 'btn-soft'}`}
+                                        aria-label={`Add ${selectedCount} to album`}
+                                        aria-expanded={showAlbumMenu}
+                                        title={`Add ${selectedCount} to album`}
+                                    >
+                                        <PlusIcon className="toolbar-icon" />
+                                        <span className="sr-only">Add {selectedCount} to album</span>
+                                    </button>
+                                    {showAlbumMenu && (
+                                        <div className="gallery-menu" role="menu" aria-label="Add to album">
+                                            <button
+                                                type="button"
+                                                className="gallery-menu-action"
+                                                onClick={() => void handleCreateAlbumFromSelected()}
+                                            >
+                                                <PlusIcon className="toolbar-icon" aria-hidden="true" />
+                                                <span>Create new album</span>
+                                            </button>
+                                            <div className="gallery-menu-divider" />
+                                            <p className="gallery-menu-label">Add to existing album</p>
+                                            <div className="gallery-menu-album-list">
+                                                {albumMenuLoading && <p className="gallery-menu-empty">Loading…</p>}
+                                                {!albumMenuLoading && albumMenuOptions && albumMenuOptions.length === 0 && (
+                                                    <p className="gallery-menu-empty">No albums yet.</p>
+                                                )}
+                                                {!albumMenuLoading && albumMenuOptions && albumMenuOptions.map((album) => (
+                                                    <button
+                                                        key={album.id}
+                                                        type="button"
+                                                        className="gallery-menu-action"
+                                                        disabled={addingToAlbumId !== null}
+                                                        onClick={() => void handleAddSelectedToAlbum(album)}
+                                                    >
+                                                        <span>{album.name}</span>
+                                                        <span className="gallery-menu-action-meta">{album.photoCount}</span>
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
                                 <button
                                     type="button"
                                     onClick={handleDownloadSelected}
@@ -4742,6 +4868,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                     e.stopPropagation();
                                     openLightboxAt(index);
                                 }}
+                                onLongPress={() => handleTileLongPress(photo)}
                                 mediaOverlay={(
                                     <>
                                         <label
@@ -4820,6 +4947,16 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 )}
                 {loadingMore && <p className="status">Loading more photos…</p>}
             </div>
+
+            <PhotoActionSheet
+                open={!!actionSheetTarget}
+                onClose={() => setActionSheetTarget(null)}
+                filenames={actionSheetTarget?.filenames || []}
+                people={actionSheetTarget?.people}
+                showLibraryLink={false}
+                onDownload={actionSheetTarget && actionSheetTarget.filenames.length > 1 ? handleDownloadSelected : undefined}
+                onDelete={actionSheetTarget && actionSheetTarget.filenames.length > 1 ? handleDeletePhotos : undefined}
+            />
         </section>
     );
 };

@@ -25,6 +25,7 @@ import { useAppServices } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
 import PhotoTile from './shared/PhotoTile';
 import PhotoQuickActions, { libraryFocusHref } from './shared/PhotoQuickActions';
+import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
 import type { PhotoPersonLink } from '../types/uiTypes';
 import { EmptyState } from './shared/EmptyState';
@@ -290,6 +291,7 @@ const ToolsPage: React.FC = () => {
     const [photosLoadError, setPhotosLoadError] = useState<ApiError | null>(null);
     const [pendingFocusFilename, setPendingFocusFilename] = useState<string | null>(null);
     const focusTargetRef = useRef<HTMLDivElement | null>(null);
+    const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
     const activeToolsPage = getToolsPageKey(location.pathname);
     const isOverviewPage = activeToolsPage === 'overview';
     const isQueueStatusPage = activeToolsPage === 'queue-status';
@@ -1319,6 +1321,7 @@ const ToolsPage: React.FC = () => {
                                 title={photo.filename}
                                 selected={selectedFlag}
                                 onCardClick={() => toggleOne(photo.filename)}
+                                onLongPress={() => setActionSheetTarget({ filenames: [photo.filename], people: photo.people })}
                                 selectableOverlay={(
                                     <input
                                         type="checkbox"
@@ -1517,6 +1520,14 @@ const ToolsPage: React.FC = () => {
             {isQueueStatusPage && renderQueueStatusPage()}
             {isBrowserWorkbenchPage && renderBrowserWorkbenchPage()}
             {isRecoveryPage && renderRecoveryPage()}
+
+            <PhotoActionSheet
+                open={!!actionSheetTarget}
+                onClose={() => setActionSheetTarget(null)}
+                filenames={actionSheetTarget?.filenames || []}
+                people={actionSheetTarget?.people}
+                showWorkbenchLink={false}
+            />
         </section>
     );
 };

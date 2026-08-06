@@ -3370,6 +3370,27 @@ html[data-theme='light'] .notification-item.unread {
   background: var(--lg-edge);
 }
 
+.gallery-menu-album-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.gallery-menu-action-meta {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.gallery-menu-empty {
+  margin: 2px;
+  padding: 4px 2px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
 .gallery-menu-filters {
   min-width: 260px;
 }
@@ -3519,10 +3540,12 @@ html[data-theme='light'] .notification-item.unread {
   transform: none;
 }
 
+/* Touch devices have no hover to reveal these, and permanently-visible corner
+   icons crowd every tile on a small screen -- long-press (see PhotoActionSheet)
+   is the touch-native replacement instead. */
 @media (hover: none) {
   .tile-quick-actions {
-    opacity: 1;
-    transform: none;
+    display: none;
   }
 }
 
@@ -4919,6 +4942,164 @@ video.photo-preview-media.is-loading {
 @media (prefers-reduced-motion: reduce) {
   .dialog-backdrop,
   .dialog-card {
+    animation: none;
+  }
+}
+
+/* ---- Mobile long-press action sheet (touch replacement for PhotoQuickActions) ---- */
+@keyframes action-sheet-slide-up {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+.action-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgba(8, 8, 12, 0.45);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: photo-preview-in var(--dur-base) var(--ease-glass) both;
+}
+
+.action-sheet {
+  width: 100%;
+  max-width: 480px;
+  max-height: min(70vh, 520px);
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+  border: 1px solid var(--lg-edge-strong);
+  border-bottom: none;
+  border-radius: 20px 20px 0 0;
+  background: var(--lg-surface-strong);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  box-shadow: var(--lg-shadow-floating);
+  animation: action-sheet-slide-up var(--dur-base) var(--ease-glass) both;
+}
+
+.action-sheet-grabber {
+  width: 36px;
+  height: 4px;
+  margin: 4px auto 10px;
+  border-radius: 999px;
+  background: var(--lg-edge-strong);
+  flex: 0 0 auto;
+}
+
+.action-sheet-title {
+  margin: 0 0 8px;
+  padding: 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  word-break: break-word;
+  flex: 0 0 auto;
+}
+
+.action-sheet-subheader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex: 0 0 auto;
+}
+
+.action-sheet-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 999px;
+  background: var(--lg-surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.action-sheet-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.action-sheet-list-scroll {
+  overflow-y: auto;
+}
+
+.action-sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 48px;
+  padding: 0 6px;
+  border: none;
+  background: transparent;
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.action-sheet-row:active {
+  background: var(--lg-surface);
+}
+
+.action-sheet-row:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.action-sheet-row-icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.action-sheet-row-meta {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.action-sheet-row-danger {
+  color: var(--danger);
+}
+
+.action-sheet-row-danger .action-sheet-row-icon {
+  color: var(--danger);
+}
+
+.action-sheet-empty {
+  padding: 12px 6px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.action-sheet-cancel {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  padding: 12px;
+  border: none;
+  border-radius: var(--r-md);
+  background: var(--lg-surface);
+  color: var(--text);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .action-sheet-backdrop,
+  .action-sheet {
     animation: none;
   }
 }

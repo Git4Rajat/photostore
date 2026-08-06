@@ -3,6 +3,7 @@ import { CheckCircleIcon } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
 import PhotoTile from './shared/PhotoTile';
 import PhotoQuickActions, { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
+import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
@@ -27,6 +28,7 @@ const CorruptedUploadsPage: React.FC = () => {
     const [error, setError] = useState<ApiError | null>(null);
     const [clearing, setClearing] = useState<string | null>(null);
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+    const [actionSheetFilename, setActionSheetFilename] = useState<string | null>(null);
 
     const load = useCallback(async () => {
         setLoading(true);
@@ -112,6 +114,7 @@ const CorruptedUploadsPage: React.FC = () => {
                                 e.preventDefault();
                                 setViewerIndex(index);
                             }}
+                            onLongPress={() => setActionSheetFilename(item.filename)}
                             mediaOverlay={(
                                 <PhotoQuickActions
                                     libraryHref={libraryFocusHref(item.filename)}
@@ -152,6 +155,12 @@ const CorruptedUploadsPage: React.FC = () => {
                     onRotationSave={handleSaveRotation}
                 />
             )}
+
+            <PhotoActionSheet
+                open={!!actionSheetFilename}
+                onClose={() => setActionSheetFilename(null)}
+                filenames={actionSheetFilename ? [actionSheetFilename] : []}
+            />
         </section>
     );
 };

@@ -4,6 +4,7 @@ import { isAuthEnabled } from '../../services/authClient';
 import { useEffect, useRef, useState } from 'react';
 import { PlayCircleIcon } from '@heroicons/react/24/solid';
 import { isVideoFilename, requiresBackendPreview } from '../../utils/photoDisplay';
+import { useLongPress } from '../../services/useLongPress';
 
 interface TilePhoto {
     filename: string;
@@ -29,6 +30,9 @@ interface PhotoTileProps {
     onCardClick?: (event: React.MouseEvent<HTMLDivElement>) => void;
     onBodyClick?: (event: React.MouseEvent<HTMLDivElement>) => void;
     onMediaClick?: (event: React.MouseEvent<HTMLImageElement>) => void;
+    // Touch/pen-only (see useLongPress) -- the touch-native replacement for the
+    // desktop hover corner icons, opening a PhotoActionSheet.
+    onLongPress?: () => void;
     useProtectedMedia?: boolean;
 }
 
@@ -71,8 +75,10 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     onCardClick,
     onBodyClick,
     onMediaClick,
+    onLongPress,
     useProtectedMedia = true,
 }) => {
+    const longPressHandlers = useLongPress(onLongPress);
     const classes = [
         'photo-card',
         'card-appear',
@@ -164,7 +170,7 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     }, [resolvedThumbnailUrl]);
 
     return (
-        <div className={classes} style={style} onClick={onCardClick}>
+        <div className={classes} style={style} onClick={onCardClick} {...longPressHandlers}>
             <span className="photo-media-wrap">
                 {!imgLoaded && <span className="photo-media-skeleton" aria-hidden="true" />}
                 <img
