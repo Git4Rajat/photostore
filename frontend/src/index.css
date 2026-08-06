@@ -1841,6 +1841,10 @@ a {
 
 .person-face-actions {
   justify-content: flex-end;
+  /* 5 icon buttons (4 on the suggested-faces row) don't fit a single line at
+     the grid's minimum card width (180px) -- wrap instead of overflowing the
+     card, which .photo-card's overflow:hidden would otherwise clip. */
+  flex-wrap: wrap;
 }
 
 .person-face-meta-chips {
@@ -6716,6 +6720,13 @@ video.photo-preview-media.is-loading {
   position: relative;
   height: 78px;
   cursor: grab;
+  /* Bars are rendered at their bucket's full width even when only partially
+     inside the visible window (so an edge bucket shows partial context
+     instead of vanishing) -- once zoomed in, a wide year/month-wide bar
+     straddling the view boundary is many times wider than the track itself.
+     Clip it here, not on .timeline-widget, so the tooltip (a sibling that
+     deliberately pops up above the widget's own box) stays unclipped. */
+  overflow: hidden;
 }
 
 .timeline-track:active {

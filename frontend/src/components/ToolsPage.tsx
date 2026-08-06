@@ -339,6 +339,27 @@ const ToolsPage: React.FC = () => {
 
     const hasMorePhotos = photos.length < photosTotal;
 
+    // Re-fetches just the acted-on photos and patches them into the existing
+    // list in place, instead of loadPhotos()'s full page-0 reset -- that reset
+    // used to throw away pagination/view state and could drop the very photo
+    // the user just ran an action on (e.g. an older photo outside the first
+    // page, or filtered out of 'recent'/'attention' once its status changed),
+    // making it look like the run did nothing.
+    const refreshPhotosByFilename = async (filenames: string[]) => {
+        const updates = await Promise.all(filenames.map(async (filename) => {
+            try {
+                const response = await get(`/photos/lookup/${encodeURIComponent(filename)}`);
+                return response?.photo as Photo | undefined;
+            } catch {
+                return undefined;
+            }
+        }));
+        setPhotos((prev) => prev.map((photo) => {
+            const updated = updates.find((candidate) => candidate?.filename === photo.filename);
+            return updated || photo;
+        }));
+    };
+
     const loadQueueStatus = async () => {
         try {
             const response = (await get(`/upload/processing/status?ts=${Date.now()}`)) as QueueStatusResponse;
@@ -651,7 +672,7 @@ const ToolsPage: React.FC = () => {
                 force: forceRun,
             });
             setMessage(`Finished ${runningActionLabels[action]}: ${processed} of ${plural(filenames.length, 'photo')} processed.`);
-            await loadPhotos();
+            await refreshPhotosByFilename(filenames);
             await loadQueueStatus();
         } catch (err) {
             setMessage(`Browser '${action}' failed: ${String(err)}`);

@@ -511,30 +511,28 @@ const BackgroundTabWarningModal: React.FC<BackgroundTabWarningModalProps> = ({ o
     }
 
     return (
-        <div className="dialog-overlay" onClick={onClose}>
-            <div className="dialog-container" onClick={(e) => e.stopPropagation()} role="dialog" aria-labelledby="background-tab-warning-title" aria-modal="true">
-                <div className="dialog-content">
-                    <h2 id="background-tab-warning-title" className="dialog-title">Background Processing Notice</h2>
-                    <p className="dialog-message">
-                        When this tab is not in the foreground, browser processing slows down significantly.
-                        For best performance, keep this tab active while processing photos.
-                    </p>
-                    <div className="dialog-actions">
-                        <button
-                            type="button"
-                            className="btn btn-primary"
-                            onClick={onClose}
-                        >
-                            OK
-                        </button>
-                        <button
-                            type="button"
-                            className="btn btn-soft"
-                            onClick={onDismissForever}
-                        >
-                            Don't remind me again
-                        </button>
-                    </div>
+        <div className="dialog-backdrop" onClick={onClose}>
+            <div className="dialog-card" onClick={(e) => e.stopPropagation()} role="dialog" aria-labelledby="background-tab-warning-title" aria-modal="true">
+                <h2 id="background-tab-warning-title" className="dialog-title">Background Processing Notice</h2>
+                <p className="dialog-message">
+                    When this tab is not in the foreground, browser processing slows down significantly.
+                    For best performance, keep this tab active while processing photos.
+                </p>
+                <div className="dialog-actions">
+                    <button
+                        type="button"
+                        className="btn btn-soft"
+                        onClick={onDismissForever}
+                    >
+                        Don't remind me again
+                    </button>
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        onClick={onClose}
+                    >
+                        OK
+                    </button>
                 </div>
             </div>
         </div>
@@ -632,9 +630,11 @@ const AppContent: React.FC = () => {
         };
     }, [themePreference]);
 
-    // Show background tab warning when tab goes to background (one-time, unless dismissed forever)
+    // Show background tab warning when tab goes to background (one-time, unless dismissed forever).
+    // Only relevant to the signed-in app, which is the only place AI processing runs -- public
+    // album viewers and visitors on auth pages never trigger it, so skip the listener there too.
     useEffect(() => {
-        if (typeof document === 'undefined' || typeof localStorage === 'undefined') {
+        if (!isPrivateArea || typeof document === 'undefined' || typeof localStorage === 'undefined') {
             return undefined;
         }
 
@@ -656,7 +656,7 @@ const AppContent: React.FC = () => {
         return () => {
             document.removeEventListener('visibilitychange', handleVisibilityChange);
         };
-    }, []);
+    }, [isPrivateArea]);
 
     const handleCloseBackgroundWarning = useCallback(() => {
         setShowBackgroundTabWarning(false);
@@ -968,9 +968,9 @@ const AppContent: React.FC = () => {
             {/* Styled confirm/prompt dialogs (replaces window.confirm/prompt). */}
             <DialogHost />
 
-            {/* One-time background tab warning */}
+            {/* One-time background tab warning -- only applies to the signed-in app, not public links */}
             <BackgroundTabWarningModal
-                open={showBackgroundTabWarning}
+                open={isPrivateArea && showBackgroundTabWarning}
                 onClose={handleCloseBackgroundWarning}
                 onDismissForever={handleDismissBackgroundWarningForever}
             />

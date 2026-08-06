@@ -4685,7 +4685,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                         <div className="gallery-menu" role="menu" aria-label="Add to album">
                                             <button
                                                 type="button"
-                                                className="gallery-menu-action"
+                                                className="btn btn-soft gallery-menu-action"
                                                 onClick={() => void handleCreateAlbumFromSelected()}
                                             >
                                                 <PlusIcon className="toolbar-icon" aria-hidden="true" />
@@ -4702,7 +4702,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                                     <button
                                                         key={album.id}
                                                         type="button"
-                                                        className="gallery-menu-action"
+                                                        className="btn btn-soft gallery-menu-action"
                                                         disabled={addingToAlbumId !== null}
                                                         onClick={() => void handleAddSelectedToAlbum(album)}
                                                     >
