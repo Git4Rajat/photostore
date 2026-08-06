@@ -7805,6 +7805,19 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
             if face.get('personId') == person_id:
                 face.pop('personId', None)
             face.pop('confirmedByUser', None)
+            # Deleting a cluster is explicit user intent to stop tracking these
+            # faces. Without marking them rejected, they're simply "unclustered"
+            # and the next upload's auto-cluster pass (or a manual recluster)
+            # regroups them by embedding similarity — silently resurrecting the
+            # deleted cluster under a new personId. Reuse the existing
+            # rejected/reviewStatus mechanism (already respected by
+            # _face_is_clusterable) so released faces stay out of clustering
+            # for good, same as a manually-rejected face.
+            face.pop('suspiciousReason', None)
+            face['reviewStatus'] = 'rejected'
+            face['rejected'] = True
+            face['rejectedReason'] = 'person_cluster_deleted'
+            face['rejectedAt'] = datetime.now(timezone.utc).isoformat()
             face_table_client.upsert_entity(face)
             faces_updated += 1
         except Exception:
