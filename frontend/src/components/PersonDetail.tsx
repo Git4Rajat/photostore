@@ -12,6 +12,7 @@ import { notifyApiError } from '../services/requestFeedback';
 import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 import { ErrorState } from './shared/ErrorState';
 import type { PersonDetailModel, PersonFace, PersonSummary } from '../types/people';
+import { compareNamedFirstThenAlpha } from '../utils/people';
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
 const isSuspiciousFace = (face: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
@@ -183,7 +184,10 @@ const PersonDetail: React.FC = () => {
         setMergeCandidatesLoading(true);
         try {
             const all = await faceService.listPersons();
-            setOtherPersons(((all.persons || []) as PersonSummary[]).filter((pp) => pp.personId !== personId));
+            const candidates = ((all.persons || []) as PersonSummary[]).filter((pp) => pp.personId !== personId);
+            // Named clusters first, then unnamed — alphabetical by name within each group.
+            candidates.sort((a, b) => compareNamedFirstThenAlpha(a.name, b.name));
+            setOtherPersons(candidates);
         } catch (e: unknown) {
             setOtherPersons([]);
             notifyApiError(e, { context: "Couldn't load merge candidates", retry: () => { void loadMergeCandidates(); } });

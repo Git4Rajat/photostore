@@ -12,6 +12,7 @@ import { isAuthEnabled } from '../services/authClient';
 import { useAppServices } from './AppServicesProvider';
 import { useNavigate } from 'react-router-dom';
 import type { FlatFace, MergeHistoryItem, PersonFace, PersonSummary, SuggestionItem } from '../types/people';
+import { compareNamedFirstThenAlpha, isNamedPerson } from '../utils/people';
 
 const SUSPICIOUS_FACE_CONFIDENCE = 0.6;
 const CLUSTER_PER_PAGE = 15;
@@ -151,14 +152,6 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
     );
 };
 
-// A cluster is "named" when the user gave it a real label, i.e. it isn't the
-// "Unnamed N" placeholder (mirrors the backend `_is_unnamed_name`). Used to group
-// named clusters ahead of unnamed ones in the grid and merge target dropdown.
-const isNamedPerson = (p: PersonSummary): boolean => {
-    const name = (p.name || '').trim();
-    return Boolean(name) && !/^unnamed\s*\d*$/i.test(name);
-};
-
 const FaceClusters: React.FC = () => {
     const { clusteringActive, clusteringStatusLabel } = useAppServices();
     const [initialLoading, setInitialLoading] = useState(false);
@@ -225,10 +218,19 @@ const FaceClusters: React.FC = () => {
         () => visibleFaces.slice((page - 1) * FACES_PER_PAGE, page * FACES_PER_PAGE),
         [visibleFaces, page],
     );
-    const suggestionTotalPages = Math.max(1, Math.ceil(suggestions.length / SUGGESTIONS_PER_PAGE));
+    // Suggestions whose merge target is a named cluster first, then unnamed
+    // targets — alphabetical by target name within each group.
+    const sortedSuggestions = useMemo(() => {
+        const targetNameById = new Map(persons.map((p) => [p.personId, p.name]));
+        return [...suggestions].sort((a, b) => compareNamedFirstThenAlpha(
+            targetNameById.get(a.targetPersonId || '') ?? a.targetName,
+            targetNameById.get(b.targetPersonId || '') ?? b.targetName,
+        ));
+    }, [suggestions, persons]);
+    const suggestionTotalPages = Math.max(1, Math.ceil(sortedSuggestions.length / SUGGESTIONS_PER_PAGE));
     const pagedSuggestions = useMemo(
-        () => suggestions.slice((suggestionPage - 1) * SUGGESTIONS_PER_PAGE, suggestionPage * SUGGESTIONS_PER_PAGE),
-        [suggestions, suggestionPage],
+        () => sortedSuggestions.slice((suggestionPage - 1) * SUGGESTIONS_PER_PAGE, suggestionPage * SUGGESTIONS_PER_PAGE),
+        [sortedSuggestions, suggestionPage],
     );
     const formatMergeId = (mergeId: string) => {
         if (!mergeId) return '';
