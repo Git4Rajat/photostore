@@ -15,7 +15,7 @@ import threading
 import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
 
 from azure.core.exceptions import AzureError, ResourceExistsError
@@ -561,6 +561,140 @@ clustering_queue_client = None
 queue_service_client = None
 
 
+class _UserScanCache:
+    """Short-TTL cache + per-user coalescing for a full per-user partition scan.
+
+    Several listing endpoints each need the user's entire partition from a
+    given table. Without this, back-to-back or concurrent calls (e.g. a page
+    load that hits /photos, /photos/search-adjacent people lookups, and the
+    People page in quick succession) each re-scan the same partition from
+    Azure Table Storage, and concurrent requests pile up doing duplicate
+    scans instead of sharing one. The first caller performs the scan while
+    others for the same user wait on a lock and reuse the result; writes
+    invalidate the entry, and the TTL bounds staleness for anything
+    invalidation misses.
+    """
+
+    def __init__(self, ttl_seconds: float):
+        self._ttl = ttl_seconds
+        self._cache: Dict[str, Tuple[float, List[Dict]]] = {}
+        self._locks: Dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def _lock_for(self, key: str) -> threading.Lock:
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[key] = lock
+            return lock
+
+    def _fresh(self, key: str) -> Optional[List[Dict]]:
+        with self._guard:
+            entry = self._cache.get(key)
+        if entry and entry[0] > time.monotonic():
+            return [dict(row) for row in entry[1]]
+        return None
+
+    def get(self, key: str, fetch_fn: Callable[[], List[Dict]]) -> List[Dict]:
+        cached = self._fresh(key)
+        if cached is not None:
+            return cached
+        lock = self._lock_for(key)
+        with lock:
+            # Re-check after acquiring: another request may have scanned while we waited.
+            cached = self._fresh(key)
+            if cached is not None:
+                return cached
+            rows = fetch_fn()
+            if self._ttl > 0:
+                with self._guard:
+                    self._cache[key] = (time.monotonic() + self._ttl, [dict(row) for row in rows])
+            return rows
+
+    def invalidate(self, key: str) -> None:
+        with self._guard:
+            self._cache.pop(key, None)
+
+
+# Person/face partitions are read in full by every People/Faces page load and
+# by every photo listing (for name lookups) -- see _cached_person_rows_for_user
+# and _load_user_face_summary_by_id below -- so they get the same treatment as
+# the metadata cache (_cached_metadata_rows_for_user, defined further down).
+PEOPLE_SCAN_CACHE_TTL_SECONDS = float(os.getenv('PEOPLE_SCAN_CACHE_TTL_SECONDS', '20'))
+_person_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
+_face_summary_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
+
+
+def _invalidate_people_scan_cache(user_id: str) -> None:
+    if not user_id:
+        return
+    _person_scan_cache.invalidate(user_id)
+    _face_summary_scan_cache.invalidate(user_id)
+
+
+def _partition_key_from_write_call(method_name: str, args: tuple, kwargs: dict) -> str:
+    """Best-effort PartitionKey extraction from a table-client write call, so
+    _InvalidatingTableClient can invalidate the right user's cache entry
+    without every one of the many call sites having to do it explicitly.
+    """
+    try:
+        if method_name == 'delete_entity':
+            pk = kwargs.get('partition_key')
+            if pk is None and args:
+                pk = args[0]
+            return str(pk or '')
+        if method_name == 'submit_transaction':
+            operations = args[0] if args else kwargs.get('entity_operations')
+            if operations:
+                first = operations[0]
+                entity = first[1] if isinstance(first, (list, tuple)) and len(first) > 1 else None
+                if isinstance(entity, dict):
+                    return str(entity.get('PartitionKey') or '')
+            return ''
+        entity = kwargs.get('entity')
+        if entity is None and args:
+            entity = args[0]
+        if isinstance(entity, dict):
+            return str(entity.get('PartitionKey') or '')
+    except Exception:
+        pass
+    return ''
+
+
+class _InvalidatingTableClient:
+    """Proxy around a Table Storage client that invalidates the read caches for
+    the affected user's partition on every write.
+
+    Person/face rows are written from dozens of call sites across app.py and
+    storage_utils.py (merges, labels, clustering, deletes, ...). Requiring
+    each one to remember to invalidate the cache is exactly how a stale-name
+    or vanished-cluster-after-refresh bug creeps back in; wrapping the client
+    once at construction makes it impossible to write to the table without
+    invalidating, regardless of which function does the writing.
+    """
+
+    _MUTATING_METHODS = {'upsert_entity', 'delete_entity', 'create_entity', 'update_entity', 'submit_transaction'}
+
+    def __init__(self, table_client, on_write: Callable[[str], None]):
+        self._table_client = table_client
+        self._on_write = on_write
+
+    def __getattr__(self, name):
+        attr = getattr(self._table_client, name)
+        if name not in self._MUTATING_METHODS or not callable(attr):
+            return attr
+
+        def _wrapped(*args, **kwargs):
+            try:
+                self._on_write(_partition_key_from_write_call(name, args, kwargs))
+            except Exception:
+                pass
+            return attr(*args, **kwargs)
+
+        return _wrapped
+
+
 def _prime_vector_indexes_on_startup() -> None:
     if not VECTOR_INDEX_PRIME_ON_STARTUP or VECTOR_INDEX_PRIME_MAX_USERS <= 0:
         return
@@ -690,8 +824,10 @@ def _init_storage_clients():
     config_table_client = config_table_client_local
     blob_service_client = blob_service_client_local
     albums_table_client = albums_table_client_local
-    face_table_client = face_table_client_local
-    person_table_client = person_table_client_local
+    # Wrap so every write (from anywhere in app.py or storage_utils.py) auto-invalidates
+    # the people/faces scan cache -- see _InvalidatingTableClient.
+    face_table_client = _InvalidatingTableClient(face_table_client_local, _invalidate_people_scan_cache)
+    person_table_client = _InvalidatingTableClient(person_table_client_local, _invalidate_people_scan_cache)
     merge_table_client = merge_table_client_local
     image_names_table_client = image_names_table_client_local
     users_table_client = users_table_client_local
@@ -964,6 +1100,31 @@ def _parse_capture_filter(value: str) -> Optional[datetime]:
         return parsed.replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def _parse_capture_range_args() -> Tuple[Optional[datetime], Optional[datetime]]:
+    """captureStart/captureEnd query params, shared by /photos, /photos/search
+    and /photos/filter (each accepts the same date-range filter)."""
+    return (
+        _parse_capture_filter(request.args.get('captureStart', '') or ''),
+        _parse_capture_filter(request.args.get('captureEnd', '') or ''),
+    )
+
+
+def _build_photo_summaries_page(
+    user_id: str,
+    filename_row_pairs: List[Tuple[str, Dict]],
+    pid_to_name: Dict[str, str],
+) -> List[Dict]:
+    """Shared page-building step for /photos, /photos/search and /photos/filter:
+    turn a page's (filename, metadata row) pairs into response photo dicts.
+    Size comes from the metadata row (stamped at finalize / backfilled by the
+    caller) -- never HEADs a blob per result.
+    """
+    return [
+        _build_photo_summary(user_id, filename, row, include_props=True, head_missing=False, pid_to_name=pid_to_name)
+        for filename, row in filename_row_pairs
+    ]
 
 
 def _metadata_upload_date(metadata: Dict) -> datetime:
@@ -1530,15 +1691,31 @@ def _semantic_embedding_for_row(
     return vision_utils.encode_text_embedding(semantic_text), semantic_text
 
 
+def _cached_person_rows_for_user(user_id: str) -> List[Dict]:
+    """Every person row for user_id, from the short-TTL cache when fresh.
+
+    Shared by every caller that needs the full person partition (name index,
+    People/Faces page listings, ...) so they scan Azure Table Storage once per
+    TTL window instead of once per call. See _UserScanCache / _person_scan_cache.
+    """
+    if person_table_client is None:
+        return []
+
+    def _fetch() -> List[Dict]:
+        try:
+            return list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        except Exception:
+            return []
+
+    return _person_scan_cache.get(user_id, _fetch)
+
+
 def _load_people_name_index(user_id: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     pid_to_name: Dict[str, str] = {}
     name_to_ids: Dict[str, List[str]] = {}
     if person_table_client is None:
         return pid_to_name, name_to_ids
-    try:
-        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
+    rows = _cached_person_rows_for_user(user_id)
     for row in rows:
         person_id = str(row.get('RowKey') or '')
         name = str(row.get('name') or '').strip()
@@ -2048,57 +2225,25 @@ def _count_processing_statuses(user_id: str, steps: List[str]) -> Dict[str, Dict
 # server. The first request performs the scan while identical concurrent
 # requests wait on a per-user lock and reuse the result; writes invalidate the
 # user's entry, and the TTL bounds staleness for anything invalidation misses.
+# (Uses the same _UserScanCache as the person/face caches defined near
+# _init_storage_clients -- metadata writes go through many call sites rather
+# than a wrapped client, so this table still invalidates explicitly.)
 METADATA_SCAN_CACHE_TTL_SECONDS = float(os.getenv('METADATA_SCAN_CACHE_TTL_SECONDS', '20'))
-_metadata_scan_cache: Dict[str, Tuple[float, List[Dict]]] = {}
-_metadata_scan_locks: Dict[str, threading.Lock] = {}
-_metadata_scan_cache_guard = threading.Lock()
-
-
-def _metadata_scan_lock_for_user(user_id: str) -> threading.Lock:
-    with _metadata_scan_cache_guard:
-        lock = _metadata_scan_locks.get(user_id)
-        if lock is None:
-            lock = threading.Lock()
-            _metadata_scan_locks[user_id] = lock
-        return lock
+_metadata_scan_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
 
 
 def _invalidate_metadata_scan_cache(user_id: str) -> None:
-    with _metadata_scan_cache_guard:
-        _metadata_scan_cache.pop(user_id, None)
+    _metadata_scan_cache.invalidate(user_id)
 
 
 def _cached_metadata_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
     """Full metadata scan for a user, served from the short-TTL cache when fresh.
 
-    Each caller gets its own shallow copy of the rows so request handlers can
-    annotate them (e.g. the uploadDate backfill) without mutating shared state.
+    Each caller gets its own shallow copy of the rows (via _UserScanCache) so
+    request handlers can annotate them (e.g. the uploadDate backfill) without
+    mutating shared state.
     """
-    def _fresh_rows() -> Optional[List[Dict]]:
-        with _metadata_scan_cache_guard:
-            entry = _metadata_scan_cache.get(user_id)
-        if entry and entry[0] > time.monotonic():
-            return [dict(row) for row in entry[1]]
-        return None
-
-    cached = _fresh_rows()
-    if cached is not None:
-        return cached
-
-    lock = _metadata_scan_lock_for_user(user_id)
-    with lock:
-        # Re-check after acquiring: another request may have scanned while we waited.
-        cached = _fresh_rows()
-        if cached is not None:
-            return cached
-        rows = _query_metadata_rows_for_user(user_id, purpose=purpose)
-        if METADATA_SCAN_CACHE_TTL_SECONDS > 0:
-            with _metadata_scan_cache_guard:
-                _metadata_scan_cache[user_id] = (
-                    time.monotonic() + METADATA_SCAN_CACHE_TTL_SECONDS,
-                    [dict(row) for row in rows],
-                )
-        return rows
+    return _metadata_scan_cache.get(user_id, lambda: _query_metadata_rows_for_user(user_id, purpose=purpose))
 
 
 def _query_metadata_rows_for_user(user_id: str, select: Optional[List[str]] = None, purpose: str = 'metadata') -> List[Dict]:
@@ -2773,10 +2918,7 @@ def _batch_upsert_entities(table_client, entities: List[Dict], *, chunk_size: in
 def _load_searchable_person_name_index(user_id: str) -> Dict[str, str]:
     if person_table_client is None:
         return {}
-    try:
-        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
+    rows = _cached_person_rows_for_user(user_id)
     index: Dict[str, str] = {}
     for row in rows:
         person_id = str(row.get('RowKey') or '').strip()
@@ -3138,16 +3280,17 @@ def _match_existing_person(
     return None, ''
 
 
-def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids: List[str]) -> Dict[str, str]:
+def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids: List[str]) -> Tuple[Dict[str, str], set]:
     if not face_ids or face_table_client is None or person_table_client is None:
-        return {}
+        return {}, set()
     try:
         import numpy as np
     except Exception:
-        return {}
+        return {}, set()
 
     session_embedding_index = [dict(entry) for entry in _load_people_embedding_index(user_id)]
     assignments: Dict[str, str] = {}
+    created_person_ids: set = set()
     people_to_refresh = set()
     next_unnamed_person_name = _make_unnamed_person_name_allocator(user_id)
 
@@ -3194,6 +3337,8 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
         else:
             name = next_unnamed_person_name()
             person_id = _create_person_entity(user_id, [face_id], emb, name=name)
+            if person_id:
+                created_person_ids.add(person_id)
             session_embedding_index.append({
                 'personId': person_id,
                 'name': name,
@@ -3218,7 +3363,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
 
     if assignments:
         _rebuild_metadata_faces_for_filename(user_id, filename)
-    return assignments
+    return assignments, created_person_ids
 
 
 def _load_existing_people_for_matching(user_id: str) -> List[Dict]:
@@ -3534,26 +3679,22 @@ def _assign_unclustered_faces(user_id: str) -> Dict:
                 continue
             candidates_by_filename.setdefault(filename, []).append(face_id)
 
-        try:
-            people_before = len(list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")))
-        except Exception:
-            people_before = 0
-
+        # Track newly-created person ids as they're created instead of diffing two
+        # full person-table scans (before/after) -- each of those was a full
+        # partition scan paid just to compute a count.
         assignments: Dict[str, str] = {}
+        created_person_ids: set = set()
         for filename, face_ids in candidates_by_filename.items():
-            assignments.update(_assign_faces_to_people_incrementally(user_id, filename, face_ids))
-
-        try:
-            people_after = len(list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")))
-        except Exception:
-            people_after = people_before
+            filename_assignments, filename_created = _assign_faces_to_people_incrementally(user_id, filename, face_ids)
+            assignments.update(filename_assignments)
+            created_person_ids.update(filename_created)
 
         return {
             'success': True,
             'queued': False,
             'candidateFaces': sum(len(face_ids) for face_ids in candidates_by_filename.values()),
             'assignedFaces': len(assignments),
-            'createdPeople': max(0, people_after - people_before),
+            'createdPeople': len(created_person_ids),
         }
     queued = _enqueue_clustering_job(
         user_id,
@@ -4854,16 +4995,20 @@ def _is_not_found_error(exc: Exception) -> bool:
 def _load_user_face_summary_by_id(user_id: str) -> Dict[str, Dict]:
     if face_table_client is None:
         return {}
-    query = f"PartitionKey eq '{_escape_odata(user_id)}'"
-    try:
-        rows = list(face_table_client.query_entities(query, select=FACE_SUMMARY_COLUMNS))
-    except TypeError:
+
+    def _fetch() -> List[Dict]:
+        query = f"PartitionKey eq '{_escape_odata(user_id)}'"
         try:
-            rows = list(face_table_client.query_entities(query))
+            return list(face_table_client.query_entities(query, select=FACE_SUMMARY_COLUMNS))
+        except TypeError:
+            try:
+                return list(face_table_client.query_entities(query))
+            except Exception:
+                return []
         except Exception:
-            return {}
-    except Exception:
-        return {}
+            return []
+
+    rows = _face_summary_scan_cache.get(user_id, _fetch)
     return {str(row.get('RowKey') or ''): row for row in rows if row.get('RowKey')}
 
 
@@ -4873,11 +5018,7 @@ def _scan_person_and_face_rows(user_id: str) -> Tuple[List[Dict], Dict[str, Dict
     (SAS minting, individual face lookups) -- callers do that only for the page
     they're about to return.
     """
-    try:
-        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
-    rows = sorted(rows, key=lambda r: str(r.get('RowKey', '')))
+    rows = sorted(_cached_person_rows_for_user(user_id), key=lambda r: str(r.get('RowKey', '')))
     face_by_id = _load_user_face_summary_by_id(user_id)
     return rows, face_by_id
 
@@ -9638,8 +9779,7 @@ def list_photos():
     except ValueError:
         return jsonify({'error': 'Invalid paging parameters.'}), 400
 
-    capture_start = _parse_capture_filter(request.args.get('captureStart', '') or '')
-    capture_end = _parse_capture_filter(request.args.get('captureEnd', '') or '')
+    capture_start, capture_end = _parse_capture_range_args()
 
     user_id, error = _require_user_id()
     if error:
@@ -9711,10 +9851,11 @@ def list_photos():
             break
 
     pid_to_name, _ = _load_people_name_index(user_id)
-    photos = []
-    for filename in selected:
-        metadata = metadata_map.get(filename, {})
-        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False, pid_to_name=pid_to_name))
+    photos = _build_photo_summaries_page(
+        user_id,
+        [(filename, metadata_map.get(filename, {})) for filename in selected],
+        pid_to_name,
+    )
 
     return jsonify({'photos': photos, 'total': len(entries)})
 
@@ -9877,8 +10018,7 @@ def search_photos():
     except ValueError:
         return jsonify({'error': 'Invalid paging parameters.'}), 400
 
-    capture_start = _parse_capture_filter(request.args.get('captureStart', '') or '')
-    capture_end = _parse_capture_filter(request.args.get('captureEnd', '') or '')
+    capture_start, capture_end = _parse_capture_range_args()
 
     user_id, error = _require_user_id()
     if error:
@@ -9996,11 +10136,11 @@ def search_photos():
     total = len(scored)
     selected = scored[offset:offset + limit]
 
-    photos = []
-    for _, filename, metadata in selected:
-        # Read size from the metadata row (stamped at finalize / backfilled by the
-        # main gallery); don't HEAD a blob per search result.
-        photos.append(_build_photo_summary(user_id, filename, metadata, include_props=True, head_missing=False, pid_to_name=pid_to_name))
+    photos = _build_photo_summaries_page(
+        user_id,
+        [(filename, metadata) for _, filename, metadata in selected],
+        pid_to_name,
+    )
 
     response_payload = {'photos': photos, 'total': total}
     if fallback_notice:
@@ -12041,8 +12181,7 @@ def filter_photos():
     except ValueError:
         return jsonify({'error': 'Invalid filter parameters'}), 400
 
-    capture_start = _parse_capture_filter(request.args.get('captureStart', '') or '')
-    capture_end = _parse_capture_filter(request.args.get('captureEnd', '') or '')
+    capture_start, capture_end = _parse_capture_range_args()
 
     try:
         all_photos = _cached_metadata_rows_for_user(user_id, purpose='photos.filter')
@@ -12086,12 +12225,11 @@ def filter_photos():
         filtered.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
         selected = filtered[offset:offset + limit]
         pid_to_name, _ = _load_people_name_index(user_id)
-        photos = []
-
-        for photo in selected:
-            name = photo['RowKey']
-            # Size comes from the metadata row (no per-result blob HEAD).
-            photos.append(_build_photo_summary(user_id, name, photo, include_props=True, head_missing=False, pid_to_name=pid_to_name))
+        photos = _build_photo_summaries_page(
+            user_id,
+            [(photo['RowKey'], photo) for photo in selected],
+            pid_to_name,
+        )
 
         return jsonify({'photos': photos, 'total': len(filtered), 'offset': offset, 'limit': limit})
     except Exception as e:
