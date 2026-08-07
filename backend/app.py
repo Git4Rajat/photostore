@@ -7798,59 +7798,84 @@ def face_crop(face_id: str):
     # The face's source photo may be stored under an anonymous UUID; resolve the
     # physical blob for both the image read and the thumbnail fallback below.
     source_blob = _resolve_media_blob_name(user_id, filename)
+
+    # Shared fallback: crop from the pre-generated thumbnail instead of the
+    # original. Used both when the original can't be downloaded and when it
+    # downloads fine but can't be decoded (e.g. a RAW/HEIC file where
+    # conversion below also fails) -- either way we still have a usable image.
+    def _crop_from_thumbnail():
+        thumb_bytes = download_media_bytes('thumbnail', source_blob)
+        with Image.open(io.BytesIO(thumb_bytes)) as img:
+            tw, th = img.size
+            sx = tw / img_w
+            sy = th / img_h
+            pad = max(1, int(min(w, h) * 0.15))
+            left = max(0, int(x * sx) - pad)
+            top = max(0, int(y * sy) - pad)
+            right = min(tw, int((x + w) * sx) + pad)
+            bottom = min(th, int((y + h) * sy) + pad)
+            cropped = img.crop((left, top, right, bottom))
+            buf = io.BytesIO()
+            cropped.convert('RGB').save(buf, format='JPEG', quality=85)
+            buf.seek(0)
+            return 'data:image/jpeg;base64,' + base64.b64encode(buf.read()).decode('ascii')
+
     try:
         image_bytes = download_media_bytes('image', source_blob)
     except Exception:
         try:
-            thumb_bytes = download_media_bytes('thumbnail', source_blob)
-            with Image.open(io.BytesIO(thumb_bytes)) as img:
-                tw, th = img.size
-                sx = tw / img_w
-                sy = th / img_h
-                pad = max(1, int(min(w, h) * 0.15))
-                left = max(0, int(x * sx) - pad)
-                top = max(0, int(y * sy) - pad)
-                right = min(tw, int((x + w) * sx) + pad)
-                bottom = min(th, int((y + h) * sy) + pad)
-                cropped = img.crop((left, top, right, bottom))
-                buf = io.BytesIO()
-                cropped.convert('RGB').save(buf, format='JPEG', quality=85)
-                buf.seek(0)
-                data_url = 'data:image/jpeg;base64,' + base64.b64encode(buf.read()).decode('ascii')
-            return jsonify({'url': data_url})
+            return jsonify({'url': _crop_from_thumbnail()})
         except Exception:
             return jsonify({'error': 'Image not available'}), 404
 
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        img = ImageOps.exif_transpose(img)
+    # RAW/cinema-RAW/HEIC originals aren't directly decodable the way a plain
+    # JPEG is (same check the preview pipeline uses, _filename_requires_backend_preview)
+    # -- extract a real preview first so Image.open below doesn't blow up with
+    # PIL.UnidentifiedImageError on bytes it can't parse.
+    if _filename_requires_backend_preview(filename):
         try:
-            metadata = _get_metadata_entity(user_id, filename) or {}
-            rotation = _normalize_rotation(metadata.get('rotation', 0))
+            converted = convert_image_to_jpeg(image_bytes, filename)
+            if converted:
+                image_bytes = converted
         except Exception:
-            rotation = 0
-        if rotation:
-            img = img.rotate(-rotation, expand=True)
-        tw, th = img.size
-        sx = tw / img_w
-        sy = th / img_h
-        pad = max(1, int(min(w, h) * 0.35))
-        left = max(0, int(x * sx) - pad)
-        top = max(0, int(y * sy) - pad)
-        right = min(tw, int((x + w) * sx) + pad)
-        bottom = min(th, int((y + h) * sy) + pad)
-        cropped = img.crop((left, top, right, bottom))
-        cropped.thumbnail((512, 512), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
-        buf = io.BytesIO()
-        cropped.convert('RGB').save(buf, format='JPEG', quality=88, optimize=True)
-        buf.seek(0)
-        cover_bytes = buf.read()
+            pass
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img = ImageOps.exif_transpose(img)
+            try:
+                metadata = _get_metadata_entity(user_id, filename) or {}
+                rotation = _normalize_rotation(metadata.get('rotation', 0))
+            except Exception:
+                rotation = 0
+            if rotation:
+                img = img.rotate(-rotation, expand=True)
+            tw, th = img.size
+            sx = tw / img_w
+            sy = th / img_h
+            pad = max(1, int(min(w, h) * 0.35))
+            left = max(0, int(x * sx) - pad)
+            top = max(0, int(y * sy) - pad)
+            right = min(tw, int((x + w) * sx) + pad)
+            bottom = min(th, int((y + h) * sy) + pad)
+            cropped = img.crop((left, top, right, bottom))
+            cropped.thumbnail((512, 512), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
+            buf = io.BytesIO()
+            cropped.convert('RGB').save(buf, format='JPEG', quality=88, optimize=True)
+            buf.seek(0)
+            cover_bytes = buf.read()
+            try:
+                upload_media_file('cover', cover_blob, cover_bytes, 'image/jpeg')
+                resp = jsonify({'url': make_media_url(cover_blob, 'cover')})
+                resp.headers['Cache-Control'] = 'public, max-age=3600, immutable'
+                return resp
+            except Exception:
+                data_url = 'data:image/jpeg;base64,' + base64.b64encode(cover_bytes).decode('ascii')
+    except Exception:
         try:
-            upload_media_file('cover', cover_blob, cover_bytes, 'image/jpeg')
-            resp = jsonify({'url': make_media_url(cover_blob, 'cover')})
-            resp.headers['Cache-Control'] = 'public, max-age=3600, immutable'
-            return resp
+            return jsonify({'url': _crop_from_thumbnail()})
         except Exception:
-            data_url = 'data:image/jpeg;base64,' + base64.b64encode(cover_bytes).decode('ascii')
+            return jsonify({'error': 'Image not available'}), 404
 
     return jsonify({'url': data_url})
 
