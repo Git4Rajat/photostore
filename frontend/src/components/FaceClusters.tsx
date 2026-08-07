@@ -167,6 +167,11 @@ const FaceClusters: React.FC = () => {
     const [initialLoading, setInitialLoading] = useState(false);
     const [actionLoading, setActionLoading] = useState(false);
     const [persons, setPersons] = useState<PersonSummary[]>([]);
+    const [personsTotal, setPersonsTotal] = useState(0);
+    // Cheap id+name roster covering every person in the account (no thumbnails,
+    // no pagination) — feeds the merge-target dropdown, which needs to offer
+    // every person regardless of what page is currently on screen.
+    const [personNames, setPersonNames] = useState<PersonSummary[]>([]);
     const [searchQuery, setSearchQuery] = useState<string>('');
     const [searchOpen, setSearchOpen] = useState<boolean>(false);
     const searchRef = useRef<HTMLDivElement | null>(null);
@@ -180,7 +185,7 @@ const FaceClusters: React.FC = () => {
     const [page, setPage] = useState(1);
     const [suggestionPage, setSuggestionPage] = useState(1);
     const [faces, setFaces] = useState<FlatFace[]>([]);
-    const [facesLoaded, setFacesLoaded] = useState(false);
+    const [facesTotal, setFacesTotal] = useState(0);
     const [facesLoading, setFacesLoading] = useState(false);
     const [selectedFaces, setSelectedFaces] = useState<Record<string, boolean>>({});
     // Multi-select for the Suggestions panel, keyed by `${sourceId}::${targetId}`.
@@ -201,33 +206,12 @@ const FaceClusters: React.FC = () => {
         return () => document.removeEventListener('pointerdown', handlePointerDown);
     }, [searchOpen]);
 
-    // Face view shows a flat, paginated grid of individual face crops. Filter by
-    // person name so the shared search box narrows faces the same way it narrows
-    // clusters, then page the result 50 at a time.
-    const visibleFaces = useMemo(() => {
-        const q = searchQuery.trim().toLowerCase();
-        if (!q) return faces;
-        return faces.filter((face) => (face.personName || '').toLowerCase().includes(q));
-    }, [faces, searchQuery]);
-
-    // Named clusters first (kept together), then unnamed — stable within each group
-    // so the backend ordering is preserved. Drives both the paginated grid and the
-    // merge target dropdown.
-    const sortedPersons = useMemo(
-        () => [...persons].sort((a, b) => Number(isNamedPerson(b)) - Number(isNamedPerson(a))),
-        [persons],
-    );
-    const activeItemCount = view === 'face' ? visibleFaces.length : sortedPersons.length;
+    // Both clusters and faces are now paginated, sorted, and (when searching)
+    // filtered server-side — `persons`/`faces` state already holds just the
+    // current page, so no client-side re-sort/slice is needed here.
+    const activeTotal = view === 'face' ? facesTotal : personsTotal;
     const activePerPage = view === 'face' ? FACES_PER_PAGE : CLUSTER_PER_PAGE;
-    const totalPages = Math.max(1, Math.ceil(activeItemCount / activePerPage));
-    const pagedPersons = useMemo(
-        () => sortedPersons.slice((page - 1) * CLUSTER_PER_PAGE, page * CLUSTER_PER_PAGE),
-        [sortedPersons, page],
-    );
-    const pagedFaces = useMemo(
-        () => visibleFaces.slice((page - 1) * FACES_PER_PAGE, page * FACES_PER_PAGE),
-        [visibleFaces, page],
-    );
+    const totalPages = Math.max(1, Math.ceil(activeTotal / activePerPage));
     // Suggestions whose merge target is a named cluster first, then unnamed
     // targets — alphabetical by target name within each group.
     const sortedSuggestions = useMemo(() => {
@@ -246,15 +230,21 @@ const FaceClusters: React.FC = () => {
         if (!mergeId) return '';
         return mergeId.length > 12 ? `${mergeId.slice(0, 6)}…${mergeId.slice(-4)}` : mergeId;
     };
+    // `persons` only holds the current page; `personNames` covers the whole
+    // account (see its declaration) — check both so labels resolve correctly
+    // for a mergeTarget/history entry that isn't on the page currently shown.
+    const findKnownPerson = (personId: string) => (
+        persons.find((p) => p.personId === personId) || personNames.find((p) => p.personId === personId)
+    );
     const getPersonLabel = (personId?: string | null) => {
         if (!personId) return 'Unknown person';
-        const match = persons.find((p) => p.personId === personId);
+        const match = findKnownPerson(personId);
         if (match?.name) return match.name;
         return `Person ${formatMergeId(personId)}`;
     };
     const getHistoryLabel = (personId?: string | null) => {
         if (!personId) return 'Unknown person';
-        const match = persons.find((p) => p.personId === personId);
+        const match = findKnownPerson(personId);
         return match?.name || 'Unknown person';
     };
     const formatMergeSummary = (merge?: MergeHistoryItem) => {
@@ -302,19 +292,35 @@ const FaceClusters: React.FC = () => {
         };
     };
 
-    const loadPersons = async (q?: string, showSpinner = true) => {
+    // Fetches one page of persons from the server (already sorted/filtered
+    // there). If the requested page comes back empty because items were
+    // removed elsewhere (a delete/merge shrank the total below this page's
+    // offset), steps back to the last real page instead of showing a
+    // spuriously empty page — this is the only "page correction" logic in the
+    // component; page turns otherwise call this directly rather than reacting
+    // to `page` via an effect, so a search reset and a page turn can never race.
+    const loadPersons = async (q?: string, showSpinner = true, targetPage = page) => {
         if (showSpinner) {
             setInitialLoading(true);
         }
         try {
-            const res = await faceService.listPersons(q || '');
+            const limit = CLUSTER_PER_PAGE;
+            let effectivePage = Math.max(1, targetPage);
+            let offset = (effectivePage - 1) * limit;
+            let res = await faceService.listPersons(q || '', offset, limit);
+            let total = res.total ?? (res.persons || []).length;
+            if ((res.persons || []).length === 0 && total > 0 && effectivePage > 1) {
+                effectivePage = Math.max(1, Math.ceil(total / limit));
+                offset = (effectivePage - 1) * limit;
+                res = await faceService.listPersons(q || '', offset, limit);
+                total = res.total ?? total;
+            }
             setPersons((res.persons || []) as PersonSummary[]);
-            // Person membership may have changed; let the face grid refetch lazily
-            // the next time it is shown (or immediately if it is already open).
-            setFacesLoaded(false);
+            setPersonsTotal(total);
+            setPage(effectivePage);
         } catch (e: unknown) {
             setStatus(String(e));
-            notifyApiError(e, { context: "Couldn't load people", retry: () => { void loadPersons(q, showSpinner); } });
+            notifyApiError(e, { context: "Couldn't load people", retry: () => { void loadPersons(q, showSpinner, targetPage); } });
         } finally {
             if (showSpinner) {
                 setInitialLoading(false);
@@ -322,13 +328,37 @@ const FaceClusters: React.FC = () => {
         }
     };
 
-    const loadFaces = async () => {
+    // Cheap id+name roster for the merge-target dropdown — see personNames'
+    // declaration. Non-critical: a failure here just leaves the dropdown stale,
+    // the main list load already surfaces a retry-capable error.
+    const loadPersonNames = async (q?: string) => {
+        try {
+            const res = await faceService.listPersonNames(q || '');
+            setPersonNames((res.persons || []) as PersonSummary[]);
+        } catch {
+            // non-critical, see comment above
+        }
+    };
+
+    // Same page-correction shape as loadPersons, for the Faces tab.
+    const loadFaces = async (q?: string, targetPage = page) => {
         setFacesLoading(true);
         try {
-            const res = await faceService.listFaces();
+            const limit = FACES_PER_PAGE;
+            let effectivePage = Math.max(1, targetPage);
+            let offset = (effectivePage - 1) * limit;
+            let res = await faceService.listFaces(q || '', offset, limit);
+            let total = res.total ?? (res.faces || []).length;
+            if ((res.faces || []).length === 0 && total > 0 && effectivePage > 1) {
+                effectivePage = Math.max(1, Math.ceil(total / limit));
+                offset = (effectivePage - 1) * limit;
+                res = await faceService.listFaces(q || '', offset, limit);
+                total = res.total ?? total;
+            }
             const nextFaces = (res.faces || []) as FlatFace[];
             setFaces(nextFaces);
-            setFacesLoaded(true);
+            setFacesTotal(total);
+            setPage(effectivePage);
             // Drop selections for faces that no longer exist.
             const liveIds = new Set(nextFaces.map((face) => face.faceId || ''));
             setSelectedFaces((prev) => {
@@ -342,7 +372,7 @@ const FaceClusters: React.FC = () => {
             });
         } catch (e: unknown) {
             setStatus(String(e));
-            notifyApiError(e, { context: "Couldn't load faces", retry: () => { void loadFaces(); } });
+            notifyApiError(e, { context: "Couldn't load faces", retry: () => { void loadFaces(q, targetPage); } });
         } finally {
             setFacesLoading(false);
         }
@@ -361,6 +391,9 @@ const FaceClusters: React.FC = () => {
             setStatus(String(e));
             notifyApiError(e, { context: "Couldn't load merge history / suggestions", retry: () => { void refreshSupportData(); } });
         }
+        // A merge/delete/etc. may have added, removed, or renamed persons; keep
+        // the merge-target dropdown's roster in sync.
+        void loadPersonNames(searchQuery.trim());
     };
 
     const getSuggestionPersonId = (value?: string) => value || '';
@@ -394,6 +427,9 @@ const FaceClusters: React.FC = () => {
     const removePersonsFromState = (personIds: string[]) => {
         const removeSet = new Set(personIds);
         setPersons(prev => prev.filter(person => !removeSet.has(person.personId)));
+        // Optimistic account-wide total adjustment; the next explicit page
+        // load (page turn, search, tab reopen) reconciles it against the server.
+        setPersonsTotal(prev => Math.max(0, prev - personIds.length));
         setSelected(prev => {
             const next = { ...prev };
             personIds.forEach(personId => delete next[personId]);
@@ -424,6 +460,8 @@ const FaceClusters: React.FC = () => {
                     ? { ...person, faceIds, faceCount: faceIds.length, representativeFace }
                     : person);
         });
+        // Optimistic account-wide total adjustment; see removePersonsFromState.
+        setPersonsTotal(prev => Math.max(0, prev - mergeIds.length));
         setSelected({});
         setMergeTarget(null);
         setSuggestions(prev => prev.filter((suggestion) => (
@@ -437,33 +475,23 @@ const FaceClusters: React.FC = () => {
     useEffect(() => {
         void (async () => {
             await loadPersons();
+            void loadPersonNames();
             void refreshSupportData();
         })();
     }, []);
-
-    // Keep the current page within range as the person list shrinks (deletes/merges/search).
-    useEffect(() => {
-        setPage((prev) => Math.min(prev, totalPages));
-    }, [totalPages]);
 
     // Keep the suggestion page within range as suggestions are declined/merged away.
     useEffect(() => {
         setSuggestionPage((prev) => Math.min(prev, suggestionTotalPages));
     }, [suggestionTotalPages]);
 
-    // Lazily fetch the flat face list the first time the Faces view is opened (or
-    // after a cluster change invalidates it) so switching tabs stays instant.
-    useEffect(() => {
-        if (view !== 'face' || facesLoaded || facesLoading) {
-            return;
-        }
-        void loadFaces();
-    }, [view, facesLoaded, facesLoading]);
-
     const handleSearch = async () => {
         setStatus('Searching…');
-        setPage(1);
-        await loadPersons(searchQuery.trim());
+        const q = searchQuery.trim();
+        await loadPersons(q, true, 1);
+        if (view === 'face') {
+            await loadFaces(q, 1);
+        }
         void refreshSupportData();
     };
 
@@ -473,11 +501,11 @@ const FaceClusters: React.FC = () => {
     };
 
     // Select every face on the current page. Page-scoped (rather than the whole
-    // filtered set) keeps a bulk delete predictable when there are many faces.
+    // account) keeps a bulk delete predictable when there are many faces.
     const selectAllVisibleFaces = () => {
         setSelectedFaces((prev) => {
             const next = { ...prev };
-            pagedFaces.forEach((face) => {
+            faces.forEach((face) => {
                 if (face.faceId) {
                     next[face.faceId] = true;
                 }
@@ -507,6 +535,7 @@ const FaceClusters: React.FC = () => {
             const result = await faceService.deleteFaces(ids);
             const deletedSet = new Set(result.deleted);
             setFaces((prev) => prev.filter((face) => !deletedSet.has(face.faceId || '')));
+            setFacesTotal((prev) => Math.max(0, prev - result.deleted.length));
             setSelectedFaces((prev) => {
                 const next = { ...prev };
                 result.deleted.forEach((id) => delete next[id]);
@@ -602,6 +631,7 @@ const FaceClusters: React.FC = () => {
             setLastMergeId(res.mergeId || null);
             showToast('Merged');
             void refreshMergeHistory();
+            void loadPersonNames(searchQuery.trim());
         } catch (e: unknown) {
             notifyApiError(e, { context: "Couldn't merge" });
             resyncAfterSuggestionError();
@@ -632,6 +662,7 @@ const FaceClusters: React.FC = () => {
             requestJobPoll();
         }
         void refreshMergeHistory();
+        void loadPersonNames(searchQuery.trim());
         if (failed) resyncAfterSuggestionError();
     };
 
@@ -689,13 +720,20 @@ const FaceClusters: React.FC = () => {
         }
     };
 
+    // Select every cluster on the current page. Page-scoped (rather than the
+    // whole account) keeps a bulk merge/delete predictable — mirrors
+    // selectAllVisibleFaces. Additive, so selections accumulate across page
+    // visits if you want to bulk-act on more than one page's worth.
     const selectAllVisible = () => {
-        setSelected(persons.reduce<Record<string, boolean>>((next, person) => {
-            if (person.personId) {
-                next[person.personId] = true;
-            }
+        setSelected((prev) => {
+            const next = { ...prev };
+            persons.forEach((person) => {
+                if (person.personId) {
+                    next[person.personId] = true;
+                }
+            });
             return next;
-        }, {}));
+        });
     };
 
     const clearSelected = () => {
@@ -820,6 +858,18 @@ const FaceClusters: React.FC = () => {
         setSelectedSuggestions(next);
     };
 
+    // Page turns fetch the requested page directly (rather than reacting to a
+    // `page` state change via an effect) so they can't race handleSearch's own
+    // setPage(1) + explicit load.
+    const goToPage = (nextPage: number) => {
+        const clamped = Math.max(1, Math.min(totalPages, nextPage));
+        if (view === 'face') {
+            void loadFaces(searchQuery.trim(), clamped);
+        } else {
+            void loadPersons(searchQuery.trim(), false, clamped);
+        }
+    };
+
     return (
         <section className="card-glass face-clusters people-minimal">
             <header className={`people-hero ${searchOpen ? 'is-searching' : ''}`}>
@@ -830,7 +880,7 @@ const FaceClusters: React.FC = () => {
                     <div>
                         <p className="people-hero-kicker">People</p>
                         <div className="people-hero-meta">
-                            <span className="people-hero-count">{view === 'face' ? faces.length : persons.length}</span>
+                            <span className="people-hero-count">{view === 'face' ? facesTotal : personsTotal}</span>
                             <span className="people-hero-label">{view === 'face' ? 'faces' : 'clusters'}</span>
                         </div>
                     </div>
@@ -856,8 +906,10 @@ const FaceClusters: React.FC = () => {
                                     aria-label="Clear search"
                                     onClick={() => {
                                         setSearchQuery('');
-                                        setPage(1);
-                                        void loadPersons();
+                                        void loadPersons('', true, 1);
+                                        if (view === 'face') {
+                                            void loadFaces('', 1);
+                                        }
                                         void refreshSupportData();
                                     }}
                                     type="button"
@@ -892,11 +944,11 @@ const FaceClusters: React.FC = () => {
 
             {status && <p className="status people-status">{status}</p>}
 
-            {persons.length > 0 && (
+            {personsTotal > 0 && (
                 <div className="people-view-toggle" role="tablist" aria-label="People view">
                     <button
                         className={`people-view-tab ${view === 'cluster' ? 'is-active' : ''}`}
-                        onClick={() => { setView('cluster'); setPage(1); }}
+                        onClick={() => { setView('cluster'); void loadPersons(searchQuery.trim(), false, 1); }}
                         role="tab"
                         aria-selected={view === 'cluster'}
                         type="button"
@@ -906,7 +958,7 @@ const FaceClusters: React.FC = () => {
                     </button>
                     <button
                         className={`people-view-tab ${view === 'face' ? 'is-active' : ''}`}
-                        onClick={() => { setView('face'); setPage(1); }}
+                        onClick={() => { setView('face'); void loadFaces(searchQuery.trim(), 1); }}
                         role="tab"
                         aria-selected={view === 'face'}
                         type="button"
@@ -917,17 +969,17 @@ const FaceClusters: React.FC = () => {
                 </div>
             )}
 
-            {persons.length > 0 && view === 'cluster' && (
+            {personsTotal > 0 && view === 'cluster' && (
                 <div className="people-merge-strip">
                     <div className="people-merge-count">{selectedCount} selected</div>
                     <button
                         className="people-secondary-btn"
-                        disabled={busy || persons.length === 0 || selectedCount === persons.length}
+                        disabled={busy || persons.length === 0}
                         onClick={selectAllVisible}
                         type="button"
                     >
                         <CheckIcon />
-                        <span>Select all</span>
+                        <span>Select page</span>
                     </button>
                     <button
                         className="people-secondary-btn"
@@ -942,16 +994,16 @@ const FaceClusters: React.FC = () => {
                         <ArrowsRightLeftIcon />
                         <select value={mergeTarget || ''} onChange={(e) => setMergeTarget(e.target.value)}>
                             <option value="">Target</option>
-                            {sortedPersons.some(isNamedPerson) && (
+                            {personNames.some(isNamedPerson) && (
                                 <optgroup label="Named">
-                                    {sortedPersons.filter(isNamedPerson).map(p => (
+                                    {personNames.filter(isNamedPerson).map(p => (
                                         <option key={p.personId} value={p.personId}>{p.name || p.personId}</option>
                                     ))}
                                 </optgroup>
                             )}
-                            {sortedPersons.some(p => !isNamedPerson(p)) && (
+                            {personNames.some(p => !isNamedPerson(p)) && (
                                 <optgroup label="Unnamed">
-                                    {sortedPersons.filter(p => !isNamedPerson(p)).map(p => (
+                                    {personNames.filter(p => !isNamedPerson(p)).map(p => (
                                         <option key={p.personId} value={p.personId}>{p.name || p.personId}</option>
                                     ))}
                                 </optgroup>
@@ -982,7 +1034,7 @@ const FaceClusters: React.FC = () => {
             )}
 
             {initialLoading && persons.length === 0 && <Loading label="Loading people…" fullPage={false} />}
-            {!initialLoading && persons.length === 0 && view === 'cluster' && (
+            {!initialLoading && personsTotal === 0 && view === 'cluster' && (
                 <EmptyState
                     icon={<UsersIcon />}
                     title="No people yet"
@@ -990,9 +1042,9 @@ const FaceClusters: React.FC = () => {
                 />
             )}
 
-            {persons.length > 0 && view === 'cluster' && (
+            {personsTotal > 0 && view === 'cluster' && (
                 <div className="people-grid">
-                    {pagedPersons.map((p, index: number) => {
+                    {persons.map((p, index: number) => {
                         const suspiciousRepresentative = isSuspiciousFace(p.representativeFace);
                         return (
                             <div key={p.personId} className={`person-tile ${selected[p.personId] ? 'is-selected' : ''} ${suspiciousRepresentative ? 'has-suspicious-face' : ''}`} style={{ ['--stagger' as string]: `${Math.min(index, 18) * 24}ms` }}>
@@ -1047,12 +1099,12 @@ const FaceClusters: React.FC = () => {
 
             {view === 'face' && (
                 <>
-                    {visibleFaces.length > 0 && (
+                    {facesTotal > 0 && (
                         <div className="people-merge-strip face-select-strip">
                             <div className="people-merge-count">{selectedFaceCount} selected</div>
                             <button
                                 className="people-secondary-btn"
-                                disabled={busy || pagedFaces.length === 0}
+                                disabled={busy || faces.length === 0}
                                 onClick={selectAllVisibleFaces}
                                 type="button"
                             >
@@ -1083,7 +1135,7 @@ const FaceClusters: React.FC = () => {
 
                     {facesLoading && faces.length === 0 ? (
                         <Loading label="Loading faces…" fullPage={false} />
-                    ) : visibleFaces.length === 0 ? (
+                    ) : facesTotal === 0 ? (
                         <EmptyState
                             icon={<FaceSmileIcon />}
                             title="No faces to review"
@@ -1091,7 +1143,7 @@ const FaceClusters: React.FC = () => {
                         />
                     ) : (
                         <div className="face-grid">
-                            {pagedFaces.map((face, index: number) => {
+                            {faces.map((face, index: number) => {
                                 const faceId = face.faceId || '';
                                 const suspicious = isSuspiciousFace(face);
                                 const isSelected = !!selectedFaces[faceId];
@@ -1142,8 +1194,8 @@ const FaceClusters: React.FC = () => {
                 <div className="people-pagination">
                     <button
                         className="people-icon-btn"
-                        onClick={() => setPage((prev) => Math.max(1, prev - 1))}
-                        disabled={page <= 1}
+                        onClick={() => goToPage(page - 1)}
+                        disabled={page <= 1 || busy || facesLoading}
                         aria-label="Previous page"
                         type="button"
                     >
@@ -1152,8 +1204,8 @@ const FaceClusters: React.FC = () => {
                     <span className="people-pagination-info">Page {page} of {totalPages}</span>
                     <button
                         className="people-icon-btn"
-                        onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
-                        disabled={page >= totalPages}
+                        onClick={() => goToPage(page + 1)}
+                        disabled={page >= totalPages || busy || facesLoading}
                         aria-label="Next page"
                         type="button"
                     >

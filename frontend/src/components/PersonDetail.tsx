@@ -184,7 +184,7 @@ const PersonDetail: React.FC = () => {
         if (!personId) return;
         setMergeCandidatesLoading(true);
         try {
-            const all = await faceService.listPersons();
+            const all = await faceService.listPersonNames();
             const candidates = ((all.persons || []) as PersonSummary[]).filter((pp) => pp.personId !== personId);
             // Named clusters first, then unnamed — alphabetical by name within each group.
             candidates.sort((a, b) => compareNamedFirstThenAlpha(a.name, b.name));
@@ -692,7 +692,7 @@ const PersonDetail: React.FC = () => {
                                             onChange={(e) => setSelectedMerge(prev => ({ ...prev, [op.personId]: e.target.checked }))}
                                         />
                                         <span className="person-merge-name">{op.name || 'Unnamed'}</span>
-                                        <span className="person-merge-count">{(op.faceIds || []).length} faces</span>
+                                        <span className="person-merge-count">{op.faceCount ?? 0} faces</span>
                                     </label>
                                 ))}
                             </div>

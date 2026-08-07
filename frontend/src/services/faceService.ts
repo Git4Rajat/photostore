@@ -2,6 +2,7 @@ import { get, post } from './apiClient';
 
 type PersonListResponse = {
     persons?: unknown[];
+    total?: number;
 };
 
 type MergeListResponse = {
@@ -49,6 +50,7 @@ type FindFacesResponse = {
 
 type FaceListResponse = {
     faces?: unknown[];
+    total?: number;
 };
 
 type BatchDeleteFacesResponse = {
@@ -68,9 +70,22 @@ const assignUnclusteredFaces = async () => {
     return await post('/api/people/assign-unclustered', {});
 };
 
-const listPersons = async (q?: string) => {
-    const url = q && q.length > 0 ? `/api/persons?q=${encodeURIComponent(q)}` : '/api/persons';
-    return await get<PersonListResponse>(url);
+const listPersons = async (q?: string, offset = 0, limit = 15) => {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    params.set('offset', String(offset));
+    params.set('limit', String(limit));
+    return await get<PersonListResponse>(`/api/persons?${params.toString()}`);
+};
+
+// Cheap id+name listing (no thumbnails, no pagination) covering every person in
+// the account — used where a full roster is needed regardless of what's on
+// screen, e.g. a merge-target picker, as opposed to listPersons' paginated,
+// thumbnail-bearing page data.
+const listPersonNames = async (q?: string) => {
+    const params = new URLSearchParams({ namesOnly: '1' });
+    if (q) params.set('q', q);
+    return await get<PersonListResponse>(`/api/persons?${params.toString()}`);
 };
 
 const getPerson = async (personId: string) => {
@@ -177,8 +192,12 @@ const deletePersons = async (personIds: string[]) => {
     };
 };
 
-const listFaces = async () => {
-    return await get<FaceListResponse>('/api/faces');
+const listFaces = async (q?: string, offset = 0, limit = 50) => {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    params.set('offset', String(offset));
+    params.set('limit', String(limit));
+    return await get<FaceListResponse>(`/api/faces?${params.toString()}`);
 };
 
 const deleteFaces = async (faceIds: string[]) => {
@@ -214,6 +233,7 @@ const declineSuggestion = async (sourcePersonId: string, targetPersonId: string)
 export default {
     assignUnclusteredFaces,
     listPersons,
+    listPersonNames,
     getPerson,
     labelPerson,
     mergePersons,

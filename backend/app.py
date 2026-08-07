@@ -4867,6 +4867,21 @@ def _load_user_face_summary_by_id(user_id: str) -> Dict[str, Dict]:
     return {str(row.get('RowKey') or ''): row for row in rows if row.get('RowKey')}
 
 
+def _scan_person_and_face_rows(user_id: str) -> Tuple[List[Dict], Dict[str, Dict]]:
+    """Shared cheap scan used by list_persons/list_faces: every person row (sorted
+    by RowKey) plus the bulk face-summary map. Neither call does per-item work
+    (SAS minting, individual face lookups) -- callers do that only for the page
+    they're about to return.
+    """
+    try:
+        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        rows = []
+    rows = sorted(rows, key=lambda r: str(r.get('RowKey', '')))
+    face_by_id = _load_user_face_summary_by_id(user_id)
+    return rows, face_by_id
+
+
 def _face_thumbnail_url(filename: str, user_id: str = '') -> str:
     """Direct-blob thumbnail URL for a face's source photo, for the People page.
 
@@ -7274,19 +7289,90 @@ def list_persons():
         if not _people_features_available():
             return jsonify({'error': 'People features not configured'}), 503
         q = (request.args.get('q') or '').strip().lower()
+        names_only = (request.args.get('namesOnly') or '').strip().lower() in ('1', 'true')
         try:
-            rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-        except Exception:
-            rows = []
+            offset = int(request.args.get('offset', '0'))
+            limit = int(request.args.get('limit', '15'))
+        except ValueError:
+            return jsonify({'error': 'Invalid paging parameters.'}), 400
 
-        face_by_id = _load_user_face_summary_by_id(user_id)
-        persons = []
+        rows, face_by_id = _scan_person_and_face_rows(user_id)
+        rows_by_id = {str(row.get('RowKey') or ''): row for row in rows}
+
+        # Phase A: one cheap pass over every person using only the bulk face map
+        # (no per-face network calls, no SAS minting, no writes) to work out name,
+        # named-first order, and total count. The expensive per-person work below
+        # (Phase B: full-fidelity face lookups + SAS thumbnail mint) only runs for
+        # the requested page slice -- this is what keeps a page load fast
+        # regardless of how many clusters/faces the account has.
+        entries = []
         unnamed_counter = 1
-        rows = sorted(rows, key=lambda r: str(r.get('RowKey', '')))
         for row in rows:
             try:
                 person_id = str(row.get('RowKey') or '')
                 if not person_id:
+                    continue
+                try:
+                    face_ids = json.loads(row.get('faceIds', '[]') or '[]')
+                except Exception:
+                    face_ids = []
+                active_count = 0
+                # See the identical comment in the Phase B loop below for what
+                # "indeterminate" protects against. Here, a bulk-map miss is
+                # conservatively treated as indeterminate rather than resolved
+                # with an individual lookup -- Phase B does that resolution, only
+                # for persons that make the page.
+                indeterminate = False
+                for fid in face_ids:
+                    face = face_by_id.get(str(fid))
+                    if face is None:
+                        indeterminate = True
+                        continue
+                    if _face_is_rejected(face) or not _face_is_owned_by_person(face, person_id):
+                        continue
+                    active_count += 1
+
+                # See the matching comment in Phase B: never auto-delete a
+                # cluster the user explicitly named, even when it's empty.
+                is_named = _person_entity_is_named(row)
+                if active_count == 0 and not indeterminate and not is_named:
+                    # Eligible for the empty-unnamed auto-delete; Phase B performs
+                    # the authoritative check (and the delete) only if this page
+                    # is actually requested.
+                    continue
+
+                raw_name = str(row.get('name', '') or '').strip()
+                name = raw_name
+                if not name:
+                    name = f'Unnamed {unnamed_counter}'
+                    unnamed_counter += 1
+                if q and q not in name.lower():
+                    continue
+                entries.append({'personId': person_id, 'name': name, 'isNamed': is_named, 'faceCount': active_count})
+            except Exception:
+                continue
+
+        # Stable sort: named clusters first, ties preserve the RowKey order
+        # already established above (mirrors the frontend's previous client-side
+        # named-first re-sort, now done once here instead).
+        entries.sort(key=lambda e: 0 if e['isNamed'] else 1)
+        total = len(entries)
+
+        if names_only:
+            return jsonify({
+                'persons': [
+                    {'personId': e['personId'], 'name': e['name'], 'faceCount': e['faceCount']}
+                    for e in entries
+                ],
+                'total': total,
+            })
+
+        persons = []
+        for entry in entries[offset:offset + limit]:
+            try:
+                person_id = entry['personId']
+                row = rows_by_id.get(person_id)
+                if row is None:
                     continue
                 try:
                     face_ids = json.loads(row.get('faceIds', '[]') or '[]')
@@ -7331,9 +7417,7 @@ def list_persons():
                 # on a plain list call is data loss — it's how named clusters
                 # "vanished after a refresh", and why re-labelling one then 404s.
                 # Keep it, show it empty, and let the user delete it explicitly.
-                raw_name = str(row.get('name', '') or '').strip()
-                is_named = bool(raw_name) and not _is_unnamed_name(raw_name)
-                if not active_face_ids and not indeterminate and not is_named:
+                if not active_face_ids and not indeterminate and not entry['isNamed']:
                     try:
                         person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
                         app.logger.info('Removed empty person cluster %s/%s', user_id, person_id)
@@ -7341,22 +7425,16 @@ def list_persons():
                         pass
                     continue
 
-                name = raw_name
-                if not name:
-                    name = f'Unnamed {unnamed_counter}'
-                    unnamed_counter += 1
-                if q and q not in name.lower():
-                    continue
                 persons.append({
                     'personId': person_id,
-                    'name': name,
+                    'name': entry['name'],
                     'faceIds': active_face_ids,
                     'faceCount': len(active_face_ids),
                     'representativeFace': rep_face,
                 })
             except Exception:
                 continue
-        return jsonify({'persons': persons})
+        return jsonify({'persons': persons, 'total': total})
     except Exception as exc:
         app.logger.exception('List persons endpoint failed')
         return jsonify({'error': 'List persons failed', 'detail': str(exc)}), 500
@@ -8590,46 +8668,70 @@ def list_faces():
             return error
         if not _people_features_available():
             return jsonify({'error': 'People features not configured'}), 503
+        q = (request.args.get('q') or '').strip().lower()
         try:
-            person_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-        except Exception:
-            person_rows = []
-        person_rows = sorted(person_rows, key=lambda r: str(r.get('RowKey', '')))
+            offset = int(request.args.get('offset', '0'))
+            limit = int(request.args.get('limit', '50'))
+        except ValueError:
+            return jsonify({'error': 'Invalid paging parameters.'}), 400
 
-        face_by_id = _load_user_face_summary_by_id(user_id)
-        faces = []
+        person_rows, face_by_id = _scan_person_and_face_rows(user_id)
+
+        # Phase A: cheap pass building the ordered (person, face) pairs using
+        # only the bulk face map -- no per-face network calls, no SAS minting.
+        # The expensive per-face summary (Phase B, below) only runs for the
+        # requested page slice.
+        entries = []
         seen = set()
         unnamed_counter = 1
         for person in person_rows:
-            person_id = str(person.get('RowKey') or '')
-            if not person_id:
-                continue
-            name = str(person.get('name', '') or '').strip()
-            if not name:
-                name = f'Unnamed {unnamed_counter}'
-                unnamed_counter += 1
             try:
-                face_ids = json.loads(person.get('faceIds', '[]') or '[]')
-            except Exception:
-                face_ids = []
-            for face_id in face_ids:
-                fid = str(face_id or '')
-                if not fid or fid in seen:
+                person_id = str(person.get('RowKey') or '')
+                if not person_id:
+                    continue
+                name = str(person.get('name', '') or '').strip()
+                if not name:
+                    name = f'Unnamed {unnamed_counter}'
+                    unnamed_counter += 1
+                if q and q not in name.lower():
                     continue
                 try:
+                    face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+                except Exception:
+                    face_ids = []
+                for face_id in face_ids:
+                    fid = str(face_id or '')
+                    if not fid or fid in seen:
+                        continue
+                    # A bulk-map miss moments after the scan above is almost
+                    # always a genuinely deleted face -- unlike list_persons,
+                    # there's no cluster-level "keep it anyway" decision at
+                    # stake here, so this cheap pass simply excludes it rather
+                    # than paying for an individual lookup.
                     face = face_by_id.get(fid)
                     if face is None:
-                        face = face_table_client.get_entity(partition_key=user_id, row_key=fid)
+                        continue
                     if _face_is_rejected(face) or not _face_is_owned_by_person(face, person_id):
                         continue
-                except Exception:
+                    seen.add(fid)
+                    entries.append({'personId': person_id, 'personName': name, 'faceId': fid})
+            except Exception:
+                continue
+
+        total = len(entries)
+        faces = []
+        for entry in entries[offset:offset + limit]:
+            try:
+                face = face_by_id.get(entry['faceId'])
+                if face is None:
                     continue
-                seen.add(fid)
-                summary = _face_summary_for_person_list(fid, face, user_id)
-                summary['personId'] = person_id
-                summary['personName'] = name
+                summary = _face_summary_for_person_list(entry['faceId'], face, user_id)
+                summary['personId'] = entry['personId']
+                summary['personName'] = entry['personName']
                 faces.append(summary)
-        return jsonify({'faces': faces})
+            except Exception:
+                continue
+        return jsonify({'faces': faces, 'total': total})
     except Exception as exc:
         app.logger.exception('List faces endpoint failed')
         return jsonify({'error': 'List faces failed', 'detail': str(exc)}), 500

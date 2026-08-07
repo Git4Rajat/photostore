@@ -24,6 +24,7 @@ import { confirmDialog } from './shared/dialogs';
 import { useAppServices } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
 import PhotoTile from './shared/PhotoTile';
+import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { libraryFocusHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
@@ -499,6 +500,23 @@ const ToolsPage: React.FC = () => {
     };
 
     const clearSelection = () => setSelected(new Set());
+    const dragSelectHandlers = useDragSelect({
+        isSelected: (filename) => selected.has(filename),
+        setSelected: (filename, isOn) => {
+            setSelected(prev => {
+                if (isOn === prev.has(filename)) {
+                    return prev;
+                }
+                const next = new Set(prev);
+                if (isOn) {
+                    next.add(filename);
+                } else {
+                    next.delete(filename);
+                }
+                return next;
+            });
+        },
+    });
     const selectAllPreview = () => setSelected((prev) => {
         const next = new Set(prev);
         overviewPhotos.forEach((photo) => next.add(photo.filename));
@@ -1202,6 +1220,8 @@ const ToolsPage: React.FC = () => {
                                     checked={selected.has(photo.filename)}
                                     onClick={(event) => event.stopPropagation()}
                                     onChange={() => toggleOne(photo.filename)}
+                                    style={{ touchAction: 'none' }}
+                                    {...dragSelectHandlers}
                                 />
                             )}
                             onCardClick={() => setViewerIndex(index)}
@@ -1350,6 +1370,8 @@ const ToolsPage: React.FC = () => {
                                         checked={selectedFlag}
                                         onClick={(event) => event.stopPropagation()}
                                         onChange={() => toggleOne(photo.filename)}
+                                        style={{ touchAction: 'none' }}
+                                        {...dragSelectHandlers}
                                     />
                                 )}
                                 bodyContent={(
