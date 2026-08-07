@@ -11,6 +11,7 @@ export interface ViewerPhoto {
     thumbnailUrl?: string;
     previewUrl?: string;
     rotation?: number;
+    thumbnailRotation?: number;
     exifSummary?: {
         camera?: string;
         capturedAt?: string;
@@ -44,6 +45,13 @@ const normalizeRotation = (value?: number | null) => {
     const rotation = Number(value || 0) % 360;
     return rotation < 0 ? rotation + 360 : rotation;
 };
+
+// Thumbnail blobs may already have EXIF/RAW rotation baked in at generation time
+// (photo.thumbnailRotation); only the rotation on top of that needs to be applied
+// as a CSS transform, matching PhotoTile's gallery-tile behavior.
+const thumbnailDisplayRotation = (photo?: ViewerPhoto | null) => (
+    normalizeRotation(normalizeRotation(photo?.rotation) - normalizeRotation(photo?.thumbnailRotation))
+);
 
 const getMainMediaPath = (photo?: ViewerPhoto | null) => {
     if (!photo) {
@@ -1016,7 +1024,12 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                                 }}
                                 aria-label={`View ${photo.filename}`}
                             >
-                                <img src={thumbUrl || undefined} alt={photo.filename} loading="lazy" />
+                                <img
+                                    src={thumbUrl || undefined}
+                                    alt={photo.filename}
+                                    loading="lazy"
+                                    style={{ transform: `rotate(${thumbnailDisplayRotation(photo)}deg)` }}
+                                />
                             </button>
                         );
                     })}

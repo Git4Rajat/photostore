@@ -1280,6 +1280,19 @@ def _normalize_rotation(value) -> int:
     return rotation % 360
 
 
+def _thumbnail_rotation_from_metadata(metadata: Optional[Dict]) -> int:
+    """Rotation baked into the stored thumbnail blob at generation time (e.g. RAW/HEIC
+    orientation correction), as opposed to `rotation` (the user's manual rotate action)."""
+    try:
+        processing_metadata = json.loads((metadata or {}).get('processing_metadata') or '{}')
+    except Exception:
+        return 0
+    client_thumbnail = processing_metadata.get('client_thumbnail') if isinstance(processing_metadata, dict) else {}
+    if isinstance(client_thumbnail, dict):
+        return _normalize_rotation(client_thumbnail.get('rotationDegrees', 0))
+    return 0
+
+
 def _blob_name_from_metadata(metadata: Optional[Dict], filename: str) -> str:
     """Physical blob name (anonymous UUID) for a photo, or the filename if not
     anonymized. Reads only the metadata already in hand — no extra table call."""
@@ -11765,6 +11778,7 @@ def public_album(token: str):
             'thumbnailUrl': urls['thumbnailUrl'],
             'previewUrl': urls.get('previewUrl') or '',
             'rotation': _normalize_rotation((metadata or {}).get('rotation', 0)),
+            'thumbnailRotation': _thumbnail_rotation_from_metadata(metadata),
         })
 
     resp = make_response(jsonify({

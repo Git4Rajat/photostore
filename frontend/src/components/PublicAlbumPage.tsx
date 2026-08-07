@@ -21,6 +21,7 @@ interface PublicPhoto {
     thumbnailUrl?: string;
     previewUrl?: string;
     rotation?: number;
+    thumbnailRotation?: number;
 }
 
 interface PublicAlbum {
