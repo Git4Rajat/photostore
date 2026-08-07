@@ -19,7 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
 
 from azure.core.exceptions import AzureError, ResourceExistsError
-from azure.data.tables import TableServiceClient
+from azure.data.tables import TableServiceClient, UpdateMode
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobSasPermissions, BlobServiceClient, UserDelegationKey, generate_blob_sas
 from azure.storage.queue import QueueServiceClient
@@ -8079,7 +8079,12 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
             face['rejected'] = True
             face['rejectedReason'] = 'person_cluster_deleted'
             face['rejectedAt'] = datetime.now(timezone.utc).isoformat()
-            face_table_client.upsert_entity(face)
+            # upsert_entity defaults to MERGE mode, which only writes fields
+            # present in the payload -- popping a key above only affects this
+            # local dict, not the stored row. REPLACE actually clears the
+            # popped fields server-side since `face` is the full entity we
+            # just fetched, not a partial payload.
+            face_table_client.upsert_entity(face, mode=UpdateMode.REPLACE)
             faces_updated += 1
         except Exception:
             continue
