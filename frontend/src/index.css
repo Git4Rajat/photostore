@@ -4243,6 +4243,14 @@ html[data-theme='light'] .notification-item.unread {
 .photo-preview {
   position: relative;
   z-index: 2;
+  /* .gallery-wrap is a grid container, and grid items default to
+     min-width:auto -- an unconstrained <video> (which has a 300px intrinsic
+     box before metadata loads, or its native pixel width after) then
+     contributes its own size as this item's content-based minimum, blowing
+     out the track and shifting the whole panel right once the overflow gets
+     clipped. min-width:0 opts back into width:100%/object-fit actually
+     shrinking the video, same fix already applied to .photo-preview-stage. */
+  min-width: 0;
   min-height: calc(100vh - 160px);
   color: #fff;
   animation: photo-preview-in var(--dur-base) var(--ease-glass) both;
@@ -4393,6 +4401,14 @@ html[data-theme='light'] .notification-item.unread {
      pixel dimensions inline (see rotationFitStyle) so the rotated box still fits. */
   width: 100%;
   height: 100%;
+  /* .photo-preview-stage is a grid (place-items:center), and grid items default to
+     min-width/min-height:auto -- for a <video> that resolves to its content-based
+     intrinsic box (the ~300px UA default before metadata loads, or its native pixel
+     size after), which then wins over width/height:100% and blows out every grid
+     ancestor above it, shifting the whole panel off-center. min:0 opts back into
+     actually shrinking to the stage, matching object-fit's intent. */
+  min-width: 0;
+  min-height: 0;
   object-fit: contain;
   image-orientation: from-image;
   transform-origin: center center;
@@ -4553,7 +4569,9 @@ video.photo-preview-media.is-loading {
 
 .photo-preview-speed {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   padding: 6px 12px;
   border: 1px solid rgba(255, 255, 255, 0.16);
@@ -4564,6 +4582,15 @@ video.photo-preview-media.is-loading {
   color: rgba(255, 255, 255, 0.9);
   font-size: 13px;
   width: fit-content;
+  /* This sits in .photo-preview-panel's single-column grid alongside the video
+     stage. As a plain block its automatic minimum size defaults to its
+     unwrapped content width (~367px for 6 speed pills + label) -- wider than
+     the panel on any phone screen, which forces the *shared* column (and so
+     the whole panel, video included) wider than the viewport and off-center.
+     flex-wrap above lets the pills break onto a second line instead; min/max
+     here let the row actually shrink to fit rather than hold the column open. */
+  max-width: 100%;
+  min-width: 0;
 }
 
 .photo-preview-speed-btn {
