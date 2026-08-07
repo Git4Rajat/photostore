@@ -457,7 +457,7 @@ const PersonDetail: React.FC = () => {
                             <span className="sr-only">Save name</span>
                         </button>
                         <button
-                            className="btn btn-soft"
+                            className="btn btn-soft person-detail-find-faces"
                             onClick={handleFindFaces}
                             disabled={findingFaces || loading}
                             aria-label="Find more faces of this person"

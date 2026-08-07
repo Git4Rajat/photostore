@@ -170,7 +170,7 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     }, [resolvedThumbnailUrl]);
 
     return (
-        <div className={classes} style={style} onClick={onCardClick} {...longPressHandlers}>
+        <div className={classes} style={style} onClick={onCardClick} data-tile-id={photo.filename} {...longPressHandlers}>
             <span className="photo-media-wrap">
                 {!imgLoaded && <span className="photo-media-skeleton" aria-hidden="true" />}
                 <img

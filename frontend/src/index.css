@@ -1837,6 +1837,19 @@ a {
   width: min(320px, 80vw);
 }
 
+.person-detail-find-faces {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.person-detail-find-faces .toolbar-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
 .person-face-grid {
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
 }
@@ -3051,6 +3064,12 @@ html[data-theme='light'] .notification-item.unread {
   transition: border-color var(--dur-base) ease, transform var(--dur-base) ease;
 }
 
+.smart-album-rule .toolbar-icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+}
+
 .smart-album-rule:hover:not(:disabled),
 .smart-album-rule:focus-visible {
   border-color: rgba(10, 132, 255, 0.45);
@@ -3477,6 +3496,10 @@ html[data-theme='light'] .notification-item.unread {
   opacity: 0;
   transform: scale(0.9);
   transition: opacity var(--dur-quick) ease, transform var(--dur-quick) ease, background-color var(--dur-quick) ease;
+  /* Slide-to-select (see useDragSelect) drags a touch point off this element
+     entirely, so the browser must not also interpret the gesture as a page
+     scroll starting here. */
+  touch-action: none;
 }
 
 .photo-card:hover .tile-select,

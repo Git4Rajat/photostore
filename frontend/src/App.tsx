@@ -229,11 +229,12 @@ const RootServiceActions: React.FC = () => {
         };
     }, [expanded]);
 
-    // On narrow screens the secondary icons (AI toggle, stop, clustering,
-    // notifications) collapse behind this chevron so the header row doesn't
+    // On narrow screens the secondary icons (upload, AI toggle, stop,
+    // clustering) collapse behind this chevron so the header row doesn't
     // overflow; on wider screens it's hidden and .root-service-secondary
-    // renders inline as before (see index.css).
-    const needsAttention = appServices.uploading || appServices.clusteringActive || appServices.unreadCount > 0;
+    // renders inline as before (see index.css). Notifications stay outside
+    // the toggle since their own badge already surfaces unread count.
+    const needsAttention = appServices.uploading || appServices.clusteringActive;
     const uploadButtonLabel = appServices.pendingUploadSummary
         ? 'Reselect upload files'
         : appServices.uploading
@@ -244,16 +245,7 @@ const RootServiceActions: React.FC = () => {
 
     return (
         <div className="root-service-actions" aria-label="Library actions" ref={wrapRef}>
-            <button
-                type="button"
-                onClick={appServices.requestUpload}
-                className="btn btn-primary icon-btn"
-                aria-label={uploadButtonLabel}
-                title={uploadButtonLabel}
-            >
-                <PlusIcon className="toolbar-icon" />
-                <span className="sr-only">{uploadButtonLabel}</span>
-            </button>
+            <NotificationBell />
 
             <button
                 type="button"
@@ -269,6 +261,17 @@ const RootServiceActions: React.FC = () => {
             </button>
 
             <div className="root-service-secondary" data-expanded={expanded}>
+                <button
+                    type="button"
+                    onClick={appServices.requestUpload}
+                    className="btn btn-primary icon-btn"
+                    aria-label={uploadButtonLabel}
+                    title={uploadButtonLabel}
+                >
+                    <PlusIcon className="toolbar-icon" />
+                    <span className="sr-only">{uploadButtonLabel}</span>
+                </button>
+
                 {!appServices.clusteringActive && (() => {
                     const loadStage = appServices.browserAiLoadProgress;
                     const isLoading = appServices.browserAiModelState.status === 'loading' || appServices.browserAiModelState.status === 'checking';
@@ -315,8 +318,6 @@ const RootServiceActions: React.FC = () => {
                 )}
 
                 <ClusteringActivityIndicator />
-
-                <NotificationBell />
             </div>
         </div>
     );

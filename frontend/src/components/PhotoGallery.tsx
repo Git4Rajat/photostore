@@ -25,6 +25,7 @@ import { plural } from '../utils/format';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import PhotoTile from './shared/PhotoTile';
+import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
@@ -4073,6 +4074,24 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         });
     };
 
+    const dragSelectHandlers = useDragSelect({
+        isSelected: (filename) => selectedPhotos.has(filename),
+        setSelected: (filename, selected) => {
+            setSelectedPhotos(prev => {
+                if (selected === prev.has(filename)) {
+                    return prev;
+                }
+                const updated = new Set(prev);
+                if (selected) {
+                    updated.add(filename);
+                } else {
+                    updated.delete(filename);
+                }
+                return updated;
+            });
+        },
+    });
+
     const handleTileLongPress = (photo: Photo) => {
         if (selectedPhotos.size > 1 && selectedPhotos.has(photo.filename)) {
             setActionSheetTarget({ filenames: Array.from(selectedPhotos) });
@@ -4875,6 +4894,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                             className={`tile-select ${isSelected ? 'is-on' : ''}`}
                                             onClick={(e) => e.stopPropagation()}
                                             title={isSelected ? 'Selected' : 'Select photo'}
+                                            {...dragSelectHandlers}
                                         >
                                             <input
                                                 type="checkbox"

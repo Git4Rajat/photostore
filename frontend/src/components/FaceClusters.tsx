@@ -742,13 +742,13 @@ const FaceClusters: React.FC = () => {
             setStatus('Please select a target person to merge into.');
             return;
         }
-        if (toMerge.length <= 1) {
-            setStatus('Select at least two persons to merge.');
+        if (toMerge.length === 0) {
+            setStatus('Select at least one person to merge.');
             return;
         }
         const mergeIds = toMerge.filter(id => id !== mergeTarget);
         if (mergeIds.length === 0) {
-            setStatus('No other persons selected to merge.');
+            setStatus('Select a different person as the merge target.');
             return;
         }
         if (!(await confirmDialog({
@@ -960,7 +960,7 @@ const FaceClusters: React.FC = () => {
                     </div>
                     <button
                         className="people-merge-btn"
-                        disabled={busy}
+                        disabled={busy || selectedCount === 0 || !mergeTarget}
                         aria-label="Merge selected"
                         onClick={() => void handleMergeSelected()}
                         type="button"

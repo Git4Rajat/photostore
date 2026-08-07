@@ -33,6 +33,7 @@ import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
 import { Loading } from './shared/Loading';
 import PhotoTile from './shared/PhotoTile';
+import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
@@ -145,6 +146,7 @@ const AlbumsPage: React.FC = () => {
     const [activeAlbumPhotos, setActiveAlbumPhotos] = useState<Photo[]>([]);
     const [activeAlbumVisibleCount, setActiveAlbumVisibleCount] = useState<number>(PAGE_SIZE);
     const [albumName, setAlbumName] = useState<string>('');
+    const [addAlbumOpen, setAddAlbumOpen] = useState<boolean>(false);
     const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
     const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
     const [selectedAlbumIds, setSelectedAlbumIds] = useState<Set<string>>(new Set());
@@ -456,7 +458,7 @@ const AlbumsPage: React.FC = () => {
                 observerRef.current.disconnect();
             }
         };
-    }, [hasMore, photosLoading, loadingMore, error, offset, fetchPhotosPage, activeAlbumId, showAddFromGallery, activeAlbumVisibleCount, activeAlbumPhotos.length, searchQuery]);
+    }, [hasMore, photosLoading, loadingMore, error, offset, fetchPhotosPage, activeAlbumId, showAddFromGallery, activeAlbumVisibleCount, activeAlbumPhotos.length, searchQuery, viewerIndex]);
 
     const submitSearch = useCallback(() => {
         const nextQuery = searchInput.trim();
@@ -559,6 +561,24 @@ const AlbumsPage: React.FC = () => {
         });
     };
 
+    const dragSelectHandlers = useDragSelect({
+        isSelected: (filename) => selectedPhotos.has(filename),
+        setSelected: (filename, selected) => {
+            setSelectedPhotos(prev => {
+                if (selected === prev.has(filename)) {
+                    return prev;
+                }
+                const updated = new Set(prev);
+                if (selected) {
+                    updated.add(filename);
+                } else {
+                    updated.delete(filename);
+                }
+                return updated;
+            });
+        },
+    });
+
     const handleTileLongPress = (photo: Photo) => {
         if (selectedPhotos.size > 1 && selectedPhotos.has(photo.filename)) {
             setActionSheetTarget({ filenames: Array.from(selectedPhotos) });
@@ -620,6 +640,7 @@ const AlbumsPage: React.FC = () => {
                 setActiveAlbumId(response.album.id);
                 setShowAddFromGallery(false);
                 setAlbumName('');
+                setAddAlbumOpen(false);
                 setStatus(`Created album ${trimmed}.`);
             }
         } catch (err) {
@@ -973,17 +994,38 @@ const AlbumsPage: React.FC = () => {
                     </div>
 
                     <div className="albums-actions-row">
-                        <input
-                            type="text"
-                            className="field"
-                            placeholder="New album name"
-                            value={albumName}
-                            onChange={(e) => setAlbumName(e.target.value)}
-                        />
-                        <button type="button" className="btn btn-primary icon-btn" onClick={handleCreateAlbum} disabled={!albumName.trim()} aria-label="Create album">
-                            <PlusIcon className="toolbar-icon" />
-                            <span className="sr-only">Create album</span>
-                        </button>
+                        {addAlbumOpen ? (
+                            <div className="gallery-search-open" style={{ flex: 1 }}>
+                                <input
+                                    type="text"
+                                    className="field gallery-search-field"
+                                    placeholder="New album name"
+                                    value={albumName}
+                                    autoFocus
+                                    onChange={(e) => setAlbumName(e.target.value)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                            void handleCreateAlbum();
+                                        } else if (e.key === 'Escape') {
+                                            setAddAlbumOpen(false);
+                                        }
+                                    }}
+                                    onBlur={() => setAddAlbumOpen(false)}
+                                    aria-label="New album name"
+                                />
+                            </div>
+                        ) : (
+                            <button
+                                type="button"
+                                className="btn btn-primary icon-btn"
+                                onClick={() => setAddAlbumOpen(true)}
+                                aria-label="Create album"
+                                title="Create album"
+                            >
+                                <PlusIcon className="toolbar-icon" />
+                                <span className="sr-only">Create album</span>
+                            </button>
+                        )}
                         <button
                             type="button"
                             className={`btn icon-btn ${smartCreateOpen ? 'btn-primary' : 'btn-soft'}`}
@@ -994,6 +1036,18 @@ const AlbumsPage: React.FC = () => {
                             <SparklesIcon className="toolbar-icon" />
                             <span className="sr-only">Smart create album</span>
                         </button>
+                        {selectedAlbumIds.size > 0 && (
+                            <button
+                                type="button"
+                                className="btn btn-danger icon-btn"
+                                onClick={() => void handleDeleteSelectedAlbums()}
+                                aria-label={`Delete selected albums (${selectedAlbumIds.size})`}
+                                title={`Delete selected albums (${selectedAlbumIds.size})`}
+                            >
+                                <TrashIcon className="toolbar-icon" />
+                                <span className="sr-only">Delete selected albums</span>
+                            </button>
+                        )}
                     </div>
 
                     {smartCreateOpen && (
@@ -1231,7 +1285,7 @@ const AlbumsPage: React.FC = () => {
                             <div className="gallery-menu-anchor" ref={actionsMenuRef}>
                                 <button
                                     type="button"
-                                    className={`btn icon-btn ${(selectedCount > 0 || selectedAlbumIds.size > 0) ? 'btn-primary' : 'btn-soft'}`}
+                                    className={`btn icon-btn ${selectedCount > 0 ? 'btn-primary' : 'btn-soft'}`}
                                     onClick={() => {
                                         setShowFilterMenu(false);
                                         setShowActionsMenu((prev) => !prev);
@@ -1285,13 +1339,6 @@ const AlbumsPage: React.FC = () => {
                                             <button type="button" className="btn btn-danger gallery-menu-action" onClick={() => { void handleDeleteSelected(); setShowActionsMenu(false); }}>
                                                 <TrashIcon className="toolbar-icon" />
                                                 Delete selected ({selectedCount})
-                                            </button>
-                                        )}
-
-                                        {selectedAlbumIds.size > 0 && (
-                                            <button type="button" className="btn btn-danger gallery-menu-action" onClick={() => { void handleDeleteSelectedAlbums(); setShowActionsMenu(false); }}>
-                                                <TrashIcon className="toolbar-icon" />
-                                                Delete selected albums ({selectedAlbumIds.size})
                                             </button>
                                         )}
 
@@ -1369,75 +1416,79 @@ const AlbumsPage: React.FC = () => {
                         />
                     )}
 
-                    <div className="gallery-grid albums-photo-grid">
-                        {filteredPhotos.map((photo) => {
-                            const isSelected = selectedPhotos.has(photo.filename);
-                            const rating = Math.max(0, Math.min(5, Math.round(photo.rating || 0)));
-                            return (
-                                <PhotoTile
-                                    key={photo.filename}
-                                    photo={photo}
-                                    selected={isSelected}
-                                    title={photo.filename}
-                                    showBody={false}
-                                    onMediaClick={(e) => {
-                                        e.stopPropagation();
-                                        e.preventDefault();
-                                        setViewerIndex(filteredPhotos.findIndex((item) => item.filename === photo.filename));
-                                    }}
-                                    onLongPress={() => handleTileLongPress(photo)}
-                                    mediaOverlay={(
-                                        <>
-                                            <label
-                                                className={`tile-select ${isSelected ? 'is-on' : ''}`}
-                                                onClick={(e) => e.stopPropagation()}
-                                                title={isSelected ? 'Selected' : 'Select photo'}
-                                            >
-                                                <input
-                                                    type="checkbox"
-                                                    className="tile-select-input"
-                                                    checked={isSelected}
-                                                    onChange={() => selectPhoto(photo.filename)}
-                                                    aria-label={`Select ${photo.filename}`}
-                                                />
-                                                <CheckIcon className="tile-select-icon" aria-hidden="true" />
-                                            </label>
-                                            {(rating > 0 || photo.liked) && (
-                                                <div className="tile-badges">
-                                                    {rating > 0 && (
-                                                        <span className="tile-star" title={`Rated ${rating}/5`} aria-label={`Rated ${rating} out of 5`}>
-                                                            <StarSolidIcon className="tile-star-track" />
-                                                            <span className="tile-star-fill" style={{ width: `${(rating / 5) * 100}%` }}>
-                                                                <StarSolidIcon className="tile-star-front" />
-                                                            </span>
-                                                        </span>
+                    {viewerIndex === null ? (
+                        <>
+                            <div className="gallery-grid albums-photo-grid">
+                                {filteredPhotos.map((photo) => {
+                                    const isSelected = selectedPhotos.has(photo.filename);
+                                    const rating = Math.max(0, Math.min(5, Math.round(photo.rating || 0)));
+                                    return (
+                                        <PhotoTile
+                                            key={photo.filename}
+                                            photo={photo}
+                                            selected={isSelected}
+                                            title={photo.filename}
+                                            showBody={false}
+                                            onMediaClick={(e) => {
+                                                e.stopPropagation();
+                                                e.preventDefault();
+                                                setViewerIndex(filteredPhotos.findIndex((item) => item.filename === photo.filename));
+                                            }}
+                                            onLongPress={() => handleTileLongPress(photo)}
+                                            mediaOverlay={(
+                                                <>
+                                                    <label
+                                                        className={`tile-select ${isSelected ? 'is-on' : ''}`}
+                                                        onClick={(e) => e.stopPropagation()}
+                                                        title={isSelected ? 'Selected' : 'Select photo'}
+                                                        {...dragSelectHandlers}
+                                                    >
+                                                        <input
+                                                            type="checkbox"
+                                                            className="tile-select-input"
+                                                            checked={isSelected}
+                                                            onChange={() => selectPhoto(photo.filename)}
+                                                            aria-label={`Select ${photo.filename}`}
+                                                        />
+                                                        <CheckIcon className="tile-select-icon" aria-hidden="true" />
+                                                    </label>
+                                                    {(rating > 0 || photo.liked) && (
+                                                        <div className="tile-badges">
+                                                            {rating > 0 && (
+                                                                <span className="tile-star" title={`Rated ${rating}/5`} aria-label={`Rated ${rating} out of 5`}>
+                                                                    <StarSolidIcon className="tile-star-track" />
+                                                                    <span className="tile-star-fill" style={{ width: `${(rating / 5) * 100}%` }}>
+                                                                        <StarSolidIcon className="tile-star-front" />
+                                                                    </span>
+                                                                </span>
+                                                            )}
+                                                            {photo.liked && (
+                                                                <span className="tile-like" title={`${photo.likes || 0} ${photo.likes === 1 ? 'like' : 'likes'}`} aria-label={`Liked, ${photo.likes || 0} likes`}>
+                                                                    <HeartSolidIcon className="tile-like-icon" />
+                                                                </span>
+                                                            )}
+                                                        </div>
                                                     )}
-                                                    {photo.liked && (
-                                                        <span className="tile-like" title={`${photo.likes || 0} ${photo.likes === 1 ? 'like' : 'likes'}`} aria-label={`Liked, ${photo.likes || 0} likes`}>
-                                                            <HeartSolidIcon className="tile-like-icon" />
-                                                        </span>
-                                                    )}
-                                                </div>
+                                                    <PhotoQuickActions
+                                                        libraryHref={libraryFocusHref(photo.filename)}
+                                                        workbenchHref={workbenchFilenameHref(photo.filename)}
+                                                        people={photo.people}
+                                                    />
+                                                </>
                                             )}
-                                            <PhotoQuickActions
-                                                libraryHref={libraryFocusHref(photo.filename)}
-                                                workbenchHref={workbenchFilenameHref(photo.filename)}
-                                                people={photo.people}
-                                            />
-                                        </>
-                                    )}
-                                />
-                            );
-                        })}
-                    </div>
+                                        />
+                                    );
+                                })}
+                            </div>
 
-                    {((activeAlbumId && !showAddFromGallery && activeAlbumVisibleCount < activeAlbumPhotos.length)
-                        || ((showAddFromGallery || !activeAlbumId) && hasMore)) && (
-                        <div ref={loadMoreRef} className="load-more-trigger" aria-hidden="true" />
-                    )}
+                            {((activeAlbumId && !showAddFromGallery && activeAlbumVisibleCount < activeAlbumPhotos.length)
+                                || ((showAddFromGallery || !activeAlbumId) && hasMore)) && (
+                                <div ref={loadMoreRef} className="load-more-trigger" aria-hidden="true" />
+                            )}
 
-                    {loadingMore && (showAddFromGallery || !activeAlbumId) && <p className="status">Loading more photos…</p>}
-                    {viewerIndex === null ? null : (
+                            {loadingMore && (showAddFromGallery || !activeAlbumId) && <p className="status">Loading more photos…</p>}
+                        </>
+                    ) : (
                         <PhotoViewer
                             photos={filteredPhotos}
                             index={viewerIndex}

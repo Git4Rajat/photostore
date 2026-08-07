@@ -8,6 +8,7 @@ import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 import { getBackendStatusSnapshot } from '../services/backendStatus';
 import { showToast } from '../services/toast';
 import PhotoTile from './shared/PhotoTile';
+import { useDragSelect } from '../services/useDragSelect';
 import PhotoViewer from './shared/PhotoViewer';
 import { Logo } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
@@ -120,6 +121,23 @@ const PublicAlbumPage: React.FC = () => {
     useBackendRecoveryRetry(loadError, () => { void loadPublicAlbum(accessCode); });
 
     const selectedCount = selectedPhotos.size;
+    const dragSelectHandlers = useDragSelect({
+        isSelected: (filename) => selectedPhotos.has(filename),
+        setSelected: (filename, selected) => {
+            setSelectedPhotos(prev => {
+                if (selected === prev.has(filename)) {
+                    return prev;
+                }
+                const updated = new Set(prev);
+                if (selected) {
+                    updated.add(filename);
+                } else {
+                    updated.delete(filename);
+                }
+                return updated;
+            });
+        },
+    });
     const downloadActionUrl = token
         ? resolveApiUrl(`/public/albums/${encodeURIComponent(token)}/download`)
         : '';
@@ -300,6 +318,7 @@ const PublicAlbumPage: React.FC = () => {
                                         className={`tile-select ${isSelected ? 'is-on' : ''}`}
                                         onClick={(e) => e.stopPropagation()}
                                         title={isSelected ? 'Selected' : 'Select photo'}
+                                        {...dragSelectHandlers}
                                     >
                                         <input
                                             type="checkbox"
