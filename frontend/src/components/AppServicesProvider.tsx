@@ -1658,6 +1658,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     title: 'Browser AI ready',
                     details: `Model loaded${result.modelVersion ? ` (${result.modelVersion})` : ''}.`,
                 });
+                // Dynamically import tesseract.js so OCR becomes available when
+                // the user loads Browser AI. Non-fatal: if import fails, OCR
+                // remains unavailable and the app continues to function.
+                (async () => {
+                    try {
+                        if (typeof window !== 'undefined' && !(window as any).Tesseract) {
+                            const mod = await import('tesseract.js');
+                            (window as any).Tesseract = (mod as any).default || mod;
+                            updateNotification(notificationId, {
+                                title: 'Browser AI ready (OCR available)',
+                                details: `Model loaded${result.modelVersion ? ` (${result.modelVersion})` : ''}. OCR engine ready.`,
+                            });
+                        }
+                    } catch {
+                        // Ignore; leave OCR as unavailable.
+                    }
+                })();
                 // Drain any photos that were uploaded while AI was off (backfill).
                 window.setTimeout(() => { void startBrowserProcessing(); }, 0);
             } else {
