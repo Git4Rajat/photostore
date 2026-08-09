@@ -1390,9 +1390,29 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
     try {
         const tesseract = await import('../vendor/tesseract');
         const { createWorker } = tesseract as any;
-        const worker = await createWorker('eng');
+        const worker = await createWorker();
         try {
-            const result = await worker.recognize(await source.arrayBuffer());
+            // Some builds expose loader helpers; if available, load/init English.
+            if (typeof worker.loadLanguage === 'function') {
+                // loadLanguage may be optional depending on the worker implementation
+                // but calling it when present ensures language data is available.
+                // Use try/catch to ignore optional failures.
+                try {
+                    await worker.loadLanguage('eng');
+                } catch {
+                    // ignore
+                }
+            }
+            if (typeof worker.initialize === 'function') {
+                try {
+                    await worker.initialize('eng');
+                } catch {
+                    // ignore
+                }
+            }
+            // Pass the Blob/File directly (tesseract.js accepts Blob/File/string),
+            // not an ArrayBuffer — passing an ArrayBuffer produced empty results.
+            const result = await worker.recognize(source as Blob | File | string);
             return String(result?.data?.text || '').trim().slice(0, 2048);
         } finally {
             await worker.terminate?.();
