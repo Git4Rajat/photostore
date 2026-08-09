@@ -113,7 +113,7 @@ export const CLIENT_PROCESSING_SCHEMA_VERSION = 2;
 const CLIENT_PROCESSING_FINALIZE_GRACE_MS = 2000;
 const CLIENT_MODEL_ACQUISITION_BUDGET_MS = 10000;
 const CLIENT_MODEL_WARMUP_BUDGET_MS = 90000;
-const CLIENT_BROWSER_STEP_BUDGET_MS = 5000;
+const CLIENT_BROWSER_STEP_BUDGET_MS = 10000;
 const CLIENT_FACE_STEP_BUDGET_MS = 20000;
 const FACE_DETECTION_SOFT_BUDGET_MS = Math.max(0, CLIENT_FACE_STEP_BUDGET_MS - 1500);
 const CLIENT_AI_INFERENCE_BUDGET_MS = 120000;
@@ -1387,33 +1387,71 @@ const geocodeWithThrottle = async (latitude: string, longitude: string): Promise
 };
 
 const runBrowserOcr = async (source: Blob | File): Promise<string> => {
+    const preprocessBlob = async (blob: Blob): Promise<Blob | null> => {
+        if (typeof document === 'undefined' || typeof createImageBitmap !== 'function') return null;
+        try {
+            const imgBitmap = await createImageBitmap(blob);
+            const canvas = document.createElement('canvas');
+            canvas.width = imgBitmap.width;
+            canvas.height = imgBitmap.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.drawImage(imgBitmap, 0, 0);
+            // Simple contrast/brightness boost and convert to grayscale
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+            // Parameters tuned to improve screenshot readability
+            const contrast = 1.2; // >1 increases contrast
+            const brightness = 10; // add brightness
+            for (let i = 0; i < data.length; i += 4) {
+                // convert to grayscale
+                const r = data[i];
+                const g = data[i + 1];
+                const b = data[i + 2];
+                let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+                gray = (gray - 128) * contrast + 128 + brightness;
+                gray = Math.max(0, Math.min(255, gray));
+                data[i] = data[i + 1] = data[i + 2] = gray;
+            }
+            ctx.putImageData(imageData, 0, 0);
+            imgBitmap.close?.();
+            return await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), 'image/png', 0.9));
+        } catch {
+            return null;
+        }
+    };
+
     try {
         const tesseract = await import('../vendor/tesseract');
         const { createWorker } = tesseract as any;
         const worker = await createWorker();
         try {
-            // Some builds expose loader helpers; if available, load/init English.
             if (typeof worker.loadLanguage === 'function') {
-                // loadLanguage may be optional depending on the worker implementation
-                // but calling it when present ensures language data is available.
-                // Use try/catch to ignore optional failures.
-                try {
-                    await worker.loadLanguage('eng');
-                } catch {
-                    // ignore
-                }
+                try { await worker.loadLanguage('eng'); } catch { /* ignore */ }
             }
             if (typeof worker.initialize === 'function') {
+                try { await worker.initialize('eng'); } catch { /* ignore */ }
+            }
+
+            // Try original image first
+            let result = await worker.recognize(source as Blob | File | string);
+            let text = String(result?.data?.text || '').trim().slice(0, 2048);
+            if (text) return text;
+
+            // If empty, attempt a preprocessed retry
+            const blobSource = source instanceof Blob ? source : new Blob([await (source as File).arrayBuffer()], { type: (source as File).type || 'image/*' });
+            const pre = await preprocessBlob(blobSource);
+            if (pre) {
                 try {
-                    await worker.initialize('eng');
+                    result = await worker.recognize(pre as Blob | File | string);
+                    text = String(result?.data?.text || '').trim().slice(0, 2048);
+                    if (text) return text;
                 } catch {
-                    // ignore
+                    // ignore retry errors
                 }
             }
-            // Pass the Blob/File directly (tesseract.js accepts Blob/File/string),
-            // not an ArrayBuffer — passing an ArrayBuffer produced empty results.
-            const result = await worker.recognize(source as Blob | File | string);
-            return String(result?.data?.text || '').trim().slice(0, 2048);
+
+            return '';
         } finally {
             await worker.terminate?.();
         }
