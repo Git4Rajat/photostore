@@ -2105,7 +2105,18 @@ def _enqueue_propagate_job(user_id: str, person_id: str) -> Dict[str, str]:
     Reclaiming a person's faces from unnamed clusters scans the whole face table
     (a past OOM driver), so it runs on the queue-scaled worker instead of blocking
     the request that triggered it (e.g. a merge or label).
+
+    Unlike _enqueue_clustering_job, this had no de-dupe guard: every call (e.g.
+    repeated "Find more faces" clicks, since the button re-enables as soon as
+    the job is *queued*, well before it finishes) fired its own full-table-scan
+    job. They queue up and run serially, so the "Finding more faces…" indicator
+    stays lit for the whole backlog and the worker burns time re-scanning.
+    Reuse whatever clustering-family job is already in flight for the user
+    instead, same as the guard _enqueue_clustering_job already has.
     """
+    existing_job_id = _has_active_clustering_job(user_id)
+    if existing_job_id:
+        return {'status': 'queued', 'jobId': existing_job_id}
     job_id = f"propagate:{user_id}:{uuid.uuid4().hex}"
     if clustering_queue_client is None:
         app.logger.warning('Clustering queue client is unavailable; propagate job %s was not enqueued', job_id)
@@ -2132,7 +2143,12 @@ def _enqueue_propagate_batch_job(user_id: str, person_ids: List[str]) -> Dict[st
     Used by the bulk merge-suggestion approval flow so approving N suggestions
     at once produces a single background job (and a single completion
     notification) instead of N — see _merge_persons_core's callers.
+
+    Same de-dupe guard as _enqueue_propagate_job — see its docstring.
     """
+    existing_job_id = _has_active_clustering_job(user_id)
+    if existing_job_id:
+        return {'status': 'queued', 'jobId': existing_job_id}
     job_id = f"propagate-batch:{user_id}:{uuid.uuid4().hex}"
     if clustering_queue_client is None:
         app.logger.warning('Clustering queue client is unavailable; batch propagate job %s was not enqueued', job_id)
@@ -11050,6 +11066,14 @@ def jobs_status():
         if metadata_table_client is None:
             return jsonify({'jobs': []})
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=JOB_STATUS_WINDOW_MINUTES)).isoformat()
+        # A clustering-family job (recluster/cluster/"find more faces") this old
+        # and still queued/running is dead, not in-flight — the worker crashed
+        # mid-job (e.g. OOM during a full face-table scan) and never wrote a
+        # terminal status. _has_active_clustering_job already treats rows this
+        # old as dead for de-dupe purposes; without the same cutoff here, a
+        # dead row shows as perpetually "in flight" and the "Finding more
+        # faces…" indicator never clears.
+        clustering_stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
         try:
             query = f"PartitionKey eq 'jobs' and userId eq '{_escape_odata(user_id)}'"
             rows = list(metadata_table_client.query_entities(query))
@@ -11060,6 +11084,10 @@ def jobs_status():
         for row in rows:
             status = str(row.get('status') or '').lower()
             updated_at = str(row.get('updatedAt') or '')
+            job_type = str(row.get('jobType') or '')
+            if status in {'queued', 'running'} and job_type == 'clustering' and updated_at and updated_at < clustering_stale_cutoff:
+                _upsert_job_status(str(row.get('jobId') or ''), user_id, 'clustering', 'failed', error='Job did not finish (worker restarted or timed out)')
+                continue
             # Keep in-flight jobs, plus terminal ones that finished recently.
             # updatedAt is a UTC isoformat string, so lexicographic comparison
             # against the cutoff is a valid recency test.
