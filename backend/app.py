@@ -11277,13 +11277,17 @@ def admin_repair_stale_people_memberships():
 @app.route('/api/admin/backfill/photos', methods=['POST'])
 @app.route('/admin/backfill/photos', methods=['POST'])
 def admin_backfill_photos():
-    """Re-queue every existing photo through the full processing pipeline.
+    """Re-queue existing photos through the processing pipeline.
 
-    Marks all processing steps as 'queued' (force=True) for every non-deleted,
-    non-video photo in the user's library.  The browser's background scheduler
-    picks them up via /upload/processing/pending and re-runs thumbnails, EXIF,
-    OCR, AI vision, map tagging, and face detection — identical to what happens
-    for a freshly uploaded photo.
+    Marks processing steps as 'queued' (force=True) for every non-deleted,
+    non-video photo in the user's library. The browser's background scheduler
+    picks them up via /upload/processing/pending and re-runs them — identical
+    to what happens for a freshly uploaded photo.
+
+    By default all steps are re-queued (thumbnails, EXIF, OCR, AI vision, map
+    tagging, and face detection). Pass a 'steps' list in the body to scope the
+    re-queue to a subset, e.g. {"steps": ["ocr"]} to re-run OCR only, across
+    every photo in the library.
     """
     user_id, error = _require_user_id()
     if error:
@@ -11291,13 +11295,25 @@ def admin_backfill_photos():
     data = request.get_json(silent=True) or {}
     if data.get('repair') is not True or data.get('confirm') != 'BACKFILL_ALL_PHOTOS':
         return jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
+
+    all_steps = ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
+    requested_steps = data.get('steps')
+    if requested_steps is None:
+        steps_to_run = all_steps
+    else:
+        if not isinstance(requested_steps, list) or not requested_steps:
+            return jsonify({'error': 'steps must be a non-empty list', 'code': 'invalid_steps'}), 400
+        invalid_steps = [step for step in requested_steps if step not in all_steps]
+        if invalid_steps:
+            return jsonify({'error': f'invalid steps: {invalid_steps}', 'code': 'invalid_steps'}), 400
+        steps_to_run = requested_steps
+
     try:
         metadata_rows = _cached_metadata_rows_for_user(user_id, purpose='admin.backfill')
     except Exception as exc:
         app.logger.exception('Backfill: failed to load metadata for %s', user_id)
         return jsonify({'error': 'Failed to load photo metadata', 'detail': str(exc)}), 503
 
-    all_steps = ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
     queued = 0
     skipped = 0
     for row in metadata_rows:
@@ -11311,18 +11327,19 @@ def admin_backfill_photos():
             skipped += 1
             continue
         try:
-            _enqueue_processing_steps(user_id, filename, all_steps, force=True)
+            _enqueue_processing_steps(user_id, filename, steps_to_run, force=True)
             queued += 1
         except Exception:
             app.logger.exception('Backfill: failed to enqueue steps for %s/%s', user_id, filename)
             skipped += 1
 
     _invalidate_metadata_scan_cache(user_id)
-    app.logger.info('Backfill queued %d photos, skipped %d for user %s', queued, skipped, user_id)
+    app.logger.info('Backfill queued %d photos (steps=%s), skipped %d for user %s', queued, steps_to_run, skipped, user_id)
     return jsonify({
         'queued': queued,
         'skipped': skipped,
         'total': queued + skipped,
+        'steps': steps_to_run,
     })
 
 

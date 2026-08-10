@@ -21,7 +21,7 @@ import { get, post } from '../services/apiClient';
 import { requestJobPoll } from '../services/jobNotifications';
 import { plural } from '../utils/format';
 import { confirmDialog } from './shared/dialogs';
-import { useAppServices } from './AppServicesProvider';
+import { useAppServices, browserProcessingActionSteps } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
 import PhotoTile from './shared/PhotoTile';
 import { useDragSelect } from '../services/useDragSelect';
@@ -96,6 +96,7 @@ type ProcessingFilterProcess = 'all' | 'thumbnail' | 'exif' | 'ocr' | 'aiVision'
 type ChipStepKey = 'thumbnail' | 'exif' | 'ocr' | 'aiVision' | 'mapDetection' | 'face';
 type QueueStageKey = keyof QueueStatus;
 type WorkbenchViewKey = 'recent' | 'all' | 'attention';
+type WorkbenchScope = 'selected' | 'view' | 'library';
 
 type QueueStageConfig = {
     key: QueueStageKey;
@@ -284,7 +285,7 @@ const ToolsPage: React.FC = () => {
     const [queueUpdatedAt, setQueueUpdatedAt] = useState<Date | null>(null);
     const [isQueueStatusExpanded, setIsQueueStatusExpanded] = useState<boolean>(true);
     const [forceRun, setForceRun] = useState<boolean>(false);
-    const [runAll, setRunAll] = useState<boolean>(false);
+    const [scope, setScope] = useState<WorkbenchScope>('selected');
     const [processingFilterState, setProcessingFilterState] = useState<ProcessingFilterState>('all');
     const [processingFilterProcess, setProcessingFilterProcess] = useState<ProcessingFilterProcess>('all');
     const [viewMode, setViewMode] = useState<WorkbenchViewKey>('recent');
@@ -653,9 +654,52 @@ const ToolsPage: React.FC = () => {
         );
     };
 
+    // Queues a single step for every non-deleted, non-video photo in the account
+    // (server-side, not limited to whatever page of `photos` happens to be loaded
+    // in this tab) and then kicks off the browser's background processing pull.
+    // Mirrors runBackfillPhotos() but scoped to one step via the 'steps' param.
+    const runBrowserActionOnLibrary = async (action: BrowserProcessingAction) => {
+        if (!(await confirmDialog({
+            title: 'Run on entire library',
+            message: `Re-run ${runningActionLabels[action]} on every photo in your library, including ones already processed? The browser will work through them in the background. This can take a while for large libraries.`,
+            confirmLabel: 'Run on all photos',
+            danger: false,
+        }))) {
+            return;
+        }
+        setRunning(action);
+        setMessage(`Queueing ${runningActionLabels[action]} for the entire library…`);
+        try {
+            const response = await post('/api/admin/backfill/photos', {
+                repair: true,
+                confirm: 'BACKFILL_ALL_PHOTOS',
+                steps: browserProcessingActionSteps[action],
+            });
+            const queued = Number(response?.queued ?? 0);
+            const skipped = Number(response?.skipped ?? 0);
+            setMessage(`${runningActionLabels[action]} queued for ${plural(queued, 'photo')}${skipped > 0 ? `, ${skipped} skipped (videos / deleted)` : ''}. Processing will start in the background.`);
+            await loadQueueStatus();
+            // Same reasoning as runBackfillPhotos(): without this, a freshly opened
+            // Tools tab would queue the work server-side but never actually start
+            // processing it.
+            if (browserAiModelState.status !== 'available') {
+                await loadBrowserAiModel();
+            }
+            void startBrowserProcessing();
+        } catch (err) {
+            setMessage(`Library-wide '${action}' failed: ${String(err)}`);
+        } finally {
+            setRunning(null);
+        }
+    };
+
     const runBrowserAction = async (action: BrowserProcessingAction) => {
+        if (isBrowserWorkbenchPage && scope === 'library') {
+            await runBrowserActionOnLibrary(action);
+            return;
+        }
         const actionPhotos = isBrowserWorkbenchPage ? workbenchPhotos : photos;
-        const useAllMatching = isBrowserWorkbenchPage && runAll;
+        const useAllMatching = isBrowserWorkbenchPage && scope === 'view';
         const selectedPhotos = useAllMatching
             ? actionPhotos
             : actionPhotos.filter((photo) => selected.has(photo.filename));
@@ -1293,31 +1337,47 @@ const ToolsPage: React.FC = () => {
                         <div className="tools-scope-group" role="group" aria-label="Processing scope">
                             <button
                                 type="button"
-                                className={`btn btn-soft tools-scope-button${!runAll ? ' active' : ''}`}
-                                onClick={() => setRunAll(false)}
-                                aria-pressed={!runAll}
+                                className={`btn btn-soft tools-scope-button${scope === 'selected' ? ' active' : ''}`}
+                                onClick={() => setScope('selected')}
+                                aria-pressed={scope === 'selected'}
                             >
                                 Selected ({selectedVisibleCount})
                             </button>
                             <button
                                 type="button"
-                                className={`btn btn-soft tools-scope-button${runAll ? ' active' : ''}`}
-                                onClick={() => setRunAll(true)}
-                                aria-pressed={runAll}
+                                className={`btn btn-soft tools-scope-button${scope === 'view' ? ' active' : ''}`}
+                                onClick={() => setScope('view')}
+                                aria-pressed={scope === 'view'}
                             >
                                 All in view ({workbenchPhotos.length})
                             </button>
+                            <button
+                                type="button"
+                                className={`btn btn-soft tools-scope-button${scope === 'library' ? ' active' : ''}`}
+                                onClick={() => setScope('library')}
+                                aria-pressed={scope === 'library'}
+                                title="Queue a step across every photo in your library, not just what's loaded on this page"
+                            >
+                                Entire library ({photosTotal})
+                            </button>
                         </div>
-                        {!runAll && selectedOutsideViewCount > 0 && (
+                        {scope === 'selected' && selectedOutsideViewCount > 0 && (
                             <p className="tools-control-note">
                                 {plural(selectedOutsideViewCount, 'selected photo')} hidden by the current view will be skipped.
+                            </p>
+                        )}
+                        {scope === 'library' && (
+                            <p className="tools-control-note">
+                                Runs the chosen step on every photo in your library (loaded or not), including ones already processed.
                             </p>
                         )}
                     </div>
                     <div className="tools-control-group">
                         <span className="tools-control-label">Options</span>
                         <div className="tools-control-row">
-                            {renderForceToggle()}
+                            {scope === 'library' ? (
+                                <span className="tools-control-note">Entire-library runs always re-process, regardless of Force re-run.</span>
+                            ) : renderForceToggle()}
                             <button type="button" className="btn btn-soft" onClick={clearSelection} disabled={selected.size === 0}>
                                 Clear selection
                             </button>

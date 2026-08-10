@@ -340,7 +340,7 @@ const BROWSER_PROCESSING_HEARTBEAT_INTERVAL_MS = 1000;
 // Debounced the same way: only finalize after a real quiet period with no new
 // completions.
 const BROWSER_PROCESSING_FINALIZE_QUIET_MS = 15000;
-const browserProcessingActionSteps: Record<BrowserProcessingAction, string[]> = {
+export const browserProcessingActionSteps: Record<BrowserProcessingAction, string[]> = {
     thumbnails: ['thumbnail'],
     exif: ['exif'],
     ocr: ['ocr'],
