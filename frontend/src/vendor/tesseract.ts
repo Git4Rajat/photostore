@@ -1,4 +1,5 @@
 type TesseractWorker = {
+    load?: () => Promise<void> | void;
     loadLanguage?: (lang: string) => Promise<void> | void;
     initialize?: (lang: string) => Promise<void> | void;
     recognize: (source: Blob | File | string) => Promise<{ data?: { text?: string } }>;

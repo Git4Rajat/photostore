@@ -1387,6 +1387,13 @@ const geocodeWithThrottle = async (latitude: string, longitude: string): Promise
 };
 
 const runBrowserOcr = async (source: Blob | File): Promise<string> => {
+    // tesseract.js's loadImage() reads `.name` off any Blob/File source (to special-case
+    // .pbm files); a plain Blob (e.g. from canvas.toBlob or File.slice, as used by the
+    // RAW/HEIC preview paths) has no `.name` and throws. Always give it a named File.
+    const toOcrSource = (blob: Blob | File): File => (
+        blob instanceof File ? blob : new File([blob], 'ocr-input.jpg', { type: blob.type || 'image/jpeg' })
+    );
+
     const preprocessBlob = async (blob: Blob): Promise<Blob | null> => {
         if (typeof document === 'undefined' || typeof createImageBitmap !== 'function') return null;
         try {
@@ -1426,6 +1433,9 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
         const { createWorker } = tesseract as any;
         const worker = await createWorker();
         try {
+            if (typeof worker.load === 'function') {
+                await worker.load();
+            }
             if (typeof worker.loadLanguage === 'function') {
                 try { await worker.loadLanguage('eng'); } catch { /* ignore */ }
             }
@@ -1434,7 +1444,7 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
             }
 
             // Try original image first
-            let result = await worker.recognize(source as Blob | File | string);
+            let result = await worker.recognize(toOcrSource(source));
             let text = String(result?.data?.text || '').trim().slice(0, 2048);
             if (text) return text;
 
@@ -1443,7 +1453,7 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
             const pre = await preprocessBlob(blobSource);
             if (pre) {
                 try {
-                    result = await worker.recognize(pre as Blob | File | string);
+                    result = await worker.recognize(toOcrSource(pre));
                     text = String(result?.data?.text || '').trim().slice(0, 2048);
                     if (text) return text;
                 } catch {
