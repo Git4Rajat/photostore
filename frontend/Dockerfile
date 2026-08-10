@@ -55,6 +55,7 @@ RUN chmod -R a+rX build/models
 FROM nginx:1.27-alpine
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY security-headers.conf /etc/nginx/security-headers.conf
 COPY docker-entrypoint.sh /docker-entrypoint.d/40-generate-env.sh
 RUN chmod +x /docker-entrypoint.d/40-generate-env.sh
 
