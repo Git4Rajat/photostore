@@ -12055,7 +12055,7 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> No
     _upsert_job_status(job_id, user_id, 'ipwork', 'running')
     try:
         client_processing = _run_ipwork_steps(user_id, filename, steps)
-        apply_client_processing_results_for_file(
+        metadata = apply_client_processing_results_for_file(
             user_id,
             filename,
             client_processing=client_processing,
@@ -12063,6 +12063,17 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> No
             client_asset_id=f'ipworker:{job_id}',
             origin='ipworker',
         )
+        # The browser reaches this same trigger via /upload and
+        # /upload/client-processing right after it POSTs its own results
+        # (see those routes). ipworker writes results directly through
+        # apply_client_processing_results_for_file instead of an HTTP call,
+        # so without this it would detect faces that never get clustered
+        # into people -- they'd just sit unassigned until someone manually
+        # ran the admin recluster-repair flow.
+        try:
+            _queue_people_clustering_after_face_processing(user_id, filename, metadata)
+        except Exception:
+            worker_logger.exception('Failed to auto-queue clustering for %s after ipwork', filename)
         _upsert_job_status(job_id, user_id, 'ipwork', 'done')
     finally:
         # apply_client_processing_results_for_file already clears the lease
