@@ -423,12 +423,32 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
             image_width, image_height = rgb_image.size
             image_bgr = cv2.cvtColor(np.array(rgb_image), cv2.COLOR_RGB2BGR)
     except Exception as exc:
-        return {'hasData': False, 'error': str(exc)}
+        # 'faces' must be present (even empty) and faceFailureStage must be a
+        # non-transient value -- storage_utils._apply_client_processing_results'
+        # face block only resolves face_status to a terminal state when
+        # isinstance(faces, list) is true; omitting it here left face_status
+        # stuck at 'running' forever instead of surfacing as a retryable
+        # 'failed' on the Tools page.
+        return {
+            'hasData': False,
+            'faces': [],
+            'rawFaceCount': 0,
+            'error': str(exc),
+            'faceFailureStage': 'unsupported_runtime',
+            'faceFailureDetail': f'ipworker_decode_failed: {exc}',
+        }
 
     try:
         detections = detect_faces(image_bgr)
     except Exception as exc:
-        return {'hasData': False, 'error': f'detection_failed: {exc}'}
+        return {
+            'hasData': False,
+            'faces': [],
+            'rawFaceCount': 0,
+            'error': f'detection_failed: {exc}',
+            'faceFailureStage': 'unsupported_runtime',
+            'faceFailureDetail': f'ipworker_detection_failed: {exc}',
+        }
 
     faces: List[Dict] = []
     for detection in detections:

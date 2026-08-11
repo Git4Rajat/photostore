@@ -22,14 +22,17 @@ ENV PIP_ROOT_USER_ACTION=ignore \
 # tesseract-ocr: OCR. libgl1/libglib2.0-0: opencv-python-headless and
 # mediapipe both dlopen a handful of X11/GL shared libs at import time even
 # in "headless" builds. libimage-exiftool-perl/libraw-bin: shared with
-# backend's own EXIF/RAW extraction (exif_utils.py). curl: fetches the
-# MediaPipe Face Landmarker task bundle below (no PyPI package ships it).
+# backend's own EXIF/RAW extraction (exif_utils.py). ffmpeg: video thumbnail
+# frame extraction (ipwork_thumbnail.py, same image_utils.py path backend's
+# Dockerfile already needs it for). curl: fetches the MediaPipe Face
+# Landmarker task bundle below (no PyPI package ships it).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     libgl1 \
     libglib2.0-0 \
     libimage-exiftool-perl \
     libraw-bin \
+    ffmpeg \
     curl \
     && rm -rf /var/lib/apt/lists/*
 

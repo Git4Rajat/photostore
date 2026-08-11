@@ -2966,8 +2966,11 @@ export const runBrowserProcessing = async (
     // AND only when the deploy-time processing mode allows client-side AI at all --
     // 'backend' mode means the browser never attempts these regardless of model
     // state, leaving them to ipworker exclusively. Until ready, these steps are
-    // left untouched so they stay pending and get backfilled once eligible;
-    // thumbnails/EXIF always run (geocode is gated separately, see below).
+    // left untouched so they stay pending and get backfilled once eligible.
+    // thumbnail and exif are not AI-gated (no model dependency) but are still
+    // skipped outright in 'backend' mode -- ipwork_thumbnail.py/ipwork_geo.py
+    // own them there so bulk reprocessing doesn't need a live browser tab
+    // (geocode is gated separately below, transitively via exif).
     const processingMode = getRuntimeConfig().processingMode || 'browser';
     const browserAiReady = processingMode !== 'backend' && browserAiModelState?.status === 'available';
 
@@ -2981,7 +2984,12 @@ export const runBrowserProcessing = async (
             sourceBytes: file.size,
         };
         const videoStartedAt = performance.now();
-        try {
+        if (processingMode === 'backend') {
+            clientProcessingReport.push(makeClientReport(clientAssetId, 'thumbnail', 'skipped', 'backend_processing_mode', videoStartedAt, {
+                runtime: 'canvas-video',
+                ...videoSourceFields,
+            }));
+        } else try {
             const thumbnail = await withTimeout(createVideoBrowserThumbnail(file), CLIENT_BROWSER_STEP_BUDGET_MS);
             if (thumbnail) {
                 clientProcessing.thumbnail = {
@@ -3059,7 +3067,12 @@ export const runBrowserProcessing = async (
     const sourceFields = getSourceReportFields(visionSource);
 
     let startedAt = performance.now();
-    if (visionSource.imageSource) {
+    if (processingMode === 'backend') {
+        clientProcessingReport.push(makeClientReport(clientAssetId, 'thumbnail', 'skipped', 'backend_processing_mode', startedAt, {
+            runtime: 'canvas',
+            ...sourceFields,
+        }));
+    } else if (visionSource.imageSource) {
         try {
             const thumbnail = await withTimeout(createBrowserThumbnail(visionSource.imageSource, processingOptions.thumbnailRotationDegrees || 0), CLIENT_BROWSER_STEP_BUDGET_MS);
             if (thumbnail) {

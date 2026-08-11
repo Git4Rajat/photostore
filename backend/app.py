@@ -359,11 +359,16 @@ if PROCESSING_MODE not in ('browser', 'backend', 'both'):
 BROWSER_ONLY_PROCESSING = PROCESSING_MODE == 'browser'
 CLUSTERING_QUEUE_NAME = os.getenv('CLUSTERING_QUEUE_NAME', 'photostore-clustering')
 IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
-# ipworker's job: exif, ocr, geo (map_detection), vision (ai_vision), face --
-# everything except thumbnail, which the browser generates client-side via a
-# cheap canvas resize regardless of PROCESSING_MODE (no model involved, so
-# there's nothing for ipworker to take over there).
-IPWORK_STEPS = ('exif', 'ocr', 'face', 'ai_vision', 'map_detection')
+# ipworker's job: thumbnail, exif, ocr, geo (map_detection), vision (ai_vision),
+# face -- the full set the browser can do client-side. Thumbnail used to be a
+# permanent browser-only exception (cheap canvas resize, no model needed, so
+# there was "nothing for ipworker to take over") until it became clear that
+# reasoning only covers the fresh-upload case: reprocessing/backfill still
+# needs a live browser tab to download each photo and redo it, defeating the
+# point of 'backend' mode for unattended bulk reprocessing. ipwork_thumbnail.py
+# reuses the same PIL/rawpy/ffmpeg path as storage_utils's existing reactive
+# server-side thumbnail fallback, so this needed no new ipworker-only deps.
+IPWORK_STEPS = ('thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detection')
 # How long ipworker holds the per-photo processing lease while it works.
 # Generous relative to the browser's 120s because a single ipworker pass runs
 # every step server-side inference in sequence (face + OCR + vision + geo)
@@ -11969,6 +11974,11 @@ def _register_ipwork_processors() -> None:
     not all four at once.
     """
     try:
+        import ipwork_thumbnail
+        IPWORK_STEP_PROCESSORS['thumbnail'] = ipwork_thumbnail.process_thumbnail
+    except Exception:
+        worker_logger.exception('ipwork_thumbnail unavailable; thumbnail step will report not_implemented')
+    try:
         import ipwork_geo
         IPWORK_STEP_PROCESSORS['exif'] = ipwork_geo.process_exif
         IPWORK_STEP_PROCESSORS['map_detection'] = ipwork_geo.process_geo
@@ -12007,19 +12017,31 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             image_bytes_cache.append(download_media_bytes('image', source_blob))
         return image_bytes_cache[0]
 
+    def _failure_shape(step: str, error: str) -> Dict:
+        # storage_utils's face block only resolves face_status to a terminal
+        # state when isinstance(faces, list) is true (even empty) -- without
+        # 'faces': [] here, a missing/crashing face processor would leave
+        # face_status stuck at 'running' forever instead of a retryable
+        # 'failed' (see ipwork_face.process_face's own except blocks for the
+        # same fix applied at the per-step level).
+        shape: Dict = {'hasData': False, 'error': error}
+        if step == 'face':
+            shape.update({'faces': [], 'rawFaceCount': 0, 'faceFailureStage': 'unsupported_runtime', 'faceFailureDetail': error})
+        return shape
+
     for step in steps:
         if step not in IPWORK_STEPS:
             continue
         processor = IPWORK_STEP_PROCESSORS.get(step)
         if processor is None:
-            client_processing[step] = {'hasData': False, 'error': 'not_implemented'}
+            client_processing[step] = _failure_shape(step, 'not_implemented')
             continue
         try:
             result = processor(user_id, filename, get_image_bytes())
-            client_processing[step] = result if isinstance(result, dict) else {'hasData': False}
+            client_processing[step] = result if isinstance(result, dict) else _failure_shape(step, 'invalid_result_shape')
         except Exception as exc:
             worker_logger.exception('ipworker step %r failed for %s/%s', step, user_id, filename)
-            client_processing[step] = {'hasData': False, 'error': str(exc)}
+            client_processing[step] = _failure_shape(step, str(exc))
     return client_processing
 
 

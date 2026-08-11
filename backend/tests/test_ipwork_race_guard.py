@@ -2,13 +2,15 @@
 
 In 'both' processing mode the browser and a server-side ipworker can both
 compute a result for the same photo/step. _apply_client_processing_results was
-previously last-write-wins for ocr/map_detection/face/ai_vision, which is fine
-with a single writer but would let the two race and clobber each other. These
-tests confirm _step_locked_done blocks a second write once a step is already
-'done', while a legitimate first write for a not-yet-done step still lands.
+previously last-write-wins for ocr/map_detection/face/ai_vision/thumbnail,
+which is fine with a single writer but would let the two race and clobber
+each other. These tests confirm _step_locked_done (and, for thumbnail,
+had_thumbnail_before) blocks a second write once a step is already 'done',
+while a legitimate first write for a not-yet-done step still lands.
 """
 from __future__ import annotations
 
+import base64
 import io
 import json
 
@@ -90,6 +92,138 @@ def test_step_locked_done_false_for_other_statuses(status):
 
 def test_step_locked_done_false_when_missing():
     assert storage_utils._step_locked_done({}, 'ocr') is False
+
+
+# --- exif ------------------------------------------------------------------
+
+def test_exif_write_applies_when_not_yet_done(processing_ctx):
+    metadata, _ = processing_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(metadata, user_id, filename, exif_status='pending')
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'exif': {
+            'hasData': True,
+            'data': {},
+            'latitude': 40.0,
+            'longitude': -73.0,
+        }},
+        client_processing_report=[],
+        client_asset_id='browser-photo.jpg',
+        origin='browser',
+    )
+
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['exif_status'] == 'done'
+    assert float(stored['latitude']) == 40.0
+
+
+def test_exif_second_writer_discarded_once_done(processing_ctx):
+    """Simulates 'both' mode: ipworker's EXIF result loses the race because
+    the browser's already landed and marked exif done. The browser's hand-
+    rolled parser and the server's exiftool-based one can disagree at the
+    margins, so a second write must not overwrite already-accepted GPS."""
+    metadata, _ = processing_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(
+        metadata, user_id, filename,
+        exif_status='done', latitude=40.0, longitude=-73.0,
+    )
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'exif': {
+            'hasData': True,
+            'data': {},
+            'latitude': 10.0,
+            'longitude': 20.0,
+        }},
+        client_processing_report=[],
+        client_asset_id='ipworker:job-1',
+        origin='ipworker',
+    )
+
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['exif_status'] == 'done'
+    assert float(stored['latitude']) == 40.0
+    assert stored['longitude'] == -73.0
+
+
+# --- thumbnail -----------------------------------------------------------------
+
+def test_thumbnail_write_applies_when_not_yet_done(processing_ctx):
+    metadata, _ = processing_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(metadata, user_id, filename, thumbnail_status='pending')
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'thumbnail': {
+            'hasData': True,
+            'contentType': 'image/jpeg',
+            'data': base64.b64encode(b'first-thumb-bytes').decode('ascii'),
+        }},
+        client_processing_report=[],
+        client_asset_id='ipworker:job-1',
+        origin='ipworker',
+    )
+
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['thumbnail_status'] == 'done'
+
+
+def test_thumbnail_second_writer_discarded_once_done(processing_ctx):
+    """Simulates 'both' mode: ipworker's thumbnail loses the race because the
+    browser's kickOffThumbnailForFile already landed and marked it done."""
+    metadata, _ = processing_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(
+        metadata, user_id, filename,
+        thumbnail_status='done',
+        processing_metadata=json.dumps({'client_thumbnail': {'source': 'browser'}}),
+    )
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'thumbnail': {
+            'hasData': True,
+            'contentType': 'image/jpeg',
+            'data': base64.b64encode(b'second-thumb-bytes-should-be-discarded').decode('ascii'),
+        }},
+        client_processing_report=[],
+        client_asset_id='ipworker:job-2',
+        origin='ipworker',
+    )
+
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['thumbnail_status'] == 'done'
+    processing = json.loads(stored['processing_metadata'])
+    assert processing['client_thumbnail']['source'] == 'browser'
+
+
+def test_thumbnail_hasdata_false_resolves_via_server_fallback_not_stuck_running(processing_ctx):
+    """ipworker reports failure inline via clientProcessing.thumbnail's hasData
+    (it never populates the separate clientProcessingReport array the
+    browser's failure path relies on -- see _run_ipwork_steps in app.py).
+    Without the hasData-aware fallback trigger, this left thumbnail_status
+    stuck at 'running' forever instead of resolving to a terminal state."""
+    metadata, _ = processing_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(metadata, user_id, filename, thumbnail_status='running')
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'thumbnail': {'hasData': False, 'error': 'decode_failed'}},
+        client_processing_report=[],
+        client_asset_id='ipworker:job-3',
+        origin='ipworker',
+    )
+
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['thumbnail_status'] == 'done'
+    processing = json.loads(stored['processing_metadata'])
+    assert processing['server_thumbnail']['fallbackFor'] == 'browser_thumbnail_failed'
 
 
 # --- ocr ---------------------------------------------------------------------
@@ -232,6 +366,29 @@ def test_ai_vision_second_writer_discarded_once_done(processing_ctx):
 
     stored = metadata.get_entity(user_id, filename)
     assert stored['caption'] == 'first caption (won the race)'
+
+
+def test_ai_vision_failure_without_model_provenance_resolves_to_failed(processing_ctx):
+    """Every one of ipwork_vision.py's failure paths (CLIP model unavailable,
+    vocabulary missing, embedding failed, an unhandled exception via
+    _run_ipwork_steps) omits modelAvailability/modelVersion/etc entirely, so
+    model_ready is always False for them -- this used to be a silent no-op on
+    ai_vision_status, leaving it stuck at 'running' forever instead of
+    resolving to a retryable terminal state."""
+    metadata, _ = processing_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(metadata, user_id, filename, ai_vision_status='running')
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'ai_vision': {'hasData': False, 'error': 'image_embedding_failed'}},
+        client_processing_report=[],
+        client_asset_id='ipworker:job-2',
+        origin='ipworker',
+    )
+
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['ai_vision_status'] == 'failed'
 
 
 # --- face ----------------------------------------------------------------------

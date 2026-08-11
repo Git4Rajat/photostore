@@ -368,6 +368,21 @@ const restrictStepsForModel = (requestedSteps: Set<string> | null, modelAvailabl
     return new Set(base.filter((step) => !BROWSER_AI_GATED_STEPS.has(step)));
 };
 
+// thumbnail/exif aren't on-device-AI-gated (no model dependency), but
+// 'backend' mode still hands them to ipworker exclusively (see the matching
+// processingMode checks inside runBrowserProcessing, PhotoGallery.tsx).
+// Filtered out here too so this queue-picker doesn't download a photo (a
+// real bandwidth cost -- see fetchProcessingBlob below) just to discover
+// there's nothing left the browser can actually do with it.
+const BACKEND_MODE_OWNED_STEPS = new Set(['thumbnail', 'exif']);
+const restrictStepsForProcessingMode = (requestedSteps: Set<string> | null, processingMode: string): Set<string> | null => {
+    if (processingMode !== 'backend') {
+        return requestedSteps;
+    }
+    const base = requestedSteps ? Array.from(requestedSteps) : ALL_BROWSER_PROCESSING_STEPS;
+    return new Set(base.filter((step) => !BACKEND_MODE_OWNED_STEPS.has(step)));
+};
+
 const normalizeRotationDegrees = (value: unknown): number => {
     const rotation = Number(value || 0);
     if (!Number.isFinite(rotation)) {
@@ -1365,11 +1380,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (!filename) {
                     return;
                 }
-                // Only run the steps the current model state allows. When browser AI
-                // isn't loaded, on-device AI steps are dropped and left pending. A null
-                // result means "all steps" (browser AI available); an empty set means
-                // nothing runnable right now (only gated steps were requested).
-                const effectiveSteps = restrictStepsForModel(requestedSteps, browserAiModelStateRef.current.status === 'available');
+                // Only run the steps the current model state / deploy-time processing
+                // mode allow. When browser AI isn't loaded, on-device AI steps are
+                // dropped and left pending; in 'backend' mode, thumbnail/exif are also
+                // dropped (ipworker owns them there). A null result means "all steps"
+                // (browser AI available, non-backend mode); an empty set means nothing
+                // runnable right now (only gated/owned steps were requested).
+                const effectiveSteps = restrictStepsForModel(
+                    restrictStepsForProcessingMode(requestedSteps, getRuntimeConfig().processingMode || 'browser'),
+                    browserAiModelStateRef.current.status === 'available',
+                );
                 if (effectiveSteps && effectiveSteps.size === 0) {
                     return;
                 }
@@ -2018,6 +2038,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const parallelThumbnailTasks = new Set<Promise<void>>();
 
             const kickOffThumbnailForFile = (file: File, filename: string) => {
+                if (getRuntimeConfig().processingMode === 'backend') {
+                    // ipworker owns thumbnails entirely in this mode (queued
+                    // automatically by the upload finalize call, same as its
+                    // other steps) -- don't claim the lease client-side just to
+                    // no-op, which would otherwise leave it held (and ipworker
+                    // locked out) until it naturally expires.
+                    return;
+                }
                 const task: Promise<void> = (async () => {
                     let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null = null;
                     try {

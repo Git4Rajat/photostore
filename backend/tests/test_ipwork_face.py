@@ -79,3 +79,41 @@ def test_compute_padded_crop_bounds_clamps_to_image_size():
     assert crop_left == 0 and crop_top == 0
     assert crop_left + crop_w <= 60
     assert crop_top + crop_h <= 60
+
+
+# --- process_face's failure-path shape (no real models needed) -------------
+#
+# storage_utils._apply_client_processing_results' face block only resolves
+# face_status to a terminal state when the payload includes 'faces' (even
+# empty) -- see _step_locked_done/the isinstance(faces, list) gate. These
+# confirm both of process_face's own except blocks produce that shape,
+# rather than a bare {'hasData': False, 'error': ...} that would leave
+# face_status stuck at 'running' forever.
+
+def test_process_face_returns_diagnosable_shape_on_decode_failure():
+    result = face_mod.process_face('lib-A', 'photo.jpg', b'not an image')
+    assert result['hasData'] is False
+    assert result['faces'] == []
+    assert result['rawFaceCount'] == 0
+    assert result['faceFailureStage'] == 'unsupported_runtime'
+    assert 'error' in result
+
+
+def test_process_face_returns_diagnosable_shape_on_detection_failure(tmp_path, monkeypatch):
+    # A real decodable image, but no ONNX model file exists at the configured
+    # path in this test environment -- _get_yolo_session's InferenceSession
+    # construction fails, exercising the second except block specifically.
+    monkeypatch.setattr(face_mod, 'YOLO_FACE_MODEL_PATH', str(tmp_path / 'missing-model.onnx'))
+    monkeypatch.setattr(face_mod, '_yolo_session', None)
+
+    from PIL import Image
+    import io
+    buffer = io.BytesIO()
+    Image.new('RGB', (64, 64), color=(10, 20, 30)).save(buffer, format='JPEG')
+
+    result = face_mod.process_face('lib-A', 'photo.jpg', buffer.getvalue())
+    assert result['hasData'] is False
+    assert result['faces'] == []
+    assert result['rawFaceCount'] == 0
+    assert result['faceFailureStage'] == 'unsupported_runtime'
+    assert 'detection_failed' in result['error']

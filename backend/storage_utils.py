@@ -2043,7 +2043,16 @@ def _apply_client_processing_results(
     # the image; fall back to the original filename for pre-anonymization photos.
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
     thumbnail_payload = payload.get('thumbnail')
-    if thumbnail_payload is not None:
+    if thumbnail_payload is not None and had_thumbnail_before:
+        # Race guard, same as ocr/map_detection/face/ai_vision below: now that
+        # ipworker can also generate thumbnails (ipwork_thumbnail.py), 'both'
+        # mode can have the browser's kickOffThumbnailForFile and ipworker
+        # both racing to write this photo's thumbnail. had_thumbnail_before
+        # was captured above, before this call's own report could touch
+        # thumbnail_status, so it reflects genuinely prior state -- whichever
+        # side lands first wins and this second write is discarded.
+        pass
+    elif thumbnail_payload is not None:
         thumbnail_provenance = _client_source_provenance(thumbnail_payload)
         thumbnail_data = str(thumbnail_payload.get('data') or '').strip()
         if thumbnail_data and not thumbnail_already_uploaded:
@@ -2071,7 +2080,16 @@ def _apply_client_processing_results(
     if (
         not thumbnail_already_uploaded
         and not had_thumbnail_before
-        and _client_report_needs_server_thumbnail_fallback(report)
+        and (
+            _client_report_needs_server_thumbnail_fallback(report)
+            # ipworker reports failure inline via clientProcessing.thumbnail's
+            # hasData (it never populates the separate clientProcessingReport
+            # array _client_report_needs_server_thumbnail_fallback inspects --
+            # see _run_ipwork_steps in app.py). Without this, an ipworker
+            # thumbnail failure left thumbnail_status stuck at 'running'
+            # forever instead of resolving to a terminal state.
+            or (isinstance(thumbnail_payload, dict) and thumbnail_payload.get('hasData') is False)
+        )
     ):
         status_updates.update(_apply_server_thumbnail_fallback(
             user_id,
@@ -2082,7 +2100,15 @@ def _apply_client_processing_results(
         ))
 
     exif_result = payload.get('exif')
-    if isinstance(exif_result, dict):
+    if isinstance(exif_result, dict) and _step_locked_done(metadata, 'exif'):
+        # Race guard, same as ocr/map_detection/face/ai_vision/thumbnail: the
+        # browser's hand-rolled EXIF parser and the server's exiftool-based one
+        # (exif_utils.py) are genuinely different implementations and can
+        # disagree at the margins (e.g. one finds GPS, the other doesn't), so
+        # 'both' mode needs first-result-wins here too, not just for steps
+        # with an obviously model-dependent result.
+        pass
+    elif isinstance(exif_result, dict):
         exif_provenance = _client_source_provenance(exif_result)
         if exif_result.get('hasData') is False:
             status_updates.update(_apply_server_exif_fallback(
@@ -2269,7 +2295,26 @@ def _apply_client_processing_results(
                         f'length={len(embedding) if is_list else None}'
                     )
         if isinstance(faces, list):
-            stored_face_ids = _store_client_face_entities(user_id, filename, faces_with_embeddings, force_reconcile=face_was_forced)
+            # A forced backfill's reconcile step (_store_client_face_entities,
+            # force_reconcile=True) deletes any previously-stored face for this
+            # photo that this pass didn't re-detect -- correct when detection
+            # genuinely ran and found nothing (or found a different set), but
+            # not when it didn't really run at all: throttled, deferred for a
+            # not-yet-ready model, or a real failure (e.g. an ipworker step
+            # crashing -- see ipwork_face.py's/​_run_ipwork_steps' failure
+            # shapes). Without this, one bad pass during Tools > Backfill could
+            # silently wipe out previously-detected/curated faces for a photo
+            # that the detector never actually got to examine this time.
+            detection_genuinely_ran = bool(faces_with_embeddings) or not (
+                face_background_throttled
+                or face_deferred_reason == 'inference_timeout'
+                or face_failure_stage in _TRANSIENT_FACE_FAILURE_STAGES
+                or face_failure_stage
+            )
+            stored_face_ids = _store_client_face_entities(
+                user_id, filename, faces_with_embeddings,
+                force_reconcile=face_was_forced and detection_genuinely_ran,
+            )
             if faces_with_embeddings:
                 faces_for_metadata = [{k: v for k, v in f.items() if k != 'embedding'} for f in faces_with_embeddings]
                 metadata['faces'] = json.dumps(faces_for_metadata, ensure_ascii=False, separators=(',', ':'))
@@ -2436,6 +2481,19 @@ def _apply_client_processing_results(
                 **ai_model_provenance,
             })
         elif ai_result is not None:
+            # Was previously a silent no-op on ai_vision_status: neither
+            # "hasData is False" nor "hasData is True" was paired with
+            # model_ready, so this branch wrote only a diagnostic breadcrumb
+            # and left the step stuck at whatever it was before (e.g.
+            # 'running' from a lease claim) forever. Genuinely reachable --
+            # every one of ipwork_vision.py's own failure paths (CLIP model
+            # unavailable, vocabulary missing, embedding failed, an unhandled
+            # exception via _run_ipwork_steps) omits modelAvailability/
+            # modelVersion/modelTaxonomyVersion/runtime entirely, so
+            # model_ready is always False for them, same as a browser
+            # payload with genuinely invalid/missing provenance. 'failed'
+            # (not 'no_data') so it's retryable and visible on the Tools page
+            # instead of looking like a confirmed "nothing to see here".
             _merge_processing_metadata(metadata, 'client_ai_vision_rejected', {
                 'source': origin,
                 'rejectedAt': _utc_now(),
@@ -2444,6 +2502,7 @@ def _apply_client_processing_results(
                 **ai_source_provenance,
                 **ai_model_provenance,
             })
+            status_updates['ai_vision_status'] = 'failed'
 
     _refresh_semantic_fields(filename, metadata)
 
