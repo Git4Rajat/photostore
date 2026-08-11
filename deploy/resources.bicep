@@ -410,23 +410,27 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'backend'
           image: backendImage
           resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
+            cpu: json('1.25')
+            memory: '2.5Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
             // Gunicorn workers are separate processes and the app is imported
             // AFTER fork (no --preload), so every worker loads its own copy of
             // numpy/scipy/scikit-learn/Pillow + the Azure SDKs (~250-350 MB
-            // each) and primes its own vector-index cache. At 4 workers that
-            // baseline alone crowds the 1 GiB limit, so a few concurrent
-            // image/zip requests can still tip the replica into an OOM kill.
-            // Keep process fan-out low on 1 GiB replicas; each worker has a
-            // substantial baseline RSS once scientific/image stacks are loaded.
+            // each) and primes its own vector-index cache. Keep process
+            // fan-out at 1 and use threads (below) for concurrency instead --
+            // each additional worker duplicates that baseline RSS, while
+            // threads share it.
             { name: 'GUNICORN_WORKERS', value: '1' }
-            // Thread fan-out controls how many heavy media requests can run at
-            // once inside a worker; lower values reduce worst-case memory spikes.
-            { name: 'GUNICORN_THREADS', value: '2' }
+            // 2.5Gi/1.25vCPU sized to comfortably hold 4 gthread threads (each
+            // able to run a media/zip request) on top of the 1-worker
+            // scientific-stack baseline above. 2026-08-10: live was manually
+            // dropped to 0.25vCPU/0.5Gi while this stayed at 4, causing a
+            // continuous OOM crash loop (exit 137) that broke uploads --
+            // don't shrink cpu/memory here without shrinking this to match,
+            // and don't shrink live without also shrinking this file.
+            { name: 'GUNICORN_THREADS', value: '4' }
             // Prime vector indexes lazily on demand; eager startup priming can
             // inflate idle RSS and duplicate index memory across workers.
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
@@ -443,7 +447,7 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           {
             // Default is 10 concurrent requests per replica, which fans out to
             // extra replicas on every burst of small API calls. Each replica
-            // runs 1 worker x 2 threads on a 1 GiB container; keep per-replica
+            // runs 1 worker x 4 threads on a 2.5Gi container; keep per-replica
             // concurrency conservative to avoid memory spikes under media load.
             name: 'http-scaler'
             http: {
