@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "15482161405019547534"
+      "templateHash": "14309603918987392304"
     }
   },
   "parameters": {
@@ -145,7 +145,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "6147960696061663297"
+              "templateHash": "17960647782654614840"
             }
           },
           "parameters": {
@@ -481,6 +481,10 @@
                         {
                           "name": "APP_CONFIG_AUTH_MODE",
                           "value": "password"
+                        },
+                        {
+                          "name": "APP_CONFIG_PROCESSING_MODE",
+                          "value": "[parameters('processingMode')]"
                         },
                         {
                           "name": "APP_CONFIG_FACE_API_MODEL_URL",

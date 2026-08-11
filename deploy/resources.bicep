@@ -511,6 +511,15 @@ resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'APP_CONFIG_UPLOAD_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_SPA_BASE_URL', value: frontendUrl }
             { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
+            // Without this, the frontend's docker-entrypoint.sh defaults
+            // processingMode to 'browser' regardless of what this deployment
+            // was actually configured with -- caught live: a 'backend'-mode
+            // deployment still served env.js with processingMode: "browser",
+            // so the browser would have attempted full client-side AI anyway,
+            // defeating the whole point of the mode. deployIpworker/PROCESSING_MODE
+            // (backend container, above) were wired correctly; this was the
+            // missing piece on the frontend side.
+            { name: 'APP_CONFIG_PROCESSING_MODE', value: processingMode }
             { name: 'APP_CONFIG_FACE_API_MODEL_URL', value: '/models/face-api' }
             // Explicit pin, added with the AdaFace swap: docker-entrypoint.sh
             // generates window.__APP_CONFIG__.arcFaceModelUrl at container start
