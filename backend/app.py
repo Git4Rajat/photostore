@@ -1995,6 +1995,18 @@ def _humanize_job(row: Dict) -> Dict:
             message = f"Removed {_plural(int(result.get('photosDeleted') or 0), 'photo')}."
         elif status == 'failed':
             title = 'Library cleanup failed'
+    elif job_type == 'ipwork':
+        # One of these per photo in backend/both processing mode -- the gallery
+        # tile's own "processing on server" badge (_active_processing_worker)
+        # already gives per-photo feedback, so this must not also surface a
+        # bell/toast per file (see kind='ipwork' exclusion in the frontend
+        # poller) or a bulk backend upload spams one "Background task
+        # finished" per photo.
+        kind = 'ipwork'
+        if status == 'done':
+            title = 'Photo processed'
+        elif status == 'failed':
+            title = 'Photo processing failed'
     elif job_type == PREVIEW_JOB_TYPE:
         kind = 'preview'
         name = str(row.get('filename') or '').rsplit('/', 1)[-1]

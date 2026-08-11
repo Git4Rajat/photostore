@@ -272,7 +272,7 @@ const RootServiceActions: React.FC = () => {
                     <span className="sr-only">{uploadButtonLabel}</span>
                 </button>
 
-                {!appServices.clusteringActive && (() => {
+                {!appServices.clusteringActive && getRuntimeConfig().processingMode !== 'backend' && (() => {
                     const loadStage = appServices.browserAiLoadProgress;
                     const isLoading = appServices.browserAiModelState.status === 'loading' || appServices.browserAiModelState.status === 'checking';
                     const browserAiTitle = isLoading && loadStage

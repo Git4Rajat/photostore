@@ -881,6 +881,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // scheduleClusterFlush).
     const pendingClusterCompletionsRef = useRef<Array<{ title: string; detail: string; failed: boolean }>>([]);
     const clusterFlushTimerRef = useRef<number | null>(null);
+    // Whether the latest poll saw an ipwork (backend/both processing mode)
+    // job still queued/running -- see scheduleClusterFlush below. This is the
+    // backend-mode equivalent of browserProcessingNotificationRef: as long as
+    // ipworker still has photos left to process, more per-photo clustering
+    // completions are likely still coming.
+    const ipworkJobsInFlightRef = useRef<boolean>(false);
 
     const flushClusterCompletions = useCallback(() => {
         if (clusterFlushTimerRef.current !== null) {
@@ -933,7 +939,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         clusterFlushTimerRef.current = window.setTimeout(() => {
             clusterFlushTimerRef.current = null;
-            if (browserProcessingNotificationRef.current !== null) {
+            if (browserProcessingNotificationRef.current !== null || ipworkJobsInFlightRef.current) {
                 scheduleClusterFlush();
                 return;
             }
@@ -993,7 +999,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         });
                         scheduleClusterFlush();
                     }
-                } else if (job.kind !== 'preview') {
+                } else if (job.kind !== 'preview' && job.kind !== 'ipwork') {
+                    // ipwork (backend/both processing mode) runs one job per photo --
+                    // same "frequent, low-signal" shape as preview, and the gallery
+                    // tile's own processing badge already covers per-photo feedback.
                     addNotification(job.title, detail);
                     if (TOASTABLE_JOB_KINDS.has(job.kind)) {
                         showToast(detail ? `${job.title} — ${detail}` : job.title, {
@@ -1006,6 +1015,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (changed) {
                 persistSeenJobIds(seen);
             }
+            ipworkJobsInFlightRef.current = inFlight.some((job) => job.kind === 'ipwork');
             // Publish the in-flight set so the People page + global pill can show
             // that clustering is running. Terminal jobs are excluded, so this
             // empties (hiding the indicator) on the poll that observes completion.
