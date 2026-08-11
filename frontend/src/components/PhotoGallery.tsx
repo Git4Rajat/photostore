@@ -60,6 +60,15 @@ const UPLOAD_DB_STORE = 'files';
 export const PHOTO_CACHE_STORAGE_KEY = 'photostore.photo.cache.v1';
 const PHOTO_CACHE_MAX_AGE_MS = 1000 * 60 * 30;
 const PHOTO_LIST_REQUEST_TIMEOUT_MS = 15000;
+// How often to check whether any currently-loaded photo is mid-processing
+// (queued/running on any step, or leased by ipworker) and, only then, refresh
+// those specific photos' status -- see the processing-status poller effect.
+// The gallery has no other push/poll path today for server-side processing
+// finishing, so without this the "processing on server" tile icon would only
+// ever update on the next unrelated refetch (reload/scroll/filter change).
+const PROCESSING_STATUS_POLL_MS = 8000;
+const PROCESSING_STEP_KEYS = ['thumbnail', 'exif', 'ocr', 'face', 'aiVision', 'mapDetection'] as const;
+const PROCESSING_STATUS_MAX_FILENAMES = 100;
 
 // A scale-to-zero backend can take up to a minute to answer the first request
 // after inactivity. Those failures look like timeouts / network errors / 5xx
@@ -274,6 +283,7 @@ type AppRuntimeConfig = {
     blazeFaceModelUrl?: string;
     arcFaceModelUrl?: string;
     arcFaceWasmPath?: string;
+    processingMode?: 'browser' | 'backend' | 'both';
 };
 
 interface BrowserVisionSource {
@@ -2952,10 +2962,14 @@ export const runBrowserProcessing = async (
 ): Promise<ClientProcessingResult> => {
     const clientProcessing: Record<string, any> = partialResult?.clientProcessing || {};
     const clientProcessingReport: ClientProcessingReportItem[] = partialResult?.clientProcessingReport || [];
-    // On-device AI (OCR, vision, face) only runs once the user has loaded browser AI.
-    // Until then these steps are left untouched so they stay pending and get
-    // backfilled when the model is loaded; thumbnails/EXIF/geocode still run.
-    const browserAiReady = browserAiModelState?.status === 'available';
+    // On-device AI (OCR, vision, face) only runs once the user has loaded browser AI,
+    // AND only when the deploy-time processing mode allows client-side AI at all --
+    // 'backend' mode means the browser never attempts these regardless of model
+    // state, leaving them to ipworker exclusively. Until ready, these steps are
+    // left untouched so they stay pending and get backfilled once eligible;
+    // thumbnails/EXIF always run (geocode is gated separately, see below).
+    const processingMode = getRuntimeConfig().processingMode || 'browser';
+    const browserAiReady = processingMode !== 'backend' && browserAiModelState?.status === 'available';
 
     if (isVideoFile(file)) {
         // Videos only get a poster-frame thumbnail in the browser; EXIF metadata
@@ -3091,7 +3105,15 @@ export const runBrowserProcessing = async (
 
     startedAt = performance.now();
     let parsedGpsExif: ParsedGpsExif | null = null;
-    try {
+    // In 'backend' mode ipworker owns exif (and, by extension below, geocode --
+    // it depends on parsedGpsExif) entirely; leaving parsedGpsExif null here
+    // naturally skips the geocode block too without a second gate there.
+    if (processingMode === 'backend') {
+        clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'skipped', 'backend_processing_mode', startedAt, {
+            runtime: 'browser-dataview',
+            ...sourceFields,
+        }));
+    } else try {
         const exif = await withTimeout(
             visionSource.isRaw ? parseRawGpsExif(file) : parseJpegGpsExif(file, file.name),
             CLIENT_BROWSER_STEP_BUDGET_MS,
@@ -3508,11 +3530,11 @@ export const runBrowserProcessing = async (
     const aiSkipReason: ClientProcessingReason | null = networkReason || (
         admissionExpired
             ? 'model_budget_exceeded'
-            : browserAiModelState?.status === 'available'
+            : browserAiReady
                 ? null
                 : modelSkipReason
     );
-    if (!aiSkipReason && aiVisionSource && hasUsableAiVisionSource && browserAiModelState?.status === 'available') {
+    if (!aiSkipReason && aiVisionSource && hasUsableAiVisionSource && browserAiReady) {
         const aiStartedAt = performance.now();
         aiVisionEvaluated = true;
         try {
@@ -3823,6 +3845,55 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const location = useLocation();
     const cachedBoot = loadPhotoCache();
     const [photos, setPhotos] = useState<Photo[]>(cachedBoot?.photos || []);
+    // Mirrors `photos` for the processing-status poller below so that effect can
+    // read the latest list on each tick without re-registering its interval
+    // every time `photos` changes (which happens on far more than just
+    // processing updates -- scrolling, liking, rating, filtering, ...).
+    const photosRef = useRef<Photo[]>(photos);
+    useEffect(() => { photosRef.current = photos; }, [photos]);
+
+    // Bounded liveness poll for server-side (ipworker) processing: only ever
+    // fires a request when at least one currently-loaded photo looks
+    // mid-processing, and only refreshes those specific photos' `processing`
+    // field in place (no full relist, no scroll/selection disruption).
+    useEffect(() => {
+        const timer = window.setInterval(async () => {
+            const pendingFilenames = photosRef.current
+                .filter((photo) => {
+                    const proc = photo.processing;
+                    if (!proc) {
+                        return false;
+                    }
+                    if (proc.activeWorker === 'ipworker') {
+                        return true;
+                    }
+                    return PROCESSING_STEP_KEYS.some((key) => {
+                        const value = proc[key];
+                        return value === 'queued' || value === 'running';
+                    });
+                })
+                .map((photo) => photo.filename)
+                .slice(0, PROCESSING_STATUS_MAX_FILENAMES);
+            if (pendingFilenames.length === 0) {
+                return;
+            }
+            try {
+                const response = await get(`/photos/processing-status?filenames=${encodeURIComponent(pendingFilenames.join(','))}`);
+                const statuses: Record<string, Photo['processing']> = (response && response.statuses) || {};
+                if (Object.keys(statuses).length === 0) {
+                    return;
+                }
+                setPhotos((prev) => prev.map((photo) => (
+                    statuses[photo.filename]
+                        ? { ...photo, processing: { ...photo.processing, ...statuses[photo.filename] } }
+                        : photo
+                )));
+            } catch {
+                // Best effort -- the next tick retries.
+            }
+        }, PROCESSING_STATUS_POLL_MS);
+        return () => window.clearInterval(timer);
+    }, []);
     const [totalAvailable, setTotalAvailable] = useState<number>(cachedBoot?.totalAvailable || 0);
     const [serverTotalLoaded, setServerTotalLoaded] = useState<boolean>(false);
     const [loading, setLoading] = useState<boolean>(false);
@@ -4973,8 +5044,17 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                             />
                                             <CheckIcon className="tile-select-icon" aria-hidden="true" />
                                         </label>
-                                        {(rating > 0 || photo.liked) && (
+                                        {(rating > 0 || photo.liked || photo.processing?.activeWorker === 'ipworker') && (
                                             <div className="tile-badges" aria-hidden="false">
+                                                {photo.processing?.activeWorker === 'ipworker' && (
+                                                    <span
+                                                        className="tile-processing"
+                                                        title="Processing on server"
+                                                        aria-label="Processing on server"
+                                                    >
+                                                        <ArrowPathIcon className="tile-processing-icon spin-icon" />
+                                                    </span>
+                                                )}
                                                 {rating > 0 && (
                                                     <span
                                                         className="tile-star"

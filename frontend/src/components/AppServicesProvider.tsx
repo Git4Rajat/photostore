@@ -2,6 +2,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { BellIcon, TrashIcon, UserGroupIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { get, getUpload, post, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
+import { getRuntimeConfig } from '../config/appConfig';
 import type {
     AppNotification,
     BrowserAiLoadStage,
@@ -1609,6 +1610,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const current = browserAiModelStateRef.current;
         if (browserAiLoadInFlightRef.current || current.status === 'loading' || current.status === 'checking' || current.status === 'available' || current.status === 'unsupported') {
             return current;
+        }
+        if (getRuntimeConfig().processingMode === 'backend') {
+            // Deployment is configured to process everything server-side (ipworker);
+            // never download the onnx/wasm/CLIP assets on the client at all --
+            // that's the whole point of this mode for weak/low-power devices.
+            const unsupported = browserAiUnsupportedState('Browser AI is disabled by this deployment (server-side processing mode).');
+            setBrowserAiModelState(unsupported);
+            return unsupported;
         }
         browserAiLoadInFlightRef.current = true;
         setBrowserAiModelState(browserAiLoadingState(current));

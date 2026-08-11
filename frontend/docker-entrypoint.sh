@@ -11,6 +11,7 @@ AUTH_MODE="${APP_CONFIG_AUTH_MODE:-entra}"
 BLAZE_FACE_MODEL_URL="${APP_CONFIG_BLAZE_FACE_MODEL_URL:-/models/browser-ai/models/blazeface/model.json}"
 ARC_FACE_MODEL_URL="${APP_CONFIG_ARC_FACE_MODEL_URL:-/models/browser-ai/models/adaface/model.onnx}"
 ARC_FACE_WASM_PATH="${APP_CONFIG_ARC_FACE_WASM_PATH:-/models/browser-ai/runtime/}"
+PROCESSING_MODE="${APP_CONFIG_PROCESSING_MODE:-browser}"
 
 # Allow an explicit build timestamp override via APP_CONFIG_BUILD_TIMESTAMP.
 # If not provided, try to preserve the build-time value embedded in the image's
@@ -35,7 +36,8 @@ window.__APP_CONFIG__ = {
   blazeFaceModelUrl: "${BLAZE_FACE_MODEL_URL}",
   arcFaceModelUrl: "${ARC_FACE_MODEL_URL}",
   arcFaceWasmPath: "${ARC_FACE_WASM_PATH}",
-  buildTimestamp: "${BUILD_TS}"
+  buildTimestamp: "${BUILD_TS}",
+  processingMode: "${PROCESSING_MODE}"
 };
 EOF
 

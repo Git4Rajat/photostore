@@ -42,11 +42,22 @@ param adminPassword string
 ])
 param emailDataLocation string = 'United States'
 
+@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new ipworker container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running ipworker (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and ipworker both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
+@allowed([
+  'browser'
+  'backend'
+  'both'
+])
+param processingMode string = 'browser'
+
 @description('Public backend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
 param backendImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
 @description('Public frontend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above.')
 param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
+
+@description('Public ipworker image. Only pulled/deployed when processingMode is "backend" or "both". Separate from backendImage (unlike the clustering `worker` role, which reuses it) because ipworker needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every backend/worker cold start if bundled into their shared image. Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment.')
+param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 
 @description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
 @secure()
@@ -63,6 +74,11 @@ var environmentName = '${appName}-env'
 var backendAppName = '${appName}-backend'
 var frontendAppName = '${appName}-frontend'
 var workerAppName = '${appName}-worker'
+var ipworkerAppName = '${appName}-ipworker'
+// Only deploy ipworker (and grant it storage access) when the deployment
+// actually needs it -- in 'browser' mode (the default) it would just sit
+// scaled to zero forever, so skip provisioning it at all.
+var deployIpworker = processingMode != 'browser'
 
 // Built-in role definition IDs for storage data-plane access.
 var roleBlobContributor = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
@@ -195,7 +211,11 @@ var backendEnv = [
   { name: 'PUBLIC_APP_BASE_URL', value: frontendUrl }
   { name: 'SPA_BASE_URL', value: frontendUrl }
   { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
-  { name: 'BROWSER_ONLY_PROCESSING', value: 'true' }
+  // BROWSER_ONLY_PROCESSING no longer exists as its own setting -- app.py
+  // derives it from PROCESSING_MODE (browser-only iff PROCESSING_MODE ==
+  // 'browser') so the two can't drift out of sync the way a second
+  // hand-edited literal here eventually would.
+  { name: 'PROCESSING_MODE', value: processingMode }
   // v3 drops the 128-d face-api descriptor concatenated onto ArcFace's 512-d
   // output (it diluted ArcFace's signal) and 5-point-landmark-aligns the crop
   // fed to ArcFace instead of using a plain padded box. v2 stays in the
@@ -572,6 +592,59 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
   }
 }
 
+// ipworker mirrors the browser's OCR/face/vision/geo pipeline server-side
+// (see backend/ipwork_*.py) -- only deployed when processingMode says the
+// server should (also) do this work. Modeled directly on `worker` above:
+// scales to zero, woken by KEDA when its own queue has messages, its own
+// image (NOT backendImage -- see ipworkerImage's description for why).
+resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker) {
+  name: ipworkerAppName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    template: {
+      containers: [
+        {
+          name: 'ipworker'
+          image: ipworkerImage
+          // Meaningfully heavier than worker's 0.5vCPU/1Gi: a single pass runs
+          // YOLO face detection, MediaPipe landmarks, AdaFace embedding, CLIP
+          // tagging, and tesseract OCR in sequence for one photo.
+          resources: {
+            cpu: json('2.0')
+            memory: '4Gi'
+          }
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'ipworker' }
+            { name: 'IPWORKER_POLL_SECONDS', value: '2' }
+          ])
+        }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 1
+        rules: [
+          {
+            name: 'ipwork-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-ipwork'
+                queueLength: '1'
+              }
+              identity: 'system'
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
 // Grant the backend and worker managed identities data-plane access to storage.
 resource backendStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for roleId in storageRoleIds: {
@@ -592,6 +665,21 @@ resource workerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01'
     properties: {
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
       principalId: worker.identity.principalId
+      principalType: 'ServicePrincipal'
+    }
+  }
+]
+
+resource ipworkerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: if (deployIpworker) {
+    name: guid(storage.id, ipworkerAppName, roleId)
+    scope: storage
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+      // Non-null assertion: this loop shares ipworker's own `deployIpworker`
+      // condition, so ipworker is guaranteed to exist whenever this
+      // evaluates -- the linter just can't correlate the two `if`s.
+      principalId: ipworker!.identity.principalId
       principalType: 'ServicePrincipal'
     }
   }

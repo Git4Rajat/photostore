@@ -8,6 +8,11 @@ if [ "${ROLE}" = "worker" ]; then
     exec python -u -c "import app; app.run_clustering_worker()"
 fi
 
+if [ "${ROLE}" = "ipworker" ]; then
+    echo "Starting ipworker..."
+    exec python -u -c "import app; app.run_ipworker()"
+fi
+
 echo "Starting Flask backend with gunicorn..."
 # Use GUNICORN_WORKERS env var if set, otherwise default to 1
 WORKERS="${GUNICORN_WORKERS:-1}"

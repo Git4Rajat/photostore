@@ -73,6 +73,21 @@
             { "label": "United Kingdom", "value": "United Kingdom" }
           ]
         }
+      },
+      {
+        "name": "processingMode",
+        "type": "Microsoft.Common.DropDown",
+        "label": "Photo processing",
+        "defaultValue": "browser",
+        "toolTip": "Where OCR/face/vision/geo processing runs. Browser: entirely client-side, same as today. Server (ipworker): the browser skips this work and a new container processes it instead -- better for low-power/mobile clients and enables bulk background reprocessing, but ipworker needs meaningfully more CPU/memory. Both: browser and server both attempt it and whichever finishes first wins -- doubles compute cost per step.",
+        "constraints": {
+          "required": true,
+          "allowedValues": [
+            { "label": "In your browser (default, no extra cost)", "value": "browser" },
+            { "label": "On the server (ipworker container)", "value": "backend" },
+            { "label": "Both (race, first result wins)", "value": "both" }
+          ]
+        }
       }
     ],
     "steps": [],
@@ -81,6 +96,7 @@
       "adminEmail": "[basics('adminEmail')]",
       "adminPassword": "[basics('adminPassword')]",
       "emailDataLocation": "[basics('emailDataLocation')]",
+      "processingMode": "[basics('processingMode')]",
       "location": "[location()]"
     }
   }

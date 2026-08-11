@@ -1,0 +1,22 @@
+# Additional deps for the ipworker role only -- layered on top of
+# requirements.txt in backend/ipworker.Dockerfile, NOT merged into it, so the
+# plain backend/worker image (which reuses requirements.txt alone) stays
+# free of this multi-GB weight and its cold starts stay fast. See
+# backend/ipworker.Dockerfile for why ipworker gets its own image instead of
+# reusing backendImage like the clustering `worker` role does.
+#
+# Pinned to the exact versions the face/vision/OCR pipelines were validated
+# against (real photos, real models, in the actual built ipworker image --
+# see ipwork_face.py/ipwork_vision.py docstrings) rather than left floating,
+# so a future image rebuild can't silently pull a different mediapipe/torch
+# version that changes detection/alignment/embedding behavior underneath an
+# already-calibrated PEOPLE_CLUSTER_EPS_MP (app.py). Bump deliberately, and
+# re-run backend/scripts/calibrate_ipworker_face_tier.py after any bump that
+# touches onnxruntime/opencv/mediapipe.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0
+open_clip_torch==3.3.0
+onnxruntime==1.28.0
+opencv-python-headless==5.0.0.93
+mediapipe==1.0.0
+pytesseract==0.3.13

@@ -116,6 +116,28 @@ The template deploys at **subscription scope** and **creates its own resource
 group** (`<appName>-rg` by default), so you're only asked for a subscription,
 a region, and a few details — no need to pick or create a resource group first.
 
+### Choosing where AI processing runs
+
+OCR, face detection, vision tagging, and geo/reverse-geocoding can each run
+**in your browser** (the default), **on the server**, or **both**. Pick this
+in the deploy form's "Photo processing" dropdown (`processingMode` parameter):
+
+| Mode | What happens |
+| --- | --- |
+| **In your browser** (default) | Same as always — everything runs client-side, free, no extra Azure cost. Requires a reasonably capable device; nothing runs until you click "Load browser AI." |
+| **On the server** | The browser skips this work entirely. A new `ipworker` container app processes every upload instead — better for low-power/mobile devices, and it's the only mode that lets you bulk-reprocess an existing library from the **Tools** page (see below) without a browser tab open. Costs more to run (`ipworker` needs meaningfully more CPU/memory than the rest of the deployment) and only scales up when there's work queued. |
+| **Both** | Browser and server both attempt each step; whichever finishes first for a given photo wins, the other is discarded. Roughly doubles compute cost per step — useful mainly for comparing the two paths, not a typical choice. |
+
+`ipworker` pulls a separate public image, `ghcr.io/git4rajat/photostore-ipworker:latest`
+(also gated behind the [Publish images workflow](.github/workflows/publish-images.yml)
+being run and set to Public in GHCR, same as the backend/frontend images
+above). It's only deployed at all when you choose "On the server" or "Both" —
+in the default browser mode, no `ipworker` container app is created.
+
+You can change this later by re-running the deployment with a different
+`processingMode` value (Azure Portal → your resource group → Deployments →
+Redeploy, or `az deployment group create` with the updated parameter).
+
 ### Sign-in — just set an email and password
 
 In the deploy form you set a **login email** and **password**. That's your
@@ -187,6 +209,10 @@ You'll see the same icons throughout the gallery and on individual photos:
 - **🗑️ Trash — delete** the photo from your library.
 - **☑️ Select** — tick photos to act on several at once (bulk download, delete,
   or "make an album from these").
+- **🔄 Spinning icon — processing on server.** Only appears if you deployed with
+  "On the server" or "Both" processing (see [Choosing where AI processing
+  runs](#choosing-where-ai-processing-runs)). Shows while `ipworker` is
+  actively working on that photo; disappears once it finishes.
 
 ### Filtering the gallery
 
@@ -256,6 +282,11 @@ face that wasn't detected, wrong location), filter to the affected photos and
 **re-run** that processing stage on them. This kicks off the AI action again for
 those photos without touching anything else. The **Corrupted uploads** view
 lists files that couldn't be processed at all.
+
+If you deployed with **"On the server" or "Both"** processing (see [Choosing
+where AI processing runs](#choosing-where-ai-processing-runs)), re-running a
+stage here also queues it to `ipworker` — this is how you bulk-reprocess an
+existing library server-side, with no browser tab needing to stay open.
 
 ### Working with Albums
 

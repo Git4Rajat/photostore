@@ -32,6 +32,18 @@ export interface Photo {
     };
     /** People identified in this photo, for the "view in cluster" quick action. */
     people?: PhotoPersonLink[];
+    /** Per-step server processing status, plus which worker (if any) currently
+     * holds the processing lease -- drives the "processing on server" tile icon. */
+    processing?: {
+        thumbnail?: string | null;
+        exif?: string | null;
+        ocr?: string | null;
+        face?: string | null;
+        faceSource?: string | null;
+        aiVision?: string | null;
+        mapDetection?: string | null;
+        activeWorker?: 'ipworker' | null;
+    };
 }
 
 export interface PhotoMetadata {

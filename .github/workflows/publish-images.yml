@@ -6,7 +6,11 @@ name: Publish public container images
 # never has to build anything themselves.
 #
 # The worker reuses the backend image (it only differs by APP_ROLE=worker),
-# so we publish just two images: photostore-backend and photostore-frontend.
+# so that's still just photostore-backend. ipworker (server-side OCR/face/
+# vision/geo -- see backend/ipwork_*.py) gets its own image,
+# photostore-ipworker, because it needs torch/open_clip/onnxruntime/opencv/
+# mediapipe/tesseract -- multiple GB that would slow every backend/worker
+# cold start if bundled into their shared image instead.
 #
 # ADMIN-ONLY BY DESIGN
 # --------------------
@@ -50,10 +54,20 @@ jobs:
         include:
           - name: backend
             context: backend
+            dockerfile: backend/Dockerfile
             lfs: false
           - name: frontend
             context: frontend
+            dockerfile: frontend/Dockerfile
             # Frontend build bundles the face model stored in Git LFS.
+            lfs: true
+          - name: ipworker
+            # Repo root, not backend/ -- ipworker.Dockerfile also bundles
+            # frontend/public/models/browser-ai's onnx weights, which live
+            # outside a backend/-scoped build context.
+            context: .
+            dockerfile: backend/ipworker.Dockerfile
+            # Bundles the same LFS-tracked onnx weights as the frontend build.
             lfs: true
     steps:
       - name: Checkout
@@ -93,6 +107,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: true
           provenance: false
           tags: |

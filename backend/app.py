@@ -235,6 +235,37 @@ PEOPLE_CLUSTER_MAX_PAIR_DISTANCE = float(os.getenv('PEOPLE_CLUSTER_MAX_PAIR_DIST
 # unreliable (same person, 5pt-vs-2pt, ranged 0.44-0.91 -- indistinguishable
 # from noise), so they must never be compared directly against one eps.
 PEOPLE_CLUSTER_EPS_2PT = float(os.getenv('PEOPLE_CLUSTER_EPS_2PT', '0.60'))
+# DBSCAN epsilon for landmark-5pt-mp (ipworker's MediaPipe-aligned tier --
+# same AdaFace weights as landmark-5pt, different landmark source; see
+# ipwork_face.py). Deliberately its OWN tier, not merged into
+# PEOPLE_CLUSTER_EPS, because real calibration data showed messier separation
+# than the browser's own tier. Calibrated twice against real photos (via
+# backend/scripts/calibrate_ipworker_face_tier.py's sibling analysis):
+#   - first pass: 4 people, 9 photos -- same-person 0.53-0.98 cosine
+#     similarity, different-person up to 0.80 (3 of the 4 people happened to
+#     look visually similar: young men, dark hair, beards).
+#   - second pass, broadened specifically to de-risk the first pass's small/
+#     skewed sample: 7 people, 13 photos (added a woman and more head-angle
+#     variety, including one full-profile shot MediaPipe couldn't align at
+#     all -- see landmark-2pt-mp note below). Same-person 8 pairs: min 0.53,
+#     median 0.80, max 0.98. Different-person 83 pairs: p95 0.75, max 0.80.
+#     The 0.18 eps below (needs >=0.82 similarity) clears BOTH passes' worst
+#     different-person pair with margin, while still auto-clustering the
+#     easy/burst-shot same-person pairs (4 of 8 in the second pass).
+# No single eps cleanly separates hard same-person pairs from the hardest
+# different-person pairs in either sample. Set conservatively tight so this
+# tier starts by under-clustering (same person split across singletons --
+# safe, user can manually merge) never over-clustering (different people
+# wrongly merged -- unsafe, hard to notice) -- matching this codebase's
+# existing bias for automatic merges (see MIN_AUTO_FACE_MERGE_SIMILARITY).
+# Alignment crops were visually inspected and looked correctly centered/
+# upright, so the overlap reflects genuine embedding-space demographic
+# similarity in a still-small sample, not a pipeline bug.
+# Revisit with calibrate_face_thresholds.py (filtering on this tier's distinct
+# modelTaxonomyVersion, FACE_EMBEDDING_MODEL_TAXONOMY_VERSION in
+# ipwork_face.py) once enough real landmark-5pt-mp faces accumulate to
+# calibrate from a larger, more representative sample than 7 people.
+PEOPLE_CLUSTER_EPS_MP = float(os.getenv('PEOPLE_CLUSTER_EPS_MP', '0.18'))
 
 register_heif_opener()
 
@@ -314,8 +345,30 @@ SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS = os.getenv(
 MAPS_ENABLED = os.getenv('MAPS_ENABLED', 'true').lower() in ('1', 'true', 'yes')
 MAPS_ON_UPLOAD = os.getenv('MAPS_ON_UPLOAD', 'false').lower() in ('1', 'true', 'yes')
 MAPS_QUEUE_ON_UPLOAD = os.getenv('MAPS_QUEUE_ON_UPLOAD', 'true').lower() in ('1', 'true', 'yes')
-BROWSER_ONLY_PROCESSING = os.getenv('BROWSER_ONLY_PROCESSING', 'false').lower() in ('1', 'true', 'yes')
+# 'browser' (default): only the client runs OCR/face/vision/geo, matching today's
+# behavior. 'backend': the client skips AI entirely and every upload is queued for
+# the ipworker container to process server-side. 'both': the client attempts AI
+# locally AND the upload is queued for ipworker; whichever result lands first for
+# a given step wins (see _step_locked_done in storage_utils.py) and the loser is
+# discarded. Deploy-time only -- see the `processingMode` bicep parameter.
+PROCESSING_MODE = os.getenv('PROCESSING_MODE', 'browser').strip().lower()
+if PROCESSING_MODE not in ('browser', 'backend', 'both'):
+    PROCESSING_MODE = 'browser'
+# Derived from PROCESSING_MODE rather than a second independent flag, so the two
+# can't drift out of sync the way hand-edited bicep literals have before.
+BROWSER_ONLY_PROCESSING = PROCESSING_MODE == 'browser'
 CLUSTERING_QUEUE_NAME = os.getenv('CLUSTERING_QUEUE_NAME', 'photostore-clustering')
+IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
+# ipworker's job: exif, ocr, geo (map_detection), vision (ai_vision), face --
+# everything except thumbnail, which the browser generates client-side via a
+# cheap canvas resize regardless of PROCESSING_MODE (no model involved, so
+# there's nothing for ipworker to take over there).
+IPWORK_STEPS = ('exif', 'ocr', 'face', 'ai_vision', 'map_detection')
+# How long ipworker holds the per-photo processing lease while it works.
+# Generous relative to the browser's 120s because a single ipworker pass runs
+# every step server-side inference in sequence (face + OCR + vision + geo)
+# rather than one step at a time.
+IPWORKER_LEASE_SECONDS = int(os.getenv('IPWORKER_LEASE_SECONDS', '300'))
 LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS = max(60, int(os.getenv('LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS', '14400')))
 CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS = max(0, int(os.getenv('CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS', '750')))
 CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS = max(30, int(os.getenv('CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS', '120')))
@@ -491,6 +544,19 @@ FACE_CLUSTER_EMBEDDING_VERSION = (
 ).strip()
 FACE_CLUSTER_EMBEDDING_DIMENSIONS = int(os.getenv('FACE_CLUSTER_EMBEDDING_DIMENSIONS', '512'))
 FACE_CLUSTER_LEGACY_EMBEDDING_DIMENSIONS = 512
+# ipworker's embeddingVersion string (must match FACE_EMBEDDING_MODEL_TAXONOMY_VERSION
+# in ipwork_face.py verbatim -- duplicated here rather than imported because
+# ipwork_face.py pulls in onnxruntime/opencv/mediapipe, which the plain
+# backend/worker roles must not import). Unlike the ArcFace->AdaFace jump
+# above, this IS the same AdaFace model/weights as FACE_CLUSTER_EMBEDDING_VERSION
+# -- only the landmark source differs (MediaPipe vs face-api.js) -- so it's
+# safe to allow into the same clustering pool; the alignment-tier split
+# ('landmark-5pt-mp' in PEOPLE_CLUSTER_ALIGNMENT_TIERS) is what keeps it from
+# ever being compared directly against browser-computed distances.
+IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION = os.getenv(
+    'IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION',
+    'adaface-ir101-webface4m-512d-v1+mediapipe-landmark-478',
+).strip()
 # The v1->v2->...->fixed8 ArcFace-era legacy version constants that used to
 # live here (each kept temporarily in _face_embedding_allowed_versions() so
 # faces on the previous version kept clustering among themselves during a
@@ -526,6 +592,7 @@ def _face_embedding_allowed_versions() -> set:
         version
         for version in {
             FACE_CLUSTER_EMBEDDING_VERSION,
+            IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION,
         }
         if version
     }
@@ -559,6 +626,7 @@ clean_requests_table_client = None
 library_store = None
 clustering_queue_client = None
 queue_service_client = None
+ipwork_queue_client = None
 
 
 class _UserScanCache:
@@ -757,7 +825,7 @@ def _init_storage_clients():
     global config_table_client
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
-    global clustering_queue_client, queue_service_client
+    global clustering_queue_client, queue_service_client, ipwork_queue_client
 
     account_name = STORAGE_ACCOUNT_NAME or os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
 
@@ -784,6 +852,7 @@ def _init_storage_clients():
             blob_service_client_local = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         queue_service_client_local = QueueServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
+        ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
     else:
         # Managed identity mode (Azure)
         credential = DefaultAzureCredential()
@@ -802,6 +871,7 @@ def _init_storage_clients():
             credential=credential,
         )
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
+        ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
 
         # Table clients
         tbl_svc = TableServiceClient(endpoint=f'https://{account_name}.table.core.windows.net', credential=credential)
@@ -837,6 +907,7 @@ def _init_storage_clients():
     audit_table_client = audit_table_client_local
     clean_requests_table_client = clean_requests_table_client_local
     clustering_queue_client = clustering_queue_client_local
+    ipwork_queue_client = ipwork_queue_client_local
     queue_service_client = queue_service_client_local
 
     # Ensure the multi-tenant tables exist and wire up the library store.
@@ -859,6 +930,10 @@ def _init_storage_clients():
         clustering_queue_client.create_queue()
     except Exception as exc:
         app.logger.debug('Queue ensure skipped for %s: %s', CLUSTERING_QUEUE_NAME, exc)
+    try:
+        ipwork_queue_client.create_queue()
+    except Exception as exc:
+        app.logger.debug('Queue ensure skipped for %s: %s', IPWORKER_QUEUE_NAME, exc)
 
     # Password-mode: ensure the config table exists and seed the initial owner
     # credential from OWNER_EMAIL/OWNER_PASSWORD on first boot (no-op afterwards).
@@ -1337,6 +1412,25 @@ def _photo_people_list(metadata: Dict, pid_to_name: Optional[Dict[str, str]]) ->
     return people
 
 
+def _active_processing_worker(metadata: Dict) -> Optional[str]:
+    """Returns 'ipworker' if ipworker currently holds an unexpired processing
+    lease on this photo, else None. Used by the gallery to show a
+    "processing on server" icon distinct from the browser's own in-tab work.
+    """
+    lease_owner = str(metadata.get('processing_lease_owner') or '').strip()
+    if not lease_owner.startswith('ipworker-'):
+        return None
+    expires_at = str(metadata.get('processing_lease_expires_at') or '').strip()
+    if not expires_at:
+        return None
+    try:
+        if datetime.fromisoformat(expires_at.replace('Z', '+00:00')) <= datetime.now(timezone.utc):
+            return None
+    except Exception:
+        return None
+    return 'ipworker'
+
+
 def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_props: bool = True,
                          head_missing: bool = True, pid_to_name: Optional[Dict[str, str]] = None) -> Dict:
     # Prefer the size/last-modified persisted on the metadata row (stamped at
@@ -1410,6 +1504,14 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
             'faceSource': face_source or None,
             'aiVision': metadata.get('ai_vision_status'),
             'mapDetection': metadata.get('map_detection_status'),
+            # Which side currently holds the active processing lease on this
+            # photo, if any -- lets the gallery show a "processing on server"
+            # icon (see PhotoGallery.tsx tile-badges) distinct from the
+            # browser's own in-tab processing. Origin is inferred from the
+            # lease-owner id prefix set at claim time (_queue_ipwork_processing
+            # uses 'ipworker-<jobId>', /upload/processing/claim uses
+            # 'browser-<uuid>' by default).
+            'activeWorker': _active_processing_worker(metadata),
         },
     }
 
@@ -2537,7 +2639,19 @@ def _face_alignment_tier(face: Dict) -> str:
     return str(face.get('alignmentMethod') or '').strip()
 
 
-PEOPLE_CLUSTER_ALIGNMENT_TIERS = ('landmark-5pt', 'landmark-2pt')
+# 'landmark-5pt-mp' (ipworker, MediaPipe-aligned) added after real-data
+# calibration -- see PEOPLE_CLUSTER_EPS_MP's comment. 'landmark-2pt-mp'
+# (ipworker's own eyes-only fallback) is deliberately NOT included yet: no
+# real landmark-2pt-mp faces have been observed to calibrate against. Of 13
+# real photos used across two calibration passes, all 13 that produced a
+# usable face landed in the 5pt path; the one deliberately-extreme
+# full-profile shot included specifically to probe the 2pt fallback instead
+# produced NO detection at all (crop_and_align_face returned None -- YOLO
+# found a candidate box, but MediaPipe couldn't resolve landmarks in it well
+# enough for either the 5pt or 2pt path). So it's not just unobserved, it may
+# be rare for this detector/landmarker pairing. Faces landing there stay
+# stored-but-excluded from clustering until real data exists.
+PEOPLE_CLUSTER_ALIGNMENT_TIERS = ('landmark-5pt', 'landmark-2pt', 'landmark-5pt-mp')
 
 
 def _face_embedding_allowed_for_clustering(face: Dict) -> bool:
@@ -4059,6 +4173,7 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
             min(PEOPLE_CLUSTER_EPS, PEOPLE_CLUSTER_MAX_PAIR_DISTANCE, PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE),
         ),
         _dbscan_pass(tier_indices['landmark-2pt'], PEOPLE_CLUSTER_EPS_2PT, PEOPLE_CLUSTER_EPS_2PT),
+        _dbscan_pass(tier_indices['landmark-5pt-mp'], PEOPLE_CLUSTER_EPS_MP, PEOPLE_CLUSTER_EPS_MP),
     ):
         for _, global_idxs in tier_clusters.items():
             clusters[next_label] = global_idxs
@@ -9093,10 +9208,49 @@ def _create_scoped_blob_url(container_name: str, filename: str, *, minutes: int 
     )
 
 
+def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None) -> Dict[str, str]:
+    """Send a real queue message so ipworker (also) processes this upload.
+
+    No-op in 'browser' mode (the default) -- ipworker never needs to be
+    deployed at all in that mode. In 'both' mode this races the browser's own
+    client-side pipeline; whichever result lands first for a given step wins
+    (see _step_locked_done in storage_utils.py) and the other is discarded.
+
+    `steps` defaults to every step ipworker owns (IPWORK_STEPS); callers that
+    only want a subset re-processed (e.g. the admin backfill endpoint scoped
+    to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
+    silently redo more than was asked.
+    """
+    if PROCESSING_MODE == 'browser':
+        return {'status': 'skipped', 'reason': 'browser_only_processing'}
+    requested_steps = [s for s in (steps if steps is not None else IPWORK_STEPS) if s in IPWORK_STEPS]
+    if not requested_steps:
+        return {'status': 'skipped', 'reason': 'no_ipwork_steps_requested'}
+    job_id = f'ipwork:{user_id}:{uuid.uuid4().hex}'
+    if ipwork_queue_client is None:
+        app.logger.warning('ipwork queue client is unavailable; job %s was not enqueued', job_id)
+        return {'status': 'unavailable', 'jobId': job_id}
+    message = {
+        'jobId': job_id,
+        'correlationId': job_id,
+        'user_id': user_id,
+        'filename': filename,
+        'steps': requested_steps,
+    }
+    try:
+        ipwork_queue_client.send_message(json.dumps(message, separators=(',', ':')))
+    except Exception:
+        app.logger.exception('Failed to enqueue ipwork job %s', job_id)
+        return {'status': 'failed', 'jobId': job_id}
+    _upsert_job_status(job_id, user_id, 'ipwork', 'queued')
+    return {'status': 'queued', 'jobId': job_id}
+
+
 def _queue_upload_processing(user_id: str, final_name: str) -> None:
     if is_video_file(final_name):
         return
     _enqueue_processing_steps(user_id, final_name, ['face'])
+    _queue_ipwork_processing(user_id, final_name)
 
 
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
@@ -9917,6 +10071,37 @@ def list_photos():
     )
 
     return jsonify({'photos': photos, 'total': len(entries)})
+
+
+@app.route('/photos/processing-status', methods=['GET'])
+@app.route('/photos/processing-status/', methods=['GET'])
+@app.route('/api/photos/processing-status', methods=['GET'])
+@app.route('/api/photos/processing-status/', methods=['GET'])
+def photos_processing_status():
+    """Point-lookup refresh for the gallery's processing-status poller
+    (PhotoGallery.tsx) -- lets the "processing on server" tile icon update
+    without re-fetching/relisting the whole page. Bounded to a small explicit
+    filename list, not a scan."""
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    raw_filenames = request.args.get('filenames', '')
+    filenames = [secure_filename(name.strip()) for name in raw_filenames.split(',') if name.strip()][:100]
+    statuses: Dict[str, Dict] = {}
+    for filename in filenames:
+        entity = _get_metadata_entity(user_id, filename)
+        if entity is None:
+            continue
+        statuses[filename] = {
+            'thumbnail': entity.get('thumbnail_status'),
+            'exif': entity.get('exif_status'),
+            'ocr': entity.get('ocr_status'),
+            'face': entity.get('face_status'),
+            'aiVision': entity.get('ai_vision_status'),
+            'mapDetection': entity.get('map_detection_status'),
+            'activeWorker': _active_processing_worker(entity),
+        }
+    return jsonify({'statuses': statuses})
 
 
 @app.route('/photos/lookup/<path:filename>', methods=['GET'])
@@ -11282,7 +11467,10 @@ def admin_backfill_photos():
     Marks processing steps as 'queued' (force=True) for every non-deleted,
     non-video photo in the user's library. The browser's background scheduler
     picks them up via /upload/processing/pending and re-runs them — identical
-    to what happens for a freshly uploaded photo.
+    to what happens for a freshly uploaded photo. When PROCESSING_MODE is
+    'backend' or 'both', each photo is also enqueued to ipworker
+    (_queue_ipwork_processing) -- this is the way to bulk-reprocess an
+    existing library server-side without any browser tab needing to be open.
 
     By default all steps are re-queued (thumbnails, EXIF, OCR, AI vision, map
     tagging, and face detection). Pass a 'steps' list in the body to scope the
@@ -11328,6 +11516,13 @@ def admin_backfill_photos():
             continue
         try:
             _enqueue_processing_steps(user_id, filename, steps_to_run, force=True)
+            # Bulk/background reprocessing of an already-uploaded library is
+            # one of the two reasons ipworker exists (see the ipworker plan) --
+            # without this, backend/both mode would only ever reach ipworker
+            # for brand-new uploads (_queue_upload_processing), and this
+            # admin action would silently do nothing beyond flipping table
+            # status columns nothing consumes.
+            _queue_ipwork_processing(user_id, filename, steps=steps_to_run)
             queued += 1
         except Exception:
             app.logger.exception('Backfill: failed to enqueue steps for %s/%s', user_id, filename)
@@ -11745,6 +11940,193 @@ def run_clustering_worker() -> None:
                 time.sleep(poll_seconds)
         except Exception:
             worker_logger.exception('Queue polling iteration failed')
+            time.sleep(poll_seconds)
+
+
+# Populated by ipworker model-implementation modules (face detect/embed, OCR,
+# vision tagging, geo) as they land -- see the ipworker plan. Each entry maps an
+# IPWORK_STEPS name to a callable of (user_id, filename, image_bytes)
+# returning a dict shaped like the matching key of the browser's
+# `clientProcessing` payload (e.g. {'hasData': True, 'text': ...} for 'ocr'), or
+# None/a falsy dict to report no data. A step with no registered processor is
+# marked 'failed' with a clear reason instead of crashing the whole job, since
+# ipworker's model coverage ships incrementally rather than all at once.
+IPWORK_STEP_PROCESSORS: Dict[str, Callable[[str, str, bytes], Optional[Dict]]] = {}
+
+
+def _register_ipwork_processors() -> None:
+    """Import and register ipworker's model-implementation modules.
+
+    Deliberately lazy -- called only from run_ipworker(), never at module
+    import time -- because these modules pull in heavy ML deps (onnxruntime,
+    opencv, mediapipe, torch, open_clip, pytesseract) that live only in the
+    ipworker image's requirements-ipworker.txt. Importing them unconditionally
+    at the top of app.py would break the plain backend/worker roles, which
+    don't have them installed and don't need them.
+
+    Each import is independently guarded so one missing/broken model doesn't
+    take down the others -- ipworker's model coverage ships incrementally,
+    not all four at once.
+    """
+    try:
+        import ipwork_geo
+        IPWORK_STEP_PROCESSORS['exif'] = ipwork_geo.process_exif
+        IPWORK_STEP_PROCESSORS['map_detection'] = ipwork_geo.process_geo
+    except Exception:
+        worker_logger.exception('ipwork_geo unavailable; exif/map_detection steps will report not_implemented')
+    try:
+        import ipwork_ocr
+        IPWORK_STEP_PROCESSORS['ocr'] = ipwork_ocr.process_ocr
+    except Exception:
+        worker_logger.exception('ipwork_ocr unavailable; ocr step will report not_implemented')
+    try:
+        import ipwork_face
+        IPWORK_STEP_PROCESSORS['face'] = ipwork_face.process_face
+    except Exception:
+        worker_logger.exception('ipwork_face unavailable; face step will report not_implemented')
+    try:
+        import ipwork_vision
+        IPWORK_STEP_PROCESSORS['ai_vision'] = ipwork_vision.process_vision
+    except Exception:
+        worker_logger.exception('ipwork_vision unavailable; ai_vision step will report not_implemented')
+
+
+def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str, Dict]:
+    """Run each requested step's registered processor for one photo.
+
+    Returns a dict shaped like the browser's `clientProcessing` payload so it
+    can be handed straight to apply_client_processing_results_for_file.
+    """
+    client_processing: Dict[str, Dict] = {}
+    image_bytes_cache: List[bytes] = []
+
+    def get_image_bytes() -> bytes:
+        if not image_bytes_cache:
+            entity = _get_metadata_entity(user_id, filename) or {}
+            source_blob = str(entity.get('anonymousImageId') or '').strip() or filename
+            image_bytes_cache.append(download_media_bytes('image', source_blob))
+        return image_bytes_cache[0]
+
+    for step in steps:
+        if step not in IPWORK_STEPS:
+            continue
+        processor = IPWORK_STEP_PROCESSORS.get(step)
+        if processor is None:
+            client_processing[step] = {'hasData': False, 'error': 'not_implemented'}
+            continue
+        try:
+            result = processor(user_id, filename, get_image_bytes())
+            client_processing[step] = result if isinstance(result, dict) else {'hasData': False}
+        except Exception as exc:
+            worker_logger.exception('ipworker step %r failed for %s/%s', step, user_id, filename)
+            client_processing[step] = {'hasData': False, 'error': str(exc)}
+    return client_processing
+
+
+def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> None:
+    """Process one ipwork queue message.
+
+    In 'both' mode the browser and ipworker are both trying to process the
+    same upload, so before doing any work ipworker first competes for the
+    same per-photo processing lease the browser's own tabs already use to
+    avoid double-processing each other (claim_processing_lease in
+    storage_utils.py -- see /upload/processing/claim). Whichever side claims
+    the lease does the work; the other observes it's already held and backs
+    off without wasting any inference. This also protects against two
+    ipworker replicas (KEDA can scale it beyond 1) picking up the same photo.
+
+    Results are written through the same path the browser uses, tagged with
+    origin='ipworker' so provenance and the write-time _step_locked_done
+    guard (storage_utils.py) both see who computed this -- a second line of
+    defense in case a lease expired mid-flight and got reclaimed.
+    """
+    filename = str(payload.get('filename') or '').strip()
+    steps = [str(s).strip() for s in (payload.get('steps') or []) if str(s).strip() in IPWORK_STEPS]
+    if not filename or not user_id or not steps:
+        return
+    lease_owner = f'ipworker-{job_id}'
+    try:
+        claim_processing_lease(user_id, filename, lease_owner, lease_seconds=IPWORKER_LEASE_SECONDS, steps=steps)
+    except Exception as exc:
+        # Another worker (a browser tab, or another ipworker replica) already
+        # holds an active lease on this photo -- they're doing the work.
+        _upsert_job_status(job_id, user_id, 'ipwork', 'skipped', reason=str(exc))
+        return
+    _upsert_job_status(job_id, user_id, 'ipwork', 'running')
+    try:
+        client_processing = _run_ipwork_steps(user_id, filename, steps)
+        apply_client_processing_results_for_file(
+            user_id,
+            filename,
+            client_processing=client_processing,
+            client_processing_report=None,
+            client_asset_id=f'ipworker:{job_id}',
+            origin='ipworker',
+        )
+        _upsert_job_status(job_id, user_id, 'ipwork', 'done')
+    finally:
+        # apply_client_processing_results_for_file already clears the lease
+        # fields unconditionally on success; this covers the failure path
+        # (an exception above would otherwise leave the lease held until it
+        # naturally expires after IPWORKER_LEASE_SECONDS).
+        release_processing_lease(user_id, filename, lease_owner)
+
+
+def run_ipworker() -> None:
+    """Poll the ipwork queue for jobs in a standalone container."""
+    logging.basicConfig(
+        level=os.getenv('LOG_LEVEL', 'INFO').upper(),
+        format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    )
+    _register_ipwork_processors()
+    poll_seconds = float(os.getenv('IPWORKER_POLL_SECONDS', '2'))
+    queue_service_client_local = queue_service_client
+    if queue_service_client_local is None:
+        _init_storage_clients()
+        queue_service_client_local = queue_service_client
+    if queue_service_client_local is None:
+        raise RuntimeError('Queue service client unavailable')
+    queue_client = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
+    try:
+        queue_client.create_queue()
+    except Exception:
+        pass
+    worker_logger.info(
+        'ipworker polling queue %s every %ss',
+        IPWORKER_QUEUE_NAME,
+        poll_seconds,
+    )
+    while True:
+        processed_any = False
+        try:
+            messages = list(queue_client.receive_messages(messages_per_page=1))
+            for message in messages:
+                processed_any = True
+                payload = {}
+                job_id = ''
+                user_id = ''
+                try:
+                    payload = json.loads(message.content or '{}')
+                    if isinstance(payload, dict):
+                        job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
+                        user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+                        _handle_ipwork_queue_payload(payload, job_id, user_id)
+                except Exception as exc:
+                    if job_id and user_id:
+                        try:
+                            _upsert_job_status(job_id, user_id, 'ipwork', 'failed', error=str(exc))
+                        except Exception:
+                            pass
+                    worker_logger.exception('Failed to process ipwork queue message')
+                finally:
+                    try:
+                        queue_client.delete_message(message)
+                    except Exception:
+                        worker_logger.exception('Failed to delete ipwork queue message')
+            if not processed_any:
+                time.sleep(poll_seconds)
+        except Exception:
+            worker_logger.exception('ipwork queue polling iteration failed')
             time.sleep(poll_seconds)
 
 

@@ -93,6 +93,7 @@ export type ClientProcessingReason =
     | 'model_load_failed'
     | 'model_unavailable'
     | 'model_budget_exceeded'
+    | 'backend_processing_mode'
     | 'file_too_large'
     | 'image_too_large'
     | 'memory_budget'

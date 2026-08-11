@@ -1939,6 +1939,14 @@ def _apply_server_exif_fallback(
     else:
         metadata['exifData'] = json.dumps({}, ensure_ascii=False, separators=(',', ':'))
         metadata['exifCount'] = 0
+        # Found via a real end-to-end test (ipworker + Azurite): a photo with
+        # truly no extractable EXIF via any path (client report said no data,
+        # and server-side exiftool/PIL re-extraction also found nothing) left
+        # exif_status stuck at whatever it was before this call ('running',
+        # if a lease claim had just set it) -- this branch never resolved it
+        # to a terminal status. Pre-existing gap, not specific to ipworker
+        # (the browser's own fallback-trigger path hits the same code).
+        status_updates['exif_status'] = 'no_data'
         mark_step_no_data(user_id, filename, 'map_detection')
         status_updates['map_detection_status'] = 'no_data'
     return status_updates
@@ -1974,6 +1982,20 @@ def _apply_server_thumbnail_fallback(
     return status_updates
 
 
+def _step_locked_done(metadata: Dict, step: str) -> bool:
+    """True if `step` is already 'done' on this photo.
+
+    Guards against two writers racing on the same photo (browser + a
+    server-side ipworker both processing the same upload in "both" mode) --
+    whichever result lands first wins, and the second is discarded rather than
+    clobbering it. Safe against legitimate forced re-runs (Tools > Backfill all
+    photos) because those reset `{step}_status` away from 'done' via
+    _enqueue_processing_steps *before* the new result is submitted, so a
+    forced resubmission never actually observes 'done' here.
+    """
+    return str(metadata.get(f'{step}_status') or '').strip().lower() == 'done'
+
+
 def _apply_client_processing_results(
     user_id: str,
     filename: str,
@@ -1983,6 +2005,7 @@ def _apply_client_processing_results(
     client_processing_report: Optional[List[Dict]],
     client_asset_id: str,
     thumbnail_already_uploaded: bool = False,
+    origin: str = 'browser',
 ) -> None:
     metadata_table_client = _CTX['metadata_table_client']
     payload = client_processing if isinstance(client_processing, dict) else {}
@@ -2033,13 +2056,13 @@ def _apply_client_processing_results(
                 pass
         if thumbnail_already_uploaded:
             mark_step_done(user_id, filename, 'thumbnail', result={
-                'source': 'browser',
+                'source': origin,
                 'clientAssetId': client_asset_id,
                 **thumbnail_provenance,
             })
             status_updates['thumbnail_status'] = 'done'
             _merge_processing_metadata(metadata, 'client_thumbnail', {
-                'source': 'browser',
+                'source': origin,
                 'acceptedAt': _utc_now(),
                 'clientAssetId': client_asset_id,
                 **({'rotationDegrees': thumbnail_payload.get('rotationDegrees')} if thumbnail_payload.get('rotationDegrees') is not None else {}),
@@ -2080,7 +2103,7 @@ def _apply_client_processing_results(
                 metadata['longitude'] = lon
             _apply_exif_metadata(metadata, exif_data)
             _merge_processing_metadata(metadata, 'client_exif', {
-                'source': 'browser',
+                'source': origin,
                 'acceptedAt': _utc_now(),
                 'hasGps': bool(lat and lon),
                 'clientAssetId': client_asset_id,
@@ -2097,7 +2120,7 @@ def _apply_client_processing_results(
                     metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
                     metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
                 mark_step_done(user_id, filename, 'map_detection', result={
-                    'source': 'browser',
+                    'source': origin,
                     'latitude': lat,
                     'longitude': lon,
                     'clientAssetId': client_asset_id,
@@ -2120,7 +2143,9 @@ def _apply_client_processing_results(
         ))
 
     ocr_result = payload.get('ocr')
-    if isinstance(ocr_result, dict):
+    if isinstance(ocr_result, dict) and _step_locked_done(metadata, 'ocr'):
+        pass
+    elif isinstance(ocr_result, dict):
         ocr_text = _sanitize_client_text(ocr_result.get('text'), 2048)
         if ocr_text:
             metadata['ocrText'] = ocr_text
@@ -2128,7 +2153,7 @@ def _apply_client_processing_results(
             metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             status_updates['ocr_status'] = 'done'
             _merge_processing_metadata(metadata, 'client_ocr', {
-                'source': 'browser',
+                'source': origin,
                 'acceptedAt': _utc_now(),
                 'clientAssetId': client_asset_id,
                 'textLength': len(ocr_text),
@@ -2139,7 +2164,9 @@ def _apply_client_processing_results(
         metadata['ocr_status'] = 'failed'
 
     map_result = payload.get('map_detection')
-    if isinstance(map_result, dict):
+    if isinstance(map_result, dict) and _step_locked_done(metadata, 'map_detection'):
+        pass
+    elif isinstance(map_result, dict):
         lat = _valid_decimal(map_result.get('latitude'), -90.0, 90.0)
         lon = _valid_decimal(map_result.get('longitude'), -180.0, 180.0)
         if lat and lon:
@@ -2164,7 +2191,7 @@ def _apply_client_processing_results(
             metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             status_updates['map_detection_status'] = 'done'
             _merge_processing_metadata(metadata, 'client_map_detection', {
-                'source': 'browser',
+                'source': origin,
                 'acceptedAt': _utc_now(),
                 'clientAssetId': client_asset_id,
                 **_client_source_provenance(map_result),
@@ -2175,7 +2202,9 @@ def _apply_client_processing_results(
         metadata['map_detection_status'] = 'failed'
 
     face_result = payload.get('face')
-    if isinstance(face_result, dict):
+    if isinstance(face_result, dict) and _step_locked_done(metadata, 'face'):
+        pass
+    elif isinstance(face_result, dict):
         # Set by _enqueue_processing_steps at queue time (force=True) and
         # untouched since -- nothing above this point writes the 'face' key of
         # processing_metadata. Distinguishes an explicit forced re-run (Tools >
@@ -2265,7 +2294,7 @@ def _apply_client_processing_results(
                 status_updates['faceCount'] = 0
                 status_updates['face_status'] = 'no_data'
             _merge_processing_metadata(metadata, 'client_face', {
-                'source': 'browser',
+                'source': origin,
                 'acceptedAt': _utc_now(),
                 'clientAssetId': client_asset_id,
                 'faceCount': len(faces_with_embeddings),
@@ -2302,7 +2331,9 @@ def _apply_client_processing_results(
         metadata['processing_lease_expires_at'] = ''
 
     ai_result = payload.get('ai_vision')
-    if isinstance(ai_result, dict):
+    if isinstance(ai_result, dict) and _step_locked_done(metadata, 'ai_vision'):
+        pass
+    elif isinstance(ai_result, dict):
         ai_source_provenance = _client_source_provenance(ai_result)
         ai_model_provenance = _client_model_provenance(ai_result)
         model_ready = (
@@ -2317,7 +2348,7 @@ def _apply_client_processing_results(
             mark_step_no_data(user_id, filename, 'ai_vision')
             status_updates['ai_vision_status'] = 'no_data'
             _merge_processing_metadata(metadata, 'client_ai_vision', {
-                'source': 'browser',
+                'source': origin,
                 'acceptedAt': _utc_now(),
                 'hasData': False,
                 'clientAssetId': client_asset_id,
@@ -2378,7 +2409,7 @@ def _apply_client_processing_results(
             metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
             metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             mark_step_done(user_id, filename, 'ai_vision', result={
-                'source': 'browser',
+                'source': origin,
                 'tags': tags,
                 'ocrText': ocr_text,
                 'clientAssetId': client_asset_id,
@@ -2387,7 +2418,7 @@ def _apply_client_processing_results(
             })
             status_updates['ai_vision_status'] = 'done'
             _merge_processing_metadata(metadata, 'client_ai_vision', {
-                'source': 'browser',
+                'source': origin,
                 'acceptedAt': _utc_now(),
                 'tags': tags,
                 'objects': objects,
@@ -2406,7 +2437,7 @@ def _apply_client_processing_results(
             })
         elif ai_result is not None:
             _merge_processing_metadata(metadata, 'client_ai_vision_rejected', {
-                'source': 'browser',
+                'source': origin,
                 'rejectedAt': _utc_now(),
                 'reason': 'invalid_or_missing_model_provenance',
                 'clientAssetId': client_asset_id,
@@ -2430,8 +2461,14 @@ def apply_client_processing_results_for_file(
     client_processing_report: Optional[List[Dict]] = None,
     client_asset_id: str = '',
     thumbnail_already_uploaded: bool = False,
+    origin: str = 'browser',
 ) -> Dict:
-    """Validate and apply late browser processing results to an existing asset."""
+    """Validate and apply late processing results to an existing asset.
+
+    `origin` identifies who computed these results ('browser' or 'ipworker')
+    and is stamped into each step's provenance; it does not change which
+    fields get written.
+    """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
     metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
@@ -2459,6 +2496,7 @@ def apply_client_processing_results_for_file(
         client_processing_report,
         client_asset_id,
         thumbnail_already_uploaded=thumbnail_already_uploaded,
+        origin=origin,
     )
     refresh_metadata_entity(user_id, filename, {
         'processing_lease_owner': '',

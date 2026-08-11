@@ -39,11 +39,22 @@ param adminPassword string
 ])
 param emailDataLocation string = 'United States'
 
+@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new ipworker container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running ipworker (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and ipworker both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
+@allowed([
+  'browser'
+  'backend'
+  'both'
+])
+param processingMode string = 'browser'
+
 @description('Public backend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
 param backendImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
 @description('Public frontend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above.')
 param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
+
+@description('Public ipworker image. Only pulled/deployed when processingMode is "backend" or "both". Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment.')
+param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 
 // Create the resource group that will hold everything.
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
@@ -61,8 +72,10 @@ module app 'resources.bicep' = {
     adminEmail: adminEmail
     adminPassword: adminPassword
     emailDataLocation: emailDataLocation
+    processingMode: processingMode
     backendImage: backendImage
     frontendImage: frontendImage
+    ipworkerImage: ipworkerImage
   }
 }
 

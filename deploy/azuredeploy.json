@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "3310503400396041127"
+      "templateHash": "15482161405019547534"
     }
   },
   "parameters": {
@@ -58,6 +58,18 @@
         "description": "Where Azure Communication Services stores email data. Pick the option closest to you."
       }
     },
+    "processingMode": {
+      "type": "string",
+      "defaultValue": "browser",
+      "allowedValues": [
+        "browser",
+        "backend",
+        "both"
+      ],
+      "metadata": {
+        "description": "Where OCR/face/vision/geo processing runs. \"browser\" (default): entirely client-side, same as today -- no extra cost, works everywhere. \"backend\": the browser skips this work entirely and a new ipworker container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running ipworker (which needs meaningfully more CPU/memory than the rest of this deployment). \"both\": the browser and ipworker both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths."
+      }
+    },
     "backendImage": {
       "type": "string",
       "defaultValue": "ghcr.io/git4rajat/photostore-backend:latest",
@@ -70,6 +82,13 @@
       "defaultValue": "ghcr.io/git4rajat/photostore-frontend:latest",
       "metadata": {
         "description": "Public frontend image. Defaults to :latest for one-click \"Deploy to Azure\" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above."
+      }
+    },
+    "ipworkerImage": {
+      "type": "string",
+      "defaultValue": "ghcr.io/git4rajat/photostore-ipworker:latest",
+      "metadata": {
+        "description": "Public ipworker image. Only pulled/deployed when processingMode is \"backend\" or \"both\". Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment."
       }
     }
   },
@@ -106,11 +125,17 @@
           "emailDataLocation": {
             "value": "[parameters('emailDataLocation')]"
           },
+          "processingMode": {
+            "value": "[parameters('processingMode')]"
+          },
           "backendImage": {
             "value": "[parameters('backendImage')]"
           },
           "frontendImage": {
             "value": "[parameters('frontendImage')]"
+          },
+          "ipworkerImage": {
+            "value": "[parameters('ipworkerImage')]"
           }
         },
         "template": {
@@ -120,7 +145,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "4722275164628164726"
+              "templateHash": "6147960696061663297"
             }
           },
           "parameters": {
@@ -166,6 +191,18 @@
                 "description": "Where Azure Communication Services stores email data. Pick the option closest to you."
               }
             },
+            "processingMode": {
+              "type": "string",
+              "defaultValue": "browser",
+              "allowedValues": [
+                "browser",
+                "backend",
+                "both"
+              ],
+              "metadata": {
+                "description": "Where OCR/face/vision/geo processing runs. \"browser\" (default): entirely client-side, same as today -- no extra cost, works everywhere. \"backend\": the browser skips this work entirely and a new ipworker container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running ipworker (which needs meaningfully more CPU/memory than the rest of this deployment). \"both\": the browser and ipworker both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths."
+              }
+            },
             "backendImage": {
               "type": "string",
               "defaultValue": "ghcr.io/git4rajat/photostore-backend:latest",
@@ -178,6 +215,13 @@
               "defaultValue": "ghcr.io/git4rajat/photostore-frontend:latest",
               "metadata": {
                 "description": "Public frontend image. Defaults to :latest for one-click \"Deploy to Azure\" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above."
+              }
+            },
+            "ipworkerImage": {
+              "type": "string",
+              "defaultValue": "ghcr.io/git4rajat/photostore-ipworker:latest",
+              "metadata": {
+                "description": "Public ipworker image. Only pulled/deployed when processingMode is \"backend\" or \"both\". Separate from backendImage (unlike the clustering `worker` role, which reuses it) because ipworker needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every backend/worker cold start if bundled into their shared image. Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment."
               }
             },
             "sessionSecretParam": {
@@ -196,6 +240,8 @@
             "backendAppName": "[format('{0}-backend', parameters('appName'))]",
             "frontendAppName": "[format('{0}-frontend', parameters('appName'))]",
             "workerAppName": "[format('{0}-worker', parameters('appName'))]",
+            "ipworkerAppName": "[format('{0}-ipworker', parameters('appName'))]",
+            "deployIpworker": "[not(equals(parameters('processingMode'), 'browser'))]",
             "roleBlobContributor": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
             "roleTableContributor": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
             "roleQueueContributor": "974c5e8b-45b9-4653-ba55-5f855dd0fb88",
@@ -365,7 +411,7 @@
                         "cpu": "[json('1.25')]",
                         "memory": "2.5Gi"
                       },
-                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'BROWSER_ONLY_PROCESSING', 'value', 'true'), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.75'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'backend'), createObject('name', 'GUNICORN_WORKERS', 'value', '1'), createObject('name', 'GUNICORN_THREADS', 'value', '4'), createObject('name', 'VECTOR_INDEX_PRIME_ON_STARTUP', 'value', 'false'), createObject('name', 'OWNER_PASSWORD', 'secretRef', 'owner-password'), createObject('name', 'SESSION_SECRET', 'secretRef', 'session-secret'), createObject('name', 'ACS_CONNECTION_STRING', 'secretRef', 'acs-connection-string')))]"
+                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'PROCESSING_MODE', 'value', parameters('processingMode')), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.75'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'backend'), createObject('name', 'GUNICORN_WORKERS', 'value', '1'), createObject('name', 'GUNICORN_THREADS', 'value', '4'), createObject('name', 'VECTOR_INDEX_PRIME_ON_STARTUP', 'value', 'false'), createObject('name', 'OWNER_PASSWORD', 'secretRef', 'owner-password'), createObject('name', 'SESSION_SECRET', 'secretRef', 'session-secret'), createObject('name', 'ACS_CONNECTION_STRING', 'secretRef', 'acs-connection-string')))]"
                     }
                   ],
                   "scale": {
@@ -485,7 +531,7 @@
                         "cpu": "[json('0.5')]",
                         "memory": "1Gi"
                       },
-                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'BROWSER_ONLY_PROCESSING', 'value', 'true'), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.75'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'worker'), createObject('name', 'CLUSTERING_WORKER_POLL_SECONDS', 'value', '2'), createObject('name', 'ACS_CONNECTION_STRING', 'secretRef', 'acs-connection-string')))]"
+                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'PROCESSING_MODE', 'value', parameters('processingMode')), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.75'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'worker'), createObject('name', 'CLUSTERING_WORKER_POLL_SECONDS', 'value', '2'), createObject('name', 'ACS_CONNECTION_STRING', 'secretRef', 'acs-connection-string')))]"
                     }
                   ],
                   "scale": {
@@ -510,6 +556,54 @@
               },
               "dependsOn": [
                 "[resourceId('Microsoft.Communication/communicationServices', format('{0}-comm', parameters('appName')))]",
+                "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
+                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
+              ]
+            },
+            {
+              "condition": "[variables('deployIpworker')]",
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2025-01-01",
+              "name": "[variables('ipworkerAppName')]",
+              "location": "[parameters('location')]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+                "template": {
+                  "containers": [
+                    {
+                      "name": "ipworker",
+                      "image": "[parameters('ipworkerImage')]",
+                      "resources": {
+                        "cpu": "[json('2.0')]",
+                        "memory": "4Gi"
+                      },
+                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'PROCESSING_MODE', 'value', parameters('processingMode')), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.75'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'false'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'false')), createArray(createObject('name', 'APP_ROLE', 'value', 'ipworker'), createObject('name', 'IPWORKER_POLL_SECONDS', 'value', '2')))]"
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": 0,
+                    "maxReplicas": 1,
+                    "rules": [
+                      {
+                        "name": "ipwork-queue",
+                        "custom": {
+                          "type": "azure-queue",
+                          "metadata": {
+                            "accountName": "[variables('storageAccountName')]",
+                            "queueName": "photostore-ipwork",
+                            "queueLength": "1"
+                          },
+                          "identity": "system"
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "dependsOn": [
                 "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
                 "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
               ]
@@ -550,6 +644,26 @@
               "dependsOn": [
                 "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
                 "[resourceId('Microsoft.App/containerApps', variables('workerAppName'))]"
+              ]
+            },
+            {
+              "copy": {
+                "name": "ipworkerStorageRoles",
+                "count": "[length(variables('storageRoleIds'))]"
+              },
+              "condition": "[variables('deployIpworker')]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', variables('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), variables('ipworkerAppName'), variables('storageRoleIds')[copyIndex()])]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageRoleIds')[copyIndex()])]",
+                "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('ipworkerAppName')), '2025-01-01', 'full').identity.principalId]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.App/containerApps', variables('ipworkerAppName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
               ]
             }
           ],
