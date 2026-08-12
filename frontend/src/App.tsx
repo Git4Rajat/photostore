@@ -480,37 +480,39 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
                         />
                     </div>
 
-                    <div className="account-menu-section">
-                        <p className="account-menu-label">Processing</p>
-                        <button
-                            type="button"
-                            className={`account-menu-toggle${turbo ? ' is-on' : ''}`}
-                            role="switch"
-                            aria-checked={turbo}
-                            onClick={() => {
-                                setTurbo((value) => {
-                                    const next = !value;
-                                    setBrowserProcessingTurbo(next);
-                                    return next;
-                                });
-                            }}
-                        >
-                            <span className="account-menu-toggle-copy">
-                                <span className="account-menu-toggle-title">
-                                    <RocketLaunchIcon className="account-menu-item-icon" aria-hidden="true" />
-                                    Turbo mode
+                    {getRuntimeConfig().processingMode !== 'backend' && (
+                        <div className="account-menu-section">
+                            <p className="account-menu-label">Processing</p>
+                            <button
+                                type="button"
+                                className={`account-menu-toggle${turbo ? ' is-on' : ''}`}
+                                role="switch"
+                                aria-checked={turbo}
+                                onClick={() => {
+                                    setTurbo((value) => {
+                                        const next = !value;
+                                        setBrowserProcessingTurbo(next);
+                                        return next;
+                                    });
+                                }}
+                            >
+                                <span className="account-menu-toggle-copy">
+                                    <span className="account-menu-toggle-title">
+                                        <RocketLaunchIcon className="account-menu-item-icon" aria-hidden="true" />
+                                        Turbo mode
+                                    </span>
+                                    <span className="account-menu-toggle-note">
+                                        {turbo
+                                            ? `Processes up to ${turboConcurrency} photos at once — faster, uses more CPU and memory.`
+                                            : 'Processes one photo at a time — gentle on this device.'}
+                                    </span>
                                 </span>
-                                <span className="account-menu-toggle-note">
-                                    {turbo
-                                        ? `Processes up to ${turboConcurrency} photos at once — faster, uses more CPU and memory.`
-                                        : 'Processes one photo at a time — gentle on this device.'}
+                                <span className="account-menu-switch" aria-hidden="true">
+                                    <span className="account-menu-switch-thumb" />
                                 </span>
-                            </span>
-                            <span className="account-menu-switch" aria-hidden="true">
-                                <span className="account-menu-switch-thumb" />
-                            </span>
-                        </button>
-                    </div>
+                            </button>
+                        </div>
+                    )}
 
                     {showAuth && (
                         <div className="account-menu-section account-menu-section-actions">
