@@ -139,14 +139,13 @@ def test_clean_request_solo_owner_needs_only_their_own_confirmation():
     assert active is not None and active['RowKey'] == request_id
     assert s.is_clean_request_fully_confirmed(active) is False
 
-    result = s.confirm_clean_token(tokens[owner])
-    assert result is not None
-    confirmed_request, confirmed_user = result
-    assert confirmed_user == owner
+    status, confirmed_request = s.confirm_clean_token(tokens[owner], account_id=owner, library_id=owner)
+    assert status == 'ok'
     assert s.is_clean_request_fully_confirmed(confirmed_request) is True
 
     # The token is single-use: a second attempt with the same raw token fails.
-    assert s.confirm_clean_token(tokens[owner]) is None
+    status2, _ = s.confirm_clean_token(tokens[owner], account_id=owner, library_id=owner)
+    assert status2 == 'invalid'
 
 
 def test_clean_request_shared_library_needs_a_second_approver():
@@ -161,16 +160,49 @@ def test_clean_request_shared_library_needs_a_second_approver():
     assert set(tokens.keys()) == {owner, bob}
 
     # Owner alone confirming is not enough.
-    _req, _user = s.confirm_clean_token(tokens[owner])
+    status1, _req = s.confirm_clean_token(tokens[owner], account_id=owner, library_id=owner)
+    assert status1 == 'ok'
     active = s.get_active_clean_request(owner)
     assert s.is_clean_request_fully_confirmed(active) is False
 
-    # Once bob also confirms, the request is fully approved.
-    _req2, confirmed_user = s.confirm_clean_token(tokens[bob])
-    assert confirmed_user == bob
+    # Once bob also confirms (as himself), the request is fully approved.
+    status2, _req2 = s.confirm_clean_token(tokens[bob], account_id=bob, library_id=owner)
+    assert status2 == 'ok'
     final = s.get_active_clean_request(owner)
     assert s.is_clean_request_fully_confirmed(final) is True
     assert final['RowKey'] == request_id
+
+
+def test_clean_request_token_confirm_requires_matching_caller():
+    """Regression test: a caller must not be able to record ANOTHER required
+    approver's confirmation just by holding their raw token (e.g. by reading
+    it out of their inbox on a shared device). That would let a single
+    account satisfy the "second approver" requirement alone, defeating the
+    whole point of gating a destructive wipe behind multi-party confirmation.
+    """
+    s = make_store()
+    owner = _seed_owner(s)
+    bob = _seed_owner(s, uid='ubob', email='bob@x.com', name='Bob Lib')
+    s.add_membership(bob, owner, is_owner=False)
+
+    request_id, tokens = s.create_clean_request(
+        library_id=owner, requested_by=owner, required_user_ids=[owner, bob],
+    )
+
+    # Owner tries to confirm using bob's token while authenticated as themself.
+    status, confirmed_request = s.confirm_clean_token(tokens[bob], account_id=owner, library_id=owner)
+    assert status == 'mismatch'
+    assert confirmed_request is None
+
+    # Bob's confirmation must NOT have been recorded, and his token must
+    # still be intact for him to use for real.
+    active = s.get_active_clean_request(owner)
+    assert active['confirmedUserIds'] == ''
+    assert request_id == active['RowKey']
+
+    status2, confirmed_request2 = s.confirm_clean_token(tokens[bob], account_id=bob, library_id=owner)
+    assert status2 == 'ok'
+    assert 'ubob' in confirmed_request2['confirmedUserIds'].split(',')
 
 
 def test_clean_request_expired_token_is_rejected():
@@ -179,7 +211,8 @@ def test_clean_request_expired_token_is_rejected():
     _request_id, tokens = s.create_clean_request(
         library_id=owner, requested_by=owner, required_user_ids=[owner], ttl_seconds=-1,
     )
-    assert s.confirm_clean_token(tokens[owner]) is None
+    status, _ = s.confirm_clean_token(tokens[owner], account_id=owner, library_id=owner)
+    assert status == 'invalid'
 
 
 def test_cancel_clean_request_removes_request_and_tokens():
@@ -191,7 +224,8 @@ def test_cancel_clean_request_removes_request_and_tokens():
     s.cancel_clean_request(owner, request_id)
     assert s.get_active_clean_request(owner) is None
     # The outstanding token was revoked along with the request.
-    assert s.confirm_clean_token(tokens[owner]) is None
+    status, _ = s.confirm_clean_token(tokens[owner], account_id=owner, library_id=owner)
+    assert status == 'invalid'
 
 
 def test_clean_request_send_throttle_caps_rate():

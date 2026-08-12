@@ -6814,12 +6814,11 @@ def library_clean_confirm():
         return error
     data = request.get_json(silent=True) or {}
     token = str(data.get('token', '') or '')
-    result = library_store.confirm_clean_token(token)
-    if not result:
-        return jsonify({'error': 'This confirmation link is invalid or has expired.'}), 400
-    confirmed_request, token_user_id = result
-    if str(confirmed_request.get('PartitionKey') or '') != library_id or token_user_id != account_id:
+    status, confirmed_request = library_store.confirm_clean_token(token, account_id=account_id, library_id=library_id)
+    if status == 'mismatch':
         return jsonify({'error': 'This confirmation link does not belong to your account.'}), 403
+    if status != 'ok' or not confirmed_request:
+        return jsonify({'error': 'This confirmation link is invalid or has expired.'}), 400
 
     request_id = str(confirmed_request.get('RowKey') or '')
     library_store.audit(library_id, actor=account_id, action='clean-confirmed', target=request_id)

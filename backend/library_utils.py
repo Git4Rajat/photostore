@@ -722,33 +722,46 @@ class LibraryStore:
         })
         return request_id, tokens_by_user
 
-    def confirm_clean_token(self, raw_token: str) -> Optional[tuple]:
-        """Validate + consume a single approver's clean-confirmation token.
+    def confirm_clean_token(self, raw_token: str, *, account_id: str, library_id: str) -> tuple:
+        """Validate a single approver's clean-confirmation token against the
+        caller's authenticated account/library context, and record the
+        approval.
 
-        Returns ``(request, user_id)`` with the approval recorded, or None if
-        the token is invalid/expired. Always deletes the token on any consume
-        attempt so it can't be brute-forced."""
+        Returns ``(status, request)``:
+          - ``'ok'``: the approval was recorded; ``request`` is the updated row.
+          - ``'mismatch'``: the token is real but wasn't issued to this caller
+            (wrong account or wrong active library). Left completely untouched
+            so the real approver can still use it — the caller must never be
+            able to record someone else's approval just by holding their link.
+          - ``'invalid'``: the token is unknown, or its request is gone,
+            already used, or expired. The token (if found) is deleted since
+            it's no longer useful.
+        Every branch other than 'mismatch' consumes the token so it can't be
+        replayed."""
         if not raw_token or self.clean_requests is None:
-            return None
+            return 'invalid', None
         token_hash = hash_invite_token(raw_token)
         lookup = self._get(self.clean_requests, _TOKEN_PK, token_hash)
-        self._delete(self.clean_requests, _TOKEN_PK, token_hash)
         if not lookup:
-            return None
-        library_id = str(lookup.get('libraryId') or '')
+            return 'invalid', None
+        token_library_id = str(lookup.get('libraryId') or '')
+        token_user_id = str(lookup.get('userId') or '')
         request_id = str(lookup.get('requestId') or '')
-        user_id = str(lookup.get('userId') or '')
-        request = self._get(self.clean_requests, library_id, request_id)
+        if token_library_id != str(library_id) or token_user_id != str(account_id):
+            return 'mismatch', None
+
+        self._delete(self.clean_requests, _TOKEN_PK, token_hash)
+        request = self._get(self.clean_requests, token_library_id, request_id)
         if not request or str(request.get('status') or '') != 'pending':
-            return None
+            return 'invalid', None
         if int(request.get('expiresAt', 0) or 0) <= _now():
-            return None
+            return 'invalid', None
         confirmed = [u for u in str(request.get('confirmedUserIds') or '').split(',') if u]
-        if user_id not in confirmed:
-            confirmed.append(user_id)
+        if token_user_id not in confirmed:
+            confirmed.append(token_user_id)
         request['confirmedUserIds'] = ','.join(confirmed)
         self.clean_requests.upsert_entity(request)
-        return request, user_id
+        return 'ok', request
 
     @staticmethod
     def is_clean_request_fully_confirmed(request: Dict) -> bool:
