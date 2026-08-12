@@ -6684,7 +6684,13 @@ def _execute_library_clean(library_id: str) -> Dict:
         if client is None:
             continue
         try:
-            for row in list(client.query_entities(f"PartitionKey eq '{pk}'")):
+            # select=[keys only]: merge_table_client's partition can hold tens of
+            # thousands of face_membership_snapshot_chunk rows carrying a ~24KB
+            # `payload` blob each (see _create_people_repair_snapshot). Fetching
+            # full rows just to read PartitionKey/RowKey materializes all of that
+            # into memory at once and OOMs the worker (same bug class fixed for
+            # list_merges).
+            for row in client.query_entities(f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey']):
                 try:
                     client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
                 except Exception:
