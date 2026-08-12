@@ -24,7 +24,7 @@ import {
     WrenchScrewdriverIcon,
     XMarkIcon,
 } from '@heroicons/react/24/outline';
-import { AppServicesProvider, ClusteringActivityIndicator, NotificationBell, useAppServices, getBrowserProcessingConcurrency, isBrowserProcessingTurboEnabled, setBrowserProcessingTurbo } from './components/AppServicesProvider';
+import { AppServicesProvider, ClusteringActivityIndicator, IpworkActivityIndicator, NotificationBell, useAppServices, getBrowserProcessingConcurrency, isBrowserProcessingTurboEnabled, setBrowserProcessingTurbo } from './components/AppServicesProvider';
 import { TimelineMetadataProvider } from './components/TimelineMetadataProvider';
 import { Logo } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
@@ -318,6 +318,7 @@ const RootServiceActions: React.FC = () => {
                 )}
 
                 <ClusteringActivityIndicator />
+                <IpworkActivityIndicator />
             </div>
         </div>
     );

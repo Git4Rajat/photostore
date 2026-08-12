@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { BellIcon, TrashIcon, UserGroupIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { BellIcon, ServerIcon, TrashIcon, UserGroupIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { get, getUpload, post, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
@@ -45,6 +45,7 @@ import {
     onJobPollRequested,
     requestJobPoll,
     clusteringActivityLabel,
+    ipworkActivityLabel,
     JOB_NOTIFY_WINDOW_MS,
     TERMINAL_JOB_STATUSES,
     TOASTABLE_JOB_KINDS,
@@ -230,6 +231,8 @@ interface AppServicesContextValue {
     activeJobs: JobStatusRecord[];
     clusteringActive: boolean;
     clusteringStatusLabel: string;
+    ipworkActive: boolean;
+    ipworkStatusLabel: string;
 }
 
 export type BrowserProcessingAction = 'thumbnails' | 'exif' | 'ocr' | 'vision' | 'map' | 'faces';
@@ -670,6 +673,34 @@ export const ClusteringActivityIndicator: React.FC = () => {
             <UserGroupIcon className="toolbar-icon bg-activity-icon" aria-hidden="true" />
             <span className="sr-only">{clusteringStatusLabel}</span>
         </button>
+    );
+};
+
+// Global icon shown while ipwork (backend/both processing mode) is generating
+// thumbnails/faces/vision data for at least one photo. ipwork runs off-screen
+// on a scale-to-zero server container with no other persistent signal: the
+// per-tile "processing on server" badge only lights up for a tile that's both
+// on-screen and actively leased, and ipwork completions are deliberately kept
+// out of the notification bell (one job per photo — see jobNotifications.ts)
+// to avoid a toast-per-photo storm on a bulk upload. Without this, a large
+// background batch was entirely invisible. Not a button — there's no action
+// to take here, just a status.
+export const IpworkActivityIndicator: React.FC = () => {
+    const { ipworkActive, ipworkStatusLabel } = useAppServices();
+    if (!ipworkActive) {
+        return null;
+    }
+    return (
+        <span
+            className="btn btn-soft icon-btn"
+            role="status"
+            aria-live="polite"
+            aria-label={ipworkStatusLabel}
+            title={ipworkStatusLabel}
+        >
+            <ServerIcon className="toolbar-icon bg-activity-icon" aria-hidden="true" />
+            <span className="sr-only">{ipworkStatusLabel}</span>
+        </span>
     );
 };
 
@@ -2691,6 +2722,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const clusteringStatusLabel = useMemo(() => clusteringActivityLabel(activeJobs), [activeJobs]);
     const clusteringActive = clusteringStatusLabel !== '';
+    const ipworkStatusLabel = useMemo(() => ipworkActivityLabel(activeJobs), [activeJobs]);
+    const ipworkActive = ipworkStatusLabel !== '';
 
     const value = useMemo<AppServicesContextValue>(() => ({
         notifications,
@@ -2720,6 +2753,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         activeJobs,
         clusteringActive,
         clusteringStatusLabel,
+        ipworkActive,
+        ipworkStatusLabel,
     }), [
         notifications,
         unreadCount,
@@ -2748,6 +2783,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         activeJobs,
         clusteringActive,
         clusteringStatusLabel,
+        ipworkActive,
+        ipworkStatusLabel,
     ]);
 
     return (

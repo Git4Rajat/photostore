@@ -47,6 +47,22 @@ export const clusteringActivityLabel = (jobs: JobStatusRecord[]): string => {
     return 'Finding more faces…';
 };
 
+// ipwork runs one job row per photo (backend/both processing mode), so it's
+// excluded from the notification bell/toast (see the kind !== 'ipwork' check
+// around pollJobStatusesOnce) to avoid one toast per file on a bulk upload.
+// That left no global signal that server-side processing was happening at
+// all — this label backs a standalone indicator for exactly that gap.
+export const isIpworkJob = (job: JobStatusRecord): boolean => job.kind === 'ipwork';
+
+// Returns '' when no ipwork job is in flight. /api/jobs/status caps its
+// response at 50 rows, so a large backlog can't be counted reliably from this
+// list alone — keep the label a simple presence signal rather than a count
+// that would silently undercount once the backlog exceeds the cap.
+export const ipworkActivityLabel = (jobs: JobStatusRecord[]): string => {
+    const inFlight = jobs.some((job) => isIpworkJob(job) && !TERMINAL_JOB_STATUSES.has(job.status));
+    return inFlight ? 'Processing photos…' : '';
+};
+
 // Only announce a completion if it finished within this window. Guards against
 // re-notifying for jobs that wrapped up long before the app was opened (the
 // backend already bounds the payload, this is a tighter client-side gate).
