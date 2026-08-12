@@ -81,6 +81,7 @@ const AdditionalInfoPage: React.FC = () => {
                         <li>Context-aware search treats queries like “red dress” as object plus modifier.</li>
                         <li>Search can combine tags, people, location, OCR text, captions, and semantic signals.</li>
                         <li>Recent uploads, map data, camera metadata, and processing state are visible from photo details.</li>
+                        <li>HEIC and RAW (CR3) files decode in-browser for accurate previews, no native format support required.</li>
                     </ul>
                 </article>
 
@@ -92,25 +93,48 @@ const AdditionalInfoPage: React.FC = () => {
                         <li>Face detection stores face records for people clustering and manual review.</li>
                         <li>Processing status tracks thumbnails, vision, maps, and faces as queued, running, done, failed, or no data.</li>
                         <li>The Tools page can queue or retry processing work without re-uploading files.</li>
+                        <li>In-app notifications (bell and toast) surface when a background processing job finishes.</li>
+                    </ul>
+                </article>
+
+                <article className="additional-card">
+                    <h3>People and Faces</h3>
+                    <ul>
+                        <li>Detected faces are clustered into people you can name, search, and use in smart albums.</li>
+                        <li>Merge clusters that belong to the same person, with undo if you merge by mistake.</li>
+                        <li>Split a cluster if faces were grouped together incorrectly.</li>
+                        <li>Confirm or reject individual low-confidence face detections.</li>
+                        <li>Unclustered faces can be reviewed and assigned to a person manually.</li>
+                        <li>Clustering aggressiveness is tunable (strictest, strict, balanced, loose) without a redeploy.</li>
                     </ul>
                 </article>
 
                 <article className="additional-card">
                     <h3>Organization</h3>
                     <ul>
-                        <li>Albums collect selected photos and can be shared through public album links.</li>
-                        <li>People clustering groups detected faces and supports naming, merging, and separating faces.</li>
+                        <li>Albums collect selected photos by hand, or auto-fill as smart albums by location, date, person, or tag/object.</li>
                         <li>Corrupted uploads are separated into their own page with hash and verification context.</li>
-                        <li>Download workflows can package selected photos for export.</li>
+                        <li>Download workflows can package selected photos or a whole album for export.</li>
                         <li>Processing counters and health views help find missing thumbnails, failed AI runs, and map/face gaps.</li>
+                    </ul>
+                </article>
+
+                <article className="additional-card">
+                    <h3>Sharing and Multi-User Libraries</h3>
+                    <ul>
+                        <li>Albums can be shared as public, read-only links, optionally protected with an access code.</li>
+                        <li>Library owners can invite up to 15 members into a shared library with equal access.</li>
+                        <li>Invited members can instead start their own separate library from the same invite flow.</li>
+                        <li>Invite links are single-use and expire after 72 hours; members can leave a shared library at any time.</li>
+                        <li>&quot;Clean library&quot; wipes content while keeping the account, and requires the owner plus a second member to confirm.</li>
                     </ul>
                 </article>
 
                 <article className="additional-card">
                     <h3>Security and Hosting</h3>
                     <ul>
-                        <li>Private routes use Microsoft Entra authentication when auth is enabled.</li>
-                        <li>Backend metadata access is partitioned by resolved user identity.</li>
+                        <li>Sign-in is email and password by default, with optional Microsoft Entra SSO for enterprise use.</li>
+                        <li>Backend metadata and blob access are scoped to the caller&apos;s active library on every request.</li>
                         <li>Blob upload SAS URLs are short-lived and created by the backend for the current upload.</li>
                         <li>The infrastructure direction is managed identity first, reducing dependency on storage keys.</li>
                         <li>The app is intended to run with near-zero idle cost by allowing services to scale to zero.</li>
