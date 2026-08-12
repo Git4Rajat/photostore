@@ -1373,19 +1373,20 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // geocode) steps. Explicit, user-initiated requests still run so on-demand
             // actions work regardless of model state; automatic backfill (including
             // baseline steps) resumes once the model becomes available.
-            if (isAutomaticPull && browserAiModelStateRef.current.status !== 'available') {
-                keepAliveRef.current?.stop();
-                return 0;
-            }
             // Defer the automatic background pull while an upload session is
             // actively transferring files: running CPU-heavy detection/embedding
             // work (WASM) concurrently with in-flight uploads was making the app
-            // sluggish. runUploadSession explicitly kicks off a fresh
-            // startBrowserProcessing() call the moment it finishes, so nothing is
-            // lost -- this just sequences the two phases instead of interleaving
-            // them. Explicit, user-initiated requests (isAutomaticPull false)
-            // still run immediately regardless.
+            // sluggish. runUploadSession explicitly recomputes keep-alive state
+            // once it finishes, so nothing is lost -- this just sequences the two
+            // phases instead of interleaving them. Leave the keep-alive alone
+            // here: the upload owns it for the duration of the transfer, and a
+            // heartbeat tick landing mid-upload must not release the wake lock.
+            // Explicit, user-initiated requests (isAutomaticPull false) still run
+            // immediately regardless.
             if (isAutomaticPull && uploadingRef.current) {
+                return 0;
+            }
+            if (isAutomaticPull && browserAiModelStateRef.current.status !== 'available') {
                 keepAliveRef.current?.stop();
                 return 0;
             }
@@ -2015,6 +2016,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         isResumingUploadRef.current = true;
         setUploading(true);
         uploadingRef.current = true;
+        // Hold the wake lock for the whole transfer, not just the post-upload
+        // processing pass -- a large batch can take long enough for the laptop
+        // to autolock mid-transfer otherwise.
+        keepAliveRef.current?.start();
         setPendingUploadSession(null);
         const totalCount = session.files.length;
         let totalUploaded = session.files.filter((file) => file.status === 'done').length;
@@ -2287,7 +2292,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
 
             await notifyUploadComplete();
-            void startBrowserProcessing();
         } catch (err) {
             if (uploadStopRequestedRef.current || isUploadStoppedError(err)) {
                 const latest = uploadSessionRef.current || session;
@@ -2325,6 +2329,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             uploadSourceFilesRef.current.clear();
             uploadAbortControllersRef.current.clear();
             uploadStopRequestedRef.current = false;
+            // Recompute keep-alive state now that the transfer has ended (on
+            // every exit path -- success, stopped, or errored): resumes the
+            // background processing pull, and releases the wake lock if there
+            // is nothing left to protect.
+            void startBrowserProcessing();
         }
     }, [
         addNotification,
