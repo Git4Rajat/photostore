@@ -565,9 +565,15 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
         {
           name: 'worker'
           image: backendImage
+          // 2026-08-10: live was manually bumped from 0.5vCPU/1Gi to 2/4Gi
+          // (same incident/session as the backend cpu/memory fix above) --
+          // unprojected full-table scans in worker job handlers (see the
+          // library_clean OOM writeup) can pull large partitions into memory
+          // in one pass. Keep this in sync with live; don't let it drift back
+          // down to the old undersized default.
           resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'worker' }
@@ -619,9 +625,9 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
         {
           name: 'ipworker'
           image: ipworkerImage
-          // Meaningfully heavier than worker's 0.5vCPU/1Gi: a single pass runs
-          // YOLO face detection, MediaPipe landmarks, AdaFace embedding, CLIP
-          // tagging, and tesseract OCR in sequence for one photo.
+          // Same footprint as worker's 2vCPU/4Gi (see above): a single pass
+          // runs YOLO face detection, MediaPipe landmarks, AdaFace embedding,
+          // CLIP tagging, and tesseract OCR in sequence for one photo.
           resources: {
             cpu: json('2.0')
             memory: '4Gi'
