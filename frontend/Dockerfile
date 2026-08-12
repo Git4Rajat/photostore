@@ -15,6 +15,17 @@ RUN npm ci --no-audit --no-fund
 COPY . ./
 RUN npm run sync:blazeface-model
 RUN node scripts/sync-browser-ai-runtime.mjs
+# TEMPORARY (2026-08-12): the repo's Git LFS budget is exceeded, so CI
+# checks these two files out with lfs:false (real bytes never materialize --
+# only the ~130 B pointer stub does). Overwrite with the real binaries from
+# a GitHub Release mirror instead. Revert once the LFS budget resets: drop
+# this apk add + the two curl RUN lines below, and flip lfs:true back on in
+# publish-images.yml. node:20-alpine doesn't ship curl, so install it first.
+RUN apk add --no-cache curl
+RUN curl -fsSL -o public/models/browser-ai/models/adaface/model.onnx \
+    https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/adaface-model.onnx
+RUN curl -fsSL -o public/models/browser-ai/models/yolo-face/model.onnx \
+    https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/yolo-face-model.onnx
 RUN chmod -R a+rX public/models
 RUN test -f public/models/browser-ai/models/blazeface/model.json && \
     test -f public/models/browser-ai/models/blazeface/group1-shard1of1.bin && \

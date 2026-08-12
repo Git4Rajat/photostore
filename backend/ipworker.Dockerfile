@@ -50,8 +50,18 @@ RUN chmod +x /app/entrypoint.sh
 
 # Same .onnx weights the frontend ships (frontend/public/models/browser-ai),
 # bundled at build time rather than fetched at runtime.
-COPY frontend/public/models/browser-ai/models/yolo-face/model.onnx /app/models/yolo-face/model.onnx
-COPY frontend/public/models/browser-ai/models/adaface/model.onnx /app/models/adaface/model.onnx
+# TEMPORARY (2026-08-12): normally these are COPYed straight from the
+# Git-LFS-tracked files in the checkout, but the repo's Git LFS budget is
+# exceeded, so CI checks this build context out with lfs:false and the real
+# bytes never materialize (only the ~130 B pointer stub does). Fetch the
+# real binaries from a GitHub Release mirror instead. Revert once the LFS
+# budget resets: restore the two COPY lines below and flip lfs:true back on
+# in publish-images.yml.
+RUN mkdir -p /app/models/yolo-face /app/models/adaface && \
+    curl -fsSL -o /app/models/adaface/model.onnx \
+        https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/adaface-model.onnx && \
+    curl -fsSL -o /app/models/yolo-face/model.onnx \
+        https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/yolo-face-model.onnx
 COPY frontend/public/models/browser-ai/vocab/tag-vocabulary.v1.json /app/vocab/tag-vocabulary.v1.json
 
 # MediaPipe's Tasks API (mediapipe>=1.0 removed the old solutions.face_mesh,

@@ -60,7 +60,12 @@ jobs:
             context: frontend
             dockerfile: frontend/Dockerfile
             # Frontend build bundles the face model stored in Git LFS.
-            lfs: true
+            # TEMPORARY (2026-08-12): the repo's Git LFS budget is exceeded,
+            # which makes checkout itself fail when lfs:true tries to fetch.
+            # Set to false and let frontend/Dockerfile curl the real weights
+            # from a GitHub Release mirror instead. Revert to true once the
+            # LFS budget resets (and undo the matching Dockerfile change).
+            lfs: false
           - name: ipworker
             # Repo root, not backend/ -- ipworker.Dockerfile also bundles
             # frontend/public/models/browser-ai's onnx weights, which live
@@ -68,7 +73,9 @@ jobs:
             context: .
             dockerfile: backend/ipworker.Dockerfile
             # Bundles the same LFS-tracked onnx weights as the frontend build.
-            lfs: true
+            # TEMPORARY (2026-08-12): same Git LFS budget issue as above --
+            # see backend/ipworker.Dockerfile for the curl-based workaround.
+            lfs: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
