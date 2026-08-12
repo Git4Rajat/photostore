@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ArrowLeftIcon, ArrowUturnLeftIcon, ArrowsRightLeftIcon, CheckIcon, ExclamationTriangleIcon, MinusCircleIcon, NoSymbolIcon, PhotoIcon, PlusCircleIcon, SparklesIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
-import { useParams, useNavigate, Link } from 'react-router-dom';
+import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import faceService from '../services/faceService';
 import { resolveApiUrl } from '../services/apiClient';
 import { showToast } from '../services/toast';
@@ -123,6 +123,10 @@ const PersonDetail: React.FC = () => {
     const [name, setName] = useState('');
     const [loading, setLoading] = useState(false);
     const navigate = useNavigate();
+    // FaceClusters attaches the page/tab it was opened from (see openPerson
+    // in FaceClusters.tsx) so navigating back can land on the same page
+    // instead of resetting to page 1.
+    const location = useLocation();
     const [otherPersons, setOtherPersons] = useState<PersonSummary[]>([]);
     const [mergeCandidatesLoading, setMergeCandidatesLoading] = useState(false);
     const [selectedMerge, setSelectedMerge] = useState<Record<string, boolean>>({});
@@ -321,7 +325,7 @@ const PersonDetail: React.FC = () => {
             showToast(`Face moved to ${res?.name || 'own cluster'}`);
             if (nextPersonId && res?.oldPersonDeleted) {
                 navigated = true;
-                navigate(`/people/${nextPersonId}`);
+                navigate(`/people/${nextPersonId}`, { state: location.state });
                 return;
             }
             await load();
@@ -362,7 +366,7 @@ const PersonDetail: React.FC = () => {
             const res = await faceService.markNotFace(personId, faceId);
             if (res?.personDeleted) {
                 showToast('False positive removed');
-                navigate('/people');
+                navigate('/people', { state: location.state });
                 return;
             }
             setPerson((prev) => (prev ? { ...prev, faces: (prev.faces || []).filter((face) => face.faceId !== faceId) } : prev));
@@ -434,7 +438,7 @@ const PersonDetail: React.FC = () => {
                     <p className="person-detail-meta">{displayFaces.length} faces</p>
                 </div>
                 <div className="person-detail-actions">
-                    <button className="btn btn-soft icon-btn" onClick={() => navigate('/people')} aria-label="Back to people">
+                    <button className="btn btn-soft icon-btn" onClick={() => navigate('/people', { state: location.state })} aria-label="Back to people">
                         <ArrowLeftIcon className="toolbar-icon" />
                         <span className="sr-only">Back to people</span>
                     </button>

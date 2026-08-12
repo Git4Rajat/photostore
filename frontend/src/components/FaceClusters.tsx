@@ -10,7 +10,7 @@ import { requestJobPoll } from '../services/jobNotifications';
 import { notifyApiError } from '../services/requestFeedback';
 import { isAuthEnabled } from '../services/authClient';
 import { useAppServices } from './AppServicesProvider';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import type { FlatFace, MergeHistoryItem, PersonFace, PersonSummary, SuggestionItem } from '../types/people';
 import { compareNamedFirstThenAlpha, isNamedPerson } from '../utils/people';
 
@@ -19,6 +19,10 @@ const CLUSTER_PER_PAGE = 15;
 const FACES_PER_PAGE = 50;
 const SUGGESTIONS_PER_PAGE = 5;
 type PeopleView = 'cluster' | 'face';
+// Handed to PersonDetail via navigate(..., { state }) and forwarded back on
+// its "Back to people" navigation, so returning from a cluster restores the
+// page/tab it was opened from instead of resetting to page 1.
+type PeopleNavState = { page?: number; view?: PeopleView };
 const isSuspiciousFace = (face?: PersonFace) => face?.reviewStatus === 'suspicious' || Number(face?.confidence || 0) < SUSPICIOUS_FACE_CONFIDENCE;
 const getFaceFallbackPath = (filename?: string | null) => filename ? `/api/photos/access/thumbnail/${encodeURIComponent(filename)}` : '';
 const getFaceProxyThumbnailPath = (filename?: string | null) => filename ? `/api/photos/thumbnail/${encodeURIComponent(filename)}` : '';
@@ -164,6 +168,11 @@ const PersonAvatarMedia: React.FC<{ rep?: PersonFace; alt: string }> = ({ rep, a
 
 const FaceClusters: React.FC = () => {
     const { clusteringActive, clusteringStatusLabel } = useAppServices();
+    const location = useLocation();
+    // Restored when arriving back from PersonDetail's "Back to people" button
+    // (see openPerson below); a fresh visit to /people has no state, so this
+    // falls back to the normal defaults.
+    const navState = location.state as PeopleNavState | null;
     const [initialLoading, setInitialLoading] = useState(false);
     const [actionLoading, setActionLoading] = useState(false);
     const [persons, setPersons] = useState<PersonSummary[]>([]);
@@ -181,8 +190,8 @@ const FaceClusters: React.FC = () => {
     const [status, setStatus] = useState<string>('');
     const [merges, setMerges] = useState<MergeHistoryItem[]>([]);
     const [suggestions, setSuggestions] = useState<SuggestionItem[]>([]);
-    const [view, setView] = useState<PeopleView>('cluster');
-    const [page, setPage] = useState(1);
+    const [view, setView] = useState<PeopleView>(navState?.view || 'cluster');
+    const [page, setPage] = useState(navState?.page || 1);
     const [suggestionPage, setSuggestionPage] = useState(1);
     const [faces, setFaces] = useState<FlatFace[]>([]);
     const [facesTotal, setFacesTotal] = useState(0);
@@ -192,6 +201,9 @@ const FaceClusters: React.FC = () => {
     const [selectedSuggestions, setSelectedSuggestions] = useState<Record<string, boolean>>({});
     const navigate = useNavigate();
     const busy = initialLoading || actionLoading;
+    // Carries the page/tab we're on so PersonDetail's "Back to people" button
+    // can restore it instead of landing back on page 1.
+    const openPerson = (personId: string) => navigate(`/people/${personId}`, { state: { page, view } as PeopleNavState });
 
     useEffect(() => {
         if (!searchOpen) {
@@ -1048,7 +1060,7 @@ const FaceClusters: React.FC = () => {
                         const suspiciousRepresentative = isSuspiciousFace(p.representativeFace);
                         return (
                             <div key={p.personId} className={`person-tile ${selected[p.personId] ? 'is-selected' : ''} ${suspiciousRepresentative ? 'has-suspicious-face' : ''}`} style={{ ['--stagger' as string]: `${Math.min(index, 18) * 24}ms` }}>
-                                <button className="person-tile-main" onClick={() => navigate(`/people/${p.personId}`)} type="button">
+                                <button className="person-tile-main" onClick={() => openPerson(p.personId)} type="button">
                                     <div className="person-avatar" style={getAvatarStyle(p.personId)}>
                                         {p.representativeFace?.filename ? (
                                             <PersonAvatarMedia
@@ -1079,7 +1091,7 @@ const FaceClusters: React.FC = () => {
                                     <div className="person-name">{p.name || 'Unnamed'}</div>
                                     <div className="person-count">{p.faceCount ?? (p.faceIds || []).length}</div>
                                 </div>
-                                <button className="person-open" aria-label="Open person" onClick={() => navigate(`/people/${p.personId}`)} type="button">
+                                <button className="person-open" aria-label="Open person" onClick={() => openPerson(p.personId)} type="button">
                                     <ArrowRightIcon />
                                 </button>
                                 <button
@@ -1273,7 +1285,7 @@ const FaceClusters: React.FC = () => {
                                     <div className="people-suggestion-faces">
                                         <button
                                             className="people-suggestion-face"
-                                            onClick={() => s.sourcePersonId && navigate(`/people/${s.sourcePersonId}`)}
+                                            onClick={() => s.sourcePersonId && openPerson(s.sourcePersonId)}
                                             type="button"
                                             title={sourceLabel}
                                         >
@@ -1289,7 +1301,7 @@ const FaceClusters: React.FC = () => {
                                         <ArrowsRightLeftIcon className="people-suggestion-arrow" />
                                         <button
                                             className="people-suggestion-face"
-                                            onClick={() => s.targetPersonId && navigate(`/people/${s.targetPersonId}`)}
+                                            onClick={() => s.targetPersonId && openPerson(s.targetPersonId)}
                                             type="button"
                                             title={targetLabel}
                                         >
@@ -1317,7 +1329,7 @@ const FaceClusters: React.FC = () => {
                                             <ArrowsRightLeftIcon />
                                             <span className="sr-only">Merge suggestion</span>
                                         </button>
-                                        <button className="people-icon-btn" onClick={() => s.targetPersonId && navigate(`/people/${s.targetPersonId}`)} aria-label="Review suggestion" type="button">
+                                        <button className="people-icon-btn" onClick={() => s.targetPersonId && openPerson(s.targetPersonId)} aria-label="Review suggestion" type="button">
                                             <ArrowRightIcon />
                                         </button>
                                         <button
