@@ -2043,6 +2043,36 @@ def _apply_client_processing_results(
     # the image; fall back to the original filename for pre-anonymization photos.
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
     thumbnail_payload = payload.get('thumbnail')
+    if (
+        not thumbnail_already_uploaded
+        and thumbnail_payload is None
+        and not had_thumbnail_before
+        and any(
+            str(item.get('step') or '').strip() == 'thumbnail'
+            and str(item.get('status') or '').strip().lower() == 'done'
+            for item in report
+        )
+    ):
+        # _apply_client_report_statuses above already trusted this report and
+        # set metadata['thumbnail_status'] = 'done' -- but a report saying
+        # "done" only proves the client-side render succeeded, not that the
+        # bytes actually reached blob storage (that's a separate direct-PUT
+        # step, tracked by thumbnail_already_uploaded/thumbnail_payload, which
+        # are both absent here). A dropped upload after a successful render
+        # left exactly this combination and permanently orphaned
+        # thumbnail_status at 'done' with no blob behind it (2026-08-13
+        # incident). Verify before trusting it; self-heal via the same
+        # fallback path used for an explicit failure report if it's missing.
+        try:
+            get_media_properties('thumbnail', thumbnail_blob_name)
+        except Exception:
+            status_updates.update(_apply_server_thumbnail_fallback(
+                user_id,
+                filename,
+                metadata,
+                get_image_bytes(),
+                fallback_for='report_claimed_done_but_blob_missing',
+            ))
     if thumbnail_payload is not None and had_thumbnail_before:
         # Race guard, same as ocr/map_detection/face/ai_vision below: now that
         # ipworker can also generate thumbnails (ipwork_thumbnail.py), 'both'

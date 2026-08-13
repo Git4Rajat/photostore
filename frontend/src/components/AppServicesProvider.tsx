@@ -2120,8 +2120,25 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                     filteredResult,
                                     String(claim?.thumbnailUploadUrl || ''),
                                 );
-                            } catch {
+                            } catch (thumbnailErr) {
+                                console.warn(`Direct thumbnail upload failed for ${filename}.`, thumbnailErr);
                                 delete filteredResult.clientProcessing.thumbnail;
+                                // Without this, clientProcessingReport still carries the
+                                // canvas-render step's earlier 'done' entry (that step did
+                                // succeed -- only the network upload failed), so the backend
+                                // would trust a stale "done" and never learn the blob never
+                                // landed. See the sibling report-correction above.
+                                filteredResult.clientProcessingReport = [
+                                    ...(Array.isArray(filteredResult.clientProcessingReport) ? filteredResult.clientProcessingReport : []),
+                                    {
+                                        clientAssetId: `browser-${filename}`,
+                                        step: 'thumbnail',
+                                        status: 'failed',
+                                        reason: 'direct_thumbnail_upload_failed',
+                                        durationMs: Math.max(0, Math.round(performance.now() - processingStartedAt)),
+                                        runtime: 'browser-processing-scheduler',
+                                    },
+                                ];
                             }
                         }
                         await postUpload('/upload/client-processing', {
