@@ -11932,7 +11932,7 @@ def run_clustering_worker() -> None:
     while True:
         processed_any = False
         try:
-            messages = list(queue_client.receive_messages(messages_per_page=1))
+            messages = list(queue_client.receive_messages(messages_per_page=1, max_messages=1))
             for message in messages:
                 processed_any = True
                 payload = {}
@@ -12149,7 +12149,7 @@ def run_ipworker() -> None:
     while True:
         processed_any = False
         try:
-            messages = list(queue_client.receive_messages(messages_per_page=1))
+            messages = list(queue_client.receive_messages(messages_per_page=1, max_messages=1))
             for message in messages:
                 processed_any = True
                 payload = {}
