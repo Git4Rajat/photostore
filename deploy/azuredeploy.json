@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "1762599481411269543"
+      "templateHash": "5921597361572943226"
     }
   },
   "parameters": {
@@ -145,7 +145,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "5692342843570678683"
+              "templateHash": "11046874323284330373"
             }
           },
           "parameters": {
@@ -589,7 +589,7 @@
                   ],
                   "scale": {
                     "minReplicas": 0,
-                    "maxReplicas": 1,
+                    "maxReplicas": 4,
                     "rules": [
                       {
                         "name": "ipwork-queue",

@@ -640,7 +640,12 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
       ]
       scale: {
         minReplicas: 0
-        maxReplicas: 1
+        // 4, not 1: at 1 replica, jobs process strictly one at a time (each
+        // runs YOLO + AdaFace + CLIP + OCR in sequence, so a large backlog
+        // -- e.g. from a library backfill -- drains for a very long time
+        // with only one replica). KEDA still scales to 0 when the queue is
+        // empty, so this only costs more while there's actually a backlog.
+        maxReplicas: 4
         rules: [
           {
             name: 'ipwork-queue'
