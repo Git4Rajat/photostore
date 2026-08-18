@@ -1281,11 +1281,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const persistSession = useCallback((session: PersistedUploadSession | null) => {
         uploadSessionRef.current = session;
-        if (!session) {
-            localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY);
-            return;
+        try {
+            if (!session) {
+                localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY);
+                return;
+            }
+            localStorage.setItem(UPLOAD_SESSION_STORAGE_KEY, JSON.stringify(session));
+        } catch {
+            // Storage quota or serialization errors just mean this session won't
+            // resume after a refresh -- the in-memory ref above still drives the
+            // active upload, so a full localStorage must not abort the transfer.
         }
-        localStorage.setItem(UPLOAD_SESSION_STORAGE_KEY, JSON.stringify(session));
     }, []);
 
     const updatePersistedFile = useCallback((fileKey: string, updates: Partial<PersistedUploadFile>) => {
