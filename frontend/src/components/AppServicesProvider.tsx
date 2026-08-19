@@ -36,6 +36,7 @@ import { FILE_ACCEPT_FILTER, requiresBackendPreview } from '../utils/photoDispla
 import { plural } from '../utils/format';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
+import { getUnattendedConcurrencyBonus, reportBrowserProcessingOutcome } from '../services/unattendedProcessingScaler';
 import { showToast } from '../services/toast';
 import {
     fetchJobStatuses,
@@ -316,6 +317,13 @@ export const setBrowserProcessingTurbo = (enabled: boolean): void => {
 // How many photos to process concurrently. Capped by both core count and device
 // memory so a low-end device can't spawn enough concurrent model instances to
 // crash the tab. Returns 1 (the original serial behaviour) when turbo is off.
+//
+// On top of that interactive-safe baseline, an unattended ramp (see
+// unattendedProcessingScaler) adds more workers once the tab has been
+// hidden/idle long enough that there's no interactive workload sharing the
+// machine -- useful for draining a large backlog overnight. The ramp is
+// capped separately (and lower on low-memory devices) and backs itself off
+// if it turns out to be too aggressive for this specific machine.
 export const getBrowserProcessingConcurrency = (): number => {
     if (!isBrowserProcessingTurboEnabled()) {
         return 1;
@@ -327,7 +335,9 @@ export const getBrowserProcessingConcurrency = (): number => {
     const memoryGb = typeof nav.deviceMemory === 'number' && nav.deviceMemory > 0 ? nav.deviceMemory : 4;
     const byCores = Math.min(Math.max(cores - 1, 2), 6);
     const byMemory = memoryGb <= 4 ? 2 : (memoryGb <= 8 ? 4 : 6);
-    return Math.max(1, Math.min(byCores, byMemory));
+    const baseline = Math.max(1, Math.min(byCores, byMemory));
+    const unattendedCeiling = memoryGb <= 4 ? 3 : (memoryGb <= 8 ? 8 : 12);
+    return Math.max(1, Math.min(baseline + getUnattendedConcurrencyBonus(), unattendedCeiling));
 };
 
 const WARMUP_POLL_INTERVAL_MS = 5000;
@@ -1527,6 +1537,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         uploadId: `browser-${filename}`,
                         thumbnailAlreadyUploaded,
                     });
+                    reportBrowserProcessingOutcome(true);
                     if (faceDeferred) {
                         browserProcessingDeferredRef.current.set(filename, itemRotation);
                         syncBrowserProcessingNotification(browserProcessingNotification, `Deferred ${filename} for later face retry`);
@@ -1550,6 +1561,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         return;
                     }
                     browserProcessingNotification.failedCount += 1;
+                    reportBrowserProcessingOutcome(false);
                     const statuses = item?.statuses || {};
                     const failureReport = buildBrowserProcessingFailureReport(filename, statuses, effectiveSteps, processingStartedAt);
                     if (failureReport.length > 0) {
