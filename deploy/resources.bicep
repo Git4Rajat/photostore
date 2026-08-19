@@ -650,6 +650,14 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'ipworker' }
             { name: 'IPWORKER_POLL_SECONDS', value: '2' }
+            // receive_messages() with no visibility_timeout defaults to Azure's
+            // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
+            // + tesseract OCR in sequence) can exceed -- see
+            // IPWORKER_VISIBILITY_TIMEOUT_SECONDS in backend/app.py for why this
+            // matches IPWORKER_LEASE_SECONDS rather than copying the clustering
+            // worker's much longer window (that one is safe at 1800s only
+            // because it's maxReplicas=1; this app is maxReplicas=4).
+            { name: 'IPWORKER_VISIBILITY_TIMEOUT_SECONDS', value: '300' }
           ])
         }
       ]
@@ -670,6 +678,19 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
                 accountName: storageAccountName
                 queueName: 'photostore-ipwork'
                 queueLength: '1'
+                // Default strategy ('all') counts messages that are dequeued
+                // but not yet deleted, not just genuinely unclaimed ones. In
+                // 'both' processing mode, a message ipworker lost the
+                // per-photo lease race on is deliberately left undeleted so
+                // Azure redelivers and retries it later (see
+                // IPWORK_LEASE_RETRY_LIMIT in backend/app.py) -- with the
+                // default strategy that retry-pending message still counts
+                // as backlog, scaling ipworker up to handle photos the
+                // browser already finished. 'visibleonly' (falls back to
+                // 'all' above 32 messages, so real large backlogs still scale
+                // correctly) fixes that without touching genuine backlog
+                // handling.
+                queueLengthStrategy: 'visibleonly'
               }
               identity: 'system'
             }

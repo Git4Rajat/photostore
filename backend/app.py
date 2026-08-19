@@ -386,8 +386,30 @@ IPWORKER_LEASE_SECONDS = int(os.getenv('IPWORKER_LEASE_SECONDS', '300'))
 # Queue's own visibility timeout) while it keeps losing the per-photo lease
 # race to another owner, before giving up and deleting the message. This is
 # what lets a photo whose browser tab closed mid-processing still get
-# finished by ipworker on its own -- see _handle_ipwork_queue_payload.
-IPWORK_LEASE_RETRY_LIMIT = int(os.getenv('IPWORK_LEASE_RETRY_LIMIT', '15'))
+# finished by ipworker on its own -- see _handle_ipwork_queue_payload. Each
+# retry costs one IPWORKER_VISIBILITY_TIMEOUT_SECONDS wait (below), so keep
+# this small -- the browser's own lease (CLIENT_PROCESSING_LEASE_SECONDS,
+# 120s) has long since expired by the first retry if the browser really did
+# abandon the photo, so more than a couple of retries mainly extends the
+# worst-case abandon window (limit x visibility timeout) without actually
+# improving the odds of success.
+IPWORK_LEASE_RETRY_LIMIT = int(os.getenv('IPWORK_LEASE_RETRY_LIMIT', '3'))
+# Same bug class as CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS above: with no
+# visibility_timeout, receive_messages() defaults to Azure's 30s, and one
+# ipwork pass (download + YOLO face detection + MediaPipe landmarks + AdaFace
+# embedding + CLIP tagging + tesseract OCR, run in sequence) can plausibly
+# exceed that on a larger image -- Azure would then redeliver the same
+# message to a second replica while the first is still working it, and
+# because the redelivered copy carries the same jobId (so the same
+# processing-lease owner string), claim_processing_lease's ownership check
+# doesn't block the second attempt: two replicas can genuinely run the full
+# model pipeline concurrently on one photo. Unlike the clustering worker this
+# can't just use a very long window -- ipworker runs maxReplicas=4, so a
+# window much longer than one photo's worst-case processing time would delay
+# recovery if a replica crashes mid-job while other replicas sit idle.
+# Matches IPWORKER_LEASE_SECONDS, the same "how long is one photo allowed to
+# take" budget already used for the app-level lease.
+IPWORKER_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('IPWORKER_VISIBILITY_TIMEOUT_SECONDS', '300'))
 LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS = max(60, int(os.getenv('LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS', '14400')))
 CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS = max(0, int(os.getenv('CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS', '750')))
 CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS = max(30, int(os.getenv('CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS', '120')))
@@ -12266,7 +12288,11 @@ def run_ipworker() -> None:
     while True:
         processed_any = False
         try:
-            messages = list(queue_client.receive_messages(messages_per_page=1, max_messages=1))
+            messages = list(queue_client.receive_messages(
+                messages_per_page=1,
+                max_messages=1,
+                visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
+            ))
             for message in messages:
                 processed_any = True
                 payload = {}
