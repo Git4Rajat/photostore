@@ -1607,7 +1607,12 @@ export const getBrowserAiNetworkGate = (): BrowserAiNetworkGate => {
             hasNetworkInfo: false,
         };
     }
-    if (downlink > 0 && downlink < 1.5) {
+    // Chrome's `downlink` sample is coarse and can under-report even on a good
+    // connection (little recent transfer history to base it on, esp. desktop/Wi-Fi).
+    // Only trust it as a blocking signal when effectiveType doesn't already say
+    // the connection behaves like 4g -- that classification is the more holistic
+    // signal, and a 4g/low-downlink combo means the downlink sample is the outlier.
+    if (downlink > 0 && downlink < 1.5 && effectiveType !== '4g') {
         return {
             allowed: false,
             reason: 'poor_network',
@@ -2051,6 +2056,7 @@ export const acquireBrowserAiModel = async (
             }
             const assetUrl = resolveManifestAssetUrl(manifestUrl, assetPath);
             let assetResponse = await cache.match(assetUrl);
+            const assetWasCached = Boolean(assetResponse);
             if (!assetResponse) {
                 if (networkReason) {
                     return finish({
@@ -2080,32 +2086,49 @@ export const acquireBrowserAiModel = async (
                 modelCacheStatus = 'downloaded';
             }
 
-            const assetBlob = await assetResponse.clone().blob();
+            let assetBlob = await assetResponse.clone().blob();
             const expectedBytes = Number(asset.bytes || asset.size || 0);
-            if (expectedBytes > 0 && assetBlob.size !== expectedBytes) {
+            const describeAssetMismatch = async (): Promise<string | null> => {
+                if (expectedBytes > 0 && assetBlob.size !== expectedBytes) {
+                    return `Model asset size mismatch: ${assetPath}`;
+                }
+                if (asset.sha256) {
+                    const actualHash = await blobSha256(assetBlob);
+                    if (actualHash.toLowerCase() !== String(asset.sha256).toLowerCase()) {
+                        return `Model asset checksum mismatch: ${assetPath}`;
+                    }
+                }
+                return null;
+            };
+
+            let assetMismatch = await describeAssetMismatch();
+            if (assetMismatch && assetWasCached && !networkReason) {
+                // A previously cached asset can go stale when a deploy ships a new
+                // model file at the same URL (CacheStorage has no revalidation of
+                // its own). Evict and retry once from the network before failing,
+                // mirroring the manifest's own self-heal above.
+                await cache.delete(assetUrl);
+                const refetchedAsset = await withTimeout(
+                    fetch(assetUrl, { cache: 'no-store' }),
+                    CLIENT_MODEL_ACQUISITION_BUDGET_MS,
+                );
+                if (refetchedAsset && refetchedAsset.ok) {
+                    await cache.put(assetUrl, refetchedAsset.clone());
+                    assetBlob = await refetchedAsset.clone().blob();
+                    modelCacheStatus = 'downloaded';
+                    assetMismatch = await describeAssetMismatch();
+                }
+            }
+            if (assetMismatch) {
                 return finish({
                     status: 'unavailable',
                     reason: 'model_load_failed',
-                    detail: `Model asset size mismatch: ${assetPath}`,
+                    detail: assetMismatch,
                     modelAvailability: 'unavailable',
                     modelCacheStatus: 'failed',
                     modelManifestVersion: manifestVersion,
                     runtime: manifest.runtime || 'browser-ai-worker',
                 });
-            }
-            if (asset.sha256) {
-                const actualHash = await blobSha256(assetBlob);
-                if (actualHash.toLowerCase() !== String(asset.sha256).toLowerCase()) {
-                    return finish({
-                        status: 'unavailable',
-                        reason: 'model_load_failed',
-                        detail: `Model asset checksum mismatch: ${assetPath}`,
-                        modelAvailability: 'unavailable',
-                        modelCacheStatus: 'failed',
-                        modelManifestVersion: manifestVersion,
-                        runtime: manifest.runtime || 'browser-ai-worker',
-                    });
-                }
             }
         }
     }
