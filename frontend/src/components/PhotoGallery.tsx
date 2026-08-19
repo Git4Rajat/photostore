@@ -24,8 +24,10 @@ import { getFileExtension, isHeicFilename, isRawFilename, isVideoFilename } from
 import { plural } from '../utils/format';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
-import PhotoTile from './shared/PhotoTile';
+import PhotoTile, { shouldFetchScopedThumbnail } from './shared/PhotoTile';
 import { useDragSelect } from '../services/useDragSelect';
+import { isAuthEnabled } from '../services/authClient';
+import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
 import PhotoQuickActions, { workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
@@ -60,6 +62,36 @@ const UPLOAD_DB_STORE = 'files';
 export const PHOTO_CACHE_STORAGE_KEY = 'photostore.photo.cache.v1';
 const PHOTO_CACHE_MAX_AGE_MS = 1000 * 60 * 30;
 const PHOTO_LIST_REQUEST_TIMEOUT_MS = 15000;
+
+// Discrete pinch-zoom density levels for the gallery grid. Index 0 is the
+// default/comfortable tile size (matches the un-zoomed .gallery-grid CSS);
+// each entry is a linear tile-size multiplier, not a tile-count multiplier —
+// tile count scales with the square of linear size, so level 4's 0.36 works
+// out to roughly 8x as many tiles visible per screen as level 0 (before the
+// CSS min-tile-size floor kicks in on narrow phones). Deliberately a short,
+// discrete list rather than continuous scaling: it keeps the CSS grid
+// snapping to a few tuned presets instead of arbitrary in-between sizes, and
+// caps how far a user can zoom out -- dense, but never Photos-app-style
+// year/month bucketing.
+const GALLERY_ZOOM_SCALES = [1, 0.75, 0.6, 0.47, 0.36] as const;
+const GALLERY_ZOOM_MAX_LEVEL = GALLERY_ZOOM_SCALES.length - 1;
+const GALLERY_ZOOM_STORAGE_KEY = 'photostore.gallery.zoomLevel.v1';
+// Pinch distance ratio (relative to where the current level "snapped") that
+// triggers stepping to the next/previous zoom level.
+const GALLERY_PINCH_STEP_RATIO = 1.3;
+
+const loadGalleryZoomLevel = (): number => {
+    const raw = Number(localStorage.getItem(GALLERY_ZOOM_STORAGE_KEY));
+    return Number.isInteger(raw) && raw >= 0 && raw <= GALLERY_ZOOM_MAX_LEVEL ? raw : 0;
+};
+
+// More visible tiles per screen at denser zoom means the infinite-scroll
+// sentinel is reached sooner; scale how many photos we fetch per page so
+// zooming out doesn't turn into a rapid string of small pagination requests.
+const pageSizeForZoomLevel = (basePageSize: number, zoomLevel: number): number => {
+    const scale = GALLERY_ZOOM_SCALES[zoomLevel] ?? 1;
+    return Math.round(basePageSize / (scale * scale));
+};
 // How often to check whether any currently-loaded photo is mid-processing
 // (queued/running on any step, or leased by ipworker) and, only then, refresh
 // those specific photos' status -- see the processing-status poller effect.
@@ -3881,6 +3913,17 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const location = useLocation();
     const cachedBoot = loadPhotoCache();
     const [photos, setPhotos] = useState<Photo[]>(cachedBoot?.photos || []);
+    // filename -> batch-resolved access URL (see thumbnailAccessCache). '' means
+    // "resolved, but the thumbnail isn't generated yet" (render placeholder);
+    // an absent key means resolution for that page hasn't finished yet.
+    const [thumbAccessUrls, setThumbAccessUrls] = useState<Map<string, string>>(new Map());
+    const [galleryZoomLevel, setGalleryZoomLevel] = useState<number>(loadGalleryZoomLevel);
+    const galleryGridRef = useRef<HTMLDivElement | null>(null);
+    const pinchPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+    // Distance between the two pointers the last time the zoom level stepped —
+    // reset on every step so each subsequent step needs the same relative
+    // pinch motion again, giving discrete "notches" rather than a runaway.
+    const pinchStepDistanceRef = useRef<number>(0);
     // Mirrors `photos` for the processing-status poller below so that effect can
     // read the latest list on each tick without re-registering its interval
     // every time `photos` changes (which happens on far more than just
@@ -3981,7 +4024,12 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const photoListRequestSeqRef = useRef<number>(0);
     const hasBootstrappedFiltersRef = useRef<boolean>(false);
     const didInitialRevalidateRef = useRef<boolean>(false);
-    const PAGE_SIZE = 24;
+    const PAGE_SIZE = pageSizeForZoomLevel(24, galleryZoomLevel);
+
+    useEffect(() => {
+        localStorage.setItem(GALLERY_ZOOM_STORAGE_KEY, String(galleryZoomLevel));
+    }, [galleryZoomLevel]);
+
     const getUserFacingFetchError = (err: unknown): string => {
         if (isApiError(err)) {
             if (err.status === 401 || err.status === 403) {
@@ -4140,6 +4188,27 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             }
             const list: Photo[] = Array.isArray(response.photos) ? response.photos : [];
             setPhotos(prevPhotos => append ? [...prevPhotos, ...list] : list);
+            // One batched access-token request per fetched page, not one per
+            // tile — otherwise a denser zoomed-in page (up to PAGE_SIZE tiles)
+            // would fire that many individual requests on mount. See
+            // thumbnailAccessCache.ts for why this matters.
+            if (isAuthEnabled()) {
+                const needsAccess = list
+                    .filter(p => shouldFetchScopedThumbnail(p.filename, p.thumbnailUrl))
+                    .map(p => p.filename);
+                if (needsAccess.length > 0) {
+                    resolveThumbnailAccessUrls(needsAccess).then((resolved) => {
+                        if (requestSeq !== photoListRequestSeqRef.current) {
+                            return;
+                        }
+                        setThumbAccessUrls(prev => {
+                            const next = new Map(prev);
+                            resolved.forEach((url, filename) => next.set(filename, url));
+                            return next;
+                        });
+                    });
+                }
+            }
             setTotalAvailable(typeof response.total === 'number' ? response.total : list.length);
             setServerTotalLoaded(true);
             setOffset(nextOffset + list.length);
@@ -4167,7 +4236,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 setLoadingMore(false);
             }
         }
-    }, [sortBy, filters, searchQuery, buildCaptureQuery]);
+    }, [sortBy, filters, searchQuery, buildCaptureQuery, galleryZoomLevel]);
 
     // Deep link from another page ("view in library" on a photo tile) — an exact
     // point lookup rather than reusing the fuzzy/semantic search endpoint, so it
@@ -4673,6 +4742,64 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         setLightboxIndex(index);
     }, [filteredPhotos.length]);
 
+    // Two-finger pinch on the grid steps the density level (see
+    // GALLERY_ZOOM_SCALES). Modeled on Timeline.tsx's pinch-to-zoom-level
+    // handling: track active pointers in a ref, and step by whole levels
+    // once the pinch has moved far enough, rather than scaling continuously
+    // -- the grid only has a handful of tuned presets, not arbitrary sizes.
+    const stepGalleryZoom = useCallback((direction: 1 | -1) => {
+        setGalleryZoomLevel((level) => Math.max(0, Math.min(GALLERY_ZOOM_MAX_LEVEL, level + direction)));
+    }, []);
+
+    const handleGalleryPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+        if (e.pointerType !== 'touch') {
+            return;
+        }
+        pinchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pinchPointersRef.current.size === 2) {
+            try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+            } catch {
+                // Best-effort: a failed capture just means a finger that
+                // wanders off the grid element mid-pinch may stop delivering
+                // move events. The baseline below still needs to be set
+                // either way, or the gesture would eat its first step just
+                // re-establishing it.
+            }
+            const [a, b] = Array.from(pinchPointersRef.current.values());
+            pinchStepDistanceRef.current = Math.hypot(a.x - b.x, a.y - b.y);
+        }
+    }, []);
+
+    const handleGalleryPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+        if (pinchPointersRef.current.size !== 2 || !pinchPointersRef.current.has(e.pointerId)) {
+            return;
+        }
+        e.preventDefault();
+        pinchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        const [a, b] = Array.from(pinchPointersRef.current.values());
+        const distance = Math.hypot(a.x - b.x, a.y - b.y);
+        const baseline = pinchStepDistanceRef.current;
+        if (baseline <= 0 || distance <= 0) {
+            pinchStepDistanceRef.current = distance;
+            return;
+        }
+        if (distance / baseline >= GALLERY_PINCH_STEP_RATIO) {
+            // Fingers spreading apart -- step toward the default, less-dense view.
+            stepGalleryZoom(-1);
+            pinchStepDistanceRef.current = distance;
+        } else if (baseline / distance >= GALLERY_PINCH_STEP_RATIO) {
+            // Fingers pinching together -- step toward a denser grid.
+            stepGalleryZoom(1);
+            pinchStepDistanceRef.current = distance;
+        }
+    }, [stepGalleryZoom]);
+
+    const handleGalleryPointerEnd = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+        pinchPointersRef.current.delete(e.pointerId);
+        pinchStepDistanceRef.current = 0;
+    }, []);
+
     const hideDiscovery = location.pathname && location.pathname.startsWith('/people');
 
     const sectionClass = hideDiscovery ? '' : 'gallery-wrap card-glass reveal-up delay-1 gallery-studio';
@@ -5046,7 +5173,15 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             )}
 
             {lightboxIndex === null ? (
-                <div className="gallery-grid">
+                <div
+                    ref={galleryGridRef}
+                    className="gallery-grid gallery-grid--zoomable"
+                    style={{ '--gallery-zoom-scale': GALLERY_ZOOM_SCALES[galleryZoomLevel] } as React.CSSProperties}
+                    onPointerDown={handleGalleryPointerDown}
+                    onPointerMove={handleGalleryPointerMove}
+                    onPointerUp={handleGalleryPointerEnd}
+                    onPointerCancel={handleGalleryPointerEnd}
+                >
                     {filteredPhotos.map((photo, index) => {
                         const isSelected = selectedPhotos.has(photo.filename);
                         const rating = Math.max(0, Math.min(5, Math.round(photo.rating || 0)));
@@ -5058,6 +5193,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                 animationDelayMs={(index % 8) * 36}
                                 title={photo.filename}
                                 showBody={false}
+                                useBatchedAccess
+                                resolvedAccessUrl={thumbAccessUrls.get(photo.filename)}
                                 onMediaClick={(e) => {
                                     e.stopPropagation();
                                     openLightboxAt(index);

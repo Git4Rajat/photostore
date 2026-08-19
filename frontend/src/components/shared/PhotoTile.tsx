@@ -34,6 +34,14 @@ interface PhotoTileProps {
     // desktop hover corner icons, opening a PhotoActionSheet.
     onLongPress?: () => void;
     useProtectedMedia?: boolean;
+    // When true, this tile never mints its own access token — it trusts the
+    // parent to have batch-resolved one via thumbnailAccessCache and passed
+    // it in resolvedAccessUrl (undefined/'' just means "not ready yet",
+    // rendered as the placeholder, not a signal to fall back to a per-tile
+    // fetch). Used by PhotoGallery, which resolves a whole page of tiles in
+    // one request instead of one request per tile.
+    useBatchedAccess?: boolean;
+    resolvedAccessUrl?: string;
 }
 
 // Neutral placeholder for photos whose thumbnail hasn't been generated yet.
@@ -48,7 +56,7 @@ const PLACEHOLDER_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(
     '<path d="M232 330l86-104 58 62 50-54 84 96z"/></g></svg>',
 )}`;
 
-const isHttpUrl = (value?: string) => Boolean(value && value.startsWith('http'));
+export const isHttpUrl = (value?: string) => Boolean(value && value.startsWith('http'));
 
 const resolveThumbnailSource = (thumbnailUrl?: string) => {
     if (!thumbnailUrl) {
@@ -57,7 +65,10 @@ const resolveThumbnailSource = (thumbnailUrl?: string) => {
     return isHttpUrl(thumbnailUrl) ? thumbnailUrl : resolveApiUrl(thumbnailUrl);
 };
 
-const shouldFetchScopedThumbnail = (filename: string, thumbnailUrl?: string) => (
+// Exported so PhotoGallery can decide, per fetched page, which filenames
+// actually need an access token resolved (batched) vs. already have a
+// directly-usable URL from the listing response.
+export const shouldFetchScopedThumbnail = (filename: string, thumbnailUrl?: string) => (
     Boolean(thumbnailUrl && !isHttpUrl(thumbnailUrl)) || (!thumbnailUrl && requiresBackendPreview(filename))
 );
 
@@ -77,6 +88,8 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     onMediaClick,
     onLongPress,
     useProtectedMedia = true,
+    useBatchedAccess = false,
+    resolvedAccessUrl,
 }) => {
     const longPressHandlers = useLongPress(onLongPress);
     const classes = [
@@ -99,6 +112,11 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     const fallbackThumbnailUrl = resolveThumbnailSource(photo.thumbnailUrl);
 
     useEffect(() => {
+        if (useBatchedAccess) {
+            // Parent (PhotoGallery) owns resolution via a single batched
+            // request per page — this tile must not also fetch its own.
+            return undefined;
+        }
         let active = true;
         if (!shouldUseProtectedMedia || !shouldFetchScopedThumbnail(photo.filename, photo.thumbnailUrl)) {
             // Listings hand out absolute SAS URLs the <img> can load directly —
@@ -133,10 +151,14 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
         return () => {
             active = false;
         };
-    }, [fallbackThumbnailUrl, photo.filename, photo.thumbnailUrl, shouldUseProtectedMedia]);
+    }, [fallbackThumbnailUrl, photo.filename, photo.thumbnailUrl, shouldUseProtectedMedia, useBatchedAccess]);
 
     const resolvedThumbnailUrl = shouldUseProtectedMedia
-        ? (scopedThumbnailUrl || PLACEHOLDER_THUMBNAIL)
+        ? (useBatchedAccess
+            ? (!shouldFetchScopedThumbnail(photo.filename, photo.thumbnailUrl)
+                ? (isHttpUrl(photo.thumbnailUrl) ? photo.thumbnailUrl! : PLACEHOLDER_THUMBNAIL)
+                : (resolvedAccessUrl || PLACEHOLDER_THUMBNAIL))
+            : (scopedThumbnailUrl || PLACEHOLDER_THUMBNAIL))
         : fallbackThumbnailUrl;
     const mediaClassName = ['photo-media', onMediaClick ? 'interactive' : '']
         .filter(Boolean)

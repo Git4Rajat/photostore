@@ -3935,6 +3935,20 @@ html[data-theme='light'] .notification-item.unread {
   gap: 16px;
 }
 
+/* Pinch-zoom density override for the main gallery grid only. Other pages
+   reusing .gallery-grid (Albums, FaceClusters, PersonDetail, ...) never set
+   --gallery-zoom-scale, so the var falls back to 1 and they render exactly
+   as before. Floored via max() so narrow phones can't shrink tiles below a
+   legible, tappable size even at the densest zoom level. */
+.gallery-grid.gallery-grid--zoomable {
+  grid-template-columns: repeat(auto-fill, minmax(max(48px, calc(180px * var(--gallery-zoom-scale, 1))), 1fr));
+  /* pan-y (rather than the default auto) keeps single-finger vertical
+     scroll native while opting the browser's own pinch-to-zoom-the-page
+     gesture out, so a two-finger pinch here reaches our JS handlers
+     instead of magnifying the viewport. */
+  touch-action: pan-y;
+}
+
 .photo-card {
   border-radius: var(--r-lg);
   overflow: hidden;
@@ -3961,6 +3975,10 @@ html[data-theme='light'] .notification-item.unread {
   display: block;
   transform-origin: center center;
   transition: transform var(--dur-base) ease;
+}
+
+.gallery-grid--zoomable .photo-media {
+  height: max(36px, calc(140px * var(--gallery-zoom-scale, 1)));
 }
 
 .photo-media.interactive {
@@ -6322,6 +6340,10 @@ video.photo-preview-media.is-loading {
   .person-face-grid {
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   }
+
+  .gallery-grid.gallery-grid--zoomable {
+    grid-template-columns: repeat(auto-fill, minmax(max(48px, calc(160px * var(--gallery-zoom-scale, 1))), 1fr));
+  }
 }
 
 @media (max-width: 720px) {
@@ -6410,6 +6432,10 @@ video.photo-preview-media.is-loading {
   .gallery-grid {
     grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
     gap: 10px;
+  }
+
+  .gallery-grid.gallery-grid--zoomable {
+    grid-template-columns: repeat(auto-fill, minmax(max(48px, calc(132px * var(--gallery-zoom-scale, 1))), 1fr));
   }
 
   .tools-hero,
@@ -6755,6 +6781,10 @@ video.photo-preview-media.is-loading {
     grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
   }
 
+  .gallery-grid.gallery-grid--zoomable {
+    grid-template-columns: repeat(auto-fill, minmax(max(48px, calc(124px * var(--gallery-zoom-scale, 1))), 1fr));
+  }
+
   .person-avatar {
     width: 72px;
     height: 72px;
@@ -6779,6 +6809,10 @@ video.photo-preview-media.is-loading {
     gap: 10px;
   }
 
+  .gallery-grid.gallery-grid--zoomable {
+    grid-template-columns: repeat(auto-fill, minmax(max(48px, calc(140px * var(--gallery-zoom-scale, 1))), 1fr));
+  }
+
   .tools-queue-grid {
     grid-template-columns: 1fr;
   }
@@ -6791,6 +6825,10 @@ video.photo-preview-media.is-loading {
   .person-face-grid {
     grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
     gap: 8px;
+  }
+
+  .gallery-grid.gallery-grid--zoomable {
+    grid-template-columns: repeat(auto-fill, minmax(max(48px, calc(118px * var(--gallery-zoom-scale, 1))), 1fr));
   }
 }
 
