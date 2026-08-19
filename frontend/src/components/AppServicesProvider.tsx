@@ -1328,14 +1328,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         sha256ArrayBuffer(await readBlobArrayBuffer(file))
     );
 
-    const postFinalizeWithRetry = async (payload: any, signal?: AbortSignal) => {
+    // Shared by /upload/init and /upload/finalize: with the backend allowed to
+    // scale to zero during a long-running upload (see the keepalive gate below),
+    // either call can land on a cold replica and get a 502/503 while it starts.
+    // Same exponential backoff (capped 15s, MAX_FINALIZE_RETRIES attempts -- up
+    // to ~75s total) for both, since a cold start is a cold start either way.
+    const postUploadWithRetry = async (url: string, payload: any, signal?: AbortSignal) => {
         let lastError: unknown = null;
         for (let attempt = 0; attempt < MAX_FINALIZE_RETRIES; attempt += 1) {
             if (uploadStopRequestedRef.current || signal?.aborted) {
                 throw new Error(UPLOAD_STOPPED_ERROR);
             }
             try {
-                return await postUpload('/upload/finalize', payload);
+                return await postUpload(url, payload);
             } catch (err) {
                 lastError = err;
                 if (!isRetriableUploadError(err)) {
@@ -1347,8 +1352,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 await sleep(Math.min(1000 * Math.pow(2, attempt), 15000));
             }
         }
-        throw lastError || new Error('Finalize failed.');
+        throw lastError || new Error(`Request to ${url} failed.`);
     };
+    const postInitWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/init', payload, signal);
+    const postFinalizeWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/finalize', payload, signal);
 
     const startBrowserProcessing = useCallback(async (options: BrowserProcessingStartOptions = {}) => {
         if (browserProcessingStartInFlightRef.current) {
@@ -1865,13 +1872,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
-        const initResponse = await postUpload('/upload/init', {
+        const initResponse = await postInitWithRetry({
             filename: file.name,
             totalSize: file.size,
             sha256,
             directToBlob: true,
             uploadId: options?.existingUploadId,
-        });
+        }, options?.signal);
         if (typeof initResponse?.uploadId === 'string' && initResponse.uploadId) {
             options?.onUploadInitialized?.(initResponse.uploadId);
         }
@@ -2698,18 +2705,26 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
     }, [addNotification, clearPersistedSession, loadPersistedSession, persistSession]);
 
-    // Keep the backend warm only while work is actually in flight (an upload
-    // batch or browser-side processing). Pinging /health around the clock kept
-    // the scaled-to-zero backend billing 24/7 whenever a tab stayed open; idle
-    // browsing wakes it on demand and the cold-start handling covers the rest.
+    // Keep the backend warm only for browser-side processing, not for uploads.
+    // Uploads are already direct-to-blob (see uploadFileInChunks) -- the backend
+    // is only touched briefly per file (init + finalize), and those calls now
+    // retry through a cold start (postInitWithRetry/postFinalizeWithRetry), so
+    // there's no need to pay to keep a replica warm for the whole transfer.
+    // Pinging /health every 30s for the duration of a large batch (which can run
+    // for a long time, especially backgrounded via BackgroundKeepAlive) was
+    // billing the backend as continuously active even though it does almost no
+    // work during the transfer itself -- the single biggest lever in the backend
+    // cost complaint this was built to address. Pinging /health around the clock
+    // kept the scaled-to-zero backend billing 24/7 whenever a tab stayed open;
+    // idle browsing wakes it on demand and the cold-start handling covers the rest.
     useEffect(() => {
-        if (!uploading && !browserProcessingActive) {
+        if (!browserProcessingActive) {
             stopBackendKeepalive();
             return undefined;
         }
         startBackendKeepalive();
         return () => stopBackendKeepalive();
-    }, [uploading, browserProcessingActive, startBackendKeepalive, stopBackendKeepalive]);
+    }, [browserProcessingActive, startBackendKeepalive, stopBackendKeepalive]);
 
     useEffect(() => {
         void startBrowserProcessing();
