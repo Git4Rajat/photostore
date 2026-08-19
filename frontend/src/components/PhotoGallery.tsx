@@ -1565,11 +1565,6 @@ const normalizeBrowserAiError = (err: unknown): { reason: ClientProcessingReason
     return { reason: 'model_load_failed', detail };
 };
 
-const isKnownClassifierOnlyWarmupFailure = (warmupResult: BrowserAiWarmupResult) => {
-    const reason = String(warmupResult.reason || '').toLowerCase();
-    return reason.includes('unsupported model type: resnet');
-};
-
 export const normalizeNativeFaceDetectionError = (err: unknown) => {
     if (err instanceof FaceDetectionUnavailableError) {
         if (err && typeof err === 'object' && !(err as any).faceFailureStage) {
@@ -2263,36 +2258,32 @@ const acquireBrowserAiModelInner = async (
         });
     }
 
+    // warmBrowserAiWorker only ever warms the CLIP scene classifier + tag
+    // vocabulary (browserAiWorker.ts's `warmup()`/`classify()`) -- face
+    // detection and the AdaFace embedding model are separate, main-thread
+    // pipelines already validated by the 'face_model'/'embedding_model'
+    // stages above, with their own hard-fail returns. And `warmup()` itself
+    // never throws (as long as the manifest's enableLocalVisionFallback
+    // isn't explicitly false, which it isn't here): any classify() failure
+    // -- network-blocked CDN, a bad vocabulary fetch, an unsupported model
+    // type, anything -- is already caught there and reported as a graceful
+    // `fallback: true`. So reaching here with `usingLocalFallback` true
+    // always means "classifier degraded, everything else already works";
+    // there's no reason to hard-fail the whole feature over it.
     const usingLocalFallback = Boolean(warmupResult.fallback);
-    const classifierOnlyWarmupFailure = usingLocalFallback && isKnownClassifierOnlyWarmupFailure(warmupResult);
-    if (usingLocalFallback && !classifierOnlyWarmupFailure) {
-        return finish({
-            status: 'unavailable',
-            reason: 'model_load_failed',
-            detail: `Browser AI classifier unavailable${warmupResult.reason ? ` (${warmupResult.reason})` : ''}`,
-            modelAvailability: 'unavailable',
-            modelCacheStatus: 'failed',
-            modelManifestVersion: manifestVersion,
-            model: manifest.model || firstModel?.name || '',
-            modelVersion: manifest.modelVersion || firstModel?.version || '',
-            modelTaxonomyVersion: manifest.modelTaxonomyVersion || firstModel?.taxonomyVersion || '',
-            runtime: manifest.runtime || 'browser-ai-worker',
-            manifest,
-        });
-    }
     return finish({
         status: 'available',
         reason: 'done',
-        detail: classifierOnlyWarmupFailure
+        detail: usingLocalFallback
             ? `Browser AI ready; image classifier disabled (${warmupResult.reason})`
             : 'Browser AI ready',
         modelAvailability: modelCacheStatus === 'downloaded' ? 'downloaded' : 'cached',
         modelCacheStatus,
         modelManifestVersion: manifestVersion,
-        model: classifierOnlyWarmupFailure ? manifest.model || firstModel?.name || '' : warmupResult.model || manifest.model || firstModel?.name || '',
-        modelVersion: classifierOnlyWarmupFailure ? manifest.modelVersion || firstModel?.version || '' : warmupResult.modelVersion || manifest.modelVersion || firstModel?.version || '',
-        modelTaxonomyVersion: classifierOnlyWarmupFailure ? manifest.modelTaxonomyVersion || firstModel?.taxonomyVersion || '' : warmupResult.modelTaxonomyVersion || manifest.modelTaxonomyVersion || firstModel?.taxonomyVersion || '',
-        runtime: classifierOnlyWarmupFailure ? manifest.runtime || 'browser-ai-worker' : warmupResult.runtime || manifest.runtime || 'browser-ai-worker',
+        model: usingLocalFallback ? manifest.model || firstModel?.name || '' : warmupResult.model || manifest.model || firstModel?.name || '',
+        modelVersion: usingLocalFallback ? manifest.modelVersion || firstModel?.version || '' : warmupResult.modelVersion || manifest.modelVersion || firstModel?.version || '',
+        modelTaxonomyVersion: usingLocalFallback ? manifest.modelTaxonomyVersion || firstModel?.taxonomyVersion || '' : warmupResult.modelTaxonomyVersion || manifest.modelTaxonomyVersion || firstModel?.taxonomyVersion || '',
+        runtime: usingLocalFallback ? manifest.runtime || 'browser-ai-worker' : warmupResult.runtime || manifest.runtime || 'browser-ai-worker',
         manifest,
     });
 };
