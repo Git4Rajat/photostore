@@ -399,6 +399,14 @@ var backendEnv = [
   { name: 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', value: '0.58' }
   { name: 'MAPS_ON_UPLOAD', value: 'false' }
   { name: 'MAPS_QUEUE_ON_UPLOAD', value: 'false' }
+  // Minimum interval between automatic full-recluster (DBSCAN) maintenance
+  // passes per user -- new faces are assigned synchronously in-process via
+  // _assign_faces_to_people_incrementally (no worker involved) as they
+  // arrive, so this pass only needs to run occasionally to merge fragmented
+  // unnamed-person clusters. Without this gate, a sustained multi-hour
+  // backfill kept re-firing it every ~2 minutes, keeping ownphotostore-worker
+  // alive continuously doing a full re-cluster of the whole library.
+  { name: 'PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', value: '1800' }
 ]
 
 resource backend 'Microsoft.App/containerApps@2024-03-01' = {
@@ -578,6 +586,13 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'worker' }
             { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
+            // receive_messages() with no visibility_timeout defaults to
+            // Azure's 30s -- a full DBSCAN pass over a large library can
+            // exceed that, causing Azure to redeliver the same message
+            // before the finally-block delete runs (duplicate processing).
+            // Long window is safe only because this app is maxReplicas=1
+            // (only ever one consumer, so this just prevents self-redelivery).
+            { name: 'CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS', value: '1800' }
             // The worker sends the "cleanup complete" email once a library_clean
             // job finishes; without this it silently no-ops (is_configured()
             // false) since ACS_CONNECTION_STRING lived only on the backend's env.

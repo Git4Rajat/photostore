@@ -358,6 +358,14 @@ if PROCESSING_MODE not in ('browser', 'backend', 'both'):
 # can't drift out of sync the way hand-edited bicep literals have before.
 BROWSER_ONLY_PROCESSING = PROCESSING_MODE == 'browser'
 CLUSTERING_QUEUE_NAME = os.getenv('CLUSTERING_QUEUE_NAME', 'photostore-clustering')
+# receive_messages() with no visibility_timeout defaults to Azure's 30s -- a
+# full DBSCAN pass over a large library can exceed that, making Azure
+# redeliver the same message before run_clustering_worker's finally-block
+# delete runs, causing duplicate processing. A long window is safe only
+# because ownphotostore-worker runs maxReplicas=1 (there's only ever one
+# consumer, so this just prevents the worker from redelivering to itself);
+# revisit if the worker is ever scaled beyond 1 replica.
+CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS', '1800'))
 IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
 # ipworker's job: thumbnail, exif, ocr, geo (map_detection), vision (ai_vision),
 # face -- the full set the browser can do client-side. Thumbnail used to be a
@@ -2183,6 +2191,49 @@ def _mark_clustering_job_rerun_requested(job_id: str) -> None:
         pass
 
 
+# Minimum time between automatic full-recluster (DBSCAN) maintenance passes
+# for a given user. New faces are assigned synchronously via
+# _assign_faces_to_people_incrementally (no worker involved) as they arrive;
+# this pass exists only to merge fragmented unnamed-person clusters that the
+# greedy matcher can leave behind, so it doesn't need to run on every upload
+# -- it previously did (via unconditional coalesced reruns), which is what
+# kept ownphotostore-worker alive continuously during a sustained backfill.
+PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS = int(os.getenv('PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', '1800'))
+
+
+def _clustering_maintenance_due(user_id: str) -> bool:
+    """Best-effort cooldown check + claim in one round trip, gating the
+    automatic maintenance recluster (not the explicit user-triggered
+    endpoints, which call _enqueue_clustering_job directly and must stay
+    immediate). Read-then-write, no etag -- this codebase has no working
+    optimistic-concurrency primitive (upsert_entity doesn't accept one), and
+    the worst case under a race is one extra job enqueue (still bounded by
+    _has_active_clustering_job), not a repeating chain.
+    """
+    if metadata_table_client is None:
+        return False
+    row = None
+    try:
+        row = metadata_table_client.get_entity(partition_key='clustering_maintenance', row_key=user_id)
+    except Exception:
+        row = None
+    last = _parse_iso_date(str((row or {}).get('lastStartedAt') or ''))
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS)
+    if last is not None and last >= cutoff:
+        return False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        metadata_table_client.upsert_entity({
+            'PartitionKey': 'clustering_maintenance',
+            'RowKey': user_id,
+            'lastStartedAt': now_iso,
+            'updatedAt': now_iso,
+        })
+    except Exception:
+        pass
+    return True
+
+
 def _enqueue_clustering_job(
     user_id: str,
     *,
@@ -2928,30 +2979,36 @@ def _update_person_rep_embedding(user_id: str, person_id: str) -> None:
 
 
 def _confirmed_face_count(user_id: str, face_ids: List[str], person_id: str = '') -> int:
-    if face_table_client is None:
-        return 0
+    # Was one face_table_client.get_entity() per face_id -- for
+    # _load_people_embedding_index (called once per photo now that face
+    # assignment is synchronous, see _queue_people_clustering_after_face_processing)
+    # that's ~2x(all faces owned by all the user's people) point-read RPCs per
+    # photo. _load_user_face_summary_by_id already scans+caches this same data
+    # (PEOPLE_SCAN_CACHE_TTL_SECONDS-window shared across calls in a backfill).
+    summary = _load_user_face_summary_by_id(user_id)
     count = 0
     for face_id in face_ids:
-        try:
-            face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-            if person_id and not _face_is_owned_by_person(face, person_id):
-                continue
-            if _face_is_rejected(face):
-                continue
-            if _coerce_bool(face.get('confirmedByUser', False)):
-                count += 1
-        except Exception:
+        face = summary.get(str(face_id))
+        if face is None:
             continue
+        if person_id and not _face_is_owned_by_person(face, person_id):
+            continue
+        if _face_is_rejected(face):
+            continue
+        if _coerce_bool(face.get('confirmedByUser', False)):
+            count += 1
     return count
 
 
 def _load_people_embedding_index(user_id: str) -> List[Dict]:
     if person_table_client is None:
         return []
-    try:
-        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        return []
+    # Was an uncached direct query_entities call -- _cached_person_rows_for_user
+    # wraps the identical query in _person_scan_cache, sharing one scan across
+    # every call within PEOPLE_SCAN_CACHE_TTL_SECONDS instead of re-querying
+    # the full person partition on every single call (this function now runs
+    # once per photo during a backfill, not just occasionally).
+    rows = _cached_person_rows_for_user(user_id)
 
     index = []
     for row in rows:
@@ -3363,13 +3420,15 @@ def _prepare_existing_people_match(existing_people: Optional[List[Dict]], np=Non
 
 
 def _active_face_ids_for_person(user_id: str, person_id: str, face_ids: List[str]) -> List[str]:
-    if face_table_client is None or not user_id or not person_id:
+    if not user_id or not person_id:
         return []
+    # See _confirmed_face_count for why this uses the cached face summary
+    # instead of a per-face_id get_entity() call.
+    summary = _load_user_face_summary_by_id(user_id)
     active_face_ids = []
     for face_id in face_ids:
-        try:
-            face = face_table_client.get_entity(partition_key=user_id, row_key=str(face_id))
-        except Exception:
+        face = summary.get(str(face_id))
+        if face is None:
             continue
         if _face_is_owned_by_person(face, person_id) and not _face_is_rejected(face):
             active_face_ids.append(str(face_id))
@@ -3535,10 +3594,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
 def _load_existing_people_for_matching(user_id: str) -> List[Dict]:
     if person_table_client is None:
         return []
-    try:
-        existing_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        return []
+    existing_rows = _cached_person_rows_for_user(user_id)
 
     existing_people = []
     for row in existing_rows:
@@ -4064,10 +4120,7 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
         rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         rows = []
-    try:
-        existing_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        existing_rows = []
+    existing_rows = _cached_person_rows_for_user(user_id)
 
     existing_people = []
     existing_face_ids_by_person: Dict[str, List[str]] = {}
@@ -9281,8 +9334,29 @@ def _queue_upload_processing(user_id: str, final_name: str) -> None:
     _queue_ipwork_processing(user_id, final_name)
 
 
+def _face_ids_awaiting_person_assignment(user_id: str, filename: str) -> List[str]:
+    """Face rows for one photo that don't have a personId yet. metadata's own
+    'faces' list never carries the server-assigned Table RowKey (it's built
+    from the client-reported payload with the embedding stripped), so this is
+    the only way to get face_ids for the incremental matcher below."""
+    if face_table_client is None:
+        return []
+    try:
+        rows = list(face_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
+        ))
+    except Exception:
+        return []
+    return [str(r.get('RowKey') or '') for r in rows if r.get('RowKey') and not r.get('personId')]
+
+
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
-    """Queue clustering once browser face results are durable and usable."""
+    """Assign newly-detected faces to people, then queue a maintenance
+    recluster if one's due. Runs synchronously, in-process (backend or
+    ipworker, wherever the face step just ran) -- no clustering-worker
+    round trip for the common case of recognizing an existing person or
+    bootstrapping a new one.
+    """
     if not _people_features_available() or not isinstance(metadata, dict):
         return None
     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
@@ -9305,6 +9379,16 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
             face_count = sum(1 for face in faces_value if isinstance(face, dict))
     if face_count <= 0:
         return None
+
+    try:
+        face_ids = _face_ids_awaiting_person_assignment(user_id, filename)
+        if face_ids:
+            _assign_faces_to_people_incrementally(user_id, filename, face_ids)
+    except Exception:
+        app.logger.exception('Incremental face-to-person assignment failed for %s/%s', user_id, filename)
+
+    if not _clustering_maintenance_due(user_id):
+        return {'status': 'cooldown_skipped'}
 
     return _enqueue_clustering_job(
         user_id,
@@ -11713,6 +11797,8 @@ def _maybe_enqueue_coalesced_rerun(job_id: Optional[str], user_id: str) -> None:
         return
     if not row.get('rerunRequested'):
         return
+    if not _clustering_maintenance_due(user_id):
+        return
     _enqueue_clustering_job(user_id, job_type='people_cluster', payload={'trigger': 'coalesced_rerun'})
 
 
@@ -11938,7 +12024,11 @@ def run_clustering_worker() -> None:
     while True:
         processed_any = False
         try:
-            messages = list(queue_client.receive_messages(messages_per_page=1, max_messages=1))
+            messages = list(queue_client.receive_messages(
+                messages_per_page=1,
+                max_messages=1,
+                visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
+            ))
             for message in messages:
                 processed_any = True
                 payload = {}
