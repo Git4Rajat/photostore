@@ -154,6 +154,17 @@ export const CLIENT_PROCESSING_SCHEMA_VERSION = 2;
 const CLIENT_PROCESSING_FINALIZE_GRACE_MS = 2000;
 const CLIENT_MODEL_ACQUISITION_BUDGET_MS = 10000;
 const CLIENT_MODEL_WARMUP_BUDGET_MS = 90000;
+// Every network fetch() inside acquireBrowserAiModel is individually bounded by
+// CLIENT_MODEL_ACQUISITION_BUDGET_MS/CLIENT_MODEL_WARMUP_BUDGET_MS, but the raw
+// CacheStorage calls (caches.open/cache.match/cache.put/cache.delete) are not --
+// Chrome has a known failure mode where caches.open() never resolves (corrupted
+// Cache Storage backend, disk-full, post-crash profile state), which would hang
+// this whole function forever with the UI frozen mid-stage and no error surfaced.
+// This outer watchdog guarantees it always eventually settles. Sized above the
+// worst-case sum of every inner budget (manifest + several asset fetches + face
+// model + embedding model, each up to 10s, plus the 90s worker warmup) so it never
+// cuts off a legitimately slow-but-progressing cold load.
+const BROWSER_AI_MODEL_ACQUISITION_TIMEOUT_MS = 180000;
 const CLIENT_BROWSER_STEP_BUDGET_MS = 10000;
 const CLIENT_FACE_STEP_BUDGET_MS = 20000;
 const FACE_DETECTION_SOFT_BUDGET_MS = Math.max(0, CLIENT_FACE_STEP_BUDGET_MS - 1500);
@@ -1928,6 +1939,25 @@ const runNativeFaceDetection = async (imageSource: Blob | File, rotationDegrees 
 };
 
 export const acquireBrowserAiModel = async (
+    onProgress?: (stage: BrowserAiLoadStage) => void,
+): Promise<BrowserAiModelState> => {
+    const startedAt = performance.now();
+    const result = await withTimeout(acquireBrowserAiModelInner(onProgress), BROWSER_AI_MODEL_ACQUISITION_TIMEOUT_MS);
+    if (result) {
+        return result;
+    }
+    return {
+        status: 'unavailable',
+        reason: 'model_download_timeout',
+        detail: 'Model load timed out -- the browser cache or network appears unresponsive. Try reloading the page.',
+        modelAvailability: 'unavailable',
+        modelCacheStatus: 'failed',
+        runtime: 'browser-ai-worker',
+        modelAcquisitionMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    };
+};
+
+const acquireBrowserAiModelInner = async (
     onProgress?: (stage: BrowserAiLoadStage) => void,
 ): Promise<BrowserAiModelState> => {
     const startedAt = performance.now();
