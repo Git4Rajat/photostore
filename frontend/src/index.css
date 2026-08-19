@@ -3606,6 +3606,28 @@ html[data-theme='light'] .notification-item.unread {
   filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
 }
 
+/* Both overlays above are sized/positioned for a comfortably large tile
+   (26px selection circle inset 8px from the corner, badge cluster
+   similarly inset) and don't shrink with the tile itself. At gallery
+   pinch-zoom's denser levels a tile can end up smaller than the circle
+   it's supposed to sit on top of, so it stops reading as a corner badge
+   and starts reading as "the circle covers the photo". Rather than
+   shrinking them further (illegible at that point) or hard-coding a
+   gallery zoom-level cutoff, query the tile's own rendered width directly
+   -- true regardless of *why* the tile got small (zoom level, viewport
+   breakpoint, or both). ~90px is roughly 3.5x the selection circle's own
+   footprint (26px + 2x 8px inset), the point below which it stops reading
+   as a small corner accent. Selecting/rating individual photos at that
+   density isn't really usable anyway -- zooming back in restores both.
+   Placed last (after both overlays' base rules) so it wins the cascade
+   at equal specificity regardless of source order above. */
+@container (max-width: 90px) {
+  .tile-select,
+  .tile-badges {
+    display: none;
+  }
+}
+
 /* ---- Gallery tile overlay: quick actions (view in library / workbench / cluster) ---- */
 .tile-quick-actions {
   position: absolute;
@@ -3988,6 +4010,10 @@ html[data-theme='light'] .notification-item.unread {
 .photo-media-wrap {
   position: relative;
   display: block;
+  /* Lets the overlay-hiding rule below query this tile's own rendered
+     width directly, rather than re-deriving it from gallery zoom level +
+     responsive breakpoint (which combine to determine the actual size). */
+  container-type: inline-size;
 }
 
 /* Thumbnails fade in once loaded; a shimmer skeleton fills the space until then.
