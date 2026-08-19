@@ -374,6 +374,12 @@ IPWORK_STEPS = ('thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detection'
 # every step server-side inference in sequence (face + OCR + vision + geo)
 # rather than one step at a time.
 IPWORKER_LEASE_SECONDS = int(os.getenv('IPWORKER_LEASE_SECONDS', '300'))
+# How many times ipworker will let a queue message be redelivered (via Azure
+# Queue's own visibility timeout) while it keeps losing the per-photo lease
+# race to another owner, before giving up and deleting the message. This is
+# what lets a photo whose browser tab closed mid-processing still get
+# finished by ipworker on its own -- see _handle_ipwork_queue_payload.
+IPWORK_LEASE_RETRY_LIMIT = int(os.getenv('IPWORK_LEASE_RETRY_LIMIT', '15'))
 LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS = max(60, int(os.getenv('LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS', '14400')))
 CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS = max(0, int(os.getenv('CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS', '750')))
 CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS = max(30, int(os.getenv('CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS', '120')))
@@ -12062,8 +12068,8 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
     return client_processing
 
 
-def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> None:
-    """Process one ipwork queue message.
+def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> str:
+    """Process one ipwork queue message. Returns 'done', 'noop', or 'lease_busy'.
 
     In 'both' mode the browser and ipworker are both trying to process the
     same upload, so before doing any work ipworker first competes for the
@@ -12078,22 +12084,42 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> No
     origin='ipworker' so provenance and the write-time _step_locked_done
     guard (storage_utils.py) both see who computed this -- a second line of
     defense in case a lease expired mid-flight and got reclaimed.
+
+    A 'lease_busy' return tells run_ipworker's caller to leave the queue
+    message undeleted so it gets redelivered and retried later (see
+    IPWORK_LEASE_RETRY_LIMIT) -- this is what lets ipworker finish a photo
+    whose browser tab claimed the lease and then closed mid-processing,
+    instead of that photo only ever getting picked up again if some browser
+    tab reopens and polls /upload/processing/pending.
     """
     filename = str(payload.get('filename') or '').strip()
     steps = [str(s).strip() for s in (payload.get('steps') or []) if str(s).strip() in IPWORK_STEPS]
     if not filename or not user_id or not steps:
-        return
+        return 'noop'
     lease_owner = f'ipworker-{job_id}'
     try:
-        claim_processing_lease(user_id, filename, lease_owner, lease_seconds=IPWORKER_LEASE_SECONDS, steps=steps)
+        lease = claim_processing_lease(user_id, filename, lease_owner, lease_seconds=IPWORKER_LEASE_SECONDS, steps=steps)
     except Exception as exc:
         # Another worker (a browser tab, or another ipworker replica) already
         # holds an active lease on this photo -- they're doing the work.
         _upsert_job_status(job_id, user_id, 'ipwork', 'skipped', reason=str(exc))
-        return
+        return 'lease_busy'
+    # Drop any step someone else already finished while this message was
+    # sitting in the queue (e.g. a redelivered retry, or two ipwork messages
+    # for the same photo) -- claim_processing_lease just computed fresh
+    # statuses, so this is free and avoids redoing completed inference.
+    lease_statuses = lease.get('statuses') or {}
+    runnable_steps = [
+        step for step in steps
+        if str(lease_statuses.get(f'{step}Status') or '').strip().lower() not in {'done', 'no_data', 'skipped', 'unsupported'}
+    ]
+    if not runnable_steps:
+        release_processing_lease(user_id, filename, lease_owner)
+        _upsert_job_status(job_id, user_id, 'ipwork', 'skipped', reason='already_done')
+        return 'noop'
     _upsert_job_status(job_id, user_id, 'ipwork', 'running')
     try:
-        client_processing = _run_ipwork_steps(user_id, filename, steps)
+        client_processing = _run_ipwork_steps(user_id, filename, runnable_steps)
         metadata = apply_client_processing_results_for_file(
             user_id,
             filename,
@@ -12120,6 +12146,7 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> No
         # (an exception above would otherwise leave the lease held until it
         # naturally expires after IPWORKER_LEASE_SECONDS).
         release_processing_lease(user_id, filename, lease_owner)
+    return 'done'
 
 
 def run_ipworker() -> None:
@@ -12155,12 +12182,13 @@ def run_ipworker() -> None:
                 payload = {}
                 job_id = ''
                 user_id = ''
+                outcome = 'done'
                 try:
                     payload = json.loads(message.content or '{}')
                     if isinstance(payload, dict):
                         job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
                         user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
-                        _handle_ipwork_queue_payload(payload, job_id, user_id)
+                        outcome = _handle_ipwork_queue_payload(payload, job_id, user_id)
                 except Exception as exc:
                     if job_id and user_id:
                         try:
@@ -12168,11 +12196,20 @@ def run_ipworker() -> None:
                         except Exception:
                             pass
                     worker_logger.exception('Failed to process ipwork queue message')
-                finally:
-                    try:
-                        queue_client.delete_message(message)
-                    except Exception:
-                        worker_logger.exception('Failed to delete ipwork queue message')
+                    outcome = 'done'  # a real processing error, not a race -- don't retry-loop it
+                # A message that lost the lease race ('lease_busy') is left
+                # undeleted so Azure's own visibility timeout redelivers it --
+                # by the next attempt, whoever held the lease (typically a
+                # browser tab) has either finished or, if its tab closed
+                # mid-processing, its lease has expired and ipworker claims it
+                # instead. Bounded by dequeue_count so a lease that's stuck for
+                # some other reason doesn't retry forever.
+                if outcome == 'lease_busy' and int(getattr(message, 'dequeue_count', 0) or 0) < IPWORK_LEASE_RETRY_LIMIT:
+                    continue
+                try:
+                    queue_client.delete_message(message)
+                except Exception:
+                    worker_logger.exception('Failed to delete ipwork queue message')
             if not processed_any:
                 time.sleep(poll_seconds)
         except Exception:

@@ -97,3 +97,47 @@ def test_clustering_trigger_failure_does_not_fail_the_job(monkeypatch, dispatch_
     )
 
     assert ('ipwork', 'done') in dispatch_ctx.job_statuses
+
+
+def test_lease_busy_backs_off_without_running_steps(monkeypatch, dispatch_ctx):
+    """When another owner (a browser tab, typically) already holds the
+    lease, ipworker must back off without running any inference, and report
+    'lease_busy' so run_ipworker's caller retries later instead of silently
+    dropping the job -- see IPWORK_LEASE_RETRY_LIMIT."""
+    def _claim_denied(*a, **k):
+        raise RuntimeError('Processing lease is already held by another client.')
+
+    monkeypatch.setattr(app, 'claim_processing_lease', _claim_denied)
+    ran_steps = []
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a, **k: ran_steps.append(a) or {})
+
+    outcome = app._handle_ipwork_queue_payload(
+        {'filename': 'photo.jpg', 'steps': ['face']}, 'job-4', 'lib-A',
+    )
+
+    assert outcome == 'lease_busy'
+    assert ran_steps == []
+    assert ('ipwork', 'skipped') in dispatch_ctx.job_statuses
+
+
+def test_already_done_steps_are_not_rerun(monkeypatch, dispatch_ctx):
+    """A redelivered retry (or a duplicate ipwork message) whose requested
+    step already completed elsewhere -- e.g. the browser finished it before
+    its tab closed -- must not redo the inference."""
+    monkeypatch.setattr(
+        app, 'claim_processing_lease',
+        lambda *a, **k: {'ownerId': 'ipworker-job-5', 'statuses': {'faceStatus': 'done'}},
+    )
+    released = []
+    monkeypatch.setattr(app, 'release_processing_lease', lambda *a, **k: released.append(a))
+    ran_steps = []
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a, **k: ran_steps.append(a) or {})
+
+    outcome = app._handle_ipwork_queue_payload(
+        {'filename': 'photo.jpg', 'steps': ['face']}, 'job-5', 'lib-A',
+    )
+
+    assert outcome == 'noop'
+    assert ran_steps == []
+    assert len(released) == 1
+    assert ('ipwork', 'skipped') in dispatch_ctx.job_statuses
