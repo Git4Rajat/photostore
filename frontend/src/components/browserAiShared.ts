@@ -259,6 +259,22 @@ export const getAdaptiveUploadProfile = (
         lowLatencyEvidence = true;
     }
 
+    // Cross-check a BAD reported rtt the same way downlink already is: a real
+    // production upload ran at fileParallelism 1 for its entire ~28min
+    // duration even though the earliest, pre-congestion round-trips in the
+    // same capture measured 25-350ms -- well under the >=400ms this gate
+    // treats as "high latency". connection.rtt is a coarse NQE estimate, not
+    // a ping, and can misreport just like downlink can. Only ever LOWER a bad
+    // reported rtt using a fast measured probe (never raise a good one into a
+    // false negative) -- a SLOW probe still isn't used as evidence of bad
+    // latency above, since that's just as likely to be a cold-started backend
+    // as an actually slow link.
+    let effectiveRtt = rtt;
+    if (rtt >= 400 && !isMobileViewport && !coarsePointer
+        && typeof options?.measuredRttMs === 'number' && options.measuredRttMs > 0 && options.measuredRttMs < ACTIVE_PROBE_RTT_FAST_MS) {
+        effectiveRtt = options.measuredRttMs;
+    }
+
     // Bigger batches pay relatively more in per-block commit overhead, so
     // floor the chunk size regardless of which tier below is picked -- this
     // never reduces fileParallelism, it only affects chunking.
@@ -271,7 +287,7 @@ export const getAdaptiveUploadProfile = (
     if (connection?.saveData || effectiveType === 'slow-2g' || effectiveType === '2g') {
         return { fileParallelism: 1, chunkSizeBytes: 1 * MB, reason: 'data saver or very slow network' };
     }
-    if (hasNetworkInfo && (rtt >= 400 || downlink < 1.5)) {
+    if (hasNetworkInfo && (effectiveRtt >= 400 || downlink < 1.5)) {
         return { fileParallelism: 1, chunkSizeBytes: 1 * MB, reason: 'high latency or congested network' };
     }
     if (effectiveType === '3g' || connectionType === 'cellular') {

@@ -85,6 +85,39 @@ describe('getAdaptiveUploadProfile', () => {
         expect(profile.reason).toBe('high latency or congested network');
     });
 
+    it('lets a fast measured RTT override a bad reported connection.rtt', () => {
+        // connection.rtt is a coarse NQE estimate, not a ping, and can
+        // misreport high latency on a genuinely fast link -- a real production
+        // upload ran at fileParallelism 1 for its whole session even though the
+        // earliest, pre-congestion round-trips measured 25-350ms. A fast
+        // measured probe should lift this out of the "high latency" tier,
+        // mirroring the existing downlink cross-check (only ever lowers a bad
+        // reading, never raises a good one into a false negative).
+        setConnection({ downlink: 50, rtt: 450, type: 'wifi' });
+        setMatchMedia({});
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB), { measuredRttMs: 40 });
+        expect(profile.reason).not.toBe('high latency or congested network');
+        expect(profile.fileParallelism).toBeGreaterThan(1);
+    });
+
+    it('keeps a bad reported connection.rtt when no measured RTT contradicts it', () => {
+        setConnection({ downlink: 50, rtt: 450, type: 'wifi' });
+        setMatchMedia({});
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB));
+        expect(profile.reason).toBe('high latency or congested network');
+        expect(profile.fileParallelism).toBe(1);
+    });
+
+    it('does not let a slow measured RTT excuse a bad reported connection.rtt', () => {
+        // A slow probe is just as likely to be a cold-started backend as a
+        // slow link, so it must not be used as evidence either way here.
+        setConnection({ downlink: 50, rtt: 450, type: 'wifi' });
+        setMatchMedia({});
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB), { measuredRttMs: 5000 });
+        expect(profile.reason).toBe('high latency or congested network');
+        expect(profile.fileParallelism).toBe(1);
+    });
+
     it('uses a lower ceiling for large files even on a fast connection', () => {
         setConnection({ downlink: 50, rtt: 20, type: 'wifi' });
         setMatchMedia({});
