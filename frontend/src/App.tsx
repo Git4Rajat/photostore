@@ -903,6 +903,9 @@ const AppContent: React.FC = () => {
                                 {appServices.pendingUploadSummary.failedCount > 0
                                     ? `, ${appServices.pendingUploadSummary.failedCount} failed`
                                     : ''}
+                                {appServices.pendingUploadSummary.failedCount > 0
+                                    ? '. If Retry can’t find them, use Upload and reselect the same photos (or the whole folder) — files already uploaded are skipped automatically, so there’s no need to pick out just the failed ones.'
+                                    : ''}
                             </p>
                         </div>
                         <div className="upload-approval-actions">
