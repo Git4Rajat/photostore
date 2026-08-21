@@ -215,6 +215,8 @@ def configure_storage(
     blob_cover_container: Optional[str] = None,
     blob_vector_index_container: Optional[str] = None,
     image_names_table_client=None,
+    hash_index_table_client=None,
+    filename_owners_table_client=None,
     queue_map_on_upload: bool = False,
 ) -> None:
     _CTX['metadata_table_client'] = metadata_table_client
@@ -226,6 +228,8 @@ def configure_storage(
     _CTX['blob_cover_container'] = (blob_cover_container or '').strip()
     _CTX['blob_vector_index_container'] = (blob_vector_index_container or '').strip()
     _CTX['image_names_table_client'] = image_names_table_client
+    _CTX['hash_index_table_client'] = hash_index_table_client
+    _CTX['filename_owners_table_client'] = filename_owners_table_client
     _CTX['queue_map_on_upload'] = bool(queue_map_on_upload)
 
 
@@ -1340,17 +1344,49 @@ def hamming_distance(hash1: str, hash2: str) -> int:
 
 
 def detect_duplicates(user_id: str, file_hash: str, perceptual_hash: Optional[str] = None) -> List[Dict]:
-    """Detect duplicates. If perceptual_hash is None, only check exact hash (fast path)."""
+    """Detect duplicates. Exact-hash check is an O(1) point lookup against the
+    hash index (see _store_hash_index) rather than a scan of the user's whole
+    partition -- that scan cost grew with library size, so early uploads in a
+    batch were fast and later ones in the same batch got progressively slower
+    as the partition filled up. If perceptual_hash is None, only the exact
+    check runs (fast path)."""
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
+    hash_index_table_client = _CTX.get('hash_index_table_client')
 
     duplicates = []
     try:
-        query = f"PartitionKey eq '{user_id}' and fileHash eq '{file_hash}'"
-        exact_matches = list(metadata_table_client.query_entities(query))
-        for match in exact_matches:
+        matched_filename = None
+        if hash_index_table_client is not None:
+            try:
+                index_row = hash_index_table_client.get_entity(partition_key=user_id, row_key=file_hash)
+                candidate = str(index_row.get('filename') or '')
+            except Exception:
+                candidate = ''
+            if candidate:
+                # Self-heal: confirm the photo the index points at still exists
+                # before reporting a duplicate, so a stale index row (left behind
+                # by a delete path that hasn't caught up) can never cause a real
+                # upload to be wrongly skipped as "already have it".
+                try:
+                    metadata_table_client.get_entity(partition_key=user_id, row_key=candidate)
+                    matched_filename = candidate
+                except Exception:
+                    try:
+                        hash_index_table_client.delete_entity(partition_key=user_id, row_key=file_hash)
+                    except Exception:
+                        pass
+        else:
+            # No hash index configured (e.g. older deploy) -- fall back to the
+            # original partition scan so dedup still works, just not O(1).
+            query = f"PartitionKey eq '{_escape_odata(user_id)}' and fileHash eq '{_escape_odata(file_hash)}'"
+            exact_matches = list(metadata_table_client.query_entities(query))
+            if exact_matches:
+                matched_filename = str(exact_matches[0]['RowKey'])
+
+        if matched_filename:
             duplicates.append({
-                'filename': match['RowKey'],
+                'filename': matched_filename,
                 'type': 'exact',
                 'hash': file_hash,
             })
@@ -2709,6 +2745,10 @@ def finalize_uploaded_file(
         metadata.pop(PENDING_ANONYMOUS_BLOB_FIELD, None)
 
     metadata_table_client.upsert_entity(metadata)
+    # Keep the O(1) dedup/collision indexes current for the next upload -- see
+    # detect_duplicates() and _resolve_filename_for_upload().
+    _store_hash_index(user_id, file_hash, final_filename)
+    _store_filename_owner(user_id, final_filename, file_hash)
     file_is_video = is_video_file(final_filename)
     video_status_overrides = {'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
     try:
@@ -2955,34 +2995,50 @@ def mark_step_done(user_id: str, filename: str, step: str, result: Optional[Dict
     update_processing_status(user_id, filename, step, 'done', result=result)
 
 
+def _query_filename_owners(filename: str) -> List[Dict[str, str]]:
+    """Return owner rows for a filename as [{'owner': library_id, 'fileHash': ...}].
+
+    Uses the filename-owners index (PartitionKey=filename) when configured --
+    a query scoped to just this one filename. Falls back to a full metadata-
+    table scan (RowKey eq filename, across every library) when the index isn't
+    wired up yet, e.g. immediately after a deploy before the backfill runs.
+    """
+    filename_owners_table_client = _CTX.get('filename_owners_table_client')
+    if filename_owners_table_client is not None:
+        query = f"PartitionKey eq '{_escape_odata(filename)}'"
+        rows = list(filename_owners_table_client.query_entities(query))
+        return [{'owner': str(r.get('RowKey') or ''), 'fileHash': str(r.get('fileHash') or '')} for r in rows]
+
+    metadata_table_client = _CTX['metadata_table_client']
+    entities = list(metadata_table_client.query_entities(f"RowKey eq '{_escape_odata(filename)}'"))
+    return [{'owner': str(e.get('PartitionKey') or ''), 'fileHash': str(e.get('fileHash') or '')} for e in entities]
+
+
 def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) -> str:
     """Return a safe filename to use for storing this upload.
 
-    If another metadata entity exists with the same RowKey (filename) but a
-    different fileHash, generate a unique candidate to avoid overwriting.
+    If another library already owns this exact filename with different content
+    (a different fileHash), generate a unique candidate to avoid a cross-tenant
+    blob-name collision -- blob storage names are not partitioned per library,
+    so two libraries independently uploading "IMG_1234.jpg" would otherwise
+    silently overwrite each other's bytes.
     """
     _require_context()
-    metadata_table_client = _CTX['metadata_table_client']
 
     safe_name = secure_filename(filename)
     if not safe_name or safe_name != filename:
         return filename
 
     try:
-        # Look for any existing entity with this RowKey across partitions.
-        query = f"RowKey eq '{filename}'"
-        entities = list(metadata_table_client.query_entities(query))
-        for ent in entities:
-            existing_hash = str(ent.get('fileHash', '') or '')
-            owner = str(ent.get('PartitionKey', '') or '')
+        for row in _query_filename_owners(filename):
+            owner = row['owner']
+            existing_hash = row['fileHash']
             if owner and owner != user_id and existing_hash and existing_hash != file_hash:
-                # Conflict: pick a unique filename
+                # Conflict: pick a unique filename not already owned by anyone.
                 name, ext = os.path.splitext(filename)
                 for _ in range(5):
                     candidate = f"{name}-{uuid.uuid4().hex[:8]}{ext}"
-                    # Ensure candidate is not already present
-                    q2 = f"RowKey eq '{candidate}'"
-                    if not list(metadata_table_client.query_entities(q2)):
+                    if not _query_filename_owners(candidate):
                         return candidate
                 return f"{name}-{uuid.uuid4().hex[:8]}{ext}"
     except Exception:
@@ -2990,6 +3046,64 @@ def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) ->
         return filename
 
     return filename
+
+
+def _store_hash_index(user_id: str, file_hash: str, filename: str) -> None:
+    """Record filename <- fileHash so a later detect_duplicates() call is an
+    O(1) point lookup instead of a partition scan. Best-effort: dedup still
+    works (just slower, via the fallback scan) if this write fails."""
+    hash_index_table_client = _CTX.get('hash_index_table_client')
+    if hash_index_table_client is None or not file_hash or not filename:
+        return
+    try:
+        hash_index_table_client.upsert_entity({
+            'PartitionKey': user_id,
+            'RowKey': file_hash,
+            'filename': filename,
+        })
+    except Exception:
+        pass
+
+
+def delete_hash_index_entry(user_id: str, file_hash: str) -> None:
+    """Drop the dedup-index row for a deleted photo so its hash doesn't keep
+    matching new uploads (detect_duplicates self-heals a stale row too, but
+    proactive cleanup keeps the index from accreting dead rows)."""
+    hash_index_table_client = _CTX.get('hash_index_table_client')
+    if hash_index_table_client is None or not file_hash:
+        return
+    try:
+        hash_index_table_client.delete_entity(partition_key=user_id, row_key=file_hash)
+    except Exception:
+        pass
+
+
+def _store_filename_owner(user_id: str, filename: str, file_hash: str) -> None:
+    """Record filename -> (owner library, fileHash) so a later
+    _resolve_filename_for_upload() collision check is scoped to just this one
+    filename instead of scanning the entire metadata table."""
+    filename_owners_table_client = _CTX.get('filename_owners_table_client')
+    if filename_owners_table_client is None or not filename:
+        return
+    try:
+        filename_owners_table_client.upsert_entity({
+            'PartitionKey': filename,
+            'RowKey': user_id,
+            'fileHash': file_hash,
+        })
+    except Exception:
+        pass
+
+
+def delete_filename_owner_entry(user_id: str, filename: str) -> None:
+    """Drop this library's filename-ownership row for a deleted photo."""
+    filename_owners_table_client = _CTX.get('filename_owners_table_client')
+    if filename_owners_table_client is None or not filename:
+        return
+    try:
+        filename_owners_table_client.delete_entity(partition_key=filename, row_key=user_id)
+    except Exception:
+        pass
 
 
 def reset_received_ranges(user_id: str, filename: str, total_size: int, expected_hash: Optional[str] = None) -> None:

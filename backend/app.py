@@ -76,6 +76,8 @@ from storage_utils import (
     resolve_physical_blob_name,
     invalidate_image_names_cache,
     delete_image_name_mapping,
+    delete_hash_index_entry,
+    delete_filename_owner_entry,
     LOCAL_VISION_FALLBACK_MODEL,
     LOCAL_VISION_FALLBACK_TAXONOMY_VERSION,
     LOCAL_VISION_FALLBACK_RUNTIME,
@@ -285,6 +287,13 @@ MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
 # Image-name anonymization: maps opaque UUID blob names <-> original filenames,
 # partitioned per library. See storage_utils anonymization helpers.
 IMAGE_NAMES_TABLE = os.getenv('IMAGE_NAMES_TABLE', 'photoimagenames')
+# Upload dedup index: PartitionKey=library_id, RowKey=fileHash -> filename, for an
+# O(1) exact-duplicate lookup on every finalize instead of a per-partition scan.
+HASH_INDEX_TABLE = os.getenv('HASH_INDEX_TABLE', 'photofilehashes')
+# Cross-tenant filename-collision index: PartitionKey=filename, RowKey=library_id,
+# so /upload/finalize can check "does any OTHER library already own this filename"
+# without scanning the entire metadata table.
+FILENAME_OWNERS_TABLE = os.getenv('FILENAME_OWNERS_TABLE', 'photofilenameowners')
 # Multi-tenant library sharing (accounts, libraries, memberships, invites, audit).
 USERS_TABLE = os.getenv('USERS_TABLE', 'photousers')
 LIBRARIES_TABLE = os.getenv('LIBRARIES_TABLE', 'photolibraries')
@@ -657,6 +666,8 @@ face_table_client = None
 person_table_client = None
 merge_table_client = None
 image_names_table_client = None
+hash_index_table_client = None
+filename_owners_table_client = None
 config_table_client = None
 users_table_client = None
 libraries_table_client = None
@@ -863,6 +874,7 @@ def _init_storage_clients():
     global metadata_table_client
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
     global image_names_table_client
+    global hash_index_table_client, filename_owners_table_client
     global config_table_client
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
@@ -879,6 +891,8 @@ def _init_storage_clients():
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
+        hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
+        filename_owners_table_client_local = tbl_svc.get_table_client(FILENAME_OWNERS_TABLE)
         config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
         users_table_client_local = tbl_svc.get_table_client(USERS_TABLE)
         libraries_table_client_local = tbl_svc.get_table_client(LIBRARIES_TABLE)
@@ -922,6 +936,8 @@ def _init_storage_clients():
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
+        hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
+        filename_owners_table_client_local = tbl_svc.get_table_client(FILENAME_OWNERS_TABLE)
         config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
         users_table_client_local = tbl_svc.get_table_client(USERS_TABLE)
         libraries_table_client_local = tbl_svc.get_table_client(LIBRARIES_TABLE)
@@ -941,6 +957,8 @@ def _init_storage_clients():
     person_table_client = _InvalidatingTableClient(person_table_client_local, _invalidate_people_scan_cache)
     merge_table_client = merge_table_client_local
     image_names_table_client = image_names_table_client_local
+    hash_index_table_client = hash_index_table_client_local
+    filename_owners_table_client = filename_owners_table_client_local
     users_table_client = users_table_client_local
     libraries_table_client = libraries_table_client_local
     memberships_table_client = memberships_table_client_local
@@ -1005,6 +1023,8 @@ def _init_storage_clients():
         blob_cover_container=BLOB_COVER_CONTAINER,
         blob_vector_index_container=BLOB_VECTOR_INDEX_CONTAINER,
         image_names_table_client=image_names_table_client,
+        hash_index_table_client=hash_index_table_client,
+        filename_owners_table_client=filename_owners_table_client,
         queue_map_on_upload=(MAPS_QUEUE_ON_UPLOAD and not MAPS_ON_UPLOAD),
     )
     _prime_vector_indexes_on_startup()
@@ -1073,6 +1093,22 @@ def create_image_names_table() -> None:
     try:
         svc = _ensure_table_service_client()
         svc.create_table_if_not_exists(table_name=IMAGE_NAMES_TABLE)
+    except AzureError:
+        pass
+
+
+def create_hash_index_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=HASH_INDEX_TABLE)
+    except AzureError:
+        pass
+
+
+def create_filename_owners_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=FILENAME_OWNERS_TABLE)
     except AzureError:
         pass
 
@@ -6741,6 +6777,15 @@ def _execute_library_clean(library_id: str) -> Dict:
         if not filename:
             continue
         _delete_upload_temp_files_for_filename(filename)
+        # Drop this library's filename-ownership row regardless of the shared
+        # check below -- it tracks "does THIS library have a row under this
+        # name", which is going away here even when the underlying blob (and
+        # its anonymous-id mapping) survives for another library that shares it.
+        if filename_owners_table_client is not None:
+            try:
+                filename_owners_table_client.delete_entity(partition_key=filename, row_key=library_id)
+            except Exception:
+                pass
         anonymous_id = str(row.get('anonymousImageId') or '').strip()
         if _is_filename_shared(filename, library_id):
             # Another library still references this content-addressed blob.
@@ -6761,7 +6806,8 @@ def _execute_library_clean(library_id: str) -> Dict:
             blobs_deleted += 1
 
     for client in (metadata_table_client, face_table_client, person_table_client,
-                   albums_table_client, merge_table_client, image_names_table_client):
+                   albums_table_client, merge_table_client, image_names_table_client,
+                   hash_index_table_client):
         if client is None:
             continue
         try:
@@ -10831,6 +10877,13 @@ def delete_multiple_photos():
                 removed_any = True
             except Exception as exc:
                 file_errors.append(f'metadata: {str(exc)}')
+            # Best-effort: drop this library's dedup/collision index rows too,
+            # so a deleted photo's hash/filename doesn't linger and confuse a
+            # later upload (detect_duplicates self-heals a stale hit anyway).
+            file_hash = str(metadata.get('fileHash') or '')
+            if file_hash:
+                delete_hash_index_entry(user_id, file_hash)
+            delete_filename_owner_entry(user_id, safe_name)
         elif not removed_any:
             errors.append(f'{safe_name}: Not found')
             continue
@@ -12911,7 +12964,7 @@ def filter_photos():
 
 
 # Guard other optional startup helpers to avoid import-time failures
-for _fn in ('create_blob_containers', 'create_metadata_table', 'create_albums_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_image_names_table'):
+for _fn in ('create_blob_containers', 'create_metadata_table', 'create_albums_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
     if _fn in globals() and callable(globals().get(_fn)):
         try:
             globals().get(_fn)()
