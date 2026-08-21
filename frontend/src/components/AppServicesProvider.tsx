@@ -877,7 +877,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         resolve: (value: any) => void;
         reject: (err: unknown) => void;
     }>>([]);
-    const batchInitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const batchInitDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const batchInitMaxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1432,19 +1433,35 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // Fresh (non-resumed) uploads register in chunks via /upload/init-batch
     // instead of one /upload/init HTTP round trip per file -- each of the
     // (up to ~20) concurrent upload lanes calls requestBatchedInit for its own
-    // file at roughly the same moment, so a short collection window naturally
-    // gathers a full chunk without the lanes needing to coordinate explicitly.
-    // Resumed uploads (existingUploadId already set) skip this and call
-    // postInitWithRetry directly -- see uploadFileInChunks.
+    // file at roughly the same moment. Resumed uploads (existingUploadId
+    // already set) skip this and call postInitWithRetry directly -- see
+    // uploadFileInChunks.
+    //
+    // Debounced with a hard cap, not a single fixed window: each lane only
+    // reaches this call after its own file finishes hashing (crypto.subtle),
+    // and hash time scales with file size -- a batch of files with varied
+    // sizes arrives staggered, not all at once. A single short fixed window
+    // (previously 30ms) closed before slower lanes' hashes finished, so most
+    // batches ended up size 1 in practice (confirmed live: every batch in a
+    // production HAR capture had exactly 1 file). Instead, every new arrival
+    // resets a short debounce (catches lanes finishing within a few ms of
+    // each other); a longer max-wait timer from the FIRST arrival guarantees
+    // the batch still flushes promptly even if requests keep trickling in
+    // one at a time rather than clustering.
     const INIT_BATCH_MAX_SIZE = 12;
-    const INIT_BATCH_WINDOW_MS = 30;
+    const INIT_BATCH_DEBOUNCE_MS = 50;
+    const INIT_BATCH_MAX_WAIT_MS = 250;
 
     const flushInitBatch = async () => {
         const batch = pendingBatchInitRef.current;
         pendingBatchInitRef.current = [];
-        if (batchInitTimerRef.current) {
-            clearTimeout(batchInitTimerRef.current);
-            batchInitTimerRef.current = null;
+        if (batchInitDebounceTimerRef.current) {
+            clearTimeout(batchInitDebounceTimerRef.current);
+            batchInitDebounceTimerRef.current = null;
+        }
+        if (batchInitMaxWaitTimerRef.current) {
+            clearTimeout(batchInitMaxWaitTimerRef.current);
+            batchInitMaxWaitTimerRef.current = null;
         }
         if (batch.length === 0) {
             return;
@@ -1472,8 +1489,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             pendingBatchInitRef.current.push({ filename, totalSize, sha256, resolve, reject });
             if (pendingBatchInitRef.current.length >= INIT_BATCH_MAX_SIZE) {
                 void flushInitBatch();
-            } else if (!batchInitTimerRef.current) {
-                batchInitTimerRef.current = setTimeout(() => { void flushInitBatch(); }, INIT_BATCH_WINDOW_MS);
+                return;
+            }
+            if (batchInitDebounceTimerRef.current) {
+                clearTimeout(batchInitDebounceTimerRef.current);
+            }
+            batchInitDebounceTimerRef.current = setTimeout(() => { void flushInitBatch(); }, INIT_BATCH_DEBOUNCE_MS);
+            if (!batchInitMaxWaitTimerRef.current) {
+                batchInitMaxWaitTimerRef.current = setTimeout(() => { void flushInitBatch(); }, INIT_BATCH_MAX_WAIT_MS);
             }
         })
     );
@@ -2447,7 +2470,22 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             await knownHashesPromise;
             await Promise.all(Array.from({ length: activeLaneCount }, () => worker()));
-            await Promise.allSettled(Array.from(parallelThumbnailTasks));
+            // Deliberately NOT awaited: parallelThumbnailTasks (the browser-side
+            // thumbnail claim/generate/report dance kicked off per-file above)
+            // used to gate "Upload complete" and clearing the persisted session
+            // on every file's client-processing report finishing -- observed at
+            // 33-37s each in production, so a batch of even a handful of files
+            // could leave the UI showing "uploading" long after every byte had
+            // actually transferred and been finalized. Each task already cleans
+            // up after itself (self-removes from the Set, releases its own
+            // processing lease in a finally) and reports failures gracefully, so
+            // there's nothing here that needs harvesting -- they keep running in
+            // the background exactly as before, just without blocking the
+            // upload-complete UI state on their completion. If a claimed lease is
+            // still in flight when the tab closes, it expires naturally and
+            // ipworker's already-queued fallback (see _queue_upload_processing)
+            // picks up that file's thumbnail instead -- the same fallback path
+            // that already handles any client-side thumbnail failure.
 
             if (uploadStopRequestedRef.current) {
                 const latest = uploadSessionRef.current || normalized;
