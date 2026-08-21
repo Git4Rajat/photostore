@@ -1334,11 +1334,23 @@ const detectFacesWithEmbeddings = async (sourceCanvas: HTMLCanvasElement): Promi
 };
 
 export const dataUrlToBlob = async (dataUrl: string): Promise<Blob> => {
-    const response = await fetch(dataUrl);
-    if (!response.ok) {
+    // Decoded locally rather than via fetch(dataUrl): fetching a data: URI is
+    // treated as a connect-src-governed request, which the app's CSP blocks.
+    const match = dataUrl.match(/^data:([^;,]*)(;base64)?,([\s\S]*)$/);
+    if (!match) {
         throw new Error('Failed to convert thumbnail data URL to blob.');
     }
-    return await response.blob();
+    const [, mimeType, isBase64, data] = match;
+    const contentType = mimeType || 'application/octet-stream';
+    if (isBase64) {
+        const byteString = atob(data);
+        const bytes = new Uint8Array(byteString.length);
+        for (let i = 0; i < byteString.length; i += 1) {
+            bytes[i] = byteString.charCodeAt(i);
+        }
+        return new Blob([bytes], { type: contentType });
+    }
+    return new Blob([decodeURIComponent(data)], { type: contentType });
 };
 
 export const readBlobArrayBuffer = (blob: Blob): Promise<ArrayBuffer> => {
