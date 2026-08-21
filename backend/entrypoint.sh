@@ -29,6 +29,14 @@ THREADS="${GUNICORN_THREADS:-2}"
 # keeps steady-state RSS well under the container limit.
 MAX_REQUESTS="${GUNICORN_MAX_REQUESTS:-400}"
 MAX_REQUESTS_JITTER="${GUNICORN_MAX_REQUESTS_JITTER:-50}"
+# With --workers 1, a max-requests recycle stops the sole worker from
+# accepting new connections until it either drains its in-flight request(s)
+# or graceful-timeout forces it out -- there is no second worker to cover the
+# gap, so this window is a full capacity-zero blackout (observed live: up to
+# ~120s, producing bursts of 503s). Bounded to 60s -- comfortably above the
+# ~33-37s average for the slowest known endpoint (/upload/client-processing)
+# so that request isn't routinely killed mid-flight, while capping the
+# outage far below the old 120s ceiling.
 exec gunicorn app:app \
     --bind 0.0.0.0:5000 \
     --workers "$WORKERS" \
@@ -37,5 +45,5 @@ exec gunicorn app:app \
     --max-requests "$MAX_REQUESTS" \
     --max-requests-jitter "$MAX_REQUESTS_JITTER" \
     --timeout 600 \
-    --graceful-timeout 120 \
+    --graceful-timeout 60 \
     --keep-alive 30
