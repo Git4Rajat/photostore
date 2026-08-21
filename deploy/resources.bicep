@@ -473,14 +473,23 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
         maxReplicas: 3
         rules: [
           {
-            // Default is 10 concurrent requests per replica, which fans out to
-            // extra replicas on every burst of small API calls. Each replica
-            // runs 1 worker x 4 threads on a 2.5Gi container; keep per-replica
-            // concurrency conservative to avoid memory spikes under media load.
+            // Was 15 (raised from KEDA's default 10 to avoid fanning out to
+            // extra replicas on every burst of small API calls). But each
+            // replica only runs 1 worker x 4 threads -- waiting for 15
+            // concurrent requests before adding capacity means 11 of them are
+            // already queued behind those 4 threads first. Confirmed live via
+            // HAR capture during a real upload burst: /upload/init, finalize,
+            // and even trivial /health calls were all taking 7-60s, almost
+            // entirely queueing time, not real work -- a handful of RAW-file
+            // requests (since fixed to no longer block synchronously, see
+            // finalize_uploaded_file) were holding all 4 threads for up to a
+            // minute each with no relief arriving. 8 (2x thread count) scales
+            // out sooner under real load while still absorbing a small burst
+            // of quick polling calls without fanning out for it.
             name: 'http-scaler'
             http: {
               metadata: {
-                concurrentRequests: '15'
+                concurrentRequests: '8'
               }
             }
           }
@@ -658,6 +667,15 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // worker's much longer window (that one is safe at 1800s only
             // because it's maxReplicas=1; this app is maxReplicas=4).
             { name: 'IPWORKER_VISIBILITY_TIMEOUT_SECONDS', value: '300' }
+            // Default (20s, see backend/app.py) is tuned for interactive
+            // backend requests. A single ipwork pass takes ~60-90s, so at the
+            // default TTL the per-photo people/face partition scan
+            // (_load_people_embedding_index, _load_user_face_summary_by_id)
+            // is cold again before the next photo -- every photo re-scans
+            // the full people/face tables instead of reusing the cache.
+            // Backend/worker keep the 20s default; only ipworker's per-photo
+            // cadence outlasts it.
+            { name: 'PEOPLE_SCAN_CACHE_TTL_SECONDS', value: '120' }
           ])
         }
       ]

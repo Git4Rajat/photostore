@@ -62,6 +62,8 @@ from storage_utils import (
     claim_processing_lease,
     heartbeat_processing_lease,
     reset_received_ranges,
+    reset_upload_tracking_and_reserve_blob,
+    reset_upload_tracking_and_reserve_blobs_batch,
     release_processing_lease,
     update_processing_status,
     upload_media_file,
@@ -1725,6 +1727,34 @@ def _require_library_context(require_auth: bool = False):
             return None, None, (jsonify({'error': 'You no longer have access to this library.'}), 403)
 
     return user_id, library_id, None
+
+
+def _is_safe_path_segment(name: str) -> bool:
+    """True if name is a bare path segment safe to use as a blob/metadata key
+    (no path traversal, separators, or null bytes)."""
+    if not name or name in ('.', '..'):
+        return False
+    if '/' in name or '\\' in name or '\x00' in name:
+        return False
+    return os.path.basename(name) == name
+
+
+def _validate_media_filename(filename: str) -> Optional[str]:
+    """Validate a user-supplied photo/video filename for use as a metadata
+    key. Returns the filename unchanged if it is safe (no path traversal)
+    and has an allowed extension, else None.
+
+    Deliberately does NOT use werkzeug's secure_filename() for this check:
+    secure_filename() strips leading '.'/'_' characters, which silently
+    mangles legitimate camera filenames such as Canon's "_MG_1234.CR3"
+    (the AdobeRGB-color-space naming convention), either rejecting them
+    outright (round-trip equality checks) or renaming them out from under
+    the caller (bare sanitize-and-continue call sites).
+    """
+    name = (filename or '').strip()
+    if not _is_safe_path_segment(name) or not allowed_file(name):
+        return None
+    return name
 
 
 def _require_user_id(require_auth: bool = False):
@@ -7032,8 +7062,8 @@ def proxy_thumbnail(filename: str):
     user_id, error = _require_user_id()
     if error:
         return error
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
 
     metadata_entity = _get_metadata_entity(user_id, safe_name)
@@ -7269,8 +7299,8 @@ def photo_access_url(kind: str, filename: str):
     user_id, error = _require_user_id()
     if error:
         return error
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
     metadata = _get_metadata_entity(user_id, safe_name)
     if not metadata:
@@ -7319,8 +7349,8 @@ def photo_access_url_batch():
     urls: Dict[str, str] = {}
     expires_at = ''
     for raw_name in filenames:
-        safe_name = secure_filename(str(raw_name or ''))
-        if not safe_name or not allowed_file(safe_name):
+        safe_name = _validate_media_filename(str(raw_name or ''))
+        if not safe_name:
             continue
         metadata = _get_metadata_entity(user_id, safe_name)
         if not metadata:
@@ -7536,8 +7566,8 @@ def proxy_preview(filename: str):
     user_id, error = _require_user_id()
     if error:
         return error
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
 
     preview_metadata = _get_metadata_entity(user_id, safe_name)
@@ -7606,8 +7636,8 @@ def proxy_image(filename: str):
     user_id, error = _require_user_id()
     if error:
         return error
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
 
     metadata_entity = _get_metadata_entity(user_id, safe_name)
@@ -7667,9 +7697,9 @@ def proxy_cover(filename: str):
     expected_hash = hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:16]
     if user_hash != expected_hash:
         return jsonify({'error': 'Not found'}), 404
-    safe_leaf = secure_filename(leaf)
-    if not safe_leaf or safe_leaf != leaf:
+    if not _is_safe_path_segment(leaf):
         return jsonify({'error': 'Invalid cover path'}), 400
+    safe_leaf = leaf
 
     cover_blob = f'{user_hash}/{safe_leaf}'
     try:
@@ -9230,11 +9260,11 @@ def init_upload():
     if blocked:
         return jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
     data = request.get_json(silent=True) or {}
-    filename = secure_filename(data.get('filename', ''))
+    filename = _validate_media_filename(data.get('filename', ''))
     total_size = int(data.get('totalSize', 0))
     expected_hash = (data.get('sha256') or '').strip()
 
-    if not filename or not allowed_file(filename):
+    if not filename:
         return jsonify({'error': 'Invalid filename'}), 400
     if total_size <= 0:
         return jsonify({'error': 'Invalid totalSize'}), 400
@@ -9243,13 +9273,10 @@ def init_upload():
 
     upload_id = secure_filename(str(data.get('uploadId') or '')) or str(uuid.uuid4())
     direct = bool(data.get('directToBlob'))
-    if not data.get('uploadId'):
+    is_fresh_upload = not data.get('uploadId')
+    if is_fresh_upload:
         try:
             _cleanup_failed_upload(user_id, filename)
-        except Exception:
-            pass
-        try:
-            reset_received_ranges(user_id, filename, total_size, expected_hash or None)
         except Exception:
             pass
 
@@ -9258,11 +9285,28 @@ def init_upload():
     # the browser keeps staging blocks to the same blob — a fresh UUID per call
     # would orphan already-staged blocks (InvalidBlockList) and break retry/resume.
     anonymous_blob_name = None
-    if direct:
+    if is_fresh_upload and direct:
+        # Fast path for the common case (new upload, direct-to-blob): one read
+        # + one write against the metadata row instead of reset_received_ranges
+        # and reserve_pending_anonymous_blob each separately re-reading and
+        # re-writing it (was 2 reads + 2 writes here alone).
         try:
-            anonymous_blob_name = reserve_pending_anonymous_blob(user_id, filename)
+            anonymous_blob_name = reset_upload_tracking_and_reserve_blob(
+                user_id, filename, total_size, expected_hash or None,
+            )
         except Exception:
-            app.logger.debug('Failed to reserve anonymous blob name for %s', filename)
+            app.logger.debug('Failed to reset tracking / reserve anonymous blob name for %s', filename)
+    else:
+        if is_fresh_upload:
+            try:
+                reset_received_ranges(user_id, filename, total_size, expected_hash or None)
+            except Exception:
+                pass
+        if direct:
+            try:
+                anonymous_blob_name = reserve_pending_anonymous_blob(user_id, filename)
+            except Exception:
+                app.logger.debug('Failed to reserve anonymous blob name for %s', filename)
 
     blob_url = None
     expires_at = None
@@ -9292,6 +9336,116 @@ def init_upload():
         'thumbnailSasExpiresAt': thumbnail_sas_expires_at,
         'totalSize': total_size,
     })
+
+
+MAX_INIT_BATCH_FILES = 20
+
+
+@app.route('/upload/init-batch', methods=['POST'])
+@app.route('/upload/init-batch/', methods=['POST'])
+@app.route('/api/upload/init-batch', methods=['POST'])
+@app.route('/api/upload/init-batch/', methods=['POST'])
+def init_upload_batch():
+    """Batched /upload/init for a chunk of new (non-resumed) direct-to-blob
+    uploads: one Azure Table query + one transactional batch write for the
+    whole chunk, instead of a read + write PER FILE (see
+    reset_upload_tracking_and_reserve_blobs_batch). Meant to be called once
+    per ~10-15-file chunk from the frontend, not once per file.
+
+    Scoped to fresh, direct-to-blob uploads only -- deliberately simpler than
+    single-file /upload/init: no per-file _cleanup_failed_upload rare-path
+    handling (re-uploading a filename that was already fully completed
+    before, without deleting the old photo first, is rare enough that the
+    frontend falls back to single-file /upload/init for resumes and any
+    retried file anyway). Every entry must be a genuinely new upload -- pass
+    a client-supplied uploadId through single-file /upload/init instead.
+    """
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    blocked = _library_cleanup_block_reason(user_id)
+    if blocked:
+        return jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
+    data = request.get_json(silent=True) or {}
+    files = data.get('files')
+    if not isinstance(files, list) or not files:
+        return jsonify({'error': 'files must be a non-empty list'}), 400
+    if len(files) > MAX_INIT_BATCH_FILES:
+        return jsonify({'error': f'Batch too large (max {MAX_INIT_BATCH_FILES} files)'}), 400
+
+    parsed = []
+    for idx, item in enumerate(files):
+        if not isinstance(item, dict):
+            parsed.append({'index': idx, 'error': 'Invalid file entry'})
+            continue
+        filename = _validate_media_filename(item.get('filename', ''))
+        total_size = int(item.get('totalSize', 0) or 0)
+        expected_hash = str(item.get('sha256') or '').strip()
+        if not filename:
+            parsed.append({'index': idx, 'error': 'Invalid filename'})
+            continue
+        if total_size <= 0 or total_size > MAX_UPLOAD_FILE_BYTES:
+            parsed.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
+            continue
+        parsed.append({
+            'index': idx,
+            'filename': filename,
+            'total_size': total_size,
+            'expected_hash': expected_hash,
+            'upload_id': str(uuid.uuid4()),
+        })
+
+    valid = [p for p in parsed if 'error' not in p]
+    anonymous_blob_names: Dict[str, str] = {}
+    if valid:
+        try:
+            anonymous_blob_names = reset_upload_tracking_and_reserve_blobs_batch(
+                user_id,
+                [
+                    {
+                        'filename': p['filename'],
+                        'total_size': p['total_size'],
+                        'expected_hash': p['expected_hash'] or None,
+                        'is_fresh': True,
+                    }
+                    for p in valid
+                ],
+            )
+        except Exception:
+            app.logger.exception('Batch upload-tracking reservation failed for %s files', len(valid))
+
+    results = []
+    for p in parsed:
+        if 'error' in p:
+            results.append({'index': p['index'], 'filename': p.get('filename'), 'error': p['error']})
+            continue
+        filename = p['filename']
+        anonymous_blob_name = anonymous_blob_names.get(filename)
+        try:
+            blob_url, expires_at = _create_direct_upload_blob_url(anonymous_blob_name or filename)
+        except Exception as exc:
+            results.append({'index': p['index'], 'filename': filename, 'error': 'Direct upload is not configured', 'detail': str(exc)})
+            continue
+        thumbnail_blob_url = None
+        thumbnail_sas_expires_at = None
+        try:
+            thumbnail_blob_url, thumbnail_sas_expires_at = _create_direct_thumbnail_upload_blob_url(anonymous_blob_name or filename)
+        except Exception:
+            pass
+        results.append({
+            'index': p['index'],
+            'filename': filename,
+            'uploadId': p['upload_id'],
+            'uploadUrl': f"/upload/{p['upload_id']}?filename={filename}",
+            'blobUrl': blob_url,
+            'thumbnailBlobUrl': thumbnail_blob_url,
+            'blobName': anonymous_blob_name or filename,
+            'originalFilename': filename,
+            'sasExpiresAt': expires_at,
+            'thumbnailSasExpiresAt': thumbnail_sas_expires_at,
+            'totalSize': p['total_size'],
+        })
+    return jsonify({'results': results})
 
 
 def _create_blob_sas_url(
@@ -9502,10 +9656,10 @@ def finalize_direct_upload():
     if blocked:
         return jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
     data = request.get_json(silent=True) or {}
-    filename = secure_filename(data.get('filename', ''))
+    filename = _validate_media_filename(data.get('filename', ''))
     total_size = int(data.get('totalSize', 0) or 0)
     content_type = str(data.get('contentType') or 'application/octet-stream')
-    if not filename or not allowed_file(filename):
+    if not filename:
         return jsonify({'error': 'Invalid filename'}), 400
     if total_size <= 0 or total_size > MAX_UPLOAD_FILE_BYTES:
         return jsonify({'error': 'Invalid totalSize'}), 400
@@ -9608,8 +9762,8 @@ def upload_client_processing_results():
     if blocked:
         return jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
     data = request.get_json(silent=True) or {}
-    filename = secure_filename(data.get('filename', ''))
-    if not filename or not allowed_file(filename):
+    filename = _validate_media_filename(data.get('filename', ''))
+    if not filename:
         return jsonify({'error': 'Invalid filename'}), 400
     try:
         metadata = apply_client_processing_results_for_file(
@@ -9900,7 +10054,7 @@ def upload_processing_claim():
     if error:
         return error
     data = request.get_json(silent=True) or {}
-    filename = secure_filename(str(data.get('filename') or ''))
+    filename = _validate_media_filename(str(data.get('filename') or '')) or ''
     if not filename:
         return jsonify({'error': 'Missing filename'}), 400
     lease_owner = str(data.get('leaseId') or data.get('ownerId') or f'browser-{uuid.uuid4()}').strip()
@@ -9939,7 +10093,7 @@ def upload_processing_heartbeat():
     if error:
         return error
     data = request.get_json(silent=True) or {}
-    filename = secure_filename(str(data.get('filename') or ''))
+    filename = _validate_media_filename(str(data.get('filename') or '')) or ''
     lease_id = str(data.get('leaseId') or '')
     try:
         lease = heartbeat_processing_lease(user_id, filename, lease_id, lease_seconds=120)
@@ -9957,7 +10111,7 @@ def upload_processing_release():
     if error:
         return error
     data = request.get_json(silent=True) or {}
-    filename = secure_filename(str(data.get('filename') or ''))
+    filename = _validate_media_filename(str(data.get('filename') or '')) or ''
     lease_id = str(data.get('leaseId') or '')
     release_processing_lease(user_id, filename, lease_id)
     return jsonify({'ok': True})
@@ -10157,8 +10311,8 @@ def cancel_uploads():
             continue
 
         original_name = str(item.get('filename') or '')
-        safe_name = secure_filename(original_name)
-        if not safe_name or safe_name != original_name or not allowed_file(safe_name):
+        safe_name = _validate_media_filename(original_name)
+        if not safe_name:
             errors.append({'filename': original_name or '<unknown>', 'error': 'Invalid filename'})
             continue
 
@@ -10282,7 +10436,9 @@ def photos_processing_status():
     if error:
         return error
     raw_filenames = request.args.get('filenames', '')
-    filenames = [secure_filename(name.strip()) for name in raw_filenames.split(',') if name.strip()][:100]
+    filenames = [
+        f for f in (_validate_media_filename(name.strip()) for name in raw_filenames.split(',') if name.strip()) if f
+    ][:100]
     statuses: Dict[str, Dict] = {}
     for filename in filenames:
         entity = _get_metadata_entity(user_id, filename)
@@ -10311,8 +10467,8 @@ def lookup_photo(filename: str):
     user_id, error = _require_user_id()
     if error:
         return error
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
     metadata = _get_metadata_entity(user_id, safe_name)
     if not metadata:
@@ -10407,8 +10563,8 @@ def clear_corrupted_upload(filename: str):
     user_id, error = _require_user_id()
     if error:
         return error
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
 
     metadata = _get_metadata_entity(user_id, safe_name)
@@ -10604,8 +10760,8 @@ def photos_metadata():
 
     metadata = {}
     for filename in filenames:
-        safe_name = secure_filename(filename)
-        if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+        safe_name = _validate_media_filename(filename)
+        if not safe_name:
             metadata[filename] = {'error': 'Invalid filename'}
             continue
 
@@ -10833,8 +10989,8 @@ def delete_multiple_photos():
     valid_names = []
     seen = set()
     for filename in filenames:
-        safe_name = secure_filename(filename)
-        if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+        safe_name = _validate_media_filename(filename)
+        if not safe_name:
             errors.append(f'{filename}: Invalid filename')
             continue
         if safe_name in seen:
@@ -11108,8 +11264,8 @@ def add_photos_to_album(album_id: str):
     added = []
     errors = []
     for filename in filenames:
-        safe = secure_filename(str(filename))
-        if not safe or not allowed_file(safe) or safe != filename:
+        safe = _validate_media_filename(str(filename))
+        if not safe:
             errors.append(f'{filename}: Invalid filename')
             continue
         if not _get_metadata_entity(user_id, safe):
@@ -11897,8 +12053,8 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
     if not user_id:
         return
     if job_type == PREVIEW_JOB_TYPE:
-        filename = secure_filename(str(payload.get('filename') or ''))
-        if not filename or not allowed_file(filename):
+        filename = _validate_media_filename(str(payload.get('filename') or ''))
+        if not filename:
             if job_id:
                 _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'failed', error='invalid filename')
             return
@@ -12509,8 +12665,8 @@ def public_thumbnail(token: str, filename: str):
         return jsonify({'error': 'Not found'}), 404
     if not _album_grant_valid(entity, token):
         return jsonify({'error': 'Not found'}), 404
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
     if safe_name not in _album_filenames(entity):
         return jsonify({'error': 'Not found'}), 404
@@ -12549,8 +12705,8 @@ def public_image(token: str, filename: str):
         return jsonify({'error': 'Not found'}), 404
     if not _album_grant_valid(entity, token):
         return jsonify({'error': 'Not found'}), 404
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
     if safe_name not in _album_filenames(entity):
         return jsonify({'error': 'Not found'}), 404
@@ -12588,8 +12744,8 @@ def public_preview(token: str, filename: str):
         return jsonify({'error': 'Not found'}), 404
     if not _album_grant_valid(entity, token):
         return jsonify({'error': 'Not found'}), 404
-    safe_name = secure_filename(filename)
-    if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
     if safe_name not in _album_filenames(entity):
         return jsonify({'error': 'Not found'}), 404
@@ -12768,8 +12924,8 @@ def set_photo_rating(filename: str):
         return jsonify({'error': 'Rating must be between 0 and 5'}), 400
 
     try:
-        safe_name = secure_filename(filename)
-        if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+        safe_name = _validate_media_filename(filename)
+        if not safe_name:
             return jsonify({'error': 'Invalid filename'}), 400
         metadata = _get_metadata_entity(user_id, safe_name)
         if not metadata:
@@ -12790,8 +12946,8 @@ def toggle_like_photo(filename: str):
         return error
 
     try:
-        safe_name = secure_filename(filename)
-        if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+        safe_name = _validate_media_filename(filename)
+        if not safe_name:
             return jsonify({'error': 'Invalid filename'}), 400
         metadata = _get_metadata_entity(user_id, safe_name)
         if not metadata:
@@ -12832,8 +12988,8 @@ def set_photo_rotation(filename: str):
     rotation = _normalize_rotation(data.get('rotation', 0))
 
     try:
-        safe_name = secure_filename(filename)
-        if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+        safe_name = _validate_media_filename(filename)
+        if not safe_name:
             return jsonify({'error': 'Invalid filename'}), 400
         metadata = _get_metadata_entity(user_id, safe_name)
         if not metadata:
@@ -12860,8 +13016,8 @@ def get_photo_metadata(filename: str):
         return error
 
     try:
-        safe_name = secure_filename(filename)
-        if not safe_name or not allowed_file(safe_name) or safe_name != filename:
+        safe_name = _validate_media_filename(filename)
+        if not safe_name:
             return jsonify({'error': 'Invalid filename'}), 400
         metadata = _get_metadata_entity(user_id, safe_name)
         if not metadata:

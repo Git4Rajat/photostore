@@ -15,8 +15,10 @@ const setMatchMedia = (matches: { mobile?: boolean; coarse?: boolean }) => {
     })) as unknown as typeof window.matchMedia;
 };
 
-const setResourceTiming = (entries: Array<{ transferSize: number; requestStart: number; responseEnd: number }>) => {
-    vi.spyOn(performance, 'getEntriesByType').mockReturnValue(entries as unknown as PerformanceEntryList);
+const setResourceTiming = (entries: Array<{ transferSize: number; requestStart: number; responseEnd: number; startTime?: number }>) => {
+    vi.spyOn(performance, 'getEntriesByType').mockReturnValue(
+        entries.map((e) => ({ startTime: 0, ...e })) as unknown as PerformanceEntryList,
+    );
 };
 
 const bigFile = (size: number) => [{ size }];
@@ -50,6 +52,39 @@ describe('getAdaptiveUploadProfile', () => {
         expect(profile.reason).toMatch(/reliable wired/);
     });
 
+    it('reaches the top tier on good downlink+rtt even when connection.type is unreported (typical desktop Chrome)', () => {
+        // Chrome only has "partial support" for connection.type and commonly
+        // reports it as empty/'unknown' even on a real wired/wifi connection --
+        // the top tier must not silently require it.
+        setConnection({ downlink: 50, rtt: 20, type: '' });
+        setMatchMedia({});
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB));
+        expect(profile.fileParallelism).toBe(20);
+    });
+
+    it('lets a recent observed transfer raise a live but conservative connection.downlink reading', () => {
+        // Chrome's downlink is a coarse, traffic-history-based NQE estimate that
+        // can under-report an idle-but-fast link; a recent real transfer should
+        // be allowed to override it upward (never downward).
+        setConnection({ downlink: 5, rtt: 20, type: '' });
+        setMatchMedia({});
+        setResourceTiming([{ transferSize: 20 * MB, requestStart: 0, responseEnd: 1000, startTime: 0 }]);
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB));
+        expect(profile.fileParallelism).toBe(20);
+    });
+
+    it('ignores a stale observed transfer when a live connection.downlink reading disagrees', () => {
+        // An old Resource Timing entry (e.g. from a fast wifi network before the
+        // user switched to slow cellular) must not override a live, low, and now
+        // -correct downlink reading.
+        setConnection({ downlink: 1, rtt: 20, type: '' });
+        setMatchMedia({});
+        setResourceTiming([{ transferSize: 20 * MB, requestStart: -120_000, responseEnd: -119_000, startTime: -120_000 }]);
+        vi.spyOn(performance, 'now').mockReturnValue(0);
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB));
+        expect(profile.reason).toBe('high latency or congested network');
+    });
+
     it('uses a lower ceiling for large files even on a fast connection', () => {
         setConnection({ downlink: 50, rtt: 20, type: 'wifi' });
         setMatchMedia({});
@@ -63,7 +98,7 @@ describe('getAdaptiveUploadProfile', () => {
         setResourceTiming([{ transferSize: 20 * MB, requestStart: 0, responseEnd: 1000 }]); // ~160Mbps observed
         const profile = getAdaptiveUploadProfile(bigFile(1 * MB), { measuredRttMs: 40 });
         expect(profile.fileParallelism).toBe(20);
-        expect(profile.reason).toMatch(/measured round trip/);
+        expect(profile.reason).toMatch(/fast connection \(measured\)/);
     });
 
     it('does not use a slow measured RTT as evidence of a bad connection', () => {

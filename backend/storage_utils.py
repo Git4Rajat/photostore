@@ -1929,9 +1929,10 @@ def _client_report_needs_server_exif_fallback(report: List[Dict]) -> bool:
 def _client_report_needs_server_thumbnail_fallback(report: List[Dict]) -> bool:
     # Deliberately excludes 'skipped': that status is only ever reported for
     # RAW/video (see rawFallback / createVideoBrowserThumbnail in
-    # PhotoGallery.tsx), formats that already get an eager server thumbnail at
-    # finalize time via _upload_needs_server_bytes, so re-triggering here would
-    # just redo identical, already-attempted work.
+    # PhotoGallery.tsx), formats that never attempt a client-side thumbnail at
+    # all and instead rely on ipworker's queued 'thumbnail' step (video also
+    # still gets an eager one at finalize time -- see finalize_uploaded_file).
+    # Re-triggering here would just redo work ipworker already has queued.
     for item in report:
         if str(item.get('step') or '').strip() != 'thumbnail':
             continue
@@ -2654,23 +2655,6 @@ def apply_client_processing_results_for_file(
     return metadata
 
 
-def _upload_needs_server_bytes(filename: str) -> bool:
-    """True when the backend must eagerly read the uploaded bytes at finalize
-    time to do work the browser cannot: server-side thumbnails for video/RAW
-    (video needs metadata extraction regardless, and RAW decode success in the
-    browser is inconsistent enough to still generate one eagerly) and video
-    metadata. HEIC/HEIF thumbnails are decoded reliably in the browser now (see
-    heicDecodeWorker.ts); if that fails for a specific file, the backend only
-    steps in reactively once the client reports the failure -- see
-    _client_report_needs_server_thumbnail_fallback -- instead of always paying
-    for a re-download + decode that's usually unnecessary.
-    """
-    if is_video_file(filename):
-        return True
-    ext = _filename_extension(filename)
-    return ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA
-
-
 def finalize_uploaded_file(
     user_id: str,
     filename: str,
@@ -2701,7 +2685,15 @@ def finalize_uploaded_file(
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
 
-    needs_server_bytes = _upload_needs_server_bytes(filename)
+    # Only video still needs eager bytes here (for the metadata extraction
+    # below). RAW used to be lumped in with video via _upload_needs_server_bytes
+    # -- forcing a blob re-download + synchronous decode inside this HTTP
+    # request even when the browser already sent a trustworthy hash -- but
+    # RAW's thumbnail/EXIF work is redundant with what ipworker's queued
+    # 'thumbnail'/'exif' steps already do for every upload (see
+    # _queue_upload_processing below), so there's no reason to also do it here,
+    # synchronously, on one of the backend's few gunicorn threads.
+    is_video = is_video_file(filename)
     blob_to_read = anonymous_blob_name or filename
 
     # The browser sends the file's hex SHA-256 (same algorithm and bytes as the
@@ -2709,7 +2701,7 @@ def finalize_uploaded_file(
     # Fall back to reading the blob when there is no client hash to trust.
     image_bytes: Optional[bytes] = None
     client_hash = str(client_sha256 or '')
-    if needs_server_bytes or not client_hash:
+    if is_video or not client_hash:
         image_bytes = download_media_bytes('image', blob_to_read)
         file_hash = hashlib.sha256(image_bytes).hexdigest()
     else:
@@ -2783,34 +2775,35 @@ def finalize_uploaded_file(
     except Exception:
         pass
 
-    # Server-side thumbnail / video metadata — only for formats the browser can't
-    # handle, using the bytes we already had to download for them.
-    if needs_server_bytes and image_bytes is not None:
+    # Server-side thumbnail / metadata extraction, eagerly, here -- video only.
+    # RAW used to get this treatment too, but it's redundant: ipworker's queued
+    # 'thumbnail'/'exif' steps (_queue_upload_processing, below) call the exact
+    # same helpers for every uploaded photo, including RAW, so doing it again
+    # here just duplicated the work while holding a gunicorn thread for as long
+    # as the RAW decode took (measured multi-second to ~60s on real CR3 files).
+    # RAW capture dates and thumbnails now show up whenever ipworker gets to
+    # them instead of instantly -- an intentional trade (see the "own highway"
+    # discussion): correctness-only background work no longer blocks the
+    # upload-critical path.
+    if file_is_video and image_bytes is not None:
         try:
             thumbnail_bytes = _create_server_thumbnail_for_upload(image_bytes, final_filename)
             if thumbnail_bytes:
                 # Use anonymous ID for thumbnail if image was anonymized
                 thumbnail_blob_name = metadata.get('anonymousImageId') or final_filename
                 upload_media_file('thumbnail', thumbnail_blob_name, thumbnail_bytes, 'image/jpeg')
-                thumbnail_reason = 'video_browser_unsupported' if file_is_video else 'raw_browser_unsupported'
                 mark_step_done(user_id, final_filename, 'thumbnail', result={
                     'source': 'server',
-                    'reason': thumbnail_reason,
+                    'reason': 'video_browser_unsupported',
                 })
         except Exception:
             pass
-        # Also extract EXIF eagerly here, for the same reason as the thumbnail
-        # above: RAW capture dates otherwise depend entirely on best-effort
-        # client-side parsing that may run much later (it's deferred until the
-        # browser AI model loads, see startBrowserProcessing) or never, which
-        # left RAW photos sorting by upload date -- i.e. as "just captured" --
-        # until that eventually caught up.
         try:
             _finalize_server_side_exif(
                 user_id,
                 final_filename,
                 image_bytes,
-                fallback_for='video_upload' if file_is_video else 'raw_upload',
+                fallback_for='video_upload',
             )
         except Exception:
             pass
@@ -3142,5 +3135,109 @@ def reset_received_ranges(user_id: str, filename: str, total_size: int, expected
     if expected_hash:
         entity['upload_sha256_expected'] = expected_hash
     metadata_table_client.upsert_entity(entity)
+
+
+def reset_upload_tracking_and_reserve_blob(
+    user_id: str,
+    filename: str,
+    total_size: int,
+    expected_hash: Optional[str] = None,
+) -> Optional[str]:
+    """Fresh-upload version of /upload/init's per-file bookkeeping: does the
+    combined work of reset_received_ranges() + reserve_pending_anonymous_blob()
+    against a single fetch of the metadata row instead of each function
+    re-reading (and re-writing) it separately. Those two still exist standalone
+    for their own tests/callers; this is just the fast path for the common
+    case (a brand-new upload, not a resume) where both need to run back to
+    back on the same row anyway.
+    """
+    _require_context()
+    metadata_table_client = _CTX['metadata_table_client']
+    if not user_id or not filename:
+        return None
+    try:
+        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+    except Exception:
+        entity = {'PartitionKey': user_id, 'RowKey': filename}
+
+    entity['received_ranges'] = json.dumps([])
+    entity['upload_total_size'] = total_size
+    entity['upload_started_at'] = datetime.now(timezone.utc).isoformat()
+    if expected_hash:
+        entity['upload_sha256_expected'] = expected_hash
+
+    existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or entity.get('anonymousImageId') or '').strip()
+    anonymous_blob_name = existing or _generate_anonymous_id()
+    entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
+
+    try:
+        metadata_table_client.upsert_entity(entity)
+    except Exception:
+        return anonymous_blob_name
+    return anonymous_blob_name
+
+
+def reset_upload_tracking_and_reserve_blobs_batch(
+    user_id: str,
+    files: List[Dict[str, object]],
+) -> Dict[str, str]:
+    """Batched version of reset_upload_tracking_and_reserve_blob for
+    /upload/init-batch: one query to fetch every existing row for this chunk
+    of filenames, one transactional batch write to commit all of them --
+    instead of a read + write PER FILE. Meant to be called once per ~10-15
+    file chunk, not once per file.
+
+    `files` is a list of {'filename', 'total_size', 'expected_hash', 'is_fresh'}
+    dicts (all for the same user_id/partition, which submit_transaction
+    requires). Returns {filename: anonymous_blob_name}.
+    """
+    _require_context()
+    metadata_table_client = _CTX['metadata_table_client']
+    if not user_id or not files:
+        return {}
+
+    filenames = [str(f['filename']) for f in files]
+    existing_by_name: Dict[str, Dict] = {}
+    or_clause = ' or '.join(f"RowKey eq '{_escape_odata(name)}'" for name in filenames)
+    try:
+        rows = metadata_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and ({or_clause})"
+        )
+        for row in rows:
+            existing_by_name[str(row.get('RowKey') or '')] = dict(row)
+    except Exception:
+        existing_by_name = {}
+
+    anonymous_blob_names: Dict[str, str] = {}
+    operations = []
+    for f in files:
+        filename = str(f['filename'])
+        entity = existing_by_name.get(filename) or {'PartitionKey': user_id, 'RowKey': filename}
+        if f.get('is_fresh'):
+            entity['received_ranges'] = json.dumps([])
+            entity['upload_total_size'] = f['total_size']
+            entity['upload_started_at'] = datetime.now(timezone.utc).isoformat()
+            if f.get('expected_hash'):
+                entity['upload_sha256_expected'] = f['expected_hash']
+
+        existing_blob = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or entity.get('anonymousImageId') or '').strip()
+        anonymous_blob_name = existing_blob or _generate_anonymous_id()
+        entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
+        anonymous_blob_names[filename] = anonymous_blob_name
+        operations.append(('upsert', entity))
+
+    try:
+        metadata_table_client.submit_transaction(operations)
+    except Exception:
+        # A transaction is all-or-nothing -- if the batch itself failed (rare:
+        # a real Azure error, not an app bug), fall back to committing each
+        # entity individually so this chunk's files still work, just without
+        # the round-trip savings for this one chunk.
+        for _, entity in operations:
+            try:
+                metadata_table_client.upsert_entity(entity)
+            except Exception:
+                pass
+    return anonymous_blob_names
 
 

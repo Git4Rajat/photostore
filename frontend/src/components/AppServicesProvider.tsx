@@ -774,6 +774,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const [notifications, setNotifications] = useState<AppNotification[]>([]);
     const [uploading, setUploading] = useState<boolean>(false);
     const [pendingUploadSession, setPendingUploadSession] = useState<PersistedUploadSession | null>(null);
+    // Live mirror of pendingUploadSession for startUpload's re-entrancy guard.
+    // React-state closures go stale inside a long async chain (e.g.
+    // handleUploadSelection awaits retryPersistedUploadSession -- which clears
+    // pendingUploadSession via setState -- then calls startUpload for files
+    // that weren't part of the paused session; that startUpload closure was
+    // created before the clear, so the plain state variable would still read
+    // the OLD truthy session and wrongly bail with "Upload already starting").
+    const pendingUploadSessionRef = useRef<PersistedUploadSession | null>(null);
+    useEffect(() => {
+        pendingUploadSessionRef.current = pendingUploadSession;
+    }, [pendingUploadSession]);
     const [browserAiModelState, setBrowserAiModelState] = useState<SharedBrowserAiModelState>({
         status: 'checking',
         modelAvailability: 'skipped',
@@ -857,6 +868,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // just backend compute. Grown (never cleared) as files finish uploading, so
     // within-batch duplicates are caught without a second network round trip.
     const knownHashesRef = useRef<Map<string, string>>(new Map());
+    // Coalesces concurrent /upload/init calls (one per upload lane) into
+    // /upload/init-batch requests -- see requestBatchedInit below.
+    const pendingBatchInitRef = useRef<Array<{
+        filename: string;
+        totalSize: number;
+        sha256: string;
+        resolve: (value: any) => void;
+        reject: (err: unknown) => void;
+    }>>([]);
+    const batchInitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1333,6 +1354,32 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         sha256ArrayBuffer(await readBlobArrayBuffer(file))
     );
 
+    // GET analogue of postUploadWithRetry below: /upload/known-hashes can hit
+    // the same cold-start 502/503 as init/finalize (the backend scales to
+    // zero), and without a retry here that would silently disable client-side
+    // dedup for the WHOLE batch instead of just costing one extra round trip.
+    const getUploadWithRetry = async <T = any>(url: string): Promise<T> => {
+        let lastError: unknown = null;
+        for (let attempt = 0; attempt < MAX_FINALIZE_RETRIES; attempt += 1) {
+            if (uploadStopRequestedRef.current) {
+                throw new Error(UPLOAD_STOPPED_ERROR);
+            }
+            try {
+                return await getUpload<T>(url);
+            } catch (err) {
+                lastError = err;
+                if (!isRetriableUploadError(err)) {
+                    break;
+                }
+                if (!navigator.onLine) {
+                    await waitForOnline();
+                }
+                await sleep(Math.min(1000 * Math.pow(2, attempt), 15000));
+            }
+        }
+        throw lastError || new Error(`Request to ${url} failed.`);
+    };
+
     // Best-effort prefetch of the library's dedup index (see backend
     // list_known_file_hashes), merged into knownHashesRef so uploadFileInChunks
     // can skip a known duplicate before staging a single byte. A failed/slow
@@ -1341,7 +1388,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // correctness never depends on this succeeding.
     const fetchKnownHashes = async (): Promise<void> => {
         try {
-            const response = await getUpload<{ hashes?: Record<string, string> }>('/upload/known-hashes');
+            const response = await getUploadWithRetry<{ hashes?: Record<string, string> }>('/upload/known-hashes');
             const hashes = response?.hashes;
             if (hashes && typeof hashes === 'object') {
                 for (const [hash, filename] of Object.entries(hashes)) {
@@ -1381,6 +1428,55 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     };
     const postInitWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/init', payload, signal);
     const postFinalizeWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/finalize', payload, signal);
+
+    // Fresh (non-resumed) uploads register in chunks via /upload/init-batch
+    // instead of one /upload/init HTTP round trip per file -- each of the
+    // (up to ~20) concurrent upload lanes calls requestBatchedInit for its own
+    // file at roughly the same moment, so a short collection window naturally
+    // gathers a full chunk without the lanes needing to coordinate explicitly.
+    // Resumed uploads (existingUploadId already set) skip this and call
+    // postInitWithRetry directly -- see uploadFileInChunks.
+    const INIT_BATCH_MAX_SIZE = 12;
+    const INIT_BATCH_WINDOW_MS = 30;
+
+    const flushInitBatch = async () => {
+        const batch = pendingBatchInitRef.current;
+        pendingBatchInitRef.current = [];
+        if (batchInitTimerRef.current) {
+            clearTimeout(batchInitTimerRef.current);
+            batchInitTimerRef.current = null;
+        }
+        if (batch.length === 0) {
+            return;
+        }
+        try {
+            const response = await postUploadWithRetry('/upload/init-batch', {
+                files: batch.map(({ filename, totalSize, sha256 }) => ({ filename, totalSize, sha256 })),
+            });
+            const results = Array.isArray(response?.results) ? response.results : [];
+            batch.forEach((req, index) => {
+                const result = results[index];
+                if (result && !result.error) {
+                    req.resolve(result);
+                } else {
+                    req.reject(new Error(result?.error || 'Batch init failed for this file.'));
+                }
+            });
+        } catch (err) {
+            batch.forEach((req) => req.reject(err));
+        }
+    };
+
+    const requestBatchedInit = (filename: string, totalSize: number, sha256: string): Promise<any> => (
+        new Promise((resolve, reject) => {
+            pendingBatchInitRef.current.push({ filename, totalSize, sha256, resolve, reject });
+            if (pendingBatchInitRef.current.length >= INIT_BATCH_MAX_SIZE) {
+                void flushInitBatch();
+            } else if (!batchInitTimerRef.current) {
+                batchInitTimerRef.current = setTimeout(() => { void flushInitBatch(); }, INIT_BATCH_WINDOW_MS);
+            }
+        })
+    );
 
     const startBrowserProcessing = useCallback(async (options: BrowserProcessingStartOptions = {}) => {
         if (browserProcessingStartInFlightRef.current) {
@@ -1912,13 +2008,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // so a failed upload can't leave its content permanently unclaimed.
         knownHashesRef.current.set(sha256, file.name);
         try {
-            const initResponse = await postInitWithRetry({
-                filename: file.name,
-                totalSize: file.size,
-                sha256,
-                directToBlob: true,
-                uploadId: options?.existingUploadId,
-            }, options?.signal);
+            // Resumes carry an existing uploadId and must go straight to
+            // single-file /upload/init (it needs to reuse the SAME reserved
+            // blob/uploadId, which /upload/init-batch doesn't support -- see
+            // its docstring). Fresh uploads coalesce into /upload/init-batch.
+            const initResponse = options?.existingUploadId
+                ? await postInitWithRetry({
+                    filename: file.name,
+                    totalSize: file.size,
+                    sha256,
+                    directToBlob: true,
+                    uploadId: options.existingUploadId,
+                }, options?.signal)
+                : await requestBatchedInit(file.name, file.size, sha256);
             if (typeof initResponse?.uploadId === 'string' && initResponse.uploadId) {
                 options?.onUploadInitialized?.(initResponse.uploadId);
             }
@@ -2456,38 +2558,52 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         && file.lastModified === meta.lastModified
     );
 
-    const attachSelectedFilesToPendingSession = useCallback(async (selectedFiles: File[]): Promise<number> => {
+    const attachSelectedFilesToPendingSession = useCallback(async (
+        selectedFiles: File[],
+    ): Promise<{ matchedCount: number; unmatchedFiles: File[] }> => {
         const session = pendingUploadSession || loadPersistedSession();
         if (!session) {
-            return 0;
+            return { matchedCount: 0, unmatchedFiles: selectedFiles };
         }
 
         const matchedKeys = new Set<string>();
         let matchedCount = 0;
         const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
+        const doneFiles = session.files.filter((file) => file.status === 'done');
+        const unmatchedFiles: File[] = [];
 
         for (const file of selectedFiles) {
             const meta = unfinishedFiles.find((candidate) => (
                 !matchedKeys.has(candidate.key) && fileMatchesPersistedUpload(file, candidate)
             ));
-            if (!meta) {
+            if (meta) {
+                matchedKeys.add(meta.key);
+                matchedCount += 1;
+                uploadSourceFilesRef.current.set(meta.key, file);
+                try {
+                    await idbPut(meta.key, file);
+                } catch {
+                    // The in-memory File reference still allows retry in this tab.
+                }
+                updatePersistedFile(meta.key, { status: 'pending', error: undefined });
                 continue;
             }
-            matchedKeys.add(meta.key);
-            matchedCount += 1;
-            uploadSourceFilesRef.current.set(meta.key, file);
-            try {
-                await idbPut(meta.key, file);
-            } catch {
-                // The in-memory File reference still allows retry in this tab.
+            // Already uploaded under this session -- nothing to do (and not a
+            // "new" file either, so it shouldn't be handed to startUpload).
+            if (doneFiles.some((candidate) => fileMatchesPersistedUpload(file, candidate))) {
+                continue;
             }
-            updatePersistedFile(meta.key, { status: 'pending', error: undefined });
+            // Not part of this paused session at all -- e.g. the user
+            // reselected a broader folder than their original pick. The
+            // caller starts these as their own fresh batch instead of
+            // silently dropping them (see handleUploadSelection).
+            unmatchedFiles.push(file);
         }
 
         const latest = uploadSessionRef.current || session;
         persistSession(latest);
         setPendingUploadSession(latest);
-        return matchedCount;
+        return { matchedCount, unmatchedFiles };
     }, [loadPersistedSession, pendingUploadSession, persistSession, updatePersistedFile]);
 
     const retryPersistedUploadSession = useCallback(async () => {
@@ -2547,11 +2663,46 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         );
     }, [addNotification, uploading]);
 
+    // Best-effort resume cache: writes each file's bytes into IndexedDB so an
+    // interrupted upload can resume after a page reload (uploadSourceFilesRef
+    // already covers the CURRENT tab session regardless -- this is only for
+    // surviving a reload/crash). Throttled to a small worker pool instead of
+    // firing every idbPut concurrently: a 1000-file batch used to open ~1000
+    // simultaneous IndexedDB connections at once, exactly the kind of burst
+    // that trips iOS Safari's much tighter per-tab memory/storage ceilings.
+    const CACHE_FOR_RESUME_CONCURRENCY = 4;
+    const cacheUploadFilesForResume = async (session: PersistedUploadSession, filesToUpload: File[]) => {
+        let cursor = 0;
+        const worker = async () => {
+            while (true) {
+                if (uploadStopRequestedRef.current) {
+                    return;
+                }
+                const index = cursor;
+                cursor += 1;
+                if (index >= session.files.length) {
+                    return;
+                }
+                try {
+                    await idbPut(session.files[index].key, filesToUpload[index]);
+                } catch {
+                    // Resume-after-reload won't find this file, but the
+                    // in-memory File reference still covers this tab's
+                    // current session -- not fatal, just less resilient.
+                }
+            }
+        };
+        await Promise.all(Array.from(
+            { length: Math.min(CACHE_FOR_RESUME_CONCURRENCY, session.files.length) },
+            () => worker(),
+        ));
+    };
+
     const startUpload = useCallback(async (filesToUpload: File[]) => {
         if (filesToUpload.length === 0) {
             return;
         }
-        if (uploadStartInProgressRef.current || pendingUploadSession) {
+        if (uploadStartInProgressRef.current || pendingUploadSessionRef.current) {
             addNotification('Upload already starting', 'The selected files are already being prepared or uploaded.');
             return;
         }
@@ -2633,9 +2784,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         try {
             persistSession(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
-            await Promise.all(session.files.map((meta, index) => (
-                idbPut(meta.key, filesToUpload[index]).catch(() => undefined)
-            )));
+            // Not awaited: the actual upload only needs uploadSourceFilesRef
+            // (already set above), so there's no reason to block starting on
+            // this -- resume-after-reload is a nice-to-have, not a
+            // prerequisite for this tab's own upload to proceed.
+            void cacheUploadFilesForResume(session, filesToUpload);
             if (uploadStopRequestedRef.current) {
                 await cleanupUnfinishedUploadArtifacts(session);
                 await clearPersistedSession();
@@ -2670,7 +2823,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         addNotification,
         cleanupUnfinishedUploadArtifacts,
         clearPersistedSession,
-        pendingUploadSession,
         persistSession,
         warmBackend,
         warmEndpoint,
@@ -2708,14 +2860,33 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // instead of being queued via startUpload below.
             if (pendingUploadSession || (!uploading && loadPersistedSession())) {
                 void (async () => {
-                    const matchedCount = await attachSelectedFilesToPendingSession(selectedFiles);
-                    if (matchedCount === 0) {
+                    const { matchedCount, unmatchedFiles } = await attachSelectedFilesToPendingSession(selectedFiles);
+                    if (matchedCount > 0) {
+                        addNotification('Files reselected', `${plural(matchedCount, 'file')} reattached to the paused upload.`);
+                        // Awaited: startUpload below (for anything that wasn't
+                        // part of this paused session) checks `uploading` to
+                        // decide whether to start immediately or queue --
+                        // letting this finish first keeps that check accurate
+                        // instead of racing two sessions against each other.
+                        await retryPersistedUploadSession();
+                    } else if (unmatchedFiles.length === 0) {
                         addNotification('No paused files matched', 'Select the same file names, sizes, and modified dates from the paused upload.');
                         setUploadError('Selected files did not match the paused upload. Choose the original files to retry.');
-                        return;
                     }
-                    addNotification('Files reselected', `${plural(matchedCount, 'file')} reattached to the paused upload.`);
-                    await retryPersistedUploadSession();
+                    if (unmatchedFiles.length > 0) {
+                        // A broader reselection (e.g. the whole folder instead
+                        // of just the original picks) can include files that
+                        // were never part of this paused session at all --
+                        // start those as their own batch instead of silently
+                        // dropping them. startUpload's own dedupe check still
+                        // applies, so anything already fully uploaded gets
+                        // skipped there too.
+                        addNotification(
+                            'New files found',
+                            `${plural(unmatchedFiles.length, 'file')} in this selection weren't part of the paused upload -- uploading separately.`,
+                        );
+                        void startUpload(unmatchedFiles);
+                    }
                 })();
             } else {
                 void startUpload(selectedFiles);

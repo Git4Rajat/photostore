@@ -145,6 +145,10 @@ const RESOURCE_TIMING_MIN_DURATION_MS = 20;
 // runs higher for the same underlying link, so it gets its own, looser
 // threshold rather than being compared against the same number.
 const ACTIVE_PROBE_RTT_FAST_MS = 250;
+// Only used to sanity-check (never replace) a live connection.downlink
+// reading -- caps how old a Resource Timing entry can be before we stop
+// trusting it as still representative of the current network state.
+const RESOURCE_TIMING_RECENT_WINDOW_MS = 60_000;
 
 // navigator.connection (the Network Information API) is unavailable in
 // Safari (desktop and iOS) and Firefox, so those browsers would otherwise
@@ -154,16 +158,28 @@ const ACTIVE_PROBE_RTT_FAST_MS = 250;
 // observed transfer rate instead of guessing -- transferSize is 0 for cache
 // hits and for cross-origin entries without a Timing-Allow-Origin header, so
 // this only reflects entries that actually hit the network.
-const measureObservedDownlinkMbps = (): number | null => {
+//
+// Also used (with maxAgeMs set) as a cross-check even when connection.downlink
+// IS available: Chrome's downlink is a coarse, traffic-history-based estimate
+// from its Network Quality Estimator, not a link-speed test, and commonly
+// under-reports an otherwise-idle fast connection. maxAgeMs guards against the
+// opposite mistake there -- using a since-stale reading (e.g. from a fast wifi
+// network the page loaded on, before the user switched to slow cellular) to
+// override a live, lower, and now-correct connection.downlink.
+const measureObservedDownlinkMbps = (maxAgeMs?: number): number | null => {
     if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
         return null;
     }
+    const now = performance.now();
     let bestBytes = 0;
     let bestDurationMs = 0;
     for (const entry of performance.getEntriesByType('resource') as PerformanceResourceTiming[]) {
         const bytes = entry.transferSize || 0;
         const durationMs = entry.responseEnd - entry.requestStart;
         if (bytes < RESOURCE_TIMING_MIN_BYTES || durationMs < RESOURCE_TIMING_MIN_DURATION_MS) {
+            continue;
+        }
+        if (typeof maxAgeMs === 'number' && (now - entry.startTime) > maxAgeMs) {
             continue;
         }
         if (bytes > bestBytes) {
@@ -198,11 +214,11 @@ export const getAdaptiveUploadProfile = (
     const connection = nav.connection;
     const effectiveType = (connection?.effectiveType || '').toLowerCase();
     const connectionType = (connection?.type || '').toLowerCase();
-    let downlink = Number(connection?.downlink || 0);
+    const reportedDownlink = Number(connection?.downlink || 0);
     const rtt = Number(connection?.rtt || 0);
     const isWifi = connectionType === 'wifi';
     const isEthernet = connectionType === 'ethernet';
-    let hasNetworkInfo = Boolean(connection && Number.isFinite(downlink) && downlink > 0);
+    let hasNetworkInfo = Boolean(connection && Number.isFinite(reportedDownlink) && reportedDownlink > 0);
     const isMobileViewport = window.matchMedia?.('(max-width: 760px)').matches || false;
     const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches || false;
     const lowMemory = typeof nav.deviceMemory === 'number' && nav.deviceMemory <= 4;
@@ -211,23 +227,36 @@ export const getAdaptiveUploadProfile = (
     const totalBytes = files.reduce((sum, file) => sum + (file.size || 0), 0);
     const isHugeBatch = totalBytes > 150 * MB;
 
-    // A fast round trip on the caller's active probe (e.g. timing the
-    // backend warm-up call that already happens before an upload starts) is
-    // solid evidence of low latency -- but only ever used as *positive*
-    // evidence. A slow or missing reading just leaves this false rather than
-    // being treated as evidence of a bad connection, since a slow warm-up
-    // call is just as likely to be a cold-started backend container as an
-    // actually slow network.
-    let probedLowLatency = false;
-    if (!hasNetworkInfo && !isMobileViewport && !coarsePointer) {
-        const observed = measureObservedDownlinkMbps();
+    // Always cross-check against a real observed transfer rate, even when
+    // connection.downlink is already available -- see measureObservedDownlinkMbps
+    // for why. When there's a live reading to cross-check against, only trust
+    // *recent* Resource Timing entries and only ever raise the number, never
+    // lower it (never contradict a live, lower, possibly-since-degraded
+    // reading); with no live reading at all (Safari/Firefox), any real
+    // observed transfer is better than the static guess, however old it is.
+    let downlink = reportedDownlink;
+    if (!isMobileViewport && !coarsePointer) {
+        const observed = measureObservedDownlinkMbps(hasNetworkInfo ? RESOURCE_TIMING_RECENT_WINDOW_MS : undefined);
         if (observed !== null) {
-            downlink = observed;
+            downlink = hasNetworkInfo ? Math.max(downlink, observed) : observed;
             hasNetworkInfo = true;
         }
-        if (typeof options?.measuredRttMs === 'number' && options.measuredRttMs > 0 && options.measuredRttMs < ACTIVE_PROBE_RTT_FAST_MS) {
-            probedLowLatency = true;
-        }
+    }
+
+    // Good evidence of low latency, from whichever source has it. rtt>0 means
+    // the Network Information API actually reported a number (trust it as-is,
+    // even a bad one, over a substitute); only fall back to the caller's
+    // active probe (e.g. timing the backend warm-up call that already happens
+    // before an upload starts) when the API gave us no rtt at all -- a slow or
+    // missing probe reading just leaves this false rather than being treated
+    // as evidence of a bad connection, since a slow warm-up call is just as
+    // likely to be a cold-started backend container as an actually slow
+    // network.
+    const hasGoodApiRtt = rtt > 0 && rtt < 100;
+    let lowLatencyEvidence = hasGoodApiRtt;
+    if (!lowLatencyEvidence && rtt === 0 && !isMobileViewport && !coarsePointer
+        && typeof options?.measuredRttMs === 'number' && options.measuredRttMs > 0 && options.measuredRttMs < ACTIVE_PROBE_RTT_FAST_MS) {
+        lowLatencyEvidence = true;
     }
 
     // Bigger batches pay relatively more in per-block commit overhead, so
@@ -261,13 +290,18 @@ export const getAdaptiveUploadProfile = (
             reason: 'no network info available, assuming desktop wifi or ethernet',
         });
     }
-    if (downlink >= 10 && ((rtt > 0 && rtt < 100 && (isEthernet || isWifi)) || probedLowLatency)) {
+    if (downlink >= 10 && lowLatencyEvidence) {
+        // connection.type ('wifi'/'ethernet') is only ever used for the log
+        // message, never as a gate -- it's "partial support, experimental" on
+        // desktop Chrome and unavailable on Firefox/Safari, and everything
+        // that actually needs excluding (mobile viewport/pointer, 3g/cellular)
+        // was already filtered out by the branches above this one.
         return withChunkFloor({
             fileParallelism: hasLargeFiles ? 12 : 20,
             chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES,
-            reason: probedLowLatency && !(rtt > 0 && rtt < 100)
-                ? 'fast connection (measured round trip)'
-                : 'reliable wired or strong wifi connection',
+            reason: hasGoodApiRtt && (isEthernet || isWifi)
+                ? 'reliable wired or strong wifi connection'
+                : 'fast connection (measured)',
         });
     }
     if (effectiveType === '4g' && downlink >= 20 && !hasLargeFiles) {
