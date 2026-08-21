@@ -1411,6 +1411,29 @@ def detect_duplicates(user_id: str, file_hash: str, perceptual_hash: Optional[st
     return duplicates
 
 
+def list_known_file_hashes(user_id: str) -> Dict[str, str]:
+    """Return {fileHash: filename} for every indexed photo in this library.
+
+    Meant to be fetched ONCE per upload batch by the frontend (not per file --
+    that would just reintroduce the scan-per-upload problem this index was
+    built to fix) so the browser can skip re-uploading a file it can already
+    tell is a duplicate, before spending any transfer bandwidth on it. The
+    backend's own point-lookup in detect_duplicates() stays authoritative at
+    finalize time regardless -- this is a bandwidth-saving prefetch, not a
+    replacement for server-side validation (two tabs/devices could otherwise
+    race past a client-side-only check).
+    """
+    _require_context()
+    hash_index_table_client = _CTX.get('hash_index_table_client')
+    if hash_index_table_client is None:
+        return {}
+    try:
+        rows = hash_index_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
+        return {str(row.get('RowKey') or ''): str(row.get('filename') or '') for row in rows if row.get('RowKey')}
+    except Exception:
+        return {}
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

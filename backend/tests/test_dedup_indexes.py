@@ -106,6 +106,30 @@ def test_finalize_writes_both_indexes(dedup_ctx):
     assert filename_owners.get_entity('vacation.jpg', 'lib-A')['fileHash'] == file_hash
 
 
+def test_list_known_file_hashes_returns_this_librarys_index(dedup_ctx):
+    """Backs the frontend's once-per-batch prefetch (GET /upload/known-hashes)
+    that lets the browser skip re-uploading a known duplicate before spending
+    any transfer bandwidth on it."""
+    metadata, hash_index, filename_owners = dedup_ctx
+    hash_a = 'n' * 64
+    hash_b = 'o' * 64
+    storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256=hash_a)
+    storage_utils.finalize_uploaded_file('lib-A', 'beach.jpg', 'image/jpeg', client_sha256=hash_b)
+    # A different library's hashes must never leak into lib-A's prefetch.
+    storage_utils.finalize_uploaded_file('lib-B', 'other.jpg', 'image/jpeg', client_sha256='p' * 64)
+
+    assert storage_utils.list_known_file_hashes('lib-A') == {
+        hash_a: 'vacation.jpg',
+        hash_b: 'beach.jpg',
+    }
+
+
+def test_list_known_file_hashes_empty_without_index_table(no_index_ctx):
+    # Older-deploy fallback: no crash, just nothing to prefetch client-side --
+    # dedup still works via the finalize-time scan fallback either way.
+    assert storage_utils.list_known_file_hashes('lib-A') == {}
+
+
 def test_detect_duplicates_hit_is_point_lookup_not_a_scan(dedup_ctx):
     metadata, hash_index, filename_owners = dedup_ctx
     file_hash = 'b' * 64

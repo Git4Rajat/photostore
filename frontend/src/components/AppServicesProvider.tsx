@@ -852,6 +852,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const uploadSourceFilesRef = useRef<Map<string, File>>(new Map());
     const uploadStopRequestedRef = useRef<boolean>(false);
     const uploadAbortControllersRef = useRef<Set<AbortController>>(new Set());
+    // Prefetched once per batch (see fetchKnownHashes) so uploadFileInChunks can
+    // skip a known duplicate before spending any transfer bandwidth on it, not
+    // just backend compute. Grown (never cleared) as files finish uploading, so
+    // within-batch duplicates are caught without a second network round trip.
+    const knownHashesRef = useRef<Map<string, string>>(new Map());
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1327,6 +1332,26 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const computeSha256 = async (file: File): Promise<string> => (
         sha256ArrayBuffer(await readBlobArrayBuffer(file))
     );
+
+    // Best-effort prefetch of the library's dedup index (see backend
+    // list_known_file_hashes), merged into knownHashesRef so uploadFileInChunks
+    // can skip a known duplicate before staging a single byte. A failed/slow
+    // fetch just means this batch misses the early-skip optimization -- the
+    // backend's own point-lookup at finalize time stays authoritative, so
+    // correctness never depends on this succeeding.
+    const fetchKnownHashes = async (): Promise<void> => {
+        try {
+            const response = await getUpload<{ hashes?: Record<string, string> }>('/upload/known-hashes');
+            const hashes = response?.hashes;
+            if (hashes && typeof hashes === 'object') {
+                for (const [hash, filename] of Object.entries(hashes)) {
+                    knownHashesRef.current.set(hash, filename);
+                }
+            }
+        } catch {
+            // Ignore -- see comment above.
+        }
+    };
 
     // Shared by /upload/init and /upload/finalize: with the backend allowed to
     // scale to zero during a long-running upload (see the keepalive gate below),
@@ -1872,141 +1897,171 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
-        const initResponse = await postInitWithRetry({
-            filename: file.name,
-            totalSize: file.size,
-            sha256,
-            directToBlob: true,
-            uploadId: options?.existingUploadId,
-        }, options?.signal);
-        if (typeof initResponse?.uploadId === 'string' && initResponse.uploadId) {
-            options?.onUploadInitialized?.(initResponse.uploadId);
+        if (knownHashesRef.current.has(sha256)) {
+            // Already have this content under some filename -- skip the network
+            // transfer entirely (no /upload/init, no blob staging, no finalize).
+            // The backend's own finalize-time check is what actually enforces
+            // this for real; this is purely an earlier, cheaper exit.
+            return { skippedDuplicate: true };
         }
-        if (typeof initResponse?.blobUrl !== 'string' || !initResponse.blobUrl) {
-            throw new Error('Blob upload URL was not returned by the backend.');
-        }
-        const configuredChunkSize = Math.min(
-            MAX_BACKEND_UPLOAD_CHUNK_BYTES,
-            Math.max(512 * 1024, options?.chunkSizeBytes || DEFAULT_UPLOAD_PROFILE.chunkSizeBytes),
-        );
-        // Cap to a parallel-friendly block size. This is resume-stable: the block
-        // size we settle on is persisted (via onBlockCommitted) and fed back as
-        // options.chunkSizeBytes on resume, so the block layout never shifts
-        // between runs.
-        const stagingBlockSize = Math.min(configuredChunkSize, PARALLEL_UPLOAD_BLOCK_BYTES);
-        const chunkSize = file.size <= stagingBlockSize ? file.size : stagingBlockSize;
-        const BlockBlobClient = await loadBlockBlobClient();
-        const blockBlobClient = new BlockBlobClient(initResponse.blobUrl);
-        let skippedDuplicate = false;
-
-        // Enumerate every block up front. Block IDs are derived from the block
-        // index, so blocks can be staged out of order and in parallel — the final
-        // commitBlockList still lists them in index order.
-        const allBlocks: Array<{ blockIndex: number; start: number; end: number }> = [];
-        for (let start = 0; start < file.size; start += chunkSize) {
-            const end = Math.min(start + chunkSize, file.size);
-            allBlocks.push({ blockIndex: Math.floor(start / chunkSize), start, end });
-        }
-
-        // Index-aligned block-id map (dense, '' = not yet staged). Keeping it
-        // aligned by block index — instead of compacting with filter(Boolean) —
-        // is what lets out-of-order parallel staging persist a correct resume
-        // checkpoint and commit the blocks in the right order.
-        const priorBlockIds = options?.existingBlockIds || [];
-        const blockIds: string[] = allBlocks.map(({ blockIndex }) => priorBlockIds[blockIndex] || '');
-
-        // Resume: skip blocks already staged in a previous run and seed progress
-        // with their bytes.
-        let committedBytes = 0;
-        for (const { blockIndex, start, end } of allBlocks) {
-            if (blockIds[blockIndex]) {
-                committedBytes += end - start;
+        // Claim this hash immediately, synchronously with the check above (no
+        // await in between) -- otherwise two concurrent lanes uploading
+        // byte-identical NEW files would both pass the .has() check before
+        // either finishes, and neither would see the other's claim. Rolled
+        // back in the catch below if this upload doesn't end up succeeding,
+        // so a failed upload can't leave its content permanently unclaimed.
+        knownHashesRef.current.set(sha256, file.name);
+        try {
+            const initResponse = await postInitWithRetry({
+                filename: file.name,
+                totalSize: file.size,
+                sha256,
+                directToBlob: true,
+                uploadId: options?.existingUploadId,
+            }, options?.signal);
+            if (typeof initResponse?.uploadId === 'string' && initResponse.uploadId) {
+                options?.onUploadInitialized?.(initResponse.uploadId);
             }
-        }
-        if (committedBytes > 0) {
-            options?.onChunkCommitted?.(committedBytes);
-        }
+            if (typeof initResponse?.blobUrl !== 'string' || !initResponse.blobUrl) {
+                throw new Error('Blob upload URL was not returned by the backend.');
+            }
+            const configuredChunkSize = Math.min(
+                MAX_BACKEND_UPLOAD_CHUNK_BYTES,
+                Math.max(512 * 1024, options?.chunkSizeBytes || DEFAULT_UPLOAD_PROFILE.chunkSizeBytes),
+            );
+            // Cap to a parallel-friendly block size. This is resume-stable: the block
+            // size we settle on is persisted (via onBlockCommitted) and fed back as
+            // options.chunkSizeBytes on resume, so the block layout never shifts
+            // between runs.
+            const stagingBlockSize = Math.min(configuredChunkSize, PARALLEL_UPLOAD_BLOCK_BYTES);
+            const chunkSize = file.size <= stagingBlockSize ? file.size : stagingBlockSize;
+            const BlockBlobClient = await loadBlockBlobClient();
+            const blockBlobClient = new BlockBlobClient(initResponse.blobUrl);
+            let skippedDuplicate = false;
 
-        const pendingBlocks = allBlocks.filter(({ blockIndex }) => !blockIds[blockIndex]);
-        const stageConcurrency = Math.max(1, Math.min(
-            options?.blockConcurrency || TARGET_CONCURRENT_UPLOAD_BLOCKS,
-            pendingBlocks.length,
-        ));
+            // Enumerate every block up front. Block IDs are derived from the block
+            // index, so blocks can be staged out of order and in parallel — the final
+            // commitBlockList still lists them in index order.
+            const allBlocks: Array<{ blockIndex: number; start: number; end: number }> = [];
+            for (let start = 0; start < file.size; start += chunkSize) {
+                const end = Math.min(start + chunkSize, file.size);
+                allBlocks.push({ blockIndex: Math.floor(start / chunkSize), start, end });
+            }
 
-        // Bounded worker pool: workers pull blocks off a shared cursor so at most
-        // `stageConcurrency` stageBlock requests are in flight for this file.
-        let blockCursor = 0;
-        const stageWorker = async () => {
-            while (true) {
-                if (uploadStopRequestedRef.current || options?.signal?.aborted) {
-                    throw new Error(UPLOAD_STOPPED_ERROR);
+            // Index-aligned block-id map (dense, '' = not yet staged). Keeping it
+            // aligned by block index — instead of compacting with filter(Boolean) —
+            // is what lets out-of-order parallel staging persist a correct resume
+            // checkpoint and commit the blocks in the right order.
+            const priorBlockIds = options?.existingBlockIds || [];
+            const blockIds: string[] = allBlocks.map(({ blockIndex }) => priorBlockIds[blockIndex] || '');
+
+            // Resume: skip blocks already staged in a previous run and seed progress
+            // with their bytes.
+            let committedBytes = 0;
+            for (const { blockIndex, start, end } of allBlocks) {
+                if (blockIds[blockIndex]) {
+                    committedBytes += end - start;
                 }
-                const cursor = blockCursor;
-                blockCursor += 1;
-                if (cursor >= pendingBlocks.length) {
-                    return;
-                }
-                const { blockIndex, start, end } = pendingBlocks[cursor];
-                const blockId = btoa(`block-${String(blockIndex).padStart(8, '0')}`);
+            }
+            if (committedBytes > 0) {
+                options?.onChunkCommitted?.(committedBytes);
+            }
 
-                let lastError: unknown = null;
-                for (let attempt = 0; attempt < 3; attempt += 1) {
-                    try {
-                        await blockBlobClient.stageBlock(blockId, file.slice(start, end), end - start, {
-                            abortSignal: options?.signal,
-                        });
-                        blockIds[blockIndex] = blockId;
-                        // committedBytes is a running total (not a contiguous
-                        // offset), so it stays monotonic even as blocks finish out
-                        // of order — safe for the progress + resume bookkeeping.
-                        committedBytes += end - start;
-                        options?.onChunkCommitted?.(committedBytes);
-                        // Persist the index-aligned map (with '' holes) so a
-                        // resume can tell exactly which blocks still need staging.
-                        options?.onBlockCommitted?.([...blockIds], chunkSize);
-                        lastError = null;
-                        break;
-                    } catch (err) {
-                        if (isRetriableUploadError(err)) {
-                            if (!navigator.onLine) {
-                                await waitForOnline();
+            const pendingBlocks = allBlocks.filter(({ blockIndex }) => !blockIds[blockIndex]);
+            const stageConcurrency = Math.max(1, Math.min(
+                options?.blockConcurrency || TARGET_CONCURRENT_UPLOAD_BLOCKS,
+                pendingBlocks.length,
+            ));
+
+            // Bounded worker pool: workers pull blocks off a shared cursor so at most
+            // `stageConcurrency` stageBlock requests are in flight for this file.
+            let blockCursor = 0;
+            const stageWorker = async () => {
+                while (true) {
+                    if (uploadStopRequestedRef.current || options?.signal?.aborted) {
+                        throw new Error(UPLOAD_STOPPED_ERROR);
+                    }
+                    const cursor = blockCursor;
+                    blockCursor += 1;
+                    if (cursor >= pendingBlocks.length) {
+                        return;
+                    }
+                    const { blockIndex, start, end } = pendingBlocks[cursor];
+                    const blockId = btoa(`block-${String(blockIndex).padStart(8, '0')}`);
+
+                    let lastError: unknown = null;
+                    for (let attempt = 0; attempt < 3; attempt += 1) {
+                        try {
+                            await blockBlobClient.stageBlock(blockId, file.slice(start, end), end - start, {
+                                abortSignal: options?.signal,
+                            });
+                            blockIds[blockIndex] = blockId;
+                            // committedBytes is a running total (not a contiguous
+                            // offset), so it stays monotonic even as blocks finish out
+                            // of order — safe for the progress + resume bookkeeping.
+                            committedBytes += end - start;
+                            options?.onChunkCommitted?.(committedBytes);
+                            // Persist the index-aligned map (with '' holes) so a
+                            // resume can tell exactly which blocks still need staging.
+                            options?.onBlockCommitted?.([...blockIds], chunkSize);
+                            lastError = null;
+                            break;
+                        } catch (err) {
+                            if (isRetriableUploadError(err)) {
+                                if (!navigator.onLine) {
+                                    await waitForOnline();
+                                }
+                                await sleep(100 * Math.pow(2, attempt));
                             }
-                            await sleep(100 * Math.pow(2, attempt));
+                            lastError = err;
                         }
-                        lastError = err;
+                    }
+
+                    if (lastError) {
+                        throw lastError;
                     }
                 }
+            };
 
-                if (lastError) {
-                    throw lastError;
-                }
+            await Promise.all(Array.from({ length: stageConcurrency }, () => stageWorker()));
+
+            const finalBlockIds = blockIds.filter(Boolean);
+            if (finalBlockIds.length === 0) {
+                throw new Error('No upload blocks were staged.');
             }
-        };
-
-        await Promise.all(Array.from({ length: stageConcurrency }, () => stageWorker()));
-
-        const finalBlockIds = blockIds.filter(Boolean);
-        if (finalBlockIds.length === 0) {
-            throw new Error('No upload blocks were staged.');
+            options?.onFinalizeStarted?.();
+            await blockBlobClient.commitBlockList(finalBlockIds, {
+                abortSignal: options?.signal,
+                blobHTTPHeaders: {
+                    blobContentType: file.type || 'application/octet-stream',
+                },
+            });
+            const completeResponse = await postFinalizeWithRetry({
+                filename: file.name,
+                uploadId: initResponse.uploadId,
+                totalSize: file.size,
+                contentType: file.type || 'application/octet-stream',
+                sha256,
+            }, options?.signal);
+            if (Array.isArray(completeResponse?.duplicates) && completeResponse.duplicates.length > 0) {
+                skippedDuplicate = true;
+            }
+            // Newly-stored content keeps the claim set above; a server-detected
+            // duplicate also leaves it in place (it's already correctly pointing
+            // at whichever filename actually holds this content).
+            return { skippedDuplicate };
+        } catch (err) {
+            // This upload didn't finish, so nothing was actually stored under
+            // this hash -- release the claim (only if it's still ours; a
+            // concurrent lane can't have taken over the same hash, since the
+            // synchronous check-then-claim above means at most one lane ever
+            // holds a given hash's claim within a batch) so a later file with
+            // the same content is retried instead of silently skipped.
+            if (knownHashesRef.current.get(sha256) === file.name) {
+                knownHashesRef.current.delete(sha256);
+            }
+            throw err;
         }
-        options?.onFinalizeStarted?.();
-        await blockBlobClient.commitBlockList(finalBlockIds, {
-            abortSignal: options?.signal,
-            blobHTTPHeaders: {
-                blobContentType: file.type || 'application/octet-stream',
-            },
-        });
-        const completeResponse = await postFinalizeWithRetry({
-            filename: file.name,
-            uploadId: initResponse.uploadId,
-            totalSize: file.size,
-            contentType: file.type || 'application/octet-stream',
-            sha256,
-        }, options?.signal);
-        if (Array.isArray(completeResponse?.duplicates) && completeResponse.duplicates.length > 0) {
-            skippedDuplicate = true;
-        }
-        return { skippedDuplicate };
     }, []);
 
     const cleanupUnfinishedUploadArtifacts = useCallback(async (session: PersistedUploadSession) => {
@@ -2039,6 +2094,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
 
         isResumingUploadRef.current = true;
+        // Kick off in parallel with the setup below (notification creation,
+        // session persistence, block-size planning) and only await it right
+        // before the worker pool starts -- overlaps a network round trip with
+        // work we'd be doing anyway instead of adding it to the critical path.
+        const knownHashesPromise = fetchKnownHashes();
         setUploading(true);
         uploadingRef.current = true;
         // Hold the wake lock for the whole transfer, not just the post-upload
@@ -2283,6 +2343,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
             };
 
+            await knownHashesPromise;
             await Promise.all(Array.from({ length: activeLaneCount }, () => worker()));
             await Promise.allSettled(Array.from(parallelThumbnailTasks));
 
@@ -2513,6 +2574,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             'Warming up upload path',
             'Waiting for backend storage and upload readiness before upload starts.',
         );
+        // Piggyback a real-latency reading on this warm-up call rather than
+        // firing a dedicated probe request: only trust the timing when we
+        // know it's actually making a fresh network call (not a dedup
+        // short-circuit off some other concurrent warm-up) -- otherwise a
+        // near-instant "0ms" short-circuit would look like great latency.
+        const measuringRtt = !backendWarmupInFlightRef.current;
+        const warmupStartedAt = performance.now();
         try {
             await Promise.all([
                 warmEndpoint(warmBackend, backendWarmupInFlightRef),
@@ -2528,12 +2596,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             });
             return;
         }
+        const measuredRttMs = measuringRtt ? performance.now() - warmupStartedAt : undefined;
         updateNotification(warmupNotificationId, {
             title: 'Upload path ready',
             details: 'Backend storage is ready. Starting upload.',
         });
         const totalBytes = filesToUpload.reduce((sum, file) => sum + file.size, 0);
-        const uploadProfile = getAdaptiveUploadProfile(filesToUpload);
+        const uploadProfile = getAdaptiveUploadProfile(filesToUpload, { measuredRttMs });
         const preparingNotificationId = addNotification(
             'Preparing upload',
             `Preparing ${plural(filesToUpload.length, 'file')}, ${formatBytes(totalBytes)}. ${plural(uploadProfile.fileParallelism, 'upload lane')}, ${formatBytes(uploadProfile.chunkSizeBytes)} chunks: ${uploadProfile.reason}.`,

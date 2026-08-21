@@ -2,6 +2,7 @@ import type {
     BrowserAiModelState,
     BrowserAiModelUiStatus,
     BrowserAiNetworkGate,
+    UploadProfile,
 } from '../types/browserProcessing';
 
 export const MB = 1024 * 1024;
@@ -136,22 +137,148 @@ export const formatBrowserAiReason = (state: BrowserAiModelState): string => {
             : 'Browser AI model is not loaded.';
 };
 
-export const getAdaptiveUploadProfile = (files: Array<{ size?: number }>): typeof DEFAULT_UPLOAD_PROFILE => {
-    const totalBytes = files.reduce((sum, file) => sum + Number(file?.size || 0), 0);
-    if (totalBytes > 150 * MB) {
-        return {
-            fileParallelism: 2,
-            chunkSizeBytes: 16 * MB,
-            reason: 'large upload set',
-        };
+const RESOURCE_TIMING_MIN_BYTES = 100 * 1024;
+const RESOURCE_TIMING_MIN_DURATION_MS = 20;
+// The connection.rtt gate below (rtt < 100) is calibrated for the Network
+// Information API's raw TCP RTT. A caller-supplied measuredRttMs instead
+// times a full HTTPS round trip (TLS handshake + request/response), which
+// runs higher for the same underlying link, so it gets its own, looser
+// threshold rather than being compared against the same number.
+const ACTIVE_PROBE_RTT_FAST_MS = 250;
+
+// navigator.connection (the Network Information API) is unavailable in
+// Safari (desktop and iOS) and Firefox, so those browsers would otherwise
+// always fall through to the fixed "assume it's fine" guess below regardless
+// of how slow their actual link is. Mine the Resource Timing entries for
+// assets the page already fetched (JS bundles, images) to get a real
+// observed transfer rate instead of guessing -- transferSize is 0 for cache
+// hits and for cross-origin entries without a Timing-Allow-Origin header, so
+// this only reflects entries that actually hit the network.
+const measureObservedDownlinkMbps = (): number | null => {
+    if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
+        return null;
     }
-    if (totalBytes > 50 * MB) {
-        return {
-            fileParallelism: 3,
-            chunkSizeBytes: 8 * MB,
-            reason: 'moderate upload set',
-        };
+    let bestBytes = 0;
+    let bestDurationMs = 0;
+    for (const entry of performance.getEntriesByType('resource') as PerformanceResourceTiming[]) {
+        const bytes = entry.transferSize || 0;
+        const durationMs = entry.responseEnd - entry.requestStart;
+        if (bytes < RESOURCE_TIMING_MIN_BYTES || durationMs < RESOURCE_TIMING_MIN_DURATION_MS) {
+            continue;
+        }
+        if (bytes > bestBytes) {
+            bestBytes = bytes;
+            bestDurationMs = durationMs;
+        }
     }
-    return DEFAULT_UPLOAD_PROFILE;
+    if (bestBytes === 0 || bestDurationMs === 0) {
+        return null;
+    }
+    return (bestBytes * 8) / (bestDurationMs / 1000) / 1_000_000;
+};
+
+export const getAdaptiveUploadProfile = (
+    files: Array<{ size: number }> = [],
+    options?: { measuredRttMs?: number },
+): UploadProfile => {
+    if (typeof navigator === 'undefined' || typeof window === 'undefined') {
+        return DEFAULT_UPLOAD_PROFILE;
+    }
+
+    const nav = navigator as Navigator & {
+        connection?: {
+            effectiveType?: string;
+            saveData?: boolean;
+            downlink?: number;
+            rtt?: number;
+            type?: string;
+        };
+        deviceMemory?: number;
+    };
+    const connection = nav.connection;
+    const effectiveType = (connection?.effectiveType || '').toLowerCase();
+    const connectionType = (connection?.type || '').toLowerCase();
+    let downlink = Number(connection?.downlink || 0);
+    const rtt = Number(connection?.rtt || 0);
+    const isWifi = connectionType === 'wifi';
+    const isEthernet = connectionType === 'ethernet';
+    let hasNetworkInfo = Boolean(connection && Number.isFinite(downlink) && downlink > 0);
+    const isMobileViewport = window.matchMedia?.('(max-width: 760px)').matches || false;
+    const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches || false;
+    const lowMemory = typeof nav.deviceMemory === 'number' && nav.deviceMemory <= 4;
+    const largestFile = files.reduce((max, file) => Math.max(max, file.size || 0), 0);
+    const hasLargeFiles = largestFile >= 40 * MB;
+    const totalBytes = files.reduce((sum, file) => sum + (file.size || 0), 0);
+    const isHugeBatch = totalBytes > 150 * MB;
+
+    // A fast round trip on the caller's active probe (e.g. timing the
+    // backend warm-up call that already happens before an upload starts) is
+    // solid evidence of low latency -- but only ever used as *positive*
+    // evidence. A slow or missing reading just leaves this false rather than
+    // being treated as evidence of a bad connection, since a slow warm-up
+    // call is just as likely to be a cold-started backend container as an
+    // actually slow network.
+    let probedLowLatency = false;
+    if (!hasNetworkInfo && !isMobileViewport && !coarsePointer) {
+        const observed = measureObservedDownlinkMbps();
+        if (observed !== null) {
+            downlink = observed;
+            hasNetworkInfo = true;
+        }
+        if (typeof options?.measuredRttMs === 'number' && options.measuredRttMs > 0 && options.measuredRttMs < ACTIVE_PROBE_RTT_FAST_MS) {
+            probedLowLatency = true;
+        }
+    }
+
+    // Bigger batches pay relatively more in per-block commit overhead, so
+    // floor the chunk size regardless of which tier below is picked -- this
+    // never reduces fileParallelism, it only affects chunking.
+    const withChunkFloor = (profile: UploadProfile): UploadProfile => (
+        isHugeBatch && profile.chunkSizeBytes < 16 * MB
+            ? { ...profile, chunkSizeBytes: 16 * MB }
+            : profile
+    );
+
+    if (connection?.saveData || effectiveType === 'slow-2g' || effectiveType === '2g') {
+        return { fileParallelism: 1, chunkSizeBytes: 1 * MB, reason: 'data saver or very slow network' };
+    }
+    if (hasNetworkInfo && (rtt >= 400 || downlink < 1.5)) {
+        return { fileParallelism: 1, chunkSizeBytes: 1 * MB, reason: 'high latency or congested network' };
+    }
+    if (effectiveType === '3g' || connectionType === 'cellular') {
+        if (downlink >= 10 && effectiveType === '4g') {
+            return withChunkFloor({ fileParallelism: 3, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'fast cellular with moderate parallelism' });
+        }
+        return { fileParallelism: 1, chunkSizeBytes: 2 * MB, reason: 'mobile or slow network' };
+    }
+    if (isMobileViewport || coarsePointer || lowMemory) {
+        return withChunkFloor({ fileParallelism: hasLargeFiles ? 1 : 2, chunkSizeBytes: 2 * MB, reason: 'mobile device profile' });
+    }
+    if (!hasNetworkInfo) {
+        return withChunkFloor({
+            fileParallelism: hasLargeFiles ? 6 : 8,
+            chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES,
+            reason: 'no network info available, assuming desktop wifi or ethernet',
+        });
+    }
+    if (downlink >= 10 && ((rtt > 0 && rtt < 100 && (isEthernet || isWifi)) || probedLowLatency)) {
+        return withChunkFloor({
+            fileParallelism: hasLargeFiles ? 12 : 20,
+            chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES,
+            reason: probedLowLatency && !(rtt > 0 && rtt < 100)
+                ? 'fast connection (measured round trip)'
+                : 'reliable wired or strong wifi connection',
+        });
+    }
+    if (effectiveType === '4g' && downlink >= 20 && !hasLargeFiles) {
+        return withChunkFloor({ fileParallelism: 12, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'fast network' });
+    }
+    if (downlink >= 8 && !hasLargeFiles) {
+        return withChunkFloor({ fileParallelism: 6, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'good network' });
+    }
+    if (hasLargeFiles) {
+        return withChunkFloor({ fileParallelism: 16, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'large files' });
+    }
+    return withChunkFloor(DEFAULT_UPLOAD_PROFILE);
 };
 

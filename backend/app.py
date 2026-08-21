@@ -78,6 +78,7 @@ from storage_utils import (
     delete_image_name_mapping,
     delete_hash_index_entry,
     delete_filename_owner_entry,
+    list_known_file_hashes,
     LOCAL_VISION_FALLBACK_MODEL,
     LOCAL_VISION_FALLBACK_TAXONOMY_VERSION,
     LOCAL_VISION_FALLBACK_RUNTIME,
@@ -9472,6 +9473,21 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
         # of enqueueing a new job per photo.
         coalesce_on_conflict=True,
     )
+
+
+@app.route('/upload/known-hashes', methods=['GET'])
+@app.route('/upload/known-hashes/', methods=['GET'])
+@app.route('/api/upload/known-hashes', methods=['GET'])
+@app.route('/api/upload/known-hashes/', methods=['GET'])
+def get_known_upload_hashes():
+    """One bulk fetch for the whole library's dedup index -- meant to be called
+    once per upload batch (see list_known_file_hashes), not per file, so the
+    frontend can skip re-uploading a known duplicate before spending any
+    transfer bandwidth on it."""
+    _, user_id, error = _require_library_context()
+    if error:
+        return error
+    return jsonify({'hashes': list_known_file_hashes(user_id)})
 
 
 @app.route('/upload/finalize', methods=['POST'])
