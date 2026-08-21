@@ -6034,6 +6034,13 @@ def handle_preflight():
                 resp.headers['Vary'] = 'Origin'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
         resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Upload-Id, X-Filename, Content-Range'
+        # Without this, the browser re-preflights every method+headers
+        # combination on every call (observed live: OPTIONS was 39% of all
+        # backend requests during a bulk upload), doubling load on the same
+        # thread pool that's already contended. Browsers clamp this to their
+        # own ceiling (Chromium 7200s, Firefox 86400s) regardless of the
+        # value sent, so one high number is safe everywhere.
+        resp.headers['Access-Control-Max-Age'] = '86400'
         return resp
 
 
