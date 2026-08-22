@@ -470,7 +470,16 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
       ]
       scale: {
         minReplicas: 0
-        maxReplicas: 3
+        // Was 3. Raised to 5 after a real HAR capture showed the client-side
+        // upload-parallelism fix (effectiveRtt cross-check, see
+        // browserAiShared.ts) unlocked bursts of 16-20 concurrent files --
+        // real throughput went up ~7x, but 3 replicas x 4 threads = 12
+        // threads couldn't absorb that peak (replica count was even observed
+        // dipping to 1 mid-burst), so per-request latency on
+        // finalize/client-processing got worse even as overall wall-clock
+        // time improved. Only raises the ceiling under load -- minReplicas
+        // stays 0, idle scale-to-zero is unaffected.
+        maxReplicas: 5
         rules: [
           {
             // Was 15 (raised from KEDA's default 10 to avoid fanning out to
