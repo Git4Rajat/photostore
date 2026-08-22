@@ -1671,6 +1671,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     return;
                 }
                 const processingStartedAt = performance.now();
+                // /upload/client-processing already clears the lease server-side once
+                // it succeeds (apply_client_processing_results_for_file) -- so once
+                // that call has gone through, the explicit /release below in `finally`
+                // has nothing left to do. Skip it then and save the round trip; only
+                // fall back to it when no report was ever sent (e.g. every requested
+                // step was already terminal before this attempt started).
+                let leaseReleasedByReport = false;
                 try {
                     syncBrowserProcessingNotification(browserProcessingNotification, `Processing ${filename}`);
                     let imageUrl = String(item?.sourceUrl || '');
@@ -1736,6 +1743,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         uploadId: `browser-${filename}`,
                         thumbnailAlreadyUploaded,
                     });
+                    leaseReleasedByReport = true;
                     reportBrowserProcessingOutcome(true);
                     if (faceDeferred) {
                         browserProcessingDeferredRef.current.set(filename, itemRotation);
@@ -1745,7 +1753,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     processedCount += 1;
                     browserProcessingNotification.processedCount += 1;
                     syncBrowserProcessingNotification(browserProcessingNotification);
-                    await post('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
                 } catch (err) {
                     const errorName = String((err as Error)?.name || '');
                     const errorMessage = String((err as Error)?.message || '');
@@ -1764,21 +1771,26 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     const statuses = item?.statuses || {};
                     const failureReport = buildBrowserProcessingFailureReport(filename, statuses, effectiveSteps, processingStartedAt);
                     if (failureReport.length > 0) {
-                        await postUpload('/upload/client-processing', {
-                            filename,
-                            clientProcessingSchemaVersion: CLIENT_PROCESSING_SCHEMA_VERSION,
-                            clientProcessing: {},
-                            clientProcessingReport: failureReport,
-                            clientAssetId: `browser-${filename}`,
-                            uploadId: `browser-${filename}`,
-                        }).catch((postErr) => {
+                        try {
+                            await postUpload('/upload/client-processing', {
+                                filename,
+                                clientProcessingSchemaVersion: CLIENT_PROCESSING_SCHEMA_VERSION,
+                                clientProcessing: {},
+                                clientProcessingReport: failureReport,
+                                clientAssetId: `browser-${filename}`,
+                                uploadId: `browser-${filename}`,
+                            });
+                            leaseReleasedByReport = true;
+                        } catch (postErr) {
                             console.warn(`Browser processing failure report was not accepted for ${filename}.`, postErr);
-                        });
+                        }
                     }
                     console.warn(`Browser processing failed for ${filename}.`, err);
                     syncBrowserProcessingNotification(browserProcessingNotification, `Failed ${filename}`);
                 } finally {
-                    await post('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                    if (!leaseReleasedByReport) {
+                        await post('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                    }
                 }
             };
             // Drain `pending` with up to `concurrency` items in flight at once. Each
@@ -2410,6 +2422,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
                     if (!claim?.claimed) return;
                     const processingStartedAt = performance.now();
+                    // Same reasoning as the drain-loop path above: a successful
+                    // /upload/client-processing call already releases the lease
+                    // server-side, so the explicit /release in `finally` below is
+                    // only needed when that report never went out.
+                    let leaseReleasedByReport = false;
                     try {
                         const convertedPreview = await fetchConvertedRawPreview(filename);
                         const result = await runBrowserProcessing(
@@ -2459,10 +2476,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             uploadId: `browser-${filename}`,
                             thumbnailAlreadyUploaded,
                         });
+                        leaseReleasedByReport = true;
                     } catch (err) {
                         console.warn(`Parallel thumbnail generation failed for ${filename}.`, err);
                     } finally {
-                        await post('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                        if (!leaseReleasedByReport) {
+                            await post('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                        }
                     }
                 })();
                 parallelThumbnailTasks.add(task);
