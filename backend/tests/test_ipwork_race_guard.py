@@ -69,7 +69,7 @@ def processing_ctx(monkeypatch):
     monkeypatch.setitem(storage_utils._CTX, 'face_table_client', None)
     monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda kind, name: _tiny_jpeg_bytes())
     monkeypatch.setattr(storage_utils, 'upload_media_file', lambda *a, **k: None)
-    monkeypatch.setattr(storage_utils, 'refresh_user_vector_index', lambda *a, **k: None)
+    monkeypatch.setattr(storage_utils, 'touch_user_vector_index_state', lambda *a, **k: None)
     monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a, **k: None)
     calls = _Calls()
     monkeypatch.setattr(
@@ -461,6 +461,30 @@ def test_default_origin_is_browser(processing_ctx):
         client_asset_id='browser-photo.jpg',
     )
 
-    stored = metadata.get_entity(user_id, filename)
-    processing = json.loads(stored['processing_metadata'])
-    assert processing['client_ocr']['source'] == 'browser'
+
+def test_applying_results_marks_vector_index_dirty_without_eager_rebuild(monkeypatch, processing_ctx):
+    """A per-photo apply must not trigger a full-library vector-index
+    rebuild (refresh_user_vector_index scans + re-embeds every photo in the
+    library, and re-uploads the whole index) -- it should just mark the
+    index stale via the cheap touch_user_vector_index_state and let the
+    existing lazy on-search rebuild path pick it up later."""
+    metadata, _ = processing_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(metadata, user_id, filename, ocr_status='pending')
+
+    def _boom(*a, **k):
+        raise AssertionError('eager full-library refresh_user_vector_index must not run per photo')
+
+    monkeypatch.setattr(storage_utils, 'refresh_user_vector_index', _boom)
+    touched = []
+    monkeypatch.setattr(storage_utils, 'touch_user_vector_index_state', lambda *a, **k: touched.append(a))
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'ocr': {'text': 'server side text'}},
+        client_processing_report=[],
+        client_asset_id='ipworker:job-1',
+        origin='ipworker',
+    )
+
+    assert touched == [(user_id,)]

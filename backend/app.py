@@ -12520,6 +12520,7 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
         _upsert_job_status(job_id, user_id, 'ipwork', 'skipped', reason='already_done')
         return 'noop'
     _upsert_job_status(job_id, user_id, 'ipwork', 'running')
+    lease_cleared_by_apply = False
     try:
         client_processing = _run_ipwork_steps(user_id, filename, runnable_steps)
         metadata = apply_client_processing_results_for_file(
@@ -12530,6 +12531,12 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
             client_asset_id=f'ipworker:{job_id}',
             origin='ipworker',
         )
+        # apply_client_processing_results_for_file already clears the lease
+        # fields unconditionally once it returns -- mark that here so the
+        # finally block below doesn't pay a redundant read+write re-releasing
+        # a lease that's already cleared (same waste class just fixed on the
+        # browser side, see browser AI heartbeat/release redundancy).
+        lease_cleared_by_apply = True
         # The browser reaches this same trigger via /upload and
         # /upload/client-processing right after it POSTs its own results
         # (see those routes). ipworker writes results directly through
@@ -12543,11 +12550,13 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
             worker_logger.exception('Failed to auto-queue clustering for %s after ipwork', filename)
         _upsert_job_status(job_id, user_id, 'ipwork', 'done')
     finally:
-        # apply_client_processing_results_for_file already clears the lease
-        # fields unconditionally on success; this covers the failure path
-        # (an exception above would otherwise leave the lease held until it
-        # naturally expires after IPWORKER_LEASE_SECONDS).
-        release_processing_lease(user_id, filename, lease_owner)
+        # Only needed when apply_client_processing_results_for_file never
+        # got far enough to clear the lease itself (e.g. an exception from
+        # _run_ipwork_steps or the apply call), so a failed attempt doesn't
+        # leave the lease held until it naturally expires after
+        # IPWORKER_LEASE_SECONDS.
+        if not lease_cleared_by_apply:
+            release_processing_lease(user_id, filename, lease_owner)
     return 'done'
 
 

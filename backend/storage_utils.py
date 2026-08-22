@@ -2599,7 +2599,13 @@ def _apply_client_processing_results(
     if status_updates:
         metadata.update(status_updates)
     metadata_table_client.upsert_entity(metadata)
-    refresh_user_vector_index(user_id)
+    # A full eager refresh here would rescan and re-embed the user's whole
+    # library on every single photo (measured at ~20s for a ~6k-photo
+    # library) -- the same per-photo full-library-work bug already fixed
+    # once for clustering and once for the people/face scan cache. Just mark
+    # the index stale; get_user_vector_index's existing lazy path rebuilds it
+    # once, on demand, the next time someone actually searches.
+    touch_user_vector_index_state(user_id)
 
 
 def apply_client_processing_results_for_file(

@@ -160,6 +160,49 @@ def test_clustering_trigger_failure_does_not_fail_the_job(monkeypatch, dispatch_
     assert ('ipwork', 'done') in dispatch_ctx.job_statuses
 
 
+def test_success_does_not_redundantly_release_already_cleared_lease(monkeypatch, dispatch_ctx):
+    """apply_client_processing_results_for_file already clears the lease
+    fields unconditionally once it returns -- calling release_processing_lease
+    again on the success path pays a wasted read+write for nothing on every
+    single photo. Only a failed attempt (which never reached that clearing)
+    should still fall back to an explicit release."""
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda user_id, filename, steps: {'ocr': {'text': 'hi'}})
+    monkeypatch.setattr(
+        app, 'apply_client_processing_results_for_file',
+        lambda *a, **k: {'processing_state': 'active', 'ocr_status': 'done', 'face_status': 'pending'},
+    )
+    released = []
+    monkeypatch.setattr(app, 'release_processing_lease', lambda *a, **k: released.append(a))
+
+    outcome = app._handle_ipwork_queue_payload(
+        {'filename': 'photo.jpg', 'steps': ['ocr']}, 'job-6', 'lib-A',
+    )
+
+    assert outcome == 'done'
+    assert released == []
+
+
+def test_failure_still_releases_lease(monkeypatch, dispatch_ctx):
+    """A crash before apply_client_processing_results_for_file returns means
+    the lease was never cleared -- the finally block must still release it so
+    it doesn't sit held until it naturally expires."""
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda user_id, filename, steps: {'ocr': {'text': 'hi'}})
+
+    def _boom(*a, **k):
+        raise RuntimeError('table storage unavailable')
+
+    monkeypatch.setattr(app, 'apply_client_processing_results_for_file', _boom)
+    released = []
+    monkeypatch.setattr(app, 'release_processing_lease', lambda *a, **k: released.append(a))
+
+    with pytest.raises(RuntimeError):
+        app._handle_ipwork_queue_payload(
+            {'filename': 'photo.jpg', 'steps': ['ocr']}, 'job-7', 'lib-A',
+        )
+
+    assert len(released) == 1
+
+
 def test_lease_busy_backs_off_without_running_steps(monkeypatch, dispatch_ctx):
     """When another owner (a browser tab, typically) already holds the
     lease, ipworker must back off without running any inference, and report
