@@ -46,10 +46,12 @@ EOF
 # FQDNs), so this is regenerated here rather than baked in at image build
 # time, same reasoning as env.js above. See csp.conf for the directives this
 # was verified against in a real browser (and for why script-src also needs
-# unpkg.com, and connect-src needs photon.komoot.io, added alongside this).
-CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://photon.komoot.io"
+# unpkg.com, and connect-src needs photon.komoot.io plus the data: scheme --
+# tesseract-core.wasm.js fetches its embedded wasm binary as a data: URI --
+# added alongside this).
+CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://photon.komoot.io data:"
 if [ -n "$API_BASE_URL" ]; then
-  CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://photon.komoot.io"
+  CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://photon.komoot.io data:"
 fi
 
 cat > /etc/nginx/csp.conf <<EOF
