@@ -398,7 +398,23 @@ var backendEnv = [
   { name: 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', value: '0.74' }
   { name: 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', value: '0.58' }
   { name: 'MAPS_ON_UPLOAD', value: 'false' }
-  { name: 'MAPS_QUEUE_ON_UPLOAD', value: 'false' }
+  // Was 'false' (an unexplained override of the Python default, 'true', that
+  // predates this file's history). With this off, the browser's own EXIF
+  // report makes _apply_client_processing_results do a synchronous, blocking
+  // reverse-geocode call (Nominatim, up to GEOCODER_TIMEOUT=8s) inline in
+  // /upload/client-processing -- almost certainly the real explanation for
+  // that endpoint's previously-observed 33-61s average latency. This is
+  // pure duplicate work in 'both'/'backend' PROCESSING_MODE: ipworker already
+  // queues 'map_detection' for every upload via _queue_ipwork_processing
+  // regardless of this flag, and ipwork_geo.process_geo calls the exact same
+  // maps_utils.reverse_geocode -- whichever finishes first wins via the
+  // existing _step_locked_done race guard, same as every other dual-path
+  // step. Turning this on just stops redoing that work synchronously on one
+  // of the backend's few gunicorn threads. Only correctness precondition:
+  // PROCESSING_MODE must not be 'browser' (ipworker would never run then,
+  // and geocoding would never happen) -- confirmed live at 'both' before
+  // making this change.
+  { name: 'MAPS_QUEUE_ON_UPLOAD', value: 'true' }
   // Minimum interval between automatic full-recluster (DBSCAN) maintenance
   // passes per user -- new faces are assigned synchronously in-process via
   // _assign_faces_to_people_incrementally (no worker involved) as they
