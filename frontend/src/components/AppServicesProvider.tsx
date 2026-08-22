@@ -318,6 +318,22 @@ const IDB_RESUME_CACHE_CONCURRENCY = 4;
 // support.
 const CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES = 200 * MB;
 
+// A fresh (non-queued) mobile Safari picker selection above this size was
+// observed live to fail with zero network calls ever firing -- no upload
+// endpoint hit, nothing logged, tab stays alive (see
+// mobile-safari-large-batch-upload-crash memory). 937 files was the largest
+// confirmed-reliable fresh selection; this is set a little below that as a
+// margin of safety, not a precisely measured ceiling. Telling: the *same*
+// device successfully handled 1300+ files when they were queued onto an
+// already-running upload (deferred) rather than started immediately off a
+// fresh pick -- consistent with an iOS memory-pressure window right after the
+// native picker finishes transcoding a huge RAW/HEIC selection, which settles
+// by the time a queued batch's turn comes up. Splitting a huge fresh
+// selection into chunks and only starting the first one immediately (queuing
+// the rest through the exact same deferred mechanism) gives every chunk after
+// the first that same "settled" treatment.
+const MAX_FRESH_UPLOAD_BATCH_SIZE = 900;
+
 // ---- Turbo mode --------------------------------------------------------------
 // On-device processing normally drains one photo at a time to keep resource use
 // gentle. Turbo trades that for throughput: it processes several photos at once,
@@ -3185,8 +3201,47 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         await retryPersistedUploadSession();
     }, [retryPersistedUploadSession]);
 
+    // Splits a large fresh selection into <=MAX_FRESH_UPLOAD_BATCH_SIZE
+    // chunks instead of handing it to startUpload in one shot: only the
+    // first chunk starts immediately, the rest queue through
+    // queuedUploadBatchesRef -- the exact mechanism startUpload's own
+    // `uploading` branch already uses for files picked while an upload is
+    // running, which is the one code path confirmed live to handle 1300+
+    // files reliably. See MAX_FRESH_UPLOAD_BATCH_SIZE's own comment for why
+    // immediate-vs-deferred seems to matter here.
+    const startUploadInBatches = useCallback((files: File[]) => {
+        if (files.length <= MAX_FRESH_UPLOAD_BATCH_SIZE) {
+            void startUpload(files);
+            return;
+        }
+        const firstBatch = files.slice(0, MAX_FRESH_UPLOAD_BATCH_SIZE);
+        const remainder = files.slice(MAX_FRESH_UPLOAD_BATCH_SIZE);
+        for (let i = 0; i < remainder.length; i += MAX_FRESH_UPLOAD_BATCH_SIZE) {
+            queuedUploadBatchesRef.current.push(remainder.slice(i, i + MAX_FRESH_UPLOAD_BATCH_SIZE));
+        }
+        setQueuedUploadFileCount((count) => count + remainder.length);
+        addNotification(
+            'Large selection split into batches',
+            `${plural(files.length, 'file')} split into batches of up to ${MAX_FRESH_UPLOAD_BATCH_SIZE}. The first batch is starting now; the rest will follow automatically as each one finishes.`,
+        );
+        void startUpload(firstBatch);
+    }, [addNotification, startUpload]);
+
     const handleUploadSelection = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
         const selectedFiles = event.target.files ? Array.from(event.target.files) : [];
+        if (selectedFiles.length === 0) {
+            // Indistinguishable from here whether the user cancelled the
+            // picker (routine, happens constantly -- must not toast on this)
+            // or the native picker itself failed to return any files for a
+            // very large selection (seen live with 1888 items: no upload
+            // network call ever fired, and the tab stayed alive the whole
+            // time per a HAR capture, ruling out the earlier OOM-crash
+            // theory for this specific case -- see
+            // mobile-safari-large-batch-upload-crash). A console breadcrumb
+            // costs nothing for ordinary users but gives the next devtools
+            // session something HAR alone can't show.
+            console.warn('Upload picker closed with no files selected.', { rawFileListLength: event.target.files?.length ?? null });
+        }
         if (selectedFiles.length > 0) {
             // loadPersistedSession() reflects the live session while a healthy
             // upload is actively running too, so gate that fallback on !uploading
@@ -3220,11 +3275,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             'New files found',
                             `${plural(unmatchedFiles.length, 'file')} in this selection weren't part of the paused upload -- uploading separately.`,
                         );
-                        void startUpload(unmatchedFiles);
+                        startUploadInBatches(unmatchedFiles);
                     }
                 })();
             } else {
-                void startUpload(selectedFiles);
+                startUploadInBatches(selectedFiles);
             }
         }
 
@@ -3236,7 +3291,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         pendingUploadSession,
         retryPersistedUploadSession,
         setUploadError,
-        startUpload,
+        startUploadInBatches,
         uploading,
     ]);
 
