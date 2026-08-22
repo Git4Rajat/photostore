@@ -126,6 +126,9 @@ const sha256ArrayBuffer = (buffer: ArrayBuffer) => withPhotoGalleryRuntime((runt
 const acquireBrowserAiModel = (onProgress?: (stage: BrowserAiLoadStage) => void) => withPhotoGalleryRuntime(
     (runtime) => runtime.acquireBrowserAiModel(onProgress) as Promise<SharedBrowserAiModelState>,
 );
+const createBrowserThumbnail = (source: Blob | File, rotationDegrees?: number) => (
+    withPhotoGalleryRuntime((runtime) => runtime.createBrowserThumbnail(source, rotationDegrees))
+);
 const preloadNativeFaceModels = () => withPhotoGalleryRuntime((runtime) => runtime.preloadNativeFaceModels());
 const createPersistentBrowserAiWorker = () => withPhotoGalleryRuntime((runtime) => runtime.createPersistentBrowserAiWorker());
 type BrowserAiWorkerHandle = ReturnType<PhotoGalleryRuntime['createPersistentBrowserAiWorker']>;
@@ -226,6 +229,7 @@ interface AppServicesContextValue {
     loadBrowserAiModel: () => Promise<SharedBrowserAiModelState>;
     uploading: boolean;
     pendingUploadSummary: PendingUploadSummary | null;
+    pendingUploadFailedFiles: PersistedUploadFile[];
     queuedUploadFileCount: number;
     requestUpload: () => void;
     resumeAllPendingUploads: () => Promise<void>;
@@ -333,6 +337,24 @@ const CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES = 200 * MB;
 // the rest through the exact same deferred mechanism) gives every chunk after
 // the first that same "settled" treatment.
 const MAX_FRESH_UPLOAD_BATCH_SIZE = 900;
+
+// A file that fails mid-batch almost always still has its bytes available in
+// this same tab right then (uploadSourceFilesRef/uploadHandlesRef are only
+// cleared once the whole runUploadSession call finishes) -- unlike the manual
+// Retry banner, which runs long after that cleanup and so frequently finds
+// nothing left to retry (see mobile-safari-large-batch-upload-crash memory).
+// Automatically retrying failed files a couple of times, still inside the
+// same run, turns most transient failures (a flaky connection, a brief 503)
+// into a non-event instead of a stuck paused session.
+const AUTO_RETRY_MAX_ROUNDS = 2;
+const AUTO_RETRY_DELAY_MS = 1500;
+
+// Failed-file previews are stored as JPEG data URLs inside the persisted
+// session (localStorage), so a run with many failures (e.g. the network
+// dropped entirely) can't be allowed to balloon that unboundedly -- capped
+// well under any realistic localStorage quota. Remaining failed files still
+// show by name, just without a thumbnail.
+const MAX_FAILED_FILE_PREVIEWS = 50;
 
 // ---- Turbo mode --------------------------------------------------------------
 // On-device processing normally drains one photo at a time to keep resource use
@@ -1326,6 +1348,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             failedCount: failed.length,
         };
     }, [pendingUploadSession]);
+
+    const pendingUploadFailedFiles = useMemo(() => (
+        pendingUploadSession
+            ? pendingUploadSession.files.filter((file) => file.status === 'failed')
+            : []
+    ), [pendingUploadSession]);
 
     // uploadErrorHandlerRef is only ever wired up by PhotoGallery.tsx's own
     // mount effect -- it's a no-op with the message silently discarded on any
@@ -2541,6 +2569,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             };
 
             let nextFileIndex = 0;
+            let failedPreviewCount = 0;
             const worker = async () => {
                 while (true) {
                     if (uploadStopRequestedRef.current) {
@@ -2554,6 +2583,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
                     const fileMeta = pendingFiles[currentIndex];
                     updatePersistedFile(fileMeta.key, { status: 'uploading', error: undefined });
+                    let resolvedFileForFailurePreview: File | null = null;
 
                     try {
                         const sourceFile = uploadSourceFilesRef.current.get(fileMeta.key);
@@ -2586,6 +2616,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         // check's narrowing into the onFinalizeStarted
                         // closure below.
                         const resolvedFile = file;
+                        resolvedFileForFailurePreview = resolvedFile;
                         const controller = new AbortController();
                         uploadAbortControllersRef.current.add(controller);
                         let result: { skippedDuplicate: boolean };
@@ -2639,11 +2670,25 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             throw new Error(UPLOAD_STOPPED_ERROR);
                         }
                         totalFailed += 1;
+                        let previewDataUrl: string | undefined;
+                        if (resolvedFileForFailurePreview && failedPreviewCount < MAX_FAILED_FILE_PREVIEWS) {
+                            failedPreviewCount += 1;
+                            try {
+                                const thumb = await createBrowserThumbnail(resolvedFileForFailurePreview);
+                                if (thumb?.dataUrl) {
+                                    previewDataUrl = thumb.dataUrl;
+                                }
+                            } catch {
+                                // Best-effort only (e.g. RAW formats have no client-side
+                                // decoder) -- the failed file still shows by name.
+                            }
+                        }
                         updatePersistedFile(fileMeta.key, {
                             status: 'failed',
                             error: uploadSourceFilesRef.current.has(fileMeta.key)
                                 ? `${getUploadErrorMessage(err, 'Upload failed for this file.')} Please reselect this file to retry.`
                                 : getUploadErrorMessage(err, 'Upload failed for this file.'),
+                            previewDataUrl,
                         });
                     }
 
@@ -2663,6 +2708,46 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             await knownHashesPromise;
             await Promise.all(Array.from({ length: activeLaneCount }, () => worker()));
+
+            // Automatically retry files that just failed, still inside this same
+            // run -- their bytes are still in uploadSourceFilesRef/uploadHandlesRef
+            // right now (only cleared in the `finally` below), which is exactly
+            // what the *manual* Retry banner usually can't rely on, since by the
+            // time a user clicks it this cleanup has long since run. This turns
+            // most transient failures (a flaky connection, a brief 503) into a
+            // non-event instead of a stuck paused session.
+            let autoRetryRound = 0;
+            while (autoRetryRound < AUTO_RETRY_MAX_ROUNDS && !uploadStopRequestedRef.current) {
+                const latestForRetry = uploadSessionRef.current || normalized;
+                const retryCandidates = latestForRetry.files.filter((retryFile) => (
+                    retryFile.status === 'failed'
+                    && (!options.fileKeys || options.fileKeys.has(retryFile.key))
+                    && (uploadSourceFilesRef.current.has(retryFile.key) || uploadHandlesRef.current.has(retryFile.key))
+                ));
+                if (retryCandidates.length === 0) {
+                    break;
+                }
+                autoRetryRound += 1;
+                totalFailed -= retryCandidates.length;
+                updateNotification(notificationId, {
+                    title: 'Retrying failed files',
+                    details: `Automatically retrying ${plural(retryCandidates.length, 'file')} (attempt ${autoRetryRound}/${AUTO_RETRY_MAX_ROUNDS}).`,
+                    progress: {
+                        uploadedCount: totalUploaded,
+                        totalCount,
+                        failedCount: totalFailed,
+                        skippedDuplicateCount: totalSkippedDuplicates,
+                        mbPerSecond: currentUploadRate(),
+                    },
+                });
+                await sleep(AUTO_RETRY_DELAY_MS);
+                pendingFiles.length = 0;
+                pendingFiles.push(...retryCandidates);
+                nextFileIndex = 0;
+                const retryLaneCount = Math.max(1, Math.min(activeLaneCount, retryCandidates.length));
+                await Promise.all(Array.from({ length: retryLaneCount }, () => worker()));
+            }
+
             // Deliberately NOT awaited: parallelThumbnailTasks (the browser-side
             // thumbnail claim/generate/report dance kicked off per-file above)
             // used to gate "Upload complete" and clearing the persisted session
@@ -3452,6 +3537,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         loadBrowserAiModel,
         uploading,
         pendingUploadSummary,
+        pendingUploadFailedFiles,
         queuedUploadFileCount,
         requestUpload,
         resumeAllPendingUploads,
@@ -3482,6 +3568,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         loadBrowserAiModel,
         uploading,
         pendingUploadSummary,
+        pendingUploadFailedFiles,
         queuedUploadFileCount,
         requestUpload,
         resumeAllPendingUploads,

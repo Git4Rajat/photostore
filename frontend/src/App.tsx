@@ -34,6 +34,7 @@ import { DialogHost } from './components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
 import { getMine } from './services/libraryClient';
 import { getRuntimeConfig } from './config/appConfig';
+import { formatBytes } from './components/browserAiShared';
 
 const isPasswordMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
 
@@ -907,6 +908,29 @@ const AppContent: React.FC = () => {
                                     ? '. If Retry can’t find them, use Upload and reselect the same photos (or the whole folder) — files already uploaded are skipped automatically, so there’s no need to pick out just the failed ones.'
                                     : ''}
                             </p>
+                            {appServices.pendingUploadFailedFiles.length > 0 && (
+                                <details className="upload-approval-failed-details">
+                                    <summary>Show {appServices.pendingUploadFailedFiles.length} failed file(s)</summary>
+                                    <ul className="upload-approval-failed-list">
+                                        {appServices.pendingUploadFailedFiles.map((file) => (
+                                            <li key={file.key} className="upload-approval-failed-item">
+                                                {file.previewDataUrl ? (
+                                                    <img src={file.previewDataUrl} alt="" className="upload-approval-failed-thumb" />
+                                                ) : (
+                                                    <span className="upload-approval-failed-thumb upload-approval-failed-thumb-fallback">
+                                                        <PhotoIcon />
+                                                    </span>
+                                                )}
+                                                <span className="upload-approval-failed-info">
+                                                    <span className="upload-approval-failed-name">{file.name}</span>
+                                                    <span className="upload-approval-failed-size">{formatBytes(file.size)}</span>
+                                                    <span className="upload-approval-failed-reason">{file.error || 'Upload failed.'}</span>
+                                                </span>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </details>
+                            )}
                         </div>
                         <div className="upload-approval-actions">
                             <button

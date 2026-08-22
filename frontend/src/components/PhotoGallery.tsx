@@ -2680,7 +2680,7 @@ const createVideoBrowserThumbnail = async (file: File): Promise<{ dataUrl: strin
     }
 };
 
-const createBrowserThumbnail = async (source: Blob | File, rotationDegrees = 0): Promise<{ dataUrl: string; width: number; height: number; rotationDegrees: number } | null> => {
+export const createBrowserThumbnail = async (source: Blob | File, rotationDegrees = 0): Promise<{ dataUrl: string; width: number; height: number; rotationDegrees: number } | null> => {
     if (typeof createImageBitmap !== 'function') {
         return null;
     }

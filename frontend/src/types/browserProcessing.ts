@@ -51,6 +51,12 @@ export interface PersistedUploadFile {
     blockIds?: string[];
     chunkSizeBytes?: number;
     error?: string;
+    // Small best-effort JPEG data URL captured at the moment this file was
+    // marked failed (while its bytes were still in memory), so the paused-
+    // upload UI can show what a file looked like instead of just its name --
+    // capped per-session (see MAX_FAILED_FILE_PREVIEWS) since it's stored in
+    // the persisted session written to localStorage.
+    previewDataUrl?: string;
 }
 
 export interface PersistedUploadSession {

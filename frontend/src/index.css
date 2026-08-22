@@ -2968,6 +2968,100 @@ html[data-theme='light'] .notification-item.unread {
   align-items: center;
 }
 
+.upload-approval-failed-details {
+  margin-top: 6px;
+  width: 100%;
+}
+
+.upload-approval-failed-details > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  list-style: none;
+}
+
+.upload-approval-failed-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.upload-approval-failed-details > summary::before {
+  content: '▸ ';
+}
+
+.upload-approval-failed-details[open] > summary::before {
+  content: '▾ ';
+}
+
+.upload-approval-failed-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.upload-approval-failed-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: var(--r-md, 8px);
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.upload-approval-failed-thumb {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.upload-approval-failed-thumb-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+
+.upload-approval-failed-thumb-fallback svg {
+  width: 18px;
+  height: 18px;
+}
+
+.upload-approval-failed-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.upload-approval-failed-name {
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-approval-failed-size {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.upload-approval-failed-reason {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .hidden-upload-input {
   display: none;
 }
