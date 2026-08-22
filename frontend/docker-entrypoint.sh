@@ -45,12 +45,13 @@ EOF
 # varies by environment (prod vs. test sandbox both use random Container Apps
 # FQDNs), so this is regenerated here rather than baked in at image build
 # time, same reasoning as env.js above. See csp.conf for the directives this
-# was verified against in a real browser.
-CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com"
+# was verified against in a real browser (and for why script-src also needs
+# unpkg.com, and connect-src needs photon.komoot.io, added alongside this).
+CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://photon.komoot.io"
 if [ -n "$API_BASE_URL" ]; then
-  CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com"
+  CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://photon.komoot.io"
 fi
 
 cat > /etc/nginx/csp.conf <<EOF
-add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://*.blob.core.windows.net; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" always;
+add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://unpkg.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://*.blob.core.windows.net; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" always;
 EOF
