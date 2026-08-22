@@ -1452,12 +1452,21 @@ const geocodeWithThrottle = async (latitude: string, longitude: string): Promise
     };
 };
 
-// Kept well under CLIENT_BROWSER_STEP_BUDGET_MS so a hung recognize() call still
-// lets `finally` below terminate the worker before the outer per-step budget gives
-// up on runBrowserOcr entirely -- otherwise the dedicated Worker (and its Tesseract
-// WASM heap) leaks forever, one per photo, since terminate() is gated on the same
-// await that never settles.
-const OCR_RECOGNIZE_TIMEOUT_MS = 7000;
+// Total budget for the whole function (setup + both possible recognize()
+// attempts combined), kept safely under the caller's CLIENT_BROWSER_STEP_BUDGET_MS
+// (10s, wrapping the entire runBrowserOcr(...) call). A single fixed per-call
+// timeout applied to each of the up-to-two sequential recognize() calls would
+// let their worst case (2x that timeout) exceed the outer budget -- and once
+// the *outer* withTimeout abandons a still-running runBrowserOcr mid-retry,
+// its `finally` (and the worker.terminate() inside it) no longer fires on any
+// predictable schedule the caller can rely on. Racing every recognize() call
+// against a shared deadline instead guarantees runBrowserOcr always settles
+// (and terminates its worker) before the outer budget gives up.
+const OCR_TOTAL_BUDGET_MS = 8500;
+// Skip the preprocessed retry if less than this much of the shared budget is
+// left -- not enough time for a real attempt, so it would just dispatch a
+// second worker job that immediately loses its own race.
+const OCR_MIN_RETRY_BUDGET_MS = 1500;
 
 const runBrowserOcr = async (source: Blob | File): Promise<string> => {
     // tesseract.js's loadImage() reads `.name` off any Blob/File source (to special-case
@@ -1501,6 +1510,13 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
         }
     };
 
+    // Measured from function entry, not after setup, so a slow cold-start
+    // (worker spin-up, language-data fetch) counts against the same budget as
+    // the recognize() calls -- otherwise setup time is "free" and the total
+    // wall-clock time the outer caller sees can still exceed its own budget.
+    const deadline = performance.now() + OCR_TOTAL_BUDGET_MS;
+    const remainingBudgetMs = () => Math.max(0, deadline - performance.now());
+
     try {
         const tesseract = await import('../vendor/tesseract');
         const { createWorker } = tesseract as any;
@@ -1527,22 +1543,27 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
             }
 
             // Try original image first
-            let result = await withTimeout<{ data?: { text?: string } }>(worker.recognize(toOcrSource(source)), OCR_RECOGNIZE_TIMEOUT_MS);
+            let result: { data?: { text?: string } } | null = null;
+            try {
+                result = await withTimeout<{ data?: { text?: string } }>(worker.recognize(toOcrSource(source)), remainingBudgetMs());
+            } catch {
+                // fall through with result still null -- treated the same as a timeout below
+            }
             let text = String(result?.data?.text || '').trim().slice(0, 2048);
             if (text) return text;
-            if (!result) {
-                // Timed out (or the worker never responded at all) -- a retry would
-                // almost certainly hang the same way, so skip it and fall through to
-                // `finally` to terminate the worker instead of leaking it.
+            if (!result || remainingBudgetMs() < OCR_MIN_RETRY_BUDGET_MS) {
+                // Timed out / errored, or not enough of the shared budget left for a
+                // real second attempt -- skip the retry and fall through to `finally`
+                // to terminate the worker instead of leaking it.
                 return '';
             }
 
             // If empty, attempt a preprocessed retry
             const blobSource = source instanceof Blob ? source : new Blob([await (source as File).arrayBuffer()], { type: (source as File).type || 'image/*' });
             const pre = await preprocessBlob(blobSource);
-            if (pre) {
+            if (pre && remainingBudgetMs() >= OCR_MIN_RETRY_BUDGET_MS) {
                 try {
-                    result = await withTimeout<{ data?: { text?: string } }>(worker.recognize(toOcrSource(pre)), OCR_RECOGNIZE_TIMEOUT_MS);
+                    result = await withTimeout<{ data?: { text?: string } }>(worker.recognize(toOcrSource(pre)), remainingBudgetMs());
                     text = String(result?.data?.text || '').trim().slice(0, 2048);
                     if (text) return text;
                 } catch {
