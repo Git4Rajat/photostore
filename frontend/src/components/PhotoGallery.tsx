@@ -1468,7 +1468,7 @@ const OCR_TOTAL_BUDGET_MS = 8500;
 // second worker job that immediately loses its own race.
 const OCR_MIN_RETRY_BUDGET_MS = 1500;
 
-const runBrowserOcr = async (source: Blob | File): Promise<string> => {
+const runBrowserOcrInner = async (source: Blob | File): Promise<string> => {
     // tesseract.js's loadImage() reads `.name` off any Blob/File source (to special-case
     // .pbm files); a plain Blob (e.g. from canvas.toBlob or File.slice, as used by the
     // RAW/HEIC preview paths) has no `.name` and throws. Always give it a named File.
@@ -1577,6 +1577,35 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
         }
     } catch {
         return '';
+    }
+};
+
+// Real-world crash (reproduced in a real headless Chrome, not theorized): firing
+// a whole photo backlog's worth of OCR calls at once -- exactly what happens
+// right after turning browser AI on -- spins up one dedicated Tesseract WASM
+// worker per photo concurrently, and beyond a handful of simultaneous workers
+// this reliably crashes with "Cannot read properties of null (reading
+// 'postMessage')" inside tesseract.js's own internals (and, at higher
+// concurrency, crashes the whole tab from memory pressure). Verified clean at
+// up to 4 concurrent workers across repeated bursts; picked 2 for headroom
+// since real user hardware varies. Excess calls are skipped (return '')
+// immediately rather than queued -- a queue would make late callers wait an
+// unbounded time, which would itself blow past the outer per-step timeout
+// budget (CLIENT_BROWSER_STEP_BUDGET_MS) during a real backlog burst. Skipped
+// photos aren't lost: the existing pending-work mechanism retries incomplete
+// steps later once capacity frees up.
+const OCR_MAX_CONCURRENT_WORKERS = 2;
+let ocrActiveWorkerCount = 0;
+
+const runBrowserOcr = async (source: Blob | File): Promise<string> => {
+    if (ocrActiveWorkerCount >= OCR_MAX_CONCURRENT_WORKERS) {
+        return '';
+    }
+    ocrActiveWorkerCount += 1;
+    try {
+        return await runBrowserOcrInner(source);
+    } finally {
+        ocrActiveWorkerCount -= 1;
     }
 };
 
