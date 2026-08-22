@@ -391,6 +391,17 @@ export const getBrowserProcessingConcurrency = (): number => {
 const PENDING_PROCESSING_BATCH_SIZE = 40;
 
 const WARMUP_POLL_INTERVAL_MS = 5000;
+// The shared HTTP client's own timeout is 600s (createHttpClient's default)
+// and a "no response" failure is retried up to COLD_START_RETRIES times with
+// backoff (httpClient.ts) -- fine for real work, but catastrophic for a
+// liveness ping: a warm-up request that merely *hangs* (a flaky mobile
+// connection switching wifi/cellular, not a clean failure) could take up to
+// ~50 minutes to ever settle. Every startUpload/requestUpload call made
+// while it's stuck is silently blocked by uploadStartInProgressRef the whole
+// time. This is a real ping, not real work -- give it its own short leash
+// instead of inheriting the client-wide budget meant for actual data
+// transfers. AbortSignal.timeout is supported iOS Safari 16+.
+const WARMUP_REQUEST_TIMEOUT_MS = 8000;
 const BACKEND_KEEPALIVE_INTERVAL_MS = 30000;
 // While a batch is draining, the keep-alive heartbeat worker drives the loop at
 // this cadence so it keeps running at full speed in a hidden/minimized tab.
@@ -881,8 +892,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
     }, [warmEndpoint]);
 
-    const warmBackend = useCallback(() => get('/health').then(() => undefined), []);
-    const warmUpload = useCallback(() => getUpload('/health').then(() => undefined), []);
+    const warmBackend = useCallback(() => (
+        get('/health', { signal: AbortSignal.timeout(WARMUP_REQUEST_TIMEOUT_MS) }).then(() => undefined)
+    ), []);
+    const warmUpload = useCallback(() => (
+        getUpload('/health', { signal: AbortSignal.timeout(WARMUP_REQUEST_TIMEOUT_MS) }).then(() => undefined)
+    ), []);
     const startBackendKeepalive = useCallback(() => {
         if (backendKeepaliveTimerRef.current !== null) {
             return;
@@ -3058,6 +3073,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             setUploadError(message);
             setUploading(false);
             uploadingRef.current = false;
+            // Without this, a single warm-up failure (cold-start timeout, a
+            // transient network blip, backend capacity pressure) wedges this
+            // flag true forever -- every future requestUpload()/startUpload()
+            // call bails at its own early-return guard for the rest of the
+            // tab session, with no visible way out: `uploading` is already
+            // false here, so the Stop button (the only other place this gets
+            // reset) isn't even rendered to click.
+            uploadStartInProgressRef.current = false;
             updateNotification(warmupNotificationId, {
                 title: 'Upload warm-up failed',
                 details: message,
