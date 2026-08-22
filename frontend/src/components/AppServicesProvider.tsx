@@ -300,13 +300,23 @@ const TARGET_CONCURRENT_UPLOAD_BLOCKS = 6;
 // than this, so the cap only ever lowers the large desktop sizes.
 const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
 
-// Shared IndexedDB-access concurrency for the upload resume cache (both
-// writing it in cacheUploadFilesForResume and checking it in
-// retryPersistedUploadSession) -- a 1000-file batch firing every idbPut/idbGet
-// concurrently used to open ~1000 simultaneous IndexedDB connections at once,
-// exactly the kind of burst that trips iOS Safari's much tighter per-tab
-// memory/storage ceilings.
+// Shared IndexedDB-access concurrency for the upload resume cache (writing it
+// in cacheUploadFilesForResume/attachSelectedFilesToPendingSession, and
+// checking it in retryPersistedUploadSession) -- a 1000-file batch firing
+// every idbPut/idbGet concurrently used to open ~1000 simultaneous IndexedDB
+// connections at once, exactly the kind of burst that trips iOS Safari's much
+// tighter per-tab memory/storage ceilings.
 const IDB_RESUME_CACHE_CONCURRENCY = 4;
+
+// Shared with the same two write sites above: even throttled to the
+// concurrency above, a thousand-plus-photo mobile batch (each full-res
+// HEIC/RAW file several MB+) still pushes gigabytes of blob writes through
+// IndexedDB while competing for the same tight memory budget the upload
+// itself needs -- iOS Safari kills the tab outright, with no JS error to
+// catch. Cap the total bytes cached on constrained devices instead of
+// skipping the feature outright, so small mobile uploads still get resume
+// support.
+const CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES = 200 * MB;
 
 // ---- Turbo mode --------------------------------------------------------------
 // On-device processing normally drains one photo at a time to keep resource use
@@ -1286,8 +1296,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         };
     }, [pendingUploadSession]);
 
+    // uploadErrorHandlerRef is only ever wired up by PhotoGallery.tsx's own
+    // mount effect -- it's a no-op with the message silently discarded on any
+    // other route (Tools, Library, Albums...), even though the global Upload
+    // button in the header (RootServiceActions) is reachable from all of
+    // them. A toast is route-independent, so it's the fallback that actually
+    // guarantees an upload failure is visible instead of vanishing when the
+    // user isn't on the Gallery page at that moment.
     const setUploadError = useCallback((message: string | null) => {
         uploadErrorHandlerRef.current?.(message);
+        if (message) {
+            showToast(message, { variant: 'error' });
+        }
     }, []);
 
     const invalidatePhotoCache = useCallback(() => {
@@ -2748,24 +2768,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
 
         const matchedKeys = new Set<string>();
-        let matchedCount = 0;
+        const matchedPairs: Array<{ key: string; file: File }> = [];
         const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
         const doneFiles = session.files.filter((file) => file.status === 'done');
         const unmatchedFiles: File[] = [];
 
+        // Fast, synchronous matching pass only -- no IndexedDB writes here.
+        // uploadSourceFilesRef is set immediately per match, which is all
+        // retryPersistedUploadSession actually needs to proceed; the blob
+        // persistence below is a slower best-effort extra, done afterward.
         for (const file of selectedFiles) {
             const meta = unfinishedFiles.find((candidate) => (
                 !matchedKeys.has(candidate.key) && fileMatchesPersistedUpload(file, candidate)
             ));
             if (meta) {
                 matchedKeys.add(meta.key);
-                matchedCount += 1;
                 uploadSourceFilesRef.current.set(meta.key, file);
-                try {
-                    await idbPut(meta.key, file);
-                } catch {
-                    // The in-memory File reference still allows retry in this tab.
-                }
+                matchedPairs.push({ key: meta.key, file });
                 updatePersistedFile(meta.key, { status: 'pending', error: undefined });
                 continue;
             }
@@ -2781,6 +2800,46 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             unmatchedFiles.push(file);
         }
 
+        // Writing every matched file's full bytes into IndexedDB -- same
+        // hazard cacheUploadFilesForResume guards against, and this is
+        // exactly the path a retry of a batch that failed for that reason
+        // hits (reselecting the SAME large batch always matches here, not
+        // startUpload). Previously this ran sequentially and unthrottled,
+        // both slow (one open/write/close IndexedDB cycle at a time for
+        // potentially 1000+ files -- looks hung) and uncapped in total bytes
+        // (the actual crash risk). Throttled + budget-capped the same way,
+        // and NOT awaited -- uploadSourceFilesRef above already lets the
+        // upload proceed without waiting for this.
+        void (async () => {
+            const budgetBytes = isConstrainedUploadDevice() ? CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES : Infinity;
+            let cachedBytes = 0;
+            let cursor = 0;
+            const worker = async () => {
+                while (true) {
+                    const index = cursor;
+                    cursor += 1;
+                    if (index >= matchedPairs.length) {
+                        return;
+                    }
+                    if (cachedBytes >= budgetBytes) {
+                        continue;
+                    }
+                    const { key, file } = matchedPairs[index];
+                    try {
+                        await idbPut(key, file);
+                        cachedBytes += file.size;
+                    } catch {
+                        // The in-memory File reference still allows retry in this tab.
+                    }
+                }
+            };
+            await Promise.all(Array.from(
+                { length: Math.min(IDB_RESUME_CACHE_CONCURRENCY, matchedPairs.length) },
+                () => worker(),
+            ));
+        })();
+
+        const matchedCount = matchedPairs.length;
         const latest = uploadSessionRef.current || session;
         persistSession(latest);
         setPendingUploadSession(latest);
@@ -2873,14 +2932,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // simultaneous IndexedDB connections at once, exactly the kind of burst
     // that trips iOS Safari's much tighter per-tab memory/storage ceilings.
     //
-    // That throttle alone wasn't enough for a large mobile batch: even at
-    // concurrency 4, a thousand-plus-photo selection (each full-res HEIC/RAW
-    // file several MB+) still pushes gigabytes of blob writes through
-    // IndexedDB while the upload itself competes for the same tight memory
-    // budget -- iOS Safari kills the tab outright, with no JS error to catch.
-    // Cap the total bytes cached on constrained devices instead of skipping
-    // the feature outright, so small mobile uploads still get resume support.
-    const CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES = 200 * MB;
+    // That throttle alone wasn't enough for a large mobile batch -- see
+    // CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES's own comment above.
     const cacheUploadFilesForResume = async (
         session: PersistedUploadSession,
         filesToUpload: File[],
@@ -2943,7 +2996,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return;
         }
         if (uploadStartInProgressRef.current || pendingUploadSessionRef.current) {
-            addNotification('Upload already starting', 'The selected files are already being prepared or uploaded.');
+            const message = pendingUploadSessionRef.current
+                ? 'A paused upload is waiting -- use Retry or Discard on the banner before starting a new one.'
+                : 'The selected files are already being prepared or uploaded.';
+            addNotification('Upload already starting', message);
+            // A bell-only notification is easy to miss here in particular: a
+            // stuck pendingUploadSession silently blocks every subsequent
+            // Upload click with no other feedback -- this is the exact "I
+            // picked files and nothing happened" dead end reported live.
+            showToast(message, { variant: 'error' });
             return;
         }
         if (uploading) {
@@ -3084,7 +3145,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const requestUpload = useCallback(() => {
         if (uploadStartInProgressRef.current) {
-            addNotification('Upload already starting', 'Wait for the current upload preparation to finish before selecting more files.');
+            const message = 'Wait for the current upload preparation to finish before selecting more files.';
+            addNotification('Upload already starting', message);
+            showToast(message, { variant: 'error' });
             return;
         }
         // While actively uploading, skip the warm-up poll (the backend is

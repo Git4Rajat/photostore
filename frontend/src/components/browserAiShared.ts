@@ -249,8 +249,16 @@ export const getAdaptiveUploadProfile = (
     // lower it (never contradict a live, lower, possibly-since-degraded
     // reading); with no live reading at all (Safari/Firefox), any real
     // observed transfer is better than the static guess, however old it is.
+    // Mobile devices get this same cross-check now too (previously skipped
+    // here entirely) -- a touch device on strong wifi deserves the same
+    // chance to prove it via real evidence as desktop does, rather than
+    // being blocked from ever reaching the fast tiers below purely on form
+    // factor. lowMemory is still excluded from this, on purpose: a
+    // genuinely memory-constrained device shouldn't get a bandwidth-earned
+    // reason to raise parallelism when the real risk there is concurrent
+    // Blob/hash memory pressure, not link speed.
     let downlink = reportedDownlink;
-    if (!isMobileViewport && !coarsePointer) {
+    if (!lowMemory) {
         const observed = measureObservedDownlinkMbps(hasNetworkInfo ? RESOURCE_TIMING_RECENT_WINDOW_MS : undefined);
         if (observed !== null) {
             downlink = hasNetworkInfo ? Math.max(downlink, observed) : observed;
@@ -269,7 +277,7 @@ export const getAdaptiveUploadProfile = (
     // network.
     const hasGoodApiRtt = rtt > 0 && rtt < 100;
     let lowLatencyEvidence = hasGoodApiRtt;
-    if (!lowLatencyEvidence && rtt === 0 && !isMobileViewport && !coarsePointer
+    if (!lowLatencyEvidence && rtt === 0 && !lowMemory
         && typeof options?.measuredRttMs === 'number' && options.measuredRttMs > 0 && options.measuredRttMs < ACTIVE_PROBE_RTT_FAST_MS) {
         lowLatencyEvidence = true;
     }
@@ -285,7 +293,7 @@ export const getAdaptiveUploadProfile = (
     // latency above, since that's just as likely to be a cold-started backend
     // as an actually slow link.
     let effectiveRtt = rtt;
-    if (rtt >= 400 && !isMobileViewport && !coarsePointer
+    if (rtt >= 400 && !lowMemory
         && typeof options?.measuredRttMs === 'number' && options.measuredRttMs > 0 && options.measuredRttMs < ACTIVE_PROBE_RTT_FAST_MS) {
         effectiveRtt = options.measuredRttMs;
     }
@@ -311,8 +319,27 @@ export const getAdaptiveUploadProfile = (
         }
         return { fileParallelism: 1, chunkSizeBytes: 2 * MB, reason: 'mobile or slow network' };
     }
-    if (isMobileViewport || coarsePointer || lowMemory) {
-        return withChunkFloor({ fileParallelism: hasLargeFiles ? 1 : 2, chunkSizeBytes: 2 * MB, reason: 'mobile device profile' });
+    // A genuinely memory-constrained device (not just a touch/mobile form
+    // factor) still gets capped hard regardless of connection quality -- the
+    // risk there is concurrent Blob/hash memory pressure, which a fast link
+    // doesn't fix.
+    if (lowMemory) {
+        return withChunkFloor({ fileParallelism: hasLargeFiles ? 1 : 2, chunkSizeBytes: 2 * MB, reason: 'low device memory' });
+    }
+    // Mobile/touch devices with no real signal either way (no Network
+    // Information API -- true for all of iOS Safari and Chrome-on-iOS, since
+    // iOS forces the WebKit engine regardless of browser -- and no
+    // Resource Timing evidence yet) get a distinct, more modest fallback
+    // than desktop's "assume wifi or ethernet" guess just below: a phone or
+    // tablet with zero evidence could just as plausibly be on cellular,
+    // where desktop's blind assumption is reasonable because a wired/wifi
+    // desktop machine on cellular is physically unlikely. This is not a
+    // ceiling -- real evidence (the cross-checked downlink/rtt above, or a
+    // measured cellular effectiveType) still reaches the same top tier
+    // below as any other device; this only covers the true-zero-evidence
+    // case.
+    if ((isMobileViewport || coarsePointer) && !hasNetworkInfo) {
+        return withChunkFloor({ fileParallelism: hasLargeFiles ? 2 : 4, chunkSizeBytes: 2 * MB, reason: 'mobile device, no network signal' });
     }
     if (!hasNetworkInfo) {
         return withChunkFloor({
@@ -324,9 +351,11 @@ export const getAdaptiveUploadProfile = (
     if (downlink >= 10 && lowLatencyEvidence) {
         // connection.type ('wifi'/'ethernet') is only ever used for the log
         // message, never as a gate -- it's "partial support, experimental" on
-        // desktop Chrome and unavailable on Firefox/Safari, and everything
-        // that actually needs excluding (mobile viewport/pointer, 3g/cellular)
-        // was already filtered out by the branches above this one.
+        // desktop Chrome and unavailable on Firefox/Safari. Reachable by
+        // mobile/touch devices too now (deliberately) as long as they clear
+        // this same bar with real evidence -- only lowMemory, cellular, and
+        // no-signal-at-all mobile were filtered out above; a touch device on
+        // demonstrably fast, low-latency wifi lands here same as desktop.
         return withChunkFloor({
             fileParallelism: hasLargeFiles ? 12 : 20,
             chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES,

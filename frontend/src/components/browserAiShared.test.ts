@@ -38,10 +38,27 @@ describe('getAdaptiveUploadProfile', () => {
         expect(getAdaptiveUploadProfile(bigFile(1 * MB)).fileParallelism).toBe(1);
     });
 
-    it('keeps mobile viewports conservative regardless of reported downlink', () => {
+    it('reaches the top tier on mobile too when there is strong real evidence (fast, low-latency wifi)', () => {
         setConnection({ effectiveType: '4g', downlink: 50, rtt: 20, type: 'wifi' });
         setMatchMedia({ mobile: true });
-        expect(getAdaptiveUploadProfile(bigFile(1 * MB)).fileParallelism).toBe(2);
+        expect(getAdaptiveUploadProfile(bigFile(1 * MB)).fileParallelism).toBe(20);
+    });
+
+    it('gives mobile a modest, non-top-tier profile when there is no network signal at all', () => {
+        setConnection(undefined);
+        setMatchMedia({ mobile: true });
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB));
+        expect(profile.fileParallelism).toBe(4);
+        expect(profile.reason).toMatch(/mobile device, no network signal/);
+    });
+
+    it('keeps a low-memory device capped even on a fast, low-latency connection', () => {
+        setConnection({ effectiveType: '4g', downlink: 50, rtt: 20, type: 'wifi' });
+        setDeviceMemory(4);
+        setMatchMedia({ mobile: true });
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB));
+        expect(profile.fileParallelism).toBe(2);
+        expect(profile.reason).toBe('low device memory');
     });
 
     it('raises the ceiling for a confirmed fast wired/wifi connection', () => {
@@ -167,13 +184,14 @@ describe('getAdaptiveUploadProfile', () => {
 
     it('floors the chunk size for huge batches without cutting parallelism', () => {
         setConnection(undefined);
-        // Mobile tier normally uses 2MB chunks; none of these files individually
-        // trip the "large file" threshold (40MB), so parallelism should be
-        // unaffected by the batch-size floor -- only chunkSizeBytes should move.
+        // Mobile-with-no-network-info tier normally uses 2MB chunks; none of
+        // these files individually trip the "large file" threshold (40MB), so
+        // parallelism should be unaffected by the batch-size floor -- only
+        // chunkSizeBytes should move.
         setMatchMedia({ mobile: true });
         const manyFiles = Array.from({ length: 5 }, () => ({ size: 35 * MB })); // 175MB total
         const profile = getAdaptiveUploadProfile(manyFiles);
-        expect(profile.fileParallelism).toBe(2);
+        expect(profile.fileParallelism).toBe(4);
         expect(profile.chunkSizeBytes).toBeGreaterThanOrEqual(16 * MB);
     });
 });
