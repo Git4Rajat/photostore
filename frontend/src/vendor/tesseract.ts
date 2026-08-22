@@ -2,6 +2,7 @@ type TesseractWorker = {
     load?: () => Promise<void> | void;
     loadLanguage?: (lang: string) => Promise<void> | void;
     initialize?: (lang: string) => Promise<void> | void;
+    setParameters?: (params: Record<string, string>) => Promise<void> | void;
     recognize: (source: Blob | File | string) => Promise<{ data?: { text?: string } }>;
     terminate?: () => Promise<void> | void;
 };

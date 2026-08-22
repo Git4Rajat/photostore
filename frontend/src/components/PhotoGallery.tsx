@@ -1452,6 +1452,13 @@ const geocodeWithThrottle = async (latitude: string, longitude: string): Promise
     };
 };
 
+// Kept well under CLIENT_BROWSER_STEP_BUDGET_MS so a hung recognize() call still
+// lets `finally` below terminate the worker before the outer per-step budget gives
+// up on runBrowserOcr entirely -- otherwise the dedicated Worker (and its Tesseract
+// WASM heap) leaks forever, one per photo, since terminate() is gated on the same
+// await that never settles.
+const OCR_RECOGNIZE_TIMEOUT_MS = 7000;
+
 const runBrowserOcr = async (source: Blob | File): Promise<string> => {
     // tesseract.js's loadImage() reads `.name` off any Blob/File source (to special-case
     // .pbm files); a plain Blob (e.g. from canvas.toBlob or File.slice, as used by the
@@ -1508,18 +1515,34 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
             if (typeof worker.initialize === 'function') {
                 try { await worker.initialize('eng'); } catch { /* ignore */ }
             }
+            if (typeof worker.setParameters === 'function') {
+                // PSM 11 (SPARSE_TEXT): look for scattered text anywhere in the image
+                // instead of assuming a structured document layout. Real photos (signs,
+                // screenshots, labels) routinely trip the default AUTO mode's layout
+                // analysis into over-segmenting background texture into a huge tree of
+                // spurious blocks/words/symbols, which can grow large enough that the
+                // worker's postMessage back to the main thread throws a DataCloneError
+                // (structured-clone OOM) instead of ever resolving.
+                try { await worker.setParameters({ tessedit_pageseg_mode: '11' }); } catch { /* ignore */ }
+            }
 
             // Try original image first
-            let result = await worker.recognize(toOcrSource(source));
+            let result = await withTimeout<{ data?: { text?: string } }>(worker.recognize(toOcrSource(source)), OCR_RECOGNIZE_TIMEOUT_MS);
             let text = String(result?.data?.text || '').trim().slice(0, 2048);
             if (text) return text;
+            if (!result) {
+                // Timed out (or the worker never responded at all) -- a retry would
+                // almost certainly hang the same way, so skip it and fall through to
+                // `finally` to terminate the worker instead of leaking it.
+                return '';
+            }
 
             // If empty, attempt a preprocessed retry
             const blobSource = source instanceof Blob ? source : new Blob([await (source as File).arrayBuffer()], { type: (source as File).type || 'image/*' });
             const pre = await preprocessBlob(blobSource);
             if (pre) {
                 try {
-                    result = await worker.recognize(toOcrSource(pre));
+                    result = await withTimeout<{ data?: { text?: string } }>(worker.recognize(toOcrSource(pre)), OCR_RECOGNIZE_TIMEOUT_MS);
                     text = String(result?.data?.text || '').trim().slice(0, 2048);
                     if (text) return text;
                 } catch {
