@@ -1586,15 +1586,18 @@ const runBrowserOcrInner = async (source: Blob | File): Promise<string> => {
 // worker per photo concurrently, and beyond a handful of simultaneous workers
 // this reliably crashes with "Cannot read properties of null (reading
 // 'postMessage')" inside tesseract.js's own internals (and, at higher
-// concurrency, crashes the whole tab from memory pressure). Verified clean at
-// up to 4 concurrent workers across repeated bursts; picked 2 for headroom
-// since real user hardware varies. Excess calls are skipped (return '')
-// immediately rather than queued -- a queue would make late callers wait an
-// unbounded time, which would itself blow past the outer per-step timeout
+// concurrency, crashes the whole tab from memory pressure). A cap of 2 was
+// clean across repeated bursts in headless Chrome, but a live Edge session
+// under real load (concurrent failed fetches/retries competing for the same
+// resources) still hit the same crash at that cap -- lowered to 1 for a wider
+// safety margin, since real user hardware/browser/load conditions vary more
+// than a synthetic benchmark can capture. Excess calls are skipped (return
+// '') immediately rather than queued -- a queue would make late callers wait
+// an unbounded time, which would itself blow past the outer per-step timeout
 // budget (CLIENT_BROWSER_STEP_BUDGET_MS) during a real backlog burst. Skipped
 // photos aren't lost: the existing pending-work mechanism retries incomplete
 // steps later once capacity frees up.
-const OCR_MAX_CONCURRENT_WORKERS = 2;
+const OCR_MAX_CONCURRENT_WORKERS = 1;
 let ocrActiveWorkerCount = 0;
 
 const runBrowserOcr = async (source: Blob | File): Promise<string> => {
@@ -1608,6 +1611,29 @@ const runBrowserOcr = async (source: Blob | File): Promise<string> => {
         ocrActiveWorkerCount -= 1;
     }
 };
+
+// Safety net for the same underlying tesseract.js v2.1.5 architecture issue:
+// its worker wrapper tracks in-flight jobs keyed only by action name ('recognize'),
+// not per-call, and a stray, already-abandoned job's rejection can arrive *after*
+// our own worker.terminate() already nulled its Worker reference -- surfacing as
+// a genuinely uncaught "Cannot read properties of null (reading 'postMessage')"
+// that isn't reachable from any try/catch we hold (nothing is still listening to
+// that specific stray promise by the time it settles). The concurrency cap above
+// minimizes how often this fires; this listener stops the residual case from
+// showing up as an alarming console crash -- our own awaited OCR call has already
+// resolved via its own timeout/catch handling well before this stray rejection
+// arrives, so suppressing it changes nothing about the actual OCR outcome.
+if (typeof window !== 'undefined') {
+    window.addEventListener('unhandledrejection', (event) => {
+        const reason = event.reason;
+        const message = reason instanceof Error ? reason.message : String(reason || '');
+        const stack = reason instanceof Error ? String(reason.stack || '') : '';
+        if (message.includes("Cannot read properties of null (reading 'postMessage')") && stack.includes('recognize')) {
+            event.preventDefault();
+            console.debug('[ocr] suppressed a known stray tesseract.js worker rejection (harmless -- see runBrowserOcr comments)', message);
+        }
+    });
+}
 
 const resolveManifestUrl = (path: string) => new URL(path, window.location.origin).toString();
 
