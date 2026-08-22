@@ -10012,7 +10012,11 @@ def upload_processing_pending():
         return jsonify({'pending': []})
 
     try:
-        limit = max(1, min(int(request.args.get('limit', '1') or 1), 25))
+        # Raised from 25: the frontend's pending-drain now fetches a real batch
+        # (PENDING_PROCESSING_BATCH_SIZE=40, see AppServicesProvider.tsx) up
+        # front for its lanes to work through, decoupled from lane count --
+        # capping this below that silently truncated the batch every time.
+        limit = max(1, min(int(request.args.get('limit', '1') or 1), 60))
     except ValueError:
         return jsonify({'error': 'Invalid limit'}), 400
 
@@ -10052,6 +10056,33 @@ def upload_processing_pending():
     return jsonify({'pending': bounded, 'totalPending': len(pending)})
 
 
+def _claim_processing_lease_response(user_id: str, filename: str, lease_owner: str, steps: Optional[List[str]]) -> Tuple[Dict, int]:
+    """Shared body of upload_processing_claim, also used per-item by the
+    batch route below -- same lease semantics either way, just fewer HTTP
+    round trips when claiming several photos at once."""
+    try:
+        lease = claim_processing_lease(user_id, filename, lease_owner, lease_seconds=120, steps=steps)
+    except Exception as exc:
+        message = str(exc)
+        if 'already held by another client' in message.lower() or 'lease is already held' in message.lower():
+            return {'claimed': False, 'reason': 'lease_active', 'detail': message}, 200
+        return {'claimed': False, 'reason': 'lease_active', 'detail': message}, 409
+    response = {
+        'claimed': True,
+        'leaseId': lease_owner,
+        'expiresAt': lease.get('leaseExpiresAt') or '',
+    }
+    try:
+        # Thumbnail upload must target the same physical (anonymous) blob as the image.
+        physical_name = _resolve_media_blob_name(user_id, filename)
+        thumbnail_url, thumbnail_expires_at = _create_direct_thumbnail_upload_blob_url(physical_name)
+        response['thumbnailUploadUrl'] = thumbnail_url
+        response['thumbnailUploadExpiresAt'] = thumbnail_expires_at
+    except Exception:
+        app.logger.warning('Failed to mint browser thumbnail upload URL for claimed photo %s', filename, exc_info=True)
+    return response, 200
+
+
 @app.route('/upload/processing/claim', methods=['POST'])
 @app.route('/upload/processing/claim/', methods=['POST'])
 @app.route('/api/upload/processing/claim', methods=['POST'])
@@ -10067,28 +10098,55 @@ def upload_processing_claim():
     lease_owner = str(data.get('leaseId') or data.get('ownerId') or f'browser-{uuid.uuid4()}').strip()
     requested_steps = data.get('steps')
     steps = [str(step or '').strip() for step in requested_steps] if isinstance(requested_steps, list) else None
-    try:
-        lease = claim_processing_lease(user_id, filename, lease_owner, lease_seconds=120, steps=steps)
-    except Exception as exc:
-        message = str(exc)
-        if 'already held by another client' in message.lower() or 'lease is already held' in message.lower():
-            return jsonify({'claimed': False, 'reason': 'lease_active', 'detail': message}), 200
-        return jsonify({'claimed': False, 'reason': 'lease_active', 'detail': message}), 409
-    lease_expires_at = lease.get('leaseExpiresAt') or ''
-    response = {
-        'claimed': True,
-        'leaseId': lease_owner,
-        'expiresAt': lease_expires_at,
-    }
-    try:
-        # Thumbnail upload must target the same physical (anonymous) blob as the image.
-        physical_name = _resolve_media_blob_name(user_id, filename)
-        thumbnail_url, thumbnail_expires_at = _create_direct_thumbnail_upload_blob_url(physical_name)
-        response['thumbnailUploadUrl'] = thumbnail_url
-        response['thumbnailUploadExpiresAt'] = thumbnail_expires_at
-    except Exception:
-        app.logger.warning('Failed to mint browser thumbnail upload URL for claimed photo %s', filename, exc_info=True)
-    return jsonify(response)
+    response, status = _claim_processing_lease_response(user_id, filename, lease_owner, steps)
+    return jsonify(response), status
+
+
+MAX_CLAIM_BATCH_ITEMS = 60
+
+
+@app.route('/upload/processing/claim-batch', methods=['POST'])
+@app.route('/upload/processing/claim-batch/', methods=['POST'])
+@app.route('/api/upload/processing/claim-batch', methods=['POST'])
+@app.route('/api/upload/processing/claim-batch/', methods=['POST'])
+def upload_processing_claim_batch():
+    """Claim leases for several photos in one round trip.
+
+    Scoped deliberately to "claim what you're about to start on right now"
+    (the frontend only ever batches this to its current lane count, not its
+    whole fetched pending batch) -- claiming far more than that upfront would
+    hold leases on photos no lane has reached yet, and could let them expire
+    before anyone actually processes them. Each item's claim is still fully
+    independent (own read/write, own success/failure), same as calling
+    /upload/processing/claim in a loop; this only collapses the HTTP round
+    trips, not the lease semantics.
+    """
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    items = data.get('items')
+    if not isinstance(items, list) or not items:
+        return jsonify({'error': 'items must be a non-empty list'}), 400
+    if len(items) > MAX_CLAIM_BATCH_ITEMS:
+        return jsonify({'error': f'Too many items (max {MAX_CLAIM_BATCH_ITEMS})'}), 400
+
+    results = []
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            results.append({'claimed': False, 'reason': 'invalid_item'})
+            continue
+        filename = _validate_media_filename(str(raw_item.get('filename') or '')) or ''
+        if not filename:
+            results.append({'claimed': False, 'reason': 'invalid_filename'})
+            continue
+        lease_owner = str(raw_item.get('leaseId') or raw_item.get('ownerId') or f'browser-{uuid.uuid4()}').strip()
+        requested_steps = raw_item.get('steps')
+        steps = [str(step or '').strip() for step in requested_steps] if isinstance(requested_steps, list) else None
+        response, _status = _claim_processing_lease_response(user_id, filename, lease_owner, steps)
+        results.append({'filename': filename, **response})
+
+    return jsonify({'results': results})
 
 
 @app.route('/upload/processing/heartbeat', methods=['POST'])

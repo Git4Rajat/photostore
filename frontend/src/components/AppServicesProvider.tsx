@@ -119,6 +119,8 @@ const acquireBrowserAiModel = (onProgress?: (stage: BrowserAiLoadStage) => void)
     (runtime) => runtime.acquireBrowserAiModel(onProgress) as Promise<SharedBrowserAiModelState>,
 );
 const preloadNativeFaceModels = () => withPhotoGalleryRuntime((runtime) => runtime.preloadNativeFaceModels());
+const createPersistentBrowserAiWorker = () => withPhotoGalleryRuntime((runtime) => runtime.createPersistentBrowserAiWorker());
+type BrowserAiWorkerHandle = ReturnType<PhotoGalleryRuntime['createPersistentBrowserAiWorker']>;
 
 const fetchProcessingBlob = async (url: string): Promise<Blob> => {
     const resolvedUrl = resolveApiUrl(url);
@@ -339,6 +341,12 @@ export const getBrowserProcessingConcurrency = (): number => {
     const unattendedCeiling = memoryGb <= 4 ? 3 : (memoryGb <= 8 ? 8 : 12);
     return Math.max(1, Math.min(baseline + getUnattendedConcurrencyBonus(), unattendedCeiling));
 };
+
+// How many pending photos to claim in one /upload/processing/pending round
+// trip. Deliberately decoupled from lane count (concurrency) -- this is about
+// minimizing repeat fetches and keeping each lane's persistent AI worker fed
+// across a real batch, not about how many photos process at once.
+const PENDING_PROCESSING_BATCH_SIZE = 40;
 
 const WARMUP_POLL_INTERVAL_MS = 5000;
 const BACKEND_KEEPALIVE_INTERVAL_MS = 30000;
@@ -1535,6 +1543,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // keep every concurrent slot fed. Off (concurrency 1) preserves the
             // original one-at-a-time drain exactly.
             const concurrency = getBrowserProcessingConcurrency();
+            // Fetch a decent-sized batch up front, independent of lane count --
+            // otherwise a low concurrency (e.g. 1-2 lanes, the common case with
+            // turbo off) means re-polling /upload/processing/pending after almost
+            // every photo. A bigger batch also gives each lane's persistent AI
+            // worker (see runDrainWorker below) more photos to stay warm across
+            // before the batch drains and it has to fetch again.
+            const pendingBatchSize = Math.max(concurrency, PENDING_PROCESSING_BATCH_SIZE);
             // When browser AI isn't loaded, skip the automatic background pull: it
             // would download pending images just to run baseline (thumbnail/EXIF/
             // geocode) steps. Explicit, user-initiated requests still run so on-demand
@@ -1559,7 +1574,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             const pendingResponse = requestedFilenames.length > 0
                 ? { pending: requestedItems.map((item) => ({ ...item, statuses: {} })) }
-                : await get(`/upload/processing/pending?limit=${Math.max(1, concurrency)}`);
+                : await get(`/upload/processing/pending?limit=${pendingBatchSize}`);
             const pending = Array.isArray(pendingResponse?.pending) ? pendingResponse.pending : [];
             if (pending.length === 0) {
                 // Queue drained: release the background keep-alive so the tab stops
@@ -1580,7 +1595,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 ? Math.max(pending.length, pendingTotal)
                 : pending.length;
             const browserProcessingNotification = ensureBrowserProcessingNotification(pendingRemaining);
-            const processOnePendingItem = async (item: any): Promise<void> => {
+            const processOnePendingItem = async (
+                item: any,
+                aiWorkerHandle?: BrowserAiWorkerHandle,
+                preClaimed?: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string; reason?: string },
+            ): Promise<void> => {
                 if (browserProcessingCancelRef.current) {
                     return;
                 }
@@ -1609,16 +1628,22 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
                 }
                 let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null = null;
-                try {
-                    claim = await post('/upload/processing/claim', {
-                        filename,
-                        steps: effectiveSteps ? Array.from(effectiveSteps) : undefined,
-                    });
-                } catch (err) {
-                    if (shouldSuppressLeaseWarning(err)) {
-                        return;
+                if (preClaimed) {
+                    // Already claimed in the batch call runDrainWorker made for this
+                    // lane's first item -- skip the redundant per-item network call.
+                    claim = preClaimed;
+                } else {
+                    try {
+                        claim = await post('/upload/processing/claim', {
+                            filename,
+                            steps: effectiveSteps ? Array.from(effectiveSteps) : undefined,
+                        });
+                    } catch (err) {
+                        if (shouldSuppressLeaseWarning(err)) {
+                            return;
+                        }
+                        throw err;
                     }
-                    throw err;
                 }
                 if (!claim?.claimed) {
                     return;
@@ -1651,6 +1676,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             faceRotationDegrees: itemRotation,
                             thumbnailRotationDegrees: itemRotation,
                             convertedPreview,
+                            aiWorkerHandle,
                         },
                     );
                     const filteredResult = filterBrowserProcessingResult(result, effectiveSteps);
@@ -1734,21 +1760,72 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
             };
             // Drain `pending` with up to `concurrency` items in flight at once. Each
-            // worker pulls the next index and processes it; with concurrency 1 this is
+            // lane pulls the next index and processes it; with concurrency 1 this is
             // exactly the original serial drain. Items are independent (each holds its
             // own server-side lease), so distinct filenames never collide.
+            //
+            // Each lane is its own "conveyor belt": one persistent AI worker created
+            // once per lane and reused for every photo that lane pulls, instead of a
+            // fresh Worker (and a from-scratch CLIP/vocabulary reload) per photo --
+            // see createPersistentBrowserAiWorker. Skipped entirely when this batch
+            // can't use it anyway (model not loaded, or backend-owns-AI mode), so an
+            // idle/ineligible drain never pays for a worker it won't use.
+            const shouldUseAiWorker = browserAiModelStateRef.current.status === 'available'
+                && (getRuntimeConfig().processingMode || 'browser') !== 'backend';
+            const workerCount = Math.max(1, Math.min(concurrency, pending.length));
+            // Batch-claim only the first `workerCount` items -- as many as are
+            // about to start being worked on right now (every lane begins
+            // pulling from index 0 simultaneously via Promise.all below), not
+            // the whole fetched batch: claiming further ahead than a lane is
+            // about to reach would hold leases on photos nobody's processing
+            // yet, risking the 120s lease expiring before a lane gets there.
+            // Skipped at concurrency 1 (the default, Turbo off) -- there's
+            // only one lane and one first item, so there's nothing to batch.
+            // Falls back to each lane's own per-item claim call (unchanged)
+            // if this fails or a filename isn't in the response.
+            const preClaimedByFilename = new Map<string, { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string; reason?: string }>();
+            if (workerCount > 1) {
+                const firstWaveSteps = restrictStepsForModel(
+                    restrictStepsForProcessingMode(requestedSteps, getRuntimeConfig().processingMode || 'browser'),
+                    browserAiModelStateRef.current.status === 'available',
+                );
+                try {
+                    const batchResponse = await post('/upload/processing/claim-batch', {
+                        items: pending.slice(0, workerCount).map((item: any) => ({
+                            filename: String(item?.filename || ''),
+                            steps: firstWaveSteps ? Array.from(firstWaveSteps) : undefined,
+                        })),
+                    });
+                    const results = Array.isArray(batchResponse?.results) ? batchResponse.results : [];
+                    for (const result of results) {
+                        const filename = String(result?.filename || '');
+                        if (filename) {
+                            preClaimedByFilename.set(filename, result);
+                        }
+                    }
+                } catch {
+                    // Fall back to each lane claiming its own first item individually.
+                }
+            }
             let nextIndex = 0;
             const runDrainWorker = async (): Promise<void> => {
-                while (!browserProcessingCancelRef.current) {
-                    const index = nextIndex;
-                    nextIndex += 1;
-                    if (index >= pending.length) {
-                        return;
+                const aiWorkerHandle = shouldUseAiWorker ? await createPersistentBrowserAiWorker() : undefined;
+                try {
+                    while (!browserProcessingCancelRef.current) {
+                        const index = nextIndex;
+                        nextIndex += 1;
+                        if (index >= pending.length) {
+                            return;
+                        }
+                        const filename = String(pending[index]?.filename || '');
+                        const preClaimed = preClaimedByFilename.get(filename);
+                        preClaimedByFilename.delete(filename);
+                        await processOnePendingItem(pending[index], aiWorkerHandle, preClaimed);
                     }
-                    await processOnePendingItem(pending[index]);
+                } finally {
+                    aiWorkerHandle?.dispose();
                 }
             };
-            const workerCount = Math.max(1, Math.min(concurrency, pending.length));
             await Promise.all(Array.from({ length: workerCount }, () => runDrainWorker()));
             // Posting face-detection results enqueues a clustering job server-side;
             // wake the job poller so the "Grouping people…" indicator can show.

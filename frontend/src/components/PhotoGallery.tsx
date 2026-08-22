@@ -1849,65 +1849,162 @@ const warmBrowserAiWorker = (
     worker.postMessage({ type: 'browser-ai-warmup', manifest, timeoutMs });
 });
 
+// A single analyze() call against a Worker that stays alive across many
+// photos, so the CLIP model + tokenized vocabulary (browserAiWorker.ts loads
+// and caches both at module scope, meant to be "encoded once per worker
+// session and reused for every photo") actually gets reused across a batch
+// instead of being rebuilt from scratch on every single photo -- see
+// createPersistentBrowserAiWorker for the batch-drain lifecycle this exists
+// for. Multiple in-flight analyze() calls are matched back to their
+// resolvers by requestId in case a caller ever pipelines more than one.
+export type BrowserAiWorkerHandle = {
+    analyze: (imageSource: Blob | File, modelState: BrowserAiModelState, timeoutMs: number) => Promise<Record<string, any>>;
+    dispose: () => void;
+};
+
+export const createPersistentBrowserAiWorker = (): BrowserAiWorkerHandle => {
+    const worker = createBrowserAiWorker();
+    const pending = new Map<string, { resolve: (result: Record<string, any>) => void; reject: (err: unknown) => void; timer?: number }>();
+
+    const settle = (requestId: string, err?: unknown, result?: Record<string, any>) => {
+        const entry = pending.get(requestId);
+        if (!entry) {
+            return;
+        }
+        pending.delete(requestId);
+        if (entry.timer !== undefined) {
+            window.clearTimeout(entry.timer);
+        }
+        if (err) {
+            entry.reject(err);
+        } else {
+            entry.resolve(result || {});
+        }
+    };
+
+    worker.onmessage = (event) => {
+        const data = event.data || {};
+        if (data.type !== 'browser-ai-analyze-result') {
+            return;
+        }
+        if (data.ok === true) {
+            settle(String(data.requestId || ''), undefined, data.result || {});
+        } else {
+            settle(String(data.requestId || ''), new Error(String(data.reason || 'model_load_failed')));
+        }
+    };
+    worker.onerror = (event) => {
+        const err = new Error(event.message || (event as ErrorEvent).error?.message || 'model_load_failed');
+        for (const requestId of Array.from(pending.keys())) {
+            settle(requestId, err);
+        }
+    };
+
+    const analyze = (imageSource: Blob | File, modelState: BrowserAiModelState, timeoutMs: number): Promise<Record<string, any>> => (
+        new Promise((resolve, reject) => {
+            if (!modelState.manifest) {
+                reject(new Error('model_unavailable'));
+                return;
+            }
+            const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const timer = window.setTimeout(() => settle(requestId, new Error('inference_timeout')), timeoutMs);
+            pending.set(requestId, { resolve, reject, timer });
+            createBrowserAiImagePayload(imageSource)
+                .then((image) => {
+                    if (!image) {
+                        settle(requestId, new Error('unsupported_runtime'));
+                        return;
+                    }
+                    worker.postMessage({
+                        type: 'browser-ai-analyze',
+                        requestId,
+                        manifest: modelState.manifest,
+                        image,
+                        timeoutMs,
+                    }, [image.data.buffer]);
+                })
+                .catch((err) => settle(requestId, err));
+        })
+    );
+
+    const dispose = () => {
+        worker.onmessage = null;
+        worker.onerror = null;
+        const disposedError = new Error('worker_disposed');
+        for (const requestId of Array.from(pending.keys())) {
+            settle(requestId, disposedError);
+        }
+        worker.terminate();
+    };
+
+    return { analyze, dispose };
+};
+
 const runBrowserAiVisionInWorker = (
     imageSource: Blob | File,
     modelState: BrowserAiModelState,
     timeoutMs: number,
-): Promise<Record<string, any>> => new Promise((resolve, reject) => {
-    if (!modelState.manifest) {
-        reject(new Error('model_unavailable'));
-        return;
+    workerHandle?: BrowserAiWorkerHandle,
+): Promise<Record<string, any>> => {
+    if (workerHandle) {
+        return workerHandle.analyze(imageSource, modelState, timeoutMs);
     }
-    let settled = false;
-    let timer: number | undefined;
-    const worker = createBrowserAiWorker();
-    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const finish = (err?: unknown, result?: Record<string, any>) => {
-        if (settled) {
+    return new Promise((resolve, reject) => {
+        if (!modelState.manifest) {
+            reject(new Error('model_unavailable'));
             return;
         }
-        settled = true;
-        if (timer !== undefined) {
-            window.clearTimeout(timer);
-        }
-        worker.terminate();
-        if (err) {
-            reject(err);
-        } else {
-            resolve(result || {});
-        }
-    };
-    timer = window.setTimeout(() => finish(new Error('inference_timeout')), timeoutMs);
-    worker.onmessage = (event) => {
-        const data = event.data || {};
-        if (data.type !== 'browser-ai-analyze-result' || data.requestId !== requestId) {
-            return;
-        }
-        if (data.ok === true) {
-            finish(undefined, data.result || {});
-        } else {
-            finish(new Error(String(data.reason || 'model_load_failed')));
-        }
-    };
-    worker.onerror = (event) => {
-        finish(new Error(event.message || (event as ErrorEvent).error?.message || 'model_load_failed'));
-    };
-    createBrowserAiImagePayload(imageSource)
-        .then((image) => {
-            if (!image) {
-                finish(new Error('unsupported_runtime'));
+        let settled = false;
+        let timer: number | undefined;
+        const worker = createBrowserAiWorker();
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const finish = (err?: unknown, result?: Record<string, any>) => {
+            if (settled) {
                 return;
             }
-            worker.postMessage({
-                type: 'browser-ai-analyze',
-                requestId,
-                manifest: modelState.manifest,
-                image,
-                timeoutMs,
-            }, [image.data.buffer]);
-        })
-        .catch((err) => finish(err));
-});
+            settled = true;
+            if (timer !== undefined) {
+                window.clearTimeout(timer);
+            }
+            worker.terminate();
+            if (err) {
+                reject(err);
+            } else {
+                resolve(result || {});
+            }
+        };
+        timer = window.setTimeout(() => finish(new Error('inference_timeout')), timeoutMs);
+        worker.onmessage = (event) => {
+            const data = event.data || {};
+            if (data.type !== 'browser-ai-analyze-result' || data.requestId !== requestId) {
+                return;
+            }
+            if (data.ok === true) {
+                finish(undefined, data.result || {});
+            } else {
+                finish(new Error(String(data.reason || 'model_load_failed')));
+            }
+        };
+        worker.onerror = (event) => {
+            finish(new Error(event.message || (event as ErrorEvent).error?.message || 'model_load_failed'));
+        };
+        createBrowserAiImagePayload(imageSource)
+            .then((image) => {
+                if (!image) {
+                    finish(new Error('unsupported_runtime'));
+                    return;
+                }
+                worker.postMessage({
+                    type: 'browser-ai-analyze',
+                    requestId,
+                    manifest: modelState.manifest,
+                    image,
+                    timeoutMs,
+                }, [image.data.buffer]);
+            })
+            .catch((err) => finish(err));
+    });
+};
 
 const runNativeFaceDetection = async (imageSource: Blob | File, rotationDegrees = 0): Promise<BrowserFaceDetectionResult | null> => {
     if (typeof window === 'undefined' || typeof createImageBitmap !== 'function') {
@@ -3046,7 +3143,12 @@ export const runBrowserProcessing = async (
     batchStartedAt: number,
     browserAiModelState?: BrowserAiModelState,
     partialResult?: ClientProcessingResult,
-    processingOptions: { faceRotationDegrees?: number; thumbnailRotationDegrees?: number; convertedPreview?: Blob | File } = {},
+    processingOptions: {
+        faceRotationDegrees?: number;
+        thumbnailRotationDegrees?: number;
+        convertedPreview?: Blob | File;
+        aiWorkerHandle?: BrowserAiWorkerHandle;
+    } = {},
 ): Promise<ClientProcessingResult> => {
     const clientProcessing: Record<string, any> = partialResult?.clientProcessing || {};
     const clientProcessingReport: ClientProcessingReportItem[] = partialResult?.clientProcessingReport || [];
@@ -3643,6 +3745,7 @@ export const runBrowserProcessing = async (
                 aiVisionSource,
                 browserAiModelState,
                 CLIENT_AI_INFERENCE_BUDGET_MS,
+                processingOptions.aiWorkerHandle,
             );
             const localFallback = isLocalVisionFallbackResult(aiResult);
             const tags = (localFallback ? [] : toArray<unknown>(aiResult.tags))
