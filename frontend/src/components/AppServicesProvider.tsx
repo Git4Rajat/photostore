@@ -3317,6 +3317,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // running, which is the one code path confirmed live to handle 1300+
     // files reliably. See MAX_FRESH_UPLOAD_BATCH_SIZE's own comment for why
     // immediate-vs-deferred seems to matter here.
+    // Pure queuing, no immediate start -- for callers that already know
+    // something else is about to occupy runUploadSession's shared refs (e.g.
+    // resuming a handful of matched stale files below) and so can't safely
+    // start these immediately even though `uploading` may still read false
+    // at the moment of the call.
+    const enqueueUploadFilesInBatches = useCallback((files: File[]) => {
+        if (files.length === 0) {
+            return;
+        }
+        for (let i = 0; i < files.length; i += MAX_FRESH_UPLOAD_BATCH_SIZE) {
+            queuedUploadBatchesRef.current.push(files.slice(i, i + MAX_FRESH_UPLOAD_BATCH_SIZE));
+        }
+        setQueuedUploadFileCount((count) => count + files.length);
+    }, []);
+
     const startUploadInBatches = useCallback((files: File[]) => {
         if (files.length <= MAX_FRESH_UPLOAD_BATCH_SIZE) {
             void startUpload(files);
@@ -3324,16 +3339,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const firstBatch = files.slice(0, MAX_FRESH_UPLOAD_BATCH_SIZE);
         const remainder = files.slice(MAX_FRESH_UPLOAD_BATCH_SIZE);
-        for (let i = 0; i < remainder.length; i += MAX_FRESH_UPLOAD_BATCH_SIZE) {
-            queuedUploadBatchesRef.current.push(remainder.slice(i, i + MAX_FRESH_UPLOAD_BATCH_SIZE));
-        }
-        setQueuedUploadFileCount((count) => count + remainder.length);
+        enqueueUploadFilesInBatches(remainder);
         addNotification(
             'Large selection split into batches',
             `${plural(files.length, 'file')} split into batches of up to ${MAX_FRESH_UPLOAD_BATCH_SIZE}. The first batch is starting now; the rest will follow automatically as each one finishes.`,
         );
         void startUpload(firstBatch);
-    }, [addNotification, startUpload]);
+    }, [addNotification, startUpload, enqueueUploadFilesInBatches]);
 
     const handleUploadSelection = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
         const selectedFiles = event.target.files ? Array.from(event.target.files) : [];
@@ -3358,32 +3370,56 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // instead of being queued via startUpload below.
             if (pendingUploadSession || (!uploading && loadPersistedSession())) {
                 void (async () => {
-                    const { matchedCount, unmatchedFiles } = await attachSelectedFilesToPendingSession(selectedFiles);
-                    if (matchedCount > 0) {
-                        addNotification('Files reselected', `${plural(matchedCount, 'file')} reattached to the paused upload.`);
-                        // Awaited: startUpload below (for anything that wasn't
-                        // part of this paused session) checks `uploading` to
-                        // decide whether to start immediately or queue --
-                        // letting this finish first keeps that check accurate
-                        // instead of racing two sessions against each other.
-                        await retryPersistedUploadSession();
-                    } else if (unmatchedFiles.length === 0) {
-                        addNotification('No paused files matched', 'Select the same file names, sizes, and modified dates from the paused upload.');
-                        setUploadError('Selected files did not match the paused upload. Choose the original files to retry.');
-                    }
-                    if (unmatchedFiles.length > 0) {
-                        // A broader reselection (e.g. the whole folder instead
-                        // of just the original picks) can include files that
-                        // were never part of this paused session at all --
-                        // start those as their own batch instead of silently
-                        // dropping them. startUpload's own dedupe check still
-                        // applies, so anything already fully uploaded gets
-                        // skipped there too.
-                        addNotification(
-                            'New files found',
-                            `${plural(unmatchedFiles.length, 'file')} in this selection weren't part of the paused upload -- uploading separately.`,
-                        );
-                        startUploadInBatches(unmatchedFiles);
+                    try {
+                        const { matchedCount, unmatchedFiles } = await attachSelectedFilesToPendingSession(selectedFiles);
+                        // A broader reselection (e.g. the whole folder, or a
+                        // much larger date range, instead of just the
+                        // original picks) can include files that were never
+                        // part of this paused session at all -- upload those
+                        // as their own batch instead of silently dropping
+                        // them. startUpload's own dedupe check still applies,
+                        // so anything already fully uploaded gets skipped
+                        // there too.
+                        //
+                        // Queued/started BEFORE awaiting the resume below,
+                        // not after: runUploadSession can't safely run twice
+                        // at once (it shares refs like uploadSourceFilesRef
+                        // across calls), so if a resume is about to run this
+                        // bulk of new files must be queued rather than
+                        // started immediately -- but queuing itself must
+                        // happen right away. A large new selection (e.g.
+                        // 4000 files) that happens to overlap by a handful of
+                        // names with a stale paused session used to sit
+                        // silently behind `await retryPersistedUploadSession()`
+                        // here, with nothing visibly starting until that
+                        // resume (of only the few matched files) finished --
+                        // indistinguishable from a total failure if that
+                        // resume was itself slow.
+                        if (unmatchedFiles.length > 0) {
+                            if (matchedCount > 0) {
+                                enqueueUploadFilesInBatches(unmatchedFiles);
+                                addNotification(
+                                    'New files found',
+                                    `${plural(unmatchedFiles.length, 'file')} in this selection weren't part of the paused upload -- queued to start once it resumes.`,
+                                );
+                            } else {
+                                startUploadInBatches(unmatchedFiles);
+                            }
+                        }
+                        if (matchedCount > 0) {
+                            addNotification('Files reselected', `${plural(matchedCount, 'file')} reattached to the paused upload.`);
+                            await retryPersistedUploadSession();
+                        } else if (unmatchedFiles.length === 0) {
+                            addNotification('No paused files matched', 'Select the same file names, sizes, and modified dates from the paused upload.');
+                            setUploadError('Selected files did not match the paused upload. Choose the original files to retry.');
+                        }
+                    } catch (err) {
+                        // Unguarded before this fix: a throw anywhere above
+                        // (matching, resuming) became a silent unhandled
+                        // promise rejection -- the whole selection would just
+                        // do nothing with zero visible feedback.
+                        console.error('Reselecting files against the paused upload failed.', err);
+                        setUploadError(getUploadErrorMessage(err, 'Reselecting files failed unexpectedly. Try Upload again.'));
                     }
                 })();
             } else {
@@ -3395,6 +3431,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [
         addNotification,
         attachSelectedFilesToPendingSession,
+        enqueueUploadFilesInBatches,
         loadPersistedSession,
         pendingUploadSession,
         retryPersistedUploadSession,
