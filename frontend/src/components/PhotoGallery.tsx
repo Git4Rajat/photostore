@@ -28,6 +28,7 @@ import PhotoTile, { shouldFetchScopedThumbnail } from './shared/PhotoTile';
 import { useDragSelect } from '../services/useDragSelect';
 import { isAuthEnabled } from '../services/authClient';
 import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
+import type { FileSystemFileHandle } from '../services/fileSystemAccess';
 import PhotoQuickActions, { workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
@@ -3923,7 +3924,11 @@ const openUploadDb = (): Promise<IDBDatabase> => new Promise((resolve, reject) =
     request.onerror = () => reject(request.error || new Error('Failed to open upload database.'));
 });
 
-export const idbPut = async (key: string, value: Blob): Promise<void> => {
+// Also accepts a FileSystemFileHandle (Chrome/Edge desktop's resume path --
+// see fileSystemAccess.ts): IndexedDB's structured clone algorithm supports
+// storing handles directly, and they're far cheaper to persist than the
+// file's actual bytes.
+export const idbPut = async (key: string, value: Blob | FileSystemFileHandle): Promise<void> => {
     const db = await openUploadDb();
     await new Promise<void>((resolve, reject) => {
         const tx = db.transaction(UPLOAD_DB_STORE, 'readwrite');
@@ -3934,12 +3939,12 @@ export const idbPut = async (key: string, value: Blob): Promise<void> => {
     db.close();
 };
 
-export const idbGet = async (key: string): Promise<Blob | null> => {
+export const idbGet = async (key: string): Promise<Blob | FileSystemFileHandle | null> => {
     const db = await openUploadDb();
-    const result = await new Promise<Blob | null>((resolve, reject) => {
+    const result = await new Promise<Blob | FileSystemFileHandle | null>((resolve, reject) => {
         const tx = db.transaction(UPLOAD_DB_STORE, 'readonly');
         const req = tx.objectStore(UPLOAD_DB_STORE).get(key);
-        req.onsuccess = () => resolve((req.result as Blob | undefined) || null);
+        req.onsuccess = () => resolve((req.result as Blob | FileSystemFileHandle | undefined) || null);
         req.onerror = () => reject(req.error || new Error('Failed to load upload blob.'));
     });
     db.close();

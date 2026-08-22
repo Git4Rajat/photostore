@@ -30,6 +30,7 @@ import {
     getAdaptiveUploadProfile,
     getBrowserAiUnsupportedReason,
     isBrowserAiNetworkRetryReason,
+    isConstrainedUploadDevice,
     isUploadStoppedError,
 } from './browserAiShared';
 import { FILE_ACCEPT_FILTER, requiresBackendPreview } from '../utils/photoDisplay';
@@ -38,6 +39,13 @@ import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 import { getUnattendedConcurrencyBonus, reportBrowserProcessingOutcome } from '../services/unattendedProcessingScaler';
 import { showToast } from '../services/toast';
+import {
+    isFileSystemAccessSupported,
+    isFileSystemFileHandle,
+    pickUploadFilesViaFileSystemAccess,
+    resolveFileFromHandle,
+    type FileSystemFileHandle,
+} from '../services/fileSystemAccess';
 import {
     fetchJobStatuses,
     isLikelyAuthenticated,
@@ -109,7 +117,7 @@ const withPhotoGalleryRuntime = async <T,>(select: (runtime: PhotoGalleryRuntime
 const dataUrlToBlob = (dataUrl: string) => withPhotoGalleryRuntime((runtime) => runtime.dataUrlToBlob(dataUrl));
 const idbDelete = (key: string) => withPhotoGalleryRuntime((runtime) => runtime.idbDelete(key));
 const idbGet = (key: string) => withPhotoGalleryRuntime((runtime) => runtime.idbGet(key));
-const idbPut = (key: string, value: Blob | File) => withPhotoGalleryRuntime((runtime) => runtime.idbPut(key, value));
+const idbPut = (key: string, value: Blob | File | FileSystemFileHandle) => withPhotoGalleryRuntime((runtime) => runtime.idbPut(key, value));
 const readBlobArrayBuffer = (blob: Blob | File) => withPhotoGalleryRuntime((runtime) => runtime.readBlobArrayBuffer(blob));
 const runBrowserProcessing = (...args: Parameters<PhotoGalleryRuntime['runBrowserProcessing']>) => (
     withPhotoGalleryRuntime((runtime) => runtime.runBrowserProcessing(...args))
@@ -291,6 +299,14 @@ const TARGET_CONCURRENT_UPLOAD_BLOCKS = 6;
 // spot for browser block uploads. Slower-network profiles pick smaller chunks
 // than this, so the cap only ever lowers the large desktop sizes.
 const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
+
+// Shared IndexedDB-access concurrency for the upload resume cache (both
+// writing it in cacheUploadFilesForResume and checking it in
+// retryPersistedUploadSession) -- a 1000-file batch firing every idbPut/idbGet
+// concurrently used to open ~1000 simultaneous IndexedDB connections at once,
+// exactly the kind of burst that trips iOS Safari's much tighter per-tab
+// memory/storage ceilings.
+const IDB_RESUME_CACHE_CONCURRENCY = 4;
 
 // ---- Turbo mode --------------------------------------------------------------
 // On-device processing normally drains one photo at a time to keep resource use
@@ -869,6 +885,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const isResumingUploadRef = useRef<boolean>(false);
     const uploadStartInProgressRef = useRef<boolean>(false);
     const uploadSourceFilesRef = useRef<Map<string, File>>(new Map());
+    // Mirrors uploadSourceFilesRef but for FileSystemFileHandle-backed
+    // selections (Chrome/Edge desktop only, see fileSystemAccess.ts) --
+    // cleared alongside it once a session concludes, since the durable
+    // source of truth for resuming beyond this tab session is IndexedDB
+    // (cacheUploadFilesForResume persists these handles there too).
+    const uploadHandlesRef = useRef<Map<string, FileSystemFileHandle>>(new Map());
     const uploadStopRequestedRef = useRef<boolean>(false);
     const uploadAbortControllersRef = useRef<Set<AbortController>>(new Set());
     // Prefetched once per batch (see fetchKnownHashes) so uploadFileInChunks can
@@ -2464,18 +2486,41 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
                     try {
                         const sourceFile = uploadSourceFilesRef.current.get(fileMeta.key);
-                        const cachedBlob = sourceFile ? null : await idbGet(fileMeta.key);
-                        if (!sourceFile && !cachedBlob) {
+                        let file: File | null = sourceFile || null;
+                        if (!file) {
+                            // Prefer the in-memory handle over a round trip
+                            // through IndexedDB when this tab still has it
+                            // (e.g. resuming right after a Stop, not a
+                            // reload) -- only one of a handle or a cached
+                            // blob will exist per key, so a single idbGet
+                            // covers the reload case either way.
+                            const handleFromMemory = uploadHandlesRef.current.get(fileMeta.key);
+                            if (handleFromMemory) {
+                                file = await resolveFileFromHandle(handleFromMemory);
+                            } else {
+                                const cached = await idbGet(fileMeta.key);
+                                if (cached && isFileSystemFileHandle(cached)) {
+                                    file = await resolveFileFromHandle(cached);
+                                } else if (cached) {
+                                    file = new File([cached], fileMeta.name, { type: fileMeta.type, lastModified: fileMeta.lastModified });
+                                }
+                            }
+                        }
+                        if (!file) {
                             throw new Error(`Missing cached file for ${fileMeta.name}. Please reselect this file.`);
                         }
-
-                        const file = sourceFile || new File([cachedBlob as Blob], fileMeta.name, { type: fileMeta.type, lastModified: fileMeta.lastModified });
+                        // Reassigned to a non-null const: `file` is a `let`
+                        // (needed above to accumulate it from several
+                        // possible sources), so TS can't carry the null
+                        // check's narrowing into the onFinalizeStarted
+                        // closure below.
+                        const resolvedFile = file;
                         const controller = new AbortController();
                         uploadAbortControllersRef.current.add(controller);
                         let result: { skippedDuplicate: boolean };
                         const chunkSizeBytes = fileMeta.chunkSizeBytes || uploadProfile.chunkSizeBytes;
                         try {
-                            result = await uploadFileInChunks(file, {
+                            result = await uploadFileInChunks(resolvedFile, {
                                 startByte: fileMeta.uploadedBytes,
                                 existingUploadId: fileMeta.uploadId,
                                 existingBlockIds: fileMeta.blockIds,
@@ -2492,7 +2537,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                     updatePersistedFile(fileMeta.key, { blockIds, chunkSizeBytes: nextChunkSizeBytes });
                                 },
                                 onFinalizeStarted: () => {
-                                    updatePersistedFile(fileMeta.key, { status: 'finalizing', uploadedBytes: file.size });
+                                    updatePersistedFile(fileMeta.key, { status: 'finalizing', uploadedBytes: resolvedFile.size });
                                 },
                                 signal: controller.signal,
                                 chunkSizeBytes,
@@ -2514,7 +2559,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             error: undefined,
                         });
                         if (!result.skippedDuplicate) {
-                            kickOffThumbnailForFile(file, fileMeta.name);
+                            kickOffThumbnailForFile(resolvedFile, fileMeta.name);
                         }
                         uploadSourceFilesRef.current.delete(fileMeta.key);
                         await idbDelete(fileMeta.key);
@@ -2647,6 +2692,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             uploadingRef.current = false;
             isResumingUploadRef.current = false;
             uploadSourceFilesRef.current.clear();
+            uploadHandlesRef.current.clear();
             uploadAbortControllersRef.current.clear();
             uploadStopRequestedRef.current = false;
             // Recompute keep-alive state now that the transfer has ended (on
@@ -2727,10 +2773,31 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return;
         }
         const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
-        const cacheChecks = await Promise.all(unfinishedFiles.map(async (file) => ({
-            file,
-            hasCachedBlob: uploadSourceFilesRef.current.has(file.key) || Boolean(await idbGet(file.key).catch(() => null)),
-        })));
+        // Throttled the same way as cacheUploadFilesForResume: an unfinished
+        // batch of 1000+ files, most missing from uploadSourceFilesRef after a
+        // reload, used to fire that many simultaneous idbGet calls via a bare
+        // Promise.all -- the same IndexedDB-connection burst iOS Safari can't
+        // handle, just on the read side this time.
+        const cacheChecks: Array<{ file: PersistedUploadFile; hasCachedBlob: boolean }> = new Array(unfinishedFiles.length);
+        let cacheCheckCursor = 0;
+        const cacheCheckWorker = async () => {
+            while (true) {
+                const index = cacheCheckCursor;
+                cacheCheckCursor += 1;
+                if (index >= unfinishedFiles.length) {
+                    return;
+                }
+                const file = unfinishedFiles[index];
+                const hasCachedBlob = uploadSourceFilesRef.current.has(file.key)
+                    || uploadHandlesRef.current.has(file.key)
+                    || Boolean(await idbGet(file.key).catch(() => null));
+                cacheChecks[index] = { file, hasCachedBlob };
+            }
+        };
+        await Promise.all(Array.from(
+            { length: Math.min(IDB_RESUME_CACHE_CONCURRENCY, unfinishedFiles.length) },
+            () => cacheCheckWorker(),
+        ));
         const missingCachedFiles = cacheChecks.filter((item) => !item.hasCachedBlob).map((item) => item.file);
         const retryableFiles = cacheChecks.filter((item) => item.hasCachedBlob).map((item) => item.file);
         if (retryableFiles.length === 0) {
@@ -2785,8 +2852,22 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // firing every idbPut concurrently: a 1000-file batch used to open ~1000
     // simultaneous IndexedDB connections at once, exactly the kind of burst
     // that trips iOS Safari's much tighter per-tab memory/storage ceilings.
-    const CACHE_FOR_RESUME_CONCURRENCY = 4;
-    const cacheUploadFilesForResume = async (session: PersistedUploadSession, filesToUpload: File[]) => {
+    //
+    // That throttle alone wasn't enough for a large mobile batch: even at
+    // concurrency 4, a thousand-plus-photo selection (each full-res HEIC/RAW
+    // file several MB+) still pushes gigabytes of blob writes through
+    // IndexedDB while the upload itself competes for the same tight memory
+    // budget -- iOS Safari kills the tab outright, with no JS error to catch.
+    // Cap the total bytes cached on constrained devices instead of skipping
+    // the feature outright, so small mobile uploads still get resume support.
+    const CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES = 200 * MB;
+    const cacheUploadFilesForResume = async (
+        session: PersistedUploadSession,
+        filesToUpload: File[],
+        handlesToUpload: Map<string, FileSystemFileHandle>,
+    ) => {
+        const budgetBytes = isConstrainedUploadDevice() ? CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES : Infinity;
+        let cachedBytes = 0;
         let cursor = 0;
         const worker = async () => {
             while (true) {
@@ -2798,8 +2879,32 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (index >= session.files.length) {
                     return;
                 }
+                const key = session.files[index].key;
+                // A FileSystemFileHandle (Chrome/Edge desktop) is a few bytes,
+                // not the file's content -- persist it unconditionally,
+                // bypassing the blob budget entirely, since it can re-derive
+                // a live File later instead of needing its bytes duplicated
+                // now.
+                const handle = handlesToUpload.get(key);
+                if (handle) {
+                    try {
+                        await idbPut(key, handle);
+                    } catch {
+                        // Falls back to the in-memory uploadHandlesRef entry
+                        // for this tab's own session -- not fatal.
+                    }
+                    continue;
+                }
+                if (cachedBytes >= budgetBytes) {
+                    // Past the budget: in-memory uploadSourceFilesRef still
+                    // covers this tab's own upload, this file just won't
+                    // survive a reload/crash for resume purposes.
+                    continue;
+                }
+                const file = filesToUpload[index];
                 try {
-                    await idbPut(session.files[index].key, filesToUpload[index]);
+                    await idbPut(key, file);
+                    cachedBytes += file.size;
                 } catch {
                     // Resume-after-reload won't find this file, but the
                     // in-memory File reference still covers this tab's
@@ -2808,12 +2913,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
         };
         await Promise.all(Array.from(
-            { length: Math.min(CACHE_FOR_RESUME_CONCURRENCY, session.files.length) },
+            { length: Math.min(IDB_RESUME_CACHE_CONCURRENCY, session.files.length) },
             () => worker(),
         ));
     };
 
-    const startUpload = useCallback(async (filesToUpload: File[]) => {
+    const startUpload = useCallback(async (filesToUpload: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => {
         if (filesToUpload.length === 0) {
             return;
         }
@@ -2895,15 +3000,25 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 status: 'pending',
             })),
         };
+        const keyedHandles = new Map<string, FileSystemFileHandle>();
+        if (handlesToUpload) {
+            filesToUpload.forEach((file, index) => {
+                const handle = handlesToUpload.get(file);
+                if (handle) {
+                    keyedHandles.set(session.files[index].key, handle);
+                }
+            });
+        }
 
         try {
             persistSession(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
+            uploadHandlesRef.current = keyedHandles;
             // Not awaited: the actual upload only needs uploadSourceFilesRef
             // (already set above), so there's no reason to block starting on
             // this -- resume-after-reload is a nice-to-have, not a
             // prerequisite for this tab's own upload to proceed.
-            void cacheUploadFilesForResume(session, filesToUpload);
+            void cacheUploadFilesForResume(session, filesToUpload, keyedHandles);
             if (uploadStopRequestedRef.current) {
                 await cleanupUnfinishedUploadArtifacts(session);
                 await clearPersistedSession();
@@ -2958,8 +3073,30 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (!uploading) {
             void pollUntilWarm(warmUpload, uploadWarmupInFlightRef);
         }
+        // Chrome/Edge desktop only (unsupported in Safari/Firefox and on
+        // mobile -- isFileSystemAccessSupported() is false there, so this
+        // always falls through to the classic <input> picker below). Picking
+        // via File System Access instead of the hidden <input> gets each file
+        // a persistable handle, which is what lets a large desktop batch (the
+        // camera-import case) resume after a reload without the manual
+        // reselect-and-match flow the <input> path still needs. Not run
+        // through attachSelectedFilesToPendingSession's paused-session
+        // matching: any earlier paused session on this browser is expected to
+        // resume on its own via those same handles (see retryPersistedUploadSession/
+        // the auto-resume effect), so a fresh pick here is always a new batch.
+        if (isFileSystemAccessSupported()) {
+            void (async () => {
+                const picked = await pickUploadFilesViaFileSystemAccess();
+                if (picked.length === 0) {
+                    return;
+                }
+                const handles = new Map(picked.map(({ file, handle }) => [file, handle]));
+                await startUpload(picked.map(({ file }) => file), handles);
+            })();
+            return;
+        }
         uploadInputRef.current?.click();
-    }, [addNotification, pollUntilWarm, uploading, warmUpload]);
+    }, [addNotification, pollUntilWarm, startUpload, uploading, warmUpload]);
 
     const resumeAllPendingUploads = useCallback(async () => {
         await retryPersistedUploadSession();

@@ -193,6 +193,21 @@ const measureObservedDownlinkMbps = (maxAgeMs?: number): number | null => {
     return (bestBytes * 8) / (bestDurationMs / 1000) / 1_000_000;
 };
 
+// Shared with the upload resume-cache (AppServicesProvider.tsx): mobile
+// Safari's per-tab memory ceiling is far tighter than desktop's, so the same
+// signals that cap upload fileParallelism below are reused there to decide
+// when background work needs a tighter leash too.
+export const isConstrainedUploadDevice = (): boolean => {
+    if (typeof navigator === 'undefined' || typeof window === 'undefined') {
+        return false;
+    }
+    const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+    const isMobileViewport = window.matchMedia?.('(max-width: 760px)').matches || false;
+    const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches || false;
+    const lowMemory = typeof deviceMemory === 'number' && deviceMemory <= 4;
+    return isMobileViewport || coarsePointer || lowMemory;
+};
+
 export const getAdaptiveUploadProfile = (
     files: Array<{ size: number }> = [],
     options?: { measuredRttMs?: number },
