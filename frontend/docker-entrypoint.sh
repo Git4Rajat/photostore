@@ -55,5 +55,5 @@ if [ -n "$API_BASE_URL" ]; then
 fi
 
 cat > /etc/nginx/csp.conf <<EOF
-add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://unpkg.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://*.blob.core.windows.net; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" always;
+add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://unpkg.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://*.blob.core.windows.net; media-src 'self' blob:; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" always;
 EOF
