@@ -2106,7 +2106,35 @@ const runBrowserAiVisionInWorker = (
     });
 };
 
+// withTimeoutOutcome (used at the runNativeFaceDetection call site) only stops
+// *waiting* on a slow detection -- it can't cancel the underlying ONNX
+// session.run() once started. On an already-overloaded/throttling mobile tab,
+// each timed-out photo leaves its detection running in the background while
+// the drain loop moves straight on to the next photo's detection call, so a
+// device that's slow enough to time out once starts piling up concurrent
+// inference passes on the SAME shared singleton session -- more heavy WASM
+// work and memory held per photo, which makes the device slower still, which
+// times out more photos. That runaway feedback loop (not any single leaked
+// object) is what matches "tab crashes after a certain count of files": each
+// timeout adds one more zombie inference pass instead of freeing anything.
+// Concurrent session.run() calls on one onnxruntime-web session are also not
+// something to rely on being safe. Mirrors the OCR concurrency cap fix below:
+// while a detection call (including an orphaned one) is still in flight, skip
+// starting a new one rather than queue it -- the existing pending-work/deferred
+// mechanism retries the skipped step on a later pass once capacity frees up.
+const FACE_DETECTION_MAX_CONCURRENT = 1;
+let faceDetectionActiveCount = 0;
+
 const runNativeFaceDetection = async (imageSource: Blob | File, rotationDegrees = 0): Promise<BrowserFaceDetectionResult | null> => {
+    faceDetectionActiveCount += 1;
+    try {
+        return await runNativeFaceDetectionInner(imageSource, rotationDegrees);
+    } finally {
+        faceDetectionActiveCount -= 1;
+    }
+};
+
+const runNativeFaceDetectionInner = async (imageSource: Blob | File, rotationDegrees = 0): Promise<BrowserFaceDetectionResult | null> => {
     if (typeof window === 'undefined' || typeof createImageBitmap !== 'function') {
         return null;
     }
@@ -3600,31 +3628,42 @@ export const runBrowserProcessing = async (
                 ...sourceFields,
             }));
         } else {
-            const faceAttempt = await withTimeoutOutcome(
-                runNativeFaceDetection(faceSource, processingOptions.faceRotationDegrees || 0),
-                CLIENT_FACE_STEP_BUDGET_MS,
-            );
+            // A prior photo's detection call may still be running in the background
+            // (its own step timed out, but the underlying inference wasn't
+            // cancellable) -- don't start a second concurrent pass on the same
+            // shared session. Treat it exactly like a timeout: deferred, not a
+            // "zero faces found" result, so it gets retried once capacity frees up.
+            const faceDetectorBusy = faceDetectionActiveCount >= FACE_DETECTION_MAX_CONCURRENT;
+            const faceAttempt = faceDetectorBusy
+                ? ({ timedOut: true, value: null } as const)
+                : await withTimeoutOutcome(
+                    runNativeFaceDetection(faceSource, processingOptions.faceRotationDegrees || 0),
+                    CLIENT_FACE_STEP_BUDGET_MS,
+                );
             const faceResult = faceAttempt.value;
             if (faceAttempt.timedOut) {
                 const isBackgroundThrottled = typeof document !== 'undefined' && document.visibilityState !== 'visible';
+                const deferredReason = isBackgroundThrottled ? 'background_throttled' : 'inference_timeout';
+                const faceFailureStage = isBackgroundThrottled ? 'background_throttled' : 'timeout';
+                const faceFailureDetail = faceDetectorBusy ? 'browser_face_detector_busy' : (isBackgroundThrottled ? 'browser_background_throttled' : 'blazeface_load_timeout');
                 clientProcessing.face = {
                     hasData: false,
                     faces: [],
                     source: 'browser',
                     embeddingsReady: false,
                     faceModelReady: false,
-                    deferredReason: isBackgroundThrottled ? 'background_throttled' : 'inference_timeout',
-                    faceFailureStage: isBackgroundThrottled ? 'background_throttled' : 'timeout',
-                    faceFailureDetail: isBackgroundThrottled ? 'browser_background_throttled' : 'blazeface_load_timeout',
-                    debugStages: isBackgroundThrottled ? ['model_load_started', 'background_throttled'] : ['model_load_started', 'timeout'],
+                    deferredReason,
+                    faceFailureStage,
+                    faceFailureDetail,
+                    debugStages: faceDetectorBusy ? ['model_load_started', 'busy'] : (isBackgroundThrottled ? ['model_load_started', 'background_throttled'] : ['model_load_started', 'timeout']),
                     ...sourceFields,
                 };
-                clientProcessingReport.push(makeClientReport(clientAssetId, 'face', 'timeout', 'inference_timeout', startedAt, {
+                clientProcessingReport.push(makeClientReport(clientAssetId, 'face', 'timeout', deferredReason, startedAt, {
                     runtime: 'browser-face-detector',
-                    reason: isBackgroundThrottled ? 'background_throttled' : 'inference_timeout',
-                    detail: isBackgroundThrottled ? 'browser_background_throttled' : 'browser_face_detector_timeout',
-                    faceFailureStage: isBackgroundThrottled ? 'background_throttled' : 'timeout',
-                    faceFailureDetail: isBackgroundThrottled ? 'browser_background_throttled' : 'blazeface_load_timeout',
+                    reason: deferredReason,
+                    detail: faceFailureDetail,
+                    faceFailureStage,
+                    faceFailureDetail,
                     ...sourceFields,
                 }));
             } else {
@@ -3923,10 +3962,21 @@ export const runBrowserProcessing = async (
             detail: browserAiModelState?.detail || finalAiSkipReason,
             ...sourceFields,
         }));
-        clientProcessingReport.push(makeClientReport(clientAssetId, 'ocr', 'skipped', 'upstream_incomplete', performance.now(), {
-            runtime: 'browser-ocr-pending',
-            ...sourceFields,
-        }));
+        // The ocr block above (the visionSource.imageSource / .isRaw branches)
+        // already pushes exactly one 'ocr' report for every photo except the one
+        // gap it doesn't cover: imageSource absent AND isRaw false. Pushing here
+        // unconditionally used to silently overwrite whatever the earlier block
+        // already correctly reported (e.g. 'model_unavailable', matching what
+        // 'face' reports in the same scenario) with a misleading
+        // upstream_incomplete/browser-ocr-pending status -- making OCR's reported
+        // status untrustworthy for telling "ran and found nothing" apart from
+        // "never ran." Only fill the actual gap.
+        if (!visionSource.imageSource && !visionSource.isRaw) {
+            clientProcessingReport.push(makeClientReport(clientAssetId, 'ocr', 'skipped', 'upstream_incomplete', performance.now(), {
+                runtime: 'browser-ocr-pending',
+                ...sourceFields,
+            }));
+        }
     }
 
     return { clientProcessing, clientProcessingReport };
