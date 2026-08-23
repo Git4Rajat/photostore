@@ -26,6 +26,7 @@ def metadata_table(monkeypatch):
     monkeypatch.setattr(app, '_delete_upload_temp_files_for_filename', lambda *a, **k: ([], []))
     monkeypatch.setattr(app, '_delete_photo_blobs_if_present', lambda *a, **k: [])
     monkeypatch.setattr(app, 'delete_image_name_mapping', lambda *a, **k: None)
+    monkeypatch.setattr(app, 'original_filename_for_anonymous_id', lambda *a, **k: None)
     return table
 
 
@@ -90,3 +91,30 @@ def test_row_with_no_upload_tracking_is_left_alone(metadata_table):
 
     assert result['metadataAction'] == 'none'
     assert metadata_table.get_entity('lib-A', 'photo.jpg')['thumbnail_status'] == 'done'
+
+
+def test_stale_pre_rename_row_deletes_row_but_preserves_shared_blob(metadata_table, monkeypatch):
+    """A cross-tenant filename clash at finalize (_resolve_filename_for_upload)
+    renames the upload and only updates the row under the NEW name -- this row,
+    still keyed by the original filename, is left behind with the same
+    pendingAnonymousBlob UUID that's now live under the renamed row's
+    anonymousImageId. It must NOT delete that shared blob (it would break the
+    other, successfully finalized row) even though it looks identical to a
+    genuinely abandoned upload; the stale row itself should still go."""
+    _seed_row(
+        metadata_table, 'lib-A', 'IMG_0051.heic',
+        pendingAnonymousBlob='shared-uuid-789',
+    )
+    delete_calls = []
+    monkeypatch.setattr(app, '_delete_photo_blobs_if_present', lambda *a, **k: delete_calls.append(a) or [])
+    monkeypatch.setattr(
+        app, 'original_filename_for_anonymous_id',
+        lambda user_id, anon_id: 'IMG_0051-ed20808c.heic' if anon_id == 'shared-uuid-789' else None,
+    )
+
+    result = app._cleanup_failed_upload('lib-A', 'IMG_0051.heic')
+
+    assert delete_calls == []
+    assert result['metadataAction'] == 'deleted'
+    with pytest.raises(Exception):
+        metadata_table.get_entity('lib-A', 'IMG_0051.heic')

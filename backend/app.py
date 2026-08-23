@@ -76,6 +76,7 @@ from storage_utils import (
     reserve_pending_anonymous_blob,
     read_pending_anonymous_blob,
     resolve_physical_blob_name,
+    original_filename_for_anonymous_id,
     invalidate_image_names_cache,
     delete_image_name_mapping,
     delete_hash_index_entry,
@@ -10347,13 +10348,35 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
                 or ''
             ).strip()
             physical_name = anonymous_id or filename
-            extra = [filename] if anonymous_id else None
-            cleanup['errors'].extend(_delete_photo_blobs_if_present(physical_name, extra))
+
+            # A cross-tenant filename clash at finalize (_resolve_filename_for_upload)
+            # renames the upload but only touches the row keyed by the NEW name --
+            # this row (still keyed by the pre-rename filename) is left behind
+            # looking exactly like an abandoned upload, even though its blob
+            # reservation was long since promoted to a live, finalized row under
+            # the renamed filename. The name-mapping table is stamped with the
+            # current owner at finalize, so it's the authoritative check before
+            # deleting a blob by UUID: if some OTHER filename now owns this
+            # anonymous_id, the blob is live and must be preserved -- only the
+            # stale husk row below should go.
+            blob_owned_elsewhere = False
             if anonymous_id:
-                try:
-                    delete_image_name_mapping(user_id, anonymous_id)
-                except Exception:
-                    pass
+                current_owner_filename = original_filename_for_anonymous_id(user_id, anonymous_id)
+                blob_owned_elsewhere = bool(current_owner_filename) and current_owner_filename != filename
+
+            if blob_owned_elsewhere:
+                app.logger.warning(
+                    'Skipped deleting blob %s during cleanup of stale row %s: '
+                    'now owned by %s.', anonymous_id, filename, current_owner_filename,
+                )
+            else:
+                extra = [filename] if anonymous_id else None
+                cleanup['errors'].extend(_delete_photo_blobs_if_present(physical_name, extra))
+                if anonymous_id:
+                    try:
+                        delete_image_name_mapping(user_id, anonymous_id)
+                    except Exception:
+                        pass
 
             try:
                 metadata_table_client.delete_entity(partition_key=user_id, row_key=filename)

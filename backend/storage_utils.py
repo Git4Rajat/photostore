@@ -355,6 +355,22 @@ def resolve_physical_blob_name(library_id: str, original_filename: str, kind: st
     return anonymous_id or original_filename
 
 
+def original_filename_for_anonymous_id(library_id: str, anonymous_id: str) -> Optional[str]:
+    """Reverse of resolve_physical_blob_name: whichever real filename currently
+    owns this anonymous blob id (stamped into the name-mapping table at
+    finalize), or None if nothing currently claims it.
+
+    Used to tell a genuinely orphaned blob reservation apart from a stale
+    pre-rename metadata row whose blob was since claimed by a *different*,
+    successfully finalized filename (see _resolve_filename_for_upload) --
+    deleting the blob by UUID in the latter case would silently break that
+    other, live row.
+    """
+    if not library_id or not anonymous_id:
+        return None
+    return _get_original_filename(library_id, anonymous_id)
+
+
 def load_image_names_cache(library_id: str) -> None:
     """Load all image name mappings for a library into memory cache."""
     image_names_table_client = _CTX.get('image_names_table_client')
