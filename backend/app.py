@@ -10308,11 +10308,21 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
         metadata = None
 
     has_upload_tracking = bool(metadata) and any(field in metadata for field in UPLOAD_TRACKING_FIELDS)
+    # thumbnail_status deliberately excluded: kickOffThumbnailForFile fires an
+    # early, thumbnail-only processing claim concurrently with the raw upload
+    # itself (before finalize), so thumbnail_status can be 'running' on a row
+    # whose upload was then abandoned before finalize ever ran -- fooling this
+    # into treating a genuinely incomplete upload as "completed", which left
+    # the row's stale claim/lease fields (and its orphaned blob reservation)
+    # behind forever instead of deleting them below. anonymousImageId,
+    # fileHash, mimeType, and perceptualHash are only ever stamped together at
+    # finalize (finalize_uploaded_file, storage_utils.py), so they're the
+    # actual trustworthy "this upload really finished" signals.
     has_completed_metadata = bool(metadata) and bool(
         metadata.get('fileHash')
         or metadata.get('perceptualHash')
         or metadata.get('mimeType')
-        or metadata.get('thumbnail_status')
+        or metadata.get('anonymousImageId')
         or metadata.get('verification_status')
     )
 
