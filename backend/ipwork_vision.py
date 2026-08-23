@@ -26,6 +26,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 import vision_utils
+from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
 
 # Same vocabulary file the browser fetches at runtime (manifest.tagVocabularyUrl,
 # default frontend/public/models/browser-ai/vocab/tag-vocabulary.v1.json) --
@@ -75,13 +76,26 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
     return exp / np.sum(exp)
 
 
+def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
+    """See ipwork_face.py's copy of this helper: RAW formats (e.g. CR3) have
+    no generic PIL codec, so vision_utils.encode_image_embedding's Image.open()
+    raises on the raw bytes unless it's handed the same embedded/rawpy preview
+    ipwork_thumbnail.py already extracts."""
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
+    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
+        preview = extract_raw_preview_bytes(image_bytes, filename)
+        if preview:
+            return preview
+    return image_bytes
+
+
 def process_vision(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
     if not vision_utils.image_encoder_available():
         return {'hasData': False, 'error': 'clip_model_unavailable'}
     if not _load_vocabulary():
         return {'hasData': False, 'error': 'vocabulary_unavailable'}
 
-    image_embedding = vision_utils.encode_image_embedding(image_bytes)
+    image_embedding = vision_utils.encode_image_embedding(_decodable_image_bytes(image_bytes, filename))
     if not image_embedding:
         return {'hasData': False, 'error': 'image_embedding_failed'}
 

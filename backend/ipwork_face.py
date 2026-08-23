@@ -37,6 +37,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageOps
 
+from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
+
 # cv2/onnxruntime/mediapipe are ipworker-only deps (requirements-ipworker.txt),
 # not in backend/requirements.txt -- guarded the same way ipwork_ocr.py guards
 # pytesseract, so importing this module never hard-crashes outside the
@@ -406,9 +408,22 @@ def compute_face_embedding(aligned_bgr: np.ndarray) -> Optional[np.ndarray]:
 
 # --- Top-level ipworker step processor --------------------------------------
 
+def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
+    """RAW formats (e.g. CR3) have no generic PIL codec -- Image.open() on the
+    raw bytes raises 'cannot identify image file'. Extract the same embedded/
+    rawpy preview ipwork_thumbnail.py already uses so RAW photos decode here
+    too, instead of every RAW upload silently failing face + ai_vision."""
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
+    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
+        preview = extract_raw_preview_bytes(image_bytes, filename)
+        if preview:
+            return preview
+    return image_bytes
+
+
 def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
     try:
-        with Image.open(io.BytesIO(image_bytes)) as pil_image:
+        with Image.open(io.BytesIO(_decodable_image_bytes(image_bytes, filename))) as pil_image:
             # Most phone photos are stored with an EXIF orientation tag rather
             # than physically rotated pixels. Confirmed against a real sideways
             # photo (orientation=6) during validation: without this, detection

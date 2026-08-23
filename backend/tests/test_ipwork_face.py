@@ -99,6 +99,68 @@ def test_process_face_returns_diagnosable_shape_on_decode_failure():
     assert 'error' in result
 
 
+# --- RAW (CR3/etc.) decode routing ------------------------------------------
+#
+# PIL has no generic codec for RAW containers -- Image.open() on the raw bytes
+# raises 'cannot identify image file'. Confirmed live in production: every
+# CR3 upload in a real backlog had ai_vision_status/face_status stuck
+# 'failed' with exactly that error, 0/173 non-RAW files affected.
+# _decodable_image_bytes must route RAW extensions through
+# image_utils.extract_raw_preview_bytes (the same helper ipwork_thumbnail.py
+# already uses successfully) before anything touches PIL.
+
+def test_decodable_image_bytes_passes_through_non_raw_unchanged():
+    original = b'plain-jpeg-bytes'
+    assert face_mod._decodable_image_bytes(original, 'photo.jpg') == original
+
+
+def test_decodable_image_bytes_extracts_preview_for_raw_extension(monkeypatch):
+    calls = []
+
+    def fake_extract(image_bytes, filename):
+        calls.append((image_bytes, filename))
+        return b'decodable-jpeg-preview'
+
+    monkeypatch.setattr(face_mod, 'extract_raw_preview_bytes', fake_extract)
+
+    result = face_mod._decodable_image_bytes(b'raw-cr3-bytes', 'IMG_0036.cr3')
+
+    assert result == b'decodable-jpeg-preview'
+    assert calls == [(b'raw-cr3-bytes', 'IMG_0036.cr3')]
+
+
+def test_decodable_image_bytes_falls_back_to_original_when_extraction_fails(monkeypatch):
+    monkeypatch.setattr(face_mod, 'extract_raw_preview_bytes', lambda image_bytes, filename: None)
+
+    result = face_mod._decodable_image_bytes(b'raw-cr3-bytes', 'IMG_0036.cr3')
+
+    assert result == b'raw-cr3-bytes'
+
+
+def test_process_face_decodes_raw_extension_via_extracted_preview(monkeypatch):
+    # End-to-end through process_face's own Image.open call: raw bytes alone
+    # would raise (as in the decode-failure test above), but routing a CR3
+    # filename through a stubbed extractor that returns a real JPEG lets
+    # decode succeed -- proving process_face actually calls
+    # _decodable_image_bytes rather than only ipwork_thumbnail.py having the
+    # RAW-aware path.
+    from PIL import Image
+    import io
+    buffer = io.BytesIO()
+    Image.new('RGB', (64, 64), color=(10, 20, 30)).save(buffer, format='JPEG')
+    real_jpeg = buffer.getvalue()
+
+    monkeypatch.setattr(face_mod, 'extract_raw_preview_bytes', lambda image_bytes, filename: real_jpeg)
+    monkeypatch.setattr(face_mod, 'YOLO_FACE_MODEL_PATH', '/nonexistent/missing-model.onnx')
+    monkeypatch.setattr(face_mod, '_yolo_session', None)
+
+    result = face_mod.process_face('lib-A', 'IMG_0036.cr3', b'not-a-real-raw-container')
+
+    # Decode succeeded (no longer 'ipworker_decode_failed'); it fails later at
+    # detection only because no real ONNX model is available in this test env.
+    assert 'detection_failed' in result['error']
+
+
 def test_process_face_returns_diagnosable_shape_on_detection_failure(tmp_path, monkeypatch):
     # A real decodable image, but no ONNX model file exists at the configured
     # path in this test environment -- _get_yolo_session's InferenceSession
