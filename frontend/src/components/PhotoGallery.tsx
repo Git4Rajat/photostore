@@ -2719,6 +2719,40 @@ const extractEmbeddedJpegPreview = async (file: File): Promise<BrowserVisionSour
     };
 };
 
+// Chrome/Edge have no native HEIC decoder (see createOrientedImageCanvas above), so handing
+// OCR/face-detection the raw undecoded file as the 'original' fallback below is a guaranteed
+// failure for every one of those steps, not a graceful degradation -- worse, tesseract.js's
+// vendored blueimp-load-image throws an uncaught "toBlob is not a function" when its internal
+// <img> fails to load HEIC bytes, which leaves its promise permanently unresolved and burns the
+// entire OCR_TOTAL_BUDGET_MS on a call that could never have succeeded. Reuse the same
+// libheif-backed decode already proven for thumbnails so this fallback only fires when the
+// backend-converted preview is truly unavailable (e.g. a transient 503), not on every HEIC photo.
+const createHeicDecodedVisionSource = async (
+    file: File,
+    base: Omit<BrowserVisionSource, 'imageSource' | 'sourceKind' | 'skipReason' | 'sourceBytes'>,
+): Promise<BrowserVisionSource | null> => {
+    try {
+        const canvas = await withTimeout(createOrientedImageCanvas(file), CLIENT_BROWSER_STEP_BUDGET_MS);
+        if (!canvas) {
+            return null;
+        }
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.9));
+        if (!blob) {
+            return null;
+        }
+        return {
+            ...base,
+            imageSource: blob,
+            sourceKind: 'raw_converted_jpeg',
+            previewWidth: canvas.width,
+            previewHeight: canvas.height,
+            sourceBytes: blob.size,
+        };
+    } catch {
+        return null;
+    }
+};
+
 const resolveBrowserVisionSource = async (file: File, convertedPreview?: Blob | File): Promise<BrowserVisionSource> => {
     const sourceFormat = getFileExtension(file.name) || file.type || 'unknown';
     if (!isRawFile(file)) {
@@ -2732,6 +2766,16 @@ const resolveBrowserVisionSource = async (file: File, convertedPreview?: Blob | 
                 ...converted,
                 sourceKind: 'backend_converted_jpeg',
             };
+        }
+        if (isHeicFilename(file.name)) {
+            const decoded = await createHeicDecodedVisionSource(file, {
+                sourceFormat,
+                originalBytes: file.size,
+                isRaw: false,
+            });
+            if (decoded) {
+                return decoded;
+            }
         }
         return {
             imageSource: file,
