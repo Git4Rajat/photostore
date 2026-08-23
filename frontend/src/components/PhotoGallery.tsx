@@ -1478,8 +1478,9 @@ const runBrowserOcrInner = async (source: Blob | File): Promise<string> => {
 
     const preprocessBlob = async (blob: Blob): Promise<Blob | null> => {
         if (typeof document === 'undefined' || typeof createImageBitmap !== 'function') return null;
+        let imgBitmap: ImageBitmap | null = null;
         try {
-            const imgBitmap = await createImageBitmap(blob);
+            imgBitmap = await createImageBitmap(blob);
             const canvas = document.createElement('canvas');
             canvas.width = imgBitmap.width;
             canvas.height = imgBitmap.height;
@@ -1503,10 +1504,13 @@ const runBrowserOcrInner = async (source: Blob | File): Promise<string> => {
                 data[i] = data[i + 1] = data[i + 2] = gray;
             }
             ctx.putImageData(imageData, 0, 0);
-            imgBitmap.close?.();
             return await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), 'image/png', 0.9));
         } catch {
             return null;
+        } finally {
+            // finally, not inline after putImageData -- the `if (!ctx) return null`
+            // path above skipped the close entirely before this change.
+            imgBitmap?.close?.();
         }
     };
 
@@ -2804,13 +2808,26 @@ const resolveBrowserVisionSource = async (file: File, convertedPreview?: Blob | 
     }
 };
 
+// withTimeout (used at the call site below) only stops *waiting* on a slow
+// video decode -- it can't cancel the underlying <video> load/seek once
+// started. Same orphaned-work pileup as the face-detection bug this mirrors
+// (see FACE_DETECTION_MAX_CONCURRENT above): a timed-out video keeps
+// decoding in the background while the drain loop moves on, so a slow/
+// mobile device can accumulate several concurrent decodes, each pinning its
+// own hardware video-decoder handle -- mobile browsers cap those in the
+// single digits, making this a likely contributor to tab crashes on long
+// sessions with many videos.
+const VIDEO_THUMBNAIL_MAX_CONCURRENT = 1;
+let videoThumbnailActiveCount = 0;
+
 const createVideoBrowserThumbnail = async (file: File): Promise<{ dataUrl: string; width: number; height: number; rotationDegrees: number } | null> => {
-    if (typeof document === 'undefined') {
+    if (typeof document === 'undefined' || videoThumbnailActiveCount >= VIDEO_THUMBNAIL_MAX_CONCURRENT) {
         return null;
     }
+    videoThumbnailActiveCount += 1;
     const objectUrl = URL.createObjectURL(file);
+    const video = document.createElement('video');
     try {
-        const video = document.createElement('video');
         video.muted = true;
         video.playsInline = true;
         video.preload = 'auto';
@@ -2847,7 +2864,16 @@ const createVideoBrowserThumbnail = async (file: File): Promise<{ dataUrl: strin
         }
         return { dataUrl: await blobToDataUrl(blob), width, height, rotationDegrees: 0 };
     } finally {
+        // Explicit teardown, not just letting `video` fall out of scope --
+        // browsers keep decoder buffers / hardware video-decoder handles
+        // pinned to a <video> element until the src is cleared and load()
+        // is called; GC of the element wrapper alone doesn't reliably
+        // release them promptly.
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
         URL.revokeObjectURL(objectUrl);
+        videoThumbnailActiveCount -= 1;
     }
 };
 
