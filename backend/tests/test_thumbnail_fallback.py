@@ -232,3 +232,38 @@ def test_single_download_serves_both_exif_and_thumbnail_fallback(processing_ctx)
 
     assert calls.downloads == [('image', filename)]
     assert len(calls.uploads) == 1  # only the thumbnail upload; EXIF has no blob upload
+
+
+def test_missing_source_blob_fails_gracefully_instead_of_500(processing_ctx, monkeypatch):
+    """A genuinely missing source blob (e.g. a lost upload reservation) used
+    to propagate download_media_bytes's ResourceNotFoundError straight out of
+    apply_client_processing_results_for_file uncaught -- turning "the source
+    is gone" into a 500 on the whole /upload/client-processing request
+    instead of the steps just resolving to 'failed' like any other terminal
+    failure."""
+    metadata, calls = processing_ctx
+    user_id, filename = 'lib-A', 'photo.cr3'
+    _seed_row(metadata, user_id, filename)
+
+    def _raise_not_found(kind, name):
+        calls.downloads.append((kind, name))
+        raise storage_utils.ResourceNotFoundError('The specified blob does not exist.')
+
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', _raise_not_found)
+
+    result = storage_utils.apply_client_processing_results_for_file(
+        user_id,
+        filename,
+        client_processing={},
+        client_processing_report=[
+            {'step': 'thumbnail', 'status': 'failed', 'reason': 'unknown_error'},
+            {'step': 'exif', 'status': 'unsupported', 'reason': 'unknown_error'},
+        ],
+        client_asset_id='browser-photo.cr3',
+    )
+
+    assert calls.uploads == []
+    assert result['thumbnail_status'] == 'failed'
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['thumbnail_status'] == 'failed'
+    assert stored['exif_status'] == 'failed'

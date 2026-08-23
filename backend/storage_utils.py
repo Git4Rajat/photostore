@@ -2056,6 +2056,24 @@ def _step_locked_done(metadata: Dict, step: str) -> bool:
     return str(metadata.get(f'{step}_status') or '').strip().lower() == 'done'
 
 
+def _try_get_image_bytes(get_image_bytes: Callable[[], bytes]) -> Optional[bytes]:
+    """Best-effort source-image fetch for the server-side fallback paths below.
+
+    The source blob can genuinely be gone (e.g. a lost upload reservation) --
+    in that case every server-side fallback (thumbnail/exif regeneration) is
+    equally unable to help, so callers should resolve the step to 'failed'
+    instead of calling into a fallback with unusable bytes. Without this, the
+    download's ResourceNotFoundError propagated straight out of
+    _apply_client_processing_results uncaught, turning "the source is missing"
+    into a 500 on the whole /upload/client-processing request instead of a
+    normal terminal step failure.
+    """
+    try:
+        return get_image_bytes()
+    except Exception:
+        return None
+
+
 def _apply_client_processing_results(
     user_id: str,
     filename: str,
@@ -2126,13 +2144,17 @@ def _apply_client_processing_results(
         try:
             get_media_properties('thumbnail', thumbnail_blob_name)
         except Exception:
-            status_updates.update(_apply_server_thumbnail_fallback(
-                user_id,
-                filename,
-                metadata,
-                get_image_bytes(),
-                fallback_for='report_claimed_done_but_blob_missing',
-            ))
+            source_bytes = _try_get_image_bytes(get_image_bytes)
+            if source_bytes is not None:
+                status_updates.update(_apply_server_thumbnail_fallback(
+                    user_id,
+                    filename,
+                    metadata,
+                    source_bytes,
+                    fallback_for='report_claimed_done_but_blob_missing',
+                ))
+            else:
+                status_updates['thumbnail_status'] = 'failed'
     if thumbnail_payload is not None and had_thumbnail_before:
         # Race guard, same as ocr/map_detection/face/ai_vision below: now that
         # ipworker can also generate thumbnails (ipwork_thumbnail.py), 'both'
@@ -2181,13 +2203,17 @@ def _apply_client_processing_results(
             or (isinstance(thumbnail_payload, dict) and thumbnail_payload.get('hasData') is False)
         )
     ):
-        status_updates.update(_apply_server_thumbnail_fallback(
-            user_id,
-            filename,
-            metadata,
-            get_image_bytes(),
-            fallback_for='browser_thumbnail_failed',
-        ))
+        source_bytes = _try_get_image_bytes(get_image_bytes)
+        if source_bytes is not None:
+            status_updates.update(_apply_server_thumbnail_fallback(
+                user_id,
+                filename,
+                metadata,
+                source_bytes,
+                fallback_for='browser_thumbnail_failed',
+            ))
+        else:
+            status_updates['thumbnail_status'] = 'failed'
 
     exif_result = payload.get('exif')
     if isinstance(exif_result, dict) and _step_locked_done(metadata, 'exif'):
@@ -2201,13 +2227,17 @@ def _apply_client_processing_results(
     elif isinstance(exif_result, dict):
         exif_provenance = _client_source_provenance(exif_result)
         if exif_result.get('hasData') is False:
-            status_updates.update(_apply_server_exif_fallback(
-                user_id,
-                filename,
-                metadata,
-                get_image_bytes(),
-                fallback_for='browser_no_data',
-            ))
+            source_bytes = _try_get_image_bytes(get_image_bytes)
+            if source_bytes is not None:
+                status_updates.update(_apply_server_exif_fallback(
+                    user_id,
+                    filename,
+                    metadata,
+                    source_bytes,
+                    fallback_for='browser_no_data',
+                ))
+            else:
+                status_updates['exif_status'] = 'failed'
         elif exif_result.get('hasData') is True:
             exif_data = _sanitize_client_exif(exif_result.get('data') or {})
             lat = _valid_decimal(exif_result.get('latitude') or exif_data.get('GPS.LatitudeDecimal'), -90.0, 90.0)
@@ -2250,13 +2280,17 @@ def _apply_client_processing_results(
     elif exif_result is not None:
         status_updates['exif_status'] = 'failed'
     elif _client_report_needs_server_exif_fallback(report):
-        status_updates.update(_apply_server_exif_fallback(
-            user_id,
-            filename,
-            metadata,
-            get_image_bytes(),
-            fallback_for='browser_unsupported',
-        ))
+        source_bytes = _try_get_image_bytes(get_image_bytes)
+        if source_bytes is not None:
+            status_updates.update(_apply_server_exif_fallback(
+                user_id,
+                filename,
+                metadata,
+                source_bytes,
+                fallback_for='browser_unsupported',
+            ))
+        else:
+            status_updates['exif_status'] = 'failed'
 
     ocr_result = payload.get('ocr')
     if isinstance(ocr_result, dict) and _step_locked_done(metadata, 'ocr'):
