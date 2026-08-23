@@ -190,14 +190,21 @@ def test_resolve_filename_identical_content_across_libraries_no_rename(dedup_ctx
     assert final_name == 'vacation.jpg'
 
 
-def test_resolve_filename_same_library_reupload_no_rename(dedup_ctx):
+def test_resolve_filename_same_library_reupload_renames(dedup_ctx):
     metadata, hash_index, filename_owners = dedup_ctx
     storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='h' * 64)
 
-    # The SAME library re-uploading under the same name with different bytes
-    # (an intentional overwrite) is not a cross-tenant collision.
-    _, final_name = storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='i' * 64)
-    assert final_name == 'vacation.jpg'
+    # The SAME library uploading different bytes under a filename it already
+    # owns must NOT silently replace the earlier photo -- filename collisions
+    # happen within one library too (e.g. Apple Photos exporting many distinct
+    # edited photos all as "FullSizeRender.heic"), and (user_id, filename) is
+    # the metadata table's row key, so without a rename the second upload's
+    # finalize would overwrite the first photo's row. Calls the resolver
+    # directly rather than the full finalize path, same as
+    # test_resolve_filename_conflict_across_libraries_renames above.
+    final_name = storage_utils._resolve_filename_for_upload('lib-A', 'vacation.jpg', 'i' * 64)
+    assert final_name != 'vacation.jpg'
+    assert final_name.startswith('vacation-') and final_name.endswith('.jpg')
 
 
 def test_delete_helpers_remove_index_rows(dedup_ctx):

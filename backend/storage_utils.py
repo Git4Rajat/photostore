@@ -465,7 +465,17 @@ PENDING_ANONYMOUS_BLOB_FIELD = 'pendingAnonymousBlob'
 def reserve_pending_anonymous_blob(user_id: str, original_filename: str) -> Optional[str]:
     """Return the anonymous blob name for this upload, reserving one on the
     metadata row if none exists yet. Reused verbatim on a resumed /upload/init so
-    the browser keeps staging blocks to the SAME blob."""
+    the browser keeps staging blocks to the SAME blob.
+
+    Deliberately only reuses the transient PENDING_ANONYMOUS_BLOB_FIELD, never a
+    permanent anonymousImageId: the same (user_id, filename) row is reused across
+    completely unrelated uploads (e.g. Apple Photos exporting many distinct edits
+    all as "FullSizeRender.heic"), so once a prior upload has finalized -- and
+    finalize_uploaded_file has already popped this field -- an anonymousImageId
+    left on the row belongs to THAT finished photo, not this new one. Treating it
+    as reusable here would stage the new file's bytes directly onto the old
+    photo's blob, silently overwriting it.
+    """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
     if not user_id or not original_filename:
@@ -474,7 +484,7 @@ def reserve_pending_anonymous_blob(user_id: str, original_filename: str) -> Opti
         entity = metadata_table_client.get_entity(partition_key=user_id, row_key=original_filename)
     except Exception:
         entity = {'PartitionKey': user_id, 'RowKey': original_filename}
-    existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or entity.get('anonymousImageId') or '').strip()
+    existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
     if existing:
         return existing
     reserved = _generate_anonymous_id()
@@ -3089,11 +3099,15 @@ def _query_filename_owners(filename: str) -> List[Dict[str, str]]:
 def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) -> str:
     """Return a safe filename to use for storing this upload.
 
-    If another library already owns this exact filename with different content
-    (a different fileHash), generate a unique candidate to avoid a cross-tenant
-    blob-name collision -- blob storage names are not partitioned per library,
-    so two libraries independently uploading "IMG_1234.jpg" would otherwise
-    silently overwrite each other's bytes.
+    If this exact filename is already owned by a different photo (a different
+    fileHash) -- whether from another library (cross-tenant blob-name collision;
+    blob storage names aren't partitioned per library) or from this SAME user's
+    own earlier upload -- generate a unique candidate instead of colliding.
+    Same-user collisions are common in practice: e.g. Apple Photos exports many
+    distinct edited photos all under the generic name "FullSizeRender.heic", and
+    the metadata table has exactly one row per (user_id, filename), so without
+    this check a later same-named upload would silently overwrite an earlier
+    photo's row.
     """
     _require_context()
 
@@ -3105,7 +3119,7 @@ def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) ->
         for row in _query_filename_owners(filename):
             owner = row['owner']
             existing_hash = row['fileHash']
-            if owner and owner != user_id and existing_hash and existing_hash != file_hash:
+            if owner and existing_hash and existing_hash != file_hash:
                 # Conflict: pick a unique filename not already owned by anyone.
                 name, ext = os.path.splitext(filename)
                 for _ in range(5):
@@ -3222,7 +3236,11 @@ def reset_upload_tracking_and_reserve_blob(
     if expected_hash:
         entity['upload_sha256_expected'] = expected_hash
 
-    existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or entity.get('anonymousImageId') or '').strip()
+    # See reserve_pending_anonymous_blob's docstring: only the transient pending
+    # field is reusable here. A stale anonymousImageId from a prior, unrelated,
+    # already-finalized upload of this same filename must never be handed back
+    # as if it were a fresh reservation.
+    existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
     anonymous_blob_name = existing or _generate_anonymous_id()
     entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
 
@@ -3276,7 +3294,11 @@ def reset_upload_tracking_and_reserve_blobs_batch(
             if f.get('expected_hash'):
                 entity['upload_sha256_expected'] = f['expected_hash']
 
-        existing_blob = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or entity.get('anonymousImageId') or '').strip()
+        # See reserve_pending_anonymous_blob's docstring: never fall back to a
+        # permanent anonymousImageId here -- these are all fresh uploads, and a
+        # prior, unrelated, already-finalized photo under this same filename
+        # must not have its blob silently reused/overwritten.
+        existing_blob = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
         anonymous_blob_name = existing_blob or _generate_anonymous_id()
         entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
         anonymous_blob_names[filename] = anonymous_blob_name

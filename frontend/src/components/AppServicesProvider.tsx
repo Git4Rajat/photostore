@@ -1595,6 +1595,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const requestBatchedInit = (filename: string, totalSize: number, sha256: string): Promise<any> => (
         new Promise((resolve, reject) => {
+            // Never let two entries for the identical filename land in the same
+            // /upload/init-batch request -- the backend reserves blob names keyed
+            // purely by filename per request, so two same-named files in one call
+            // corrupt each other's reservation (both can end up staging blocks to
+            // the same blob). This happens more than it sounds: Apple Photos
+            // exports many distinct edited photos all as "FullSizeRender.heic",
+            // and a folder-select can easily land two of them in the same debounce
+            // window. Flushing the in-flight batch first guarantees the duplicate
+            // starts a fresh batch instead.
+            if (pendingBatchInitRef.current.some((req) => req.filename === filename)) {
+                void flushInitBatch();
+            }
             pendingBatchInitRef.current.push({ filename, totalSize, sha256, resolve, reject });
             if (pendingBatchInitRef.current.length >= INIT_BATCH_MAX_SIZE) {
                 void flushInitBatch();
