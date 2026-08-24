@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 
 import pytest
+from azure.core.exceptions import ResourceExistsError
 
 import storage_utils
 
@@ -32,6 +33,12 @@ class _FakePointTable:
 
     def __init__(self) -> None:
         self.rows: dict = {}
+
+    def create_entity(self, entity):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        if key in self.rows:
+            raise ResourceExistsError(f'{key} already exists')
+        self.rows[key] = dict(entity)
 
     def upsert_entity(self, entity):
         self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
@@ -205,6 +212,42 @@ def test_resolve_filename_same_library_reupload_renames(dedup_ctx):
     final_name = storage_utils._resolve_filename_for_upload('lib-A', 'vacation.jpg', 'i' * 64)
     assert final_name != 'vacation.jpg'
     assert final_name.startswith('vacation-') and final_name.endswith('.jpg')
+
+
+def test_concurrent_same_filename_uploads_do_not_collide(dedup_ctx):
+    """Two upload lanes finalizing the exact same filename with DIFFERENT
+    content at (almost) the same time -- neither has stored ownership yet
+    when the other's collision check runs. Before the atomic claim fix, both
+    _resolve_filename_for_upload calls would see no existing owner and both
+    return the unchanged filename, so the second upsert_entity would silently
+    clobber the first photo's metadata row. _claim_filename_owner's
+    create_entity makes the ownership write itself the collision check, so
+    only one of the two racing calls can win the original name."""
+    metadata, hash_index, filename_owners = dedup_ctx
+
+    lane_a_name = storage_utils._resolve_filename_for_upload('lib-A', 'IP_image.heic', 'a' * 64)
+    # Neither lane has called _store_filename_owner yet at this point in a
+    # real race -- simulated here by resolving lane B before lane A's
+    # finalize reaches its later _store_filename_owner call.
+    lane_b_name = storage_utils._resolve_filename_for_upload('lib-A', 'IP_image.heic', 'b' * 64)
+
+    assert lane_a_name == 'IP_image.heic'
+    assert lane_b_name != 'IP_image.heic'
+    assert lane_b_name.startswith('IP_image-') and lane_b_name.endswith('.heic')
+
+
+def test_concurrent_identical_reupload_is_not_treated_as_a_conflict(dedup_ctx):
+    """Two lanes racing on the same filename with the SAME content (e.g. a
+    retried finalize call) must both resolve to the original name, not rename
+    one of them -- this isn't a real collision."""
+    metadata, hash_index, filename_owners = dedup_ctx
+    same_hash = 'c' * 64
+
+    first = storage_utils._resolve_filename_for_upload('lib-A', 'IP_image.heic', same_hash)
+    second = storage_utils._resolve_filename_for_upload('lib-A', 'IP_image.heic', same_hash)
+
+    assert first == 'IP_image.heic'
+    assert second == 'IP_image.heic'
 
 
 def test_delete_helpers_remove_index_rows(dedup_ctx):

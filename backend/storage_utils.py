@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import BinaryIO, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from azure.core.exceptions import ResourceNotFoundError, ResourceModifiedError
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError, ResourceModifiedError
 from azure.storage.blob import ContentSettings as BlobContentSettings
 from werkzeug.utils import secure_filename
 
@@ -462,7 +462,7 @@ def get_anonymous_blob_name(
 PENDING_ANONYMOUS_BLOB_FIELD = 'pendingAnonymousBlob'
 
 
-def reserve_pending_anonymous_blob(user_id: str, original_filename: str) -> Optional[str]:
+def reserve_pending_anonymous_blob(user_id: str, original_filename: str, expected_hash: Optional[str] = None) -> Optional[str]:
     """Return the anonymous blob name for this upload, reserving one on the
     metadata row if none exists yet. Reused verbatim on a resumed /upload/init so
     the browser keeps staging blocks to the SAME blob.
@@ -475,6 +475,17 @@ def reserve_pending_anonymous_blob(user_id: str, original_filename: str) -> Opti
     left on the row belongs to THAT finished photo, not this new one. Treating it
     as reusable here would stage the new file's bytes directly onto the old
     photo's blob, silently overwriting it.
+
+    A pending reservation can ALSO belong to a still-in-flight upload of a
+    DIFFERENT file that just happens to share this filename (two distinct
+    photos both named "FullSizeRender.heic" uploaded around the same time,
+    one not yet finalized) -- reusing it then would stage two unrelated
+    files' chunks onto the same blob (positional block IDs, so they clobber
+    each other -- see the "Uploaded blob size mismatch" finalize check). When
+    `expected_hash` is available on both sides, only reuse the pending
+    reservation if it matches; otherwise treat it as unrelated and reserve a
+    fresh blob. If either hash is unavailable, fall back to the old
+    always-reuse behavior rather than block the upload.
     """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
@@ -485,10 +496,13 @@ def reserve_pending_anonymous_blob(user_id: str, original_filename: str) -> Opti
     except Exception:
         entity = {'PartitionKey': user_id, 'RowKey': original_filename}
     existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
-    if existing:
+    existing_hash = str(entity.get('upload_sha256_expected') or '').strip()
+    if existing and (not expected_hash or not existing_hash or existing_hash == expected_hash):
         return existing
     reserved = _generate_anonymous_id()
     entity[PENDING_ANONYMOUS_BLOB_FIELD] = reserved
+    if expected_hash:
+        entity['upload_sha256_expected'] = expected_hash
     try:
         metadata_table_client.upsert_entity(entity)
     except Exception:
@@ -3096,6 +3110,40 @@ def _query_filename_owners(filename: str) -> List[Dict[str, str]]:
     return [{'owner': str(e.get('PartitionKey') or ''), 'fileHash': str(e.get('fileHash') or '')} for e in entities]
 
 
+def _claim_filename_owner(user_id: str, filename: str, file_hash: str) -> bool:
+    """Atomically try to claim `filename` for (user_id, file_hash).
+
+    Returns True if the caller may use this filename as-is: either it just
+    claimed an unowned filename, or the filename is already owned by this
+    SAME content (an idempotent retry/re-upload). Returns False if the
+    filename is already owned by DIFFERENT content, so the caller must pick
+    another candidate.
+
+    Uses the table's atomic create_entity (fails if the row already exists)
+    rather than a separate read-then-upsert, so two concurrent uploads racing
+    on the identical filename can't both observe "unowned" and both proceed
+    -- exactly one create_entity call wins, and the loser is told to rename.
+    """
+    filename_owners_table_client = _CTX.get('filename_owners_table_client')
+    if filename_owners_table_client is None or not filename:
+        return True
+    try:
+        filename_owners_table_client.create_entity({
+            'PartitionKey': filename,
+            'RowKey': user_id,
+            'fileHash': file_hash,
+        })
+        return True
+    except ResourceExistsError:
+        try:
+            existing = filename_owners_table_client.get_entity(partition_key=filename, row_key=user_id)
+        except Exception:
+            return True
+        return str(existing.get('fileHash') or '') == file_hash
+    except Exception:
+        return True
+
+
 def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) -> str:
     """Return a safe filename to use for storing this upload.
 
@@ -3108,6 +3156,11 @@ def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) ->
     the metadata table has exactly one row per (user_id, filename), so without
     this check a later same-named upload would silently overwrite an earlier
     photo's row.
+
+    Claiming happens here, atomically, rather than later at write time --
+    concurrent uploads (the frontend runs several upload lanes in parallel)
+    can name-collide on the exact same filename before either has finalized,
+    and a plain read-then-write check can't tell them apart in time.
     """
     _require_context()
 
@@ -3116,22 +3169,55 @@ def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) ->
         return filename
 
     try:
+        if _CTX.get('filename_owners_table_client') is None:
+            # Index not wired up yet (e.g. just after deploy, before backfill)
+            # -- fall back to a best-effort scan check. Not race-safe, but
+            # matches this codebase's existing degraded-mode behavior.
+            for row in _query_filename_owners(filename):
+                owner = row['owner']
+                existing_hash = row['fileHash']
+                if owner and existing_hash and existing_hash != file_hash:
+                    name, ext = os.path.splitext(filename)
+                    for _ in range(5):
+                        candidate = f"{name}-{uuid.uuid4().hex[:8]}{ext}"
+                        if not _query_filename_owners(candidate):
+                            return candidate
+                    return f"{name}-{uuid.uuid4().hex[:8]}{ext}"
+            return filename
+
+        # Cross-tenant check first: this is a read against every OTHER
+        # owner's row for this filename (blob storage names aren't
+        # partitioned per library, so any other owner's differing content is
+        # already a real conflict). Two different users racing on the exact
+        # same filename at the exact same instant is rare enough that this
+        # non-atomic check is an acceptable holdover from the pre-fix
+        # behavior -- the dangerous, common race is same-user concurrent
+        # upload lanes, handled atomically below.
         for row in _query_filename_owners(filename):
             owner = row['owner']
             existing_hash = row['fileHash']
-            if owner and existing_hash and existing_hash != file_hash:
-                # Conflict: pick a unique filename not already owned by anyone.
+            if owner and owner != user_id and existing_hash and existing_hash != file_hash:
                 name, ext = os.path.splitext(filename)
                 for _ in range(5):
                     candidate = f"{name}-{uuid.uuid4().hex[:8]}{ext}"
                     if not _query_filename_owners(candidate):
                         return candidate
                 return f"{name}-{uuid.uuid4().hex[:8]}{ext}"
+
+        if _claim_filename_owner(user_id, filename, file_hash):
+            return filename
+
+        # Same-user conflict: pick a unique filename and atomically claim
+        # that instead.
+        name, ext = os.path.splitext(filename)
+        for _ in range(5):
+            candidate = f"{name}-{uuid.uuid4().hex[:8]}{ext}"
+            if _claim_filename_owner(user_id, candidate, file_hash):
+                return candidate
+        return f"{name}-{uuid.uuid4().hex[:8]}{ext}"
     except Exception:
         # On error, fall back to original filename to avoid blocking uploads.
         return filename
-
-    return filename
 
 
 def _store_hash_index(user_id: str, file_hash: str, filename: str) -> None:
@@ -3230,18 +3316,23 @@ def reset_upload_tracking_and_reserve_blob(
     except Exception:
         entity = {'PartitionKey': user_id, 'RowKey': filename}
 
+    # See reserve_pending_anonymous_blob's docstring: only the transient pending
+    # field is reusable here, and only when its recorded content hash matches
+    # this upload's -- otherwise it belongs to a different, still-in-flight
+    # upload that happens to share this filename, and reusing it would stage
+    # two unrelated files' chunks onto the same blob. Captured before the
+    # mutations below overwrite upload_sha256_expected with the new value.
+    existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
+    existing_hash = str(entity.get('upload_sha256_expected') or '').strip()
+    reuse = bool(existing) and (not expected_hash or not existing_hash or existing_hash == expected_hash)
+
     entity['received_ranges'] = json.dumps([])
     entity['upload_total_size'] = total_size
     entity['upload_started_at'] = datetime.now(timezone.utc).isoformat()
     if expected_hash:
         entity['upload_sha256_expected'] = expected_hash
 
-    # See reserve_pending_anonymous_blob's docstring: only the transient pending
-    # field is reusable here. A stale anonymousImageId from a prior, unrelated,
-    # already-finalized upload of this same filename must never be handed back
-    # as if it were a fresh reservation.
-    existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
-    anonymous_blob_name = existing or _generate_anonymous_id()
+    anonymous_blob_name = existing if reuse else _generate_anonymous_id()
     entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
 
     try:
@@ -3287,19 +3378,28 @@ def reset_upload_tracking_and_reserve_blobs_batch(
     for f in files:
         filename = str(f['filename'])
         entity = existing_by_name.get(filename) or {'PartitionKey': user_id, 'RowKey': filename}
-        if f.get('is_fresh'):
-            entity['received_ranges'] = json.dumps([])
-            entity['upload_total_size'] = f['total_size']
-            entity['upload_started_at'] = datetime.now(timezone.utc).isoformat()
-            if f.get('expected_hash'):
-                entity['upload_sha256_expected'] = f['expected_hash']
+        expected_hash = f.get('expected_hash')
 
         # See reserve_pending_anonymous_blob's docstring: never fall back to a
         # permanent anonymousImageId here -- these are all fresh uploads, and a
         # prior, unrelated, already-finalized photo under this same filename
-        # must not have its blob silently reused/overwritten.
+        # must not have its blob silently reused/overwritten. Same reasoning
+        # extends to a pending (not yet finalized) reservation: only reuse it
+        # if its recorded hash matches this file's, otherwise it belongs to a
+        # different, still-in-flight upload sharing this filename. Captured
+        # before the mutations below overwrite upload_sha256_expected.
         existing_blob = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
-        anonymous_blob_name = existing_blob or _generate_anonymous_id()
+        existing_hash = str(entity.get('upload_sha256_expected') or '').strip()
+        reuse = bool(existing_blob) and (not expected_hash or not existing_hash or existing_hash == expected_hash)
+
+        if f.get('is_fresh'):
+            entity['received_ranges'] = json.dumps([])
+            entity['upload_total_size'] = f['total_size']
+            entity['upload_started_at'] = datetime.now(timezone.utc).isoformat()
+            if expected_hash:
+                entity['upload_sha256_expected'] = expected_hash
+
+        anonymous_blob_name = existing_blob if reuse else _generate_anonymous_id()
         entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
         anonymous_blob_names[filename] = anonymous_blob_name
         operations.append(('upsert', entity))

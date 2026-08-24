@@ -9312,7 +9312,7 @@ def init_upload():
                 pass
         if direct:
             try:
-                anonymous_blob_name = reserve_pending_anonymous_blob(user_id, filename)
+                anonymous_blob_name = reserve_pending_anonymous_blob(user_id, filename, expected_hash or None)
             except Exception:
                 app.logger.debug('Failed to reserve anonymous blob name for %s', filename)
 

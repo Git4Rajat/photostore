@@ -94,3 +94,39 @@ def test_batch_scopes_query_to_requested_filenames_and_partition(batch_ctx):
         {'filename': 'shared.jpg', 'total_size': 50, 'expected_hash': None, 'is_fresh': True},
     ])
     assert result['shared.jpg'] != 'other-library-uuid'
+
+
+def test_batch_does_not_reuse_a_different_in_flight_uploads_reservation(batch_ctx):
+    """A row can already have a pending reservation from a DIFFERENT, still
+    uploading file that happens to share this filename (e.g. two distinct
+    photos both exported as "IP_image.heic" -- one still mid-transfer, not
+    yet finalized). Reusing that reservation would stage this file's chunks
+    onto the other file's blob -- the collision that produces "Uploaded blob
+    size mismatch" at finalize. A mismatched recorded hash must force a
+    fresh blob instead."""
+    batch_ctx.upsert_entity({
+        'PartitionKey': 'lib-A',
+        'RowKey': 'IP_image.heic',
+        'pendingAnonymousBlob': 'other-upload-uuid',
+        'upload_sha256_expected': 'h-first-photo',
+    })
+    result = storage_utils.reset_upload_tracking_and_reserve_blobs_batch('lib-A', [
+        {'filename': 'IP_image.heic', 'total_size': 900, 'expected_hash': 'h-second-photo', 'is_fresh': True},
+    ])
+    assert result['IP_image.heic'] != 'other-upload-uuid'
+
+
+def test_batch_reuses_reservation_for_a_genuine_resume_of_the_same_content(batch_ctx):
+    """Same filename, SAME content hash (a retry/resume of the exact same
+    upload) must still reuse the existing reservation, not be treated as a
+    collision."""
+    batch_ctx.upsert_entity({
+        'PartitionKey': 'lib-A',
+        'RowKey': 'IP_image.heic',
+        'pendingAnonymousBlob': 'existing-uuid',
+        'upload_sha256_expected': 'h-same-photo',
+    })
+    result = storage_utils.reset_upload_tracking_and_reserve_blobs_batch('lib-A', [
+        {'filename': 'IP_image.heic', 'total_size': 900, 'expected_hash': 'h-same-photo', 'is_fresh': True},
+    ])
+    assert result['IP_image.heic'] == 'existing-uuid'

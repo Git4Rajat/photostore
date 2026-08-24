@@ -262,6 +262,26 @@ def test_reserve_pending_anonymous_blob_is_stable_across_calls(finalize_ctx):
     assert metadata.get_entity('lib-A', 'vacation.jpg')['pendingAnonymousBlob'] == first
 
 
+def test_reserve_pending_anonymous_blob_ignores_a_different_in_flight_upload(finalize_ctx):
+    """Two DISTINCT photos can share a filename while one is still mid-upload
+    (e.g. two files both named "IP_image.heic" in one batch). The second
+    file's reservation call must not reuse the first's still-pending blob --
+    doing so would stage both files' chunks onto the same blob (positional
+    block IDs collide) and produce a corrupted blob / "Uploaded blob size
+    mismatch" at finalize."""
+    first = storage_utils.reserve_pending_anonymous_blob('lib-A', 'IP_image.heic', 'h-first-photo')
+    second = storage_utils.reserve_pending_anonymous_blob('lib-A', 'IP_image.heic', 'h-second-photo')
+    assert second != first
+
+
+def test_reserve_pending_anonymous_blob_reuses_for_matching_hash(finalize_ctx):
+    """A genuine resume/retry of the exact same content must still reuse the
+    original reservation."""
+    first = storage_utils.reserve_pending_anonymous_blob('lib-A', 'IP_image.heic', 'h-same-photo')
+    second = storage_utils.reserve_pending_anonymous_blob('lib-A', 'IP_image.heic', 'h-same-photo')
+    assert second == first
+
+
 def test_read_pending_anonymous_blob_is_replica_safe(finalize_ctx):
     """finalize can land on a different replica than init; the reservation must be
     readable from the durable row with no shared in-process state."""
