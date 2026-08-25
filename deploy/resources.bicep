@@ -685,12 +685,13 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             { name: 'APP_ROLE', value: 'ipworker' }
             { name: 'IPWORKER_POLL_SECONDS', value: '2' }
             // How many photos one replica processes concurrently (see
-            // IPWORKER_CONCURRENCY in backend/app.py). Starts at 1 --
-            // today's exact sequential behavior -- and should only be
-            // raised after the benchmarked rollout (CPU/memory headroom
-            // measured via Azure Monitor at each step) confirms a higher
-            // value is safe, not guessed.
-            { name: 'IPWORKER_CONCURRENCY', value: '1' }
+            // IPWORKER_CONCURRENCY in backend/app.py). Raised live to 3
+            // out-of-band at some point (found as bicep/live drift on
+            // 2026-08-25, no matching bicep commit or activity-log entry --
+            // whatis showed this would silently regress back to 1 on the
+            // next deploy). Bicep now matches live; don't lower without
+            // re-benchmarking CPU/memory headroom via Azure Monitor first.
+            { name: 'IPWORKER_CONCURRENCY', value: '3' }
             // receive_messages() with no visibility_timeout defaults to Azure's
             // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
             // + tesseract OCR in sequence) can exceed -- see
@@ -708,6 +709,12 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // Backend/worker keep the 20s default; only ipworker's per-photo
             // cadence outlasts it.
             { name: 'PEOPLE_SCAN_CACHE_TTL_SECONDS', value: '120' }
+            // How often the background orphaned-photo sweep runs per
+            // replica (backend/app.py, _ipwork_sweep_loop). Kept in sync
+            // with the 'ipwork-sweep-wake' cron rule's 20-minute period
+            // above -- a replica only stays up for that rule's 5-minute
+            // window, so this only needs to fire once per wake.
+            { name: 'IPWORK_SWEEP_INTERVAL_SECONDS', value: '1200' }
           ])
         }
       ]
@@ -716,8 +723,10 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
         // 4, not 1: at 1 replica, jobs process strictly one at a time (each
         // runs YOLO + AdaFace + CLIP + OCR in sequence, so a large backlog
         // -- e.g. from a library backfill -- drains for a very long time
-        // with only one replica). KEDA still scales to 0 when the queue is
-        // empty, so this only costs more while there's actually a backlog.
+        // with only one replica). KEDA still scales to 0 between the
+        // queue-length rule below and the cron rule's wake windows, so this
+        // only costs more while there's actually a backlog or during a
+        // brief periodic wake.
         maxReplicas: 4
         rules: [
           {
@@ -743,6 +752,32 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
                 queueLengthStrategy: 'visibleonly'
               }
               identity: 'system'
+            }
+          }
+          {
+            // The queue-length rule above only wakes ipworker when there's
+            // already a message on the queue -- but a photo that never got
+            // enqueued in the first place (uploaded while ipworker was
+            // stopped, or during a 'browser'-only PROCESSING_MODE window)
+            // leaves the queue empty forever, so with only that rule
+            // ipworker would never come up to run its own background
+            // orphaned-photo sweep (_ipwork_sweep_loop in backend/app.py).
+            // This cron rule wakes one replica for a 5-minute window every
+            // 20 minutes purely so that sweep gets a chance to run,
+            // independent of current queue depth; it scales back to 0
+            // afterward same as the queue rule. Keep this in sync with
+            // IPWORK_SWEEP_INTERVAL_SECONDS below (also 20 min) -- a wider
+            // gap here would leave a wake cycle with nothing to do, and a
+            // narrower one would waste replica time re-sweeping mid-cycle.
+            name: 'ipwork-sweep-wake'
+            custom: {
+              type: 'cron'
+              metadata: {
+                timezone: 'Etc/UTC'
+                start: '0,20,40 * * * *'
+                end: '5,25,45 * * * *'
+                desiredReplicas: '1'
+              }
             }
           }
         ]
