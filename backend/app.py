@@ -10095,17 +10095,19 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
 
     Mirrors _browser_processing_pending_item's notion of "not done yet"
     (same terminal-status set, same lease-expiry check, same ai_vision
-    no-data retry case) but adds one more guard that only matters for an
-    *active* re-enqueue (unlike the browser poll, which is read-only): a
-    'queued' step is skipped unless it's been stuck long enough
-    (IPWORK_SWEEP_STALE_QUEUED_SECONDS) that its original queue message
-    was plausibly lost (ipworker was stopped, queue purged, etc.) rather
-    than still legitimately in flight -- otherwise every sweep interval
-    would pile a fresh duplicate message onto a perfectly healthy backlog.
+    no-data retry case, same stale-face-embedding-version retry case) but
+    adds one more guard that only matters for an *active* re-enqueue
+    (unlike the browser poll, which is read-only): a 'queued' step is
+    skipped unless it's been stuck long enough (IPWORK_SWEEP_STALE_QUEUED_SECONDS)
+    that its original queue message was plausibly lost (ipworker was
+    stopped, queue purged, etc.) rather than still legitimately in flight
+    -- otherwise every sweep interval would pile a fresh duplicate message
+    onto a perfectly healthy backlog.
     """
     if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
         return []
     lease_expired = _browser_processing_lease_expired(entity)
+    face_version_stale = _browser_processing_face_version_stale(entity)
     last_update = str(entity.get('last_processing_update') or '').strip()
     stale_enough = True
     if last_update:
@@ -10123,7 +10125,15 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
             and status in {'failed', 'no_data', 'skipped', 'timeout'}
             and _raw_ai_vision_no_data_should_retry(entity)
         )
-        if status in BROWSER_PROCESSING_TERMINAL_STATUSES and not retryable_no_data:
+        # A 'done' face_status doesn't mean this photo is actually done if
+        # its stored embedding predates the current FACE_CLUSTER_EMBEDDING_VERSION
+        # -- _browser_processing_pending_item already re-queues these for the
+        # browser (see _browser_processing_face_version_stale); without this,
+        # an embedding-version bump would only ever get re-embedded by
+        # whichever browser tabs happen to be open, and ipworker's sweep
+        # would silently skip this entire class of "pending" work forever.
+        face_version_retry = step == 'face' and face_version_stale
+        if status in BROWSER_PROCESSING_TERMINAL_STATUSES and not retryable_no_data and not face_version_retry:
             continue
         if status == 'running' and not lease_expired:
             continue

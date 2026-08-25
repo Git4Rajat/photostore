@@ -13,6 +13,7 @@ have a message legitimately in flight.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -81,6 +82,46 @@ class TestEligibleSteps:
         monkeypatch.setattr(app, '_raw_ai_vision_no_data_should_retry', lambda entity: False)
         entity = _entity(ai_vision_status='no_data')
         assert 'ai_vision' not in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_stale_face_embedding_version_is_eligible_despite_done_status(self, monkeypatch):
+        """Regression test: a 'done' face_status doesn't mean this photo is
+        actually finished if the stored embedding predates the current
+        FACE_CLUSTER_EMBEDDING_VERSION -- _browser_processing_pending_item
+        already re-queues these for the browser (see
+        _browser_processing_face_version_stale). Before this fix, the sweep
+        treated 'done' as terminal unconditionally and silently skipped this
+        entire class of pending work forever, since it never checked the
+        embedding version at all."""
+        monkeypatch.setattr(app, 'FACE_CLUSTER_EMBEDDING_VERSION', 'current-version')
+        entity = _entity(
+            face_status='done',
+            processing_metadata=json.dumps({
+                'client_face': {'hasData': True, 'modelTaxonomyVersion': 'old-version'},
+            }),
+        )
+        assert 'face' in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_current_face_embedding_version_is_left_done(self, monkeypatch):
+        monkeypatch.setattr(app, 'FACE_CLUSTER_EMBEDDING_VERSION', 'current-version')
+        entity = _entity(
+            face_status='done',
+            processing_metadata=json.dumps({
+                'client_face': {'hasData': True, 'modelTaxonomyVersion': 'current-version'},
+            }),
+        )
+        assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_stale_version_with_no_face_data_is_left_done(self, monkeypatch):
+        """A 'no_data' result (no faces detected) has nothing to re-embed,
+        so a version mismatch shouldn't force it back into the queue."""
+        monkeypatch.setattr(app, 'FACE_CLUSTER_EMBEDDING_VERSION', 'current-version')
+        entity = _entity(
+            face_status='no_data',
+            processing_metadata=json.dumps({
+                'client_face': {'hasData': False, 'modelTaxonomyVersion': 'old-version'},
+            }),
+        )
+        assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
 
 
 class TestSweepLoop:
