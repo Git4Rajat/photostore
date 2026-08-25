@@ -48,6 +48,7 @@ export interface PersistedUploadFile {
     skippedDuplicate: boolean;
     status: PersistedUploadFileStatus;
     uploadId?: string;
+    blobName?: string;
     blockIds?: string[];
     chunkSizeBytes?: number;
     error?: string;

@@ -2202,8 +2202,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             startByte?: number;
             existingUploadId?: string;
             existingBlockIds?: string[];
+            existingBlobName?: string;
             onChunkCommitted?: (bytesReceived: number) => void;
-            onUploadInitialized?: (uploadId: string) => void;
+            onUploadInitialized?: (uploadId: string, blobName: string) => void;
             onBlockCommitted?: (blockIds: string[], chunkSizeBytes: number) => void;
             onFinalizeStarted?: () => void;
             signal?: AbortSignal;
@@ -2246,8 +2247,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     uploadId: options.existingUploadId,
                 }, options?.signal)
                 : await requestBatchedInit(file.name, file.size, sha256);
+            const blobName = typeof initResponse?.blobName === 'string' ? initResponse.blobName : '';
             if (typeof initResponse?.uploadId === 'string' && initResponse.uploadId) {
-                options?.onUploadInitialized?.(initResponse.uploadId);
+                options?.onUploadInitialized?.(initResponse.uploadId, blobName);
             }
             if (typeof initResponse?.blobUrl !== 'string' || !initResponse.blobUrl) {
                 throw new Error('Blob upload URL was not returned by the backend.');
@@ -2279,7 +2281,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // aligned by block index — instead of compacting with filter(Boolean) —
             // is what lets out-of-order parallel staging persist a correct resume
             // checkpoint and commit the blocks in the right order.
-            const priorBlockIds = options?.existingBlockIds || [];
+            //
+            // Only trust locally-cached block IDs from a prior run if this init
+            // handed back the SAME blob they were staged against. A resumed
+            // /upload/init can legitimately return a DIFFERENT blob than last
+            // time -- e.g. reserve_pending_anonymous_blob's content-hash check
+            // (see backend/storage_utils.py) decides the filename's pending
+            // reservation actually belongs to a different upload and mints a
+            // fresh one. Blindly replaying old block IDs against a blob they
+            // were never staged on is exactly what produces Azure's
+            // "InvalidBlockList" error at commit time -- and since it never
+            // gets recorded here as a match, this run correctly restages
+            // everything from scratch instead of repeating the failure.
+            const priorBlockIds = (options?.existingBlobName && options.existingBlobName === blobName)
+                ? (options?.existingBlockIds || [])
+                : [];
             const blockIds: string[] = allBlocks.map(({ blockIndex }) => priorBlockIds[blockIndex] || '');
 
             // Resume: skip blocks already staged in a previous run and seed progress
@@ -2638,8 +2654,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 startByte: fileMeta.uploadedBytes,
                                 existingUploadId: fileMeta.uploadId,
                                 existingBlockIds: fileMeta.blockIds,
-                                onUploadInitialized: (uploadId) => {
-                                    updatePersistedFile(fileMeta.key, { uploadId });
+                                existingBlobName: fileMeta.blobName,
+                                onUploadInitialized: (uploadId, blobName) => {
+                                    updatePersistedFile(fileMeta.key, { uploadId, blobName });
                                 },
                                 onChunkCommitted: (bytesReceived) => {
                                     const previousBytes = lastCommittedBytesByFile.get(fileMeta.key) || 0;
