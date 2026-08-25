@@ -10086,6 +10086,115 @@ def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
     }
 
 
+IPWORK_SWEEP_INTERVAL_SECONDS = int(os.getenv('IPWORK_SWEEP_INTERVAL_SECONDS', '1200'))
+IPWORK_SWEEP_STALE_QUEUED_SECONDS = int(os.getenv('IPWORK_SWEEP_STALE_QUEUED_SECONDS', '1800'))
+
+
+def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
+    """Which IPWORK_STEPS on this photo are safe to hand ipworker right now.
+
+    Mirrors _browser_processing_pending_item's notion of "not done yet"
+    (same terminal-status set, same lease-expiry check, same ai_vision
+    no-data retry case) but adds one more guard that only matters for an
+    *active* re-enqueue (unlike the browser poll, which is read-only): a
+    'queued' step is skipped unless it's been stuck long enough
+    (IPWORK_SWEEP_STALE_QUEUED_SECONDS) that its original queue message
+    was plausibly lost (ipworker was stopped, queue purged, etc.) rather
+    than still legitimately in flight -- otherwise every sweep interval
+    would pile a fresh duplicate message onto a perfectly healthy backlog.
+    """
+    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+        return []
+    lease_expired = _browser_processing_lease_expired(entity)
+    last_update = str(entity.get('last_processing_update') or '').strip()
+    stale_enough = True
+    if last_update:
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(last_update.replace('Z', '+00:00'))).total_seconds()
+            stale_enough = age >= IPWORK_SWEEP_STALE_QUEUED_SECONDS
+        except Exception:
+            stale_enough = True
+
+    eligible = []
+    for step in IPWORK_STEPS:
+        status = str(entity.get(f'{step}_status') or '').strip().lower()
+        retryable_no_data = (
+            step == 'ai_vision'
+            and status in {'failed', 'no_data', 'skipped', 'timeout'}
+            and _raw_ai_vision_no_data_should_retry(entity)
+        )
+        if status in BROWSER_PROCESSING_TERMINAL_STATUSES and not retryable_no_data:
+            continue
+        if status == 'running' and not lease_expired:
+            continue
+        if status == 'queued' and not stale_enough:
+            continue
+        eligible.append(step)
+    return eligible
+
+
+def _sweep_stale_processing_into_ipwork() -> Dict[str, int]:
+    """Self-heal orphaned photos: ones with no ipwork queue message ever
+    sent (or one that's long gone) sitting stuck pending/stale-queued/
+    stale-running across EVERY library, not just whichever one library a
+    currently-open browser tab happens to have active.
+
+    Without this, a photo that misses the one-time upload-time race (e.g.
+    uploaded while ipworker was admin-stopped, or PROCESSING_MODE was
+    briefly 'browser') stays invisible to both consumers forever: ipworker
+    only ever sees what's explicitly queued to it, and the browser's own
+    /upload/processing/pending poll is scoped to one library per open tab.
+    """
+    stats = {'libraries': 0, 'photosQueued': 0, 'stepsQueued': 0}
+    if library_store is None or metadata_table_client is None:
+        return stats
+    try:
+        library_ids = library_store.list_all_library_ids()
+    except Exception:
+        worker_logger.exception('ipwork sweep: failed to list libraries')
+        return stats
+
+    for library_id in library_ids:
+        stats['libraries'] += 1
+        try:
+            rows = _query_metadata_rows_for_user(library_id, select=BROWSER_PROCESSING_PENDING_SELECT, purpose='ipwork_sweep')
+        except Exception:
+            worker_logger.warning('ipwork sweep: metadata scan failed for library %s', library_id, exc_info=True)
+            continue
+        for row in rows:
+            filename = str(row.get('RowKey') or '').strip()
+            if not filename or is_video_file(filename):
+                continue
+            steps = _ipwork_sweep_eligible_steps(row)
+            if not steps:
+                continue
+            try:
+                _queue_ipwork_processing(library_id, filename, steps=steps)
+                stats['photosQueued'] += 1
+                stats['stepsQueued'] += len(steps)
+            except Exception:
+                worker_logger.exception('ipwork sweep: failed to enqueue %s/%s', library_id, filename)
+    return stats
+
+
+def _ipwork_sweep_loop() -> None:
+    """Runs for the lifetime of the ipworker process on its own daemon
+    thread, independent of the queue-polling loop in run_ipworker, so a
+    slow/large sweep never delays picking up fresh queue messages."""
+    time.sleep(min(60, IPWORK_SWEEP_INTERVAL_SECONDS))
+    while True:
+        try:
+            stats = _sweep_stale_processing_into_ipwork()
+            if stats['photosQueued']:
+                worker_logger.info(
+                    'ipwork sweep: released %d stale photo(s), %d step(s), across %d librar(y/ies)',
+                    stats['photosQueued'], stats['stepsQueued'], stats['libraries'],
+                )
+        except Exception:
+            worker_logger.exception('ipwork sweep iteration failed')
+        time.sleep(IPWORK_SWEEP_INTERVAL_SECONDS)
+
+
 @app.route('/upload/processing/pending', methods=['GET'])
 @app.route('/upload/processing/pending/', methods=['GET'])
 @app.route('/api/upload/processing/pending', methods=['GET'])
@@ -12787,6 +12896,7 @@ def run_ipworker() -> None:
         poll_seconds,
         IPWORKER_CONCURRENCY,
     )
+    threading.Thread(target=_ipwork_sweep_loop, name='ipwork-sweep', daemon=True).start()
 
     with ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork') as executor:
         in_flight = {}  # future -> message

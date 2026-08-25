@@ -385,6 +385,17 @@ class LibraryStore:
             return None
         return self._get(self.libraries, _LIBRARY_PK, str(library_id))
 
+    def list_all_library_ids(self) -> List[str]:
+        """Every library RowKey in the system. Single-partition scan
+        (all libraries share PartitionKey=``library``) -- cheap even at
+        scale. For background jobs that must sweep every library, not just
+        one caller's own (see the ipwork stale-processing sweep)."""
+        try:
+            rows = self.libraries.query_entities(f"PartitionKey eq '{_LIBRARY_PK}'", select=['RowKey'])
+            return [str(row.get('RowKey') or '').strip() for row in rows if row.get('RowKey')]
+        except Exception:
+            return []
+
     def create_library(self, library_id: str, *, name: str, owner_user_id: str) -> Dict:
         entity = {
             'PartitionKey': _LIBRARY_PK,

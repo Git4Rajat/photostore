@@ -77,6 +77,11 @@ def _run_until_idle(monkeypatch, queue_client) -> None:
     # geocoder loading so the suite doesn't pay for it (or depend on those
     # weights/packages being present) on every run_ipworker() call.
     monkeypatch.setattr(app, '_prewarm_ipwork_models', lambda: None)
+    # run_ipworker also starts a daemon sweep thread; leaving the real one
+    # running would call the same monkeypatched time.sleep from a second
+    # thread and raise _StopLoop there instead of on the main thread this
+    # test actually watches via pytest.raises.
+    monkeypatch.setattr(app, '_ipwork_sweep_loop', lambda: None)
 
     def _stop_when_idle(_seconds):
         raise _StopLoop()
