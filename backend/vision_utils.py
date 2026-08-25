@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import threading
 import unicodedata
 from typing import List
 
@@ -20,6 +21,13 @@ _TOKENIZER = None
 _PREPROCESS = None
 _MODEL_NAME = ''
 _MODEL_PRETRAINED = ''
+
+# PyTorch's plain nn.Module.forward() is not documented safe for concurrent
+# calls from multiple threads on one shared module instance (unlike
+# onnxruntime's InferenceSession.Run(), which is explicitly documented
+# reentrant) -- serialize just the forward() calls below so concurrent
+# ipworker threads can't corrupt each other's inference.
+_MODEL_LOCK = threading.Lock()
 
 _FALLBACK_EMBEDDING_DIMS = max(256, int(os.getenv('TEXT_EMBEDDING_FALLBACK_DIMS', '1024')))
 if _FALLBACK_EMBEDDING_DIMS % 2:
@@ -121,7 +129,8 @@ def encode_text_embedding(text: str) -> List[float]:
     try:
         tokens = _TOKENIZER([text]).to(_device())
         with torch.no_grad():
-            text_features = _MODEL.encode_text(tokens)
+            with _MODEL_LOCK:
+                text_features = _MODEL.encode_text(tokens)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features.squeeze(0).cpu().tolist()
     except Exception:
@@ -151,7 +160,8 @@ def encode_image_embedding(image_bytes: bytes) -> List[float]:
             image = ImageOps.exif_transpose(image)
             pixel_values = _PREPROCESS(image.convert('RGB')).unsqueeze(0).to(_device())
         with torch.no_grad():
-            image_features = _MODEL.encode_image(pixel_values)
+            with _MODEL_LOCK:
+                image_features = _MODEL.encode_image(pixel_values)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         return image_features.squeeze(0).cpu().tolist()
     except Exception:
@@ -168,7 +178,8 @@ def encode_text_embeddings_batch(texts: List[str]) -> List[List[float]]:
     try:
         tokens = _TOKENIZER(list(texts)).to(_device())
         with torch.no_grad():
-            text_features = _MODEL.encode_text(tokens)
+            with _MODEL_LOCK:
+                text_features = _MODEL.encode_text(tokens)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features.cpu().tolist()
     except Exception:

@@ -12,13 +12,19 @@ import zipfile
 import time
 import logging
 import threading
+try:
+    import resource  # POSIX-only; ipworker always runs in a Linux container
+except ImportError:
+    resource = None
 import unicodedata
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
 
-from azure.core.exceptions import AzureError, ResourceExistsError
+from azure.core import MatchConditions
+from azure.core.exceptions import AzureError, ResourceExistsError, ResourceModifiedError
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobSasPermissions, BlobServiceClient, UserDelegationKey, generate_blob_sas
@@ -423,6 +429,16 @@ IPWORK_LEASE_RETRY_LIMIT = int(os.getenv('IPWORK_LEASE_RETRY_LIMIT', '3'))
 # Matches IPWORKER_LEASE_SECONDS, the same "how long is one photo allowed to
 # take" budget already used for the app-level lease.
 IPWORKER_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('IPWORKER_VISIBILITY_TIMEOUT_SECONDS', '300'))
+# Bounded worker-thread pool inside a single ipworker replica -- lets one
+# replica process several photos' synchronous I/O (blob download/upload,
+# table reads/writes, the geocode HTTP call) concurrently instead of one
+# photo at a time, without raising replica count or size. Defaults to 1
+# (today's exact sequential behavior); raise only after benchmarking --
+# see the ipworker intra-replica concurrency plan for the gated rollout
+# (Azure Monitor showed real CPU headroom, ~45% avg per replica, but
+# memory was already the tighter constraint at ~66-77% peak at
+# concurrency=1, so this isn't guessed higher without measurement).
+IPWORKER_CONCURRENCY = max(1, int(os.getenv('IPWORKER_CONCURRENCY', '1')))
 LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS = max(60, int(os.getenv('LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS', '14400')))
 CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS = max(0, int(os.getenv('CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS', '750')))
 CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS = max(30, int(os.getenv('CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS', '120')))
@@ -3190,19 +3206,52 @@ def _person_entity_is_named(person: Dict) -> bool:
     return bool(name) and not _is_unnamed_name(name)
 
 
-def _update_person_entity(user_id: str, person_id: str, updates: Dict) -> bool:
+def _update_person_entity_with_retry(
+    user_id: str,
+    person_id: str,
+    mutate_fn: Callable[[Dict], Optional[Dict]],
+    *,
+    max_attempts: int = 5,
+) -> Optional[Dict]:
+    """Read-modify-write a person entity using ETag optimistic concurrency.
+
+    Person entities are read-modify-written from several places
+    (_add_face_to_person, _remove_face_from_other_people, _update_person_entity)
+    and, unlike the per-(user_id, filename) metadata entity, are keyed only
+    by (user_id, person_id) -- coarser-grained, since one person aggregates
+    faces from many photos. Concurrent ipworker threads/replicas processing
+    two different photos for the same user can genuinely both match the
+    same existing person, so an unconditional upsert_entity here silently
+    drops whichever thread's write lost the race. mutate_fn(person_dict) ->
+    mutated dict, or None to skip the write entirely (e.g. the mutation
+    turned out to be a no-op).
+    """
     if person_table_client is None:
-        return False
-    try:
-        entity = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
-    except Exception:
-        return False
-    entity.update(updates)
-    try:
-        person_table_client.upsert_entity(entity)
-        return True
-    except Exception:
-        return False
+        return None
+    for _ in range(max_attempts):
+        try:
+            person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+        except Exception:
+            return None
+        mutated = mutate_fn(dict(person))
+        if mutated is None:
+            return None
+        try:
+            person_table_client.update_entity(
+                mutated, etag=person.metadata['etag'], match_condition=MatchConditions.IfNotModified,
+            )
+            return mutated
+        except ResourceModifiedError:
+            continue  # someone else wrote first -- re-read and retry
+        except Exception:
+            return None
+    worker_logger.warning('person entity update retries exhausted for %s/%s', user_id, person_id)
+    return None
+
+
+def _update_person_entity(user_id: str, person_id: str, updates: Dict) -> bool:
+    result = _update_person_entity_with_retry(user_id, person_id, lambda person: {**person, **updates})
+    return result is not None
 
 
 def _batch_upsert_entities(table_client, entities: List[Dict], *, chunk_size: int = 100) -> None:
@@ -3296,6 +3345,51 @@ def _remove_face_from_person(user_id: str, person_id: str, face_id: str) -> None
         pass
 
 
+def _remove_face_from_person_with_retry(
+    user_id: str, person_id: str, face_id: str, *, max_attempts: int = 5,
+) -> Optional[str]:
+    """Removes face_id from one person's faceIds, re-reading fresh state on
+    every attempt -- an etag conflict means another thread/replica just
+    changed this same person, so which branch (update / keep-empty-named /
+    delete) applies may have changed too, not just the faceIds list.
+    Returns 'updated', 'kept_empty', 'deleted', or None if nothing needed
+    to change (face_id was already gone by the time this ran)."""
+    if person_table_client is None:
+        return None
+    for _ in range(max_attempts):
+        try:
+            person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+        except Exception:
+            return None
+        try:
+            face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+        except Exception:
+            face_ids = []
+        if face_id not in face_ids:
+            return None
+        next_face_ids = [fid for fid in face_ids if fid != face_id]
+        etag = person.metadata['etag']
+        try:
+            if next_face_ids:
+                person['faceIds'] = json.dumps(next_face_ids)
+                person_table_client.update_entity(person, etag=etag, match_condition=MatchConditions.IfNotModified)
+                return 'updated'
+            if _person_entity_is_named(person):
+                # Preserve a user-named cluster that loses its last face to this
+                # reassignment; keep it empty rather than silently deleting it.
+                person['faceIds'] = json.dumps([])
+                person_table_client.update_entity(person, etag=etag, match_condition=MatchConditions.IfNotModified)
+                return 'kept_empty'
+            person_table_client.delete_entity(partition_key=user_id, row_key=person_id, etag=etag, match_condition=MatchConditions.IfNotModified)
+            return 'deleted'
+        except ResourceModifiedError:
+            continue  # someone else wrote first -- re-read and retry
+        except Exception:
+            return None
+    worker_logger.warning('person face-removal retries exhausted for %s/%s', user_id, person_id)
+    return None
+
+
 def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: str) -> Dict:
     if person_table_client is None or not face_id:
         return {'removed': 0, 'deletedPeople': 0, 'touchedPeople': []}
@@ -3307,34 +3401,29 @@ def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: s
     removed = 0
     deleted_people = 0
     touched_people = []
-    for person in rows:
-        person_id = str(person.get('RowKey') or '')
+    for row in rows:
+        person_id = str(row.get('RowKey') or '')
         if not person_id or person_id == keep_person_id:
             continue
         try:
-            face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+            face_ids = json.loads(row.get('faceIds', '[]') or '[]')
         except Exception:
             face_ids = []
         if face_id not in face_ids:
             continue
-        next_face_ids = [fid for fid in face_ids if fid != face_id]
-        removed += len(face_ids) - len(next_face_ids)
+        # row is a possibly-stale snapshot from the query above -- the retry
+        # helper re-reads fresh state (and re-checks face_id is still
+        # present) before writing, so a race with another thread/replica
+        # touching this same person is handled there, not here.
+        outcome = _remove_face_from_person_with_retry(user_id, person_id, face_id)
+        if outcome is None:
+            continue
+        removed += 1
         touched_people.append(person_id)
-        try:
-            if next_face_ids:
-                person['faceIds'] = json.dumps(next_face_ids)
-                person_table_client.upsert_entity(person)
-                _update_person_rep_embedding(user_id, person_id)
-            elif _person_entity_is_named(person):
-                # Preserve a user-named cluster that loses its last face to this
-                # reassignment; keep it empty rather than silently deleting it.
-                person['faceIds'] = json.dumps([])
-                person_table_client.upsert_entity(person)
-            else:
-                person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
-                deleted_people += 1
-        except Exception:
-            pass
+        if outcome == 'deleted':
+            deleted_people += 1
+        elif outcome == 'updated':
+            _update_person_rep_embedding(user_id, person_id)
     return {'removed': removed, 'deletedPeople': deleted_people, 'touchedPeople': touched_people}
 
 
@@ -3349,23 +3438,21 @@ def _add_face_to_person(user_id: str, person_id: str, face_id: str) -> None:
         except Exception:
             pass
     _remove_face_from_other_people(user_id, face_id, person_id)
-    try:
-        person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
-    except Exception:
-        return
-    try:
-        face_ids = json.loads(person.get('faceIds', '[]') or '[]')
-    except Exception:
-        face_ids = []
-    next_face_ids = _dedupe_face_ids_preserving_order([*face_ids, face_id])
-    if next_face_ids == face_ids:
-        return
-    person['faceIds'] = json.dumps(next_face_ids)
-    try:
-        person_table_client.upsert_entity(person)
+
+    def _mutate(person: Dict) -> Optional[Dict]:
+        try:
+            face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+        except Exception:
+            face_ids = []
+        next_face_ids = _dedupe_face_ids_preserving_order([*face_ids, face_id])
+        if next_face_ids == face_ids:
+            return None
+        person['faceIds'] = json.dumps(next_face_ids)
+        return person
+
+    result = _update_person_entity_with_retry(user_id, person_id, _mutate)
+    if result is not None:
         _update_person_rep_embedding(user_id, person_id)
-    except Exception:
-        pass
 
 
 def _remove_faces_for_filename(user_id: str, filename: str) -> None:
@@ -12593,6 +12680,87 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     return 'done'
 
 
+def _prewarm_ipwork_models() -> None:
+    """Synchronously triggers every lazily-created ipwork singleton once,
+    before the worker pool starts, so the unlocked check-then-set race in
+    each module's lazy getter is never hit concurrently once
+    IPWORKER_CONCURRENCY > 1 threads start running steps. Also removes
+    first-message cold-start latency. Best-effort and per-module isolated,
+    matching _register_ipwork_processors' pattern -- one model failing to
+    load here shouldn't block the others; the existing per-step
+    'not_implemented'/error-shape fallback already handles a model being
+    unavailable at request time."""
+    try:
+        import ipwork_face
+        ipwork_face._get_yolo_session()
+        ipwork_face._get_adaface_session()
+        ipwork_face._get_face_landmarker()
+    except Exception:
+        worker_logger.exception('ipwork_face model pre-warm failed')
+    try:
+        import vision_utils
+        vision_utils._load_model()
+    except Exception:
+        worker_logger.exception('vision_utils CLIP model pre-warm failed')
+    try:
+        import ipwork_vision
+        ipwork_vision._load_vocabulary()
+    except Exception:
+        worker_logger.exception('ipwork_vision vocabulary pre-warm failed')
+    try:
+        import maps_utils
+        maps_utils._get_geocoder()
+    except Exception:
+        worker_logger.exception('maps_utils geocoder pre-warm failed')
+
+
+def _process_ipwork_message(message) -> str:
+    """Runs on a worker thread. Parses one queue message and dispatches it
+    through _handle_ipwork_queue_payload, returning the outcome string
+    ('done'/'noop'/'lease_busy'). Never raises -- any exception here is
+    caught and reported via _upsert_job_status, the same as the old
+    single-message loop body did inline, so a bug in one worker thread
+    can't escape into the main thread's future.result() call."""
+    payload = {}
+    job_id = ''
+    user_id = ''
+    outcome = 'done'
+    try:
+        payload = json.loads(message.content or '{}')
+        if isinstance(payload, dict):
+            job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
+            user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+            outcome = _handle_ipwork_queue_payload(payload, job_id, user_id)
+    except Exception as exc:
+        if job_id and user_id:
+            try:
+                _upsert_job_status(job_id, user_id, 'ipwork', 'failed', error=str(exc))
+            except Exception:
+                pass
+        worker_logger.exception('Failed to process ipwork queue message')
+        outcome = 'done'  # a real processing error, not a race -- don't retry-loop it
+    return outcome
+
+
+def _log_ipwork_memory_sample(in_flight_after: int) -> None:
+    """Logs (peak RSS so far, remaining in-flight count) right after a
+    photo finishes, so IPWORKER_CONCURRENCY benchmark runs can correlate
+    memory against how many photos were genuinely concurrent -- Azure
+    Monitor's WorkingSetBytes is container-aggregate only and can't show
+    whether N concurrent photos need ~N x one photo's memory or worse.
+    True per-thread RSS isn't a meaningful OS concept (threads share one
+    process address space), so this is a process-wide sample, not a
+    per-worker one -- correlate the *sequence* of samples against
+    IPWORKER_CONCURRENCY across benchmark runs instead."""
+    if resource is None:
+        return
+    try:
+        peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return
+    worker_logger.info('ipwork memory sample: peak_rss_mb=%.1f in_flight=%s', peak_rss_mb, in_flight_after)
+
+
 def run_ipworker() -> None:
     """Poll the ipwork queue for jobs in a standalone container."""
     logging.basicConfig(
@@ -12600,6 +12768,7 @@ def run_ipworker() -> None:
         format='%(asctime)s %(levelname)s %(name)s %(message)s',
     )
     _register_ipwork_processors()
+    _prewarm_ipwork_models()
     poll_seconds = float(os.getenv('IPWORKER_POLL_SECONDS', '2'))
     queue_service_client_local = queue_service_client
     if queue_service_client_local is None:
@@ -12613,56 +12782,67 @@ def run_ipworker() -> None:
     except Exception:
         pass
     worker_logger.info(
-        'ipworker polling queue %s every %ss',
+        'ipworker polling queue %s every %ss at concurrency=%s',
         IPWORKER_QUEUE_NAME,
         poll_seconds,
+        IPWORKER_CONCURRENCY,
     )
-    while True:
-        processed_any = False
-        try:
-            messages = list(queue_client.receive_messages(
-                messages_per_page=1,
-                max_messages=1,
-                visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
-            ))
-            for message in messages:
-                processed_any = True
-                payload = {}
-                job_id = ''
-                user_id = ''
-                outcome = 'done'
-                try:
-                    payload = json.loads(message.content or '{}')
-                    if isinstance(payload, dict):
-                        job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
-                        user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
-                        outcome = _handle_ipwork_queue_payload(payload, job_id, user_id)
-                except Exception as exc:
-                    if job_id and user_id:
-                        try:
-                            _upsert_job_status(job_id, user_id, 'ipwork', 'failed', error=str(exc))
-                        except Exception:
-                            pass
-                    worker_logger.exception('Failed to process ipwork queue message')
-                    outcome = 'done'  # a real processing error, not a race -- don't retry-loop it
-                # A message that lost the lease race ('lease_busy') is left
-                # undeleted so Azure's own visibility timeout redelivers it --
-                # by the next attempt, whoever held the lease (typically a
-                # browser tab) has either finished or, if its tab closed
-                # mid-processing, its lease has expired and ipworker claims it
-                # instead. Bounded by dequeue_count so a lease that's stuck for
-                # some other reason doesn't retry forever.
-                if outcome == 'lease_busy' and int(getattr(message, 'dequeue_count', 0) or 0) < IPWORK_LEASE_RETRY_LIMIT:
+
+    with ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork') as executor:
+        in_flight = {}  # future -> message
+        while True:
+            try:
+                # Only fetch as many new messages as there are free worker
+                # slots -- keeps the pool saturated by refilling one slot at
+                # a time as futures complete, instead of batch-waiting for a
+                # full round of IPWORKER_CONCURRENCY messages to finish
+                # before fetching more. Azure Queue's GET Messages caps a
+                # single call at 32 regardless of IPWORKER_CONCURRENCY.
+                free_slots = min(IPWORKER_CONCURRENCY - len(in_flight), 32)
+                if free_slots > 0:
+                    messages = list(queue_client.receive_messages(
+                        messages_per_page=free_slots,
+                        max_messages=free_slots,
+                        visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
+                    ))
+                    for message in messages:
+                        future = executor.submit(_process_ipwork_message, message)
+                        in_flight[future] = message
+
+                if not in_flight:
+                    time.sleep(poll_seconds)
                     continue
-                try:
-                    queue_client.delete_message(message)
-                except Exception:
-                    worker_logger.exception('Failed to delete ipwork queue message')
-            if not processed_any:
+
+                # Block for up to poll_seconds waiting for at least one
+                # in-flight future to finish (returns early as soon as one
+                # does); on timeout, loop back around to check for more
+                # free-slot capacity / new messages.
+                done, _pending = wait(list(in_flight.keys()), timeout=poll_seconds, return_when=FIRST_COMPLETED)
+                for future in done:
+                    message = in_flight.pop(future)
+                    try:
+                        outcome = future.result()
+                    except Exception:
+                        # Defensive backstop only -- _process_ipwork_message
+                        # already catches everything it can attribute to a
+                        # job_id internally.
+                        worker_logger.exception('ipwork worker task raised unexpectedly')
+                        outcome = 'done'
+                    _log_ipwork_memory_sample(len(in_flight))
+                    # Same lease_busy-vs-delete logic as before, just per
+                    # completed future instead of per loop iteration; the
+                    # actual delete_message call stays on the main thread
+                    # (as does receive_messages above) so there's no
+                    # question about QueueClient thread-safety for either.
+                    if outcome == 'lease_busy' and int(getattr(message, 'dequeue_count', 0) or 0) < IPWORK_LEASE_RETRY_LIMIT:
+                        continue
+                    try:
+                        queue_client.delete_message(message)
+                    except Exception:
+                        worker_logger.exception('Failed to delete ipwork queue message')
+            except Exception:
+                worker_logger.exception('ipwork queue polling iteration failed')
                 time.sleep(poll_seconds)
-        except Exception:
-            worker_logger.exception('ipwork queue polling iteration failed')
-            time.sleep(poll_seconds)
 
 
 @app.route('/upload/processing/status', methods=['GET'])

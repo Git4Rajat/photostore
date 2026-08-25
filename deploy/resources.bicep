@@ -684,6 +684,13 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'ipworker' }
             { name: 'IPWORKER_POLL_SECONDS', value: '2' }
+            // How many photos one replica processes concurrently (see
+            // IPWORKER_CONCURRENCY in backend/app.py). Starts at 1 --
+            // today's exact sequential behavior -- and should only be
+            // raised after the benchmarked rollout (CPU/memory headroom
+            // measured via Azure Monitor at each step) confirms a higher
+            // value is safe, not guessed.
+            { name: 'IPWORKER_CONCURRENCY', value: '1' }
             // receive_messages() with no visibility_timeout defaults to Azure's
             // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
             // + tesseract OCR in sequence) can exceed -- see

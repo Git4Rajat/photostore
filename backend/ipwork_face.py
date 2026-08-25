@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -112,6 +113,12 @@ FACE_EMBEDDING_RUNTIME = 'onnxruntime+mediapipe'
 _yolo_session: Optional[ort.InferenceSession] = None
 _adaface_session: Optional[ort.InferenceSession] = None
 _face_mesh = None
+# MediaPipe's Tasks API is not documented thread-safe for concurrent
+# .detect() calls on one shared FaceLandmarker instance -- unlike ONNX
+# Runtime's Run(), this is a real correctness risk (crossed-up/corrupted
+# landmark results across threads, not just a crash), so serialize just
+# the detect() call below.
+_FACE_LANDMARKER_LOCK = threading.Lock()
 
 
 def _get_yolo_session() -> ort.InferenceSession:
@@ -266,7 +273,8 @@ def detect_five_landmarks(image_bgr: np.ndarray, bbox: dict) -> Optional[np.ndar
     landmarker = _get_face_landmarker()
     rgb_crop = np.ascontiguousarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_crop)
-    result = landmarker.detect(mp_image)
+    with _FACE_LANDMARKER_LOCK:
+        result = landmarker.detect(mp_image)
     if not result.face_landmarks:
         return None
     landmarks = result.face_landmarks[0]
