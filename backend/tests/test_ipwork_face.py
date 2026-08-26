@@ -161,6 +161,35 @@ def test_process_face_decodes_raw_extension_via_extracted_preview(monkeypatch):
     assert 'detection_failed' in result['error']
 
 
+# --- top-level model provenance on success/no-detections -------------------
+#
+# storage_utils._client_model_provenance only reads model/modelVersion/
+# modelTaxonomyVersion/runtime from the TOP LEVEL of a step's result, not
+# from inside individual face entries -- that's what gets copied into
+# processing_metadata's client_face.modelTaxonomyVersion summary, which
+# _browser_processing_face_version_stale (app.py) reads to decide whether a
+# photo needs re-embedding. Before this fix, process_face's return value only
+# carried modelTaxonomyVersion per-face, so client_face.modelTaxonomyVersion
+# was always left blank for ipworker-processed photos -- permanently "stale"
+# even immediately after a successful re-embed, causing ipworker to re-detect
+# the same photos on every sweep cycle forever.
+
+def test_process_face_no_detections_still_reports_top_level_model_version(monkeypatch):
+    monkeypatch.setattr(face_mod, 'detect_faces', lambda image_bgr: [])
+
+    from PIL import Image
+    import io
+    buffer = io.BytesIO()
+    Image.new('RGB', (64, 64), color=(10, 20, 30)).save(buffer, format='JPEG')
+
+    result = face_mod.process_face('lib-A', 'photo.jpg', buffer.getvalue())
+
+    assert result['hasData'] is False
+    assert result['faces'] == []
+    assert result['modelTaxonomyVersion'] == face_mod.FACE_EMBEDDING_MODEL_TAXONOMY_VERSION
+    assert result['runtime'] == face_mod.FACE_EMBEDDING_RUNTIME
+
+
 def test_process_face_returns_diagnosable_shape_on_detection_failure(tmp_path, monkeypatch):
     # A real decodable image, but no ONNX model file exists at the configured
     # path in this test environment -- _get_yolo_session's InferenceSession

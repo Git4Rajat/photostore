@@ -10030,7 +10030,12 @@ def _browser_processing_face_version_stale(entity: Dict) -> bool:
     if not client_face.get('hasData'):
         return False
     stored_version = str(client_face.get('modelTaxonomyVersion') or '').strip()
-    return stored_version != FACE_CLUSTER_EMBEDDING_VERSION
+    # Browser and ipworker tag faces with their own distinct version strings
+    # for the same underlying AdaFace model (see IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION's
+    # definition) -- comparing only against FACE_CLUSTER_EMBEDDING_VERSION would
+    # mark every ipworker-processed face permanently stale even right after a
+    # successful re-embed, since it's never tagged with the browser's string.
+    return stored_version not in _face_embedding_allowed_versions()
 
 
 def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:

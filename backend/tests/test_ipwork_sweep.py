@@ -111,6 +111,26 @@ class TestEligibleSteps:
         )
         assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
 
+    def test_ipworker_tagged_version_is_also_accepted_as_current(self, monkeypatch):
+        """Regression test: browser and ipworker tag faces with their own
+        distinct version strings for the same underlying AdaFace model (see
+        IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION's definition in app.py).
+        Before this fix, _browser_processing_face_version_stale only compared
+        against FACE_CLUSTER_EMBEDDING_VERSION (the browser's string), so an
+        ipworker-processed photo was permanently flagged stale -- even
+        immediately after a successful re-embed under the current ipworker
+        model -- causing it to be re-queued and re-detected on every sweep
+        cycle forever."""
+        monkeypatch.setattr(app, 'FACE_CLUSTER_EMBEDDING_VERSION', 'browser-current')
+        monkeypatch.setattr(app, 'IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION', 'ipworker-current')
+        entity = _entity(
+            face_status='done',
+            processing_metadata=json.dumps({
+                'client_face': {'hasData': True, 'modelTaxonomyVersion': 'ipworker-current'},
+            }),
+        )
+        assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
+
     def test_stale_version_with_no_face_data_is_left_done(self, monkeypatch):
         """A 'no_data' result (no faces detected) has nothing to re-embed,
         so a version mismatch shouldn't force it back into the queue."""

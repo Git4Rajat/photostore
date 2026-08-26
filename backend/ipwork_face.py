@@ -501,6 +501,19 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
             'modelAvailability': 'available',
         })
 
+    # Top-level model/version fields (not just per-face) are required so
+    # storage_utils._client_model_provenance can stamp processing_metadata's
+    # client_face.modelTaxonomyVersion summary -- that field, not the per-face
+    # rows, is what _browser_processing_face_version_stale reads. Without
+    # this, ipworker-processed photos never clear the stale-version flag and
+    # get re-detected on every sweep cycle forever, even after succeeding.
+    model_fields = {
+        'model': 'AdaFace IR-101 (mediapipe-aligned)',
+        'modelVersion': 'adaface-ir101-webface4m-512d-v1',
+        'modelTaxonomyVersion': FACE_EMBEDDING_MODEL_TAXONOMY_VERSION,
+        'runtime': FACE_EMBEDDING_RUNTIME,
+        'modelAvailability': 'available',
+    }
     if not faces:
-        return {'hasData': False, 'faces': [], 'rawFaceCount': len(detections)}
-    return {'hasData': True, 'faces': faces, 'rawFaceCount': len(detections)}
+        return {'hasData': False, 'faces': [], 'rawFaceCount': len(detections), **model_fields}
+    return {'hasData': True, 'faces': faces, 'rawFaceCount': len(detections), **model_fields}
