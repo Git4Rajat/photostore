@@ -12754,6 +12754,19 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
         step for step in steps
         if str(lease_statuses.get(f'{step}Status') or '').strip().lower() not in {'done', 'no_data', 'skipped', 'unsupported'}
     ]
+    # claim_processing_lease reads the raw face_status field, which doesn't
+    # know about embedding-version staleness -- a 'done' status there just
+    # means SOME embedding was stored, not that it's the current model. The
+    # sweep (_ipwork_sweep_eligible_steps) already re-offers these photos
+    # for exactly this reason; without this check here too, every one of
+    # them would round-trip through claim_processing_lease, see 'done', and
+    # get marked 'skipped' -- silently discarding the whole point of
+    # queueing them (this is exactly what happened the first time the sweep
+    # ran against a real stale-embedding-version backlog).
+    if 'face' in steps and 'face' not in runnable_steps:
+        entity = _get_metadata_entity(user_id, filename) or {}
+        if _browser_processing_face_version_stale(entity):
+            runnable_steps.append('face')
     if not runnable_steps:
         release_processing_lease(user_id, filename, lease_owner)
         _upsert_job_status(job_id, user_id, 'ipwork', 'skipped', reason='already_done')
