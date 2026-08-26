@@ -245,3 +245,58 @@ def test_already_done_steps_are_not_rerun(monkeypatch, dispatch_ctx):
     assert ran_steps == []
     assert len(released) == 1
     assert ('ipwork', 'skipped') in dispatch_ctx.job_statuses
+
+
+def test_stale_face_embedding_version_forces_rerun_despite_done_lease_status(monkeypatch, dispatch_ctx):
+    """claim_processing_lease reports the raw (stale) faceStatus='done', but
+    the stored embedding predates FACE_CLUSTER_EMBEDDING_VERSION -- the same
+    class of work _browser_processing_pending_item already re-queues for the
+    browser (_browser_processing_face_version_stale). Without re-checking
+    staleness here too, every sweep-enqueued stale-embedding job would
+    round-trip through this 'already done' skip and never actually get
+    reprocessed -- this is exactly what happened to ~15.6k real jobs before
+    this fix (all landed status='skipped', reason='already_done')."""
+    monkeypatch.setattr(
+        app, 'claim_processing_lease',
+        lambda *a, **k: {'ownerId': 'ipworker-job-8', 'statuses': {'faceStatus': 'done'}},
+    )
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda user_id, filename: {'RowKey': filename})
+    monkeypatch.setattr(app, '_browser_processing_face_version_stale', lambda entity: True)
+    ran_steps = []
+    monkeypatch.setattr(
+        app, '_run_ipwork_steps',
+        lambda user_id, filename, steps: ran_steps.append(steps) or {'face': {'faces': [{}]}},
+    )
+    monkeypatch.setattr(
+        app, 'apply_client_processing_results_for_file',
+        lambda *a, **k: {'processing_state': 'active', 'face_status': 'done', 'faceCount': 1},
+    )
+
+    outcome = app._handle_ipwork_queue_payload(
+        {'filename': 'photo.jpg', 'steps': ['face']}, 'job-8', 'lib-A',
+    )
+
+    assert outcome == 'done'
+    assert ran_steps == [['face']]
+    assert ('ipwork', 'skipped') not in dispatch_ctx.job_statuses
+
+
+def test_current_face_embedding_version_still_skips_done_step(monkeypatch, dispatch_ctx):
+    """The inverse of the above -- a genuinely current embedding must still
+    take the cheap already-done skip, not be forced to rerun on every job."""
+    monkeypatch.setattr(
+        app, 'claim_processing_lease',
+        lambda *a, **k: {'ownerId': 'ipworker-job-9', 'statuses': {'faceStatus': 'done'}},
+    )
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda user_id, filename: {'RowKey': filename})
+    monkeypatch.setattr(app, '_browser_processing_face_version_stale', lambda entity: False)
+    ran_steps = []
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a, **k: ran_steps.append(a) or {})
+
+    outcome = app._handle_ipwork_queue_payload(
+        {'filename': 'photo.jpg', 'steps': ['face']}, 'job-9', 'lib-A',
+    )
+
+    assert outcome == 'noop'
+    assert ran_steps == []
+    assert ('ipwork', 'skipped') in dispatch_ctx.job_statuses
