@@ -2392,7 +2392,26 @@ def _apply_client_processing_results(
         metadata['map_detection_status'] = 'failed'
 
     face_result = payload.get('face')
-    if isinstance(face_result, dict) and _step_locked_done(metadata, 'face'):
+    face_result_version = str(face_result.get('modelTaxonomyVersion') or '').strip() if isinstance(face_result, dict) else ''
+    face_reembed_new_version = False
+    if face_result_version:
+        try:
+            prior_processing_peek = json.loads(metadata.get('processing_metadata') or '{}')
+        except Exception:
+            prior_processing_peek = {}
+        prior_client_face_peek = prior_processing_peek.get('client_face') if isinstance(prior_processing_peek, dict) else None
+        stored_face_version = str(prior_client_face_peek.get('modelTaxonomyVersion') or '').strip() if isinstance(prior_client_face_peek, dict) else ''
+        # A genuine re-embed under a different model (e.g. the stale-embedding-
+        # version sweep/poll re-offering an already-'done' photo) must be
+        # allowed to overwrite even though _step_locked_done sees 'done' --
+        # unlike the forced-backfill path, that re-offer never resets
+        # face_status away from 'done' first (see _ipwork_sweep_eligible_steps/
+        # _browser_processing_pending_item in app.py), so without this check
+        # the first-result-wins guard below silently discarded every re-embed:
+        # real inference ran, but the stored embedding/version never changed,
+        # and the photo stayed flagged stale forever.
+        face_reembed_new_version = face_result_version != stored_face_version
+    if isinstance(face_result, dict) and _step_locked_done(metadata, 'face') and not face_reembed_new_version:
         pass
     elif isinstance(face_result, dict):
         # Set by _enqueue_processing_steps at queue time (force=True) and

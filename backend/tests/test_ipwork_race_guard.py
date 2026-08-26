@@ -429,6 +429,38 @@ def test_face_second_writer_skipped_once_done(processing_ctx):
     assert metadata.get_entity(user_id, filename)['face_status'] == 'done'
 
 
+def test_face_reembed_under_new_model_version_still_applies_once_done(processing_ctx):
+    """Regression test: a stale-embedding-version re-queue (ipworker sweep or
+    the browser's own poll) never resets face_status away from 'done' before
+    resubmitting -- unlike the forced-backfill path -- so the guard above
+    must not treat this case as a same-version race. Before this fix, a
+    genuine re-embed under a newer model was silently discarded exactly like
+    a redundant duplicate: real inference ran, but the stored
+    embedding/version never changed and the photo stayed flagged stale
+    forever."""
+    metadata, calls = processing_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(
+        metadata, user_id, filename, face_status='done', faceCount=1,
+        processing_metadata=json.dumps({
+            'client_face': {'hasData': True, 'modelTaxonomyVersion': 'old-version'},
+        }),
+    )
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'face': {
+            'faces': [],
+            'modelTaxonomyVersion': 'new-version',
+        }},
+        client_processing_report=[],
+        client_asset_id='ipworker:job-1',
+        origin='ipworker',
+    )
+
+    assert len(calls.face_store_calls) == 1
+
+
 # --- origin provenance -----------------------------------------------------------
 
 def test_origin_is_stamped_into_processing_metadata(processing_ctx):
