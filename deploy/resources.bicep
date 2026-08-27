@@ -685,13 +685,17 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             { name: 'APP_ROLE', value: 'ipworker' }
             { name: 'IPWORKER_POLL_SECONDS', value: '2' }
             // How many photos one replica processes concurrently (see
-            // IPWORKER_CONCURRENCY in backend/app.py). Raised live to 3
+            // IPWORKER_CONCURRENCY in backend/app.py). Was raised live to 3
             // out-of-band at some point (found as bicep/live drift on
-            // 2026-08-25, no matching bicep commit or activity-log entry --
-            // whatis showed this would silently regress back to 1 on the
-            // next deploy). Bicep now matches live; don't lower without
-            // re-benchmarking CPU/memory headroom via Azure Monitor first.
-            { name: 'IPWORKER_CONCURRENCY', value: '3' }
+            // 2026-08-25). Lowered back to 2 on 2026-08-27 after per-step
+            // timing logs (see _run_ipwork_steps/_handle_ipwork_queue_payload)
+            // showed 3 concurrent OCR/face passes (both CPU-bound: pytesseract
+            // shells out to the tesseract binary, face runs YOLO+AdaFace)
+            // fighting over only 2 vCPU -- per-message wall time (steps_ms)
+            // ran 2-5x higher than any single photo's own step-sum, the
+            // signature of CPU oversubscription rather than I/O wait.
+            // Re-benchmark before raising this again without also raising cpu.
+            { name: 'IPWORKER_CONCURRENCY', value: '2' }
             // receive_messages() with no visibility_timeout defaults to Azure's
             // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
             // + tesseract OCR in sequence) can exceed -- see
