@@ -696,6 +696,20 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // signature of CPU oversubscription rather than I/O wait.
             // Re-benchmark before raising this again without also raising cpu.
             { name: 'IPWORKER_CONCURRENCY', value: '2' }
+            // Confirmed live 2026-08-27: this image's tesseract build spawns
+            // multiple OS threads per image_to_string() call by default (no
+            // prior thread cap existed anywhere in this Dockerfile/entrypoint).
+            // At IPWORKER_CONCURRENCY=2 on 2 vCPU that's a second, previously
+            // invisible layer of the exact same CPU-oversubscription bug the
+            // concurrency lowering above already fixed once -- two OCR calls
+            // each internally multi-threaded were still fighting over 2 real
+            // cores. Capping tesseract to 1 thread per call measured a
+            // one-sample OCR drop from 5474ms to 2439ms and a live aggregate
+            // throughput gain of 2052/hr -> 2724/hr (+33%) via the same
+            // thumbnail_status='done' done-delta method used to validate the
+            // concurrency fix. No correctness impact -- purely how many OS
+            // threads one call spawns, not what it returns.
+            { name: 'OMP_THREAD_LIMIT', value: '1' }
             // receive_messages() with no visibility_timeout defaults to Azure's
             // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
             // + tesseract OCR in sequence) can exceed -- see
