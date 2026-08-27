@@ -121,12 +121,30 @@ _face_mesh = None
 _FACE_LANDMARKER_LOCK = threading.Lock()
 
 
+def _single_threaded_session_options() -> ort.SessionOptions:
+    # Confirmed live 2026-08-27: with no SessionOptions, onnxruntime defaults
+    # intra_op_num_threads to 0 (auto -- one thread per detected core), and
+    # this is NOT affected by OMP_THREAD_LIMIT (that env var only bounds
+    # OpenMP-based libraries like tesseract; onnxruntime uses its own thread
+    # pool). At IPWORKER_CONCURRENCY=2, two worker threads each holding an
+    # auto-threaded YOLO/AdaFace session is the same CPU-oversubscription bug
+    # already fixed once for tesseract, just in a library that env var
+    # doesn't reach -- see docs/ipworker-architecture.md for the writeup.
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    return options
+
+
 def _get_yolo_session() -> ort.InferenceSession:
     global _yolo_session
     if ort is None or cv2 is None:
         raise RuntimeError('onnxruntime_or_opencv_unavailable')
     if _yolo_session is None:
-        _yolo_session = ort.InferenceSession(YOLO_FACE_MODEL_PATH, providers=['CPUExecutionProvider'])
+        _yolo_session = ort.InferenceSession(
+            YOLO_FACE_MODEL_PATH, sess_options=_single_threaded_session_options(),
+            providers=['CPUExecutionProvider'],
+        )
     return _yolo_session
 
 
@@ -135,7 +153,10 @@ def _get_adaface_session() -> ort.InferenceSession:
     if ort is None or cv2 is None:
         raise RuntimeError('onnxruntime_or_opencv_unavailable')
     if _adaface_session is None:
-        _adaface_session = ort.InferenceSession(ADAFACE_MODEL_PATH, providers=['CPUExecutionProvider'])
+        _adaface_session = ort.InferenceSession(
+            ADAFACE_MODEL_PATH, sess_options=_single_threaded_session_options(),
+            providers=['CPUExecutionProvider'],
+        )
     return _adaface_session
 
 

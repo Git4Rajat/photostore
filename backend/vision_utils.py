@@ -16,6 +16,18 @@ except Exception:
     torch = None
     open_clip = None
 
+if torch is not None:
+    # Confirmed live 2026-08-27: torch.get_num_threads() is unaffected by
+    # OMP_THREAD_LIMIT (the env var already set for ipworker's tesseract
+    # fix) -- that only bounds OpenMP-based libraries in a way this build's
+    # intra-op thread pool doesn't observably respect. At
+    # IPWORKER_CONCURRENCY=2, two worker threads each running CLIP inference
+    # with an unconstrained thread pool is the same CPU-oversubscription bug
+    # already fixed once for tesseract; set it explicitly here instead of
+    # relying on an env var with unverified effect on this library. See
+    # docs/ipworker-architecture.md for the writeup.
+    torch.set_num_threads(1)
+
 _MODEL = None
 _TOKENIZER = None
 _PREPROCESS = None
