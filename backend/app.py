@@ -12681,12 +12681,16 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
     """
     client_processing: Dict[str, Dict] = {}
     image_bytes_cache: List[bytes] = []
+    download_ms = 0
 
     def get_image_bytes() -> bytes:
+        nonlocal download_ms
         if not image_bytes_cache:
+            started = time.monotonic()
             entity = _get_metadata_entity(user_id, filename) or {}
             source_blob = str(entity.get('anonymousImageId') or '').strip() or filename
             image_bytes_cache.append(download_media_bytes('image', source_blob))
+            download_ms = round((time.monotonic() - started) * 1000)
         return image_bytes_cache[0]
 
     def _failure_shape(step: str, error: str) -> Dict:
@@ -12701,6 +12705,10 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             shape.update({'faces': [], 'rawFaceCount': 0, 'faceFailureStage': 'unsupported_runtime', 'faceFailureDetail': error})
         return shape
 
+    # Timed separately from each step below (instead of folding it into
+    # whichever step happens to trigger the lazy download) so a slow step
+    # can't be blamed for I/O that's really the metadata read + blob fetch.
+    step_ms: Dict[str, int] = {}
     for step in steps:
         if step not in IPWORK_STEPS:
             continue
@@ -12709,11 +12717,24 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             client_processing[step] = _failure_shape(step, 'not_implemented')
             continue
         try:
-            result = processor(user_id, filename, get_image_bytes())
+            image_bytes = get_image_bytes()
+        except Exception as exc:
+            worker_logger.exception('ipworker image download failed for %s/%s', user_id, filename)
+            client_processing[step] = _failure_shape(step, str(exc))
+            continue
+        step_started = time.monotonic()
+        try:
+            result = processor(user_id, filename, image_bytes)
             client_processing[step] = result if isinstance(result, dict) else _failure_shape(step, 'invalid_result_shape')
         except Exception as exc:
             worker_logger.exception('ipworker step %r failed for %s/%s', step, user_id, filename)
             client_processing[step] = _failure_shape(step, str(exc))
+        finally:
+            step_ms[step] = round((time.monotonic() - step_started) * 1000)
+    worker_logger.info(
+        'ipwork step timings user=%s file=%s download_ms=%s step_ms=%s',
+        user_id, filename, download_ms, step_ms,
+    )
     return client_processing
 
 
@@ -12745,9 +12766,12 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     steps = [str(s).strip() for s in (payload.get('steps') or []) if str(s).strip() in IPWORK_STEPS]
     if not filename or not user_id or not steps:
         return 'noop'
+    message_started = time.monotonic()
     lease_owner = f'ipworker-{job_id}'
     try:
+        lease_started = time.monotonic()
         lease = claim_processing_lease(user_id, filename, lease_owner, lease_seconds=IPWORKER_LEASE_SECONDS, steps=steps)
+        lease_claim_ms = round((time.monotonic() - lease_started) * 1000)
     except Exception as exc:
         # Another worker (a browser tab, or another ipworker replica) already
         # holds an active lease on this photo -- they're doing the work.
@@ -12782,7 +12806,10 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     _upsert_job_status(job_id, user_id, 'ipwork', 'running')
     lease_cleared_by_apply = False
     try:
+        steps_started = time.monotonic()
         client_processing = _run_ipwork_steps(user_id, filename, runnable_steps)
+        steps_ms = round((time.monotonic() - steps_started) * 1000)
+        apply_started = time.monotonic()
         metadata = apply_client_processing_results_for_file(
             user_id,
             filename,
@@ -12791,6 +12818,7 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
             client_asset_id=f'ipworker:{job_id}',
             origin='ipworker',
         )
+        apply_ms = round((time.monotonic() - apply_started) * 1000)
         # apply_client_processing_results_for_file already clears the lease
         # fields unconditionally once it returns -- mark that here so the
         # finally block below doesn't pay a redundant read+write re-releasing
@@ -12804,11 +12832,21 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
         # so without this it would detect faces that never get clustered
         # into people -- they'd just sit unassigned until someone manually
         # ran the admin recluster-repair flow.
+        cluster_started = time.monotonic()
         try:
             _queue_people_clustering_after_face_processing(user_id, filename, metadata)
         except Exception:
             worker_logger.exception('Failed to auto-queue clustering for %s after ipwork', filename)
+        cluster_ms = round((time.monotonic() - cluster_started) * 1000)
         _upsert_job_status(job_id, user_id, 'ipwork', 'done')
+        # Total-vs-sum-of-parts breakdown for the whole message, not just the
+        # per-step split inside _run_ipwork_steps -- lease_claim_ms/apply_ms/
+        # cluster_ms cover everything outside that per-step breakdown.
+        worker_logger.info(
+            'ipwork message timings user=%s file=%s lease_claim_ms=%s steps_ms=%s apply_ms=%s cluster_ms=%s total_ms=%s',
+            user_id, filename, lease_claim_ms, steps_ms, apply_ms, cluster_ms,
+            round((time.monotonic() - message_started) * 1000),
+        )
     finally:
         # Only needed when apply_client_processing_results_for_file never
         # got far enough to clear the lease itself (e.g. an exception from
