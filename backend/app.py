@@ -11919,14 +11919,17 @@ def jobs_status():
         if metadata_table_client is None:
             return jsonify({'jobs': []})
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=JOB_STATUS_WINDOW_MINUTES)).isoformat()
-        # A clustering-family job (recluster/cluster/"find more faces") this old
-        # and still queued/running is dead, not in-flight — the worker crashed
-        # mid-job (e.g. OOM during a full face-table scan) and never wrote a
-        # terminal status. _has_active_clustering_job already treats rows this
-        # old as dead for de-dupe purposes; without the same cutoff here, a
-        # dead row shows as perpetually "in flight" and the "Finding more
-        # faces…" indicator never clears.
-        clustering_stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
+        # A job of ANY type (clustering, ipwork, library_clean, preview, ...)
+        # this old and still queued/running is dead, not in-flight — the
+        # worker/ipworker crashed mid-job (e.g. OOM) and never wrote a
+        # terminal status. This used to only cover job_type == 'clustering'
+        # (mirroring _has_active_clustering_job's de-dupe cutoff), but any job
+        # type can be orphaned the same way — an old stuck 'ipwork' row was
+        # found stuck 15 days "running", keeping the server-processing
+        # indicator on forever with nothing left to actually process. Without
+        # this cutoff a dead row shows as perpetually "in flight" and its
+        # activity indicator never clears.
+        stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
         try:
             query = f"PartitionKey eq 'jobs' and userId eq '{_escape_odata(user_id)}'"
             rows = list(metadata_table_client.query_entities(query))
@@ -11938,8 +11941,8 @@ def jobs_status():
             status = str(row.get('status') or '').lower()
             updated_at = str(row.get('updatedAt') or '')
             job_type = str(row.get('jobType') or '')
-            if status in {'queued', 'running'} and job_type == 'clustering' and updated_at and updated_at < clustering_stale_cutoff:
-                _upsert_job_status(str(row.get('jobId') or ''), user_id, 'clustering', 'failed', error='Job did not finish (worker restarted or timed out)')
+            if status in {'queued', 'running'} and updated_at and updated_at < stale_cutoff:
+                _upsert_job_status(str(row.get('jobId') or ''), user_id, job_type, 'failed', error='Job did not finish (worker restarted or timed out)')
                 continue
             # Keep in-flight jobs, plus terminal ones that finished recently.
             # updatedAt is a UTC isoformat string, so lexicographic comparison
