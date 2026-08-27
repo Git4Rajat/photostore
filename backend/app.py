@@ -42,6 +42,7 @@ from ordering_utils import (
 )
 from timeline_metadata import build_timeline_summary
 from image_utils import (
+    BROWSER_UNVIEWABLE_EXTENSIONS,
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
     allowed_file,
@@ -6045,7 +6046,7 @@ def _find_public_album_by_token(token: str) -> Optional[Dict]:
 
 def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = None) -> Dict[str, str]:
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    preview_required = ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA or ext in {'heic', 'heif'}
+    preview_required = ext in BROWSER_UNVIEWABLE_EXTENSIONS
     preview_url = f'/public/photos/{token}/preview/{filename}' if preview_required else ''
     # Direct SAS URLs point at storage, so they must name the physical blob (the
     # anonymous UUID for anonymized photos). The proxy fallbacks keep the original
@@ -7195,7 +7196,7 @@ def _preview_proxy_url(filename: str) -> str:
 
 def _filename_requires_backend_preview(filename: str) -> bool:
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    return ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA or ext in {'heic', 'heif'}
+    return ext in BROWSER_UNVIEWABLE_EXTENSIONS
 
 
 def _is_missing_media_error(exc: Exception) -> bool:
@@ -7332,6 +7333,10 @@ def _preview_failure_payload(filename: str) -> dict:
     if ext in {'heic', 'heif'}:
         reason = 'heic_decode_failed'
         detail = ('This HEIC/HEIF image could not be converted into a viewable preview. '
+                  'It may be damaged or use an unsupported variant.')
+    elif ext == 'jxl':
+        reason = 'jxl_decode_failed'
+        detail = ('This JPEG XL image could not be converted into a viewable preview. '
                   'It may be damaged or use an unsupported variant.')
     elif ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
         reason = 'raw_decode_failed'

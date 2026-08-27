@@ -11,6 +11,7 @@ azure-communication-email
 # release (12.3.0 fixes multiple image-parsing CVEs).
 Pillow>=12.3.0
 pillow-heif
+pillow-jxl-plugin
 imagehash
 numpy
 scikit-learn

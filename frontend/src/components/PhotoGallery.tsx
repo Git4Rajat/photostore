@@ -20,7 +20,7 @@ import {
 import { ARC_FACE_5POINT_TEMPLATE, solveSimilarityTransform } from '../services/faceAlignment';
 import { loadFaceApiRuntimeBundle } from '../services/faceApiRuntime';
 import { preloadYoloFaceModel, detectFacesWithYolo, resetYoloFaceModelStateForTests } from '../services/yoloFaceDetectionRuntime';
-import { getFileExtension, isHeicFilename, isRawFilename, isVideoFilename } from '../utils/photoDisplay';
+import { getFileExtension, isHeicFilename, isJxlFilename, isRawFilename, isVideoFilename } from '../utils/photoDisplay';
 import { plural } from '../utils/format';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
@@ -2781,6 +2781,23 @@ const resolveBrowserVisionSource = async (file: File, convertedPreview?: Blob | 
                 return decoded;
             }
         }
+        // No browser can decode raw JXL bytes via <img>/createImageBitmap (unlike HEIC,
+        // there's no client-side WASM decoder wired up here either), so falling through
+        // to imageSource: file would hand tesseract.js/face-detection bytes they're
+        // guaranteed to fail on -- the same failure class that used to burn the full OCR
+        // budget on raw HEIC bytes (see createHeicDecodedVisionSource above). Skip
+        // cleanly instead and wait for the backend-converted preview to show up.
+        if (isJxlFilename(file.name)) {
+            return {
+                imageSource: null,
+                sourceKind: 'unsupported',
+                sourceFormat,
+                originalBytes: file.size,
+                sourceBytes: 0,
+                isRaw: false,
+                skipReason: 'jxl_preview_missing',
+            };
+        }
         return {
             imageSource: file,
             sourceKind: 'original',
@@ -3498,7 +3515,12 @@ export const runBrowserProcessing = async (
     } else if (visionSource.isRaw) {
         rawFallback(visionSource, sourceStartedAt);
     } else {
-        clientProcessingReport.push(makeClientReport(clientAssetId, 'thumbnail', 'timeout', 'inference_timeout', sourceStartedAt, {
+        // A deliberate skip (e.g. JXL with no backend preview yet, skipReason set by
+        // resolveBrowserVisionSource) is not the same as resolveBrowserVisionSource itself
+        // timing out (the synthetic fallback at this function's top, skipReason
+        // 'inference_timeout') -- report each with its real reason/status.
+        const isDeliberateSkip = Boolean(visionSource.skipReason) && visionSource.skipReason !== 'inference_timeout';
+        clientProcessingReport.push(makeClientReport(clientAssetId, 'thumbnail', isDeliberateSkip ? 'skipped' : 'timeout', visionSource.skipReason || 'inference_timeout', sourceStartedAt, {
             runtime: 'browser-source-resolver',
             ...sourceFields,
         }));
@@ -3595,7 +3617,10 @@ export const runBrowserProcessing = async (
                 ...sourceFields,
             }));
         }
-    } else if (visionSource.isRaw) {
+    } else {
+        // Covers both the RAW no-preview case and formats like JXL that resolveBrowserVisionSource
+        // deliberately leaves imageSource null for (no client-side decode available) -- without this
+        // branch, a null imageSource + isRaw:false source silently produced no 'ocr' report at all.
         clientProcessing.ocr = {
             hasData: false,
             text: '',

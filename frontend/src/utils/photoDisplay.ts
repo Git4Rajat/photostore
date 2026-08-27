@@ -12,13 +12,20 @@ const SUPPORTED_VIDEO_EXTENSIONS = [
 
 const SUPPORTED_HEIC_EXTENSIONS = ['heic', 'heif'] as const;
 
+// JPEG XL: Pillow decodes it server-side (backend/image_utils.py), but no
+// mainstream browser renders it natively via <img src>, so like HEIC/RAW it
+// always needs a backend-converted JPEG preview.
+const SUPPORTED_JXL_EXTENSIONS = ['jxl'] as const;
+
 const RAW_EXTENSIONS = new Set<string>(SUPPORTED_RAW_EXTENSIONS);
 const VIDEO_EXTENSIONS = new Set<string>(SUPPORTED_VIDEO_EXTENSIONS);
 const HEIC_EXTENSIONS = new Set<string>(SUPPORTED_HEIC_EXTENSIONS);
+const JXL_EXTENSIONS = new Set<string>(SUPPORTED_JXL_EXTENSIONS);
 
 const BACKEND_PREVIEW_EXTENSIONS = new Set<string>([
     ...SUPPORTED_HEIC_EXTENSIONS,
     ...SUPPORTED_RAW_EXTENSIONS,
+    ...SUPPORTED_JXL_EXTENSIONS,
 ]);
 
 export const FILE_ACCEPT_FILTER = [
@@ -28,6 +35,7 @@ export const FILE_ACCEPT_FILTER = [
     '.heif',
     ...SUPPORTED_RAW_EXTENSIONS.map((ext) => `.${ext}`),
     ...SUPPORTED_VIDEO_EXTENSIONS.map((ext) => `.${ext}`),
+    ...SUPPORTED_JXL_EXTENSIONS.map((ext) => `.${ext}`),
 ].join(',');
 
 export type MediaKind = 'RAW' | 'JPEG' | 'VIDEO';
@@ -42,6 +50,8 @@ export const isRawFilename = (filename: string): boolean => RAW_EXTENSIONS.has(g
 export const isVideoFilename = (filename: string): boolean => VIDEO_EXTENSIONS.has(getFileExtension(filename));
 
 export const isHeicFilename = (filename: string): boolean => HEIC_EXTENSIONS.has(getFileExtension(filename));
+
+export const isJxlFilename = (filename: string): boolean => JXL_EXTENSIONS.has(getFileExtension(filename));
 
 export const requiresBackendPreview = (filename: string): boolean => (
     BACKEND_PREVIEW_EXTENSIONS.has(getFileExtension(filename))

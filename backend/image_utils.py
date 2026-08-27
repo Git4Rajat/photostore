@@ -14,6 +14,11 @@ try:
 except Exception:
     pass
 
+try:
+    import pillow_jxl  # noqa: F401 -- import side effect registers JXL with Pillow's Image.open()
+except Exception:
+    pass
+
 RESAMPLING_LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
 
 RAW_EXTENSIONS_RAWPY = {
@@ -32,7 +37,7 @@ RAW_EXTENSIONS_CINEMA = {
 
 PILLOW_NATIVE = {
     'tif', 'tiff', 'jpg', 'jpeg', 'png',
-    'webp', 'heic', 'heif', 'bmp', 'gif',
+    'webp', 'heic', 'heif', 'bmp', 'gif', 'jxl',
 }
 
 VIDEO_EXTENSIONS = {
@@ -41,6 +46,12 @@ VIDEO_EXTENSIONS = {
 }
 
 ALLOWED_EXTENSIONS = PILLOW_NATIVE | RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | VIDEO_EXTENSIONS
+
+# Formats Pillow can decode server-side but that browsers can't render directly via
+# <img src>, so the frontend must fetch a backend-converted JPEG preview instead of
+# trying to display the original bytes (mirrors frontend/src/utils/photoDisplay.ts's
+# requiresBackendPreview).
+BROWSER_UNVIEWABLE_EXTENSIONS = RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | {'heic', 'heif', 'jxl'}
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
