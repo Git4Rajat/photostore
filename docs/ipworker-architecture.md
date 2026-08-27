@@ -36,6 +36,13 @@ IPWORK_STEPS = ('thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detection'
   sequence for one photo" — i.e. originally provisioned for **one photo at a
   time per replica**.
 - **Scale**: `minReplicas: 0`, `maxReplicas: 4`. Scales to zero when idle.
+- **2 vCPU/4Gi is a hard ceiling, not just today's choice.** This managed
+  environment (`resource managedEnvironment`, `resources.bicep:185-188`) has
+  `properties: {}` — no `workloadProfiles` configured, i.e. it's a plain
+  Consumption environment. Azure caps Consumption-only environments at 2
+  vCPU/4Gi per replica; going higher requires migrating the managed
+  environment to Workload Profiles first, not just bumping a bicep number.
+  Relevant if a future "just give it more CPU" plan comes up.
 
 ## 3. How work gets dispatched
 
@@ -85,6 +92,19 @@ lazy image download shared across all steps, no intra-photo parallelism:
 `thumbnail → exif → ocr → face → ai_vision → map_detection`. A slow step (OCR)
 blocks everything after it for that photo; it does not block other photos,
 since those run on their own thread-pool slots.
+
+**Results are also batched, not streamed per-step — this matters more than
+the ordering above.** `_handle_ipwork_queue_payload` calls `_run_ipwork_steps`
+to completion (building one `client_processing` dict across all 6 steps) and
+only *then* calls `apply_client_processing_results_for_file` once with the
+whole dict. So today, nothing — not even the already-finished thumbnail —
+becomes visible/persisted until OCR *and* every step after it also finishes.
+Reordering `IPWORK_STEPS` alone would not fix this (the batched write still
+waits for the slowest step regardless of order); the actual fix would be
+either per-step persistence or splitting the fast steps into their own apply
+call before OCR runs. Not implemented — a real UX-latency lever (time until a
+thumbnail/face appears), distinct from raw photos/hour throughput, which this
+change would not move.
 
 `IPWORKER_CONCURRENCY`'s own comment (`backend/app.py:428-434`) documents the
 last real benchmark that set it: Azure Monitor showed ~45% avg CPU per
@@ -169,6 +189,9 @@ the `photometadata` table over clean 2-minute windows:
   concurrency slots × 3600s ÷ ~14s-per-slot ≈ 2057/hr — i.e. throughput is now
   well-explained by the measured per-photo latency, not still bottlenecked by
   contention.
+- `IPWORKER_CONCURRENCY=2` + `OMP_THREAD_LIMIT=1` on 2 vCPU: **~2724 photos/hour**
+  (+33% more). See below — a second, previously invisible layer of the same
+  oversubscription bug.
 
 **Root cause of the pre-fix gap**: `IPWORKER_CONCURRENCY=3` was raised
 out-of-band (found as bicep/live drift 2026-08-25) without re-checking CPU
@@ -179,6 +202,17 @@ individually gets slower the more of its neighbors are also mid-OCR/face —
 textbook oversubscription. Confirmed by per-message `total_ms` running 2-5x
 higher than any single photo's own step-sum measured when contention was
 lower.
+
+**Second layer of the same bug, found 2026-08-27**: nothing in
+`ipworker.Dockerfile`/`entrypoint.sh` ever set `OMP_THREAD_LIMIT` (or any
+other tesseract thread cap) — confirmed by reading both files. This image's
+tesseract build spawns multiple OS threads *per `image_to_string()` call* by
+default, so even at the already-fixed `IPWORKER_CONCURRENCY=2`, two
+concurrent OCR calls were each internally multi-threaded and still fighting
+over 2 real cores. Setting `OMP_THREAD_LIMIT=1` (live env var, then committed
+to `resources.bicep`) measured a one-sample OCR drop from 5474ms to 2439ms
+and the aggregate throughput gain above — no correctness impact, since this
+only bounds internal parallelism, not OCR output.
 
 ## 7. Two OCR cost-reduction paths tried this session, both rejected on real data
 
@@ -234,10 +268,11 @@ from scratch.
 | vCPU / memory per replica | 2.0 / 4Gi |
 | Concurrency per replica | 2 |
 | Total concurrent-photo ceiling | 8 |
-| Dominant per-photo cost | OCR, 5.4-10.4s (65-70% of step time) |
-| Per-photo wall time (current) | ~10.8-13.6s |
-| Measured aggregate throughput | ~2052 photos/hour (all 4 replicas) |
-| Per-slot throughput | ~256 photos/hour |
+| Dominant per-photo cost | OCR, 2.4-10.4s (65-70% of step time) |
+| Per-photo wall time (current) | ~10.8-13.6s (pre-OMP-fix figure; not yet re-measured per-step post-fix) |
+| Measured aggregate throughput | ~2724 photos/hour (all 4 replicas, with OMP_THREAD_LIMIT=1) |
+| Per-slot throughput | ~341 photos/hour |
+| Tesseract thread cap | `OMP_THREAD_LIMIT=1` (added 2026-08-27) |
 | Scale-out trigger | queue length ≥1 (visible-only), or cron wake every 20min |
 | Lease TTL / queue visibility timeout | 300s / 300s |
 | Lease retry limit | 3 attempts |
