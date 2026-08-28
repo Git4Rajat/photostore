@@ -10098,6 +10098,57 @@ def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
 
 IPWORK_SWEEP_INTERVAL_SECONDS = int(os.getenv('IPWORK_SWEEP_INTERVAL_SECONDS', '1200'))
 IPWORK_SWEEP_STALE_QUEUED_SECONDS = int(os.getenv('IPWORK_SWEEP_STALE_QUEUED_SECONDS', '1800'))
+_IPWORK_SWEEP_LOCK_ROW_KEY = 'ipwork_sweep_lock'
+
+
+def _try_claim_ipwork_sweep_lock(owner_id: str, ttl_seconds: int) -> bool:
+    """Every ipworker replica runs its own copy of _ipwork_sweep_loop on an
+    independent timer -- without this, N replicas redundantly re-enqueue the
+    same "stale" backlog on every cycle. Confirmed live 2026-08-28: with 4
+    replicas this produced a ~5x queue-depth blowup during a single backfill
+    (see docs/ipworker-architecture.md). Only the replica that wins this
+    claim actually runs the sweep for a given cycle; the
+    create-then-steal-if-expired shape mirrors the delegation-key claim
+    above (_MEDIA_DELEGATION_KEY_PARTITION) so a crashed lock holder doesn't
+    block the sweep forever.
+    """
+    if metadata_table_client is None:
+        return False
+    now = datetime.now(timezone.utc)
+    lock_row = {
+        'PartitionKey': _MEDIA_DELEGATION_KEY_PARTITION,
+        'RowKey': _IPWORK_SWEEP_LOCK_ROW_KEY,
+        'lease_owner': owner_id,
+        'lease_expires_at': (now + timedelta(seconds=ttl_seconds)).isoformat(),
+    }
+    try:
+        metadata_table_client.create_entity(dict(lock_row))
+        return True
+    except ResourceExistsError:
+        pass
+    except Exception:
+        return False
+
+    try:
+        existing = metadata_table_client.get_entity(_MEDIA_DELEGATION_KEY_PARTITION, _IPWORK_SWEEP_LOCK_ROW_KEY)
+    except Exception:
+        return False
+
+    expires_at = str(existing.get('lease_expires_at') or '')
+    try:
+        still_held = bool(expires_at) and datetime.fromisoformat(expires_at.replace('Z', '+00:00')) > now
+    except Exception:
+        still_held = False
+    if still_held and str(existing.get('lease_owner') or '') != owner_id:
+        return False  # another replica holds a live lease
+
+    try:
+        metadata_table_client.update_entity(
+            lock_row, etag=existing.metadata['etag'], match_condition=MatchConditions.IfNotModified,
+        )
+        return True
+    except Exception:
+        return False  # lost the race to steal an expired lease
 
 
 def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
@@ -10200,16 +10251,23 @@ def _sweep_stale_processing_into_ipwork() -> Dict[str, int]:
 def _ipwork_sweep_loop() -> None:
     """Runs for the lifetime of the ipworker process on its own daemon
     thread, independent of the queue-polling loop in run_ipworker, so a
-    slow/large sweep never delays picking up fresh queue messages."""
+    slow/large sweep never delays picking up fresh queue messages.
+
+    Every replica runs this same loop, so each iteration first claims a
+    cluster-wide lock (_try_claim_ipwork_sweep_lock) and skips the actual
+    scan entirely if another replica already holds it -- see that
+    function's docstring for why this matters."""
+    owner_id = uuid.uuid4().hex
     time.sleep(min(60, IPWORK_SWEEP_INTERVAL_SECONDS))
     while True:
         try:
-            stats = _sweep_stale_processing_into_ipwork()
-            if stats['photosQueued']:
-                worker_logger.info(
-                    'ipwork sweep: released %d stale photo(s), %d step(s), across %d librar(y/ies)',
-                    stats['photosQueued'], stats['stepsQueued'], stats['libraries'],
-                )
+            if _try_claim_ipwork_sweep_lock(owner_id, ttl_seconds=IPWORK_SWEEP_INTERVAL_SECONDS):
+                stats = _sweep_stale_processing_into_ipwork()
+                if stats['photosQueued']:
+                    worker_logger.info(
+                        'ipwork sweep: released %d stale photo(s), %d step(s), across %d librar(y/ies)',
+                        stats['photosQueued'], stats['stepsQueued'], stats['libraries'],
+                    )
         except Exception:
             worker_logger.exception('ipwork sweep iteration failed')
         time.sleep(IPWORK_SWEEP_INTERVAL_SECONDS)

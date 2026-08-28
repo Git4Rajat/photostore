@@ -17,6 +17,8 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+from azure.data.tables import TableEntity
 
 import app
 
@@ -210,3 +212,80 @@ class TestSweepLoop:
         assert queued_calls == [('lib-b', 'stuck.jpg')]
         assert stats['libraries'] == 2
         assert stats['photosQueued'] == 1
+
+
+class _FakeLockTable:
+    """Minimal metadata_table_client stand-in for the sweep lock's
+    create-then-steal-if-expired claim, with real ETag semantics (same
+    shape as _FakePersonTable in test_person_entity_concurrency.py)."""
+
+    def __init__(self) -> None:
+        self.rows: dict = {}
+        self._etags: dict = {}
+        self._version = 0
+
+    def create_entity(self, entity):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        if key in self.rows:
+            raise ResourceExistsError('already exists')
+        self.rows[key] = dict(entity)
+        self._version += 1
+        self._etags[key] = f'W/"{self._version}"'
+
+    def get_entity(self, partition_key, row_key):
+        key = (partition_key, row_key)
+        if key not in self.rows:
+            raise ResourceNotFoundError(f'{key} not found')
+        entity = TableEntity(dict(self.rows[key]))
+        entity._metadata = {'etag': self._etags[key], 'timestamp': None}
+        return entity
+
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        if key not in self.rows:
+            raise ResourceNotFoundError(f'{key} not found')
+        if etag is not None and etag != self._etags[key]:
+            raise ResourceModifiedError('etag mismatch')
+        self.rows[key] = dict(entity)
+        self._version += 1
+        self._etags[key] = f'W/"{self._version}"'
+
+
+class TestSweepLock:
+    """Regression tests for the actual production bug: every ipworker
+    replica ran _ipwork_sweep_loop independently, so N replicas redundantly
+    re-enqueued the exact same stale backlog on every cycle -- confirmed
+    live 2026-08-28 to cause a ~5x queue-depth blowup during a single
+    backfill. _try_claim_ipwork_sweep_lock ensures only one replica's sweep
+    actually runs per cycle."""
+
+    def test_first_claim_succeeds(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is True
+
+    def test_second_replica_is_blocked_while_lease_is_live(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is True
+        assert app._try_claim_ipwork_sweep_lock('replica-b', ttl_seconds=1200) is False
+
+    def test_same_owner_can_renew_its_own_lease(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is True
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is True
+
+    def test_another_replica_can_steal_an_expired_lease(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=-10) is True  # already expired
+        assert app._try_claim_ipwork_sweep_lock('replica-b', ttl_seconds=1200) is True
+
+    def test_four_replicas_racing_only_one_wins(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        results = [
+            app._try_claim_ipwork_sweep_lock(owner, ttl_seconds=1200)
+            for owner in ('replica-a', 'replica-b', 'replica-c', 'replica-d')
+        ]
+        assert results == [True, False, False, False]
+
+    def test_no_metadata_table_client_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', None)
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is False
