@@ -289,6 +289,28 @@ const getUploadErrorMessage = (err: unknown, fallback: string): string => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Tiny FIFO dispatch queue: at most `concurrency` submitted jobs run at once,
+// the rest wait their turn. See enqueueInitBatchDispatchRef/
+// enqueueFinalizeBatchDispatchRef for why upload batch dispatch needs this.
+const createDispatchQueue = (concurrency: number) => {
+    const queue: Array<() => Promise<void>> = [];
+    let active = 0;
+    const pump = () => {
+        while (active < concurrency && queue.length > 0) {
+            const job = queue.shift()!;
+            active += 1;
+            job().finally(() => {
+                active -= 1;
+                pump();
+            });
+        }
+    };
+    return (job: () => Promise<void>) => {
+        queue.push(job);
+        pump();
+    };
+};
+
 // Direct-to-blob uploads talk to Azure Blob over HTTP/1.1, where browsers cap
 // concurrent connections per origin at ~6. Staging a file's blocks one at a time
 // leaves ~5 of those idle, which is why a single large file crawls. We instead
@@ -1007,6 +1029,22 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }>>([]);
     const batchFinalizeDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const batchFinalizeMaxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // Caps how many /upload/init-batch (resp. /upload/finalize-batch) network
+    // calls can be in flight against the backend at once -- independent of
+    // batch ACCUMULATION above and independent of blob-transfer lane count
+    // (which can legitimately run ~20 wide since those PUTs bypass the
+    // backend entirely). Without this, every one of the ~20 lanes flushes
+    // its own debounce/max-wait timer the moment it fires, regardless of
+    // whether earlier flushes are still in flight -- a live HAR caught up to
+    // 16 concurrent init-batch and 20 concurrent finalize-batch requests
+    // hitting the backend at once, each queueing behind gunicorn thread/GIL
+    // contention for 80-240s. That staggered lanes' arrival times so badly
+    // batches mostly ended up size 1 anyway -- the exact thing batching was
+    // meant to prevent. Separate pools (not one shared pool) so a burst of
+    // finalize jobs, which don't block a lane, can never queue ahead of an
+    // init job, which does.
+    const enqueueInitBatchDispatchRef = useRef(createDispatchQueue(2));
+    const enqueueFinalizeBatchDispatchRef = useRef(createDispatchQueue(2));
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1595,7 +1633,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const INIT_BATCH_DEBOUNCE_MS = 50;
     const INIT_BATCH_MAX_WAIT_MS = 250;
 
-    const flushInitBatch = async () => {
+    const flushInitBatch = () => {
         const batch = pendingBatchInitRef.current;
         pendingBatchInitRef.current = [];
         if (batchInitDebounceTimerRef.current) {
@@ -1609,22 +1647,27 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (batch.length === 0) {
             return;
         }
-        try {
-            const response = await postUploadWithRetry('/upload/init-batch', {
-                files: batch.map(({ filename, totalSize, sha256 }) => ({ filename, totalSize, sha256 })),
-            });
-            const results = Array.isArray(response?.results) ? response.results : [];
-            batch.forEach((req, index) => {
-                const result = results[index];
-                if (result && !result.error) {
-                    req.resolve(result);
-                } else {
-                    req.reject(new Error(result?.error || 'Batch init failed for this file.'));
-                }
-            });
-        } catch (err) {
-            batch.forEach((req) => req.reject(err));
-        }
+        // Dispatch through the shared queue (see enqueueInitBatchDispatchRef)
+        // instead of calling postUploadWithRetry directly -- this is what
+        // caps concurrent /upload/init-batch requests against the backend.
+        enqueueInitBatchDispatchRef.current(async () => {
+            try {
+                const response = await postUploadWithRetry('/upload/init-batch', {
+                    files: batch.map(({ filename, totalSize, sha256 }) => ({ filename, totalSize, sha256 })),
+                });
+                const results = Array.isArray(response?.results) ? response.results : [];
+                batch.forEach((req, index) => {
+                    const result = results[index];
+                    if (result && !result.error) {
+                        req.resolve(result);
+                    } else {
+                        req.reject(new Error(result?.error || 'Batch init failed for this file.'));
+                    }
+                });
+            } catch (err) {
+                batch.forEach((req) => req.reject(err));
+            }
+        });
     };
 
     const requestBatchedInit = (filename: string, totalSize: number, sha256: string): Promise<any> => (
@@ -1677,7 +1720,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const FINALIZE_BATCH_DEBOUNCE_MS = 200;
     const FINALIZE_BATCH_MAX_WAIT_MS = 2500;
 
-    const flushFinalizeBatch = async () => {
+    const flushFinalizeBatch = () => {
         const batch = pendingBatchFinalizeRef.current;
         pendingBatchFinalizeRef.current = [];
         if (batchFinalizeDebounceTimerRef.current) {
@@ -1691,24 +1734,29 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (batch.length === 0) {
             return;
         }
-        try {
-            const response = await postUploadWithRetry('/upload/finalize-batch', {
-                files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId }) => ({
-                    filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId,
-                })),
-            });
-            const results = Array.isArray(response?.results) ? response.results : [];
-            batch.forEach((req, index) => {
-                const result = results[index];
-                if (result && !result.error) {
-                    req.resolve(result);
-                } else {
-                    req.reject(new Error(result?.error || 'Batch finalize failed for this file.'));
-                }
-            });
-        } catch (err) {
-            batch.forEach((req) => req.reject(err));
-        }
+        // Dispatch through the shared queue (see enqueueFinalizeBatchDispatchRef)
+        // instead of calling postUploadWithRetry directly -- this is what
+        // caps concurrent /upload/finalize-batch requests against the backend.
+        enqueueFinalizeBatchDispatchRef.current(async () => {
+            try {
+                const response = await postUploadWithRetry('/upload/finalize-batch', {
+                    files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId }) => ({
+                        filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId,
+                    })),
+                });
+                const results = Array.isArray(response?.results) ? response.results : [];
+                batch.forEach((req, index) => {
+                    const result = results[index];
+                    if (result && !result.error) {
+                        req.resolve(result);
+                    } else {
+                        req.reject(new Error(result?.error || 'Batch finalize failed for this file.'));
+                    }
+                });
+            } catch (err) {
+                batch.forEach((req) => req.reject(err));
+            }
+        });
     };
 
     const requestBatchedFinalize = (payload: {
