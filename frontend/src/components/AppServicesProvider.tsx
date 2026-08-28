@@ -725,13 +725,21 @@ export const NotificationBell: React.FC = () => {
             <button
                 type="button"
                 onClick={() => {
-                    setShowNotifications((prev) => {
-                        const next = !prev;
-                        if (next) {
-                            markAllNotificationsRead();
-                        }
-                        return next;
-                    });
+                    // Deliberately not the setShowNotifications(prev => ...)
+                    // updater form: React can invoke that updater outside a
+                    // normal event context, and it was calling
+                    // markAllNotificationsRead() (a DIFFERENT component's
+                    // state setter, from AppServicesProvider) from inside it
+                    // -- triggering "Cannot update a component while
+                    // rendering a different component". A plain click handler
+                    // always sees the latest showNotifications from this
+                    // render, so there's no staleness risk in reading it
+                    // directly instead.
+                    const next = !showNotifications;
+                    setShowNotifications(next);
+                    if (next) {
+                        markAllNotificationsRead();
+                    }
                 }}
                 className="btn btn-soft notification-bell"
                 aria-label="Open notifications"
@@ -2211,7 +2219,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             chunkSizeBytes?: number;
             blockConcurrency?: number;
         },
-    ): Promise<{ skippedDuplicate: boolean }> => {
+    ): Promise<{ skippedDuplicate: true } | { skippedDuplicate: false; sha256: string; uploadId: string }> => {
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
@@ -2266,7 +2274,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const chunkSize = file.size <= stagingBlockSize ? file.size : stagingBlockSize;
             const BlockBlobClient = await loadBlockBlobClient();
             const blockBlobClient = new BlockBlobClient(initResponse.blobUrl);
-            let skippedDuplicate = false;
 
             // Enumerate every block up front. Block IDs are derived from the block
             // index, so blocks can be staged out of order and in parallel — the final
@@ -2379,20 +2386,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     blobContentType: file.type || 'application/octet-stream',
                 },
             });
-            const completeResponse = await postFinalizeWithRetry({
-                filename: file.name,
-                uploadId: initResponse.uploadId,
-                totalSize: file.size,
-                contentType: file.type || 'application/octet-stream',
-                sha256,
-            }, options?.signal);
-            if (Array.isArray(completeResponse?.duplicates) && completeResponse.duplicates.length > 0) {
-                skippedDuplicate = true;
-            }
-            // Newly-stored content keeps the claim set above; a server-detected
-            // duplicate also leaves it in place (it's already correctly pointing
-            // at whichever filename actually holds this content).
-            return { skippedDuplicate };
+            // The bytes are now durably committed to blob storage -- everything
+            // left (register/dedup/queue this upload via /upload/finalize) is
+            // backend bookkeeping, not data transfer, and measured at 20-90s+
+            // per file under load (see the upload-speed investigation this
+            // session). Returning here instead of also awaiting finalize lets
+            // the caller immediately reuse this lane for the next file's
+            // blocks while finalize runs in the background (finalizeUploadedFile
+            // in runUploadSession) -- staying in this function to await it was
+            // leaving lanes idle ~80% of the time even though each chunk itself
+            // transfers fast.
+            return { skippedDuplicate: false, sha256, uploadId: initResponse.uploadId };
         } catch (err) {
             // This upload didn't finish, so nothing was actually stored under
             // this hash -- release the claim (only if it's still ours; a
@@ -2616,8 +2620,120 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 void task.finally(() => parallelThumbnailTasks.delete(task));
             };
 
-            let nextFileIndex = 0;
             let failedPreviewCount = 0;
+
+            // Shared by the worker's own catch (staging/commit failures) and
+            // finalizeUploadedFile's catch (finalize failures) below -- both
+            // need to report a file as failed the same way, just from
+            // different points in the (now-decoupled) per-file pipeline.
+            const markFileFailed = async (fileMeta: PersistedUploadFile, resolvedFile: File | null, err: unknown) => {
+                totalFailed += 1;
+                let previewDataUrl: string | undefined;
+                if (resolvedFile && failedPreviewCount < MAX_FAILED_FILE_PREVIEWS) {
+                    failedPreviewCount += 1;
+                    try {
+                        const thumb = await createBrowserThumbnail(resolvedFile);
+                        if (thumb?.dataUrl) {
+                            previewDataUrl = thumb.dataUrl;
+                        }
+                    } catch {
+                        // Best-effort only (e.g. RAW formats have no client-side
+                        // decoder) -- the failed file still shows by name.
+                    }
+                }
+                updatePersistedFile(fileMeta.key, {
+                    status: 'failed',
+                    error: uploadSourceFilesRef.current.has(fileMeta.key)
+                        ? `${getUploadErrorMessage(err, 'Upload failed for this file.')} Please reselect this file to retry.`
+                        : getUploadErrorMessage(err, 'Upload failed for this file.'),
+                    previewDataUrl,
+                });
+                updateNotification(notificationId, {
+                    title: 'Upload in progress',
+                    details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
+                    progress: {
+                        uploadedCount: totalUploaded,
+                        totalCount,
+                        failedCount: totalFailed,
+                        skippedDuplicateCount: totalSkippedDuplicates,
+                        mbPerSecond: currentUploadRate(),
+                    },
+                });
+            };
+
+            // Runs in the background, NOT awaited by the worker loop below --
+            // see the comment at uploadFileInChunks's return for why. Tracked in
+            // pendingFinalizeTasks so runUploadSession can wait for all of them
+            // to settle before deciding the session is actually complete (a file
+            // isn't really done just because its lane moved on).
+            const pendingFinalizeTasks = new Set<Promise<void>>();
+            const finalizeUploadedFile = async (
+                file: File,
+                fileMeta: PersistedUploadFile,
+                controller: AbortController,
+                staged: { sha256: string; uploadId: string },
+            ): Promise<void> => {
+                try {
+                    const completeResponse = await postFinalizeWithRetry({
+                        filename: file.name,
+                        uploadId: staged.uploadId,
+                        totalSize: file.size,
+                        contentType: file.type || 'application/octet-stream',
+                        sha256: staged.sha256,
+                    }, controller.signal);
+                    const skippedDuplicate = Array.isArray(completeResponse?.duplicates) && completeResponse.duplicates.length > 0;
+
+                    totalUploaded += 1;
+                    if (skippedDuplicate) {
+                        totalSkippedDuplicates += 1;
+                    }
+                    updatePersistedFile(fileMeta.key, {
+                        status: 'done',
+                        uploadedBytes: fileMeta.size,
+                        skippedDuplicate,
+                        error: undefined,
+                    });
+                    if (!skippedDuplicate) {
+                        kickOffThumbnailForFile(file, fileMeta.name);
+                    }
+                    uploadSourceFilesRef.current.delete(fileMeta.key);
+                    await idbDelete(fileMeta.key);
+                    updateNotification(notificationId, {
+                        title: 'Upload in progress',
+                        details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
+                        progress: {
+                            uploadedCount: totalUploaded,
+                            totalCount,
+                            failedCount: totalFailed,
+                            skippedDuplicateCount: totalSkippedDuplicates,
+                            mbPerSecond: currentUploadRate(),
+                        },
+                    });
+                } catch (err) {
+                    // This upload didn't finish, so nothing was actually stored
+                    // under this hash -- release the claim so a later file with
+                    // the same content is retried instead of silently skipped
+                    // (mirrors uploadFileInChunks's own rollback for a
+                    // staging-phase failure).
+                    if (knownHashesRef.current.get(staged.sha256) === file.name) {
+                        knownHashesRef.current.delete(staged.sha256);
+                    }
+                    if (uploadStopRequestedRef.current || isUploadStoppedError(err)) {
+                        // A deliberate Stop, not a real failure -- leave the file
+                        // at whatever status it already had ('finalizing', set
+                        // by onFinalizeStarted below) so a future resume retries
+                        // it naturally (its already-committed blocks are still
+                        // persisted via onBlockCommitted, so resume won't
+                        // re-stage them, just re-attempt finalize).
+                        return;
+                    }
+                    await markFileFailed(fileMeta, file, err);
+                } finally {
+                    uploadAbortControllersRef.current.delete(controller);
+                }
+            };
+
+            let nextFileIndex = 0;
             const worker = async () => {
                 while (true) {
                     if (uploadStopRequestedRef.current) {
@@ -2667,10 +2783,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         resolvedFileForFailurePreview = resolvedFile;
                         const controller = new AbortController();
                         uploadAbortControllersRef.current.add(controller);
-                        let result: { skippedDuplicate: boolean };
                         const chunkSizeBytes = fileMeta.chunkSizeBytes || uploadProfile.chunkSizeBytes;
+                        let staged: Awaited<ReturnType<typeof uploadFileInChunks>>;
                         try {
-                            result = await uploadFileInChunks(resolvedFile, {
+                            staged = await uploadFileInChunks(resolvedFile, {
                                 startByte: fileMeta.uploadedBytes,
                                 existingUploadId: fileMeta.uploadId,
                                 existingBlockIds: fileMeta.blockIds,
@@ -2695,69 +2811,70 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 chunkSizeBytes,
                                 blockConcurrency: perFileBlockConcurrency,
                             });
-                        } finally {
+                        } catch (err) {
+                            // Ownership of removing this controller from
+                            // uploadAbortControllersRef passes to whichever path
+                            // runs next (the inline duplicate branch, or
+                            // finalizeUploadedFile's own finally) -- but neither
+                            // of those runs if staging/commit itself throws, so
+                            // this is the one path that must clean it up itself.
                             uploadAbortControllersRef.current.delete(controller);
+                            throw err;
                         }
 
-                        totalUploaded += 1;
-                        if (result.skippedDuplicate) {
+                        if (staged.skippedDuplicate) {
+                            // No network work left for this file at all (the
+                            // client-side known-hash check short-circuited
+                            // before init/stage/finalize) -- resolve it inline,
+                            // nothing to background.
+                            uploadAbortControllersRef.current.delete(controller);
+                            totalUploaded += 1;
                             totalSkippedDuplicates += 1;
+                            updatePersistedFile(fileMeta.key, {
+                                status: 'done',
+                                uploadedBytes: fileMeta.size,
+                                skippedDuplicate: true,
+                                error: undefined,
+                            });
+                            uploadSourceFilesRef.current.delete(fileMeta.key);
+                            await idbDelete(fileMeta.key);
+                            updateNotification(notificationId, {
+                                title: 'Upload in progress',
+                                details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
+                                progress: {
+                                    uploadedCount: totalUploaded,
+                                    totalCount,
+                                    failedCount: totalFailed,
+                                    skippedDuplicateCount: totalSkippedDuplicates,
+                                    mbPerSecond: currentUploadRate(),
+                                },
+                            });
+                        } else {
+                            // Bytes are committed to blob storage -- hand the
+                            // slow part (register/dedup/queue via
+                            // /upload/finalize) to the background and grab the
+                            // next file immediately instead of idling this
+                            // lane's connection budget for 20-90s+.
+                            const finalizeTask = finalizeUploadedFile(resolvedFile, fileMeta, controller, staged)
+                                .finally(() => { pendingFinalizeTasks.delete(finalizeTask); });
+                            pendingFinalizeTasks.add(finalizeTask);
                         }
-
-                        updatePersistedFile(fileMeta.key, {
-                            status: 'done',
-                            uploadedBytes: fileMeta.size,
-                            skippedDuplicate: result.skippedDuplicate,
-                            error: undefined,
-                        });
-                        if (!result.skippedDuplicate) {
-                            kickOffThumbnailForFile(resolvedFile, fileMeta.name);
-                        }
-                        uploadSourceFilesRef.current.delete(fileMeta.key);
-                        await idbDelete(fileMeta.key);
                     } catch (err) {
                         if (uploadStopRequestedRef.current || isUploadStoppedError(err)) {
                             throw new Error(UPLOAD_STOPPED_ERROR);
                         }
-                        totalFailed += 1;
-                        let previewDataUrl: string | undefined;
-                        if (resolvedFileForFailurePreview && failedPreviewCount < MAX_FAILED_FILE_PREVIEWS) {
-                            failedPreviewCount += 1;
-                            try {
-                                const thumb = await createBrowserThumbnail(resolvedFileForFailurePreview);
-                                if (thumb?.dataUrl) {
-                                    previewDataUrl = thumb.dataUrl;
-                                }
-                            } catch {
-                                // Best-effort only (e.g. RAW formats have no client-side
-                                // decoder) -- the failed file still shows by name.
-                            }
-                        }
-                        updatePersistedFile(fileMeta.key, {
-                            status: 'failed',
-                            error: uploadSourceFilesRef.current.has(fileMeta.key)
-                                ? `${getUploadErrorMessage(err, 'Upload failed for this file.')} Please reselect this file to retry.`
-                                : getUploadErrorMessage(err, 'Upload failed for this file.'),
-                            previewDataUrl,
-                        });
+                        await markFileFailed(fileMeta, resolvedFileForFailurePreview, err);
                     }
-
-                    updateNotification(notificationId, {
-                        title: 'Upload in progress',
-                        details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
-                        progress: {
-                            uploadedCount: totalUploaded,
-                            totalCount,
-                            failedCount: totalFailed,
-                            skippedDuplicateCount: totalSkippedDuplicates,
-                            mbPerSecond: currentUploadRate(),
-                        },
-                    });
                 }
             };
 
             await knownHashesPromise;
             await Promise.all(Array.from({ length: activeLaneCount }, () => worker()));
+            // Lanes only stage+commit bytes now; the backend confirmation for
+            // each file is still finishing in the background (see
+            // finalizeUploadedFile above) -- wait for all of it before treating
+            // any completion/retry/failure count below as final.
+            await Promise.all(Array.from(pendingFinalizeTasks));
 
             // Automatically retry files that just failed, still inside this same
             // run -- their bytes are still in uploadSourceFilesRef/uploadHandlesRef
@@ -2796,6 +2913,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 nextFileIndex = 0;
                 const retryLaneCount = Math.max(1, Math.min(activeLaneCount, retryCandidates.length));
                 await Promise.all(Array.from({ length: retryLaneCount }, () => worker()));
+                await Promise.all(Array.from(pendingFinalizeTasks));
             }
 
             // Deliberately NOT awaited: parallelThumbnailTasks (the browser-side

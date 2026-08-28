@@ -467,13 +467,29 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // each additional worker duplicates that baseline RSS, while
             // threads share it.
             { name: 'GUNICORN_WORKERS', value: '1' }
-            // 2.5Gi/1.25vCPU sized to comfortably hold 4 gthread threads (each
-            // able to run a media/zip request) on top of the 1-worker
-            // scientific-stack baseline above. 2026-08-10: live was manually
-            // dropped to 0.25vCPU/0.5Gi while this stayed at 4, causing a
-            // continuous OOM crash loop (exit 137) that broke uploads --
-            // don't shrink cpu/memory here without shrinking this to match,
-            // and don't shrink live without also shrinking this file.
+            // 2026-08-28: tried raising 4->12 live on photostore-test to fix
+            // slow /upload/finalize|init-batch|client-processing|processing-
+            // claim calls (each 20-90s+, ~19-28 concurrent against a 20-slot
+            // fleet ceiling of 1 worker x 4 threads x 5 replicas -- looked
+            // like textbook thread starvation, and CPU was only 70-90%/
+            // replica, not pegged, seemingly ruling out CPU as the limit).
+            // A second real HAR taken ~10min after the bump proved this
+            // wrong: /upload/processing/claim (genuinely I/O-wait-bound --
+            // a lease check) got dramatically faster (p50 0.3s->0.2s, p90
+            // 45s->0.4s), but finalize/init-batch/client-processing got
+            // WORSE (p50 37-45s->60-67s, p90 85-94s->197-240s, with p90/max
+            // suspiciously clustered right at 240s across all three --
+            // signature of a request/gateway timeout being hit under
+            // contention, not organic slowness). Conclusion: those 3
+            // handlers do enough CPU-bound Python work that more threads
+            // caused GIL contention to dominate instead of relieving an I/O
+            // queue -- same oversubscription failure mode already hit once
+            // on ipworker's IPWORKER_CONCURRENCY (see docs/ipworker-
+            // architecture.md), this time on the web tier. Reverted live to
+            // 4 the same session. Don't re-raise this without first finding
+            // and fixing (or moving off-thread) whatever CPU-bound work
+            // those 3 handlers do per call -- more threads alone made it
+            // worse, not better.
             { name: 'GUNICORN_THREADS', value: '4' }
             // Prime vector indexes lazily on demand; eager startup priming can
             // inflate idle RSS and duplicate index memory across workers.
