@@ -1636,6 +1636,51 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     };
     const postInitWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/init', payload, signal);
 
+    // Same retry/backoff schedule as postUploadWithRetry above, but for calls
+    // that run through a small shared dispatch gate (initDispatchGateRef/
+    // finalizeDispatchGateRef, capacity 2 -- see flushInitBatch/
+    // flushFinalizeBatch). postUploadWithRetry sleeps *while still holding*
+    // whatever slot it was given, so a single request stuck retriable-failing
+    // (each attempt can run up to Azure's ~240s ingress timeout) could occupy
+    // a slot for MAX_FINALIZE_RETRIES * 240s -- tens of minutes. With only 2
+    // slots total, two such stragglers wedged the entire init/finalize
+    // pipeline for every other pending file (head-of-line blocking/convoy).
+    // Here each attempt is its own gate.run() job, so the slot is released
+    // the instant an attempt settles and the backoff sleep + next attempt
+    // happen off-gate, competing fairly with other pending batches instead
+    // of monopolizing a slot to do nothing but wait.
+    const runGatedRequestWithRetry = (
+        gate: ReturnType<typeof createDispatchGate>,
+        url: string,
+        payload: any,
+    ): Promise<any> => new Promise((resolve, reject) => {
+        const attemptOnce = (attempt: number) => {
+            gate.run(async () => {
+                if (uploadStopRequestedRef.current) {
+                    reject(new Error(UPLOAD_STOPPED_ERROR));
+                    return;
+                }
+                try {
+                    resolve(await postUpload(url, payload));
+                } catch (err) {
+                    if (attempt >= MAX_FINALIZE_RETRIES - 1 || !isRetriableUploadError(err)) {
+                        reject(err);
+                        return;
+                    }
+                    const delay = Math.min(1000 * Math.pow(2, attempt), 15000);
+                    void (async () => {
+                        if (!navigator.onLine) {
+                            await waitForOnline();
+                        }
+                        await sleep(delay);
+                        attemptOnce(attempt + 1);
+                    })();
+                }
+            });
+        };
+        attemptOnce(0);
+    });
+
     // Fresh (non-resumed) uploads register in chunks via /upload/init-batch
     // instead of one /upload/init HTTP round trip per file -- each of the
     // (up to ~20) concurrent upload lanes calls requestBatchedInit for its own
@@ -1688,11 +1733,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const batch = pendingBatchInitRef.current;
         pendingBatchInitRef.current = [];
-        gate.run(async () => {
-            try {
-                const response = await postUploadWithRetry('/upload/init-batch', {
-                    files: batch.map(({ filename, totalSize, sha256 }) => ({ filename, totalSize, sha256 })),
-                });
+        runGatedRequestWithRetry(gate, '/upload/init-batch', {
+            files: batch.map(({ filename, totalSize, sha256 }) => ({ filename, totalSize, sha256 })),
+        })
+            .then((response) => {
                 const results = Array.isArray(response?.results) ? response.results : [];
                 batch.forEach((req, index) => {
                     const result = results[index];
@@ -1702,10 +1746,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         req.reject(new Error(result?.error || 'Batch init failed for this file.'));
                     }
                 });
-            } catch (err) {
+            })
+            .catch((err) => {
                 batch.forEach((req) => req.reject(err));
-            }
-        });
+            });
     };
 
     const requestBatchedInit = (filename: string, totalSize: number, sha256: string): Promise<any> => (
@@ -1784,13 +1828,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const batch = pendingBatchFinalizeRef.current;
         pendingBatchFinalizeRef.current = [];
-        gate.run(async () => {
-            try {
-                const response = await postUploadWithRetry('/upload/finalize-batch', {
-                    files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId }) => ({
-                        filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId,
-                    })),
-                });
+        runGatedRequestWithRetry(gate, '/upload/finalize-batch', {
+            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId }) => ({
+                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId,
+            })),
+        })
+            .then((response) => {
                 const results = Array.isArray(response?.results) ? response.results : [];
                 batch.forEach((req, index) => {
                     const result = results[index];
@@ -1800,10 +1843,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         req.reject(new Error(result?.error || 'Batch finalize failed for this file.'));
                     }
                 });
-            } catch (err) {
+            })
+            .catch((err) => {
                 batch.forEach((req) => req.reject(err));
-            }
-        });
+            });
     };
 
     const requestBatchedFinalize = (payload: {

@@ -3,6 +3,7 @@ import { ArrowLeftIcon, ArrowUturnLeftIcon, ArrowsRightLeftIcon, CheckIcon, Excl
 import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import faceService from '../services/faceService';
 import { resolveApiUrl } from '../services/apiClient';
+import { isAuthEnabled } from '../services/authClient';
 import { showToast } from '../services/toast';
 import { requestJobPoll } from '../services/jobNotifications';
 import { useProtectedBlobUrls } from '../services/imageClient';
@@ -479,9 +480,15 @@ const PersonDetail: React.FC = () => {
                             {displayFaces.map((f: PersonFace) => {
                                 const faceId = f.faceId || '';
                                 const path = f.filename ? `/api/photos/thumbnail/${encodeURIComponent(f.filename)}` : '';
+                                // resolveApiUrl(path) is an absolute cross-origin backend URL in
+                                // deployments where the frontend/backend are on different origins
+                                // (the norm here) -- CSP img-src only allows 'self' and blob storage,
+                                // so it must not be used as a live <img> src while auth is enabled.
+                                // Only fall back to it when auth is off (same-origin proxy setups);
+                                // otherwise wait for the protected blob: URL and show the placeholder.
                                 const thumbSrc = isDirectUrl(f.thumbnailUrl)
                                     ? f.thumbnailUrl
-                                    : (protectedImageUrls[path] || resolveApiUrl(path));
+                                    : (protectedImageUrls[path] || (isAuthEnabled() ? '' : resolveApiUrl(path)));
                                 const suspicious = isSuspiciousFace(f);
                                 const singleFaceCluster = displayFaces.length === 1 && (person?.name || '').toLowerCase().startsWith('unnamed');
                                 return (
@@ -593,7 +600,7 @@ const PersonDetail: React.FC = () => {
                                     const path = f.filename ? `/api/photos/thumbnail/${encodeURIComponent(f.filename)}` : '';
                                     const thumbSrc = isDirectUrl(f.thumbnailUrl)
                                         ? f.thumbnailUrl
-                                        : (protectedSuggestionUrls[path] || resolveApiUrl(path));
+                                        : (protectedSuggestionUrls[path] || (isAuthEnabled() ? '' : resolveApiUrl(path)));
                                     const matchPct = typeof f.similarity === 'number' ? Math.round(f.similarity * 100) : null;
                                     return (
                                         <div key={faceId || `${f.filename}-${f.bbox?.left}-${f.bbox?.top}`} className="photo-card person-face-card">
