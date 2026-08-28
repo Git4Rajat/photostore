@@ -864,6 +864,15 @@ const formatBrowserProcessingNotificationDetails = (
 export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [notifications, setNotifications] = useState<AppNotification[]>([]);
     const [uploading, setUploading] = useState<boolean>(false);
+    // True from the moment runUploadSession flips `uploading` false early
+    // (all bytes transferred) until its background finalize/retry tail
+    // actually finishes -- distinct from `uploading` specifically so the
+    // queued-batch drain effect below doesn't start a new session while
+    // isResumingUploadRef.current is still held (which would silently no-op
+    // against runUploadSession's own re-entrancy guard). isResumingUploadRef
+    // itself isn't usable here since it's a ref -- effects don't re-run when
+    // a ref changes, only when real state does.
+    const [backgroundUploadTailActive, setBackgroundUploadTailActive] = useState<boolean>(false);
     const [pendingUploadSession, setPendingUploadSession] = useState<PersistedUploadSession | null>(null);
     // Live mirror of pendingUploadSession for startUpload's re-entrancy guard.
     // React-state closures go stale inside a long async chain (e.g.
@@ -1650,14 +1659,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // /upload/finalize-batch: same reasoning as /upload/init-batch above, for
     // the finalize step instead. Each lane's background finalizeUploadedFile
     // task (see runUploadSession) reaches this call independently, once its
-    // own file's blocks are committed -- with the lane-blocking fix in place,
-    // several of these can now land within milliseconds of each other, which
-    // is exactly the case this batches away. finalize_uploaded_file itself is
+    // own file's blocks are committed. finalize_uploaded_file itself is
     // unchanged server-side; this only cuts how many separate HTTP
     // requests/gunicorn threads are spent invoking it.
+    //
+    // Wider window than init-batch's on purpose: a live HAR during a real
+    // upload measured a 5.35s MEDIAN gap between consecutive files becoming
+    // finalize-ready (init's arrivals cluster at session start; finalize's
+    // don't -- each file's readiness is staggered by however long its own
+    // staging took). A short window mostly catches nothing under that
+    // arrival pattern. This can afford to be generous specifically because
+    // "Upload complete" no longer waits on finalize settling (see
+    // runUploadSession) -- the wait is now invisible background latency, not
+    // time the user watches a spinner for, so trading a few seconds of
+    // additional background delay for meaningfully larger batches is free.
     const FINALIZE_BATCH_MAX_SIZE = 12;
-    const FINALIZE_BATCH_DEBOUNCE_MS = 50;
-    const FINALIZE_BATCH_MAX_WAIT_MS = 250;
+    const FINALIZE_BATCH_DEBOUNCE_MS = 200;
+    const FINALIZE_BATCH_MAX_WAIT_MS = 2500;
 
     const flushFinalizeBatch = async () => {
         const batch = pendingBatchFinalizeRef.current;
@@ -2567,7 +2585,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // transfer is back to full speed. Only the last RATE_WINDOW_MS of
         // progress is used, so the displayed number tracks current
         // conditions instead of the whole session's history.
-        const RATE_WINDOW_MS = 10000;
+        const RATE_WINDOW_MS = 10 * 60 * 1000;
         const rateSamples: Array<{ t: number; bytes: number }> = [{ t: uploadStartedAt, bytes: 0 }];
         const recordRateSample = () => {
             const now = Date.now();
@@ -2972,6 +2990,36 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             await knownHashesPromise;
             await Promise.all(Array.from({ length: activeLaneCount }, () => worker()));
+
+            // Every lane has finished transferring bytes (whether by running out
+            // of files or a Stop request) -- what's left below (backend finalize
+            // confirmation, possible auto-retries) is bookkeeping that can take
+            // tens of seconds to minutes under load, not data transfer, so the
+            // user shouldn't have to keep watching a spinner for it. Flip the
+            // UI-visible "uploading" state now and let it run to completion in
+            // the background; isResumingUploadRef stays true (unchanged) so this
+            // function still can't run twice at once. startUpload and
+            // retryPersistedUploadSession both additionally check
+            // isResumingUploadRef.current now (not just `uploading`) so a new
+            // selection made during this window queues via
+            // queuedUploadBatchesRef the same way it would during an actively
+            // transferring upload, instead of silently no-op'ing against
+            // runUploadSession's own re-entrancy guard below.
+            if (!uploadStopRequestedRef.current) {
+                setUploading(false);
+                uploadingRef.current = false;
+                const stillFinalizing = pendingFinalizeTasks.size;
+                if (stillFinalizing > 0) {
+                    setBackgroundUploadTailActive(true);
+                }
+                updateNotification(notificationId, {
+                    title: stillFinalizing > 0 ? 'Upload transferred' : 'Upload complete',
+                    details: stillFinalizing > 0
+                        ? `All bytes transferred. Confirming ${plural(stillFinalizing, 'file')} in the background.`
+                        : `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}.`,
+                });
+            }
+
             // Lanes only stage+commit bytes now; the backend confirmation for
             // each file is still finishing in the background (see
             // finalizeUploadedFile above) -- wait for all of it before treating
@@ -3116,6 +3164,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         } finally {
             setUploading(false);
             uploadingRef.current = false;
+            setBackgroundUploadTailActive(false);
             isResumingUploadRef.current = false;
             uploadSourceFilesRef.current.clear();
             uploadHandlesRef.current.clear();
@@ -3234,7 +3283,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const retryPersistedUploadSession = useCallback(async () => {
         const session = pendingUploadSession || loadPersistedSession();
-        if (!session || uploading) {
+        // isResumingUploadRef, not just `uploading`: runUploadSession now flips
+        // `uploading` false as soon as bytes finish transferring, while its own
+        // background finalize/retry tail (guarded by isResumingUploadRef) can
+        // still be running -- calling runUploadSession again here while that's
+        // true would just silently no-op against its own re-entrancy guard.
+        if (!session || uploading || isResumingUploadRef.current) {
             return;
         }
         const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
@@ -3393,7 +3447,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             showToast(message, { variant: 'error' });
             return;
         }
-        if (uploading) {
+        // isResumingUploadRef, not just `uploading` -- see the comment on the
+        // same check in retryPersistedUploadSession. Without it, a selection
+        // made while a previous session's finalize/retry tail is still
+        // draining in the background would fall through to a genuinely new
+        // runUploadSession call that immediately no-ops (its own re-entrancy
+        // guard is still held), silently dropping the files instead of
+        // queueing them.
+        if (uploading || isResumingUploadRef.current) {
             queuedUploadBatchesRef.current.push(filesToUpload);
             setQueuedUploadFileCount((count) => count + filesToUpload.length);
             addNotification(
@@ -3634,11 +3695,20 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         if (selectedFiles.length > 0) {
             // loadPersistedSession() reflects the live session while a healthy
-            // upload is actively running too, so gate that fallback on !uploading
-            // -- otherwise files picked from a second folder mid-upload would be
-            // matched against the in-flight session's files (and fail to match)
-            // instead of being queued via startUpload below.
-            if (pendingUploadSession || (!uploading && loadPersistedSession())) {
+            // upload is actively running too, so gate that fallback on
+            // !uploading -- otherwise files picked from a second folder
+            // mid-upload would be matched against the in-flight session's
+            // files (and fail to match) instead of being queued via
+            // startUpload below. isResumingUploadRef.current is ALSO required
+            // now, not just !uploading: runUploadSession flips `uploading`
+            // false as soon as bytes finish transferring, while its
+            // background finalize/retry tail (isResumingUploadRef) can still
+            // be running and still persisting the in-flight session to
+            // localStorage with non-'done' files -- without this,
+            // loadPersistedSession() would match that still-active session
+            // and misroute a new selection into "attach to paused session"
+            // instead of queueing it via startUpload.
+            if (pendingUploadSession || (!uploading && !isResumingUploadRef.current && loadPersistedSession())) {
                 void (async () => {
                     try {
                         const { matchedCount, unmatchedFiles } = await attachSelectedFilesToPendingSession(selectedFiles);
@@ -3715,8 +3785,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // sitting in a paused/needs-retry state. See startUpload's `uploading`
     // branch for how batches get queued, and stopActiveUpload for why an
     // explicit stop clears the queue instead of letting it drain here.
+    //
+    // backgroundUploadTailActive, not just `uploading`: runUploadSession now
+    // flips `uploading` false as soon as bytes finish transferring, while its
+    // background finalize/retry tail can still be running (isResumingUploadRef
+    // held). Without this check, this effect would fire the instant
+    // `uploading` goes false and call startUpload for the next queued batch,
+    // which would immediately no-op against runUploadSession's still-held
+    // re-entrancy guard -- silently losing that batch instead of starting it
+    // once the tail actually finishes.
     useEffect(() => {
-        if (uploading || pendingUploadSession) {
+        if (uploading || pendingUploadSession || backgroundUploadTailActive) {
             return;
         }
         if (queuedUploadBatchesRef.current.length === 0) {
@@ -3727,7 +3806,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             setQueuedUploadFileCount((count) => Math.max(0, count - nextBatch.length));
             void startUpload(nextBatch);
         }
-    }, [uploading, pendingUploadSession, startUpload]);
+    }, [uploading, pendingUploadSession, backgroundUploadTailActive, startUpload]);
 
     useEffect(() => {
         const restored = loadPersistedSession();
@@ -3792,7 +3871,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [startBrowserProcessing]);
 
     useEffect(() => {
-        const active = uploading || uploadStartInProgressRef.current;
+        // backgroundUploadTailActive included: closing the tab while finalize
+        // calls are still in flight (or still sitting in the batch debounce
+        // window) abandons them mid-request -- those files' blobs are already
+        // in storage but would never get a metadata row, orphaning them until
+        // a future resume happens to notice the persisted session's still-
+        // 'finalizing' status. `uploading` alone no longer covers this window
+        // now that runUploadSession flips it false as soon as bytes finish
+        // transferring, ahead of that background tail completing.
+        const active = uploading || backgroundUploadTailActive || uploadStartInProgressRef.current;
         try {
             sessionStorage.setItem('photostore.upload.active', active ? '1' : '0');
         } catch {
@@ -3807,7 +3894,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         };
         window.addEventListener('beforeunload', handleBeforeUnload);
         return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-    }, [uploading]);
+    }, [uploading, backgroundUploadTailActive]);
 
     const browserAiReasonText = formatBrowserAiReason(browserAiModelState);
     const browserAiButtonDisabled = browserAiModelState.status === 'checking'
