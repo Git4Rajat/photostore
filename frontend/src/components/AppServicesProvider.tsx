@@ -980,6 +980,24 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }>>([]);
     const batchInitDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const batchInitMaxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // Coalesces concurrent /upload/finalize calls (one per just-committed
+    // upload, fired from the background finalizeUploadedFile task -- see
+    // runUploadSession) into /upload/finalize-batch requests -- see
+    // requestBatchedFinalize below. Mirrors pendingBatchInitRef/flushInitBatch.
+    const pendingBatchFinalizeRef = useRef<Array<{
+        filename: string;
+        uploadId: string;
+        totalSize: number;
+        contentType: string;
+        sha256: string;
+        clientProcessing?: unknown;
+        clientProcessingReport?: unknown;
+        clientAssetId?: string;
+        resolve: (value: any) => void;
+        reject: (err: unknown) => void;
+    }>>([]);
+    const batchFinalizeDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const batchFinalizeMaxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1545,7 +1563,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         throw lastError || new Error(`Request to ${url} failed.`);
     };
     const postInitWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/init', payload, signal);
-    const postFinalizeWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/finalize', payload, signal);
 
     // Fresh (non-resumed) uploads register in chunks via /upload/init-batch
     // instead of one /upload/init HTTP round trip per file -- each of the
@@ -1626,6 +1643,85 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             batchInitDebounceTimerRef.current = setTimeout(() => { void flushInitBatch(); }, INIT_BATCH_DEBOUNCE_MS);
             if (!batchInitMaxWaitTimerRef.current) {
                 batchInitMaxWaitTimerRef.current = setTimeout(() => { void flushInitBatch(); }, INIT_BATCH_MAX_WAIT_MS);
+            }
+        })
+    );
+
+    // /upload/finalize-batch: same reasoning as /upload/init-batch above, for
+    // the finalize step instead. Each lane's background finalizeUploadedFile
+    // task (see runUploadSession) reaches this call independently, once its
+    // own file's blocks are committed -- with the lane-blocking fix in place,
+    // several of these can now land within milliseconds of each other, which
+    // is exactly the case this batches away. finalize_uploaded_file itself is
+    // unchanged server-side; this only cuts how many separate HTTP
+    // requests/gunicorn threads are spent invoking it.
+    const FINALIZE_BATCH_MAX_SIZE = 12;
+    const FINALIZE_BATCH_DEBOUNCE_MS = 50;
+    const FINALIZE_BATCH_MAX_WAIT_MS = 250;
+
+    const flushFinalizeBatch = async () => {
+        const batch = pendingBatchFinalizeRef.current;
+        pendingBatchFinalizeRef.current = [];
+        if (batchFinalizeDebounceTimerRef.current) {
+            clearTimeout(batchFinalizeDebounceTimerRef.current);
+            batchFinalizeDebounceTimerRef.current = null;
+        }
+        if (batchFinalizeMaxWaitTimerRef.current) {
+            clearTimeout(batchFinalizeMaxWaitTimerRef.current);
+            batchFinalizeMaxWaitTimerRef.current = null;
+        }
+        if (batch.length === 0) {
+            return;
+        }
+        try {
+            const response = await postUploadWithRetry('/upload/finalize-batch', {
+                files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId }) => ({
+                    filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId,
+                })),
+            });
+            const results = Array.isArray(response?.results) ? response.results : [];
+            batch.forEach((req, index) => {
+                const result = results[index];
+                if (result && !result.error) {
+                    req.resolve(result);
+                } else {
+                    req.reject(new Error(result?.error || 'Batch finalize failed for this file.'));
+                }
+            });
+        } catch (err) {
+            batch.forEach((req) => req.reject(err));
+        }
+    };
+
+    const requestBatchedFinalize = (payload: {
+        filename: string;
+        uploadId: string;
+        totalSize: number;
+        contentType: string;
+        sha256: string;
+        clientProcessing?: unknown;
+        clientProcessingReport?: unknown;
+        clientAssetId?: string;
+    }): Promise<any> => (
+        new Promise((resolve, reject) => {
+            // Same same-filename guard as requestBatchedInit -- two entries
+            // for the identical filename landing in the same finalize-batch
+            // request would both try to create/rename the same metadata row
+            // in one loop iteration each, immediately after each other.
+            if (pendingBatchFinalizeRef.current.some((req) => req.filename === payload.filename)) {
+                void flushFinalizeBatch();
+            }
+            pendingBatchFinalizeRef.current.push({ ...payload, resolve, reject });
+            if (pendingBatchFinalizeRef.current.length >= FINALIZE_BATCH_MAX_SIZE) {
+                void flushFinalizeBatch();
+                return;
+            }
+            if (batchFinalizeDebounceTimerRef.current) {
+                clearTimeout(batchFinalizeDebounceTimerRef.current);
+            }
+            batchFinalizeDebounceTimerRef.current = setTimeout(() => { void flushFinalizeBatch(); }, FINALIZE_BATCH_DEBOUNCE_MS);
+            if (!batchFinalizeMaxWaitTimerRef.current) {
+                batchFinalizeMaxWaitTimerRef.current = setTimeout(() => { void flushFinalizeBatch(); }, FINALIZE_BATCH_MAX_WAIT_MS);
             }
         })
     );
@@ -2674,13 +2770,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 staged: { sha256: string; uploadId: string },
             ): Promise<void> => {
                 try {
-                    const completeResponse = await postFinalizeWithRetry({
+                    // Coalesced with other lanes' just-committed files into one
+                    // /upload/finalize-batch request instead of its own HTTP
+                    // round trip -- see requestBatchedFinalize. No abort signal
+                    // here (matches requestBatchedInit -- a batch call already
+                    // in flight runs to completion rather than being torn down
+                    // mid-request on Stop).
+                    const completeResponse = await requestBatchedFinalize({
                         filename: file.name,
                         uploadId: staged.uploadId,
                         totalSize: file.size,
                         contentType: file.type || 'application/octet-stream',
                         sha256: staged.sha256,
-                    }, controller.signal);
+                    });
                     const skippedDuplicate = Array.isArray(completeResponse?.duplicates) && completeResponse.duplicates.length > 0;
 
                     totalUploaded += 1;
@@ -3650,9 +3752,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     // Keep the backend warm only for browser-side processing, not for uploads.
     // Uploads are already direct-to-blob (see uploadFileInChunks) -- the backend
-    // is only touched briefly per file (init + finalize), and those calls now
-    // retry through a cold start (postInitWithRetry/postFinalizeWithRetry), so
-    // there's no need to pay to keep a replica warm for the whole transfer.
+    // is only touched briefly per file (init + finalize, both batched across
+    // several files per call -- see requestBatchedInit/requestBatchedFinalize),
+    // and those batch calls retry through a cold start (postUploadWithRetry),
+    // so there's no need to pay to keep a replica warm for the whole transfer.
     // Pinging /health every 30s for the duration of a large batch (which can run
     // for a long time, especially backgrounded via BackgroundKeepAlive) was
     // billing the backend as continuously active even though it does almost no

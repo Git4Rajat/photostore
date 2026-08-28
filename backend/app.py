@@ -9850,6 +9850,154 @@ def finalize_direct_upload():
     })
 
 
+@app.route('/upload/finalize-batch', methods=['POST'])
+@app.route('/upload/finalize-batch/', methods=['POST'])
+@app.route('/api/upload/finalize-batch', methods=['POST'])
+@app.route('/api/upload/finalize-batch/', methods=['POST'])
+def finalize_upload_batch():
+    """Batched /upload/finalize for a chunk of just-committed direct-to-blob
+    uploads -- same reasoning as /upload/init-batch
+    (reset_upload_tracking_and_reserve_blobs_batch), applied to finalize.
+
+    Each individual finalize_uploaded_file call is inherently slow (dedup
+    check, metadata write, queue enqueue -- tens of seconds under load,
+    see docs/ipworker-architecture.md-adjacent upload-speed investigation),
+    and one HTTP request per file meant one gunicorn thread held for that
+    whole duration per file. Under concurrent load this both exhausted the
+    fleet's thread pool (requests queueing behind each other) and put
+    multiple finalize calls in real Python-level GIL contention with each
+    other (each concurrently executing real work, not just waiting on I/O).
+    Looping sequentially through a chunk on ONE thread inside ONE request
+    fixes both: one thread instead of N, and no concurrent execution within
+    this chunk to contend over. finalize_uploaded_file itself is untouched --
+    this only changes how many HTTP requests/threads are spent invoking it,
+    not what it does per file.
+
+    Every entry must be a genuinely new (non-resumed) direct-to-blob upload,
+    same restriction as /upload/init-batch -- a resumed upload still uses
+    single-file /upload/finalize.
+    """
+    account_id, user_id, error = _require_library_context()
+    if error:
+        return error
+    blocked = _library_cleanup_block_reason(user_id)
+    if blocked:
+        return jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
+    data = request.get_json(silent=True) or {}
+    files = data.get('files')
+    if not isinstance(files, list) or not files:
+        return jsonify({'error': 'files must be a non-empty list'}), 400
+    if len(files) > MAX_INIT_BATCH_FILES:
+        return jsonify({'error': f'Batch too large (max {MAX_INIT_BATCH_FILES} files)'}), 400
+
+    results = []
+    for idx, item in enumerate(files):
+        if not isinstance(item, dict):
+            results.append({'index': idx, 'error': 'Invalid file entry'})
+            continue
+        filename = _validate_media_filename(item.get('filename', ''))
+        total_size = int(item.get('totalSize', 0) or 0)
+        content_type = str(item.get('contentType') or 'application/octet-stream')
+        if not filename:
+            results.append({'index': idx, 'error': 'Invalid filename'})
+            continue
+        if total_size <= 0 or total_size > MAX_UPLOAD_FILE_BYTES:
+            results.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
+            continue
+
+        anonymous_blob_name = read_pending_anonymous_blob(user_id, filename)
+        blob_to_check = anonymous_blob_name or filename
+        try:
+            props = blob_service_client.get_blob_client(container=BLOB_IMAGE_CONTAINER, blob=blob_to_check).get_blob_properties()
+            if int(getattr(props, 'size', 0) or 0) != total_size:
+                results.append({'index': idx, 'filename': filename, 'error': 'Uploaded blob size mismatch'})
+                continue
+        except Exception as exc:
+            results.append({'index': idx, 'filename': filename, 'error': 'Uploaded blob not found', 'detail': str(exc)})
+            continue
+
+        try:
+            duplicates, final_name = finalize_uploaded_file(
+                user_id,
+                filename,
+                content_type,
+                client_processing=item.get('clientProcessing'),
+                client_processing_report=item.get('clientProcessingReport'),
+                client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
+                client_sha256=str(item.get('sha256') or ''),
+                anonymous_blob_name=anonymous_blob_name,
+            )
+        except Exception as exc:
+            app.logger.exception('Batch finalize failed for %s', filename)
+            results.append({'index': idx, 'filename': filename, 'error': 'Upload finalization failed', 'detail': str(exc)})
+            continue
+
+        # Same per-file follow-up as single-file finalize above, just inline
+        # in this loop instead of a separate request.
+        _invalidate_metadata_scan_cache(user_id)
+        try:
+            finalize_updates: Dict[str, object] = {'size': total_size}
+            if account_id:
+                finalize_updates['uploadedBy'] = account_id
+            _update_metadata_entity_fields(user_id, final_name, finalize_updates)
+        except Exception:
+            app.logger.debug('Could not stamp finalize metadata for %s', final_name)
+
+        metadata = None
+        hash_mismatch = False
+        try:
+            metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=final_name)
+            if metadata.get('upload_sha256_expected') and metadata.get('upload_sha256_match') is False:
+                hash_mismatch = True
+        except Exception:
+            pass
+        if hash_mismatch:
+            results.append({
+                'index': idx,
+                'filename': final_name,
+                'error': 'Upload hash mismatch',
+                'uploadSha256Match': metadata.get('upload_sha256_match') if metadata else False,
+            })
+            continue
+
+        if item.get('clientProcessing') or item.get('clientProcessingReport'):
+            try:
+                metadata = apply_client_processing_results_for_file(
+                    user_id,
+                    final_name,
+                    client_processing=item.get('clientProcessing'),
+                    client_processing_report=item.get('clientProcessingReport'),
+                    client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
+                )
+            except Exception:
+                app.logger.exception('Inline client processing update failed for %s', final_name)
+        try:
+            metadata = metadata or metadata_table_client.get_entity(partition_key=user_id, row_key=final_name)
+        except Exception:
+            pass
+        try:
+            _queue_upload_processing(user_id, final_name)
+        except Exception:
+            app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
+        try:
+            _queue_people_clustering_after_face_processing(user_id, final_name, metadata)
+        except Exception:
+            app.logger.exception('Failed to auto-queue clustering for %s', final_name)
+
+        results.append({
+            'index': idx,
+            'uploadId': item.get('uploadId') or '',
+            'filename': final_name,
+            'bytesReceived': total_size,
+            'totalSize': total_size,
+            'complete': True,
+            'duplicates': duplicates,
+            'clientProcessingLateResultWaitSeconds': 0,
+        })
+
+    return jsonify({'results': results})
+
+
 @app.route('/upload/client-processing', methods=['POST'])
 @app.route('/upload/client-processing/', methods=['POST'])
 @app.route('/api/upload/client-processing', methods=['POST'])
