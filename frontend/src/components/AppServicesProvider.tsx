@@ -289,25 +289,40 @@ const getUploadErrorMessage = (err: unknown, fallback: string): string => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Tiny FIFO dispatch queue: at most `concurrency` submitted jobs run at once,
-// the rest wait their turn. See enqueueInitBatchDispatchRef/
-// enqueueFinalizeBatchDispatchRef for why upload batch dispatch needs this.
-const createDispatchQueue = (concurrency: number) => {
+// Caps how many submitted jobs run at once (at most `concurrency`), and lets
+// a caller check slot availability BEFORE committing to run something -- see
+// initDispatchGateRef/finalizeDispatchGateRef. `run` always eventually runs
+// its job (queueing if busy); `onNextFreeSlot` fires its callback once, the
+// next time a slot frees up (used to defer a soft/adaptive flush instead of
+// queueing it early).
+const createDispatchGate = (concurrency: number) => {
     const queue: Array<() => Promise<void>> = [];
     let active = 0;
+    let waiter: (() => void) | null = null;
     const pump = () => {
         while (active < concurrency && queue.length > 0) {
             const job = queue.shift()!;
             active += 1;
             job().finally(() => {
                 active -= 1;
+                if (waiter) {
+                    const cb = waiter;
+                    waiter = null;
+                    cb();
+                }
                 pump();
             });
         }
     };
-    return (job: () => Promise<void>) => {
-        queue.push(job);
-        pump();
+    return {
+        hasFreeSlot: () => active < concurrency,
+        run: (job: () => Promise<void>) => {
+            queue.push(job);
+            pump();
+        },
+        onNextFreeSlot: (cb: () => void) => {
+            waiter = cb;
+        },
     };
 };
 
@@ -1031,20 +1046,30 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const batchFinalizeMaxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Caps how many /upload/init-batch (resp. /upload/finalize-batch) network
     // calls can be in flight against the backend at once -- independent of
-    // batch ACCUMULATION above and independent of blob-transfer lane count
-    // (which can legitimately run ~20 wide since those PUTs bypass the
-    // backend entirely). Without this, every one of the ~20 lanes flushes
-    // its own debounce/max-wait timer the moment it fires, regardless of
-    // whether earlier flushes are still in flight -- a live HAR caught up to
-    // 16 concurrent init-batch and 20 concurrent finalize-batch requests
-    // hitting the backend at once, each queueing behind gunicorn thread/GIL
-    // contention for 80-240s. That staggered lanes' arrival times so badly
-    // batches mostly ended up size 1 anyway -- the exact thing batching was
-    // meant to prevent. Separate pools (not one shared pool) so a burst of
-    // finalize jobs, which don't block a lane, can never queue ahead of an
-    // init job, which does.
-    const enqueueInitBatchDispatchRef = useRef(createDispatchQueue(2));
-    const enqueueFinalizeBatchDispatchRef = useRef(createDispatchQueue(2));
+    // blob-transfer lane count (which can legitimately run ~20 wide since
+    // those PUTs bypass the backend entirely). A live HAR caught up to 16
+    // concurrent init-batch and 20 concurrent finalize-batch requests hitting
+    // the backend at once (one per lane), each queueing behind gunicorn
+    // thread/GIL contention for 80-240s. Separate gates (not one shared one)
+    // so a burst of finalize jobs, which don't block a lane, can never queue
+    // ahead of an init job, which does.
+    //
+    // flushInitBatch/flushFinalizeBatch use these for more than a plain
+    // concurrency cap, though: when both slots are busy, they leave the
+    // pending batch OPEN (see the `force` parameter) instead of queueing a
+    // same-moment snapshot behind the busy slots. New arrivals keep piling
+    // into that still-open batch until a slot actually frees up, at which
+    // point whatever accumulated gets sent as ONE call. Without this, a
+    // second live HAR -- taken AFTER the concurrency cap alone was live --
+    // still showed batches stuck at ~1 file/call: the old fixed debounce/
+    // max-wait timers fired and snapshotted on their own clock regardless of
+    // whether a slot was free, so under backend congestion they mostly just
+    // queued a stream of singleton batches one slot-turn behind each other,
+    // never actually letting arrivals coalesce. Gating snapshot timing on
+    // slot availability (not just gating the dispatch) is what turns backend
+    // slowness into fewer, bigger batches instead of many small queued ones.
+    const initDispatchGateRef = useRef(createDispatchGate(2));
+    const finalizeDispatchGateRef = useRef(createDispatchGate(2));
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1629,13 +1654,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // each other); a longer max-wait timer from the FIRST arrival guarantees
     // the batch still flushes promptly even if requests keep trickling in
     // one at a time rather than clustering.
+    //
+    // That alone still wasn't enough, though (see initDispatchGateRef): the
+    // debounce/max-wait timers fire on a fixed clock and don't know whether
+    // a network slot is actually free. flushInitBatch takes a `force` flag
+    // for exactly this -- debounce/max-wait firings pass force=false (only
+    // actually send if a slot's free; otherwise leave the batch open and
+    // retry the instant one frees), while the same-filename guard and the
+    // hard size cap below pass force=true (must close now, no matter what).
     const INIT_BATCH_MAX_SIZE = 12;
     const INIT_BATCH_DEBOUNCE_MS = 50;
     const INIT_BATCH_MAX_WAIT_MS = 250;
 
-    const flushInitBatch = () => {
-        const batch = pendingBatchInitRef.current;
-        pendingBatchInitRef.current = [];
+    const flushInitBatch = (force: boolean) => {
         if (batchInitDebounceTimerRef.current) {
             clearTimeout(batchInitDebounceTimerRef.current);
             batchInitDebounceTimerRef.current = null;
@@ -1644,13 +1675,20 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             clearTimeout(batchInitMaxWaitTimerRef.current);
             batchInitMaxWaitTimerRef.current = null;
         }
-        if (batch.length === 0) {
+        if (pendingBatchInitRef.current.length === 0) {
             return;
         }
-        // Dispatch through the shared queue (see enqueueInitBatchDispatchRef)
-        // instead of calling postUploadWithRetry directly -- this is what
-        // caps concurrent /upload/init-batch requests against the backend.
-        enqueueInitBatchDispatchRef.current(async () => {
+        const gate = initDispatchGateRef.current;
+        if (!force && !gate.hasFreeSlot()) {
+            // Both slots busy -- don't snapshot yet. Leave pendingBatchInitRef
+            // open so new arrivals keep piling into it, and retry (forced)
+            // the instant a slot frees up.
+            gate.onNextFreeSlot(() => flushInitBatch(true));
+            return;
+        }
+        const batch = pendingBatchInitRef.current;
+        pendingBatchInitRef.current = [];
+        gate.run(async () => {
             try {
                 const response = await postUploadWithRetry('/upload/init-batch', {
                     files: batch.map(({ filename, totalSize, sha256 }) => ({ filename, totalSize, sha256 })),
@@ -1682,19 +1720,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // window. Flushing the in-flight batch first guarantees the duplicate
             // starts a fresh batch instead.
             if (pendingBatchInitRef.current.some((req) => req.filename === filename)) {
-                void flushInitBatch();
+                flushInitBatch(true);
             }
             pendingBatchInitRef.current.push({ filename, totalSize, sha256, resolve, reject });
             if (pendingBatchInitRef.current.length >= INIT_BATCH_MAX_SIZE) {
-                void flushInitBatch();
+                flushInitBatch(true);
                 return;
             }
             if (batchInitDebounceTimerRef.current) {
                 clearTimeout(batchInitDebounceTimerRef.current);
             }
-            batchInitDebounceTimerRef.current = setTimeout(() => { void flushInitBatch(); }, INIT_BATCH_DEBOUNCE_MS);
+            batchInitDebounceTimerRef.current = setTimeout(() => { flushInitBatch(false); }, INIT_BATCH_DEBOUNCE_MS);
             if (!batchInitMaxWaitTimerRef.current) {
-                batchInitMaxWaitTimerRef.current = setTimeout(() => { void flushInitBatch(); }, INIT_BATCH_MAX_WAIT_MS);
+                batchInitMaxWaitTimerRef.current = setTimeout(() => { flushInitBatch(false); }, INIT_BATCH_MAX_WAIT_MS);
             }
         })
     );
@@ -1716,13 +1754,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // runUploadSession) -- the wait is now invisible background latency, not
     // time the user watches a spinner for, so trading a few seconds of
     // additional background delay for meaningfully larger batches is free.
+    //
+    // Same `force` split as flushInitBatch above: debounce/max-wait firings
+    // are soft (only send if a slot's free, otherwise leave the batch open
+    // and retry once one is), the same-filename guard and hard size cap are
+    // forced (must close now regardless of slot availability). See
+    // finalizeDispatchGateRef for why this matters more than a plain
+    // concurrency cap.
     const FINALIZE_BATCH_MAX_SIZE = 12;
     const FINALIZE_BATCH_DEBOUNCE_MS = 200;
     const FINALIZE_BATCH_MAX_WAIT_MS = 2500;
 
-    const flushFinalizeBatch = () => {
-        const batch = pendingBatchFinalizeRef.current;
-        pendingBatchFinalizeRef.current = [];
+    const flushFinalizeBatch = (force: boolean) => {
         if (batchFinalizeDebounceTimerRef.current) {
             clearTimeout(batchFinalizeDebounceTimerRef.current);
             batchFinalizeDebounceTimerRef.current = null;
@@ -1731,13 +1774,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             clearTimeout(batchFinalizeMaxWaitTimerRef.current);
             batchFinalizeMaxWaitTimerRef.current = null;
         }
-        if (batch.length === 0) {
+        if (pendingBatchFinalizeRef.current.length === 0) {
             return;
         }
-        // Dispatch through the shared queue (see enqueueFinalizeBatchDispatchRef)
-        // instead of calling postUploadWithRetry directly -- this is what
-        // caps concurrent /upload/finalize-batch requests against the backend.
-        enqueueFinalizeBatchDispatchRef.current(async () => {
+        const gate = finalizeDispatchGateRef.current;
+        if (!force && !gate.hasFreeSlot()) {
+            gate.onNextFreeSlot(() => flushFinalizeBatch(true));
+            return;
+        }
+        const batch = pendingBatchFinalizeRef.current;
+        pendingBatchFinalizeRef.current = [];
+        gate.run(async () => {
             try {
                 const response = await postUploadWithRetry('/upload/finalize-batch', {
                     files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId }) => ({
@@ -1775,19 +1822,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // request would both try to create/rename the same metadata row
             // in one loop iteration each, immediately after each other.
             if (pendingBatchFinalizeRef.current.some((req) => req.filename === payload.filename)) {
-                void flushFinalizeBatch();
+                flushFinalizeBatch(true);
             }
             pendingBatchFinalizeRef.current.push({ ...payload, resolve, reject });
             if (pendingBatchFinalizeRef.current.length >= FINALIZE_BATCH_MAX_SIZE) {
-                void flushFinalizeBatch();
+                flushFinalizeBatch(true);
                 return;
             }
             if (batchFinalizeDebounceTimerRef.current) {
                 clearTimeout(batchFinalizeDebounceTimerRef.current);
             }
-            batchFinalizeDebounceTimerRef.current = setTimeout(() => { void flushFinalizeBatch(); }, FINALIZE_BATCH_DEBOUNCE_MS);
+            batchFinalizeDebounceTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, FINALIZE_BATCH_DEBOUNCE_MS);
             if (!batchFinalizeMaxWaitTimerRef.current) {
-                batchFinalizeMaxWaitTimerRef.current = setTimeout(() => { void flushFinalizeBatch(); }, FINALIZE_BATCH_MAX_WAIT_MS);
+                batchFinalizeMaxWaitTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, FINALIZE_BATCH_MAX_WAIT_MS);
             }
         })
     );
