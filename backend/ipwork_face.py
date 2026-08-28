@@ -42,7 +42,7 @@ from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw
 
 # cv2/onnxruntime/mediapipe are ipworker-only deps (requirements-ipworker.txt),
 # not in backend/requirements.txt -- guarded the same way ipwork_ocr.py guards
-# pytesseract, so importing this module never hard-crashes outside the
+# tesserocr, so importing this module never hard-crashes outside the
 # ipworker image (it shouldn't be imported there at all, but defense in depth
 # costs nothing here).
 try:

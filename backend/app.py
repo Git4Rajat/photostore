@@ -12699,7 +12699,7 @@ def _register_ipwork_processors() -> None:
 
     Deliberately lazy -- called only from run_ipworker(), never at module
     import time -- because these modules pull in heavy ML deps (onnxruntime,
-    opencv, mediapipe, torch, open_clip, pytesseract) that live only in the
+    opencv, mediapipe, torch, open_clip, tesserocr) that live only in the
     ipworker image's requirements-ipworker.txt. Importing them unconditionally
     at the top of app.py would break the plain backend/worker roles, which
     don't have them installed and don't need them.

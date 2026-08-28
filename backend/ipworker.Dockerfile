@@ -19,7 +19,12 @@ ENV PIP_ROOT_USER_ACTION=ignore \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# tesseract-ocr: OCR. libgl1/libglib2.0-0: opencv-python-headless and
+# tesseract-ocr: OCR runtime + trained data. libtesseract-dev/
+# libleptonica-dev/pkg-config/build-essential: tesserocr (ipwork_ocr.py)
+# links against libtesseract/leptonica and compiles a Cython extension at
+# `pip install` time -- unlike the pytesseract package it replaced, which
+# was pure Python shelling out to the tesseract-ocr binary and needed no
+# headers or compiler. libgl1/libglib2.0-0: opencv-python-headless and
 # mediapipe both dlopen a handful of X11/GL shared libs at import time even
 # in "headless" builds. libimage-exiftool-perl/libraw-bin: shared with
 # backend's own EXIF/RAW extraction (exif_utils.py). ffmpeg: video thumbnail
@@ -28,6 +33,10 @@ ENV PIP_ROOT_USER_ACTION=ignore \
 # Landmarker task bundle below (no PyPI package ships it).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
+    libtesseract-dev \
+    libleptonica-dev \
+    pkg-config \
+    build-essential \
     libgl1 \
     libglib2.0-0 \
     libimage-exiftool-perl \

@@ -2458,9 +2458,29 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let transferredBytesThisRun = 0;
         const lastCommittedBytesByFile = new Map<string, number>();
 
+        // Sliding window, not a lifetime average -- a lifetime average (total
+        // bytes / total elapsed since uploadStartedAt) means a slow patch
+        // (e.g. the tab was backgrounded and the browser throttled it) drags
+        // the reported rate down for the rest of the run, and it only
+        // recovers asymptotically once conditions improve -- for a large
+        // batch that reads as "speed never comes back" even though the real
+        // transfer is back to full speed. Only the last RATE_WINDOW_MS of
+        // progress is used, so the displayed number tracks current
+        // conditions instead of the whole session's history.
+        const RATE_WINDOW_MS = 10000;
+        const rateSamples: Array<{ t: number; bytes: number }> = [{ t: uploadStartedAt, bytes: 0 }];
+        const recordRateSample = () => {
+            const now = Date.now();
+            rateSamples.push({ t: now, bytes: transferredBytesThisRun });
+            while (rateSamples.length > 1 && now - rateSamples[0].t > RATE_WINDOW_MS) {
+                rateSamples.shift();
+            }
+        };
         const currentUploadRate = () => {
-            const elapsedSeconds = Math.max((Date.now() - uploadStartedAt) / 1000, 0.001);
-            return transferredBytesThisRun / elapsedSeconds / MB;
+            const now = Date.now();
+            const oldest = rateSamples[0];
+            const elapsedSeconds = Math.max((now - oldest.t) / 1000, 0.001);
+            return Math.max(0, transferredBytesThisRun - oldest.bytes) / elapsedSeconds / MB;
         };
 
         const notificationId = options.notificationId || addNotification(
@@ -2662,6 +2682,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                     const previousBytes = lastCommittedBytesByFile.get(fileMeta.key) || 0;
                                     transferredBytesThisRun += Math.max(0, bytesReceived - previousBytes);
                                     lastCommittedBytesByFile.set(fileMeta.key, bytesReceived);
+                                    recordRateSample();
                                     updatePersistedFile(fileMeta.key, { uploadedBytes: bytesReceived });
                                 },
                                 onBlockCommitted: (blockIds, nextChunkSizeBytes) => {

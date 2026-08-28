@@ -1,4 +1,4 @@
-# ipworker background-processing architecture (as of 2026-08-27)
+# ipworker background-processing architecture (as of 2026-08-28)
 
 Scope: how server-side AI processing of uploaded photos actually works today —
 dispatch, hardware, concurrency, scaling, coordination with the browser path,
@@ -28,7 +28,7 @@ IPWORK_STEPS = ('thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detection'
 
 - **Image**: its own image (`ipworkerImage`), not shared with `backend`/`worker`
   — it needs a much heavier dependency set (`requirements-ipworker.txt`: torch,
-  open_clip_torch, onnxruntime, opencv-python-headless, mediapipe, pytesseract)
+  open_clip_torch, onnxruntime, opencv-python-headless, mediapipe, tesserocr)
   that would otherwise bloat cold-starts for the plain backend/worker roles.
 - **Per-replica resources**: `2.0 vCPU / 4Gi memory`. Sized to match `worker`'s
   footprint on the reasoning that "a single pass runs YOLO face detection,
@@ -159,8 +159,10 @@ Added this session (`worker_logger.info` in `_run_ipwork_steps` and
 | IMG_0369.HEIC | 1809ms | 7ms | **10387ms** | 1269ms | 2379ms | 116ms |
 | IMG_0427.jpg | 340ms | 10ms | **6676ms** | 854ms | 1175ms | 87ms |
 
-OCR (`ipwork_ocr.py` → `pytesseract.image_to_string`, a real subprocess exec
-of the `tesseract` binary — CPU-bound, not async/network) dominates every
+OCR (`ipwork_ocr.py`, at the time via `pytesseract.image_to_string` — a real
+subprocess exec of the `tesseract` binary — CPU-bound, not async/network;
+see the `tesserocr` migration below for the current call mechanism, which
+doesn't change these recognition-time numbers materially) dominates every
 sample at 65-70% of that photo's step-sum, run **unconditionally** regardless
 of whether the photo has any text. `map_detection` (Nominatim reverse-geocode
 HTTP call, 8s timeout) is negligible (1-116ms) — ruled out as a suspect this
@@ -213,6 +215,66 @@ over 2 real cores. Setting `OMP_THREAD_LIMIT=1` (live env var, then committed
 to `resources.bicep`) measured a one-sample OCR drop from 5474ms to 2439ms
 and the aggregate throughput gain above — no correctness impact, since this
 only bounds internal parallelism, not OCR output.
+
+### Engine migration: `pytesseract` subprocess → `tesserocr` in-process (2026-08-28)
+
+**Status: implemented, locally validated, not yet built/run in the real
+ipworker container — uncommitted.** Distinct from the OCR-precision
+experiments below: this changes *how* tesseract gets called, not what it
+recognizes — same engine, same trained data, same PSM 3 default — so it's
+a plumbing change, not subject to the precision trade-offs §7 rejects.
+
+`ipwork_ocr.py` previously called `pytesseract.image_to_string()`, which
+writes the image to a temp file, forks/execs the `tesseract` CLI binary,
+lets that fresh process reload `eng.traineddata` from disk, then reads the
+output back from a second temp file — full process-spawn + model-reload
+cost paid on *every single call*. `tesserocr` binds directly to libtesseract
+in-process; `ipwork_ocr.py` now keeps one `PyTessBaseAPI` per worker thread
+(`threading.local()`, lazily created — `PyTessBaseAPI` is not safe to share
+across threads, and `IPWORKER_CONCURRENCY=2` means 2 live at once), loading
+the trained data once per thread instead of once per call.
+
+**Real measured delta** (same machine, same trained data, `.venv-photostore-tools`
+against Homebrew tesseract — a relative/mechanism-level measurement, not a
+production number): on a trivial synthetic image where recognition compute
+is negligible, `pytesseract` averaged **108ms/call**, `tesserocr` (cached API)
+averaged **8.6ms/call** — a **~100ms/call fixed-overhead removal (~12.6x)**.
+Applied to this doc's real per-photo OCR times (2.4-10.4s, dominated by
+actual recognition compute, not call setup): that ~100ms is only **~1-4% of
+a real OCR call**. This is a small, low-risk win, not a throughput lever on
+the scale of the concurrency or `OMP_THREAD_LIMIT` fixes above — flagged as
+such before implementation, confirmed rather than contradicted by the
+measurement.
+
+`OMP_THREAD_LIMIT=1` still applies with no code change: it's a
+container-level env var on the ipworker process itself (`resources.bicep:712`),
+and `tesserocr`'s libtesseract runs in that same process, so it reads the
+same `os.environ` value a spawned subprocess would previously have
+inherited.
+
+**Gotcha found during local validation, fixed before it could ship broken**:
+unlike the CLI binary, `tesserocr`'s in-process `PyTessBaseAPI` did not
+reliably auto-discover the apt-installed tessdata directory — failed
+locally with `"Failed to init API, possibly an invalid tessdata path: ./"`
+until `TESSDATA_PREFIX` was set explicitly. `entrypoint.sh`'s `ipworker`
+branch now resolves this at container start via
+`find /usr/share -name 'eng.traineddata'` rather than hardcoding a path
+that could shift with the `tesseract-ocr` package version. Only validated
+against Homebrew's tesseract layout on macOS so far — the actual Debian
+path inside the built image is unconfirmed.
+
+**Real trade-off, not just a win**: `pytesseract`'s subprocess isolated a
+crash on a corrupt/malformed image to that one call. `tesserocr` runs
+libtesseract's C++ core in-process — a hard crash there (as opposed to a
+normal caught exception, which is still handled the same way as before)
+would take down the whole ipworker replica's process, not just one photo's
+OCR. Nothing in local testing triggered this; noted as a blast-radius change
+worth being aware of, not a reason found so far to revert.
+
+**Also needs**: `libtesseract-dev`, `libleptonica-dev`, `pkg-config`,
+`build-essential` added to `ipworker.Dockerfile` — `tesserocr` compiles a
+Cython extension against these at `pip install` time, unlike pure-Python
+`pytesseract`.
 
 ## 7. OCR cost-reduction experiments, all rejected on real data so far
 
@@ -441,6 +503,7 @@ from scratch.
 | Measured aggregate throughput | ~2724 photos/hour (all 4 replicas, with OMP_THREAD_LIMIT=1) |
 | Per-slot throughput | ~341 photos/hour |
 | Tesseract thread cap | `OMP_THREAD_LIMIT=1` (added 2026-08-27) |
+| OCR call mechanism | `tesserocr` in-process (`PyTessBaseAPI` per thread), migrated 2026-08-28 from `pytesseract` subprocess; ~100ms/call fixed-overhead removed (~1-4% of a real OCR call), uncommitted, not yet built in the real container |
 | Scale-out trigger | queue length ≥1 (visible-only), or cron wake every 20min |
 | Lease TTL / queue visibility timeout | 300s / 300s |
 | Lease retry limit | 3 attempts |

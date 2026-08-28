@@ -19,4 +19,4 @@ open_clip_torch==3.3.0
 onnxruntime==1.28.0
 opencv-python-headless==5.0.0.93
 mediapipe==1.0.0
-pytesseract==0.3.13
+tesserocr==2.8.0

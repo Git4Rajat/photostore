@@ -10,6 +10,18 @@ fi
 
 if [ "${ROLE}" = "ipworker" ]; then
     echo "Starting ipworker..."
+    # tesserocr (ipwork_ocr.py) needs TESSDATA_PREFIX explicitly -- unlike
+    # the tesseract CLI binary pytesseract used to shell out to, the
+    # in-process libtesseract tesserocr links against does not reliably
+    # auto-discover the apt-installed trained-data directory (confirmed
+    # failing locally with "Failed to init API, possibly an invalid
+    # tessdata path" when unset). Discover it once at container start
+    # rather than hardcoding a path that could shift with the
+    # tesseract-ocr package version.
+    TESSDATA_DIR="$(dirname "$(find /usr/share -name 'eng.traineddata' 2>/dev/null | head -n1)" 2>/dev/null || true)"
+    if [ -n "$TESSDATA_DIR" ] && [ "$TESSDATA_DIR" != "." ]; then
+        export TESSDATA_PREFIX="$TESSDATA_DIR"
+    fi
     exec python -u -c "import app; app.run_ipworker()"
 fi
 
