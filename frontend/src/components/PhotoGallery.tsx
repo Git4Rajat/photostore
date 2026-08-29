@@ -322,7 +322,6 @@ export const resetBrowserFaceModelLoadStateForTests = () => {
 };
 
 type AppRuntimeConfig = {
-    browserGeocoderUrl?: string;
     browserGeocoderRateMs?: string | number;
     blazeFaceModelUrl?: string;
     arcFaceModelUrl?: string;
@@ -1424,6 +1423,12 @@ const getRuntimeConfig = (): AppRuntimeConfig => {
 };
 
 let lastGeocodeAt = 0;
+// Routed through our own backend (which already does this reverse-geocode
+// server-side for the ipworker path via maps_utils.reverse_geocode, at
+// negligible cost) rather than calling a third-party geocoder directly from
+// the browser. A direct browser->photon.komoot.io fetch has no same-origin
+// guarantee, so a failure there (rate-limited/down 503) surfaces as a CORS
+// error and silently drops every browser-side photo's location every time.
 const geocodeWithThrottle = async (latitude: string, longitude: string): Promise<Record<string, string> | null> => {
     const config = getRuntimeConfig();
     const rateMs = Math.max(0, Number(config.browserGeocoderRateMs || 1100));
@@ -1433,22 +1438,18 @@ const geocodeWithThrottle = async (latitude: string, longitude: string): Promise
         await new Promise((resolve) => window.setTimeout(resolve, waitMs));
     }
     lastGeocodeAt = Date.now();
-    const baseUrl = String(config.browserGeocoderUrl || 'https://photon.komoot.io/reverse').replace(/\/$/, '');
-    const url = `${baseUrl}?lat=${encodeURIComponent(latitude)}&lon=${encodeURIComponent(longitude)}&limit=1`;
-    const response = await fetch(url, { credentials: 'omit' });
-    if (!response.ok) {
+    const data = await get<Record<string, string>>(
+        `geocode/reverse?lat=${encodeURIComponent(latitude)}&lon=${encodeURIComponent(longitude)}`
+    );
+    if (!data || (!data.address && !data.city && !data.country)) {
         return null;
     }
-    const data = await response.json() as any;
-    const feature = Array.isArray(data?.features) ? data.features[0] : null;
-    const props = feature?.properties || {};
-    const coords = feature?.geometry?.coordinates;
     return {
-        address: [props.name, props.street, props.housenumber].filter(Boolean).join(' ').trim(),
-        city: props.city || props.town || props.village || '',
-        country: props.country || '',
-        latitude: String(coords?.[1] || latitude),
-        longitude: String(coords?.[0] || longitude),
+        address: data.address || '',
+        city: data.city || '',
+        country: data.country || '',
+        latitude,
+        longitude,
     };
 };
 
