@@ -6292,6 +6292,7 @@ def health_check():
     })
 
 
+@app.route('/geocode/reverse', methods=['GET'])
 @app.route('/api/geocode/reverse', methods=['GET'])
 def geocode_reverse():
     """Server-side reverse geocode, used by the browser AI pipeline's
