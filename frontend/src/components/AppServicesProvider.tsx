@@ -2522,6 +2522,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             onUploadInitialized?: (uploadId: string, blobName: string) => void;
             onBlockCommitted?: (blockIds: string[], chunkSizeBytes: number) => void;
             onFinalizeStarted?: () => void;
+            // Fired once, right after the init call resolves, with elapsed ms
+            // (covers coalescing wait + real network/backend round trip, not
+            // hash time -- timed from just before the call). Lets a caller
+            // re-evaluate fileParallelism using this file's real post-warm-up
+            // latency instead of the pre-upload guess -- see the lane
+            // re-evaluation block in the caller.
+            onInitLatencyMs?: (ms: number) => void;
             signal?: AbortSignal;
             chunkSizeBytes?: number;
             blockConcurrency?: number;
@@ -2553,6 +2560,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // single-file /upload/init (it needs to reuse the SAME reserved
             // blob/uploadId, which /upload/init-batch doesn't support -- see
             // its docstring). Fresh uploads coalesce into /upload/init-batch.
+            const initStartedAt = performance.now();
             const initResponse = options?.existingUploadId
                 ? await postInitWithRetry({
                     filename: file.name,
@@ -2562,6 +2570,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     uploadId: options.existingUploadId,
                 }, options?.signal)
                 : await requestBatchedInit(file.name, file.size, sha256);
+            options?.onInitLatencyMs?.(performance.now() - initStartedAt);
             const blobName = typeof initResponse?.blobName === 'string' ? initResponse.blobName : '';
             if (typeof initResponse?.uploadId === 'string' && initResponse.uploadId) {
                 options?.onUploadInitialized?.(initResponse.uploadId, blobName);
@@ -2838,7 +2847,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // big file the lane gets the full budget (so its blocks stage in
             // parallel), while many files each get one connection.
             const activeLaneCount = Math.min(uploadProfile.fileParallelism, Math.max(1, pendingFiles.length));
-            const perFileBlockConcurrency = Math.max(1, Math.round(TARGET_CONCURRENT_UPLOAD_BLOCKS / activeLaneCount));
+            // Mutable: can grow mid-session if the first file's real
+            // post-warm-up init latency (onInitLatencyMs, wired into worker()
+            // below) turns out much better than the pre-upload guess assumed
+            // -- e.g. getAdaptiveUploadProfile pinned fileParallelism to 1
+            // because the warm-up probe landed during a cold start rather
+            // than genuine network congestion. activeLaneCount itself (used
+            // for the initial spawn count below and the later retry pass)
+            // stays untouched by this.
+            let laneBudget = activeLaneCount;
+            let laneReevaluationDone = pendingFiles.length <= activeLaneCount;
+            const currentBlockConcurrency = () => Math.max(1, Math.round(TARGET_CONCURRENT_UPLOAD_BLOCKS / laneBudget));
 
             const parallelThumbnailTasks = new Set<Promise<void>>();
 
@@ -3120,9 +3139,34 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 onFinalizeStarted: () => {
                                     updatePersistedFile(fileMeta.key, { status: 'finalizing', uploadedBytes: resolvedFile.size });
                                 },
+                                onInitLatencyMs: (ms) => {
+                                    // One-shot: only the first file across all
+                                    // active lanes to reach this point acts on
+                                    // it (subsequent calls are no-ops via the
+                                    // guard). Re-derives fileParallelism from
+                                    // this file's real, now-past-warm-up
+                                    // latency instead of the pre-upload guess,
+                                    // and grows the running worker pool if it
+                                    // turns out higher -- see laneBudget above.
+                                    if (laneReevaluationDone) {
+                                        return;
+                                    }
+                                    laneReevaluationDone = true;
+                                    const remaining = pendingFiles.slice(nextFileIndex).map((f) => ({ size: f.size }));
+                                    if (remaining.length === 0) {
+                                        return;
+                                    }
+                                    const freshProfile = getAdaptiveUploadProfile(remaining, { measuredRttMs: ms });
+                                    const newLaneCount = Math.min(freshProfile.fileParallelism, pendingFiles.length);
+                                    if (newLaneCount > laneBudget) {
+                                        const added = newLaneCount - laneBudget;
+                                        laneBudget = newLaneCount;
+                                        spawnWorkers(added);
+                                    }
+                                },
                                 signal: controller.signal,
                                 chunkSizeBytes,
-                                blockConcurrency: perFileBlockConcurrency,
+                                blockConcurrency: currentBlockConcurrency(),
                             });
                         } catch (err) {
                             // Ownership of removing this controller from
@@ -3182,7 +3226,22 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             };
 
             await knownHashesPromise;
-            await Promise.all(Array.from({ length: activeLaneCount }, () => worker()));
+            const workerPromises: Promise<void>[] = [];
+            const spawnWorkers = (count: number) => {
+                for (let i = 0; i < count; i += 1) {
+                    workerPromises.push(worker());
+                }
+            };
+            spawnWorkers(activeLaneCount);
+            // Not a plain Promise.all(workerPromises): the onInitLatencyMs
+            // re-evaluation above can call spawnWorkers again after this
+            // starts, pushing more entries into the same array once the lane
+            // budget grows -- draining by index (re-checking .length each
+            // iteration) picks those up too, unlike a Promise.all snapshot
+            // taken at call time.
+            for (let i = 0; i < workerPromises.length; i += 1) {
+                await workerPromises[i];
+            }
 
             // Every lane has finished transferring bytes (whether by running out
             // of files or a Stop request) -- what's left below (backend finalize
@@ -3696,7 +3755,26 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             });
             return;
         }
-        const measuredRttMs = measuringRtt ? performance.now() - warmupStartedAt : undefined;
+        let measuredRttMs = measuringRtt ? performance.now() - warmupStartedAt : undefined;
+        // A cold-started backend (minReplicas: 0) pays its scale-up cost on
+        // this FIRST warm-up call, making its timing look like bad network
+        // latency to getAdaptiveUploadProfile's RTT gate even though the
+        // network itself is fine -- fileParallelism then gets pinned low for
+        // the whole session (see that gate's own comment for a prior
+        // incident this caused). Re-probe now that inFlightRef is clear: a
+        // cold start resolves after the first request, so this second call
+        // reflects genuine RTT, while a truly slow/congested network is
+        // still slow here too and correctly keeps parallelism low.
+        if (measuringRtt) {
+            const secondProbeStartedAt = performance.now();
+            try {
+                await warmEndpoint(warmBackend, backendWarmupInFlightRef);
+                measuredRttMs = performance.now() - secondProbeStartedAt;
+            } catch {
+                // Second probe failing is itself evidence of a bad
+                // connection, not grounds to discard the first reading.
+            }
+        }
         updateNotification(warmupNotificationId, {
             title: 'Upload path ready',
             details: 'Backend storage is ready. Starting upload.',
