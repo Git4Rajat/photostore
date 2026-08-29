@@ -765,6 +765,10 @@ class _UserScanCache:
 PEOPLE_SCAN_CACHE_TTL_SECONDS = float(os.getenv('PEOPLE_SCAN_CACHE_TTL_SECONDS', '20'))
 _person_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
 _face_summary_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
+# Caches _load_people_embedding_index's built (parsed + normalized) result --
+# see that function for why. Same TTL/invalidation semantics as the two
+# caches above since it's derived entirely from their underlying data.
+_people_embedding_index_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
 
 
 def _invalidate_people_scan_cache(user_id: str) -> None:
@@ -772,6 +776,7 @@ def _invalidate_people_scan_cache(user_id: str) -> None:
         return
     _person_scan_cache.invalidate(user_id)
     _face_summary_scan_cache.invalidate(user_id)
+    _people_embedding_index_cache.invalidate(user_id)
 
 
 def _partition_key_from_write_call(method_name: str, args: tuple, kwargs: dict) -> str:
@@ -2997,6 +3002,67 @@ def _embedding_precision_dtype(np):
     return getattr(np, 'float64', getattr(np, 'float32', float))
 
 
+def _best_two_person_matches(
+    face_norm,
+    session_embedding_index: List[Dict],
+    np,
+) -> Tuple[float, float, Optional[Dict]]:
+    """Same result as scanning session_embedding_index in order and tracking
+    best/second-best via strict '>' comparisons (first entry wins an exact
+    tie) -- but computes it with one batched numpy matmul across every
+    same-dimension entry instead of one _embedding_similarity_between_normalized
+    Python call (with its own per-call numpy<->list round trip) per entry.
+    That per-entry call overhead, multiplied by every person in the library
+    on every uploaded photo, was a real, unvectorized CPU cost -- see
+    _load_people_embedding_index's docstring for the sibling fix addressing
+    the other half of that same bottleneck (the GIL contention documented in
+    deploy/resources.bicep's reverted GUNICORN_THREADS 4->12 experiment).
+
+    Entries whose normalized embedding has a different length than
+    face_norm (a person still on an older embedding-taxonomy version) are
+    scored individually via the original per-entry path, preserving its
+    truncate-without-renormalize behavior for that legacy comparison.
+    """
+    best_score = 0.0
+    second_best_score = 0.0
+    best_person = None
+    if face_norm is None or not session_embedding_index:
+        return best_score, second_best_score, best_person
+
+    face_len = len(face_norm)
+    same_dim_positions: List[int] = []
+    same_dim_norms = []
+    scores: List[Optional[float]] = [None] * len(session_embedding_index)
+
+    for idx, entry in enumerate(session_embedding_index):
+        if not (entry.get('repEmbedding') or []):
+            continue
+        existing_norm = _normalized_embedding_for_entry(entry, np)
+        if existing_norm is None:
+            continue
+        if len(existing_norm) == face_len:
+            same_dim_positions.append(idx)
+            same_dim_norms.append(existing_norm)
+        else:
+            scores[idx] = _embedding_similarity_between_normalized(face_norm, existing_norm, np)
+
+    if same_dim_norms:
+        batch_scores = np.vstack(same_dim_norms) @ face_norm
+        for pos, idx in enumerate(same_dim_positions):
+            scores[idx] = float(batch_scores[pos])
+
+    for idx, score in enumerate(scores):
+        if score is None:
+            continue
+        if score > best_score:
+            second_best_score = best_score
+            best_score = score
+            best_person = session_embedding_index[idx]
+        elif score > second_best_score:
+            second_best_score = score
+    return best_score, second_best_score, best_person
+
+
 def _split_cluster_by_max_pair_distance(indices: List[int], dist_matrix, max_distance: float) -> List[List[int]]:
     if len(indices) <= 1:
         return [list(indices)]
@@ -3110,37 +3176,65 @@ def _confirmed_face_count(user_id: str, face_ids: List[str], person_id: str = ''
 def _load_people_embedding_index(user_id: str) -> List[Dict]:
     if person_table_client is None:
         return []
-    # Was an uncached direct query_entities call -- _cached_person_rows_for_user
-    # wraps the identical query in _person_scan_cache, sharing one scan across
-    # every call within PEOPLE_SCAN_CACHE_TTL_SECONDS instead of re-querying
-    # the full person partition on every single call (this function now runs
-    # once per photo during a backfill, not just occasionally).
-    rows = _cached_person_rows_for_user(user_id)
 
-    index = []
-    for row in rows:
+    # Was rebuilt from scratch (JSON-decode every person's repEmbedding + a
+    # fresh numpy normalize) on every single call -- and this runs once per
+    # uploaded photo, synchronously, inline in /upload/finalize and
+    # /upload/client-processing (see _queue_people_clustering_after_face_processing).
+    # For a library with hundreds of people that's real, unvectorized
+    # Python-level CPU work (not I/O wait) repeated per photo; under a burst
+    # of many photos finishing face detection near-simultaneously, that many
+    # gthread threads doing this at once is genuine GIL contention -- the
+    # same class of bottleneck that made raising GUNICORN_THREADS 4->12 make
+    # things WORSE instead of better (see deploy/resources.bicep's comment on
+    # that reverted experiment). Cache the built index the same way
+    # _cached_person_rows_for_user already caches the raw rows it's built
+    # from -- correctness is unaffected since this index is entirely derived
+    # from _cached_person_rows_for_user + the face-summary cache, both
+    # already governed by the same PEOPLE_SCAN_CACHE_TTL_SECONDS/
+    # _invalidate_people_scan_cache (via _InvalidatingTableClient on every
+    # person/face table write), so this adds no new staleness window beyond
+    # what those two already tolerate.
+    def _build() -> List[Dict]:
+        rows = _cached_person_rows_for_user(user_id)
         try:
-            face_ids = json.loads(row.get('faceIds', '[]') or '[]')
+            import numpy as np
         except Exception:
-            face_ids = []
-        person_id = str(row.get('RowKey') or '')
-        active_face_ids = _active_face_ids_for_person(user_id, person_id, face_ids)
-        if not active_face_ids:
-            continue
-        try:
-            rep = json.loads(row.get('repEmbedding', '[]') or '[]')
-        except Exception:
-            rep = []
-        if not rep:
-            continue
-        index.append({
-            'personId': person_id,
-            'name': row.get('name', ''),
-            'faceIds': active_face_ids,
-            'repEmbedding': rep,
-            'confirmedFaceCount': _confirmed_face_count(user_id, active_face_ids, person_id),
-        })
-    return index
+            np = None
+
+        index = []
+        for row in rows:
+            try:
+                face_ids = json.loads(row.get('faceIds', '[]') or '[]')
+            except Exception:
+                face_ids = []
+            person_id = str(row.get('RowKey') or '')
+            active_face_ids = _active_face_ids_for_person(user_id, person_id, face_ids)
+            if not active_face_ids:
+                continue
+            try:
+                rep = json.loads(row.get('repEmbedding', '[]') or '[]')
+            except Exception:
+                rep = []
+            if not rep:
+                continue
+            entry = {
+                'personId': person_id,
+                'name': row.get('name', ''),
+                'faceIds': active_face_ids,
+                'repEmbedding': rep,
+                'confirmedFaceCount': _confirmed_face_count(user_id, active_face_ids, person_id),
+            }
+            if np is not None:
+                # Precomputed once per cache build instead of once per caller
+                # (_normalized_embedding_for_entry would otherwise redo this
+                # on every fresh copy of the entry) -- read-only downstream,
+                # so sharing the same array across cached copies is safe.
+                entry['_normalized_rep_embedding'] = _normalized_embedding(rep, np)
+            index.append(entry)
+        return index
+
+    return _people_embedding_index_cache.get(user_id, _build)
 
 
 def _next_unnamed_person_name(user_id: str) -> str:
@@ -3711,23 +3805,9 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
             continue
         face_norm = _normalized_embedding(emb, np)
 
-        best_score = 0.0
-        second_best_score = 0.0
-        best_person = None
-
-        for entry in session_embedding_index:
-            existing = entry.get('repEmbedding') or []
-            if not _embeddings_are_comparable(emb, existing):
-                continue
-            score = _embedding_similarity_between_normalized(face_norm, _normalized_embedding_for_entry(entry, np), np)
-            if score is None:
-                continue
-            if score > best_score:
-                second_best_score = best_score
-                best_score = score
-                best_person = entry
-            elif score > second_best_score:
-                second_best_score = score
+        best_score, second_best_score, best_person = _best_two_person_matches(
+            face_norm, session_embedding_index, np,
+        )
 
         person_id = ''
         if (
@@ -6141,6 +6221,30 @@ def health_check():
         'storage_account': account_name,
         'uses_managed_identity': credential is not None,
     })
+
+
+@app.route('/api/geocode/reverse', methods=['GET'])
+def geocode_reverse():
+    """Server-side reverse geocode, used by the browser AI pipeline's
+    map_detection step. Proxying through the backend (instead of the browser
+    calling a third-party geocoder directly) avoids depending on that
+    service's CORS/availability from an arbitrary browser origin -- the same
+    maps_utils.reverse_geocode() call already runs cheaply (1-116ms) from the
+    ipworker path."""
+    _user_id, error = _require_user_id()
+    if error:
+        return error
+    latitude = (request.args.get('lat') or '').strip()
+    longitude = (request.args.get('lon') or '').strip()
+    if not latitude or not longitude:
+        return jsonify({'error': 'lat and lon are required'}), 400
+    import maps_utils
+    try:
+        result = maps_utils.reverse_geocode(latitude, longitude)
+    except Exception:
+        worker_logger.exception('geocode_reverse failed')
+        result = {}
+    return jsonify(result or {})
 
 
 # ---------------------------------------------------------------------------

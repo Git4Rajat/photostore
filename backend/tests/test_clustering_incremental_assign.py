@@ -9,6 +9,7 @@ similarity check, not just wiring.
 from __future__ import annotations
 
 import json
+import random
 
 import pytest
 
@@ -36,6 +37,7 @@ def clustering_tables(monkeypatch):
     # wrapper that would normally invalidate the cache on write.
     monkeypatch.setattr(app, '_person_scan_cache', app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS))
     monkeypatch.setattr(app, '_face_summary_scan_cache', app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS))
+    monkeypatch.setattr(app, '_people_embedding_index_cache', app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS))
     return face_table, person_table
 
 
@@ -157,3 +159,67 @@ def test_face_failing_embedding_alignment_gate_is_skipped(clustering_tables):
     assert assignments == {}
     assert created == set()
     assert person_table.rows == {}
+
+
+def _reference_best_two_matches(face_norm, session_embedding_index, np):
+    """Literal reimplementation of the pre-vectorization per-entry scan that
+    _best_two_person_matches replaced, used as an independent oracle."""
+    best_score = 0.0
+    second_best_score = 0.0
+    best_person = None
+    for entry in session_embedding_index:
+        existing_norm = app._normalized_embedding_for_entry(entry, np)
+        if existing_norm is None:
+            continue
+        score = app._embedding_similarity_between_normalized(face_norm, existing_norm, np)
+        if score is None:
+            continue
+        if score > best_score:
+            second_best_score = best_score
+            best_score = score
+            best_person = entry
+        elif score > second_best_score:
+            second_best_score = score
+    return best_score, second_best_score, best_person
+
+
+def test_vectorized_best_two_matches_agrees_with_reference_scan_including_mixed_dimensions():
+    """_best_two_person_matches batches same-dimension entries into one numpy
+    matmul instead of the original one-Python-call-per-entry scan (see its
+    docstring for why -- unvectorized per-entry work was a real, previously
+    undocumented source of the GIL contention that made raising
+    GUNICORN_THREADS make burst latency worse, not better). This proves the
+    batched path is numerically equivalent to the original scan across many
+    random libraries, including ones with a minority of entries on a
+    different embedding dimension (an older taxonomy version, still scored
+    via the original per-entry fallback)."""
+    import numpy as np
+
+    rng = random.Random(1234)
+
+    for trial in range(30):
+        dim = 8
+        n_people = rng.randint(0, 40)
+        session_embedding_index = []
+        for i in range(n_people):
+            # ~20% of entries simulate a stale, shorter embedding dimension
+            # from an older model version.
+            this_dim = dim - 2 if rng.random() < 0.2 else dim
+            rep = [rng.uniform(-1, 1) for _ in range(this_dim)]
+            session_embedding_index.append({
+                'personId': f'person-{trial}-{i}',
+                'repEmbedding': rep,
+            })
+        face_vec = [rng.uniform(-1, 1) for _ in range(dim)]
+        face_norm = app._normalized_embedding(face_vec, np)
+
+        got_best, got_second, got_person = app._best_two_person_matches(face_norm, session_embedding_index, np)
+        want_best, want_second, want_person = _reference_best_two_matches(
+            face_norm, [dict(e) for e in session_embedding_index], np,
+        )
+
+        assert got_best == pytest.approx(want_best, abs=1e-9)
+        assert got_second == pytest.approx(want_second, abs=1e-9)
+        got_id = got_person.get('personId') if got_person else None
+        want_id = want_person.get('personId') if want_person else None
+        assert got_id == want_id

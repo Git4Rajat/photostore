@@ -1087,6 +1087,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // slowness into fewer, bigger batches instead of many small queued ones.
     const initDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
     const finalizeDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
+    // /upload/client-processing had no concurrency control at all -- unlike
+    // init/finalize (batched AND gated), every browser-processing lane posts
+    // its own result the instant that photo's local AI work finishes, with
+    // no cap on how many of these can be in flight at once. It's also the
+    // most CPU-expensive of the three per call (it's what triggers
+    // _assign_faces_to_people_incrementally's per-photo people-matching --
+    // see backend/app.py), so it's at least as important to bound as the
+    // other two. Same capacity as them for the same reason (matches the
+    // backend's KEDA concurrentRequests threshold).
+    const clientProcessingDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1713,6 +1723,24 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         attemptOnce(0);
     });
 
+    // Purely caps how many /upload/client-processing calls run at once via
+    // clientProcessingDispatchGateRef -- deliberately NOT runGatedRequestWithRetry:
+    // that helper also adds retry/backoff and checks uploadStopRequestedRef,
+    // which governs the raw blob-transfer phase, not background AI-processing
+    // reporting (callers here already own their own cancellation via
+    // browserProcessingCancelRef and their own error handling/retry policy).
+    // This wrapper changes only concurrency; every other behavior (errors,
+    // resolution) is identical to calling postUpload directly.
+    const postClientProcessingGated = (payload: any): Promise<any> => new Promise((resolve, reject) => {
+        clientProcessingDispatchGateRef.current.run(async () => {
+            try {
+                resolve(await postUpload('/upload/client-processing', payload));
+            } catch (err) {
+                reject(err);
+            }
+        });
+    });
+
     // Fresh (non-resumed) uploads register in chunks via /upload/init-batch
     // instead of one /upload/init HTTP round trip per file -- each of the
     // (up to ~20) concurrent upload lanes calls requestBatchedInit for its own
@@ -2112,7 +2140,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             ];
                         }
                     }
-                    await postUpload('/upload/client-processing', {
+                    await postClientProcessingGated({
                         filename,
                         clientProcessingSchemaVersion: CLIENT_PROCESSING_SCHEMA_VERSION,
                         clientProcessing: filteredResult.clientProcessing,
@@ -2150,7 +2178,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     const failureReport = buildBrowserProcessingFailureReport(filename, statuses, effectiveSteps, processingStartedAt);
                     if (failureReport.length > 0) {
                         try {
-                            await postUpload('/upload/client-processing', {
+                            await postClientProcessingGated({
                                 filename,
                                 clientProcessingSchemaVersion: CLIENT_PROCESSING_SCHEMA_VERSION,
                                 clientProcessing: {},
@@ -2877,7 +2905,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 ];
                             }
                         }
-                        await postUpload('/upload/client-processing', {
+                        await postClientProcessingGated({
                             filename,
                             clientProcessingSchemaVersion: CLIENT_PROCESSING_SCHEMA_VERSION,
                             clientProcessing: filteredResult.clientProcessing,
