@@ -2858,21 +2858,29 @@ def finalize_uploaded_file(
         # in-flight upload later.
         metadata.pop(PENDING_ANONYMOUS_BLOB_FIELD, None)
 
+    # Processing-status fields, folded directly into the same `metadata` dict
+    # instead of a separate _init_processing_status_for_image() read-modify-write
+    # after the upsert below -- that used to re-read the row this function had
+    # just written two lines earlier, purely to set these fields and write it
+    # right back. Same final state, one fewer read + write per file.
+    file_is_video = is_video_file(final_filename)
+    video_status_overrides = {'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
+    status_overrides = video_status_overrides if file_is_video else {}
+    for step in PROCESSING_STEPS:
+        metadata[f'{step}_status'] = status_overrides.get(step, 'pending')
+    metadata['processing_metadata'] = json.dumps({})
+    metadata['processing_state'] = 'active'
+    metadata['processing_lease'] = ''
+    metadata['processing_lease_expires_at'] = ''
+    metadata['processing_lease_owner'] = ''
+    metadata['retry_count'] = 0
+    metadata['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+
     metadata_table_client.upsert_entity(metadata)
     # Keep the O(1) dedup/collision indexes current for the next upload -- see
     # detect_duplicates() and _resolve_filename_for_upload().
     _store_hash_index(user_id, file_hash, final_filename)
     _store_filename_owner(user_id, final_filename, file_hash)
-    file_is_video = is_video_file(final_filename)
-    video_status_overrides = {'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
-    try:
-        _init_processing_status_for_image(
-            user_id,
-            final_filename,
-            status_overrides=video_status_overrides if file_is_video else {},
-        )
-    except Exception:
-        pass
 
     # Server-side thumbnail / metadata extraction, eagerly, here -- video only.
     # RAW used to get this treatment too, but it's redundant: ipworker's queued
@@ -2929,33 +2937,6 @@ def _finalize_server_side_exif(user_id: str, filename: str, image_bytes: bytes, 
 
 PROCESSING_STEPS = (*BROWSER_PROCESSING_STEPS, 'verify')
 CLIENT_PROCESSING_LEASE_SECONDS = int(os.getenv('CLIENT_PROCESSING_LEASE_SECONDS', '120'))
-
-
-def _init_processing_status_for_image(user_id: str, filename: str, status_overrides: Optional[Dict[str, str]] = None) -> None:
-    _require_context()
-    metadata_table_client = _CTX['metadata_table_client']
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
-        entity = {'PartitionKey': user_id, 'RowKey': filename}
-
-    status_overrides = status_overrides or {}
-    for step in PROCESSING_STEPS:
-        field = f'{step}_status'
-        entity[field] = status_overrides.get(step, 'pending')
-
-    entity['processing_metadata'] = json.dumps({})
-    entity['processing_state'] = 'active'
-    entity['processing_lease'] = ''
-    entity['processing_lease_expires_at'] = ''
-    entity['processing_lease_owner'] = ''
-    entity['retry_count'] = 0
-    entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-    metadata_table_client.upsert_entity(entity)
-
-
-def init_processing_status_for_image(user_id: str, filename: str, status_overrides: Optional[Dict[str, str]] = None) -> None:
-    _init_processing_status_for_image(user_id, filename, status_overrides=status_overrides)
 
 
 def update_processing_status(
