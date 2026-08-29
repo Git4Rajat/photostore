@@ -42,6 +42,7 @@ import type { PhotoPersonLink } from '../types/uiTypes';
 import { classifyApiError, type ApiError } from '../services/apiError';
 import { notifyApiError } from '../services/requestFeedback';
 import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
+import { useAppServices } from './AppServicesProvider';
 
 interface Photo {
     filename: string;
@@ -136,6 +137,7 @@ const extractApiErrorMessage = (err: unknown, fallback: string): string => {
 
 const AlbumsPage: React.FC = () => {
     const location = useLocation();
+    const { releaseKnownHashesForFilenames } = useAppServices();
     const [photos, setPhotos] = useState<Photo[]>([]);
     const [photosLoading, setPhotosLoading] = useState<boolean>(false);
     const [semanticPhotos, setSemanticPhotos] = useState<Photo[] | null>(null);
@@ -772,6 +774,7 @@ const AlbumsPage: React.FC = () => {
             const errorsList = Array.isArray(response?.errors) ? (response.errors as string[]) : [];
 
             removeDeletedPhotos(deleted);
+            releaseKnownHashesForFilenames(deleted);
             setSelectedPhotos(new Set());
 
             if (errorsList.length > 0 && deleted.length > 0) {

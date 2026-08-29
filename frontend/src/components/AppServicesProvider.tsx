@@ -238,6 +238,7 @@ interface AppServicesContextValue {
     discardPersistedUploadSession: () => Promise<void>;
     registerUploadCompletionHandler: (handler: () => void | Promise<void>) => () => void;
     registerUploadErrorHandler: (handler: (message: string | null) => void) => () => void;
+    releaseKnownHashesForFilenames: (filenames: string[]) => void;
     startBrowserProcessing: (options?: BrowserProcessingStartOptions) => Promise<number>;
     browserProcessingActive: boolean;
     // In-flight background jobs from the last /api/jobs/status poll, so views can
@@ -1607,6 +1608,24 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // Ignore -- see comment above.
         }
     };
+
+    // knownHashesRef is grown but never cleared (see its declaration), so a
+    // deleted photo's hash lingers after removal -- re-selecting the same
+    // file later in the same tab session would be skipped as a "known
+    // duplicate" even though the backend has no record of it anymore. Called
+    // by delete flows (e.g. PhotoGallery's handleDeletePhotos) with the
+    // filenames actually confirmed deleted.
+    const releaseKnownHashesForFilenames = useCallback((filenames: string[]): void => {
+        if (filenames.length === 0) {
+            return;
+        }
+        const deleted = new Set(filenames);
+        knownHashesRef.current.forEach((filename, hash) => {
+            if (deleted.has(filename)) {
+                knownHashesRef.current.delete(hash);
+            }
+        });
+    }, []);
 
     // Shared by /upload/init and /upload/finalize: with the backend allowed to
     // scale to zero during a long-running upload (see the keepalive gate below),
@@ -4075,6 +4094,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         discardPersistedUploadSession,
         registerUploadCompletionHandler,
         registerUploadErrorHandler,
+        releaseKnownHashesForFilenames,
         startBrowserProcessing,
         browserProcessingActive,
         activeJobs,
@@ -4106,6 +4126,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         discardPersistedUploadSession,
         registerUploadCompletionHandler,
         registerUploadErrorHandler,
+        releaseKnownHashesForFilenames,
         startBrowserProcessing,
         browserProcessingActive,
         activeJobs,

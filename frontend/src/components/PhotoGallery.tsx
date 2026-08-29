@@ -4211,6 +4211,7 @@ interface PhotoGalleryProps {
     addNotification?: (title: string, details: string, progress?: UploadProgress) => string;
     registerUploadCompletionHandler?: (handler: () => void | Promise<void>) => () => void;
     registerUploadErrorHandler?: (handler: (message: string | null) => void) => () => void;
+    releaseKnownHashesForFilenames?: (filenames: string[]) => void;
 }
 
 interface AlbumSummary {
@@ -4225,6 +4226,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     addNotification = noopAddNotification,
     registerUploadCompletionHandler,
     registerUploadErrorHandler,
+    releaseKnownHashesForFilenames,
 }) => {
     const location = useLocation();
     const cachedBoot = loadPhotoCache();
@@ -4728,6 +4730,10 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
 
             if (succeeded.size > 0) {
                 addNotification('Photos deleted', `Deleted ${plural(succeeded.size, 'photo')} from your gallery.`);
+                // Otherwise the client-side dedup cache still remembers these
+                // filenames' hashes and would skip a re-upload as a "known
+                // duplicate" until the page is refreshed.
+                releaseKnownHashesForFilenames?.(Array.from(succeeded));
             }
             if (failureMessages.length > 0) {
                 setError(`Failed to delete some photos: ${failureMessages.slice(0, 5).join(', ')}`);

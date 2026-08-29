@@ -963,6 +963,7 @@ const AppContent: React.FC = () => {
                                         addNotification={appServices.addNotification}
                                         registerUploadCompletionHandler={appServices.registerUploadCompletionHandler}
                                         registerUploadErrorHandler={appServices.registerUploadErrorHandler}
+                                        releaseKnownHashesForFilenames={appServices.releaseKnownHashesForFilenames}
                                     />,
                                     'Loading library…',
                                 ),
