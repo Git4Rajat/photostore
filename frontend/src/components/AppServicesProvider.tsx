@@ -292,25 +292,35 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Caps how many submitted jobs run at once (at most `concurrency`), and lets
 // a caller check slot availability BEFORE committing to run something -- see
-// initDispatchGateRef/finalizeDispatchGateRef. `run` always eventually runs
-// its job (queueing if busy); `onNextFreeSlot` fires its callback once, the
-// next time a slot frees up (used to defer a soft/adaptive flush instead of
-// queueing it early).
+// uploadDispatchGateRef (shared by init/finalize/client-processing). `run`
+// always eventually runs its job (queueing if busy); `onNextFreeSlot`
+// registers a callback that fires once, the next time a slot frees up (used
+// to defer a soft/adaptive flush instead of queueing it early) -- safe for
+// multiple independent callers to each register their own, since every
+// registered callback is notified, not just the most recent one.
 const createDispatchGate = (concurrency: number) => {
     const queue: Array<() => Promise<void>> = [];
     let active = 0;
-    let waiter: (() => void) | null = null;
+    // A list, not a single slot: this gate can be shared across several
+    // independent callers (init/finalize/client-processing batches all
+    // share one gate -- see uploadDispatchGateRef below), and each can be
+    // waiting for a free slot at the same time. A single `waiter` variable
+    // would let the second registration silently clobber the first,
+    // leaving that caller's batch waiting forever for a callback that will
+    // never fire.
+    const waiters: Array<() => void> = [];
     const pump = () => {
         while (active < concurrency && queue.length > 0) {
             const job = queue.shift()!;
             active += 1;
             job().finally(() => {
                 active -= 1;
-                if (waiter) {
-                    const cb = waiter;
-                    waiter = null;
-                    cb();
-                }
+                // Notify every registered waiter, not just one -- run()'s own
+                // queue/pump above is what actually enforces `concurrency` if
+                // several of them all retry at once, so over-notifying here
+                // is harmless.
+                const toNotify = waiters.splice(0, waiters.length);
+                toNotify.forEach((cb) => cb());
                 pump();
             });
         }
@@ -322,7 +332,7 @@ const createDispatchGate = (concurrency: number) => {
             pump();
         },
         onNextFreeSlot: (cb: () => void) => {
-            waiter = cb;
+            waiters.push(cb);
         },
     };
 };
@@ -342,20 +352,30 @@ const TARGET_CONCURRENT_UPLOAD_BLOCKS = 6;
 // than this, so the cap only ever lowers the large desktop sizes.
 const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
 
-// How many concurrent init-batch/finalize-batch calls initDispatchGateRef/
-// finalizeDispatchGateRef allow at once. Was capacity 2 (d8583a5, 2026-08-28),
-// then briefly uncapped entirely -- both extremes measured badly on
-// photostore-test's real backend (2 vCPU/2.5Gi, GUNICORN_WORKERS=1,
-// GUNICORN_THREADS=4 per replica): capacity 2 topped out around 250-330/hr,
-// while fully uncapped drove genuine 503/504s and 100-240s stalls even on
-// that same known-stable backend config, because finalize_uploaded_file does
-// real per-file Table Storage round-trips (not parallelizable across a
-// single partition/GIL the way pure I/O wait is) and an unbounded frontend
-// can throw far more concurrent load at that than the backend's per-replica
-// thread pool can absorb. 8 matches the backend's own KEDA http-scaler
-// concurrentRequests threshold (deploy/resources.bicep) -- enough concurrent
-// load to reliably trigger scale-out without overwhelming a single replica
-// before it does.
+// How many concurrent init-batch/finalize-batch/client-processing calls the
+// shared uploadDispatchGateRef allows AT ONCE, TOTAL, ACROSS ALL THREE.
+// History: was capacity 2 (d8583a5, 2026-08-28), then briefly uncapped
+// entirely -- both extremes measured badly on photostore-test's real backend
+// (GUNICORN_WORKERS=1, GUNICORN_THREADS=4 per replica): capacity 2 topped out
+// around 250-330/hr, while fully uncapped drove genuine 503/504s and
+// 100-240s stalls even on that same known-stable backend config, because
+// finalize_uploaded_file does real per-file Table Storage round-trips (not
+// parallelizable across a single partition/GIL the way pure I/O wait is) and
+// an unbounded frontend can throw far more concurrent load at that than the
+// backend's per-replica thread pool can absorb. 8 matches the backend's own
+// KEDA http-scaler concurrentRequests threshold (deploy/resources.bicep) --
+// enough concurrent load to reliably trigger scale-out without overwhelming
+// a single replica before it does.
+//
+// 2026-08-29: init/finalize/client-processing used to each get their OWN
+// gate at this same capacity -- up to 3x8=24 concurrent requests when all
+// three phases overlapped (a normal pattern under sustained upload), 3x the
+// number this comment's own reasoning was about. A live HAR capture caught
+// it directly: sustained ~100% CPU across all 5 (max) replicas for 10+
+// minutes, with latency (16-150s) showing zero correlation to how much work
+// any individual request needed to do -- contention, not expensive work.
+// Merged into one shared gate (uploadDispatchGateRef) so this number is
+// actually the ceiling on total concurrent load, not per-phase.
 const UPLOAD_DISPATCH_CONCURRENCY = 8;
 
 // Shared IndexedDB-access concurrency for the upload resume cache (writing it
@@ -1085,18 +1105,24 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // never actually letting arrivals coalesce. Gating snapshot timing on
     // slot availability (not just gating the dispatch) is what turns backend
     // slowness into fewer, bigger batches instead of many small queued ones.
-    const initDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
-    const finalizeDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
-    // /upload/client-processing had no concurrency control at all -- unlike
-    // init/finalize (batched AND gated), every browser-processing lane posts
-    // its own result the instant that photo's local AI work finishes, with
-    // no cap on how many of these can be in flight at once. It's also the
-    // most CPU-expensive of the three per call (it's what triggers
-    // _assign_faces_to_people_incrementally's per-photo people-matching --
-    // see backend/app.py), so it's at least as important to bound as the
-    // other two. Same capacity as them for the same reason (matches the
-    // backend's KEDA concurrentRequests threshold).
-    const clientProcessingDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
+    // ONE shared gate for init-batch, finalize-batch, AND client-processing --
+    // not three separate ones. They used to each get their own
+    // createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY) instance, which meant
+    // up to 3x UPLOAD_DISPATCH_CONCURRENCY (24) concurrent requests in
+    // flight at once when all three phases overlap during a sustained
+    // upload (a real, common pattern: some lanes finalizing while others
+    // are still initializing while late client-processing reports trickle
+    // in). UPLOAD_DISPATCH_CONCURRENCY was tuned (see below) to match the
+    // backend's own KEDA scale-out trigger for ONE stream of load -- three
+    // independent gates each hitting that number silently tripled the
+    // real ceiling this was meant to enforce, which a live HAR capture
+    // confirmed: sustained ~100% CPU across all 5 (max) replicas for 10+
+    // minutes, with per-request latency (16-150s) showing zero correlation
+    // to how much work any individual request actually had to do --
+    // the signature of contention, not expensive work. Sharing one gate
+    // caps total concurrent upload-related load at UPLOAD_DISPATCH_CONCURRENCY
+    // regardless of which phase(s) are contributing it.
+    const uploadDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1682,10 +1708,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const postInitWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/init', payload, signal);
 
     // Same retry/backoff schedule as postUploadWithRetry above, but for calls
-    // that run through the shared dispatch gate (initDispatchGateRef/
-    // finalizeDispatchGateRef, capacity UPLOAD_DISPATCH_CONCURRENCY -- see
-    // flushInitBatch/flushFinalizeBatch and UPLOAD_DISPATCH_CONCURRENCY's own
-    // comment for the capacity-2 -> uncapped -> capacity-8 history). Each
+    // that run through the shared uploadDispatchGateRef (capacity
+    // UPLOAD_DISPATCH_CONCURRENCY -- see flushInitBatch/flushFinalizeBatch
+    // and UPLOAD_DISPATCH_CONCURRENCY's own comment for the capacity-2 ->
+    // uncapped -> capacity-8 -> shared-across-all-three-phases history). Each
     // retry attempt gets its own gate.run() job rather than one job that
     // sleeps through the whole backoff, so a retriable-failing request never
     // holds a slot idle across its backoff sleep -- this is what makes a
@@ -1724,15 +1750,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     });
 
     // Purely caps how many /upload/client-processing calls run at once via
-    // clientProcessingDispatchGateRef -- deliberately NOT runGatedRequestWithRetry:
-    // that helper also adds retry/backoff and checks uploadStopRequestedRef,
-    // which governs the raw blob-transfer phase, not background AI-processing
-    // reporting (callers here already own their own cancellation via
-    // browserProcessingCancelRef and their own error handling/retry policy).
-    // This wrapper changes only concurrency; every other behavior (errors,
-    // resolution) is identical to calling postUpload directly.
+    // the shared uploadDispatchGateRef -- deliberately NOT
+    // runGatedRequestWithRetry: that helper also adds retry/backoff and
+    // checks uploadStopRequestedRef, which governs the raw blob-transfer
+    // phase, not background AI-processing reporting (callers here already
+    // own their own cancellation via browserProcessingCancelRef and their
+    // own error handling/retry policy). This wrapper changes only
+    // concurrency; every other behavior (errors, resolution) is identical
+    // to calling postUpload directly.
     const postClientProcessingGated = (payload: any): Promise<any> => new Promise((resolve, reject) => {
-        clientProcessingDispatchGateRef.current.run(async () => {
+        uploadDispatchGateRef.current.run(async () => {
             try {
                 resolve(await postUpload('/upload/client-processing', payload));
             } catch (err) {
@@ -1783,9 +1810,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (pendingBatchInitRef.current.length === 0) {
             return;
         }
-        const gate = initDispatchGateRef.current;
+        const gate = uploadDispatchGateRef.current;
         if (!force && !gate.hasFreeSlot()) {
-            // Both slots busy -- don't snapshot yet. Leave pendingBatchInitRef
+            // Gate is full -- don't snapshot yet. Leave pendingBatchInitRef
             // open so new arrivals keep piling into it, and retry (forced)
             // the instant a slot frees up.
             gate.onNextFreeSlot(() => flushInitBatch(true));
@@ -1876,7 +1903,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (pendingBatchFinalizeRef.current.length === 0) {
             return;
         }
-        const gate = finalizeDispatchGateRef.current;
+        const gate = uploadDispatchGateRef.current;
         if (!force && !gate.hasFreeSlot()) {
             gate.onNextFreeSlot(() => flushFinalizeBatch(true));
             return;
