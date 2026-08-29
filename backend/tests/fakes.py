@@ -1,7 +1,8 @@
 """In-memory fakes of azure.data.tables clients for unit tests.
 
 Supports only the surface library_utils / password_auth use: upsert_entity,
-get_entity, query_entities("PartitionKey eq 'X'"), delete_entity, create_table.
+get_entity, query_entities("PartitionKey eq 'X'" [and one more "field eq 'Y'"
+clause]), delete_entity, create_table.
 """
 from __future__ import annotations
 
@@ -32,11 +33,21 @@ class FakeTable:
         self.rows.pop((partition_key, row_key), None)
 
     def query_entities(self, filter_str):
+        # Compound clause checked first -- the plain-PartitionKey pattern's
+        # greedy '(.*)' would otherwise swallow " and field eq '...'" as part
+        # of the partition key value itself.
+        m = re.match(r"PartitionKey eq '(.*)' and (\w+) eq '(.*)'$", filter_str.strip())
+        if m:
+            pk, field, value = m.group(1), m.group(2), m.group(3)
+            return [
+                dict(v) for (p, _), v in self.rows.items()
+                if p == pk and str(v.get(field, '')) == value
+            ]
         m = re.match(r"PartitionKey eq '(.*)'$", filter_str.strip())
-        if not m:
-            raise ValueError(f'Unsupported filter: {filter_str}')
-        pk = m.group(1)
-        return [dict(v) for (p, _), v in self.rows.items() if p == pk]
+        if m:
+            pk = m.group(1)
+            return [dict(v) for (p, _), v in self.rows.items() if p == pk]
+        raise ValueError(f'Unsupported filter: {filter_str}')
 
 
 def make_store():

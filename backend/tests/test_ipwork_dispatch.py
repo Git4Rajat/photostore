@@ -41,13 +41,13 @@ def dispatch_ctx(monkeypatch):
     # Default to "maintenance is due" so existing tests keep exercising the
     # enqueue path; test_maintenance_cooldown_skips_enqueue overrides this.
     monkeypatch.setattr(app, '_clustering_maintenance_due', lambda user_id: True)
-    # By default, pretend one face is awaiting assignment so the incremental
-    # matcher call is exercised (not silently skipped on an empty list) --
-    # test_face_step_success_triggers_clustering below asserts on this call.
-    monkeypatch.setattr(app, '_face_ids_awaiting_person_assignment', lambda user_id, filename: ['face-1'])
+    # Incremental face-to-person assignment is queued for the standalone
+    # clustering worker (see _enqueue_incremental_assign_job), not run
+    # in-process here -- see test_clustering_incremental_assign.py for the
+    # worker-side dispatch of the resulting 'people_incremental_assign' job.
     monkeypatch.setattr(
-        app, '_assign_faces_to_people_incrementally',
-        lambda user_id, filename, face_ids: calls.incremental_assign.append((user_id, filename, face_ids)) or ({}, set()),
+        app, '_enqueue_incremental_assign_job',
+        lambda user_id, filename: calls.incremental_assign.append((user_id, filename)) or {'status': 'queued'},
     )
     yield calls
 
@@ -63,10 +63,11 @@ def test_face_step_success_triggers_clustering(monkeypatch, dispatch_ctx):
         {'filename': 'photo.jpg', 'steps': ['face']}, 'job-1', 'lib-A',
     )
 
-    # Incremental face-to-person assignment runs synchronously, in-process,
-    # before the (now cooldown-gated) maintenance enqueue decision -- this is
-    # what eliminates the clustering worker from the common case.
-    assert dispatch_ctx.incremental_assign == [('lib-A', 'photo.jpg', ['face-1'])]
+    # Incremental face-to-person assignment is queued for the clustering
+    # worker (not run in-process) before the (now cooldown-gated) maintenance
+    # enqueue decision -- see _enqueue_incremental_assign_job's docstring for
+    # why this moved off the request path.
+    assert dispatch_ctx.incremental_assign == [('lib-A', 'photo.jpg')]
 
     assert len(dispatch_ctx.enqueue_clustering) == 1
     user_id, kwargs = dispatch_ctx.enqueue_clustering[0]
@@ -74,27 +75,6 @@ def test_face_step_success_triggers_clustering(monkeypatch, dispatch_ctx):
     assert kwargs['job_type'] == 'people_cluster'
     assert kwargs['payload']['filename'] == 'photo.jpg'
     assert ('ipwork', 'done') in dispatch_ctx.job_statuses
-
-
-def test_face_step_skips_incremental_assign_when_no_faces_awaiting(monkeypatch, dispatch_ctx):
-    """A repeat trigger for a filename whose faces are already assigned
-    (finalize -> later client-processing -> occasional ipwork re-run) should
-    be a cheap no-op, not re-run the matcher against already-assigned faces."""
-    monkeypatch.setattr(app, '_run_ipwork_steps', lambda user_id, filename, steps: {'face': {'faces': [{}]}})
-    monkeypatch.setattr(
-        app, 'apply_client_processing_results_for_file',
-        lambda *a, **k: {'processing_state': 'active', 'face_status': 'done', 'faceCount': 1},
-    )
-    monkeypatch.setattr(app, '_face_ids_awaiting_person_assignment', lambda user_id, filename: [])
-
-    app._handle_ipwork_queue_payload(
-        {'filename': 'photo.jpg', 'steps': ['face']}, 'job-1', 'lib-A',
-    )
-
-    assert dispatch_ctx.incremental_assign == []
-    # The (now cooldown-gated) maintenance enqueue decision is independent of
-    # this and still runs.
-    assert len(dispatch_ctx.enqueue_clustering) == 1
 
 
 def test_face_step_skips_enqueue_when_maintenance_cooldown_active(monkeypatch, dispatch_ctx):
@@ -112,10 +92,10 @@ def test_face_step_skips_enqueue_when_maintenance_cooldown_active(monkeypatch, d
         {'filename': 'photo.jpg', 'steps': ['face']}, 'job-1', 'lib-A',
     )
 
-    # Incremental assignment (the fast path) still runs regardless of the
+    # Incremental assignment (the fast path) is still queued regardless of the
     # maintenance cooldown -- only the (now rare) DBSCAN maintenance pass is
-    # gated, not the synchronous per-face matching.
-    assert dispatch_ctx.incremental_assign == [('lib-A', 'photo.jpg', ['face-1'])]
+    # gated, not the per-face matching.
+    assert dispatch_ctx.incremental_assign == [('lib-A', 'photo.jpg')]
     assert dispatch_ctx.enqueue_clustering == []
     assert ('ipwork', 'done') in dispatch_ctx.job_statuses
 

@@ -223,3 +223,113 @@ def test_vectorized_best_two_matches_agrees_with_reference_scan_including_mixed_
         got_id = got_person.get('personId') if got_person else None
         want_id = want_person.get('personId') if want_person else None
         assert got_id == want_id
+
+
+def test_batched_normalize_agrees_with_per_entry_reference_including_mixed_dimensions():
+    """_attach_normalized_embeddings_batched replaces _load_people_embedding_index's
+    original one-numpy-call-per-person normalize (see its docstring) with one
+    batched norm+divide per same-dimension group. Proves the batched result is
+    numerically identical to calling _normalized_embedding per entry directly,
+    across many random libraries including a minority of entries on a
+    different (legacy) embedding dimension."""
+    import numpy as np
+
+    rng = random.Random(5678)
+
+    for trial in range(30):
+        dim = 8
+        n_people = rng.randint(0, 40)
+        raw_reps = []
+        for i in range(n_people):
+            this_dim = dim - 2 if rng.random() < 0.2 else dim
+            raw_reps.append([rng.uniform(-1, 1) for _ in range(this_dim)])
+
+        entries = [{'personId': f'person-{trial}-{i}'} for i in range(n_people)]
+        app._attach_normalized_embeddings_batched(entries, raw_reps, np)
+
+        for entry, rep in zip(entries, raw_reps):
+            want = app._normalized_embedding(rep, np)
+            got = entry['_normalized_rep_embedding']
+            assert got == pytest.approx(want, abs=1e-9)
+
+
+# 2026-08-29: incremental face-to-person assignment moved from running
+# synchronously inline in the upload request path back to the standalone
+# clustering worker (see _enqueue_incremental_assign_job and
+# _queue_people_clustering_after_face_processing's docstring) -- these tests
+# cover the worker-side 'people_incremental_assign' dispatch that now does
+# the work _queue_people_clustering_after_face_processing used to do itself.
+
+def test_incremental_assign_job_matches_awaiting_face_to_existing_person(clustering_tables, monkeypatch):
+    face_table, person_table = clustering_tables
+    user_id = 'lib-A'
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE)
+
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(
+        app, '_get_metadata_entity',
+        lambda uid, filename: {'processing_state': 'active', 'face_status': 'done'},
+    )
+
+    app._handle_clustering_queue_payload(
+        {'user_id': user_id, 'type': 'people_incremental_assign', 'filename': 'photo.jpg'},
+        '', user_id, 'people_incremental_assign',
+    )
+
+    assert face_table.get_entity(user_id, 'new-face')['personId'] == 'person-1'
+    assert len(person_table.rows) == 1
+
+
+def test_incremental_assign_job_is_a_no_op_when_no_faces_awaiting(clustering_tables, monkeypatch):
+    """A repeat trigger for a filename whose faces are already assigned
+    (finalize -> later client-processing -> occasional ipwork re-run) should
+    be a cheap no-op, not re-run the matcher against already-assigned faces."""
+    face_table, person_table = clustering_tables
+    user_id = 'lib-A'
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    _seed_face(face_table, user_id, 'already-assigned', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE, personId='person-1')
+
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(
+        app, '_get_metadata_entity',
+        lambda uid, filename: {'processing_state': 'active', 'face_status': 'done'},
+    )
+    assign_calls = []
+    monkeypatch.setattr(
+        app, '_assign_faces_to_people_incrementally',
+        lambda *a, **k: assign_calls.append(a) or ({}, set()),
+    )
+
+    app._handle_clustering_queue_payload(
+        {'user_id': user_id, 'type': 'people_incremental_assign', 'filename': 'photo.jpg'},
+        '', user_id, 'people_incremental_assign',
+    )
+
+    assert assign_calls == []
+
+
+def test_incremental_assign_job_skips_deleted_photo(clustering_tables, monkeypatch):
+    face_table, person_table = clustering_tables
+    user_id = 'lib-A'
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE)
+
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(
+        app, '_get_metadata_entity',
+        lambda uid, filename: {'processing_state': 'deleted', 'face_status': 'done'},
+    )
+    assign_calls = []
+    monkeypatch.setattr(
+        app, '_assign_faces_to_people_incrementally',
+        lambda *a, **k: assign_calls.append(a) or ({}, set()),
+    )
+
+    app._handle_clustering_queue_payload(
+        {'user_id': user_id, 'type': 'people_incremental_assign', 'filename': 'photo.jpg'},
+        '', user_id, 'people_incremental_assign',
+    )
+
+    assert assign_calls == []

@@ -2388,6 +2388,41 @@ def _enqueue_clustering_job(
     return {'status': 'queued', 'jobId': job_id}
 
 
+def _enqueue_incremental_assign_job(user_id: str, filename: str) -> Dict[str, str]:
+    """Queue asynchronous face-to-person assignment for one just-processed
+    photo, run by the standalone clustering worker instead of inline in the
+    upload request path (see _queue_people_clustering_after_face_processing
+    for why: this used to run synchronously in-process, and moving it here
+    was what made /upload/finalize and /upload/client-processing responses
+    balloon from ms to tens-of-seconds under a large burst -- an unvectorized
+    per-photo embedding-index rebuild competing for the same GIL as every
+    other concurrent upload request on the replica).
+
+    Deliberately skips _enqueue_clustering_job's active-job de-dupe and
+    _upsert_job_status bookkeeping: that guard exists so a slow full-library
+    DBSCAN maintenance pass doesn't get duplicated, but here every photo
+    needs its own assignment pass -- coalescing them would silently drop
+    faces, and a status row per photo would add exactly the kind of
+    per-upload Table Storage write churn this fix is trying to get off the
+    request path. No jobId means the worker's own status/coalesced-rerun
+    bookkeeping (which all key off a truthy job_id) is a no-op for these.
+    """
+    if clustering_queue_client is None:
+        app.logger.warning('Clustering queue client is unavailable; incremental-assign for %s/%s was not enqueued', user_id, filename)
+        return {'status': 'unavailable'}
+    message = {
+        'user_id': user_id,
+        'type': 'people_incremental_assign',
+        'filename': filename,
+    }
+    try:
+        clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
+    except Exception:
+        app.logger.exception('Failed to enqueue incremental-assign job for %s/%s', user_id, filename)
+        return {'status': 'failed'}
+    return {'status': 'queued'}
+
+
 def _enqueue_propagate_job(user_id: str, person_id: str) -> Dict[str, str]:
     """Queue an asynchronous identity-propagation pass for a named person.
 
@@ -2917,6 +2952,31 @@ def _normalized_embedding(vec: List[float], np):
     return arr / norm
 
 
+def _attach_normalized_embeddings_batched(entries: List[Dict], raw_reps: List[List[float]], np) -> None:
+    """Same per-entry result as calling _normalized_embedding(rep, np) once for
+    each entries[i]/raw_reps[i] pair, but batches same-dimension embeddings
+    into one vectorized norm+divide instead of one numpy call per entry --
+    same technique _best_two_person_matches already uses for the comparison
+    step (see its docstring), applied to the other half of
+    _load_people_embedding_index's per-photo rebuild cost. A minority of
+    entries on a different (legacy) embedding dimension are simply grouped
+    into their own smaller batch, so correctness for mixed-dimension
+    libraries is unaffected."""
+    groups: Dict[int, List[int]] = {}
+    for pos, rep in enumerate(raw_reps):
+        groups.setdefault(len(rep), []).append(pos)
+
+    dtype = _embedding_precision_dtype(np)
+    for dim, positions in groups.items():
+        if dim == 0:
+            continue
+        matrix = np.asarray([raw_reps[pos] for pos in positions], dtype=dtype)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12
+        normalized = matrix / norms
+        for row_idx, pos in enumerate(positions):
+            entries[pos]['_normalized_rep_embedding'] = normalized[row_idx]
+
+
 def _normalized_embedding_for_entry(entry: Dict, np):
     cached = entry.get('_normalized_rep_embedding')
     if cached is not None:
@@ -3204,6 +3264,7 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
             np = None
 
         index = []
+        raw_reps: List[List[float]] = []
         for row in rows:
             try:
                 face_ids = json.loads(row.get('faceIds', '[]') or '[]')
@@ -3226,13 +3287,20 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
                 'repEmbedding': rep,
                 'confirmedFaceCount': _confirmed_face_count(user_id, active_face_ids, person_id),
             }
-            if np is not None:
-                # Precomputed once per cache build instead of once per caller
-                # (_normalized_embedding_for_entry would otherwise redo this
-                # on every fresh copy of the entry) -- read-only downstream,
-                # so sharing the same array across cached copies is safe.
-                entry['_normalized_rep_embedding'] = _normalized_embedding(rep, np)
             index.append(entry)
+            raw_reps.append(rep)
+
+        if np is not None and index:
+            # Precomputed once per cache build instead of once per caller
+            # (_normalized_embedding_for_entry would otherwise redo this on
+            # every fresh copy of the entry) -- read-only downstream, so
+            # sharing the same array across cached copies is safe. Batched
+            # across all entries (see _attach_normalized_embeddings_batched)
+            # instead of one numpy call per person -- that per-person call
+            # overhead, multiplied by every person in the library on every
+            # uploaded photo, was the other half of this function's
+            # unvectorized CPU cost (see module docstring above).
+            _attach_normalized_embeddings_batched(index, raw_reps, np)
         return index
 
     return _people_embedding_index_cache.get(user_id, _build)
@@ -9796,11 +9864,22 @@ def _face_ids_awaiting_person_assignment(user_id: str, filename: str) -> List[st
 
 
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
-    """Assign newly-detected faces to people, then queue a maintenance
-    recluster if one's due. Runs synchronously, in-process (backend or
-    ipworker, wherever the face step just ran) -- no clustering-worker
-    round trip for the common case of recognizing an existing person or
-    bootstrapping a new one.
+    """Queue face-to-person assignment for newly-detected faces, then queue a
+    maintenance recluster if one's due.
+
+    2026-08-19 (6696f27) promoted the incremental matcher from a
+    worker-only fallback to running synchronously, in-process, right here --
+    fixing a real bug (a runaway full-library DBSCAN loop that kept
+    ownphotostore-worker alive re-reclustering every ~2 minutes during a
+    backfill) by moving the work onto the request path instead. That traded
+    one bug for another: the unvectorized per-photo embedding-index rebuild
+    (see _load_people_embedding_index) now competes for the same
+    GUNICORN_THREADS/GIL as every other concurrent upload request, which is
+    what made /upload/finalize and /upload/client-processing responses
+    balloon from ms to tens-of-seconds under a large burst. Back to queuing
+    it for the standalone clustering worker (see
+    _enqueue_incremental_assign_job) -- the maintenance-cooldown gate below,
+    which is what actually fixed the runaway-loop bug, is untouched.
     """
     if not _people_features_available() or not isinstance(metadata, dict):
         return None
@@ -9826,11 +9905,9 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
         return None
 
     try:
-        face_ids = _face_ids_awaiting_person_assignment(user_id, filename)
-        if face_ids:
-            _assign_faces_to_people_incrementally(user_id, filename, face_ids)
+        _enqueue_incremental_assign_job(user_id, filename)
     except Exception:
-        app.logger.exception('Incremental face-to-person assignment failed for %s/%s', user_id, filename)
+        app.logger.exception('Failed to queue incremental face-to-person assignment for %s/%s', user_id, filename)
 
     if not _clustering_maintenance_due(user_id):
         return {'status': 'cooldown_skipped'}
@@ -12802,6 +12879,34 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 library_store.set_cleanup_failed(target_library_id, str(exc))
             if job_id:
                 _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error=str(exc), libraryId=target_library_id)
+        return
+
+    if job_type == 'people_incremental_assign':
+        # Handled here (before the _clustering_job_types() gate below, and
+        # its shared per-job-type 'running' status upsert + coalesced-rerun
+        # finally block) since these jobs carry no job_id -- see
+        # _enqueue_incremental_assign_job for why. Re-fetches metadata and
+        # face_ids fresh from storage rather than trusting anything from the
+        # enqueue-time request, since this may run long after that request
+        # returned.
+        if not _people_features_available():
+            return
+        filename = _validate_media_filename(str(payload.get('filename') or ''))
+        if not filename:
+            return
+        metadata = _get_metadata_entity(user_id, filename)
+        if not isinstance(metadata, dict):
+            return
+        if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
+            return
+        if str(metadata.get('face_status') or '').strip().lower() != 'done':
+            return
+        try:
+            face_ids = _face_ids_awaiting_person_assignment(user_id, filename)
+            if face_ids:
+                _assign_faces_to_people_incrementally(user_id, filename, face_ids)
+        except Exception:
+            worker_logger.exception('Incremental face-to-person assignment failed for %s/%s', user_id, filename)
         return
 
     if not (job_type in _clustering_job_types() and _people_features_available()):
