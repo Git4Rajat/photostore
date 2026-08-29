@@ -68,6 +68,7 @@ from storage_utils import (
     get_media_properties,
     claim_processing_lease,
     heartbeat_processing_lease,
+    PhotoNotFoundError,
     reset_received_ranges,
     reset_upload_tracking_and_reserve_blob,
     reset_upload_tracking_and_reserve_blobs_batch,
@@ -13114,7 +13115,8 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
 
 
 def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> str:
-    """Process one ipwork queue message. Returns 'done', 'noop', or 'lease_busy'.
+    """Process one ipwork queue message. Returns 'done', 'noop', 'lease_busy',
+    or 'not_found'.
 
     In 'both' mode the browser and ipworker are both trying to process the
     same upload, so before doing any work ipworker first competes for the
@@ -13136,6 +13138,14 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     whose browser tab claimed the lease and then closed mid-processing,
     instead of that photo only ever getting picked up again if some browser
     tab reopens and polls /upload/processing/pending.
+
+    A 'not_found' return means the photo is gone for good (deleted while
+    this message sat in the queue, e.g. uploaded during an ipworker outage
+    and deleted before it came back) -- there is no future state in which
+    retrying would succeed, so unlike 'lease_busy' this tells the caller to
+    delete the message immediately instead of burning IPWORK_LEASE_RETRY_LIMIT
+    redeliveries (each costing one IPWORKER_VISIBILITY_TIMEOUT_SECONDS wait)
+    on a photo that will never come back.
     """
     filename = str(payload.get('filename') or '').strip()
     steps = [str(s).strip() for s in (payload.get('steps') or []) if str(s).strip() in IPWORK_STEPS]
@@ -13147,6 +13157,13 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
         lease_started = time.monotonic()
         lease = claim_processing_lease(user_id, filename, lease_owner, lease_seconds=IPWORKER_LEASE_SECONDS, steps=steps)
         lease_claim_ms = round((time.monotonic() - lease_started) * 1000)
+    except PhotoNotFoundError as exc:
+        # Row was deleted (or soft-deleted) out from under this queued
+        # message -- nothing to retry, so don't treat it like lease
+        # contention (which would redeliver it up to IPWORK_LEASE_RETRY_LIMIT
+        # times for no reason).
+        _upsert_job_status(job_id, user_id, 'ipwork', 'skipped', reason=str(exc))
+        return 'not_found'
     except Exception as exc:
         # Another worker (a browser tab, or another ipworker replica) already
         # holds an active lease on this photo -- they're doing the work.
@@ -13270,7 +13287,7 @@ def _prewarm_ipwork_models() -> None:
 def _process_ipwork_message(message) -> str:
     """Runs on a worker thread. Parses one queue message and dispatches it
     through _handle_ipwork_queue_payload, returning the outcome string
-    ('done'/'noop'/'lease_busy'). Never raises -- any exception here is
+    ('done'/'noop'/'lease_busy'/'not_found'). Never raises -- any exception here is
     caught and reported via _upsert_job_status, the same as the old
     single-message loop body did inline, so a bug in one worker thread
     can't escape into the main thread's future.result() call."""

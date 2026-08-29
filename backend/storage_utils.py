@@ -2991,6 +2991,15 @@ def _processing_is_expired(entity: Dict) -> bool:
         return True
 
 
+class PhotoNotFoundError(RuntimeError):
+    """Raised by claim_processing_lease when the photo is gone (row deleted
+    or soft-deleted) rather than merely lease-contended -- callers that need
+    to tell "nothing to do here, ever" apart from "busy, retry later" (e.g.
+    ipworker deciding whether to redeliver a queue message) can catch this
+    specifically; it still satisfies existing `except RuntimeError`/
+    `except Exception` callers unchanged since it subclasses RuntimeError."""
+
+
 def claim_processing_lease(
     user_id: str,
     filename: str,
@@ -3005,9 +3014,9 @@ def claim_processing_lease(
     try:
         entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
     except Exception:
-        raise RuntimeError('Photo not found.')
+        raise PhotoNotFoundError('Photo not found.')
     if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
-        raise RuntimeError('Photo has been deleted.')
+        raise PhotoNotFoundError('Photo has been deleted.')
 
     lease_expired = _processing_is_expired(entity)
     current_owner = str(entity.get('processing_lease_owner') or '').strip()
