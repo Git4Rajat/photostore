@@ -1068,8 +1068,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // never actually letting arrivals coalesce. Gating snapshot timing on
     // slot availability (not just gating the dispatch) is what turns backend
     // slowness into fewer, bigger batches instead of many small queued ones.
-    const initDispatchGateRef = useRef(createDispatchGate(2));
-    const finalizeDispatchGateRef = useRef(createDispatchGate(2));
+    const initDispatchGateRef = useRef(createDispatchGate(Infinity));
+    const finalizeDispatchGateRef = useRef(createDispatchGate(Infinity));
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1637,18 +1637,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const postInitWithRetry = (payload: any, signal?: AbortSignal) => postUploadWithRetry('/upload/init', payload, signal);
 
     // Same retry/backoff schedule as postUploadWithRetry above, but for calls
-    // that run through a small shared dispatch gate (initDispatchGateRef/
-    // finalizeDispatchGateRef, capacity 2 -- see flushInitBatch/
-    // flushFinalizeBatch). postUploadWithRetry sleeps *while still holding*
-    // whatever slot it was given, so a single request stuck retriable-failing
-    // (each attempt can run up to Azure's ~240s ingress timeout) could occupy
-    // a slot for MAX_FINALIZE_RETRIES * 240s -- tens of minutes. With only 2
-    // slots total, two such stragglers wedged the entire init/finalize
-    // pipeline for every other pending file (head-of-line blocking/convoy).
-    // Here each attempt is its own gate.run() job, so the slot is released
-    // the instant an attempt settles and the backoff sleep + next attempt
-    // happen off-gate, competing fairly with other pending batches instead
-    // of monopolizing a slot to do nothing but wait.
+    // that run through the shared dispatch gate (initDispatchGateRef/
+    // finalizeDispatchGateRef -- see flushInitBatch/flushFinalizeBatch).
+    // initDispatchGateRef/finalizeDispatchGateRef are uncapped (concurrency:
+    // Infinity) as of 2026-08-29 -- an earlier low-capacity cap traded
+    // convoy-stall/failure risk for materially lower throughput (measured
+    // ~250-330/hr vs. ~1k/hr), which wasn't the right tradeoff. Each retry
+    // attempt still gets its own gate.run() job rather than one job that
+    // sleeps through the whole backoff, so a retriable-failing request never
+    // holds a slot idle across its backoff sleep -- harmless now that slots
+    // aren't scarce, but still correct if a cap is ever reintroduced.
     const runGatedRequestWithRetry = (
         gate: ReturnType<typeof createDispatchGate>,
         url: string,
@@ -1700,13 +1698,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // the batch still flushes promptly even if requests keep trickling in
     // one at a time rather than clustering.
     //
-    // That alone still wasn't enough, though (see initDispatchGateRef): the
-    // debounce/max-wait timers fire on a fixed clock and don't know whether
-    // a network slot is actually free. flushInitBatch takes a `force` flag
-    // for exactly this -- debounce/max-wait firings pass force=false (only
-    // actually send if a slot's free; otherwise leave the batch open and
-    // retry the instant one frees), while the same-filename guard and the
-    // hard size cap below pass force=true (must close now, no matter what).
+    // flushInitBatch still takes a `force` flag (debounce/max-wait firings
+    // pass force=false, the same-filename guard and hard size cap pass
+    // force=true), inherited from when initDispatchGateRef had limited
+    // capacity and force=false meant "only send if a slot's free, else hold
+    // the batch open." initDispatchGateRef is uncapped now (see its
+    // declaration), so hasFreeSlot() is always true and every force=false
+    // firing sends immediately too -- the flag is dormant, kept so the path
+    // still behaves correctly if a cap is ever reintroduced.
     const INIT_BATCH_MAX_SIZE = 12;
     const INIT_BATCH_DEBOUNCE_MS = 50;
     const INIT_BATCH_MAX_WAIT_MS = 250;
@@ -1799,12 +1798,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // time the user watches a spinner for, so trading a few seconds of
     // additional background delay for meaningfully larger batches is free.
     //
-    // Same `force` split as flushInitBatch above: debounce/max-wait firings
-    // are soft (only send if a slot's free, otherwise leave the batch open
-    // and retry once one is), the same-filename guard and hard size cap are
-    // forced (must close now regardless of slot availability). See
-    // finalizeDispatchGateRef for why this matters more than a plain
-    // concurrency cap.
+    // Same `force` split as flushInitBatch above -- dormant for the same
+    // reason: finalizeDispatchGateRef is uncapped, so the force=false
+    // "only send if a slot's free" path always finds one free.
     const FINALIZE_BATCH_MAX_SIZE = 12;
     const FINALIZE_BATCH_DEBOUNCE_MS = 200;
     const FINALIZE_BATCH_MAX_WAIT_MS = 2500;
