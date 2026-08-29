@@ -9564,12 +9564,22 @@ def init_upload_batch():
     retried file anyway). Every entry must be a genuinely new upload -- pass
     a client-supplied uploadId through single-file /upload/init instead.
     """
+    request_started = time.monotonic()
+    phase_ms: Dict[str, int] = {}
+    phase_started = request_started
+    def _mark(phase: str) -> None:
+        nonlocal phase_started
+        now = time.monotonic()
+        phase_ms[phase] = round((now - phase_started) * 1000)
+        phase_started = now
+
     user_id, error = _require_user_id()
     if error:
         return error
     blocked = _library_cleanup_block_reason(user_id)
     if blocked:
         return jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
+    _mark('auth_ms')
     data = request.get_json(silent=True) or {}
     files = data.get('files')
     if not isinstance(files, list) or not files:
@@ -9598,6 +9608,7 @@ def init_upload_batch():
             'expected_hash': expected_hash,
             'upload_id': str(uuid.uuid4()),
         })
+    _mark('validate_ms')
 
     valid = [p for p in parsed if 'error' not in p]
     anonymous_blob_names: Dict[str, str] = {}
@@ -9617,6 +9628,7 @@ def init_upload_batch():
             )
         except Exception:
             app.logger.exception('Batch upload-tracking reservation failed for %s files', len(valid))
+    _mark('batch_reserve_ms')
 
     results = []
     for p in parsed:
@@ -9649,6 +9661,11 @@ def init_upload_batch():
             'thumbnailSasExpiresAt': thumbnail_sas_expires_at,
             'totalSize': p['total_size'],
         })
+    _mark('sas_mint_ms')
+    app.logger.info(
+        'init-batch timings user=%s files=%s phase_ms=%s total_ms=%s',
+        user_id, len(files), phase_ms, round((time.monotonic() - request_started) * 1000),
+    )
     return jsonify({'results': results})
 
 
@@ -9981,18 +9998,34 @@ def finalize_upload_batch():
     same restriction as /upload/init-batch -- a resumed upload still uses
     single-file /upload/finalize.
     """
+    request_started = time.monotonic()
     account_id, user_id, error = _require_library_context()
     if error:
         return error
     blocked = _library_cleanup_block_reason(user_id)
     if blocked:
         return jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
+    auth_ms = round((time.monotonic() - request_started) * 1000)
     data = request.get_json(silent=True) or {}
     files = data.get('files')
     if not isinstance(files, list) or not files:
         return jsonify({'error': 'files must be a non-empty list'}), 400
     if len(files) > MAX_INIT_BATCH_FILES:
         return jsonify({'error': f'Batch too large (max {MAX_INIT_BATCH_FILES} files)'}), 400
+
+    # Summed across every file in the batch, then logged once at the end
+    # (instead of once per file) so a large batch under concurrent load
+    # doesn't multiply log volume at exactly the concurrency level this is
+    # meant to help measure.
+    phase_totals_ms = {
+        'blob_check': 0, 'finalize_write': 0, 'metadata_stamp': 0,
+        'metadata_read': 0, 'client_processing': 0, 'queue': 0, 'clustering_queue': 0,
+    }
+
+    def _accum(key: str, start: float) -> float:
+        now = time.monotonic()
+        phase_totals_ms[key] += round((now - start) * 1000)
+        return now
 
     results = []
     for idx, item in enumerate(files):
@@ -10009,16 +10042,20 @@ def finalize_upload_batch():
             results.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
             continue
 
+        t = time.monotonic()
         anonymous_blob_name = read_pending_anonymous_blob(user_id, filename)
         blob_to_check = anonymous_blob_name or filename
         try:
             props = blob_service_client.get_blob_client(container=BLOB_IMAGE_CONTAINER, blob=blob_to_check).get_blob_properties()
             if int(getattr(props, 'size', 0) or 0) != total_size:
+                t = _accum('blob_check', t)
                 results.append({'index': idx, 'filename': filename, 'error': 'Uploaded blob size mismatch'})
                 continue
         except Exception as exc:
+            t = _accum('blob_check', t)
             results.append({'index': idx, 'filename': filename, 'error': 'Uploaded blob not found', 'detail': str(exc)})
             continue
+        t = _accum('blob_check', t)
 
         try:
             duplicates, final_name = finalize_uploaded_file(
@@ -10032,9 +10069,11 @@ def finalize_upload_batch():
                 anonymous_blob_name=anonymous_blob_name,
             )
         except Exception as exc:
+            t = _accum('finalize_write', t)
             app.logger.exception('Batch finalize failed for %s', filename)
             results.append({'index': idx, 'filename': filename, 'error': 'Upload finalization failed', 'detail': str(exc)})
             continue
+        t = _accum('finalize_write', t)
 
         # Same per-file follow-up as single-file finalize above, just inline
         # in this loop instead of a separate request.
@@ -10046,6 +10085,7 @@ def finalize_upload_batch():
             _update_metadata_entity_fields(user_id, final_name, finalize_updates)
         except Exception:
             app.logger.debug('Could not stamp finalize metadata for %s', final_name)
+        t = _accum('metadata_stamp', t)
 
         metadata = None
         hash_mismatch = False
@@ -10055,6 +10095,7 @@ def finalize_upload_batch():
                 hash_mismatch = True
         except Exception:
             pass
+        t = _accum('metadata_read', t)
         if hash_mismatch:
             results.append({
                 'index': idx,
@@ -10075,18 +10116,22 @@ def finalize_upload_batch():
                 )
             except Exception:
                 app.logger.exception('Inline client processing update failed for %s', final_name)
+        t = _accum('client_processing', t)
         try:
             metadata = metadata or metadata_table_client.get_entity(partition_key=user_id, row_key=final_name)
         except Exception:
             pass
+        t = _accum('metadata_read', t)
         try:
             _queue_upload_processing(user_id, final_name)
         except Exception:
             app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
+        t = _accum('queue', t)
         try:
             _queue_people_clustering_after_face_processing(user_id, final_name, metadata)
         except Exception:
             app.logger.exception('Failed to auto-queue clustering for %s', final_name)
+        t = _accum('clustering_queue', t)
 
         results.append({
             'index': idx,
@@ -10099,6 +10144,10 @@ def finalize_upload_batch():
             'clientProcessingLateResultWaitSeconds': 0,
         })
 
+    app.logger.info(
+        'finalize-batch timings user=%s files=%s auth_ms=%s phase_totals_ms=%s total_ms=%s',
+        user_id, len(files), auth_ms, phase_totals_ms, round((time.monotonic() - request_started) * 1000),
+    )
     return jsonify({'results': results})
 
 
@@ -10107,16 +10156,19 @@ def finalize_upload_batch():
 @app.route('/api/upload/client-processing', methods=['POST'])
 @app.route('/api/upload/client-processing/', methods=['POST'])
 def upload_client_processing_results():
+    request_started = time.monotonic()
     user_id, error = _require_user_id()
     if error:
         return error
     blocked = _library_cleanup_block_reason(user_id)
     if blocked:
         return jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
+    auth_ms = round((time.monotonic() - request_started) * 1000)
     data = request.get_json(silent=True) or {}
     filename = _validate_media_filename(data.get('filename', ''))
     if not filename:
         return jsonify({'error': 'Invalid filename'}), 400
+    t = time.monotonic()
     try:
         metadata = apply_client_processing_results_for_file(
             user_id,
@@ -10132,16 +10184,24 @@ def upload_client_processing_results():
         if 'deleted' in message.lower():
             return jsonify({'error': 'Photo has been deleted'}), 410
         return jsonify({'error': 'Client processing update failed', 'detail': str(exc)}), 500
+    apply_ms = round((time.monotonic() - t) * 1000)
 
     # apply_client_processing_results_for_file writes via storage_utils,
     # bypassing _update_metadata_entity_fields.
     _invalidate_metadata_scan_cache(user_id)
 
+    t = time.monotonic()
     try:
         _queue_people_clustering_after_face_processing(user_id, filename, metadata)
     except Exception:
         app.logger.exception('Failed to auto-queue clustering after browser processing update for %s', filename)
+    clustering_queue_ms = round((time.monotonic() - t) * 1000)
 
+    app.logger.info(
+        'client-processing timings user=%s file=%s auth_ms=%s apply_ms=%s clustering_queue_ms=%s total_ms=%s',
+        user_id, filename, auth_ms, apply_ms, clustering_queue_ms,
+        round((time.monotonic() - request_started) * 1000),
+    )
     return jsonify({
         'uploadId': data.get('uploadId') or '',
         'filename': filename,
