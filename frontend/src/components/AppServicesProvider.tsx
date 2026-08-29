@@ -1035,6 +1035,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // rather than via a useEffect on `uploading` -- see the gate in
     // startBrowserProcessing for why the ordering matters.
     const uploadingRef = useRef<boolean>(false);
+    // Filenames whose /upload/finalize just succeeded in this tab session --
+    // checked (and consumed) by fetchConvertedRawPreview's callers to skip a
+    // guaranteed-to-404/503 backend preview-conversion request: the backend
+    // cannot possibly have a cached converted preview yet for a file that was
+    // just uploaded, and every failed attempt also enqueues a background
+    // preview-generation job that competes with the upload burst for backend
+    // CPU (see 2026-08-30 investigation). Each filename is removed after its
+    // first skip, so any later genuine reprocessing (stale-version requeue,
+    // manual repair) tries the backend preview normally.
+    const freshlyUploadedFilenamesRef = useRef<Set<string>>(new Set());
     const uploadSessionRef = useRef<PersistedUploadSession | null>(null);
     const isResumingUploadRef = useRef<boolean>(false);
     const uploadStartInProgressRef = useRef<boolean>(false);
@@ -2123,7 +2133,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
                     const blob = await fetchProcessingBlob(imageUrl);
                     const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
-                    const convertedPreview = await fetchConvertedRawPreview(filename);
+                    // Skip the one guaranteed-to-fail attempt right after this
+                    // tab's own upload finalized this file (see
+                    // freshlyUploadedFilenamesRef's comment) -- any later pass
+                    // for the same filename (stale-version requeue, manual
+                    // repair) tries the backend preview normally.
+                    const skipConvertedPreview = freshlyUploadedFilenamesRef.current.delete(filename);
+                    const convertedPreview = skipConvertedPreview ? undefined : await fetchConvertedRawPreview(filename);
                     await post('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
                     const result = await runBrowserProcessing(
                         file,
@@ -2912,7 +2928,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     // only needed when that report never went out.
                     let leaseReleasedByReport = false;
                     try {
-                        const convertedPreview = await fetchConvertedRawPreview(filename);
+                        // Unlike the drain-loop path above, this always runs on a
+                        // file finalizeUploadedFile just uploaded moments ago --
+                        // the backend cannot have a cached converted preview yet,
+                        // so skip straight to runBrowserProcessing's own
+                        // client-side embedded-preview fallback instead of a
+                        // guaranteed-to-fail round trip (see
+                        // freshlyUploadedFilenamesRef's comment).
+                        const convertedPreview: Blob | undefined = undefined;
                         const result = await runBrowserProcessing(
                             file,
                             `browser-${filename}`,
@@ -3053,6 +3076,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         error: undefined,
                     });
                     if (!skippedDuplicate) {
+                        freshlyUploadedFilenamesRef.current.add(fileMeta.name);
                         kickOffThumbnailForFile(file, fileMeta.name);
                     }
                     uploadSourceFilesRef.current.delete(fileMeta.key);
