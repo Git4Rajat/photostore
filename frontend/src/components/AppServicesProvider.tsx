@@ -342,6 +342,22 @@ const TARGET_CONCURRENT_UPLOAD_BLOCKS = 6;
 // than this, so the cap only ever lowers the large desktop sizes.
 const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
 
+// How many concurrent init-batch/finalize-batch calls initDispatchGateRef/
+// finalizeDispatchGateRef allow at once. Was capacity 2 (d8583a5, 2026-08-28),
+// then briefly uncapped entirely -- both extremes measured badly on
+// photostore-test's real backend (2 vCPU/2.5Gi, GUNICORN_WORKERS=1,
+// GUNICORN_THREADS=4 per replica): capacity 2 topped out around 250-330/hr,
+// while fully uncapped drove genuine 503/504s and 100-240s stalls even on
+// that same known-stable backend config, because finalize_uploaded_file does
+// real per-file Table Storage round-trips (not parallelizable across a
+// single partition/GIL the way pure I/O wait is) and an unbounded frontend
+// can throw far more concurrent load at that than the backend's per-replica
+// thread pool can absorb. 8 matches the backend's own KEDA http-scaler
+// concurrentRequests threshold (deploy/resources.bicep) -- enough concurrent
+// load to reliably trigger scale-out without overwhelming a single replica
+// before it does.
+const UPLOAD_DISPATCH_CONCURRENCY = 8;
+
 // Shared IndexedDB-access concurrency for the upload resume cache (writing it
 // in cacheUploadFilesForResume/attachSelectedFilesToPendingSession, and
 // checking it in retryPersistedUploadSession) -- a 1000-file batch firing
@@ -1069,8 +1085,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // never actually letting arrivals coalesce. Gating snapshot timing on
     // slot availability (not just gating the dispatch) is what turns backend
     // slowness into fewer, bigger batches instead of many small queued ones.
-    const initDispatchGateRef = useRef(createDispatchGate(Infinity));
-    const finalizeDispatchGateRef = useRef(createDispatchGate(Infinity));
+    const initDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
+    const finalizeDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1657,15 +1673,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     // Same retry/backoff schedule as postUploadWithRetry above, but for calls
     // that run through the shared dispatch gate (initDispatchGateRef/
-    // finalizeDispatchGateRef -- see flushInitBatch/flushFinalizeBatch).
-    // initDispatchGateRef/finalizeDispatchGateRef are uncapped (concurrency:
-    // Infinity) as of 2026-08-29 -- an earlier low-capacity cap traded
-    // convoy-stall/failure risk for materially lower throughput (measured
-    // ~250-330/hr vs. ~1k/hr), which wasn't the right tradeoff. Each retry
-    // attempt still gets its own gate.run() job rather than one job that
+    // finalizeDispatchGateRef, capacity UPLOAD_DISPATCH_CONCURRENCY -- see
+    // flushInitBatch/flushFinalizeBatch and UPLOAD_DISPATCH_CONCURRENCY's own
+    // comment for the capacity-2 -> uncapped -> capacity-8 history). Each
+    // retry attempt gets its own gate.run() job rather than one job that
     // sleeps through the whole backoff, so a retriable-failing request never
-    // holds a slot idle across its backoff sleep -- harmless now that slots
-    // aren't scarce, but still correct if a cap is ever reintroduced.
+    // holds a slot idle across its backoff sleep -- this is what makes a
+    // bounded cap safe again after 05f43ee: a slot releases the instant an
+    // attempt settles instead of being monopolized by a stragglers's backoff.
     const runGatedRequestWithRetry = (
         gate: ReturnType<typeof createDispatchGate>,
         url: string,
@@ -1717,14 +1732,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // the batch still flushes promptly even if requests keep trickling in
     // one at a time rather than clustering.
     //
-    // flushInitBatch still takes a `force` flag (debounce/max-wait firings
-    // pass force=false, the same-filename guard and hard size cap pass
-    // force=true), inherited from when initDispatchGateRef had limited
-    // capacity and force=false meant "only send if a slot's free, else hold
-    // the batch open." initDispatchGateRef is uncapped now (see its
-    // declaration), so hasFreeSlot() is always true and every force=false
-    // firing sends immediately too -- the flag is dormant, kept so the path
-    // still behaves correctly if a cap is ever reintroduced.
+    // flushInitBatch takes a `force` flag: debounce/max-wait firings pass
+    // force=false (only send if a slot's free, otherwise leave the batch
+    // open and retry the instant one frees via gate.onNextFreeSlot -- lets
+    // arrivals keep coalescing into a bigger batch while backend is busy
+    // instead of dispatching a stream of small ones), while the
+    // same-filename guard and the hard size cap below pass force=true (must
+    // close now, no matter what).
     const INIT_BATCH_MAX_SIZE = 12;
     const INIT_BATCH_DEBOUNCE_MS = 50;
     const INIT_BATCH_MAX_WAIT_MS = 250;
@@ -1817,9 +1831,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // time the user watches a spinner for, so trading a few seconds of
     // additional background delay for meaningfully larger batches is free.
     //
-    // Same `force` split as flushInitBatch above -- dormant for the same
-    // reason: finalizeDispatchGateRef is uncapped, so the force=false
-    // "only send if a slot's free" path always finds one free.
+    // Same `force` split as flushInitBatch above, same reasoning.
     const FINALIZE_BATCH_MAX_SIZE = 12;
     const FINALIZE_BATCH_DEBOUNCE_MS = 200;
     const FINALIZE_BATCH_MAX_WAIT_MS = 2500;
