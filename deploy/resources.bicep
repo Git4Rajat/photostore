@@ -63,6 +63,9 @@ param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 @secure()
 param sessionSecretParam string = '${newGuid()}${newGuid()}'
 
+@description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps logs to. Leave blank (the one-click-deploy default) for no log destination -- opt in only where you have provisioned a workspace, since it is a separate billable resource.')
+param logAnalyticsWorkspaceName string = ''
+
 var suffix = uniqueString(resourceGroup().id)
 // Secret used to sign login sessions. High-entropy random value (two GUIDs,
 // ~244 bits) generated once at deploy time — NOT derived from uniqueString,
@@ -182,10 +185,31 @@ resource containers 'Microsoft.Storage/storageAccounts/blobServices/containers@2
   }
 ]
 
+// 2026-08-30: linked ad-hoc via `az containerapp env update
+// --logs-destination log-analytics` to debug the live 50GB/5827-file
+// benchmark run's upload-endpoint phase timings -- that CLI-only linkage
+// got silently wiped on the very next `az deployment group create` (this
+// resource block's own properties: {} overwrote it back to no destination),
+// costing real time chasing a "logging still isn't appearing" false lead
+// before finding the actual cause. Declared here (opt-in via
+// logAnalyticsWorkspaceName) instead of trusting an out-of-band CLI change
+// to survive a future full-template deployment.
+resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = if (!empty(logAnalyticsWorkspaceName)) {
+  name: logAnalyticsWorkspaceName
+}
+
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: environmentName
   location: location
-  properties: {}
+  properties: empty(logAnalyticsWorkspaceName) ? {} : {
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: logAnalyticsWorkspace.properties.customerId
+        sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
+      }
+    }
+  }
 }
 
 // Shared backend/worker environment variables.
