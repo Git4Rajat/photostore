@@ -7017,16 +7017,31 @@ def _reconcile_in_progress_from_job_row(library_id: str, meta: Dict) -> bool:
 
 
 def _library_cleanup_block_reason(library_id: str) -> Optional[str]:
-    """Return a user-facing reason when uploads must be blocked for cleanup."""
+    """Return a user-facing reason when uploads must be blocked for cleanup.
+
+    Gated on the library's own lastCleanupStatus (one cheap point-read)
+    before touching _active_library_cleanup_job's full 'jobs'-partition scan
+    below: that scan pulls and deserializes every job-status row for the
+    whole account (213k+ rows and growing on a long-running account,
+    confirmed live via Log Analytics phase-timing logs to cost 17-33s per
+    call), and this function ran on EVERY init-batch/finalize-batch/
+    client-processing request -- dominating upload latency end to end, not
+    any of the actual per-file work. set_cleanup_in_progress (the sole
+    writer of 'in_progress') is called synchronously in the same request
+    that enqueues a cleanup job, before that request returns, so this gate
+    can't race a job that's genuinely active: lastCleanupStatus always
+    reflects reality by the time any *other* request observes it.
+    """
+    meta = library_store.get_library(library_id) if library_store is not None else {}
+    if str((meta or {}).get('lastCleanupStatus') or '') != 'in_progress':
+        return None
+
     stale_reason = _reconcile_stale_library_cleanup(library_id)
     if stale_reason:
         return None
 
     active_job = _active_library_cleanup_job(library_id)
     if active_job is None:
-        meta = library_store.get_library(library_id) if library_store is not None else {}
-        if str((meta or {}).get('lastCleanupStatus') or '') != 'in_progress':
-            return None
         # Cached 'in_progress' but nothing is actually queued/running. Trust the
         # recorded job row and reconcile, rather than blocking uploads on a stale
         # flag until the timeout fires.
