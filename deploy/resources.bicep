@@ -491,6 +491,24 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // those 3 handlers do per call -- more threads alone made it
             // worse, not better.
             { name: 'GUNICORN_THREADS', value: '4' }
+            // entrypoint.sh's default (400, +/-50 jitter) recycles the sole
+            // worker (GUNICORN_WORKERS=1, so no second worker covers the
+            // gap -- see entrypoint.sh's own comment) far too often under a
+            // sustained heavy upload: caught live via Log Analytics + system
+            // events during the 50GB/5827-file benchmark run -- gunicorn was
+            // autorestarting its worker every ~15-30s, each recycle showing
+            // up as a "readiness probe failed: connection refused" system
+            // event and a capacity-zero window for that replica. Memory has
+            // held stable at 1.4-1.6GB (well under the 2.5Gi limit) across
+            // hours of this same sustained load at the OLD 400-request
+            // interval, so the heap-fragmentation risk this setting guards
+            // against is not actually being hit anywhere near that
+            // frequently -- raised to recycle roughly an order of magnitude
+            // less often. Revisit (lower again, or add a second worker
+            // despite the RSS-duplication cost above) if memory growth shows
+            // up at this new interval.
+            { name: 'GUNICORN_MAX_REQUESTS', value: '4000' }
+            { name: 'GUNICORN_MAX_REQUESTS_JITTER', value: '400' }
             // Prime vector indexes lazily on demand; eager startup priming can
             // inflate idle RSS and duplicate index memory across workers.
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
