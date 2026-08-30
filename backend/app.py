@@ -12458,24 +12458,41 @@ def jobs_status():
         # activity indicator never clears.
         stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
         try:
-            query = f"PartitionKey eq 'jobs' and userId eq '{_escape_odata(user_id)}'"
-            rows = list(metadata_table_client.query_entities(query))
+            # Same 'jobs' partition _has_active_clustering_job scans (219k+
+            # rows and growing) -- userId isn't a key property, so Table
+            # Storage has no secondary index for it and "...and userId eq X"
+            # still costs a full partition scan server-side, paid on every
+            # poll of this endpoint. Reuse the same constant-key cache
+            # instead of re-scanning: one fetch of the whole partition genuinely
+            # serves every user's poll within the TTL window.
+            all_rows = _jobs_partition_scan_cache.get(
+                _JOBS_PARTITION_SCAN_CACHE_KEY,
+                lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
+            )
+            rows = [row for row in all_rows if str(row.get('userId') or '') == user_id]
         except Exception:
             app.logger.exception('Failed to query job status rows for %s', user_id)
             return jsonify({'jobs': []})
         jobs = []
+        flushed_any_stale = False
         for row in rows:
             status = str(row.get('status') or '').lower()
             updated_at = str(row.get('updatedAt') or '')
             job_type = str(row.get('jobType') or '')
             if status in {'queued', 'running'} and updated_at and updated_at < stale_cutoff:
                 _upsert_job_status(str(row.get('jobId') or ''), user_id, job_type, 'failed', error='Job did not finish (worker restarted or timed out)')
+                flushed_any_stale = True
                 continue
             # Keep in-flight jobs, plus terminal ones that finished recently.
             # updatedAt is a UTC isoformat string, so lexicographic comparison
             # against the cutoff is a valid recency test.
             if status in {'queued', 'running'} or updated_at >= cutoff:
                 jobs.append(_humanize_job(row))
+        if flushed_any_stale:
+            # The write(s) above just happened in this same request/process --
+            # don't make the caller (or the next poller, in-process) wait out
+            # the full cache TTL to see its own just-written result.
+            _jobs_partition_scan_cache.invalidate(_JOBS_PARTITION_SCAN_CACHE_KEY)
         jobs.sort(key=lambda job: job.get('updatedAt') or '', reverse=True)
         return jsonify({'jobs': jobs[:50]})
     except Exception as exc:

@@ -30,13 +30,14 @@ class _FakeJobsTable:
         self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
 
     def query_entities(self, filter_str):
-        m = re.match(r"PartitionKey eq '([^']*)' and userId eq '([^']*)'$", filter_str)
+        # jobs_status() now fetches the whole 'jobs' partition once (via
+        # _jobs_partition_scan_cache) and filters by userId in Python --
+        # see that function's comment for why the old server-side "and
+        # userId eq X" filter still cost a full partition scan anyway.
+        m = re.match(r"PartitionKey eq '([^']*)'$", filter_str)
         assert m, f'unexpected filter: {filter_str}'
-        pk, user_id = m.group(1), m.group(2)
-        return [
-            dict(row) for (p, _), row in self.rows.items()
-            if p == pk and row.get('userId') == user_id
-        ]
+        pk = m.group(1)
+        return [dict(row) for (p, _), row in self.rows.items() if p == pk]
 
 
 @pytest.fixture
@@ -44,6 +45,10 @@ def jobs_table(monkeypatch):
     table = _FakeJobsTable()
     monkeypatch.setattr(app, 'metadata_table_client', table)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    # Fresh cache per test -- _jobs_partition_scan_cache is a module-level
+    # singleton keyed by a constant, so without this, results from one test
+    # could leak into the next within the TTL window.
+    monkeypatch.setattr(app, '_jobs_partition_scan_cache', app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS))
     return table
 
 
