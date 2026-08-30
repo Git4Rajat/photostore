@@ -114,11 +114,24 @@ from exif_utils import (
 # 2026-08-30 Log Analytics query came back with zero "timings" lines despite
 # a live, active upload. Matches run_clustering_worker/run_ipworker's exact
 # LOG_LEVEL env var pattern.
+#
+# force=True because a first attempt at this fix (without it) still produced
+# zero INFO lines live: gunicorn configures its own logging before importing
+# the WSGI app, which leaves the root logger already holding handlers by the
+# time this module-level call runs -- plain basicConfig() silently no-ops
+# whenever the root logger already has any handler, regardless of level.
+# force=True tears those down and installs this configuration instead.
 logging.basicConfig(
     level=os.getenv('LOG_LEVEL', 'INFO').upper(),
     format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    force=True,
 )
 app = Flask(__name__)
+# Belt-and-suspenders alongside the basicConfig(force=True) above: Flask's
+# own app.logger can carry an independent level/handler (attached lazily by
+# Flask/Werkzeug) that would otherwise keep filtering out INFO regardless of
+# the root logger's configuration.
+app.logger.setLevel(os.getenv('LOG_LEVEL', 'INFO').upper())
 # The app always runs behind the Azure Container Apps ingress (a single trusted
 # reverse proxy) in production. Honor its X-Forwarded-* headers so request.is_secure,
 # request.host, and the client IP reflect the real external request. In local
