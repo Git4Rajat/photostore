@@ -104,6 +104,20 @@ from exif_utils import (
     exif_summary,
     parse_exif_data,
 )
+# run_clustering_worker/run_ipworker each call this themselves, but the main
+# "backend" role (gunicorn running this Flask app directly) never did --
+# Flask's default app.logger has no handler/level configured until something
+# sets one up, so every app.logger.info(...) call (including the per-request
+# phase-timing logs on the three upload endpoints) was being silently
+# dropped in production. WARNING/ERROR calls still appeared because of
+# Werkzeug/gunicorn's own default handling, which masked the gap until a
+# 2026-08-30 Log Analytics query came back with zero "timings" lines despite
+# a live, active upload. Matches run_clustering_worker/run_ipworker's exact
+# LOG_LEVEL env var pattern.
+logging.basicConfig(
+    level=os.getenv('LOG_LEVEL', 'INFO').upper(),
+    format='%(asctime)s %(levelname)s %(name)s %(message)s',
+)
 app = Flask(__name__)
 # The app always runs behind the Azure Container Apps ingress (a single trusted
 # reverse proxy) in production. Honor its X-Forwarded-* headers so request.is_secure,
