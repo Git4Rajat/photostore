@@ -1080,6 +1080,11 @@ def _init_storage_clients():
         hash_index_table_client=hash_index_table_client,
         filename_owners_table_client=filename_owners_table_client,
         queue_map_on_upload=(MAPS_QUEUE_ON_UPLOAD and not MAPS_ON_UPLOAD),
+        # Lambda, not a direct reference: _load_user_face_summary_by_id is
+        # defined later in this module than this call runs at import time --
+        # deferring the name lookup to call time (long after the module has
+        # finished importing) sidesteps that ordering issue.
+        face_summary_lookup=lambda uid: _load_user_face_summary_by_id(uid),
     )
     _prime_vector_indexes_on_startup()
 
@@ -2280,12 +2285,31 @@ def _clustering_job_types() -> set:
 # clustering for a user forever now that the de-dupe guard actually matches.
 CLUSTERING_ACTIVE_JOB_STALE_MINUTES = int(os.getenv('CLUSTERING_ACTIVE_JOB_STALE_MINUTES', '15'))
 
+# _has_active_clustering_job's query_entities("PartitionKey eq 'jobs'") is an
+# unfiltered scan of the SAME 'jobs' partition _active_library_cleanup_job
+# was found scanning on every upload request (213k+ rows and growing,
+# confirmed live to cost 17-33s/call -- see that fix's own comments). This
+# one is called far less often (gated behind _clustering_maintenance_due's
+# 30-minute cooldown, not every request) but hits the identical partition,
+# and that cooldown is a read-then-write race with no etag/CAS (see its own
+# docstring) -- every concurrent upload request in flight at the moment the
+# cooldown lapses can independently pay the full scan. Cached with a
+# constant key (not per-user): the query itself isn't scoped by user_id --
+# it fetches the whole partition and filters client-side -- so one scan
+# genuinely serves every user's check within the TTL window, the same way
+# _face_summary_scan_cache serves every caller of _load_user_face_summary_by_id.
+_JOBS_PARTITION_SCAN_CACHE_KEY = '__all_jobs__'
+_jobs_partition_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
+
 
 def _has_active_clustering_job(user_id: str) -> Optional[str]:
     if metadata_table_client is None:
         return None
     try:
-        rows = list(metadata_table_client.query_entities("PartitionKey eq 'jobs'"))
+        rows = _jobs_partition_scan_cache.get(
+            _JOBS_PARTITION_SCAN_CACHE_KEY,
+            lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
+        )
     except Exception:
         return None
     stale_before = datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)
@@ -5558,6 +5582,13 @@ FACE_SUMMARY_COLUMNS = [
     'personId',
     'rejected',
     'confirmedByUser',
+    # Read by _store_client_face_entities (storage_utils.py) via
+    # face_summary_lookup to decide whether a re-detected face's
+    # propagation-assigned personId should be preserved -- added when that
+    # function switched from its own uncached full-table scan to this shared
+    # cached summary, so this projection needs to carry everything that
+    # decision already depended on.
+    'assignedByPropagation',
 ]
 
 

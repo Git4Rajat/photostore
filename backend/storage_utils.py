@@ -218,6 +218,7 @@ def configure_storage(
     hash_index_table_client=None,
     filename_owners_table_client=None,
     queue_map_on_upload: bool = False,
+    face_summary_lookup=None,
 ) -> None:
     _CTX['metadata_table_client'] = metadata_table_client
     _CTX['face_table_client'] = face_table_client
@@ -231,6 +232,10 @@ def configure_storage(
     _CTX['hash_index_table_client'] = hash_index_table_client
     _CTX['filename_owners_table_client'] = filename_owners_table_client
     _CTX['queue_map_on_upload'] = bool(queue_map_on_upload)
+    # user_id -> {face_id: face_row_dict}, cached (PEOPLE_SCAN_CACHE_TTL_SECONDS,
+    # invalidated on every face-table write via _InvalidatingTableClient) --
+    # see _store_client_face_entities for why this matters.
+    _CTX['face_summary_lookup'] = face_summary_lookup
 
 
 def _require_context() -> None:
@@ -685,12 +690,30 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
         candidate_faces.append(face)
         candidate_bboxes.append(bbox)
 
-    try:
-        existing_rows = list(face_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
-        ))
-    except Exception:
-        existing_rows = []
+    # Was an uncached query_entities("PartitionKey eq user and filename eq X")
+    # -- Table Storage has no secondary index on filename, so that scanned
+    # every face row the account has EVER stored, on every single photo's
+    # face-result submission (same bug class as the already-fixed
+    # _load_people_embedding_index and _active_library_cleanup_job: invisible
+    # at small scale, ruinous once the table is large). face_summary_lookup
+    # is the same cached, invalidate-on-write per-user face scan
+    # _load_user_face_summary_by_id already uses elsewhere (PEOPLE_SCAN_CACHE_
+    # TTL_SECONDS, shared across every call in a burst instead of one scan
+    # per photo), filtered here in-memory by filename instead of server-side.
+    face_summary_lookup = _CTX.get('face_summary_lookup')
+    if callable(face_summary_lookup):
+        try:
+            summary = face_summary_lookup(user_id)
+        except Exception:
+            summary = {}
+        existing_rows = [row for row in summary.values() if str(row.get('filename') or '') == filename]
+    else:
+        try:
+            existing_rows = list(face_table_client.query_entities(
+                f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
+            ))
+        except Exception:
+            existing_rows = []
     existing_bboxes = [_normalize_face_bbox(row) for row in existing_rows]
 
     # Match by bbox overlap rather than exact pixels, so re-processing under a
