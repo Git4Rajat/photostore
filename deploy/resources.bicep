@@ -514,23 +514,25 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
         maxReplicas: 5
         rules: [
           {
-            // Was 15 (raised from KEDA's default 10 to avoid fanning out to
-            // extra replicas on every burst of small API calls). But each
-            // replica only runs 1 worker x 4 threads -- waiting for 15
-            // concurrent requests before adding capacity means 11 of them are
-            // already queued behind those 4 threads first. Confirmed live via
-            // HAR capture during a real upload burst: /upload/init, finalize,
-            // and even trivial /health calls were all taking 7-60s, almost
-            // entirely queueing time, not real work -- a handful of RAW-file
-            // requests (since fixed to no longer block synchronously, see
-            // finalize_uploaded_file) were holding all 4 threads for up to a
-            // minute each with no relief arriving. 8 (2x thread count) scales
-            // out sooner under real load while still absorbing a small burst
-            // of quick polling calls without fanning out for it.
+            // Was 15, then 8 (2x GUNICORN_THREADS) -- see git history for
+            // that reasoning. 2026-08-30: 8 was coupled 1:1 with the
+            // frontend's UPLOAD_DISPATCH_CONCURRENCY cap (also 8, chosen to
+            // match this exact number), which meant total app-wide upload
+            // demand could sit AT this threshold but essentially never
+            // exceed it -- so it rarely triggered scale-out past 2-3
+            // replicas even during a sustained multi-hour upload (confirmed
+            // live: Replicas metric flat at 2-3 for 3+ hours despite
+            // maxReplicas=5, while total concurrent backend requests
+            // measured via HAR sat right at 8-10). Lowered to match
+            // GUNICORN_THREADS (4, "1x") instead of 2x, and
+            // UPLOAD_DISPATCH_CONCURRENCY raised well above it (20, see its
+            // own comment) so real sustained demand now clearly exceeds this
+            // threshold instead of sitting flush with it -- giving KEDA
+            // actual headroom to scale toward maxReplicas under load.
             name: 'http-scaler'
             http: {
               metadata: {
-                concurrentRequests: '8'
+                concurrentRequests: '4'
               }
             }
           }

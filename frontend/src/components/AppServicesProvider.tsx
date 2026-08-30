@@ -376,7 +376,18 @@ const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
 // any individual request needed to do -- contention, not expensive work.
 // Merged into one shared gate (uploadDispatchGateRef) so this number is
 // actually the ceiling on total concurrent load, not per-phase.
-const UPLOAD_DISPATCH_CONCURRENCY = 8;
+//
+// 2026-08-30: that fix (capacity 8, exactly matching the backend's KEDA
+// concurrentRequests scale threshold) traded contention for a different
+// problem -- total demand now essentially never EXCEEDS the scale-out
+// threshold, so a sustained multi-hour upload sat flat at 2-3 replicas
+// instead of the intended maxReplicas=5 (confirmed live: Replicas metric +
+// a HAR capture showing 8-10 total concurrent backend requests spread across
+// only 3 replicas the whole time). Raised to 20 (5 replicas x
+// GUNICORN_THREADS=4) and the backend's threshold lowered to 4 (see
+// resources.bicep) so real sustained demand now clearly exceeds the
+// scale-out threshold instead of sitting flush with it.
+const UPLOAD_DISPATCH_CONCURRENCY = 20;
 
 // Shared IndexedDB-access concurrency for the upload resume cache (writing it
 // in cacheUploadFilesForResume/attachSelectedFilesToPendingSession, and
@@ -1778,6 +1789,27 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         });
     });
 
+    // 2026-08-30: /upload/processing/claim and /upload/processing/heartbeat
+    // were the only upload-path calls never routed through
+    // uploadDispatchGateRef -- each browser-processing lane fired its own
+    // claim/heartbeat unrestricted, on top of whatever the gate already had
+    // in flight. A live HAR capture during the 50GB benchmark run caught the
+    // effect directly: claim calls were bimodal, usually under a second but
+    // occasionally 4-30s when they landed on an already-saturated replica
+    // fighting the same GUNICORN_THREADS pool as gated calls. Routing them
+    // through the same gate makes total upload-related concurrency actually
+    // bounded by one number again, instead of UPLOAD_DISPATCH_CONCURRENCY
+    // plus an unbounded extra stream.
+    const runGatedProcessingCall = <T,>(fn: () => Promise<T>): Promise<T> => new Promise((resolve, reject) => {
+        uploadDispatchGateRef.current.run(async () => {
+            try {
+                resolve(await fn());
+            } catch (err) {
+                reject(err);
+            }
+        });
+    });
+
     // Fresh (non-resumed) uploads register in chunks via /upload/init-batch
     // instead of one /upload/init HTTP round trip per file -- each of the
     // (up to ~20) concurrent upload lanes calls requestBatchedInit for its own
@@ -2099,10 +2131,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     claim = preClaimed;
                 } else {
                     try {
-                        claim = await post('/upload/processing/claim', {
+                        claim = await runGatedProcessingCall(() => post('/upload/processing/claim', {
                             filename,
                             steps: effectiveSteps ? Array.from(effectiveSteps) : undefined,
-                        });
+                        }));
                     } catch (err) {
                         if (shouldSuppressLeaseWarning(err)) {
                             return;
@@ -2140,7 +2172,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     // repair) tries the backend preview normally.
                     const skipConvertedPreview = freshlyUploadedFilenamesRef.current.delete(filename);
                     const convertedPreview = skipConvertedPreview ? undefined : await fetchConvertedRawPreview(filename);
-                    await post('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                    await runGatedProcessingCall(() => post('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' })).catch(() => undefined);
                     const result = await runBrowserProcessing(
                         file,
                         `browser-${filename}`,
@@ -2916,7 +2948,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 const task: Promise<void> = (async () => {
                     let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null = null;
                     try {
-                        claim = await post('/upload/processing/claim', { filename, steps: ['thumbnail'] });
+                        claim = await runGatedProcessingCall(() => post('/upload/processing/claim', { filename, steps: ['thumbnail'] }));
                     } catch {
                         return;
                     }
