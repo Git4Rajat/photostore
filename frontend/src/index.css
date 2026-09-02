@@ -3447,6 +3447,15 @@ html[data-theme='light'] .notification-item.unread {
   height: 14px;
 }
 
+.gallery-search-spinner {
+  cursor: default;
+  color: var(--muted);
+}
+
+.gallery-search-spinner:hover {
+  background: transparent;
+}
+
 .gallery-menu-anchor {
   position: relative;
   display: inline-flex;

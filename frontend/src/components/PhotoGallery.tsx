@@ -5160,8 +5160,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                     enterKeyHint="search"
                                     className="field gallery-search-field"
                                     aria-label="Search photos"
+                                    aria-busy={loading}
                                 />
-                                {searchInput && (
+                                {loading ? (
+                                    <span className="gallery-search-clear gallery-search-spinner" aria-hidden="true">
+                                        <ArrowPathIcon className="toolbar-icon spin-icon" />
+                                    </span>
+                                ) : searchInput && (
                                     <button
                                         type="button"
                                         className="gallery-search-clear"
@@ -5172,6 +5177,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                         <XMarkIcon className="toolbar-icon" />
                                     </button>
                                 )}
+                                {loading && <span className="sr-only" role="status">Searching…</span>}
                             </div>
                         ) : (
                             <button
@@ -5179,9 +5185,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                 onClick={() => setSearchOpen(true)}
                                 className={`btn icon-btn ${searchQuery ? 'btn-primary' : 'btn-soft'}`}
                                 aria-label="Search"
-                                title={searchQuery ? `Searching: ${searchQuery}` : 'Search'}
+                                title={loading && searchQuery ? 'Searching…' : searchQuery ? `Searching: ${searchQuery}` : 'Search'}
                             >
-                                <MagnifyingGlassIcon className="toolbar-icon" />
+                                {loading && searchQuery ? (
+                                    <ArrowPathIcon className="toolbar-icon spin-icon" aria-hidden="true" />
+                                ) : (
+                                    <MagnifyingGlassIcon className="toolbar-icon" />
+                                )}
                                 <span className="sr-only">Search</span>
                             </button>
                         )}
