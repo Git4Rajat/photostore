@@ -1115,6 +1115,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clientProcessing?: unknown;
         clientProcessingReport?: unknown;
         clientAssetId?: string;
+        blobName?: string;
         resolve: (value: any) => void;
         reject: (err: unknown) => void;
     }>>([]);
@@ -1971,8 +1972,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchFinalizeRef.current;
         pendingBatchFinalizeRef.current = [];
         runGatedRequestWithRetry(gate, '/upload/finalize-batch', {
-            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId }) => ({
-                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId,
+            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName }) => ({
+                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName,
             })),
         })
             .then((response) => {
@@ -2000,6 +2001,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clientProcessing?: unknown;
         clientProcessingReport?: unknown;
         clientAssetId?: string;
+        blobName?: string;
     }): Promise<any> => (
         new Promise((resolve, reject) => {
             // Same same-filename guard as requestBatchedInit -- two entries
@@ -3048,6 +3050,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             let failedPreviewCount = 0;
 
+            // Set once IndexedDB itself turns out to be unopenable this run (seen
+            // on Safari/iOS as a raw "unable to open database file" DOMException --
+            // the browser's own IDB backing store, nothing this app wrote). Once
+            // that happens it stays broken for the rest of the run, so later files
+            // skip straight to the "missing cached file" path below instead of each
+            // repeating the same doomed idbGet call and surfacing that cryptic
+            // native error one file at a time.
+            let idbUnavailable = false;
+
             // Shared by the worker's own catch (staging/commit failures) and
             // finalizeUploadedFile's catch (finalize failures) below -- both
             // need to report a file as failed the same way, just from
@@ -3112,6 +3123,20 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         totalSize: file.size,
                         contentType: file.type || 'application/octet-stream',
                         sha256: staged.sha256,
+                        // The blob THIS file's blocks were actually staged
+                        // against, not re-derived server-side -- when several
+                        // files share an original filename (e.g. 10 photos all
+                        // named "Ip_image.jpeg"), every one of their /upload/init
+                        // calls writes its own reservation onto the SAME shared
+                        // (user, filename) row (renaming to a unique row only
+                        // happens later, inside finalize itself). Re-deriving the
+                        // blob name at finalize time from that row picks up
+                        // whichever file's init call happened to run last, not
+                        // necessarily this one -- "Uploaded blob not found"/"size
+                        // mismatch" for files that lose that race. Sending the
+                        // known-correct blobName sidesteps the shared row
+                        // entirely instead of trying to make the race safe.
+                        blobName: fileMeta.blobName,
                     });
                     const skippedDuplicate = Array.isArray(completeResponse?.duplicates) && completeResponse.duplicates.length > 0;
 
@@ -3195,8 +3220,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             const handleFromMemory = uploadHandlesRef.current.get(fileMeta.key);
                             if (handleFromMemory) {
                                 file = await resolveFileFromHandle(handleFromMemory);
-                            } else {
-                                const cached = await idbGet(fileMeta.key);
+                            } else if (!idbUnavailable) {
+                                // A broken IDB backing store (see idbUnavailable
+                                // above) is treated the same as "no cached blob
+                                // found" -- falls through to the existing, actionable
+                                // "Missing cached file... reselect" error below
+                                // instead of surfacing the browser's raw message.
+                                const cached = await idbGet(fileMeta.key).catch(() => {
+                                    idbUnavailable = true;
+                                    return null;
+                                });
                                 if (cached && isFileSystemFileHandle(cached)) {
                                     file = await resolveFileFromHandle(cached);
                                 } else if (cached) {

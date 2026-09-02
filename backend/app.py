@@ -10201,6 +10201,21 @@ def get_known_upload_hashes():
     return jsonify({'hashes': list_known_file_hashes(user_id)})
 
 
+_ANONYMOUS_BLOB_NAME_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
+
+def _validate_client_blob_name(value: object) -> Optional[str]:
+    """Validate a client-echoed blobName from /upload/init's own response.
+
+    Only accepts the exact UUID shape _generate_anonymous_id() produces --
+    anything else (missing, malformed, or an attempt to point finalize at an
+    arbitrary blob name) is rejected and the caller falls back to the
+    metadata-row lookup instead.
+    """
+    candidate = str(value or '').strip()
+    return candidate if _ANONYMOUS_BLOB_NAME_RE.match(candidate) else None
+
+
 @app.route('/upload/finalize', methods=['POST'])
 @app.route('/upload/finalize/', methods=['POST'])
 @app.route('/api/upload/finalize', methods=['POST'])
@@ -10221,10 +10236,19 @@ def finalize_direct_upload():
     if total_size <= 0 or total_size > MAX_UPLOAD_FILE_BYTES:
         return jsonify({'error': 'Invalid totalSize'}), 400
 
-    # Read the anonymous blob name reserved at /upload/init from the metadata row
-    # (durable + replica-safe, so this works even when finalize lands on a
-    # different replica than init).
-    anonymous_blob_name = read_pending_anonymous_blob(user_id, filename)
+    # Prefer the blob name the browser itself got back from /upload/init and
+    # actually staged its blocks against, over re-deriving it from the shared
+    # (user, filename) metadata row: when several files share an original
+    # filename (e.g. many photos named "Ip_image.jpeg"), every one of their
+    # /upload/init calls reserves its OWN blob but writes it onto that same
+    # row -- renaming apart into distinct rows only happens later, inside
+    # finalize_uploaded_file below. Re-deriving from the row here would pick
+    # up whichever file's init call happened to run last, not necessarily
+    # this one, causing spurious "Uploaded blob not found"/"size mismatch"
+    # for files that lose that race. Falls back to the row lookup for
+    # sessions that predate this field (durable + replica-safe, so it still
+    # works even when finalize lands on a different replica than init).
+    anonymous_blob_name = _validate_client_blob_name(data.get('blobName')) or read_pending_anonymous_blob(user_id, filename)
     blob_to_check = anonymous_blob_name or filename
 
     try:
@@ -10379,7 +10403,9 @@ def finalize_upload_batch():
             continue
 
         t = time.monotonic()
-        anonymous_blob_name = read_pending_anonymous_blob(user_id, filename)
+        # See the matching comment in finalize_direct_upload above -- same
+        # same-filename-collision race, same fix.
+        anonymous_blob_name = _validate_client_blob_name(item.get('blobName')) or read_pending_anonymous_blob(user_id, filename)
         blob_to_check = anonymous_blob_name or filename
         try:
             props = blob_service_client.get_blob_client(container=BLOB_IMAGE_CONTAINER, blob=blob_to_check).get_blob_properties()
