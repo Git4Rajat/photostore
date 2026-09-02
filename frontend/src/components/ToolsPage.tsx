@@ -18,6 +18,7 @@ import {
     UsersIcon,
 } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
+import { getRuntimeConfig } from '../config/appConfig';
 import { requestJobPoll } from '../services/jobNotifications';
 import { plural } from '../utils/format';
 import { confirmDialog } from './shared/dialogs';
@@ -719,7 +720,8 @@ const ToolsPage: React.FC = () => {
         setRunning(action);
         setMessage('');
         try {
-            if (action === 'vision' && browserAiModelState.status !== 'available') {
+            const processingMode = getRuntimeConfig().processingMode || 'browser';
+            if (action === 'vision' && processingMode !== 'backend' && browserAiModelState.status !== 'available') {
                 const modelState = await loadBrowserAiModel();
                 if (modelState.status !== 'available') {
                     setMessage(`Browser AI is not available: ${modelState.detail || modelState.reason || modelState.status}.`);
@@ -727,13 +729,35 @@ const ToolsPage: React.FC = () => {
                 }
             }
             setMessage(`Running ${runningActionLabels[action]} on ${plural(filenames.length, 'photo')}…`);
+            // PROCESSING_MODE 'backend'/'both': startBrowserProcessing alone can no
+            // longer (fully) do this step -- it self-gates every step to a no-op
+            // once processingMode !== 'browser' (see runBrowserProcessing in
+            // PhotoGallery.tsx). Also enqueue real ipworker jobs for exactly this
+            // selection, mirroring what runBrowserActionOnLibrary already does for
+            // the "entire library" scope. Best-effort: a network failure here
+            // shouldn't block the in-browser run below, which still works
+            // standalone in 'both' mode.
+            let ipworkQueued = 0;
+            if (processingMode !== 'browser') {
+                try {
+                    const ipworkResponse = await post('/api/admin/ipwork/enqueue', {
+                        filenames,
+                        steps: browserProcessingActionSteps[action],
+                        force: forceRun,
+                    });
+                    ipworkQueued = Number(ipworkResponse?.queued ?? 0);
+                } catch (err) {
+                    setMessage(`Backend enqueue for '${action}' failed: ${String(err)}`);
+                }
+            }
             const processed = await startBrowserProcessing({
                 actions: [action],
                 filenames,
                 items,
                 force: forceRun,
             });
-            setMessage(`Finished ${runningActionLabels[action]}: ${processed} of ${plural(filenames.length, 'photo')} processed.`);
+            const backendNote = ipworkQueued > 0 ? ` ${plural(ipworkQueued, 'photo')} queued to the backend.` : '';
+            setMessage(`Finished ${runningActionLabels[action]}: ${processed} of ${plural(filenames.length, 'photo')} processed in-browser.${backendNote}`);
             await refreshPhotosByFilename(filenames);
             await loadQueueStatus();
         } catch (err) {
