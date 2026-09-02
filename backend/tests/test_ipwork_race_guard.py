@@ -226,6 +226,31 @@ def test_thumbnail_hasdata_false_resolves_via_server_fallback_not_stuck_running(
     assert processing['server_thumbnail']['fallbackFor'] == 'browser_thumbnail_failed'
 
 
+def test_thumbnail_fallback_generation_also_failing_resolves_to_failed(processing_ctx, monkeypatch):
+    """A RAW file whose embedded preview genuinely can't be extracted (e.g. an
+    unsupported CR3 compression variant) fails both ipworker's primary attempt
+    AND the server-side fallback's re-attempt at the same extraction. Before
+    this fix, _apply_server_thumbnail_fallback silently returned an empty
+    status_updates dict in that case, leaving thumbnail_status stuck at
+    'running' forever -- invisible to the Tools page's "failed"/"no data"
+    filters, which only ever match a terminal status."""
+    metadata, _ = processing_ctx
+    user_id, filename = 'lib-A', 'photo.cr3'
+    _seed_row(metadata, user_id, filename, thumbnail_status='running')
+    monkeypatch.setattr(storage_utils, '_create_server_thumbnail_for_upload', lambda *a, **k: None)
+
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename,
+        client_processing={'thumbnail': {'hasData': False, 'error': 'raw_preview_extraction_failed'}},
+        client_processing_report=[],
+        client_asset_id='ipworker:job-4',
+        origin='ipworker',
+    )
+
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['thumbnail_status'] == 'failed'
+
+
 # --- ocr ---------------------------------------------------------------------
 
 def test_ocr_write_applies_when_not_yet_done(processing_ctx):

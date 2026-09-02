@@ -2089,6 +2089,16 @@ def _apply_server_thumbnail_fallback(
     except Exception:
         thumbnail_bytes = None
     if not thumbnail_bytes:
+        # Same class of gap as _apply_server_exif_fallback below: a RAW file
+        # whose embedded preview genuinely can't be extracted (unsupported
+        # compression variant, corrupt container, ...) left thumbnail_status
+        # stuck at whatever it was before this call ('running', from the lease
+        # claim) forever -- retries hit the exact same deterministic failure,
+        # so it never reached a terminal state and was invisible to the Tools
+        # page's "failed"/"no data" filters (found via RAW photos with no
+        # thumbnail not appearing under either filter). Resolve to 'failed' so
+        # it surfaces there instead of retrying silently forever.
+        status_updates['thumbnail_status'] = 'failed'
         return status_updates
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
     upload_media_file('thumbnail', thumbnail_blob_name, thumbnail_bytes, 'image/jpeg')
