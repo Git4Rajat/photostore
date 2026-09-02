@@ -423,6 +423,24 @@ const CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES = 200 * MB;
 // the first that same "settled" treatment.
 const MAX_FRESH_UPLOAD_BATCH_SIZE = 900;
 
+// Live-tested 2026-09-02: a single mobile Safari/iPadOS picker selection
+// breaks around ~6000 files -- the native picker itself never hands files
+// back to onChange (zero console/network activity, upstream of everything
+// else in this file). There's no web API to cap the native picker's own
+// selection count, so this rejects oversized selections after the fact
+// instead, with a safety margin under the measured break point. This can't
+// catch the failure mode it's actually named after (that one never reaches
+// this code at all, since the picker returns nothing) -- it's a safety net
+// for selections that DO make it back oversized, and gives a clear message
+// instead of the alternative silent failure. See
+// mobile-safari-large-batch-upload-crash memory.
+const MAX_MOBILE_SELECTION_SIZE = 5000;
+
+// The only intervention point that isn't gated on the native picker
+// cooperating: warn *before* it opens, once per browser, rather than only
+// reacting after the fact via MAX_MOBILE_SELECTION_SIZE above.
+const MOBILE_SELECTION_TIP_STORAGE_KEY = 'photostore.upload.mobileSelectionTipShown';
+
 // A file that fails mid-batch almost always still has its bytes available in
 // this same tab right then (uploadSourceFilesRef/uploadHandlesRef are only
 // cleared once the whole runUploadSession call finishes) -- unlike the manual
@@ -3965,6 +3983,27 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (!uploading) {
             void pollUntilWarm(warmUpload, uploadWarmupInFlightRef);
         }
+        // One-time, pre-picker warning for large libraries on constrained
+        // devices. This fires before the native picker opens -- the one
+        // moment we're not blind to what's about to happen -- because
+        // MAX_MOBILE_SELECTION_SIZE's own check can't run until the picker
+        // has already closed and handed files back (or, per the live
+        // ~6000-file ceiling, may never hand anything back at all). Gated to
+        // once per browser via localStorage so it doesn't nag on every
+        // upload.
+        if (isConstrainedUploadDevice()) {
+            try {
+                if (!localStorage.getItem(MOBILE_SELECTION_TIP_STORAGE_KEY)) {
+                    localStorage.setItem(MOBILE_SELECTION_TIP_STORAGE_KEY, '1');
+                    const tipMessage = `For reliable uploads on this device, select up to ${MAX_MOBILE_SELECTION_SIZE.toLocaleString()} photos at a time -- very large single selections can fail to open.`;
+                    addNotification('Large libraries: select in batches', tipMessage);
+                    showToast(tipMessage, { timeout: 8000 });
+                }
+            } catch {
+                // Private-browsing/quota errors just mean this one-time tip
+                // may repeat -- not worth failing the upload over.
+            }
+        }
         // Chrome/Edge desktop only (unsupported in Safari/Firefox and on
         // mobile -- isFileSystemAccessSupported() is false there, so this
         // always falls through to the classic <input> picker below). Picking
@@ -4034,6 +4073,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const handleUploadSelection = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
         const selectedFiles = event.target.files ? Array.from(event.target.files) : [];
+        if (selectedFiles.length > MAX_MOBILE_SELECTION_SIZE && isConstrainedUploadDevice()) {
+            console.warn('Rejected oversized mobile upload selection.', {
+                count: selectedFiles.length,
+                limit: MAX_MOBILE_SELECTION_SIZE,
+            });
+            setUploadError(
+                `Selected ${selectedFiles.length.toLocaleString()} files -- more than this device handles reliably in one go. `
+                + `Select up to ${MAX_MOBILE_SELECTION_SIZE.toLocaleString()} files at a time.`,
+            );
+            event.target.value = '';
+            return;
+        }
         if (selectedFiles.length === 0) {
             // Indistinguishable from here whether the user cancelled the
             // picker (routine, happens constantly -- must not toast on this)
