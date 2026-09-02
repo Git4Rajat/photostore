@@ -13741,6 +13741,7 @@ def _prewarm_ipwork_models() -> None:
     try:
         import maps_utils
         maps_utils._get_geocoder()
+        maps_utils.prewarm_offline_geocoder()
     except Exception:
         worker_logger.exception('maps_utils geocoder pre-warm failed')
 

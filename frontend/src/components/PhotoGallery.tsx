@@ -322,7 +322,6 @@ export const resetBrowserFaceModelLoadStateForTests = () => {
 };
 
 type AppRuntimeConfig = {
-    browserGeocoderRateMs?: string | number;
     blazeFaceModelUrl?: string;
     arcFaceModelUrl?: string;
     arcFaceWasmPath?: string;
@@ -1422,22 +1421,15 @@ const getRuntimeConfig = (): AppRuntimeConfig => {
     return (window as Window & { __APP_CONFIG__?: AppRuntimeConfig }).__APP_CONFIG__ || {};
 };
 
-let lastGeocodeAt = 0;
-// Routed through our own backend (which already does this reverse-geocode
-// server-side for the ipworker path via maps_utils.reverse_geocode, at
+// Routed through our own backend (which does this reverse-geocode
+// server-side via maps_utils.reverse_geocode -- an offline local lookup, at
 // negligible cost) rather than calling a third-party geocoder directly from
-// the browser. A direct browser->photon.komoot.io fetch has no same-origin
+// the browser. A direct browser->third-party fetch has no same-origin
 // guarantee, so a failure there (rate-limited/down 503) surfaces as a CORS
 // error and silently drops every browser-side photo's location every time.
+// No client-side throttle needed: the backend no longer makes an outbound
+// rate-limited call per lookup (see maps_utils.py).
 const geocodeWithThrottle = async (latitude: string, longitude: string): Promise<Record<string, string> | null> => {
-    const config = getRuntimeConfig();
-    const rateMs = Math.max(0, Number(config.browserGeocoderRateMs || 1100));
-    const now = Date.now();
-    const waitMs = Math.max(0, lastGeocodeAt + rateMs - now);
-    if (waitMs > 0) {
-        await new Promise((resolve) => window.setTimeout(resolve, waitMs));
-    }
-    lastGeocodeAt = Date.now();
     const data = await get<Record<string, string>>(
         `geocode/reverse?lat=${encodeURIComponent(latitude)}&lon=${encodeURIComponent(longitude)}`
     );

@@ -50,6 +50,7 @@ MAX_REQUESTS_JITTER="${GUNICORN_MAX_REQUESTS_JITTER:-50}"
 # so that request isn't routinely killed mid-flight, while capping the
 # outage far below the old 120s ceiling.
 exec gunicorn app:app \
+    --config gunicorn.conf.py \
     --bind 0.0.0.0:5000 \
     --workers "$WORKERS" \
     --worker-class gthread \

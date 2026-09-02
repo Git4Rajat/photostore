@@ -421,23 +421,23 @@ var backendEnv = [
   // that should have surfaced as a review suggestion but didn't.
   { name: 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', value: '0.74' }
   { name: 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', value: '0.58' }
-  { name: 'MAPS_ON_UPLOAD', value: 'false' }
-  // Was 'false' (an unexplained override of the Python default, 'true', that
-  // predates this file's history). With this off, the browser's own EXIF
-  // report makes _apply_client_processing_results do a synchronous, blocking
-  // reverse-geocode call (Nominatim, up to GEOCODER_TIMEOUT=8s) inline in
-  // /upload/client-processing -- almost certainly the real explanation for
-  // that endpoint's previously-observed 33-61s average latency. This is
-  // pure duplicate work in 'both'/'backend' PROCESSING_MODE: ipworker already
-  // queues 'map_detection' for every upload via _queue_ipwork_processing
-  // regardless of this flag, and ipwork_geo.process_geo calls the exact same
-  // maps_utils.reverse_geocode -- whichever finishes first wins via the
-  // existing _step_locked_done race guard, same as every other dual-path
-  // step. Turning this on just stops redoing that work synchronously on one
-  // of the backend's few gunicorn threads. Only correctness precondition:
-  // PROCESSING_MODE must not be 'browser' (ipworker would never run then,
-  // and geocoding would never happen) -- confirmed live at 'both' before
-  // making this change.
+  // Was 'false' 2026-08-22..2026-09-02: with this off, the browser's own EXIF
+  // report made _apply_client_processing_results do a synchronous, blocking
+  // reverse-geocode call (was Nominatim, up to GEOCODER_TIMEOUT=8s) inline in
+  // /upload/client-processing -- the real explanation for that endpoint's
+  // previously-observed 33-61s average latency. That justification is gone:
+  // maps_utils.reverse_geocode is now an offline in-process K-D tree lookup
+  // (no network call, ~microseconds, see maps_utils.py/gunicorn.conf.py),
+  // not a rate-limited third-party HTTP request. Back to 'true' so upload
+  // responses carry city/country immediately instead of waiting on the
+  // ipworker queue. Still pure duplicate work in 'both'/'backend'
+  // PROCESSING_MODE (ipworker always queues 'map_detection' too, via
+  // _queue_ipwork_processing, deduped by the existing _step_locked_done race
+  // guard) -- fine now that the duplicated work is ~microseconds instead of
+  // an 8s HTTP call. gunicorn.conf.py's post_fork hook prewarms the K-D tree
+  // on every worker (re)spawn so this doesn't reintroduce a stall after each
+  // --max-requests recycle.
+  { name: 'MAPS_ON_UPLOAD', value: 'true' }
   { name: 'MAPS_QUEUE_ON_UPLOAD', value: 'true' }
   // Minimum interval between automatic full-recluster (DBSCAN) maintenance
   // passes per user -- new faces are assigned synchronously in-process via

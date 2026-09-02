@@ -16,6 +16,8 @@ imagehash
 numpy
 scikit-learn
 geopy
+reverse_geocoder
+pycountry
 cryptography>=44.0.1,<49.0.0
 gunicorn
 requests
