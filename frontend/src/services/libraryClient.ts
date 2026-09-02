@@ -283,3 +283,39 @@ export const getLibraryCleanupInfo = async (): Promise<CleanupInfo> => {
     }
     return response.json();
 };
+
+export interface DownloadRequestResult {
+    status: string;
+    jobId?: string;
+}
+
+// Kicks off a "download entire library" export job. The backend de-dupes
+// concurrent requests for the same library, so calling this again while a
+// prior export is still queued/running just returns that job's id.
+export const requestLibraryDownload = async (): Promise<DownloadRequestResult> => {
+    const response = await authedFetch('/api/library/download/request', { method: 'POST' });
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not start the library export.'));
+    }
+    return response.json();
+};
+
+export interface DownloadStatusResult {
+    status: string;
+    result?: {
+        downloadUrl?: string;
+        expiresAt?: string;
+        photosIncluded?: number;
+        photosSkipped?: number;
+        sizeBytes?: number;
+    };
+    error?: string;
+}
+
+export const getLibraryDownloadStatus = async (jobId: string): Promise<DownloadStatusResult> => {
+    const response = await authedFetch(`/api/library/download/status?jobId=${encodeURIComponent(jobId)}`);
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not check export status.'));
+    }
+    return response.json();
+};

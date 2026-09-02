@@ -64,6 +64,7 @@ from storage_utils import (
     configure_storage,
     apply_client_processing_results_for_file,
     download_media_bytes,
+    upload_file_to_blob,
     finalize_uploaded_file,
     get_media_properties,
     claim_processing_lease,
@@ -376,6 +377,10 @@ BLOB_CONNECTION_STRING = os.getenv('BLOB_CONNECTION_STRING', '').strip()
 BLOB_IMAGE_CONTAINER = os.getenv('BLOB_IMAGE_CONTAINER', IMAGE_CONTAINER).strip()
 BLOB_THUMBNAIL_CONTAINER = os.getenv('BLOB_THUMBNAIL_CONTAINER', THUMBNAIL_CONTAINER).strip()
 BLOB_COVER_CONTAINER = os.getenv('BLOB_COVER_CONTAINER', 'covers').strip()
+# Holds "download entire library" ZIP exports. One blob per library
+# (name is library-scoped, see _execute_library_download), overwritten on
+# each re-export so this container never accumulates unbounded history.
+BLOB_EXPORTS_CONTAINER = os.getenv('BLOB_EXPORTS_CONTAINER', 'library-exports').strip()
 # 'sas' hands the browser day-stable read SAS URLs pointing straight at blob
 # storage so media bytes never stream through this container; 'proxy' serves
 # every byte through the backend. 'sas' silently degrades to proxy URLs when
@@ -1175,7 +1180,7 @@ def create_filename_owners_table() -> None:
 def create_blob_containers() -> None:
     if blob_service_client is None:
         return
-    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER):
+    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER):
         if not container_name:
             continue
         try:
@@ -2154,6 +2159,13 @@ def _humanize_job(row: Dict) -> Dict:
             message = f"Removed {_plural(int(result.get('photosDeleted') or 0), 'photo')}."
         elif status == 'failed':
             title = 'Library cleanup failed'
+    elif job_type == 'library_download':
+        kind = 'library_download'
+        if status == 'done':
+            title = 'Library export ready'
+            message = f"{_plural(int(result.get('photosIncluded') or 0), 'photo')} ready to download."
+        elif status == 'failed':
+            title = 'Library export failed'
     elif job_type == 'ipwork':
         # One of these per photo in backend/both processing mode -- the gallery
         # tile's own "processing on server" badge (_active_processing_worker)
@@ -7245,6 +7257,178 @@ def _enqueue_library_clean_job(library_id: str, actor_user_id: str, request_id: 
         return {'status': 'failed', 'jobId': job_id}
     _upsert_job_status(job_id, actor_user_id, 'library_clean', 'queued', libraryId=library_id)
     return {'status': 'queued', 'jobId': job_id}
+
+
+def _library_export_blob_name(library_id: str) -> str:
+    # Deterministic, library-scoped path: overwriting on each re-export means
+    # this container never accumulates more than one ZIP per library.
+    return f'{library_id}/library-export.zip'
+
+
+def _execute_library_download(library_id: str, library_name: str) -> Dict:
+    """Build a ZIP of every photo/video in a library and upload it to
+    BLOB_EXPORTS_CONTAINER. Runs on the queue-scaled worker, same as
+    _execute_library_clean, since it walks the library's full metadata
+    partition and reads every photo's full-size bytes."""
+    pk = _escape_odata(library_id)
+    try:
+        metadata_rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{pk}'")) if metadata_table_client else []
+    except Exception:
+        metadata_rows = []
+
+    written_count = 0
+    skipped_count = 0
+    tmp = tempfile.NamedTemporaryFile(prefix='libexport-', suffix='.zip', delete=False)
+    tmp_path = tmp.name
+    try:
+        with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file:
+            for row in metadata_rows:
+                filename = str(row.get('RowKey') or '')
+                if not filename:
+                    continue
+                if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+                    continue
+                try:
+                    blob_name = resolve_physical_blob_name(library_id, filename, 'image')
+                    data_bytes = download_media_bytes('image', blob_name)
+                    zip_file.writestr(filename, data_bytes)
+                    written_count += 1
+                except Exception as exc:
+                    skipped_count += 1
+                    app.logger.warning('Skipping %s while building library export for %s: %s', filename, library_id, exc)
+        tmp.close()
+    except Exception:
+        try:
+            tmp.close()
+        finally:
+            _remove_file_quietly(tmp_path)
+        raise
+
+    if written_count == 0:
+        _remove_file_quietly(tmp_path)
+        return {'photosIncluded': 0, 'photosSkipped': skipped_count, 'sizeBytes': 0}
+
+    zip_size = os.path.getsize(tmp_path)
+    blob_name = _library_export_blob_name(library_id)
+    try:
+        with open(tmp_path, 'rb') as fh:
+            upload_file_to_blob(BLOB_EXPORTS_CONTAINER, blob_name, fh, 'application/zip')
+    finally:
+        _remove_file_quietly(tmp_path)
+
+    download_name = f"{library_name or library_id}-export.zip"
+    download_url, expires_at = _create_stable_read_sas_url(BLOB_EXPORTS_CONTAINER, blob_name, download_filename=download_name)
+    return {
+        'downloadUrl': download_url,
+        'expiresAt': expires_at,
+        'photosIncluded': written_count,
+        'photosSkipped': skipped_count,
+        'sizeBytes': zip_size,
+    }
+
+
+def _has_active_library_download_job(library_id: str) -> Optional[str]:
+    """Return the jobId of an in-flight 'library_download' job for this
+    library, if any -- de-dupes button-mash/multi-tab clicks. Reuses the
+    already-cached whole-'jobs'-partition scan (_jobs_partition_scan_cache)
+    rather than issuing a fresh query_entities("PartitionKey eq 'jobs'") --
+    see _has_active_clustering_job, whose identical scan was the target of
+    three recent fixes (fa03bc9, e1114b7, 4b325c4) for exactly this class of
+    unscoped, per-request 'jobs'-partition read."""
+    if metadata_table_client is None:
+        return None
+    try:
+        rows = _jobs_partition_scan_cache.get(
+            _JOBS_PARTITION_SCAN_CACHE_KEY,
+            lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
+        )
+    except Exception:
+        return None
+    stale_before = datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)
+    for row in rows:
+        if str(row.get('jobType') or '') != 'library_download':
+            continue
+        if str(row.get('libraryId') or '') != library_id:
+            continue
+        if str(row.get('status') or '').lower() not in {'queued', 'running'}:
+            continue
+        updated = _parse_iso_date(str(row.get('updatedAt') or ''))
+        if updated is not None and updated < stale_before:
+            continue
+        return str(row.get('jobId') or '')
+    return None
+
+
+def _enqueue_library_download_job(library_id: str, actor_user_id: str, library_name: str) -> Dict[str, str]:
+    job_id = f"libdownload:{library_id}:{uuid.uuid4().hex}"
+    if clustering_queue_client is None:
+        # No queue configured (e.g. local dev) — run inline rather than
+        # silently dropping the request.
+        app.logger.warning('Clustering queue client is unavailable; running library download %s inline', job_id)
+        try:
+            summary = _execute_library_download(library_id, library_name)
+            _upsert_job_status(job_id, actor_user_id, 'library_download', 'done', result=summary, libraryId=library_id)
+            return {'status': 'done', 'jobId': job_id}
+        except Exception as exc:
+            app.logger.exception('Inline library download failed for %s', library_id)
+            _upsert_job_status(job_id, actor_user_id, 'library_download', 'failed', error=str(exc), libraryId=library_id)
+            return {'status': 'failed', 'jobId': job_id}
+    message = {
+        'jobId': job_id,
+        'correlationId': job_id,
+        'user_id': actor_user_id,
+        'libraryId': library_id,
+        'libraryName': library_name,
+        'type': 'library_download',
+    }
+    try:
+        clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
+    except Exception:
+        app.logger.exception('Failed to enqueue library download job %s', job_id)
+        _upsert_job_status(job_id, actor_user_id, 'library_download', 'failed', error='Failed to queue download job', libraryId=library_id)
+        return {'status': 'failed', 'jobId': job_id}
+    _upsert_job_status(job_id, actor_user_id, 'library_download', 'queued', libraryId=library_id)
+    # _has_active_library_download_job reads the same cached partition scan
+    # jobs_status() uses; without invalidating here, a second click within the
+    # cache TTL (the exact case this de-dupe exists for) would still see the
+    # pre-enqueue snapshot and queue a duplicate export job.
+    _jobs_partition_scan_cache.invalidate(_JOBS_PARTITION_SCAN_CACHE_KEY)
+    return {'status': 'queued', 'jobId': job_id}
+
+
+@app.route('/api/library/download/request', methods=['POST'])
+def library_download_request():
+    account_id, library_id, error = _require_owner_context()
+    if error:
+        return error
+    existing_job_id = _has_active_library_download_job(library_id)
+    if existing_job_id:
+        return jsonify(_clustering_queue_response({'status': 'queued', 'jobId': existing_job_id}, activeLibraryId=library_id))
+    meta = library_store.get_library(library_id) or {}
+    library_name = str(meta.get('name') or '')
+    queued = _enqueue_library_download_job(library_id, account_id, library_name)
+    return jsonify(_clustering_queue_response(queued, activeLibraryId=library_id))
+
+
+@app.route('/api/library/download/status', methods=['GET'])
+def library_download_status():
+    _account_id, _library_id, error = _require_library_context(require_auth=True)
+    if error:
+        return error
+    job_id = str(request.args.get('jobId', '') or '')
+    if not job_id or metadata_table_client is None:
+        return jsonify({'status': 'unknown'})
+    try:
+        row = metadata_table_client.get_entity(partition_key='jobs', row_key=_job_row_key(job_id))
+    except Exception:
+        return jsonify({'status': 'unknown'})
+    result = row.get('result')
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            pass
+    return jsonify({'status': str(row.get('status') or 'unknown'), 'result': result, 'error': row.get('error')})
 
 
 @app.route('/api/library/clean/request', methods=['POST'])
@@ -12753,6 +12937,72 @@ def admin_backfill_photos():
     })
 
 
+@app.route('/api/admin/ipwork/enqueue', methods=['POST'])
+@app.route('/admin/ipwork/enqueue', methods=['POST'])
+def admin_enqueue_ipwork():
+    """Queue specific steps for a caller-supplied set of photos, server-side.
+
+    The Tools page's per-step buttons (Thumbnails/EXIF/OCR/AI vision/Map
+    tagging/Faces) used to only call startBrowserProcessing() -- a purely
+    client-side pipeline. Under PROCESSING_MODE=backend that pipeline
+    self-gates every step to a no-op (see runBrowserProcessing in
+    PhotoGallery.tsx), so those buttons silently did nothing. This is the
+    selection-scoped counterpart to admin_backfill_photos() above (which
+    already does this, but only for the *entire* library): it lets a
+    specific set of filenames be (re)enqueued to ipworker without touching
+    the rest of the account. No confirm gate is required here, unlike the
+    library-wide backfill -- the blast radius is bounded to whatever the
+    caller explicitly selected.
+    """
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+
+    all_steps = ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
+    requested_steps = data.get('steps')
+    if not isinstance(requested_steps, list) or not requested_steps:
+        return jsonify({'error': 'steps must be a non-empty list', 'code': 'invalid_steps'}), 400
+    invalid_steps = [step for step in requested_steps if step not in all_steps]
+    if invalid_steps:
+        return jsonify({'error': f'invalid steps: {invalid_steps}', 'code': 'invalid_steps'}), 400
+    steps_to_run = requested_steps
+
+    raw_filenames = data.get('filenames')
+    if not isinstance(raw_filenames, list) or not raw_filenames:
+        return jsonify({'error': 'filenames must be a non-empty list', 'code': 'invalid_filenames'}), 400
+    if len(raw_filenames) > 2000:
+        return jsonify({'error': 'Too many filenames', 'code': 'too_many_filenames'}), 400
+    force = bool(data.get('force'))
+
+    queued = 0
+    skipped = 0
+    for raw_name in raw_filenames:
+        filename = _validate_media_filename(str(raw_name or ''))
+        entity = _get_metadata_entity(user_id, filename) if filename else None
+        if not entity or str(entity.get('processing_state') or '').strip().lower() == 'deleted' or is_video_file(filename):
+            skipped += 1
+            continue
+        try:
+            _enqueue_processing_steps(user_id, filename, steps_to_run, force=force)
+            # Same reasoning as admin_backfill_photos: without this, backend/both
+            # mode would never reach ipworker for an already-uploaded photo the
+            # user re-runs from the Tools page.
+            _queue_ipwork_processing(user_id, filename, steps=steps_to_run)
+            queued += 1
+        except Exception:
+            app.logger.exception('ipwork enqueue: failed to enqueue steps for %s/%s', user_id, filename)
+            skipped += 1
+
+    app.logger.info('ipwork enqueue: queued %d photos (steps=%s), skipped %d for user %s', queued, steps_to_run, skipped, user_id)
+    return jsonify({
+        'queued': queued,
+        'skipped': skipped,
+        'total': queued + skipped,
+        'steps': steps_to_run,
+    })
+
+
 def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
     """Cross-reference photometadata and photofaces against actual blobs in the
     images container. Any metadata or face row whose physical blob no longer
@@ -12970,6 +13220,21 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 library_store.set_cleanup_failed(target_library_id, str(exc))
             if job_id:
                 _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error=str(exc), libraryId=target_library_id)
+        return
+
+    if job_type == 'library_download':
+        target_library_id = str(payload.get('libraryId') or user_id)
+        library_name = str(payload.get('libraryName') or '')
+        if job_id:
+            _upsert_job_status(job_id, user_id, 'library_download', 'running', libraryId=target_library_id)
+        try:
+            summary = _execute_library_download(target_library_id, library_name)
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'library_download', 'done', result=summary, libraryId=target_library_id)
+        except Exception as exc:
+            worker_logger.exception('Library download failed for %s', target_library_id)
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'library_download', 'failed', error=str(exc), libraryId=target_library_id)
         return
 
     if job_type == 'people_incremental_assign':

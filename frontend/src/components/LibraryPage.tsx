@@ -33,6 +33,13 @@ const LibraryPage: React.FC = () => {
     const [cleanPassword, setCleanPassword] = useState('');
     const [cleanNotice, setCleanNotice] = useState<library.CleanRequestResult | null>(null);
 
+    const [downloadJobId, setDownloadJobId] = useState('');
+    const [downloadOutcome, setDownloadOutcome] = useState<'idle' | 'pending' | 'done' | 'failed'>('idle');
+    const [downloadResult, setDownloadResult] = useState<library.DownloadStatusResult['result'] | null>(null);
+    const [downloadError, setDownloadError] = useState('');
+    const [downloadRequesting, setDownloadRequesting] = useState(false);
+    const downloadPollTimer = useRef<number | null>(null);
+
     const load = useCallback(async () => {
         setError('');
         try {
@@ -77,6 +84,56 @@ const LibraryPage: React.FC = () => {
             if (cleanupPollTimer.current) window.clearInterval(cleanupPollTimer.current);
         };
     }, [load]);
+
+    // Poll for the "download entire library" export job while one is in flight.
+    useEffect(() => {
+        if (!downloadJobId || downloadOutcome === 'done' || downloadOutcome === 'failed') return undefined;
+        const poll = async () => {
+            try {
+                const result = await library.getLibraryDownloadStatus(downloadJobId);
+                if (result.status === 'done' || result.status === 'failed') {
+                    setDownloadResult(result.result || null);
+                    setDownloadError(result.error || '');
+                    setDownloadOutcome(result.status as 'done' | 'failed');
+                    return;
+                }
+            } catch {
+                // Keep polling; a transient status-check failure isn't fatal.
+            }
+            downloadPollTimer.current = window.setTimeout(poll, 3000);
+        };
+        poll();
+        return () => {
+            if (downloadPollTimer.current) window.clearTimeout(downloadPollTimer.current);
+        };
+    }, [downloadJobId, downloadOutcome]);
+
+    const handleDownloadLibrary = async () => {
+        setDownloadError('');
+        setDownloadResult(null);
+        setDownloadRequesting(true);
+        try {
+            const result = await library.requestLibraryDownload();
+            if (result.jobId) {
+                setDownloadJobId(result.jobId);
+                setDownloadOutcome('pending');
+            } else {
+                setDownloadOutcome('failed');
+                setDownloadError('Could not start the library export.');
+            }
+        } catch (e) {
+            setDownloadOutcome('failed');
+            setDownloadError(e instanceof Error ? e.message : 'Could not start the library export.');
+        } finally {
+            setDownloadRequesting(false);
+        }
+    };
+
+    const formatExportSize = (bytes?: number): string => {
+        if (!bytes) return '';
+        const mb = bytes / (1024 * 1024);
+        return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`;
+    };
 
     const run = async (fn: () => Promise<void>, successMessage = '') => {
         setBusy(true);
@@ -305,6 +362,36 @@ const LibraryPage: React.FC = () => {
                         />
                         <button type="submit" className="btn btn-soft" disabled={busy}>Save name</button>
                     </form>
+
+                    <div className="library-clean-section">
+                        <h3 className="status">Download library</h3>
+                        <p className="status">
+                            Get a ZIP of every photo and video in this library. Large libraries can take a
+                            while to prepare.
+                        </p>
+                        {downloadOutcome === 'done' && downloadResult ? (
+                            <p className="status success">
+                                Export ready — {downloadResult.photosIncluded ?? 0} photo(s)
+                                {downloadResult.sizeBytes ? `, ${formatExportSize(downloadResult.sizeBytes)}` : ''}
+                                {downloadResult.photosSkipped ? ` (${downloadResult.photosSkipped} could not be included)` : ''}.{' '}
+                                <a href={downloadResult.downloadUrl} download>Download ZIP</a>
+                            </p>
+                        ) : downloadOutcome === 'pending' ? (
+                            <p className="status">Preparing your download…</p>
+                        ) : (
+                            <>
+                                {downloadError && <p className="status error">{downloadError}</p>}
+                                <button
+                                    type="button"
+                                    className="btn btn-soft"
+                                    disabled={busy || downloadRequesting}
+                                    onClick={handleDownloadLibrary}
+                                >
+                                    {downloadRequesting ? 'Starting…' : 'Download entire library'}
+                                </button>
+                            </>
+                        )}
+                    </div>
 
                     <div className="library-clean-section">
                         <h3 className="status">Clean library</h3>

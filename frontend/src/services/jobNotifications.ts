@@ -11,7 +11,7 @@ export type JobStatusRecord = {
     jobId: string;
     // 'queued' | 'running' | 'done' | 'failed' | 'unknown'
     status: string;
-    // 'recluster' | 'find_faces' | 'cluster' | 'library_clean' | 'preview' | 'job'
+    // 'recluster' | 'find_faces' | 'cluster' | 'library_clean' | 'library_download' | 'preview' | 'job'
     kind: string;
     title: string;
     message: string;
@@ -24,7 +24,7 @@ export const TERMINAL_JOB_STATUSES = new Set(['done', 'failed']);
 
 // Job kinds worth interrupting the user with a toast. Everything still lands in
 // the notification bell; previews are frequent + low-signal so they stay quiet.
-export const TOASTABLE_JOB_KINDS = new Set(['recluster', 'find_faces', 'cluster', 'library_clean', 'job']);
+export const TOASTABLE_JOB_KINDS = new Set(['recluster', 'find_faces', 'cluster', 'library_clean', 'library_download', 'job']);
 
 // People-clustering job kinds. While any of these is queued/running we surface an
 // in-progress indicator (People-page banner + global pill) so the user isn't
