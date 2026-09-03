@@ -2398,36 +2398,59 @@ PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS = int(os.getenv('PEOPLE_CLUSTER_MAIN
 
 
 def _clustering_maintenance_due(user_id: str) -> bool:
-    """Best-effort cooldown check + claim in one round trip, gating the
-    automatic maintenance recluster (not the explicit user-triggered
+    """Atomic cooldown check + claim in one round trip (create-then-
+    conditional-update, mirroring _try_claim_ipwork_sweep_lock below), gating
+    the automatic maintenance recluster (not the explicit user-triggered
     endpoints, which call _enqueue_clustering_job directly and must stay
-    immediate). Read-then-write, no etag -- this codebase has no working
-    optimistic-concurrency primitive (upsert_entity doesn't accept one), and
-    the worst case under a race is one extra job enqueue (still bounded by
-    _has_active_clustering_job), not a repeating chain.
+    immediate).
+
+    Used to be a blind read-then-upsert with no concurrency control, on the
+    documented assumption that _has_active_clustering_job's de-dupe bounded
+    any race to "one extra job enqueue, not a repeating chain." Confirmed
+    live 2026-09-03 that assumption was wrong: a burst of uploads whose
+    face-processing lands within the same _jobs_partition_scan_cache TTL
+    window (20s) can each independently read this row as "not due yet"
+    before any of their own writes lands, and each proceeds to
+    _enqueue_clustering_job -- observed 9 concurrent full-library clustering
+    jobs for one user from a single upload batch, not one. The etag-
+    conditional update here closes that race: only one concurrent caller can
+    win the claim no matter how many check within the same window.
     """
     if metadata_table_client is None:
         return False
-    row = None
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    claim_row = {
+        'PartitionKey': 'clustering_maintenance',
+        'RowKey': user_id,
+        'lastStartedAt': now_iso,
+        'updatedAt': now_iso,
+    }
     try:
-        row = metadata_table_client.get_entity(partition_key='clustering_maintenance', row_key=user_id)
+        metadata_table_client.create_entity(dict(claim_row))
+        return True
+    except ResourceExistsError:
+        pass
     except Exception:
-        row = None
-    last = _parse_iso_date(str((row or {}).get('lastStartedAt') or ''))
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS)
+        return False
+
+    try:
+        existing = metadata_table_client.get_entity('clustering_maintenance', user_id)
+    except Exception:
+        return False
+
+    last = _parse_iso_date(str(existing.get('lastStartedAt') or ''))
+    cutoff = now - timedelta(seconds=PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS)
     if last is not None and last >= cutoff:
         return False
-    now_iso = datetime.now(timezone.utc).isoformat()
+
     try:
-        metadata_table_client.upsert_entity({
-            'PartitionKey': 'clustering_maintenance',
-            'RowKey': user_id,
-            'lastStartedAt': now_iso,
-            'updatedAt': now_iso,
-        })
+        metadata_table_client.update_entity(
+            claim_row, etag=existing.metadata['etag'], match_condition=MatchConditions.IfNotModified,
+        )
+        return True
     except Exception:
-        pass
-    return True
+        return False  # lost the race to claim the next window
 
 
 def _enqueue_clustering_job(
@@ -2666,10 +2689,21 @@ def _count_processing_statuses(user_id: str, steps: List[str]) -> Dict[str, Dict
 # than a wrapped client, so this table still invalidates explicitly.)
 METADATA_SCAN_CACHE_TTL_SECONDS = float(os.getenv('METADATA_SCAN_CACHE_TTL_SECONDS', '20'))
 _metadata_scan_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
+# /photos/filter's default sort order (rating/likes -> recency -> filename) never
+# depends on the request's minRating/minLikes/capture-range/location filter values
+# -- those only decide which rows are *included*, not how included rows are
+# ordered relative to each other. Without this, every single pagination page
+# (offset=0, 24, 48, ...) of an infinite-scroll session re-sorted the user's
+# entire library 3x from scratch even though 23 of that request's 24 results
+# were already correctly ordered by the previous page's work. Cached and
+# invalidated the same way/at the same time as _metadata_scan_cache below so it
+# can't go stale relative to it.
+_photo_default_sort_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
 
 
 def _invalidate_metadata_scan_cache(user_id: str) -> None:
     _metadata_scan_cache.invalidate(user_id)
+    _photo_default_sort_cache.invalidate(user_id)
 
 
 def _cached_metadata_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
@@ -2680,6 +2714,20 @@ def _cached_metadata_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
     mutating shared state.
     """
     return _metadata_scan_cache.get(user_id, lambda: _query_metadata_rows_for_user(user_id, purpose=purpose))
+
+
+def _cached_sorted_metadata_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
+    """Same rows as _cached_metadata_rows_for_user, pre-sorted once in the
+    canonical rating/likes -> recency -> filename order and cached separately
+    (see _photo_default_sort_cache above) so /photos/filter's pagination
+    doesn't pay for a fresh triple-sort of the whole library on every page."""
+    def _compute() -> List[Dict]:
+        rows = list(_cached_metadata_rows_for_user(user_id, purpose=purpose))
+        rows.sort(key=lambda p: p.get('RowKey', ''))
+        rows.sort(key=lambda p: _metadata_upload_date(p), reverse=True)
+        rows.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
+        return rows
+    return _photo_default_sort_cache.get(user_id, _compute)
 
 
 def _query_metadata_rows_for_user(user_id: str, select: Optional[List[str]] = None, purpose: str = 'metadata') -> List[Dict]:
@@ -7903,10 +7951,20 @@ def _stream_cached_preview(filename: str, *, cache_control: str, blob_name: Opti
 
 
 def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
+    """Called on every proxy_preview cache-miss (i.e. every first view of a
+    RAW/CR3 or other backend-preview-required file) -- unlike the
+    once-per-upload or once-per-delete call sites of this same 'jobs'
+    partition scan, this one is a hot, user-facing read path, so it reuses
+    _jobs_partition_scan_cache like _has_active_clustering_job and
+    _has_active_library_download_job do instead of re-scanning the whole
+    (213k+ row and growing) partition on every call."""
     if metadata_table_client is None:
         return None
     try:
-        rows = list(metadata_table_client.query_entities("PartitionKey eq 'jobs'"))
+        rows = _jobs_partition_scan_cache.get(
+            _JOBS_PARTITION_SCAN_CACHE_KEY,
+            lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
+        )
     except Exception:
         return None
     for row in rows:
@@ -14760,7 +14818,10 @@ def filter_photos():
     capture_start, capture_end = _parse_capture_range_args()
 
     try:
-        all_photos = _cached_metadata_rows_for_user(user_id, purpose='photos.filter')
+        # Already sorted (rating/likes -> recency -> filename, stable across
+        # loads) -- see _cached_sorted_metadata_rows_for_user. Filtering below
+        # preserves that order, so no per-request re-sort is needed.
+        all_photos = _cached_sorted_metadata_rows_for_user(user_id, purpose='photos.filter')
     except Exception as exc:
         return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
 
@@ -14791,14 +14852,6 @@ def filter_photos():
 
             filtered.append(photo)
 
-        # Stable multi-pass sort (least to most significant): filename, then most
-        # recently uploaded, then rating/likes. Applied in this order because
-        # Python's sort is stable, so equal rating/likes photos fall back to
-        # recent-first and finally to a filename tie-break — deterministic across
-        # loads instead of depending on the raw scan order.
-        filtered.sort(key=lambda p: p.get('RowKey', ''))
-        filtered.sort(key=lambda p: _metadata_upload_date(p), reverse=True)
-        filtered.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
         selected = filtered[offset:offset + limit]
         pid_to_name, _ = _load_people_name_index(user_id)
         photos = _build_photo_summaries_page(

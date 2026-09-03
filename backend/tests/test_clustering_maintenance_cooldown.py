@@ -11,17 +11,85 @@ because incremental assignment ran concurrently.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+from azure.data.tables import TableEntity
 
 import app
 from fakes import FakeTable
 
 
+class _FakeMaintenanceTable:
+    """Combines the plain-dict FakeTable surface (upsert_entity/query_entities,
+    used by this file's 'jobs' partition seeding) with real ETag semantics
+    for create_entity/get_entity/update_entity -- _clustering_maintenance_due
+    needs both against the same metadata_table_client now that its cooldown
+    claim is atomic. Mirrors test_ipwork_sweep.py's _FakeLockTable, which
+    covers the identical create-then-conditional-update shape for the ipwork
+    sweep lock."""
+
+    def __init__(self) -> None:
+        self.rows: dict = {}
+        self._etags: dict = {}
+        self._version = 0
+
+    def _bump_etag(self, key) -> None:
+        self._version += 1
+        self._etags[key] = f'W/"{self._version}"'
+
+    def upsert_entity(self, entity):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        self.rows[key] = dict(entity)
+        self._bump_etag(key)
+
+    def create_entity(self, entity):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        if key in self.rows:
+            raise ResourceExistsError('already exists')
+        self.rows[key] = dict(entity)
+        self._bump_etag(key)
+
+    def get_entity(self, partition_key, row_key):
+        key = (partition_key, row_key)
+        if key not in self.rows:
+            raise ResourceNotFoundError(f'{key} not found')
+        entity = TableEntity(dict(self.rows[key]))
+        entity._metadata = {'etag': self._etags[key], 'timestamp': None}
+        return entity
+
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        if key not in self.rows:
+            raise ResourceNotFoundError(f'{key} not found')
+        if etag is not None and etag != self._etags[key]:
+            raise ResourceModifiedError('etag mismatch')
+        self.rows[key] = dict(entity)
+        self._bump_etag(key)
+
+    def delete_entity(self, partition_key, row_key):
+        self.rows.pop((partition_key, row_key), None)
+
+    def query_entities(self, filter_str):
+        m = re.match(r"PartitionKey eq '(.*)' and (\w+) eq '(.*)'$", filter_str.strip())
+        if m:
+            pk, field, value = m.group(1), m.group(2), m.group(3)
+            return [
+                dict(v) for (p, _), v in self.rows.items()
+                if p == pk and str(v.get(field, '')) == value
+            ]
+        m = re.match(r"PartitionKey eq '(.*)'$", filter_str.strip())
+        if m:
+            pk = m.group(1)
+            return [dict(v) for (p, _), v in self.rows.items() if p == pk]
+        raise ValueError(f'Unsupported filter: {filter_str}')
+
+
 @pytest.fixture(autouse=True)
 def metadata_table(monkeypatch):
-    table = FakeTable()
+    table = _FakeMaintenanceTable()
     monkeypatch.setattr(app, 'metadata_table_client', table)
     return table
 
@@ -55,6 +123,31 @@ def test_due_again_once_cooldown_elapses_and_updates_the_row(metadata_table):
     assert app._clustering_maintenance_due('lib-A') is True
     new_last = metadata_table.get_entity('clustering_maintenance', 'lib-A')['lastStartedAt']
     assert new_last != stale.isoformat()
+
+
+def test_burst_of_concurrent_callers_only_one_wins_the_claim(metadata_table):
+    """Regression test for a real production incident (2026-09-03): a burst
+    of uploads whose face-processing lands within the same
+    _jobs_partition_scan_cache TTL window used to each independently read
+    the old blind upsert's pre-claim state and each proceed, producing 9
+    concurrent full-library clustering jobs for one user from a single
+    upload batch instead of 1. The atomic create-then-conditional-update
+    claim must let exactly one caller through per cooldown window regardless
+    of how many check at once -- this simulates that burst with no prior row
+    (the exact scenario observed live)."""
+    results = [app._clustering_maintenance_due('lib-A') for _ in range(9)]
+    assert results == [True] + [False] * 8
+
+
+def test_burst_of_concurrent_callers_after_cooldown_elapsed_only_one_wins(metadata_table):
+    stale = datetime.now(timezone.utc) - timedelta(seconds=app.PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS + 60)
+    metadata_table.upsert_entity({
+        'PartitionKey': 'clustering_maintenance', 'RowKey': 'lib-A',
+        'lastStartedAt': stale.isoformat(), 'updatedAt': stale.isoformat(),
+    })
+
+    results = [app._clustering_maintenance_due('lib-A') for _ in range(9)]
+    assert results == [True] + [False] * 8
 
 
 def test_cooldown_is_per_user(metadata_table):
