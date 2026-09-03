@@ -3581,10 +3581,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploadFileInChunks,
     ]);
 
-    const fileMatchesPersistedUpload = (file: File, meta: PersistedUploadFile) => (
-        file.name === meta.name
-        && file.size === meta.size
-        && file.lastModified === meta.lastModified
+    const persistedUploadFileMatchKey = (file: { name: string; size: number; lastModified: number }) => (
+        `${file.name}|${file.size}|${file.lastModified}`
     );
 
     const attachSelectedFilesToPendingSession = useCallback(async (
@@ -3595,22 +3593,41 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return { matchedCount: 0, unmatchedFiles: selectedFiles };
         }
 
-        const matchedKeys = new Set<string>();
         const matchedPairs: Array<{ key: string; file: File }> = [];
         const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
         const doneFiles = session.files.filter((file) => file.status === 'done');
         const unmatchedFiles: File[] = [];
+
+        // Indexed by (name, size, lastModified) so each selected file
+        // resolves in O(1) instead of a linear scan over every unfinished
+        // file. With a large paused session (thousands of files from an
+        // interrupted big-batch upload), the old selectedFiles.length x
+        // unfinishedFiles.length nested scan ran fully synchronously with no
+        // await inside -- for a big-enough paused session it blocked the
+        // main thread long enough to look like the picker itself had hung
+        // after clicking Add. A bucket (not a single value) per key because
+        // multiple unfinished files can legitimately share the same name,
+        // size, and lastModified.
+        const unfinishedByKey = new Map<string, PersistedUploadFile[]>();
+        for (const candidate of unfinishedFiles) {
+            const key = persistedUploadFileMatchKey(candidate);
+            const bucket = unfinishedByKey.get(key);
+            if (bucket) {
+                bucket.push(candidate);
+            } else {
+                unfinishedByKey.set(key, [candidate]);
+            }
+        }
+        const doneKeys = new Set(doneFiles.map(persistedUploadFileMatchKey));
 
         // Fast, synchronous matching pass only -- no IndexedDB writes here.
         // uploadSourceFilesRef is set immediately per match, which is all
         // retryPersistedUploadSession actually needs to proceed; the blob
         // persistence below is a slower best-effort extra, done afterward.
         for (const file of selectedFiles) {
-            const meta = unfinishedFiles.find((candidate) => (
-                !matchedKeys.has(candidate.key) && fileMatchesPersistedUpload(file, candidate)
-            ));
+            const bucket = unfinishedByKey.get(persistedUploadFileMatchKey(file));
+            const meta = bucket?.shift();
             if (meta) {
-                matchedKeys.add(meta.key);
                 uploadSourceFilesRef.current.set(meta.key, file);
                 matchedPairs.push({ key: meta.key, file });
                 updatePersistedFile(meta.key, { status: 'pending', error: undefined });
@@ -3618,7 +3635,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             // Already uploaded under this session -- nothing to do (and not a
             // "new" file either, so it shouldn't be handed to startUpload).
-            if (doneFiles.some((candidate) => fileMatchesPersistedUpload(file, candidate))) {
+            if (doneKeys.has(persistedUploadFileMatchKey(file))) {
                 continue;
             }
             // Not part of this paused session at all -- e.g. the user
