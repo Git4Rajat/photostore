@@ -461,6 +461,22 @@ CLUSTERING_QUEUE_NAME = os.getenv('CLUSTERING_QUEUE_NAME', 'photostore-clusterin
 # reclaimable in at most this many seconds instead of up to 1800.
 CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS', '120'))
 CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS = int(os.getenv('CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS', '40'))
+# Active lease renewal (above) means a healthy replica never loses a message
+# mid-job -- but it can't help a message whose processing crashes the whole
+# replica every time it's attempted (a "poison" job: a payload that reliably
+# OOMs or hard-kills the process before any exception handler runs), or one
+# that's redelivered over and over across many separate replica
+# restarts/redeploys for unrelated reasons. Without a ceiling, Azure just
+# keeps redelivering such a message forever, each attempt burning a full
+# replica's worth of compute. Confirmed live 2026-09-03: a batch of
+# duplicate clustering jobs (see the atomic-claim fix on
+# _clustering_maintenance_due above) kept getting redelivered across
+# unrelated restarts for hours. message.dequeue_count is Azure's own
+# per-message attempt counter (already used below for IPWORK_LEASE_RETRY_LIMIT);
+# once it exceeds this, the message is dropped and its job marked 'failed'
+# instead of retried again -- the user can retry manually from the UI if the
+# job is still wanted.
+CLUSTERING_WORKER_MAX_RETRIES = int(os.getenv('CLUSTERING_WORKER_MAX_RETRIES', '5'))
 IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
 # ipworker's job: thumbnail, exif, ocr, geo (map_detection), vision (ai_vision),
 # face -- the full set the browser can do client-side. Thumbnail used to be a
@@ -505,6 +521,16 @@ IPWORK_LEASE_RETRY_LIMIT = int(os.getenv('IPWORK_LEASE_RETRY_LIMIT', '3'))
 # Matches IPWORKER_LEASE_SECONDS, the same "how long is one photo allowed to
 # take" budget already used for the app-level lease.
 IPWORKER_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('IPWORKER_VISIBILITY_TIMEOUT_SECONDS', '300'))
+# Ceiling on total redeliveries for one message regardless of outcome --
+# distinct from IPWORK_LEASE_RETRY_LIMIT above, which only bounds the
+# lease_busy case. A message whose processing reliably crashes the whole
+# replica (e.g. a corrupt/poison image -- see the tesserocr in-process
+# migration's blast-radius note) never reaches _process_ipwork_message's own
+# except block, so it has no chance to mark itself 'failed' and stop being
+# redelivered; without this it would retry forever, one full replica-worth of
+# compute per attempt. Checked against the same message.dequeue_count Azure
+# already tracks. Same 5-retry default as CLUSTERING_WORKER_MAX_RETRIES.
+IPWORKER_MAX_RETRIES = int(os.getenv('IPWORKER_MAX_RETRIES', '5'))
 # Bounded worker-thread pool inside a single ipworker replica -- lets one
 # replica process several photos' synchronous I/O (blob download/upload,
 # table reads/writes, the geocode HTTP call) concurrently instead of one
@@ -13765,6 +13791,38 @@ def run_clustering_worker() -> None:
                 user_id = ''
                 job_type = ''
 
+                dequeue_count = int(getattr(message, 'dequeue_count', 0) or 0)
+                if dequeue_count > CLUSTERING_WORKER_MAX_RETRIES:
+                    try:
+                        payload = json.loads(message.content or '{}')
+                        if isinstance(payload, dict):
+                            job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
+                            user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+                            job_type = str(payload.get('type') or '').strip()
+                    except Exception:
+                        pass
+                    if job_id and user_id:
+                        try:
+                            _upsert_job_status(
+                                job_id, user_id, job_type or 'clustering', 'failed',
+                                error=(
+                                    f'Exceeded max retries ({CLUSTERING_WORKER_MAX_RETRIES}); '
+                                    f'redelivered {dequeue_count} times without completing. '
+                                    'Retry manually if this job is still wanted.'
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    worker_logger.warning(
+                        'Dropping clustering queue message after %s dequeues (max %s), job_id=%s',
+                        dequeue_count, CLUSTERING_WORKER_MAX_RETRIES, job_id,
+                    )
+                    try:
+                        queue_client.delete_message(message)
+                    except Exception:
+                        worker_logger.exception('Failed to delete clustering queue message exceeding max retries')
+                    continue
+
                 # Keep this message's lease alive for as long as we're actively
                 # working it, no matter how long that takes -- see
                 # CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS's comment above.
@@ -14124,11 +14182,30 @@ def _process_ipwork_message(message) -> str:
     job_id = ''
     user_id = ''
     outcome = 'done'
+    dequeue_count = int(getattr(message, 'dequeue_count', 0) or 0)
     try:
         payload = json.loads(message.content or '{}')
         if isinstance(payload, dict):
             job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
             user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+            if dequeue_count > IPWORKER_MAX_RETRIES:
+                if job_id and user_id:
+                    try:
+                        _upsert_job_status(
+                            job_id, user_id, 'ipwork', 'failed',
+                            error=(
+                                f'Exceeded max retries ({IPWORKER_MAX_RETRIES}); '
+                                f'redelivered {dequeue_count} times without completing. '
+                                'Retry manually if this job is still wanted.'
+                            ),
+                        )
+                    except Exception:
+                        pass
+                worker_logger.warning(
+                    'Dropping ipwork queue message after %s dequeues (max %s), job_id=%s',
+                    dequeue_count, IPWORKER_MAX_RETRIES, job_id,
+                )
+                return 'done'  # exceeded retries, not a race -- don't retry-loop it
             outcome = _handle_ipwork_queue_payload(payload, job_id, user_id)
     except Exception as exc:
         if job_id and user_id:

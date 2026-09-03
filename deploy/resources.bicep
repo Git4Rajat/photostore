@@ -703,6 +703,15 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             // at most this many seconds.
             { name: 'CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS', value: '120' }
             { name: 'CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS', value: '40' }
+            // Renewal above stops a *healthy* replica from ever losing its
+            // message mid-job, but not a message that keeps getting
+            // redelivered for other reasons (repeated restarts, a payload
+            // that crashes the whole process before any exception handler
+            // runs). Confirmed live 2026-09-03: duplicate clustering jobs
+            // kept getting redelivered across unrelated restarts for hours.
+            // Past this many dequeues, the message is dropped and its job
+            // marked 'failed' instead of retried again.
+            { name: 'CLUSTERING_WORKER_MAX_RETRIES', value: '5' }
             // The worker sends the "cleanup complete" email once a library_clean
             // job finishes; without this it silently no-ops (is_configured()
             // false) since ACS_CONNECTION_STRING lived only on the backend's env.
@@ -797,6 +806,14 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // renewal, so this value has to be a fixed upper bound on how long
             // one message's processing can legitimately take.
             { name: 'IPWORKER_VISIBILITY_TIMEOUT_SECONDS', value: '300' }
+            // Distinct from IPWORK_LEASE_RETRY_LIMIT below (which only bounds
+            // the lease_busy race) -- this bounds *every* outcome. A message
+            // whose processing reliably crashes the whole replica (a
+            // corrupt/poison image) never reaches _process_ipwork_message's
+            // own except block, so without this it would be redelivered by
+            // Azure forever. See CLUSTERING_WORKER_MAX_RETRIES above -- same
+            // production incident (2026-09-03) motivated both.
+            { name: 'IPWORKER_MAX_RETRIES', value: '5' }
             // Default (20s, see backend/app.py) is tuned for interactive
             // backend requests. A single ipwork pass takes ~60-90s, so at the
             // default TTL the per-photo people/face partition scan
