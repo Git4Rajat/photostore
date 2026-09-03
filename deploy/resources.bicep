@@ -478,8 +478,16 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'backend'
           image: backendImage
           resources: {
-            cpu: json('1.25')
-            memory: '2.5Gi'
+            // 2026-09-03: raised from 1.25vCPU/2.5Gi live on photostore-test
+            // after a sustained OOM crash-loop (working-set pinned at the
+            // 2.5Gi ceiling for 3+ hours, 6 OOMKilled + dozens of
+            // ContainerBackOff/ReplicaUnhealthy events, confirmed via
+            // ContainerAppSystemLogs_CL) -- every request landing on a
+            // mid-restart replica stalled, which is what made pagination and
+            // RAW/CR3 preview generation both feel "incredibly slow". Matches
+            // worker/ipworker's existing 2vCPU/4Gi tier.
+            cpu: json('2')
+            memory: '4Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
