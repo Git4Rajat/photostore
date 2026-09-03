@@ -7,6 +7,7 @@ import os
 import random
 import re
 import secrets
+import signal
 import tempfile
 import zipfile
 import time
@@ -474,6 +475,18 @@ IPWORKER_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('IPWORKER_VISIBILITY_TIMEOUT
 # memory was already the tighter constraint at ~66-77% peak at
 # concurrency=1, so this isn't guessed higher without measurement).
 IPWORKER_CONCURRENCY = max(1, int(os.getenv('IPWORKER_CONCURRENCY', '1')))
+# How long run_ipworker's SIGTERM handler waits for in-flight messages to
+# finish (and their queue messages to be deleted) before force-exiting. Azure
+# Container Apps' default terminationGracePeriodSeconds is 30s -- a replica
+# that hasn't exited by then gets SIGKILLed with no further chance to clean
+# up, so this must stay comfortably under 30 to leave margin for the exit
+# itself. Without this, a replica killed while holding an already-completed
+# message (result written, just not yet deleted from the queue) orphans that
+# message: it sits invisible until IPWORKER_VISIBILITY_TIMEOUT_SECONDS
+# elapses, then gets redelivered and reprocessed forever, since scale-down
+# during a backlog drain (KEDA shrinking replica count as visible messages
+# drop) sends SIGTERM constantly, not just on deploys.
+IPWORKER_SHUTDOWN_GRACE_SECONDS = max(1, int(os.getenv('IPWORKER_SHUTDOWN_GRACE_SECONDS', '25')))
 LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS = max(60, int(os.getenv('LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS', '14400')))
 CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS = max(0, int(os.getenv('CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS', '750')))
 CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS = max(30, int(os.getenv('CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS', '120')))
@@ -13426,7 +13439,33 @@ def run_clustering_worker() -> None:
         CLUSTERING_QUEUE_NAME,
         poll_seconds,
     )
-    while True:
+
+    # Unlike run_ipworker, this loop had no SIGTERM handler at all -- Python's
+    # default disposition for an unhandled SIGTERM is to terminate the process
+    # immediately, mid-cluster_user_faces() if one happens to be running. KEDA
+    # sends SIGTERM on every scale-down (queueLength=1 recomputes target
+    # replica count continuously, not just on deploys), so a live fleet of
+    # short-lived replicas will routinely kill a job that was seconds from
+    # finishing. The queue message survives (still invisible for the rest of
+    # CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS) so the job isn't lost
+    # forever, but the jobs-table row is left stranded at 'running' until
+    # either redelivery picks it back up or /jobs/status's stale-cutoff flags
+    # it 'failed' -- which is what a user sees as a spurious failure even
+    # though the work itself eventually completes. Installing a handler (even
+    # one that just sets a flag) stops the instant-kill: Container Apps then
+    # waits out its terminationGracePeriodSeconds (default 30s) before
+    # SIGKILLing, giving an in-flight message a real chance to finish and
+    # delete cleanly instead of being cut off mid-write.
+    shutdown_requested = threading.Event()
+
+    def _handle_shutdown_signal(signum, _frame) -> None:
+        worker_logger.info('clustering worker received signal %s, finishing in-flight message before exit', signum)
+        shutdown_requested.set()
+
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
+    while not shutdown_requested.is_set():
         processed_any = False
         try:
             messages = list(queue_client.receive_messages(
@@ -13830,17 +13869,49 @@ def run_ipworker() -> None:
     )
     threading.Thread(target=_ipwork_sweep_loop, name='ipwork-sweep', daemon=True).start()
 
-    with ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork') as executor:
-        in_flight = {}  # future -> message
+    # Container Apps sends SIGTERM (not just on deploys -- KEDA scaling this
+    # replica down mid-backlog-drain does too, since it recomputes target
+    # replica count off the shrinking visible-message count constantly) with
+    # no grace handling by default, Python's default SIGTERM disposition
+    # kills the process immediately. That can strike between a message
+    # finishing its work (results already written) and the delete_message
+    # call below that removes it from the queue -- orphaning a message that
+    # will never be re-processed differently, just endlessly redelivered.
+    # This handler stops pulling new work and gives in-flight messages up to
+    # IPWORKER_SHUTDOWN_GRACE_SECONDS to finish and be deleted properly.
+    shutdown_requested = threading.Event()
+
+    def _handle_shutdown_signal(signum, _frame) -> None:
+        worker_logger.info('ipworker received signal %s, draining in-flight work before exit', signum)
+        shutdown_requested.set()
+
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
+    executor = ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork')
+    in_flight = {}  # future -> message
+    shutdown_deadline: Optional[float] = None
+    grace_exhausted = False
+    try:
         while True:
             try:
+                if shutdown_requested.is_set() and shutdown_deadline is None:
+                    shutdown_deadline = time.monotonic() + IPWORKER_SHUTDOWN_GRACE_SECONDS
+                    worker_logger.info(
+                        'ipworker shutting down: draining %d in-flight message(s), grace=%ss',
+                        len(in_flight), IPWORKER_SHUTDOWN_GRACE_SECONDS,
+                    )
+
                 # Only fetch as many new messages as there are free worker
                 # slots -- keeps the pool saturated by refilling one slot at
                 # a time as futures complete, instead of batch-waiting for a
                 # full round of IPWORKER_CONCURRENCY messages to finish
                 # before fetching more. Azure Queue's GET Messages caps a
                 # single call at 32 regardless of IPWORKER_CONCURRENCY.
-                free_slots = min(IPWORKER_CONCURRENCY - len(in_flight), 32)
+                # Once shutdown has been requested, stop claiming new work --
+                # each claimed message costs a full visibility timeout if it
+                # can't finish before the process exits.
+                free_slots = 0 if shutdown_requested.is_set() else min(IPWORKER_CONCURRENCY - len(in_flight), 32)
                 if free_slots > 0:
                     messages = list(queue_client.receive_messages(
                         messages_per_page=free_slots,
@@ -13852,14 +13923,29 @@ def run_ipworker() -> None:
                         in_flight[future] = message
 
                 if not in_flight:
+                    if shutdown_requested.is_set():
+                        break
                     time.sleep(poll_seconds)
                     continue
 
-                # Block for up to poll_seconds waiting for at least one
+                if shutdown_deadline is not None and time.monotonic() >= shutdown_deadline:
+                    worker_logger.warning(
+                        'ipworker shutdown grace period elapsed with %d message(s) still in flight -- '
+                        'exiting now, they will be redelivered after the visibility timeout',
+                        len(in_flight),
+                    )
+                    grace_exhausted = True
+                    break
+
+                # Block for up to poll_seconds (or whatever's left of the
+                # shutdown grace period, if shorter) waiting for at least one
                 # in-flight future to finish (returns early as soon as one
                 # does); on timeout, loop back around to check for more
-                # free-slot capacity / new messages.
-                done, _pending = wait(list(in_flight.keys()), timeout=poll_seconds, return_when=FIRST_COMPLETED)
+                # free-slot capacity / new messages / the shutdown deadline.
+                wait_timeout = poll_seconds
+                if shutdown_deadline is not None:
+                    wait_timeout = max(0.1, min(poll_seconds, shutdown_deadline - time.monotonic()))
+                done, _pending = wait(list(in_flight.keys()), timeout=wait_timeout, return_when=FIRST_COMPLETED)
                 for future in done:
                     message = in_flight.pop(future)
                     try:
@@ -13884,7 +13970,21 @@ def run_ipworker() -> None:
                         worker_logger.exception('Failed to delete ipwork queue message')
             except Exception:
                 worker_logger.exception('ipwork queue polling iteration failed')
+                if shutdown_requested.is_set():
+                    break
                 time.sleep(poll_seconds)
+    finally:
+        # On a clean exit (no shutdown requested, or shutdown finished
+        # draining before the deadline) in_flight is already empty, so a
+        # blocking shutdown is instant. On a grace-period timeout there are
+        # still-running threads inside the executor -- don't block on them
+        # (Azure's own SIGKILL is coming any moment now regardless, so
+        # waiting here would just burn the remaining time doing nothing
+        # useful) and force-exit immediately after so those stragglers can't
+        # hang process termination past what Container Apps allows.
+        executor.shutdown(wait=not grace_exhausted, cancel_futures=grace_exhausted)
+    if grace_exhausted:
+        os._exit(0)
 
 
 @app.route('/upload/processing/status', methods=['GET'])
