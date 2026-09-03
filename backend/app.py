@@ -379,10 +379,18 @@ BLOB_CONNECTION_STRING = os.getenv('BLOB_CONNECTION_STRING', '').strip()
 BLOB_IMAGE_CONTAINER = os.getenv('BLOB_IMAGE_CONTAINER', IMAGE_CONTAINER).strip()
 BLOB_THUMBNAIL_CONTAINER = os.getenv('BLOB_THUMBNAIL_CONTAINER', THUMBNAIL_CONTAINER).strip()
 BLOB_COVER_CONTAINER = os.getenv('BLOB_COVER_CONTAINER', 'covers').strip()
-# Holds "download entire library" ZIP exports. One blob per library
-# (name is library-scoped, see _execute_library_download), overwritten on
-# each re-export so this container never accumulates unbounded history.
+# Holds "download entire library" ZIP exports. Blobs are library- and
+# part-scoped (see _execute_library_download/_library_export_part_blob_name),
+# overwritten on each re-export so this container never accumulates more than
+# the current run's parts per library (stale extra parts from a shrinking
+# export are swept by _cleanup_stale_library_export_parts).
 BLOB_EXPORTS_CONTAINER = os.getenv('BLOB_EXPORTS_CONTAINER', 'library-exports').strip()
+# Each export "part" ZIP is capped at roughly this many bytes (measured via the
+# metadata table's own `size` field, not re-downloaded) before it's closed and
+# uploaded and a new part is started. Keeps very large libraries from
+# producing one impractically large ZIP, bounds peak temp-disk usage to one
+# part at a time, and gives natural progress checkpoints.
+LIBRARY_EXPORT_PART_MAX_BYTES = int(os.getenv('LIBRARY_EXPORT_PART_MAX_BYTES', str(2 * 1024 ** 3)))
 # 'sas' hands the browser day-stable read SAS URLs pointing straight at blob
 # storage so media bytes never stream through this container; 'proxy' serves
 # every byte through the backend. 'sas' silently degrades to proxy URLs when
@@ -2153,7 +2161,10 @@ def _humanize_job(row: Dict) -> Dict:
         kind = 'library_download'
         if status == 'done':
             title = 'Library export ready'
-            message = f"{_plural(int(result.get('photosIncluded') or 0), 'photo')} ready to download."
+            parts = result.get('parts')
+            part_count = len(parts) if isinstance(parts, list) else 0
+            message = f"{_plural(int(result.get('photosIncluded') or 0), 'photo')} ready to download"
+            message += f" across {_plural(part_count, 'part')}." if part_count > 1 else '.'
         elif status == 'failed':
             title = 'Library export failed'
     elif job_type == 'ipwork':
@@ -7249,71 +7260,221 @@ def _enqueue_library_clean_job(library_id: str, actor_user_id: str, request_id: 
     return {'status': 'queued', 'jobId': job_id}
 
 
-def _library_export_blob_name(library_id: str) -> str:
-    # Deterministic, library-scoped path: overwriting on each re-export means
-    # this container never accumulates more than one ZIP per library.
-    return f'{library_id}/library-export.zip'
+def _library_export_part_blob_name(library_id: str, part_index: int) -> str:
+    # Deterministic, library- and part-scoped path: overwriting on each
+    # re-export means this container never accumulates more than the current
+    # run's parts per library. A run that produces fewer parts than the
+    # previous one has its extra stale parts swept by
+    # _cleanup_stale_library_export_parts.
+    return f'{library_id}/library-export-part-{part_index}.zip'
 
 
-def _execute_library_download(library_id: str, library_name: str) -> Dict:
-    """Build a ZIP of every photo/video in a library and upload it to
-    BLOB_EXPORTS_CONTAINER. Runs on the queue-scaled worker, same as
-    _execute_library_clean, since it walks the library's full metadata
-    partition and reads every photo's full-size bytes."""
+def _cleanup_stale_library_export_parts(library_id: str, keep_count: int) -> None:
+    """Delete previously-uploaded export part blobs beyond keep_count -- a
+    library whose export shrinks from e.g. 5 parts to 3 would otherwise leave
+    stale, still-downloadable blobs from the prior run."""
+    if blob_service_client is None:
+        return
+    prefix = f'{library_id}/library-export-part-'
+    try:
+        container_client = blob_service_client.get_container_client(BLOB_EXPORTS_CONTAINER)
+        for blob in container_client.list_blobs(name_starts_with=prefix):
+            name = str(getattr(blob, 'name', '') or '')
+            suffix = name[len(prefix):]
+            if not suffix.endswith('.zip'):
+                continue
+            try:
+                index = int(suffix[:-len('.zip')])
+            except ValueError:
+                continue
+            if index > keep_count:
+                try:
+                    container_client.delete_blob(name)
+                except Exception:
+                    app.logger.warning('Failed to delete stale export part %s for %s', name, library_id)
+    except Exception:
+        app.logger.warning('Failed to sweep stale export parts for %s', library_id)
+
+
+def _execute_library_download(library_id: str, library_name: str, job_id: Optional[str] = None, user_id: Optional[str] = None) -> Dict:
+    """Build one or more size-capped ZIP parts covering every photo/video in a
+    library and upload them to BLOB_EXPORTS_CONTAINER. Runs on the
+    queue-scaled worker, same as _execute_library_clean, since it walks the
+    library's full metadata partition and reads every photo's full-size
+    bytes.
+
+    Splitting into LIBRARY_EXPORT_PART_MAX_BYTES-capped parts (instead of one
+    ZIP) keeps a very large library from producing one impractically large
+    file and bounds peak temp-disk usage to a single part. It also gives a
+    resume point: if job_id identifies a job row from a PRIOR attempt (this
+    queue message was redelivered after the worker died mid-run), rows
+    already accounted for by that attempt's durably-uploaded parts
+    (exportRowsProcessed/exportPartsSummary) are skipped rather than
+    reprocessed. A fresh user-initiated re-export always gets a new job_id,
+    so this never resumes across unrelated export runs -- only across
+    retries of the same one.
+    """
     pk = _escape_odata(library_id)
     try:
         metadata_rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{pk}'")) if metadata_table_client else []
     except Exception:
         metadata_rows = []
 
+    # Stable order so part boundaries -- and the resume-skip count below --
+    # are consistent across retries of the same job.
+    metadata_rows.sort(key=lambda row: str(row.get('RowKey') or ''))
+    candidate_rows = [
+        row for row in metadata_rows
+        if str(row.get('RowKey') or '') and str(row.get('processing_state') or '').strip().lower() != 'deleted'
+    ]
+    photos_total = len(candidate_rows)
+
+    rows_processed = 0
     written_count = 0
     skipped_count = 0
+    part_index = 0
+    parts_summary: List[Dict] = []
+    if job_id and metadata_table_client is not None:
+        try:
+            prior_row = metadata_table_client.get_entity(partition_key='jobs', row_key=_job_row_key(job_id))
+            rows_processed = max(0, min(int(prior_row.get('exportRowsProcessed') or 0), photos_total))
+            written_count = int(prior_row.get('exportPhotosWritten') or 0)
+            skipped_count = int(prior_row.get('exportPhotosSkipped') or 0)
+            part_index = int(prior_row.get('exportPartsCompleted') or 0)
+            raw_summary = prior_row.get('exportPartsSummary')
+            if isinstance(raw_summary, str) and raw_summary:
+                parts_summary = json.loads(raw_summary)
+        except Exception:
+            rows_processed, written_count, skipped_count, part_index, parts_summary = 0, 0, 0, 0, []
+
+    def _durable_checkpoint() -> None:
+        # Only called right after a part's ZIP has actually been uploaded --
+        # this is what a retry's resume-skip logic above trusts, so it must
+        # never advance past data that isn't safely in blob storage yet.
+        if not job_id:
+            return
+        _upsert_job_status(
+            job_id, user_id, 'library_download', 'running',
+            libraryId=library_id,
+            exportRowsProcessed=rows_processed,
+            exportPhotosWritten=written_count,
+            exportPhotosSkipped=skipped_count,
+            exportPartsCompleted=part_index,
+            exportPartsSummary=parts_summary,
+            result={'photosCompleted': rows_processed, 'photosTotal': photos_total},
+        )
+
+    def _live_progress_heartbeat() -> None:
+        # Refreshes updatedAt (so /api/jobs/status's 15-minute stale-job
+        # cutoff doesn't flip a still-running export to 'failed') and lets the
+        # UI show real counts. Deliberately does NOT touch the durable
+        # exportRowsProcessed/exportPartsSummary checkpoint above -- a photo
+        # counted here could still be lost if the worker dies before its part
+        # finishes uploading, so advancing the resume pointer this early
+        # would let a retry skip data that was never actually made durable.
+        if not job_id:
+            return
+        _upsert_job_status(
+            job_id, user_id, 'library_download', 'running', libraryId=library_id,
+            result={'photosCompleted': rows_processed, 'photosTotal': photos_total},
+        )
+
     tmp = tempfile.NamedTemporaryFile(prefix='libexport-', suffix='.zip', delete=False)
     tmp_path = tmp.name
+    zip_file = zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED)
+    photos_in_part = 0
+    part_bytes = 0
     try:
-        with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file:
-            for row in metadata_rows:
-                filename = str(row.get('RowKey') or '')
-                if not filename:
-                    continue
-                if str(row.get('processing_state') or '').strip().lower() == 'deleted':
-                    continue
+        for row in candidate_rows[rows_processed:]:
+            filename = str(row.get('RowKey') or '')
+            try:
+                blob_name = resolve_physical_blob_name(library_id, filename, 'image')
+                data_bytes = download_media_bytes('image', blob_name)
+                zip_file.writestr(filename, data_bytes)
+                written_count += 1
+                photos_in_part += 1
+                part_bytes += len(data_bytes)
+            except Exception as exc:
+                skipped_count += 1
+                app.logger.warning('Skipping %s while building library export for %s: %s', filename, library_id, exc)
+            rows_processed += 1
+            is_last_row = rows_processed >= photos_total
+
+            if photos_in_part and (part_bytes >= LIBRARY_EXPORT_PART_MAX_BYTES or is_last_row):
+                zip_file.close()
+                tmp.close()
+                part_index += 1
+                part_size = os.path.getsize(tmp_path)
                 try:
-                    blob_name = resolve_physical_blob_name(library_id, filename, 'image')
-                    data_bytes = download_media_bytes('image', blob_name)
-                    zip_file.writestr(filename, data_bytes)
-                    written_count += 1
-                except Exception as exc:
-                    skipped_count += 1
-                    app.logger.warning('Skipping %s while building library export for %s: %s', filename, library_id, exc)
-        tmp.close()
+                    with open(tmp_path, 'rb') as fh:
+                        upload_file_to_blob(BLOB_EXPORTS_CONTAINER, _library_export_part_blob_name(library_id, part_index), fh, 'application/zip')
+                finally:
+                    _remove_file_quietly(tmp_path)
+                parts_summary.append({'partIndex': part_index, 'photosIncluded': photos_in_part, 'sizeBytes': part_size})
+                _durable_checkpoint()
+                if not is_last_row:
+                    tmp = tempfile.NamedTemporaryFile(prefix='libexport-', suffix='.zip', delete=False)
+                    tmp_path = tmp.name
+                    zip_file = zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED)
+                    photos_in_part = 0
+                    part_bytes = 0
+            elif rows_processed % 25 == 0:
+                _live_progress_heartbeat()
     except Exception:
+        try:
+            zip_file.close()
+        except Exception:
+            pass
         try:
             tmp.close()
         finally:
             _remove_file_quietly(tmp_path)
         raise
 
-    if written_count == 0:
+    if photos_in_part == 0:
+        # Either there was nothing left to process (a fully-resumed retry) or
+        # the trailing row(s) all failed -- either way the currently-open part
+        # is empty and was never uploaded above; discard it.
+        try:
+            zip_file.close()
+        except Exception:
+            pass
+        tmp.close()
         _remove_file_quietly(tmp_path)
-        return {'photosIncluded': 0, 'photosSkipped': skipped_count, 'sizeBytes': 0}
 
-    zip_size = os.path.getsize(tmp_path)
-    blob_name = _library_export_blob_name(library_id)
-    try:
-        with open(tmp_path, 'rb') as fh:
-            upload_file_to_blob(BLOB_EXPORTS_CONTAINER, blob_name, fh, 'application/zip')
-    finally:
-        _remove_file_quietly(tmp_path)
+    if part_index == 0:
+        # Nothing was ever produced (empty library, or every row failed) --
+        # leave any blobs from a prior successful export alone, matching this
+        # function's pre-chunking behavior.
+        return {'photosIncluded': written_count, 'photosSkipped': skipped_count, 'sizeBytes': 0, 'parts': []}
 
-    download_name = f"{library_name or library_id}-export.zip"
-    download_url, expires_at = _create_stable_read_sas_url(BLOB_EXPORTS_CONTAINER, blob_name, download_filename=download_name)
+    _cleanup_stale_library_export_parts(library_id, part_index)
+
+    multi_part = len(parts_summary) > 1
+    parts_result = []
+    total_size = 0
+    for part in parts_summary:
+        idx = part['partIndex']
+        blob_name = _library_export_part_blob_name(library_id, idx)
+        download_name = (
+            f"{library_name or library_id}-export-part-{idx}.zip" if multi_part
+            else f"{library_name or library_id}-export.zip"
+        )
+        download_url, expires_at = _create_stable_read_sas_url(BLOB_EXPORTS_CONTAINER, blob_name, download_filename=download_name)
+        total_size += int(part.get('sizeBytes') or 0)
+        parts_result.append({
+            'partIndex': idx,
+            'downloadUrl': download_url,
+            'expiresAt': expires_at,
+            'photosIncluded': part['photosIncluded'],
+            'sizeBytes': part['sizeBytes'],
+        })
+
     return {
-        'downloadUrl': download_url,
-        'expiresAt': expires_at,
+        'parts': parts_result,
         'photosIncluded': written_count,
         'photosSkipped': skipped_count,
-        'sizeBytes': zip_size,
+        'sizeBytes': total_size,
     }
 
 
@@ -7356,7 +7517,7 @@ def _enqueue_library_download_job(library_id: str, actor_user_id: str, library_n
         # silently dropping the request.
         app.logger.warning('Clustering queue client is unavailable; running library download %s inline', job_id)
         try:
-            summary = _execute_library_download(library_id, library_name)
+            summary = _execute_library_download(library_id, library_name, job_id=job_id, user_id=actor_user_id)
             _upsert_job_status(job_id, actor_user_id, 'library_download', 'done', result=summary, libraryId=library_id)
             return {'status': 'done', 'jobId': job_id}
         except Exception as exc:
@@ -13250,7 +13411,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         if job_id:
             _upsert_job_status(job_id, user_id, 'library_download', 'running', libraryId=target_library_id)
         try:
-            summary = _execute_library_download(target_library_id, library_name)
+            summary = _execute_library_download(target_library_id, library_name, job_id=job_id, user_id=user_id)
             if job_id:
                 _upsert_job_status(job_id, user_id, 'library_download', 'done', result=summary, libraryId=target_library_id)
         except Exception as exc:

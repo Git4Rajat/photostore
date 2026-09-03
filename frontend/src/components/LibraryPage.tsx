@@ -97,6 +97,11 @@ const LibraryPage: React.FC = () => {
                     setDownloadOutcome(result.status as 'done' | 'failed');
                     return;
                 }
+                // Still running: the export heartbeats photosCompleted/photosTotal
+                // periodically, so surface that as live progress while we keep polling.
+                if (result.result && (result.result.photosCompleted !== undefined || result.result.photosTotal !== undefined)) {
+                    setDownloadResult(result.result);
+                }
             } catch {
                 // Keep polling; a transient status-check failure isn't fatal.
             }
@@ -369,15 +374,40 @@ const LibraryPage: React.FC = () => {
                             Get a ZIP of every photo and video in this library. Large libraries can take a
                             while to prepare.
                         </p>
-                        {downloadOutcome === 'done' && downloadResult ? (
+                        {downloadOutcome === 'done' && downloadResult && (downloadResult.parts?.length ?? 0) > 1 ? (
+                            <div className="status success">
+                                <p>
+                                    Export ready — {downloadResult.photosIncluded ?? 0} photo(s) across {downloadResult.parts!.length} parts
+                                    {downloadResult.sizeBytes ? `, ${formatExportSize(downloadResult.sizeBytes)}` : ''}
+                                    {downloadResult.photosSkipped ? ` (${downloadResult.photosSkipped} could not be included)` : ''}.
+                                </p>
+                                <ul className="library-list">
+                                    {downloadResult.parts!.map((part) => (
+                                        <li key={part.partIndex} className="library-item">
+                                            <div>
+                                                Part {part.partIndex} — {part.photosIncluded} photo(s)
+                                                {part.sizeBytes ? `, ${formatExportSize(part.sizeBytes)}` : ''}
+                                            </div>
+                                            <a className="btn btn-soft" href={part.downloadUrl} download>Download</a>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        ) : downloadOutcome === 'done' && downloadResult ? (
                             <p className="status success">
                                 Export ready — {downloadResult.photosIncluded ?? 0} photo(s)
                                 {downloadResult.sizeBytes ? `, ${formatExportSize(downloadResult.sizeBytes)}` : ''}
                                 {downloadResult.photosSkipped ? ` (${downloadResult.photosSkipped} could not be included)` : ''}.{' '}
-                                <a href={downloadResult.downloadUrl} download>Download ZIP</a>
+                                {downloadResult.parts?.[0]?.downloadUrl && (
+                                    <a href={downloadResult.parts[0].downloadUrl} download>Download ZIP</a>
+                                )}
                             </p>
                         ) : downloadOutcome === 'pending' ? (
-                            <p className="status">Preparing your download…</p>
+                            <p className="status">
+                                {downloadResult?.photosTotal
+                                    ? `Preparing your download… ${downloadResult.photosCompleted ?? 0} of ${downloadResult.photosTotal} photos processed.`
+                                    : 'Preparing your download…'}
+                            </p>
                         ) : (
                             <>
                                 {downloadError && <p className="status error">{downloadError}</p>}

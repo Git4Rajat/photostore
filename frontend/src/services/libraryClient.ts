@@ -300,14 +300,27 @@ export const requestLibraryDownload = async (): Promise<DownloadRequestResult> =
     return response.json();
 };
 
+export interface DownloadPart {
+    partIndex: number;
+    downloadUrl: string;
+    expiresAt: string;
+    photosIncluded: number;
+    sizeBytes: number;
+}
+
 export interface DownloadStatusResult {
     status: string;
     result?: {
-        downloadUrl?: string;
-        expiresAt?: string;
+        // Present once the export is done: one entry per size-capped ZIP part
+        // (large libraries can produce several -- see LIBRARY_EXPORT_PART_MAX_BYTES).
+        parts?: DownloadPart[];
         photosIncluded?: number;
         photosSkipped?: number;
         sizeBytes?: number;
+        // Present while still running: live progress from the export's
+        // periodic heartbeat, absent once 'parts' is present.
+        photosCompleted?: number;
+        photosTotal?: number;
     };
     error?: string;
 }
