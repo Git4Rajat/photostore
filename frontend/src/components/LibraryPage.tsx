@@ -6,6 +6,30 @@ import { confirmDialog } from './shared/dialogs';
 
 const isPasswordAuthMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
 
+// Persists "download entire library" progress across page reloads, scoped per
+// library so switching libraries doesn't show one library's export state on
+// another's. Without this, a refresh mid-export (or even just navigating away
+// and back) lost all progress and forced the user to babysit the tab -- the
+// export itself is a fire-and-forget background job server-side, so the
+// frontend has no reason to lose track of it too.
+type StoredDownloadState = {
+    jobId: string;
+    outcome: 'pending' | 'done' | 'failed';
+    result: library.DownloadStatusResult['result'] | null;
+    error: string;
+};
+
+const downloadStorageKey = (libraryId: string): string => `photostore.libraryDownload.${libraryId}`;
+
+const loadStoredDownloadState = (libraryId: string): StoredDownloadState | null => {
+    try {
+        const raw = window.localStorage.getItem(downloadStorageKey(libraryId));
+        return raw ? (JSON.parse(raw) as StoredDownloadState) : null;
+    } catch {
+        return null;
+    }
+};
+
 // Manage shared libraries: switch between the ones you belong to, and (for the
 // owner) invite people, see members, and rename/delete the library.
 const LibraryPage: React.FC = () => {
@@ -84,6 +108,39 @@ const LibraryPage: React.FC = () => {
             if (cleanupPollTimer.current) window.clearInterval(cleanupPollTimer.current);
         };
     }, [load]);
+
+    // Restore any in-flight or completed export for the active library once
+    // it's known, so a reload lands back on live progress (resumes polling
+    // via the effect below, unchanged) or a ready-to-download link instead of
+    // the idle "Download entire library" button.
+    useEffect(() => {
+        const libraryId = mine?.activeLibraryId;
+        if (!libraryId) return;
+        const stored = loadStoredDownloadState(libraryId);
+        if (!stored) return;
+        setDownloadJobId(stored.jobId);
+        setDownloadOutcome(stored.outcome);
+        setDownloadResult(stored.result);
+        setDownloadError(stored.error);
+    }, [mine?.activeLibraryId]);
+
+    // Keep that stored state in sync so it survives the next reload too.
+    useEffect(() => {
+        const libraryId = mine?.activeLibraryId;
+        if (!libraryId || downloadOutcome === 'idle') return;
+        const stored: StoredDownloadState = {
+            jobId: downloadJobId,
+            outcome: downloadOutcome,
+            result: downloadResult,
+            error: downloadError,
+        };
+        try {
+            window.localStorage.setItem(downloadStorageKey(libraryId), JSON.stringify(stored));
+        } catch {
+            // Best-effort only (e.g. storage quota/private browsing) -- losing
+            // persistence isn't worse than the pre-existing in-memory-only behavior.
+        }
+    }, [mine?.activeLibraryId, downloadJobId, downloadOutcome, downloadResult, downloadError]);
 
     // Poll for the "download entire library" export job while one is in flight.
     useEffect(() => {

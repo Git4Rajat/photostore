@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 import zipfile
 
 import pytest
@@ -160,6 +161,46 @@ def test_execute_library_download_heartbeats_job_status(env, monkeypatch):
     assert running_calls, 'expected at least one heartbeat write during the export'
     row = table.get_entity('jobs', app._job_row_key('job1'))
     assert row['status'] == 'running'
+
+
+def test_execute_library_download_uses_stored_not_deflated_compression(env):
+    """JPEG/HEIC/RAW are already entropy-coded -- DEFLATE just burns CPU for
+    near-zero size reduction on this content, competing with the network-bound
+    downloads for the same core. Verify parts are written uncompressed."""
+    _table, _queue, uploaded = env
+    app._execute_library_download('lib1', 'My Library')
+    zf = zipfile.ZipFile(io.BytesIO(uploaded['blobs']['lib1/library-export-part-1.zip']))
+    assert zf.infolist(), 'expected at least one file in the part'
+    for info in zf.infolist():
+        assert info.compress_type == zipfile.ZIP_STORED
+
+
+def test_execute_library_download_downloads_concurrently(env, monkeypatch):
+    """Downloads are pure I/O wait -- overlapping several at once instead of
+    strictly one-at-a-time is the main lever for real-world throughput.
+    Verify concurrency actually happens by timing N artificially slow
+    downloads against how long fully sequential processing would take."""
+    table, _queue, _uploaded = env
+    for i in range(16):
+        table.upsert_entity({'PartitionKey': 'lib1', 'RowKey': f'extra{i}.jpg', 'processing_state': 'done'})
+    # 18 candidates total (16 extras + photo1/photo2; photo3 stays deleted).
+    monkeypatch.setattr(app, 'LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY', 8)
+
+    def _slow_download(kind, name):
+        time.sleep(0.1)
+        return b'fake-image-bytes'
+
+    monkeypatch.setattr(app, 'download_media_bytes', _slow_download)
+
+    started = time.monotonic()
+    result = app._execute_library_download('lib1', 'My Library')
+    elapsed = time.monotonic() - started
+
+    assert result['photosIncluded'] == 18
+    # Sequential would take ~18 * 0.1s = 1.8s; 8-way concurrency should land
+    # near 18/8 * 0.1s ~= 0.25s. Generous bound to avoid flakiness while still
+    # catching a regression back to one-at-a-time downloads.
+    assert elapsed < 1.2, f'expected concurrent downloads to finish well under sequential time, took {elapsed:.2f}s'
 
 
 def test_execute_library_download_splits_into_size_capped_parts_and_cleans_up_stale_ones(env, monkeypatch):

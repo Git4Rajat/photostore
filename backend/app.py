@@ -385,12 +385,20 @@ BLOB_COVER_CONTAINER = os.getenv('BLOB_COVER_CONTAINER', 'covers').strip()
 # the current run's parts per library (stale extra parts from a shrinking
 # export are swept by _cleanup_stale_library_export_parts).
 BLOB_EXPORTS_CONTAINER = os.getenv('BLOB_EXPORTS_CONTAINER', 'library-exports').strip()
-# Each export "part" ZIP is capped at roughly this many bytes (measured via the
-# metadata table's own `size` field, not re-downloaded) before it's closed and
+# Each export "part" ZIP is capped at roughly this many bytes (measured from
+# each photo's actual downloaded size as it's added) before it's closed and
 # uploaded and a new part is started. Keeps very large libraries from
 # producing one impractically large ZIP, bounds peak temp-disk usage to one
 # part at a time, and gives natural progress checkpoints.
 LIBRARY_EXPORT_PART_MAX_BYTES = int(os.getenv('LIBRARY_EXPORT_PART_MAX_BYTES', str(2 * 1024 ** 3)))
+# How many photo downloads _execute_library_download runs concurrently.
+# Downloading is pure network I/O wait, so overlapping several at once
+# (rather than one full blob round-trip at a time) is a large, low-risk
+# throughput win -- results are still consumed in strict row order (see
+# _execute_library_download), so this changes nothing about ordering,
+# part boundaries, or resumability, only how much wall-clock time each
+# batch of downloads actually takes.
+LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY = int(os.getenv('LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY', '8'))
 # 'sas' hands the browser day-stable read SAS URLs pointing straight at blob
 # storage so media bytes never stream through this container; 'proxy' serves
 # every byte through the backend. 'sas' silently degrades to proxy URLs when
@@ -422,13 +430,24 @@ if PROCESSING_MODE not in ('browser', 'backend', 'both'):
 BROWSER_ONLY_PROCESSING = PROCESSING_MODE == 'browser'
 CLUSTERING_QUEUE_NAME = os.getenv('CLUSTERING_QUEUE_NAME', 'photostore-clustering')
 # receive_messages() with no visibility_timeout defaults to Azure's 30s -- a
-# full DBSCAN pass over a large library can exceed that, making Azure
-# redeliver the same message before run_clustering_worker's finally-block
-# delete runs, causing duplicate processing. A long window is safe only
-# because ownphotostore-worker runs maxReplicas=1 (there's only ever one
-# consumer, so this just prevents the worker from redelivering to itself);
-# revisit if the worker is ever scaled beyond 1 replica.
-CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS', '1800'))
+# full DBSCAN pass over a large library (or a multi-hour library_download
+# export) can exceed that, making Azure redeliver the same message before
+# run_clustering_worker's finally-block delete runs, causing duplicate
+# processing. This used to be a large fixed value (1800s) justified by
+# "only one consumer, so this just prevents self-redelivery" -- but live
+# maxReplicas is actually in the hundreds (KEDA queueLength-based scaling),
+# and a fixed long lease meant any scale-down that killed a replica
+# mid-job stranded its message, completely dead, for up to the rest of
+# that 1800s window regardless of how much work remained (confirmed live:
+# one scale-down cost ~12 minutes of zero progress on a library_download
+# export). Now short + actively renewed instead: run_clustering_worker
+# renews the lease via QueueClient.update_message() every
+# CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS while a message is being
+# processed, so a healthy worker's message never actually expires no
+# matter how long the job runs, while a killed worker's message becomes
+# reclaimable in at most this many seconds instead of up to 1800.
+CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS', '120'))
+CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS = int(os.getenv('CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS', '40'))
 IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
 # ipworker's job: thumbnail, exif, ocr, geo (map_detection), vision (ai_vision),
 # face -- the full set the browser can do client-side. Thumbnail used to be a
@@ -7379,47 +7398,64 @@ def _execute_library_download(library_id: str, library_name: str, job_id: Option
             result={'photosCompleted': rows_processed, 'photosTotal': photos_total},
         )
 
+    def _download_row(row: Dict) -> Tuple[str, Optional[bytes], Optional[Exception]]:
+        filename = str(row.get('RowKey') or '')
+        try:
+            blob_name = resolve_physical_blob_name(library_id, filename, 'image')
+            return filename, download_media_bytes('image', blob_name), None
+        except Exception as exc:
+            return filename, None, exc
+
     tmp = tempfile.NamedTemporaryFile(prefix='libexport-', suffix='.zip', delete=False)
     tmp_path = tmp.name
-    zip_file = zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED)
+    # ZIP_STORED, not ZIP_DEFLATED: JPEG/HEIC/RAW are already entropy-coded,
+    # so DEFLATE spends real CPU compressing this content for near-zero size
+    # reduction -- pure waste that would otherwise compete with the
+    # network-bound downloads below for the same core.
+    zip_file = zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_STORED)
     photos_in_part = 0
     part_bytes = 0
     try:
-        for row in candidate_rows[rows_processed:]:
-            filename = str(row.get('RowKey') or '')
-            try:
-                blob_name = resolve_physical_blob_name(library_id, filename, 'image')
-                data_bytes = download_media_bytes('image', blob_name)
-                zip_file.writestr(filename, data_bytes)
-                written_count += 1
-                photos_in_part += 1
-                part_bytes += len(data_bytes)
-            except Exception as exc:
-                skipped_count += 1
-                app.logger.warning('Skipping %s while building library export for %s: %s', filename, library_id, exc)
-            rows_processed += 1
-            is_last_row = rows_processed >= photos_total
+        # Bounded read-ahead: up to LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY blob
+        # downloads run concurrently (pure I/O wait, so this overlaps network
+        # round-trips instead of paying them one at a time), but
+        # executor.map() still yields results in submission order, so the
+        # zip's contents, the size-cap part boundaries, and the durable
+        # resume checkpoint below all stay exactly as deterministic as the
+        # fully sequential version this replaces.
+        with ThreadPoolExecutor(max_workers=LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY) as executor:
+            for filename, data_bytes, exc in executor.map(_download_row, candidate_rows[rows_processed:]):
+                if exc is not None:
+                    skipped_count += 1
+                    app.logger.warning('Skipping %s while building library export for %s: %s', filename, library_id, exc)
+                else:
+                    zip_file.writestr(filename, data_bytes)
+                    written_count += 1
+                    photos_in_part += 1
+                    part_bytes += len(data_bytes)
+                rows_processed += 1
+                is_last_row = rows_processed >= photos_total
 
-            if photos_in_part and (part_bytes >= LIBRARY_EXPORT_PART_MAX_BYTES or is_last_row):
-                zip_file.close()
-                tmp.close()
-                part_index += 1
-                part_size = os.path.getsize(tmp_path)
-                try:
-                    with open(tmp_path, 'rb') as fh:
-                        upload_file_to_blob(BLOB_EXPORTS_CONTAINER, _library_export_part_blob_name(library_id, part_index), fh, 'application/zip')
-                finally:
-                    _remove_file_quietly(tmp_path)
-                parts_summary.append({'partIndex': part_index, 'photosIncluded': photos_in_part, 'sizeBytes': part_size})
-                _durable_checkpoint()
-                if not is_last_row:
-                    tmp = tempfile.NamedTemporaryFile(prefix='libexport-', suffix='.zip', delete=False)
-                    tmp_path = tmp.name
-                    zip_file = zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED)
-                    photos_in_part = 0
-                    part_bytes = 0
-            elif rows_processed % 25 == 0:
-                _live_progress_heartbeat()
+                if photos_in_part and (part_bytes >= LIBRARY_EXPORT_PART_MAX_BYTES or is_last_row):
+                    zip_file.close()
+                    tmp.close()
+                    part_index += 1
+                    part_size = os.path.getsize(tmp_path)
+                    try:
+                        with open(tmp_path, 'rb') as fh:
+                            upload_file_to_blob(BLOB_EXPORTS_CONTAINER, _library_export_part_blob_name(library_id, part_index), fh, 'application/zip')
+                    finally:
+                        _remove_file_quietly(tmp_path)
+                    parts_summary.append({'partIndex': part_index, 'photosIncluded': photos_in_part, 'sizeBytes': part_size})
+                    _durable_checkpoint()
+                    if not is_last_row:
+                        tmp = tempfile.NamedTemporaryFile(prefix='libexport-', suffix='.zip', delete=False)
+                        tmp_path = tmp.name
+                        zip_file = zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_STORED)
+                        photos_in_part = 0
+                        part_bytes = 0
+                elif rows_processed % 25 == 0:
+                    _live_progress_heartbeat()
     except Exception:
         try:
             zip_file.close()
@@ -11162,7 +11198,13 @@ def upload_processing_pending():
     return jsonify({'pending': bounded, 'totalPending': len(pending)})
 
 
-def _claim_processing_lease_response(user_id: str, filename: str, lease_owner: str, steps: Optional[List[str]]) -> Tuple[Dict, int]:
+def _claim_processing_lease_response(
+    user_id: str,
+    filename: str,
+    lease_owner: str,
+    steps: Optional[List[str]],
+    client_blob_name: Optional[str] = None,
+) -> Tuple[Dict, int]:
     """Shared body of upload_processing_claim, also used per-item by the
     batch route below -- same lease semantics either way, just fewer HTTP
     round trips when claiming several photos at once."""
@@ -11179,8 +11221,19 @@ def _claim_processing_lease_response(user_id: str, filename: str, lease_owner: s
         'expiresAt': lease.get('leaseExpiresAt') or '',
     }
     try:
-        # Thumbnail upload must target the same physical (anonymous) blob as the image.
-        physical_name = _resolve_media_blob_name(user_id, filename)
+        # Thumbnail upload must target the same physical (anonymous) blob as the
+        # image. Prefer a validated client-echoed blobName (the caller's own
+        # /upload/init response, just like finalize's _validate_client_blob_name
+        # use) over re-deriving it from the shared (user, filename) metadata row:
+        # this claim call fires right after finalizeUploadedFile, and when several
+        # in-flight files share an original filename (e.g. many photos named
+        # "IMG_8771.jpeg" from different devices merged into one library), the row
+        # lookup can return whichever same-named file's row state landed last --
+        # not necessarily this one -- so the direct thumbnail PUT below would
+        # silently overwrite a different, already-correct photo's thumbnail blob
+        # (the image itself is untouched since that upload path already uses the
+        # client-echoed blobName; only this thumbnail-claim path still had the gap).
+        physical_name = _validate_client_blob_name(client_blob_name) or _resolve_media_blob_name(user_id, filename)
         thumbnail_url, thumbnail_expires_at = _create_direct_thumbnail_upload_blob_url(physical_name)
         response['thumbnailUploadUrl'] = thumbnail_url
         response['thumbnailUploadExpiresAt'] = thumbnail_expires_at
@@ -11204,7 +11257,7 @@ def upload_processing_claim():
     lease_owner = str(data.get('leaseId') or data.get('ownerId') or f'browser-{uuid.uuid4()}').strip()
     requested_steps = data.get('steps')
     steps = [str(step or '').strip() for step in requested_steps] if isinstance(requested_steps, list) else None
-    response, status = _claim_processing_lease_response(user_id, filename, lease_owner, steps)
+    response, status = _claim_processing_lease_response(user_id, filename, lease_owner, steps, data.get('blobName'))
     return jsonify(response), status
 
 
@@ -11249,7 +11302,7 @@ def upload_processing_claim_batch():
         lease_owner = str(raw_item.get('leaseId') or raw_item.get('ownerId') or f'browser-{uuid.uuid4()}').strip()
         requested_steps = raw_item.get('steps')
         steps = [str(step or '').strip() for step in requested_steps] if isinstance(requested_steps, list) else None
-        response, _status = _claim_processing_lease_response(user_id, filename, lease_owner, steps)
+        response, _status = _claim_processing_lease_response(user_id, filename, lease_owner, steps, raw_item.get('blobName'))
         results.append({'filename': filename, **response})
 
     return jsonify({'results': results})
@@ -13640,6 +13693,36 @@ def run_clustering_worker() -> None:
                 job_id = ''
                 user_id = ''
                 job_type = ''
+
+                # Keep this message's lease alive for as long as we're actively
+                # working it, no matter how long that takes -- see
+                # CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS's comment above.
+                # update_message() returns a new message object with a fresh
+                # pop receipt each time, which the eventual delete_message
+                # must use -- hence the lock-guarded holder rather than
+                # reusing the original `message` variable directly.
+                message_holder = [message]
+                message_lock = threading.Lock()
+                stop_renewal = threading.Event()
+
+                def _renew_lease() -> None:
+                    while not stop_renewal.wait(CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS):
+                        try:
+                            with message_lock:
+                                current = message_holder[0]
+                            renewed = queue_client.update_message(
+                                current, visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
+                            )
+                            with message_lock:
+                                message_holder[0] = renewed
+                        except Exception:
+                            # Transient renewal failures shouldn't abort the job --
+                            # if the message is genuinely gone the next attempt just
+                            # fails harmlessly again until stop_renewal is set below.
+                            worker_logger.exception('Failed to renew clustering queue message lease')
+
+                renewal_thread = threading.Thread(target=_renew_lease, daemon=True)
+                renewal_thread.start()
                 try:
                     payload = json.loads(message.content or '{}')
                     if isinstance(payload, dict):
@@ -13655,8 +13738,12 @@ def run_clustering_worker() -> None:
                             pass
                     worker_logger.exception('Failed to process clustering queue message')
                 finally:
+                    stop_renewal.set()
+                    renewal_thread.join(timeout=5)
+                    with message_lock:
+                        final_message = message_holder[0]
                     try:
-                        queue_client.delete_message(message)
+                        queue_client.delete_message(final_message)
                     except Exception:
                         worker_logger.exception('Failed to delete clustering queue message')
             if not processed_any:

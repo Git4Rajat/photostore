@@ -680,13 +680,21 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'worker' }
             { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
-            // receive_messages() with no visibility_timeout defaults to
-            // Azure's 30s -- a full DBSCAN pass over a large library can
-            // exceed that, causing Azure to redeliver the same message
-            // before the finally-block delete runs (duplicate processing).
-            // Long window is safe only because this app is maxReplicas=1
-            // (only ever one consumer, so this just prevents self-redelivery).
-            { name: 'CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS', value: '1800' }
+            // Short lease, actively renewed by run_clustering_worker every
+            // CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS via update_message()
+            // while a message is being processed -- NOT a fixed 1800s
+            // upfront lease anymore. That used to be justified by "only one
+            // consumer, no renewal needed", but live scale is actually
+            // hundreds of replicas under KEDA queueLength-based autoscaling,
+            // and a fixed long lease meant any scale-down that killed a
+            // replica mid-job (confirmed live on a library_download export)
+            // stranded its message, completely dead, for up to the rest of
+            // that 1800s window. Short + renewed means a healthy worker's
+            // message never actually expires no matter how long the job
+            // runs, while a killed worker's message becomes reclaimable in
+            // at most this many seconds.
+            { name: 'CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS', value: '120' }
+            { name: 'CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS', value: '40' }
             // The worker sends the "cleanup complete" email once a library_clean
             // job finishes; without this it silently no-ops (is_configured()
             // false) since ACS_CONNECTION_STRING lived only on the backend's env.
@@ -774,9 +782,12 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
             // + tesseract OCR in sequence) can exceed -- see
             // IPWORKER_VISIBILITY_TIMEOUT_SECONDS in backend/app.py for why this
-            // matches IPWORKER_LEASE_SECONDS rather than copying the clustering
-            // worker's much longer window (that one is safe at 1800s only
-            // because it's maxReplicas=1; this app is maxReplicas=4).
+            // matches IPWORKER_LEASE_SECONDS. Unlike the clustering worker (which
+            // now actively renews its lease via update_message() -- see
+            // CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS above -- so its base
+            // timeout can be short regardless of job length), ipworker has no
+            // renewal, so this value has to be a fixed upper bound on how long
+            // one message's processing can legitimately take.
             { name: 'IPWORKER_VISIBILITY_TIMEOUT_SECONDS', value: '300' }
             // Default (20s, see backend/app.py) is tuned for interactive
             // backend requests. A single ipwork pass takes ~60-90s, so at the
