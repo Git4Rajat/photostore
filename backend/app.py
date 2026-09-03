@@ -129,6 +129,19 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(name)s %(message)s',
     force=True,
 )
+# The azure-sdk HTTP pipeline logs a full request/response dump (URL, every
+# header, one log line each) at INFO on every single blob/table/queue call --
+# previously invisible because the root logger defaulted to WARNING, so this
+# fix's INFO level silently turned it on everywhere (backend/worker/ipworker
+# all share this module). A job doing thousands of SDK calls back-to-back
+# (e.g. _execute_library_download's per-file blob downloads and per-block ZIP
+# part uploads) was found live generating tens of thousands of these lines in
+# minutes -- real, unrelated resource pressure on top of the job's own work.
+# Setting the level on the shared 'azure' parent logger (not each per-role
+# basicConfig call above/below) survives every basicConfig(force=True) call
+# in this module, since force=True only resets the root logger's handlers,
+# not another logger's already-set level.
+logging.getLogger('azure').setLevel(logging.WARNING)
 app = Flask(__name__)
 # Belt-and-suspenders alongside the basicConfig(force=True) above: Flask's
 # own app.logger can carry an independent level/handler (attached lazily by
