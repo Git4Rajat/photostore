@@ -1116,6 +1116,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clientProcessingReport?: unknown;
         clientAssetId?: string;
         blobName?: string;
+        clientLastModified?: number;
         resolve: (value: any) => void;
         reject: (err: unknown) => void;
     }>>([]);
@@ -1972,8 +1973,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchFinalizeRef.current;
         pendingBatchFinalizeRef.current = [];
         runGatedRequestWithRetry(gate, '/upload/finalize-batch', {
-            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName }) => ({
-                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName,
+            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified }) => ({
+                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified,
             })),
         })
             .then((response) => {
@@ -2002,6 +2003,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clientProcessingReport?: unknown;
         clientAssetId?: string;
         blobName?: string;
+        clientLastModified?: number;
     }): Promise<any> => (
         new Promise((resolve, reject) => {
             // Same same-filename guard as requestBatchedInit -- two entries
@@ -3137,6 +3139,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         // known-correct blobName sidesteps the shared row
                         // entirely instead of trying to make the race safe.
                         blobName: fileMeta.blobName,
+                        // Best-effort capture-date fallback for photos with no EXIF
+                        // (e.g. downloaded from the web): the device's own file
+                        // modified time, which on most pickers approximates when the
+                        // photo was added to the user's library rather than "now".
+                        clientLastModified: file.lastModified,
                     });
                     const skippedDuplicate = Array.isArray(completeResponse?.duplicates) && completeResponse.duplicates.length > 0;
 

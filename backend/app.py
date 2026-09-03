@@ -39,6 +39,7 @@ from ordering_utils import (
     order_photo_entries,
     metadata_capture_datetime,
     metadata_upload_datetime,
+    epoch_millis_to_iso,
 )
 from timeline_metadata import build_timeline_summary
 from image_utils import (
@@ -1283,31 +1284,6 @@ def _parse_iso_date(value: str) -> Optional[datetime]:
         return None
 
 
-def _parse_capture_date(exif_data: Dict[str, str]) -> Optional[datetime]:
-    if not exif_data:
-        return None
-    raw = (
-        exif_data.get('DateTimeOriginal')
-        or exif_data.get('DateTime')
-        or exif_data.get('CreateDate')
-        or exif_data.get('MediaCreateDate')
-        or exif_data.get('TrackCreateDate')
-        or ''
-    )
-    if not raw:
-        return None
-    # exiftool video dates may carry a timezone offset (e.g. 2024:01:02 10:00:00+05:30).
-    for fmt in ('%Y:%m:%d %H:%M:%S', '%Y:%m:%d %H:%M:%S%z'):
-        try:
-            parsed = datetime.strptime(raw[:26], fmt)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed
-        except Exception:
-            continue
-    return None
-
-
 def _parse_capture_filter(value: str) -> Optional[datetime]:
     if not value:
         return None
@@ -1611,10 +1587,11 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         thumbnail_rotation = _normalize_rotation(client_thumbnail.get('rotationDegrees', 0))
 
     # Dates the gallery sorts and groups by. captureDate follows the documented
-    # fallback rule (EXIF capture time, else upload time) so every photo has a
-    # chronology anchor even without EXIF.
+    # fallback rule (EXIF capture time, else the uploading device's own file-
+    # modified time, else upload time -- see metadata_capture_datetime) so
+    # every photo has a chronology anchor even without EXIF.
     upload_dt = metadata_upload_datetime(metadata)
-    capture_dt = _parse_capture_date(exif_data) or upload_dt
+    capture_dt = metadata_capture_datetime(metadata)
 
     media_urls = _private_photo_media_urls(filename, metadata)
     return {
@@ -10283,6 +10260,9 @@ def finalize_direct_upload():
         finalize_updates: Dict[str, object] = {'size': total_size}
         if account_id:
             finalize_updates['uploadedBy'] = account_id
+        client_last_modified_iso = epoch_millis_to_iso(data.get('clientLastModified'))
+        if client_last_modified_iso:
+            finalize_updates['clientLastModified'] = client_last_modified_iso
         _update_metadata_entity_fields(user_id, final_name, finalize_updates)
     except Exception:
         app.logger.debug('Could not stamp finalize metadata for %s', final_name)
@@ -10444,6 +10424,9 @@ def finalize_upload_batch():
             finalize_updates: Dict[str, object] = {'size': total_size}
             if account_id:
                 finalize_updates['uploadedBy'] = account_id
+            client_last_modified_iso = epoch_millis_to_iso(item.get('clientLastModified'))
+            if client_last_modified_iso:
+                finalize_updates['clientLastModified'] = client_last_modified_iso
             _update_metadata_entity_fields(user_id, final_name, finalize_updates)
         except Exception:
             app.logger.debug('Could not stamp finalize metadata for %s', final_name)

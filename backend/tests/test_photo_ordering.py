@@ -143,3 +143,39 @@ def test_capture_parser_supports_fractional_no_timezone_format():
     }
     ordered = ordering_utils.order_photo_entries(list(dataset.keys()), dataset, 'capture')
     assert ordered == ['newer.jpg', 'older.jpg']
+
+
+def test_capture_falls_back_to_client_last_modified_before_upload_date():
+    # A photo downloaded from the web has no EXIF capture date, but the
+    # browser's File.lastModified (persisted at finalize as clientLastModified)
+    # is a better proxy for "where it sat in the user's library" than the
+    # upload instant -- it must outrank uploadDate in the fallback chain.
+    dataset = {
+        'downloaded.jpg': {
+            'uploadDate': '2026-01-05T09:00:00+00:00',
+            'clientLastModified': '2019-06-01T12:00:00+00:00',
+        },
+        'freshly_taken.jpg': {
+            'uploadDate': '2026-01-05T09:00:00+00:00',
+            'exifData': _exif('2026:01:04 08:00:00'),
+        },
+    }
+    ordered = ordering_utils.order_photo_entries(list(dataset.keys()), dataset, 'capture')
+    # Real EXIF still outranks clientLastModified.
+    assert ordered == ['freshly_taken.jpg', 'downloaded.jpg']
+    assert ordering_utils.metadata_capture_datetime(dataset['downloaded.jpg']).year == 2019
+
+
+def test_client_last_modified_ignored_when_missing_or_invalid():
+    for row in ({}, {'clientLastModified': ''}, {'clientLastModified': 'not-a-date'}):
+        row_with_upload = {**row, 'uploadDate': '2026-01-05T09:00:00+00:00'}
+        assert ordering_utils.metadata_capture_datetime(row_with_upload).year == 2026
+
+
+def test_epoch_millis_to_iso():
+    assert ordering_utils.epoch_millis_to_iso(1717200000000).startswith('2024-06-01')
+    assert ordering_utils.epoch_millis_to_iso(None) is None
+    assert ordering_utils.epoch_millis_to_iso('') is None
+    assert ordering_utils.epoch_millis_to_iso('not-a-number') is None
+    assert ordering_utils.epoch_millis_to_iso(0) is None
+    assert ordering_utils.epoch_millis_to_iso(-1000) is None

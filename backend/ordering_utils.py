@@ -37,6 +37,21 @@ def parse_iso_date(value: str) -> Optional[datetime]:
         return None
 
 
+def epoch_millis_to_iso(value: object) -> Optional[str]:
+    """Convert a client-supplied epoch-millisecond timestamp (JS ``File.lastModified``)
+    into an ISO string for storage, or None if missing/invalid."""
+    try:
+        millis = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if millis <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(millis / 1000, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _exif_dict(metadata: Dict) -> Dict[str, str]:
     """Return the parsed EXIF map for a metadata row.
 
@@ -117,13 +132,34 @@ def metadata_upload_datetime(metadata: Dict) -> Optional[datetime]:
     )
 
 
+def metadata_client_last_modified_datetime(metadata: Dict) -> Optional[datetime]:
+    """Return the uploading device's own file-modified time, if the client sent one.
+
+    Populated at finalize from the browser File API's ``lastModified`` (see
+    ``epoch_millis_to_iso``). For a photo with no EXIF -- e.g. downloaded from
+    the web, where the capture date was never embedded in the first place --
+    this is a best-effort proxy for "when this photo was added to the user's
+    library" on the device it was uploaded from, which reads as more
+    meaningful gallery position than the upload instant. Reliability varies by
+    OS/export path (some desktop download flows just stamp it with download
+    time), so it is a fallback tier, not a substitute for real EXIF.
+    """
+    return parse_iso_date(str(metadata.get('clientLastModified') or ''))
+
+
 def metadata_capture_datetime(metadata: Dict) -> Optional[datetime]:
     """Return the capture time, falling back to the upload time.
 
     Implements the product rule "if a photo has no capture date, use its upload
-    date as the capture date". Returns None only when neither is known.
+    date as the capture date", with the client's own file-modified time as an
+    intermediate fallback (see ``metadata_client_last_modified_datetime``).
+    Returns None only when none of the three is known.
     """
-    return parse_capture_date(_exif_dict(metadata)) or metadata_upload_datetime(metadata)
+    return (
+        parse_capture_date(_exif_dict(metadata))
+        or metadata_client_last_modified_datetime(metadata)
+        or metadata_upload_datetime(metadata)
+    )
 
 
 def order_photo_entries(
