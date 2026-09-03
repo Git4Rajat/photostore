@@ -2958,7 +2958,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             const parallelThumbnailTasks = new Set<Promise<void>>();
 
-            const kickOffThumbnailForFile = (file: File, filename: string) => {
+            const kickOffThumbnailForFile = (file: File, filename: string, blobName?: string) => {
                 if (getRuntimeConfig().processingMode === 'backend') {
                     // ipworker owns thumbnails entirely in this mode (queued
                     // automatically by the upload finalize call, same as its
@@ -2970,7 +2970,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 const task: Promise<void> = (async () => {
                     let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null = null;
                     try {
-                        claim = await runGatedProcessingCall(() => post('/upload/processing/claim', { filename, steps: ['thumbnail'] }));
+                        // blobName: the blob THIS file's bytes actually landed on
+                        // (from its own /upload/init response), echoed the same way
+                        // finalize does -- see the matching comment there. Without
+                        // it, the backend re-derives the thumbnail-upload blob from
+                        // the shared (user, filename) row, which a same-named file
+                        // uploaded around the same time can have already moved on,
+                        // pointing this direct thumbnail PUT at a different photo's
+                        // (already correct) thumbnail blob and silently corrupting it.
+                        claim = await runGatedProcessingCall(() => post('/upload/processing/claim', { filename, steps: ['thumbnail'], blobName }));
                     } catch {
                         return;
                     }
@@ -3159,7 +3167,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     });
                     if (!skippedDuplicate) {
                         freshlyUploadedFilenamesRef.current.add(fileMeta.name);
-                        kickOffThumbnailForFile(file, fileMeta.name);
+                        kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
                     }
                     uploadSourceFilesRef.current.delete(fileMeta.key);
                     await idbDelete(fileMeta.key);
