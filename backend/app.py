@@ -2448,6 +2448,17 @@ def _mark_clustering_job_rerun_requested(job_id: str) -> None:
 # kept ownphotostore-worker alive continuously during a sustained backfill.
 PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS = int(os.getenv('PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', '1800'))
 
+# Caps how many maintenance passes can auto-fire back-to-back (each still
+# individually cooldown-gated above) without a genuinely fresh upload in
+# between. The cooldown alone only bounds *frequency* -- it doesn't stop an
+# indefinite drip of non-upload triggers (the ipwork sweep recovering old
+# stuck/stale-face-version photos, client-processing resubmissions after a
+# rotation, coalesced reruns) from re-arming this full ~9000+-face DBSCAN
+# pass every 30 minutes forever, even when the user hasn't uploaded anything
+# in weeks -- pure wasted worker compute. Once the cap is hit, maintenance
+# stays paused until _mark_fresh_upload_activity resets the counter.
+PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD = int(os.getenv('PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD', '3'))
+
 
 def _clustering_maintenance_due(user_id: str) -> bool:
     """Atomic cooldown check + claim in one round trip (create-then-
@@ -2477,6 +2488,7 @@ def _clustering_maintenance_due(user_id: str) -> bool:
         'RowKey': user_id,
         'lastStartedAt': now_iso,
         'updatedAt': now_iso,
+        'runsSinceUpload': 1,
     }
     try:
         metadata_table_client.create_entity(dict(claim_row))
@@ -2497,12 +2509,56 @@ def _clustering_maintenance_due(user_id: str) -> bool:
         return False
 
     try:
+        runs_since_upload = int(existing.get('runsSinceUpload') or 0)
+    except Exception:
+        runs_since_upload = 0
+    if runs_since_upload >= PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD:
+        return False
+    claim_row['runsSinceUpload'] = runs_since_upload + 1
+
+    try:
         metadata_table_client.update_entity(
             claim_row, etag=existing.metadata['etag'], match_condition=MatchConditions.IfNotModified,
         )
         return True
     except Exception:
         return False  # lost the race to claim the next window
+
+
+def _mark_fresh_upload_activity(user_id: str) -> None:
+    """Resets the PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD counter
+    on a genuinely fresh upload -- called only from /upload/finalize and
+    /upload/finalize-batch, not from client-processing resubmissions or the
+    ipwork sweep's recovery of old stuck photos, so those non-upload triggers
+    can't extend the maintenance-pass budget. Deliberately leaves
+    lastStartedAt untouched: this only affects the run-count cap, not the
+    per-pass cooldown timer, so an upload can't force an early recluster.
+
+    Reads the existing row (if any) and writes every field back rather than
+    upserting just {runsSinceUpload: 0} -- upsert_entity's merge-vs-replace
+    behavior shouldn't be relied on here (a blind partial upsert would risk
+    wiping lastStartedAt/updatedAt entirely under replace semantics). No
+    etag/conditional-update needed despite the read-then-write shape: unlike
+    _clustering_maintenance_due's claim, concurrent resets all want the same
+    outcome (runsSinceUpload=0, lastStartedAt unchanged), so there's no
+    lost-update case to guard against; the worst a race with a concurrent
+    claim above can do is make this cycle's maintenance pass skip once,
+    which is harmless.
+    """
+    if metadata_table_client is None:
+        return
+    try:
+        existing = metadata_table_client.get_entity('clustering_maintenance', user_id)
+    except Exception:
+        existing = None
+    row = dict(existing) if isinstance(existing, dict) else {}
+    row['PartitionKey'] = 'clustering_maintenance'
+    row['RowKey'] = user_id
+    row['runsSinceUpload'] = 0
+    try:
+        metadata_table_client.upsert_entity(row)
+    except Exception:
+        app.logger.exception('Failed to reset clustering maintenance run counter for %s', user_id)
 
 
 def _enqueue_clustering_job(
@@ -10648,6 +10704,10 @@ def finalize_direct_upload():
     except Exception:
         app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
     try:
+        _mark_fresh_upload_activity(user_id)
+    except Exception:
+        app.logger.exception('Failed to record fresh upload activity for %s', user_id)
+    try:
         _queue_people_clustering_after_face_processing(user_id, final_name, metadata)
     except Exception:
         app.logger.exception('Failed to auto-queue clustering for %s', final_name)
@@ -10703,6 +10763,11 @@ def finalize_upload_batch():
         return jsonify({'error': 'files must be a non-empty list'}), 400
     if len(files) > MAX_INIT_BATCH_FILES:
         return jsonify({'error': f'Batch too large (max {MAX_INIT_BATCH_FILES} files)'}), 400
+
+    try:
+        _mark_fresh_upload_activity(user_id)
+    except Exception:
+        app.logger.exception('Failed to record fresh upload activity for %s', user_id)
 
     # Summed across every file in the batch, then logged once at the end
     # (instead of once per file) so a large batch under concurrent load

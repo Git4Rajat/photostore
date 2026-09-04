@@ -150,6 +150,86 @@ def test_burst_of_concurrent_callers_after_cooldown_elapsed_only_one_wins(metada
     assert results == [True] + [False] * 8
 
 
+def _make_due_after_cooldown(metadata_table, user_id: str, runs_since_upload: int) -> None:
+    stale = datetime.now(timezone.utc) - timedelta(seconds=app.PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS + 60)
+    metadata_table.upsert_entity({
+        'PartitionKey': 'clustering_maintenance', 'RowKey': user_id,
+        'lastStartedAt': stale.isoformat(), 'updatedAt': stale.isoformat(),
+        'runsSinceUpload': runs_since_upload,
+    })
+
+
+def test_maintenance_pauses_once_run_cap_hit_without_a_fresh_upload(metadata_table):
+    """Regression test for a real cost concern (2026-09-04): with only a time
+    cooldown, a non-upload drip (ipwork sweep recovering stale photos,
+    client-processing resubmissions, coalesced reruns) can re-arm the full
+    ~9000+-face DBSCAN pass every 30 minutes forever, even weeks after the
+    user's last real upload. Once PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD
+    passes have fired back-to-back with no fresh upload in between, further
+    triggers must stop being granted regardless of how stale lastStartedAt is."""
+    _make_due_after_cooldown(metadata_table, 'lib-A', app.PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD)
+
+    assert app._clustering_maintenance_due('lib-A') is False
+
+
+def test_maintenance_still_fires_at_exactly_the_cap_boundary(metadata_table):
+    _make_due_after_cooldown(metadata_table, 'lib-A', app.PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD - 1)
+
+    assert app._clustering_maintenance_due('lib-A') is True
+    row = metadata_table.get_entity('clustering_maintenance', 'lib-A')
+    assert row['runsSinceUpload'] == app.PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD
+
+
+def test_fresh_upload_reset_does_not_bypass_the_separate_cooldown_timer(metadata_table):
+    """The run-cap reset and the per-pass cooldown are two independent
+    gates -- resetting one must not short-circuit the other. Set up a
+    *recent* lastStartedAt (still within the cooldown window) alongside a
+    capped counter, reset the counter, and confirm the cooldown alone still
+    blocks the next pass."""
+    recent = datetime.now(timezone.utc).isoformat()
+    metadata_table.upsert_entity({
+        'PartitionKey': 'clustering_maintenance', 'RowKey': 'lib-A',
+        'lastStartedAt': recent, 'updatedAt': recent,
+        'runsSinceUpload': app.PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD,
+    })
+    assert app._clustering_maintenance_due('lib-A') is False  # capped
+
+    app._mark_fresh_upload_activity('lib-A')
+
+    # Cooldown alone (lastStartedAt is still recent) must keep this blocked,
+    # independent of the counter having been reset.
+    assert app._clustering_maintenance_due('lib-A') is False
+    row = metadata_table.get_entity('clustering_maintenance', 'lib-A')
+    assert row['runsSinceUpload'] == 0
+    assert row['lastStartedAt'] == recent  # reset must not touch the cooldown timer
+
+
+def test_fresh_upload_reset_lets_maintenance_resume_once_cooldown_also_elapses(metadata_table):
+    stale = datetime.now(timezone.utc) - timedelta(seconds=app.PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS + 60)
+    metadata_table.upsert_entity({
+        'PartitionKey': 'clustering_maintenance', 'RowKey': 'lib-A',
+        'lastStartedAt': stale.isoformat(), 'updatedAt': stale.isoformat(),
+        'runsSinceUpload': app.PEOPLE_CLUSTER_MAX_MAINTENANCE_RUNS_WITHOUT_UPLOAD,
+    })
+    assert app._clustering_maintenance_due('lib-A') is False  # capped
+
+    app._mark_fresh_upload_activity('lib-A')
+
+    # lastStartedAt from the setup above is already outside the cooldown
+    # window, and the cap is now reset -- a genuinely fresh upload should be
+    # able to earn the library a maintenance pass again.
+    assert app._clustering_maintenance_due('lib-A') is True
+
+
+def test_reset_does_not_touch_a_nonexistent_row(metadata_table):
+    """A user with no maintenance row yet (never had a maintenance pass)
+    uploading for the first time must not error or create a broken partial
+    row -- _clustering_maintenance_due's own create_entity path still owns
+    first-row creation."""
+    app._mark_fresh_upload_activity('lib-fresh')
+    assert app._clustering_maintenance_due('lib-fresh') is True
+
+
 def test_cooldown_is_per_user(metadata_table):
     """A different user's cooldown state must not gate this one -- the row is
     keyed by RowKey=user_id specifically so this can't regress into the same
