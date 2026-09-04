@@ -7862,15 +7862,22 @@ def library_download_status():
 LIBRARY_EXPORT_MANIFEST_PAGE_SIZE = int(os.getenv('LIBRARY_EXPORT_MANIFEST_PAGE_SIZE', '500'))
 
 
-def _encode_export_manifest_cursor(token: Optional[str]) -> Optional[str]:
+def _encode_export_manifest_cursor(token: Optional[Dict]) -> Optional[str]:
+    # azure-data-tables' continuation_token is a {'PartitionKey', 'RowKey'}
+    # dict, not the plain string azure.core.paging.PageIterator's own type
+    # hint implies (confirmed live 2026-09-05: a bare token.encode() 500'd
+    # every request with "'dict' object has no attribute 'encode'") -- JSON
+    # round-trip it before base64ing so the opaque cursor stays a single
+    # string for the client to carry in a query param.
     if not token:
         return None
-    return base64.urlsafe_b64encode(token.encode('utf-8')).decode('ascii')
+    return base64.urlsafe_b64encode(json.dumps(token).encode('utf-8')).decode('ascii')
 
 
-def _decode_export_manifest_cursor(cursor: str) -> Optional[str]:
+def _decode_export_manifest_cursor(cursor: str) -> Optional[Dict]:
     try:
-        return base64.urlsafe_b64decode(cursor.encode('ascii')).decode('utf-8')
+        token = json.loads(base64.urlsafe_b64decode(cursor.encode('ascii')).decode('utf-8'))
+        return token if isinstance(token, dict) else None
     except Exception:
         return None
 

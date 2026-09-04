@@ -13,8 +13,16 @@ import app
 
 
 class _FakePager:
-    """Mimics azure.core.paging.PageIterator closely enough for this endpoint:
-    one page per next(pager) call, continuation_token reflects what's left."""
+    """Mimics azure.data.tables' TableEntityPropertiesPaged closely enough for
+    this endpoint: one page per next(pager) call, continuation_token reflects
+    what's left. Critically, the real SDK's continuation_token is a
+    {'PartitionKey', 'RowKey'} DICT, not the plain string
+    azure.core.paging.PageIterator's own type hint implies -- an earlier
+    version of this fake used a bare stringified index here, which let
+    _encode_export_manifest_cursor's real bug (calling .encode() on what's
+    actually a dict) ship straight to photostore-test without this suite
+    catching it. Encode the fake index inside the same dict shape so a
+    regression back to assuming a string round-trips would fail here again."""
 
     def __init__(self, rows, page_size, continuation_token=None):
         self._rows = rows
@@ -29,10 +37,10 @@ class _FakePager:
         if self._called and self.continuation_token is None:
             raise StopIteration
         self._called = True
-        start = int(self.continuation_token or 0)
+        start = int((self.continuation_token or {}).get('RowKey') or 0)
         end = start + self._page_size
         page = self._rows[start:end]
-        self.continuation_token = str(end) if end < len(self._rows) else None
+        self.continuation_token = {'PartitionKey': 'fake', 'RowKey': str(end)} if end < len(self._rows) else None
         return iter(page)
 
     next = __next__

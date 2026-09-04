@@ -418,14 +418,20 @@ const LibraryPage: React.FC = () => {
                             </>
                         ) : exportOutcome === 'done' ? (
                             <>
-                                <p className="status success">
-                                    Done — {exportProgress?.filesSaved ?? 0} file(s) saved to your downloads.
-                                    {(exportProgress?.errors.length ?? 0) > 0
-                                        ? ` ${exportProgress!.errors.length} file(s) could not be downloaded.`
-                                        : ''}
-                                </p>
+                                {exportProgress?.fatalError ? (
+                                    <p className="status error">
+                                        Stopped before finishing — {exportProgress.fatalError} {exportProgress.filesSaved} file(s) were saved before that happened.
+                                    </p>
+                                ) : (
+                                    <p className="status success">
+                                        Done — {exportProgress?.filesSaved ?? 0} file(s) saved to your downloads.
+                                        {(exportProgress?.errors.length ?? 0) > 0
+                                            ? ` ${exportProgress!.errors.length} file(s) could not be downloaded.`
+                                            : ''}
+                                    </p>
+                                )}
                                 <button type="button" className="btn btn-soft" disabled={busy} onClick={handleStartExport}>
-                                    Download again
+                                    {exportProgress?.fatalError ? 'Try again' : 'Download again'}
                                 </button>
                             </>
                         ) : (
