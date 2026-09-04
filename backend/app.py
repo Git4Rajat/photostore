@@ -3367,38 +3367,70 @@ def _split_cluster_by_max_pair_distance(indices: List[int], dist_matrix, max_dis
     if len(indices) <= 1:
         return [list(indices)]
 
+    import numpy as np
+
     threshold = max(0.0, float(max_distance))
-    remaining = list(indices)
+    remaining = np.asarray(indices, dtype=np.int64)
     split_clusters: List[List[int]] = []
 
-    while remaining:
-        seed = min(
-            remaining,
-            key=lambda idx: (
-                sum(float(dist_matrix[idx, other]) for other in remaining if other != idx),
-                idx,
-            ),
-        )
+    while remaining.size:
+        # Seed = point with the smallest total distance to everything else
+        # still unclustered. Vectorized: was an O(M^2) Python-level loop
+        # (sum() over a generator per candidate, for every candidate) --
+        # cheap at a few hundred faces, but every sub-cluster formed pays
+        # this cost, so it compounds badly once a library's largest DBSCAN
+        # cluster reaches the thousands.
+        sub = dist_matrix[np.ix_(remaining, remaining)]
+        seed_pos = int(np.argmin(sub.sum(axis=1)))
+        seed = int(remaining[seed_pos])
         cluster = [seed]
-        remaining.remove(seed)
+        remaining = np.delete(remaining, seed_pos)
 
-        while remaining:
-            candidates = []
-            for idx in remaining:
-                candidate_cluster = [*cluster, idx]
-                max_pair_distance = max(
-                    float(dist_matrix[left, right])
-                    for pos, left in enumerate(candidate_cluster)
-                    for right in candidate_cluster[pos + 1:]
-                )
-                if max_pair_distance <= threshold:
-                    distances_to_cluster = [float(dist_matrix[idx, member]) for member in cluster]
-                    candidates.append((max_pair_distance, sum(distances_to_cluster), idx))
-            if not candidates:
+        # dist_to_cluster[i] / max_dist_to_cluster[i] are running aggregates
+        # of dist_matrix[remaining[i], member] over members already accepted
+        # into `cluster`, updated incrementally as one member is added per
+        # inner-loop step. This replaces recomputing every pairwise distance
+        # in the growing candidate_cluster from scratch on every candidate
+        # check -- that used to be O(cluster_size^2) work per candidate,
+        # repeated for every remaining candidate, every step, which made the
+        # whole function roughly O(cluster_size^3): fine for the few hundred
+        # faces this was calibrated against, but an effective multi-hour
+        # hang once one person's cluster grew into the low thousands (a real
+        # 2026-09-04 incident: a single clustering job pegged a worker's CPU
+        # at 100% for 7+ hours, masked from the 15-minute stale-job sweep by
+        # the heartbeat added the same day, once this account's face count
+        # reached ~15k). The candidate_cluster's max pairwise distance is
+        # exactly max(cluster's existing diameter, max distance from the
+        # candidate to each existing member) since every accepted member
+        # already satisfies the threshold against the rest of the cluster by
+        # construction -- no need to ever recheck pairs already in `cluster`.
+        cluster_diam = 0.0
+        if remaining.size:
+            dist_to_cluster = dist_matrix[seed, remaining].astype(np.float64)
+            max_dist_to_cluster = dist_to_cluster.copy()
+
+        while remaining.size:
+            candidate_diam = np.maximum(max_dist_to_cluster, cluster_diam)
+            ok = candidate_diam <= threshold
+            if not np.any(ok):
                 break
-            _, _, next_idx = min(candidates)
+            ok_idx = np.nonzero(ok)[0]
+            # Same tie-break as the original: smallest resulting diameter,
+            # then smallest summed distance to the cluster, then smallest
+            # index. np.lexsort's last key is primary.
+            order = np.lexsort((remaining[ok_idx], dist_to_cluster[ok_idx], candidate_diam[ok_idx]))
+            chosen_pos = int(ok_idx[order[0]])
+            next_idx = int(remaining[chosen_pos])
+            cluster_diam = float(candidate_diam[chosen_pos])
             cluster.append(next_idx)
-            remaining.remove(next_idx)
+
+            remaining = np.delete(remaining, chosen_pos)
+            dist_to_cluster = np.delete(dist_to_cluster, chosen_pos)
+            max_dist_to_cluster = np.delete(max_dist_to_cluster, chosen_pos)
+            if remaining.size:
+                new_dists = dist_matrix[next_idx, remaining].astype(np.float64)
+                dist_to_cluster = dist_to_cluster + new_dists
+                max_dist_to_cluster = np.maximum(max_dist_to_cluster, new_dists)
 
         split_clusters.append(sorted(cluster))
 
@@ -7816,6 +7848,97 @@ def library_download_status():
         except Exception:
             pass
     return jsonify({'status': str(row.get('status') or 'unknown'), 'result': result, 'error': row.get('error')})
+
+
+# ---------------------------------------------------------------------------
+# Client-orchestrated library export: the browser downloads every original
+# file directly from blob storage (see frontend/src/services/
+# libraryExportDownloader.ts) instead of the server building a zip. This
+# endpoint's only job is handing out {filename, url} pages -- no zipping, no
+# queue, no worker -- which is what keeps it viable at up to ~500k photos
+# where /api/library/download/* (kept only as a rollback path) would take
+# multi-day, fully-serial worker time to build the equivalent zip parts.
+# ---------------------------------------------------------------------------
+LIBRARY_EXPORT_MANIFEST_PAGE_SIZE = int(os.getenv('LIBRARY_EXPORT_MANIFEST_PAGE_SIZE', '500'))
+
+
+def _encode_export_manifest_cursor(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    return base64.urlsafe_b64encode(token.encode('utf-8')).decode('ascii')
+
+
+def _decode_export_manifest_cursor(cursor: str) -> Optional[str]:
+    try:
+        return base64.urlsafe_b64decode(cursor.encode('ascii')).decode('utf-8')
+    except Exception:
+        return None
+
+
+@app.route('/api/library/export/manifest', methods=['GET'])
+def library_export_manifest_page():
+    """One page of {filename, url} entries covering every non-deleted photo/
+    video in the caller's library.
+
+    Paginated via the Table service's own continuation token (opaque to the
+    caller, base64'd for safe transport as a query param) rather than
+    materializing the whole library per request -- at up to ~500k rows, the
+    client calls this repeatedly as it works through its download queue, so
+    each page fetch needs to cost O(page size), not O(library size).
+    """
+    account_id, library_id, error = _require_owner_context()
+    if error:
+        return error
+    if metadata_table_client is None:
+        return jsonify({'files': [], 'nextCursor': None})
+
+    try:
+        page_size = max(1, min(int(request.args.get('pageSize', str(LIBRARY_EXPORT_MANIFEST_PAGE_SIZE))), 2000))
+    except ValueError:
+        return jsonify({'error': 'Invalid pageSize.'}), 400
+
+    raw_cursor = str(request.args.get('cursor', '') or '')
+    continuation_token = _decode_export_manifest_cursor(raw_cursor) if raw_cursor else None
+    if raw_cursor and continuation_token is None:
+        return jsonify({'error': 'Invalid cursor.'}), 400
+
+    pk = _escape_odata(library_id)
+    pager = None
+    try:
+        pager = metadata_table_client.query_entities(
+            f"PartitionKey eq '{pk}'",
+            select=['PartitionKey', 'RowKey', 'processing_state'],
+            results_per_page=page_size,
+        ).by_page(continuation_token=continuation_token)
+        rows = list(next(pager))
+    except StopIteration:
+        rows = []
+    except Exception:
+        app.logger.exception('Failed to page library export manifest for %s', library_id)
+        return jsonify({'error': 'Could not list library contents.'}), 503
+
+    next_cursor = _encode_export_manifest_cursor(pager.continuation_token) if pager is not None else None
+
+    files = []
+    for row in rows:
+        filename = str(row.get('RowKey') or '')
+        if not filename or str(row.get('processing_state') or '').strip().lower() == 'deleted':
+            continue
+        try:
+            blob_name = resolve_physical_blob_name(library_id, filename, 'image')
+            # download_filename=filename: anonymized blobs need the SAS's
+            # Content-Disposition override so the browser's own save step
+            # (the plain <a download> in libraryExportDownloader.ts) restores
+            # the real name instead of the opaque UUID.
+            download_url, _expires_at = _create_stable_read_sas_url(
+                BLOB_IMAGE_CONTAINER, blob_name, download_filename=filename,
+            )
+        except Exception:
+            app.logger.warning('Skipping %s from export manifest for %s: could not sign a URL', filename, library_id)
+            continue
+        files.append({'filename': filename, 'url': download_url})
+
+    return jsonify({'files': files, 'nextCursor': next_cursor})
 
 
 @app.route('/api/library/clean/request', methods=['POST'])
