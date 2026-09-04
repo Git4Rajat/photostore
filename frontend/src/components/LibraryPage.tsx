@@ -1,34 +1,20 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as library from '../services/libraryClient';
+import { startLibraryExport, ExportController, ExportProgress } from '../services/libraryExportDownloader';
+import { isOpfsSupported } from '../services/opfsDownloadStaging';
 import { getRuntimeConfig } from '../config/appConfig';
 import { Loading } from './shared/Loading';
 import { confirmDialog } from './shared/dialogs';
 
 const isPasswordAuthMode = (): boolean => (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
 
-// Persists "download entire library" progress across page reloads, scoped per
-// library so switching libraries doesn't show one library's export state on
-// another's. Without this, a refresh mid-export (or even just navigating away
-// and back) lost all progress and forced the user to babysit the tab -- the
-// export itself is a fire-and-forget background job server-side, so the
-// frontend has no reason to lose track of it too.
-type StoredDownloadState = {
-    jobId: string;
-    outcome: 'pending' | 'done' | 'failed';
-    result: library.DownloadStatusResult['result'] | null;
-    error: string;
-};
-
-const downloadStorageKey = (libraryId: string): string => `photostore.libraryDownload.${libraryId}`;
-
-const loadStoredDownloadState = (libraryId: string): StoredDownloadState | null => {
-    try {
-        const raw = window.localStorage.getItem(downloadStorageKey(libraryId));
-        return raw ? (JSON.parse(raw) as StoredDownloadState) : null;
-    } catch {
-        return null;
-    }
-};
+// Marks "download entire library" as in-flight across page reloads, scoped
+// per library so switching libraries doesn't show one library's export state
+// on another's. Only a flag, not the progress itself: startLibraryExport
+// figures out exactly what's left to download from its own IndexedDB records
+// (see libraryExportDownloader.ts), so a reload just needs to know whether to
+// call it again automatically instead of waiting for another click.
+const exportActiveStorageKey = (libraryId: string): string => `photostore.libraryExportActive.${libraryId}`;
 
 // Manage shared libraries: switch between the ones you belong to, and (for the
 // owner) invite people, see members, and rename/delete the library.
@@ -57,12 +43,9 @@ const LibraryPage: React.FC = () => {
     const [cleanPassword, setCleanPassword] = useState('');
     const [cleanNotice, setCleanNotice] = useState<library.CleanRequestResult | null>(null);
 
-    const [downloadJobId, setDownloadJobId] = useState('');
-    const [downloadOutcome, setDownloadOutcome] = useState<'idle' | 'pending' | 'done' | 'failed'>('idle');
-    const [downloadResult, setDownloadResult] = useState<library.DownloadStatusResult['result'] | null>(null);
-    const [downloadError, setDownloadError] = useState('');
-    const [downloadRequesting, setDownloadRequesting] = useState(false);
-    const downloadPollTimer = useRef<number | null>(null);
+    const [exportOutcome, setExportOutcome] = useState<'idle' | 'running' | 'done'>('idle');
+    const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+    const exportControllerRef = useRef<ExportController | null>(null);
 
     const load = useCallback(async () => {
         setError('');
@@ -109,92 +92,68 @@ const LibraryPage: React.FC = () => {
         };
     }, [load]);
 
-    // Restore any in-flight or completed export for the active library once
-    // it's known, so a reload lands back on live progress (resumes polling
-    // via the effect below, unchanged) or a ready-to-download link instead of
-    // the idle "Download entire library" button.
+    // Starts (or transparently resumes -- startLibraryExport figures out
+    // what's already done via its own IndexedDB records, see
+    // libraryExportDownloader.ts) the client-orchestrated export, and flags
+    // it active in localStorage so a reload can restart it automatically
+    // instead of silently going idle mid-download.
+    const startExport = useCallback((libraryId: string) => {
+        try {
+            window.localStorage.setItem(exportActiveStorageKey(libraryId), '1');
+        } catch {
+            // Best-effort only -- losing this just means a reload mid-export
+            // won't auto-resume without another click.
+        }
+        setExportOutcome('running');
+        setExportProgress(null);
+        exportControllerRef.current = startLibraryExport(
+            libraryId,
+            (progress) => setExportProgress(progress),
+            () => {
+                try {
+                    window.localStorage.removeItem(exportActiveStorageKey(libraryId));
+                } catch {
+                    // Not fatal -- worst case a finished export looks
+                    // resumable on the next reload, and immediately no-ops
+                    // since every file is already marked 'saved'.
+                }
+                exportControllerRef.current = null;
+                setExportOutcome('done');
+            },
+        );
+    }, []);
+
+    // Auto-resume an export that was still running when the page last
+    // unloaded.
     useEffect(() => {
         const libraryId = mine?.activeLibraryId;
         if (!libraryId) return;
-        const stored = loadStoredDownloadState(libraryId);
-        if (!stored) return;
-        setDownloadJobId(stored.jobId);
-        setDownloadOutcome(stored.outcome);
-        setDownloadResult(stored.result);
-        setDownloadError(stored.error);
-    }, [mine?.activeLibraryId]);
-
-    // Keep that stored state in sync so it survives the next reload too.
-    useEffect(() => {
-        const libraryId = mine?.activeLibraryId;
-        if (!libraryId || downloadOutcome === 'idle') return;
-        const stored: StoredDownloadState = {
-            jobId: downloadJobId,
-            outcome: downloadOutcome,
-            result: downloadResult,
-            error: downloadError,
-        };
+        let active = false;
         try {
-            window.localStorage.setItem(downloadStorageKey(libraryId), JSON.stringify(stored));
+            active = window.localStorage.getItem(exportActiveStorageKey(libraryId)) === '1';
         } catch {
-            // Best-effort only (e.g. storage quota/private browsing) -- losing
-            // persistence isn't worse than the pre-existing in-memory-only behavior.
+            active = false;
         }
-    }, [mine?.activeLibraryId, downloadJobId, downloadOutcome, downloadResult, downloadError]);
+        if (active) startExport(libraryId);
+    }, [mine?.activeLibraryId, startExport]);
 
-    // Poll for the "download entire library" export job while one is in flight.
-    useEffect(() => {
-        if (!downloadJobId || downloadOutcome === 'done' || downloadOutcome === 'failed') return undefined;
-        const poll = async () => {
-            try {
-                const result = await library.getLibraryDownloadStatus(downloadJobId);
-                if (result.status === 'done' || result.status === 'failed') {
-                    setDownloadResult(result.result || null);
-                    setDownloadError(result.error || '');
-                    setDownloadOutcome(result.status as 'done' | 'failed');
-                    return;
-                }
-                // Still running: the export heartbeats photosCompleted/photosTotal
-                // periodically, so surface that as live progress while we keep polling.
-                if (result.result && (result.result.photosCompleted !== undefined || result.result.photosTotal !== undefined)) {
-                    setDownloadResult(result.result);
-                }
-            } catch {
-                // Keep polling; a transient status-check failure isn't fatal.
-            }
-            downloadPollTimer.current = window.setTimeout(poll, 3000);
-        };
-        poll();
-        return () => {
-            if (downloadPollTimer.current) window.clearTimeout(downloadPollTimer.current);
-        };
-    }, [downloadJobId, downloadOutcome]);
-
-    const handleDownloadLibrary = async () => {
-        setDownloadError('');
-        setDownloadResult(null);
-        setDownloadRequesting(true);
-        try {
-            const result = await library.requestLibraryDownload();
-            if (result.jobId) {
-                setDownloadJobId(result.jobId);
-                setDownloadOutcome('pending');
-            } else {
-                setDownloadOutcome('failed');
-                setDownloadError('Could not start the library export.');
-            }
-        } catch (e) {
-            setDownloadOutcome('failed');
-            setDownloadError(e instanceof Error ? e.message : 'Could not start the library export.');
-        } finally {
-            setDownloadRequesting(false);
-        }
+    const handleStartExport = () => {
+        const libraryId = mine?.activeLibraryId;
+        if (libraryId) startExport(libraryId);
     };
 
-    const formatExportSize = (bytes?: number): string => {
-        if (!bytes) return '';
-        const mb = bytes / (1024 * 1024);
-        return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`;
+    const handleCancelExport = () => {
+        exportControllerRef.current?.cancel();
+        exportControllerRef.current = null;
+        const libraryId = mine?.activeLibraryId;
+        if (libraryId) {
+            try {
+                window.localStorage.removeItem(exportActiveStorageKey(libraryId));
+            } catch {
+                // Best-effort only.
+            }
+        }
+        setExportOutcome('idle');
     };
 
     const run = async (fn: () => Promise<void>, successMessage = '') => {
@@ -428,55 +387,51 @@ const LibraryPage: React.FC = () => {
                     <div className="library-clean-section">
                         <h3 className="status">Download library</h3>
                         <p className="status">
-                            Get a ZIP of every photo and video in this library. Large libraries can take a
-                            while to prepare.
+                            Downloads every photo and video in this library straight to your browser's default
+                            download location — there's no folder picker, so if you want them somewhere
+                            specific, point your browser's download setting there first. Turning off "ask
+                            where to save each file" beforehand is also worth doing, or a large library turns
+                            into a save dialog per file.
                         </p>
-                        {downloadOutcome === 'done' && downloadResult && (downloadResult.parts?.length ?? 0) > 1 ? (
-                            <div className="status success">
-                                <p>
-                                    Export ready — {downloadResult.photosIncluded ?? 0} photo(s) across {downloadResult.parts!.length} parts
-                                    {downloadResult.sizeBytes ? `, ${formatExportSize(downloadResult.sizeBytes)}` : ''}
-                                    {downloadResult.photosSkipped ? ` (${downloadResult.photosSkipped} could not be included)` : ''}.
-                                </p>
-                                <ul className="library-list">
-                                    {downloadResult.parts!.map((part) => (
-                                        <li key={part.partIndex} className="library-item">
-                                            <div>
-                                                Part {part.partIndex} — {part.photosIncluded} photo(s)
-                                                {part.sizeBytes ? `, ${formatExportSize(part.sizeBytes)}` : ''}
-                                            </div>
-                                            <a className="btn btn-soft" href={part.downloadUrl} download>Download</a>
-                                        </li>
-                                    ))}
-                                </ul>
-                            </div>
-                        ) : downloadOutcome === 'done' && downloadResult ? (
-                            <p className="status success">
-                                Export ready — {downloadResult.photosIncluded ?? 0} photo(s)
-                                {downloadResult.sizeBytes ? `, ${formatExportSize(downloadResult.sizeBytes)}` : ''}
-                                {downloadResult.photosSkipped ? ` (${downloadResult.photosSkipped} could not be included)` : ''}.{' '}
-                                {downloadResult.parts?.[0]?.downloadUrl && (
-                                    <a href={downloadResult.parts[0].downloadUrl} download>Download ZIP</a>
-                                )}
+                        {!isOpfsSupported() ? (
+                            <p className="status error">
+                                Your browser doesn't support the private storage this download needs in order
+                                to resume safely. Try the latest Chrome, Edge, Firefox, or Safari.
                             </p>
-                        ) : downloadOutcome === 'pending' ? (
-                            <p className="status">
-                                {downloadResult?.photosTotal
-                                    ? `Preparing your download… ${downloadResult.photosCompleted ?? 0} of ${downloadResult.photosTotal} photos processed.`
-                                    : 'Preparing your download…'}
-                            </p>
-                        ) : (
+                        ) : exportOutcome === 'running' ? (
                             <>
-                                {downloadError && <p className="status error">{downloadError}</p>}
-                                <button
-                                    type="button"
-                                    className="btn btn-soft"
-                                    disabled={busy || downloadRequesting}
-                                    onClick={handleDownloadLibrary}
-                                >
-                                    {downloadRequesting ? 'Starting…' : 'Download entire library'}
+                                <p className="status">
+                                    {exportProgress?.listingComplete
+                                        ? `Downloading… ${exportProgress.filesSaved} of ${exportProgress.filesSeen} files saved.`
+                                        : `Downloading… ${exportProgress?.filesSaved ?? 0} files saved so far (still counting the library).`}
+                                    {exportProgress?.currentFilename ? ` Current: ${exportProgress.currentFilename}` : ''}
+                                </p>
+                                {exportProgress?.fatalError && (
+                                    <p className="status error">{exportProgress.fatalError} It will pick back up from here next time.</p>
+                                )}
+                                {(exportProgress?.errors.length ?? 0) > 0 && (
+                                    <p className="status error">
+                                        {exportProgress!.errors.length} file(s) could not be downloaded and were skipped.
+                                    </p>
+                                )}
+                                <button type="button" className="btn btn-soft" onClick={handleCancelExport}>Stop</button>
+                            </>
+                        ) : exportOutcome === 'done' ? (
+                            <>
+                                <p className="status success">
+                                    Done — {exportProgress?.filesSaved ?? 0} file(s) saved to your downloads.
+                                    {(exportProgress?.errors.length ?? 0) > 0
+                                        ? ` ${exportProgress!.errors.length} file(s) could not be downloaded.`
+                                        : ''}
+                                </p>
+                                <button type="button" className="btn btn-soft" disabled={busy} onClick={handleStartExport}>
+                                    Download again
                                 </button>
                             </>
+                        ) : (
+                            <button type="button" className="btn btn-soft" disabled={busy} onClick={handleStartExport}>
+                                Download entire library
+                            </button>
                         )}
                     </div>
 

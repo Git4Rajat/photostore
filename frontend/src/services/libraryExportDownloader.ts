@@ -1,0 +1,249 @@
+// Client-orchestrated "download entire library" -- the browser fetches every
+// original file directly from blob storage and saves it via the browser's
+// own download mechanism, instead of waiting on a server-built zip. No
+// folder picker: every file lands wherever the browser already saves
+// downloads. See opfsDownloadStaging.ts for how a file survives a closed tab
+// or a restart mid-download.
+//
+// Progress and per-file status live in a dedicated IndexedDB database (not
+// localStorage -- this needs structured per-file records, not one blob) so a
+// reload resumes exactly where it left off: already-'saved' files are
+// skipped without being re-listed from the manifest twice, and a file that
+// was fully staged but never handed off (tab closed between the two steps)
+// finalizes without re-fetching anything.
+import * as library from './libraryClient';
+import { stagedByteCount, writeResponseToStaging, readStagedFile, removeStagedFile } from './opfsDownloadStaging';
+
+const DB_NAME = 'photostore-library-export';
+const FILES_STORE = 'files';
+const META_STORE = 'meta';
+
+type FileStatus = 'staged' | 'saved';
+
+const openExportDb = (): Promise<IDBDatabase> => new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(FILES_STORE)) db.createObjectStore(FILES_STORE);
+        if (!db.objectStoreNames.contains(META_STORE)) db.createObjectStore(META_STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Failed to open export database.'));
+});
+
+const fileKey = (libraryId: string, filename: string): string => `${libraryId}::${filename}`;
+
+const getFileStatus = async (libraryId: string, filename: string): Promise<FileStatus | null> => {
+    const db = await openExportDb();
+    const result = await new Promise<FileStatus | null>((resolve, reject) => {
+        const tx = db.transaction(FILES_STORE, 'readonly');
+        const req = tx.objectStore(FILES_STORE).get(fileKey(libraryId, filename));
+        req.onsuccess = () => resolve((req.result as FileStatus | undefined) || null);
+        req.onerror = () => reject(req.error || new Error('Failed to read export status.'));
+    });
+    db.close();
+    return result;
+};
+
+const setFileStatus = async (libraryId: string, filename: string, status: FileStatus): Promise<void> => {
+    const db = await openExportDb();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(FILES_STORE, 'readwrite');
+        tx.objectStore(FILES_STORE).put(status, fileKey(libraryId, filename));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Failed to persist export status.'));
+    });
+    db.close();
+};
+
+// Resume optimization only, never a correctness requirement -- every file's
+// own status above is what actually decides whether it's re-downloaded, so a
+// stale or missing cursor just means re-paging some already-'saved' entries,
+// not re-fetching their bytes.
+const getSavedCursor = async (libraryId: string): Promise<string | null> => {
+    const db = await openExportDb();
+    const result = await new Promise<string | null>((resolve, reject) => {
+        const tx = db.transaction(META_STORE, 'readonly');
+        const req = tx.objectStore(META_STORE).get(libraryId);
+        req.onsuccess = () => resolve((req.result as string | undefined) || null);
+        req.onerror = () => reject(req.error || new Error('Failed to read export cursor.'));
+    });
+    db.close();
+    return result;
+};
+
+const setSavedCursor = async (libraryId: string, cursor: string | null): Promise<void> => {
+    const db = await openExportDb();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(META_STORE, 'readwrite');
+        if (cursor) {
+            tx.objectStore(META_STORE).put(cursor, libraryId);
+        } else {
+            tx.objectStore(META_STORE).delete(libraryId);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Failed to persist export cursor.'));
+    });
+    db.close();
+};
+
+export interface ExportError {
+    filename: string;
+    message: string;
+}
+
+export interface ExportProgress {
+    filesSaved: number;
+    // Grows as manifest pages are consumed; only a firm total once
+    // listingComplete is true (before that, show it as a lower bound).
+    filesSeen: number;
+    listingComplete: boolean;
+    currentFilename: string | null;
+    errors: ExportError[];
+    // Set if paging the manifest itself failed (e.g. a session expiring
+    // mid-export) -- distinct from a per-file error, which is skipped and
+    // recorded in `errors` without stopping the rest of the export. Calling
+    // startLibraryExport again resumes from the last successfully-listed
+    // page's cursor.
+    fatalError: string | null;
+}
+
+export interface ExportController {
+    cancel: () => void;
+}
+
+const EXPORT_CONCURRENCY = 4;
+// Rapid, fully automatic downloads without further user interaction trip
+// most browsers' "this site is downloading many files" heuristics -- pacing
+// the final save step (not the fetch/stage step, which stays fully
+// concurrent) keeps well under that without slowing the actual transfer.
+const MIN_SAVE_INTERVAL_MS = 350;
+// Bounds how many {filename, url} entries sit in memory waiting for a free
+// worker -- large enough that listing rarely blocks a worker, small enough
+// that a 500k-file library never holds more than a sliver of its manifest.
+const QUEUE_HIGH_WATER = 2000;
+
+const wait = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+const triggerBrowserSave = (file: File, filename: string): void => {
+    const objectUrl = URL.createObjectURL(file);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    // Revoking immediately can cancel the save in some browsers -- give the
+    // browser's own download handoff time to actually start reading it.
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+};
+
+export const startLibraryExport = (
+    libraryId: string,
+    onProgress: (progress: ExportProgress) => void,
+    onDone: () => void,
+): ExportController => {
+    let cancelled = false;
+    const queue: library.ExportManifestFile[] = [];
+    let listingComplete = false;
+    let listingError: string | null = null;
+    let filesSeen = 0;
+    let filesSaved = 0;
+    const errors: ExportError[] = [];
+    let lastSaveAt = 0;
+
+    const emitProgress = (currentFilename: string | null) => {
+        onProgress({ filesSaved, filesSeen, listingComplete, currentFilename, errors: [...errors], fatalError: listingError });
+    };
+
+    const listManifest = async () => {
+        let cursor = await getSavedCursor(libraryId);
+        while (!cancelled) {
+            if (queue.length >= QUEUE_HIGH_WATER) {
+                await wait(200);
+                continue;
+            }
+            let page: library.ExportManifestPage;
+            try {
+                page = await library.getLibraryExportManifestPage(cursor);
+            } catch (e) {
+                listingError = e instanceof Error ? e.message : 'Could not list the library for export.';
+                return;
+            }
+            queue.push(...page.files);
+            filesSeen += page.files.length;
+            cursor = page.nextCursor;
+            await setSavedCursor(libraryId, cursor);
+            emitProgress(null);
+            if (!cursor) {
+                listingComplete = true;
+                return;
+            }
+        }
+    };
+
+    const stageAndSaveOne = async (entry: library.ExportManifestFile): Promise<void> => {
+        const { filename, url } = entry;
+        const existing = await getFileStatus(libraryId, filename);
+        if (existing !== 'saved') {
+            if (existing !== 'staged') {
+                const offset = await stagedByteCount(filename);
+                const headers: Record<string, string> = offset > 0 ? { Range: `bytes=${offset}-` } : {};
+                const response = await fetch(url, { headers });
+                if (!response.ok && response.status !== 206) {
+                    throw new Error(`Download failed (${response.status}).`);
+                }
+                // A plain 200 with a nonzero offset means the server didn't
+                // honor the Range request -- the body is the whole file, so
+                // the partial staging copy must be discarded, not appended to.
+                const actualOffset = response.status === 200 ? 0 : offset;
+                await writeResponseToStaging(filename, response, actualOffset);
+                await setFileStatus(libraryId, filename, 'staged');
+            }
+        }
+        if (existing !== 'saved') {
+            const now = Date.now();
+            const waitFor = Math.max(0, MIN_SAVE_INTERVAL_MS - (now - lastSaveAt));
+            if (waitFor > 0) await wait(waitFor);
+            lastSaveAt = Date.now();
+            const file = await readStagedFile(filename);
+            triggerBrowserSave(file, filename);
+            await setFileStatus(libraryId, filename, 'saved');
+            await removeStagedFile(filename);
+        }
+        filesSaved += 1;
+    };
+
+    const runWorker = async () => {
+        while (!cancelled) {
+            const entry = queue.shift();
+            if (!entry) {
+                if (listingComplete || listingError) return;
+                await wait(100);
+                continue;
+            }
+            emitProgress(entry.filename);
+            try {
+                await stageAndSaveOne(entry);
+            } catch (e) {
+                errors.push({ filename: entry.filename, message: e instanceof Error ? e.message : 'Download failed.' });
+            }
+            emitProgress(null);
+        }
+    };
+
+    (async () => {
+        const listing = listManifest();
+        const workers = Array.from({ length: EXPORT_CONCURRENCY }, () => runWorker());
+        await Promise.all([listing, ...workers]);
+        if (!cancelled) {
+            await setSavedCursor(libraryId, null);
+            emitProgress(null);
+            onDone();
+        }
+    })();
+
+    return {
+        cancel: () => { cancelled = true; },
+    };
+};

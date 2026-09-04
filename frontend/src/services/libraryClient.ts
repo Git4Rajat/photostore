@@ -332,3 +332,27 @@ export const getLibraryDownloadStatus = async (jobId: string): Promise<DownloadS
     }
     return response.json();
 };
+
+export interface ExportManifestFile {
+    filename: string;
+    url: string;
+}
+
+export interface ExportManifestPage {
+    files: ExportManifestFile[];
+    nextCursor: string | null;
+}
+
+// One page of {filename, url} entries for the client-orchestrated export
+// (see services/libraryExportDownloader.ts) -- the browser downloads every
+// original file directly from blob storage instead of waiting on a
+// server-built zip. Pass the previous page's nextCursor to continue; omit it
+// (or pass null) to start from the beginning of the library.
+export const getLibraryExportManifestPage = async (cursor?: string | null): Promise<ExportManifestPage> => {
+    const qs = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    const response = await authedFetch(`/api/library/export/manifest${qs}`);
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not list the library for export.'));
+    }
+    return response.json();
+};
