@@ -7674,9 +7674,8 @@ def _execute_library_download(library_id: str, library_name: str, job_id: Option
     _cleanup_stale_library_export_parts(library_id, part_index)
 
     multi_part = len(parts_summary) > 1
-    parts_result = []
-    total_size = 0
-    for part in parts_summary:
+
+    def _finalize_part(part: Dict) -> Dict:
         idx = part['partIndex']
         blob_name = _library_export_part_blob_name(library_id, idx)
         download_name = (
@@ -7684,14 +7683,28 @@ def _execute_library_download(library_id: str, library_name: str, job_id: Option
             else f"{library_name or library_id}-export.zip"
         )
         download_url, expires_at = _create_stable_read_sas_url(BLOB_EXPORTS_CONTAINER, blob_name, download_filename=download_name)
-        total_size += int(part.get('sizeBytes') or 0)
-        parts_result.append({
+        return {
             'partIndex': idx,
             'downloadUrl': download_url,
             'expiresAt': expires_at,
             'photosIncluded': part['photosIncluded'],
             'sizeBytes': part['sizeBytes'],
-        })
+        }
+
+    # Each call is independent (day-cached delegation key + local HMAC
+    # signing, no shared mutable state beyond that already-thread-safe
+    # cache), and results are tiny strings -- unlike the per-file download
+    # loop above, there's no memory-buildup risk from running all of these
+    # concurrently rather than with a bounded sliding window. Confirmed live
+    # 2026-09-04: run sequentially, this loop over a few hundred parts
+    # (large libraries at LIBRARY_EXPORT_PART_MAX_BYTES's smaller end) took
+    # long enough to repeatedly get caught mid-loop by routine replica
+    # restarts (deploys/scale-downs), and since this loop wasn't itself
+    # checkpointed, every interruption meant redoing the whole thing from
+    # part 1 again on redelivery.
+    with ThreadPoolExecutor(max_workers=LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY) as executor:
+        parts_result = list(executor.map(_finalize_part, parts_summary))
+    total_size = sum(int(part.get('sizeBytes') or 0) for part in parts_summary)
 
     return {
         'parts': parts_result,
