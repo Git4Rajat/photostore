@@ -33,12 +33,15 @@ class _FakeTable:
         except KeyError:
             raise Exception('not found')
 
-    def query_entities(self, filter_str):
+    def query_entities(self, filter_str, select=None):
         import re
         m = re.match(r"PartitionKey eq '([^']*)'$", filter_str)
         assert m, f'unexpected filter: {filter_str}'
         pk = m.group(1)
-        return [dict(row) for (p, _), row in self.rows.items() if p == pk]
+        rows = [dict(row) for (p, _), row in self.rows.items() if p == pk]
+        if select is not None:
+            rows = [{k: row[k] for k in select if k in row} for row in rows]
+        return rows
 
 
 class _FakeQueue:

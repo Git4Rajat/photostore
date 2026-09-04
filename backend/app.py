@@ -7422,7 +7422,18 @@ def _execute_library_download(library_id: str, library_name: str, job_id: Option
     """
     pk = _escape_odata(library_id)
     try:
-        metadata_rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{pk}'")) if metadata_table_client else []
+        # select=[the 2 fields actually read below]: a full row carries heavy
+        # columns (exifData, backgroundTags, aiPersonLabel, ...) never touched
+        # by this function -- materializing all of that for every row in a
+        # 17k+-photo library is the same bug class already fixed in
+        # _execute_library_clean/list_merges (see that comment), just never
+        # applied here since this function was written later. Confirmed live
+        # 2026-09-04: the unprojected version OOMKilled (exit 137) a 2vCPU/4Gi
+        # worker repeatedly, well before the executor's own download buffers
+        # could plausibly account for it.
+        metadata_rows = list(metadata_table_client.query_entities(
+            f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey', 'processing_state'],
+        )) if metadata_table_client else []
     except Exception:
         metadata_rows = []
 
