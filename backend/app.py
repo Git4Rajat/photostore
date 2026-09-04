@@ -2356,6 +2356,19 @@ def _clustering_job_types() -> set:
 # clustering for a user forever now that the de-dupe guard actually matches.
 CLUSTERING_ACTIVE_JOB_STALE_MINUTES = int(os.getenv('CLUSTERING_ACTIVE_JOB_STALE_MINUTES', '15'))
 
+# How often _handle_clustering_queue_payload refreshes a job row's updatedAt
+# while cluster_user_faces/_build_people_recluster_plan/etc. are still
+# computing. Without this, a full recluster over a large-enough face table
+# can legitimately take longer than CLUSTERING_ACTIVE_JOB_STALE_MINUTES --
+# confirmed live 2026-09-04, a healthy worker (0 restarts) still got its
+# in-progress people_cluster job force-flipped to 'failed' ("worker
+# restarted or timed out") by /api/jobs/status's staleness sweep, purely
+# because nothing had touched updatedAt since the single write at dispatch
+# time. Mirrors the fix already applied to _execute_library_download for
+# the identical failure mode (see LIBRARY_EXPORT_PART_MAX_BYTES's sibling
+# heartbeat, _live_progress_heartbeat).
+CLUSTERING_JOB_HEARTBEAT_SECONDS = int(os.getenv('CLUSTERING_JOB_HEARTBEAT_SECONDS', '120'))
+
 # _has_active_clustering_job's query_entities("PartitionKey eq 'jobs'") is an
 # unfiltered scan of the SAME 'jobs' partition _active_library_cleanup_job
 # was found scanning on every upload request (213k+ rows and growing,
@@ -13633,6 +13646,24 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         return
     if job_id:
         _upsert_job_status(job_id, user_id, 'clustering', 'running')
+
+    # Refresh updatedAt periodically while the branches below are still
+    # computing -- see CLUSTERING_JOB_HEARTBEAT_SECONDS's comment. Started
+    # unconditionally (even without a job_id, where the writes below are
+    # cheap no-ops) so every branch is covered uniformly, same as the
+    # message-lease-renewal thread this mirrors.
+    stop_heartbeat = threading.Event()
+
+    def _send_heartbeat() -> None:
+        while not stop_heartbeat.wait(CLUSTERING_JOB_HEARTBEAT_SECONDS):
+            if job_id:
+                try:
+                    _upsert_job_status(job_id, user_id, 'clustering', 'running')
+                except Exception:
+                    worker_logger.exception('Failed to send clustering job heartbeat')
+
+    heartbeat_thread = threading.Thread(target=_send_heartbeat, daemon=True)
+    heartbeat_thread.start()
     try:
         if job_type == 'people_cluster':
             eps, min_samples = _resolve_people_cluster_job_params(payload.get('eps', PEOPLE_CLUSTER_EPS), payload.get('minSamples', 2))
@@ -13754,6 +13785,8 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                         },
                     )
     finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=5)
         _maybe_enqueue_coalesced_rerun(job_id, user_id)
 
 
