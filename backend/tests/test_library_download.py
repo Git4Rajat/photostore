@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import time
 import zipfile
 
@@ -204,6 +205,74 @@ def test_execute_library_download_downloads_concurrently(env, monkeypatch):
     # near 18/8 * 0.1s ~= 0.25s. Generous bound to avoid flakiness while still
     # catching a regression back to one-at-a-time downloads.
     assert elapsed < 1.2, f'expected concurrent downloads to finish well under sequential time, took {elapsed:.2f}s'
+
+
+def test_execute_library_download_bounds_outstanding_downloads_with_a_slow_straggler(env, monkeypatch):
+    """Regression test for a real production OOM (confirmed live via
+    OOMKilled/exit 137 on a 17k-photo export): the original implementation
+    used executor.map(), which submits every remaining row's download up
+    front. With a slow straggler at the front of the list, the other
+    (concurrency - 1) worker threads race ahead through the rest of the list
+    unthrottled -- executor.map() only preserves *consumption* order, not a
+    cap on how many completed-but-unconsumed results (each holding a full
+    photo's bytes) can pile up in memory waiting for the straggler to clear.
+    The fix (a sliding window of at most LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY
+    outstanding futures) must keep that pile-up bounded."""
+    table, _queue, _uploaded = env
+    concurrency = 4
+    monkeypatch.setattr(app, 'LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY', concurrency)
+
+    total_rows = concurrency * 4
+    # 'a00.jpg'..'a13.jpg' sort before the fixture's 'photo1.jpg'/'photo2.jpg',
+    # so 'a00.jpg' -- the straggler -- lands first in the deterministic order.
+    for i in range(total_rows - 2):
+        table.upsert_entity({'PartitionKey': 'lib1', 'RowKey': f'a{i:02d}.jpg', 'processing_state': 'done'})
+
+    release_straggler = threading.Event()
+    completed_while_blocked = []
+    lock = threading.Lock()
+
+    def _download(kind, name):
+        if name == 'a00.jpg':
+            release_straggler.wait(timeout=5)
+            return b'slow'
+        with lock:
+            if not release_straggler.is_set():
+                completed_while_blocked.append(name)
+        return b'fast'
+
+    monkeypatch.setattr(app, 'download_media_bytes', _download)
+
+    result_holder = {}
+
+    def _run():
+        result_holder['result'] = app._execute_library_download('lib1', 'My Library')
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    # Give every thread besides the blocked straggler time to race as far
+    # ahead as the (buggy) code would let it -- long enough to be a real
+    # regression signal, short enough to keep the test fast (downloads are
+    # in-memory here, so real work completes in microseconds).
+    time.sleep(0.5)
+    peak_while_blocked = len(completed_while_blocked)
+    release_straggler.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), 'export did not finish after releasing the straggler'
+
+    # The window holds at most `concurrency` outstanding futures at any time
+    # (the popped straggler's replacement is submitted immediately, to keep
+    # every worker thread fed) -- so at most `concurrency` rows can complete
+    # while it's still blocked, out of total_rows = concurrency * 4 candidates.
+    # The old executor.map() code had no such cap: it would let as many of
+    # the *other* total_rows - 1 rows complete as the (concurrency - 1) free
+    # threads could chew through in the same window.
+    assert peak_while_blocked <= concurrency, (
+        f'{peak_while_blocked} downloads completed while the straggler was still '
+        f'blocked, expected at most {concurrency} (window size {concurrency}) -- '
+        'looks like the unbounded executor.map() regression'
+    )
+    assert result_holder['result']['photosIncluded'] == total_rows
 
 
 def test_execute_library_download_splits_into_size_capped_parts_and_cleans_up_stale_ones(env, monkeypatch):

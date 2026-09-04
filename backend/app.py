@@ -7514,15 +7514,35 @@ def _execute_library_download(library_id: str, library_name: str, job_id: Option
     photos_in_part = 0
     part_bytes = 0
     try:
-        # Bounded read-ahead: up to LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY blob
-        # downloads run concurrently (pure I/O wait, so this overlaps network
-        # round-trips instead of paying them one at a time), but
-        # executor.map() still yields results in submission order, so the
-        # zip's contents, the size-cap part boundaries, and the durable
-        # resume checkpoint below all stay exactly as deterministic as the
-        # fully sequential version this replaces.
+        # Bounded read-ahead: a fixed-size sliding window of at most
+        # LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY in-flight-or-completed futures,
+        # not executor.map(). map() submits every remaining row's download
+        # up front -- with max_workers=8 that only bounds how many run
+        # *concurrently*, not how many completed results can pile up waiting
+        # to be consumed: one slow straggler (a large RAW/video) blocks
+        # in-order consumption while the other 7 threads race ahead through
+        # the rest of the list, each completed download's full bytes sitting
+        # in memory until the straggler finally clears. A sliding window
+        # only ever has LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY outstanding
+        # futures (submits the next one only after popping+consuming the
+        # oldest), so peak memory is bounded regardless of file-size mix.
+        # Submission/consumption order is still strictly FIFO, so the zip's
+        # contents, size-cap part boundaries, and durable resume checkpoint
+        # below stay exactly as deterministic as the sequential version.
         with ThreadPoolExecutor(max_workers=LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY) as executor:
-            for filename, data_bytes, exc in executor.map(_download_row, candidate_rows[rows_processed:]):
+            remaining_rows = candidate_rows[rows_processed:]
+            next_row_index = 0
+            in_flight = []
+            for _ in range(min(LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY, len(remaining_rows))):
+                in_flight.append(executor.submit(_download_row, remaining_rows[next_row_index]))
+                next_row_index += 1
+
+            while in_flight:
+                future = in_flight.pop(0)
+                if next_row_index < len(remaining_rows):
+                    in_flight.append(executor.submit(_download_row, remaining_rows[next_row_index]))
+                    next_row_index += 1
+                filename, data_bytes, exc = future.result()
                 if exc is not None:
                     skipped_count += 1
                     app.logger.warning('Skipping %s while building library export for %s: %s', filename, library_id, exc)
