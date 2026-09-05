@@ -82,8 +82,8 @@ def env(monkeypatch):
     monkeypatch.setattr(app, '_require_owner_context', lambda require_auth=True: ('owner', 'lib1', None))
     monkeypatch.setattr(app, 'resolve_physical_blob_name', lambda lib, fn, kind='image': fn)
     monkeypatch.setattr(
-        app, '_create_stable_read_sas_url',
-        lambda container, name, download_filename=None: (f'https://fake.blob/{container}/{name}?sas=1', '2099-01-01T00:00:00+00:00'),
+        app, '_stable_container_read_sas',
+        lambda container: (f'https://fake.blob/{container}', 'sas=1', '2099-01-01T00:00:00+00:00'),
     )
     return table
 
@@ -116,7 +116,7 @@ def test_manifest_pages_through_a_large_library(env):
     assert len(set(seen)) == 1250
 
 
-def test_manifest_skips_deleted_rows_and_signs_original_filename(env):
+def test_manifest_skips_deleted_rows_and_shares_one_sas_for_the_page(env):
     env.add('lib1', 'a.jpg', processing_state='done')
     env.add('lib1', 'b.jpg', processing_state='deleted')
     env.add('lib1', 'c.jpg', processing_state='done')
@@ -124,13 +124,22 @@ def test_manifest_skips_deleted_rows_and_signs_original_filename(env):
     body = _get_manifest().get_json()
 
     assert [f['filename'] for f in body['files']] == ['a.jpg', 'c.jpg']
+    assert [f['blobName'] for f in body['files']] == ['a.jpg', 'c.jpg']
     assert body['nextCursor'] is None
-    assert body['files'][0]['url'] == f'https://fake.blob/{app.BLOB_IMAGE_CONTAINER}/a.jpg?sas=1'
+    # One shared token for the whole page, not one per file -- the client
+    # builds each file's URL itself as f'{baseUrl}/{blobName}?{sas}'.
+    assert body['baseUrl'] == f'https://fake.blob/{app.BLOB_IMAGE_CONTAINER}'
+    assert body['sas'] == 'sas=1'
 
 
-def test_manifest_empty_library_returns_no_files_and_no_cursor(env):
+def test_manifest_empty_library_still_returns_a_shared_sas(env):
     body = _get_manifest().get_json()
-    assert body == {'files': [], 'nextCursor': None}
+    assert body == {
+        'baseUrl': f'https://fake.blob/{app.BLOB_IMAGE_CONTAINER}',
+        'sas': 'sas=1',
+        'files': [],
+        'nextCursor': None,
+    }
 
 
 def test_manifest_rejects_non_owner(monkeypatch):

@@ -8,15 +8,22 @@
 // Progress and per-file status live in a dedicated IndexedDB database (not
 // localStorage -- this needs structured per-file records, not one blob) so a
 // reload resumes exactly where it left off: already-'saved' files are
-// skipped without being re-listed from the manifest twice, and a file that
-// was fully staged but never handed off (tab closed between the two steps)
-// finalizes without re-fetching anything.
+// skipped, and a file that was fully staged but never handed off (tab closed
+// between the two steps) finalizes without re-fetching anything.
+//
+// Deliberately NOT persisting a manifest resume cursor: an earlier version
+// did, advancing it as soon as a page was *fetched* into the in-memory queue
+// rather than once its files were actually *saved* -- a reload while some of
+// that page's entries were still sitting unprocessed in memory would silently
+// drop them forever, since the next run's listing would resume past them.
+// Every run re-pages the whole manifest from the start instead; already-
+// 'saved' files are skipped fast (a local IndexedDB read, no network), and
+// correctness matters far more here than the resume-speed optimization did.
 import * as library from './libraryClient';
 import { stagedByteCount, writeResponseToStaging, readStagedFile, removeStagedFile } from './opfsDownloadStaging';
 
 const DB_NAME = 'photostore-library-export';
 const FILES_STORE = 'files';
-const META_STORE = 'meta';
 
 type FileStatus = 'staged' | 'saved';
 
@@ -25,7 +32,6 @@ const openExportDb = (): Promise<IDBDatabase> => new Promise((resolve, reject) =
     request.onupgradeneeded = () => {
         const db = request.result;
         if (!db.objectStoreNames.contains(FILES_STORE)) db.createObjectStore(FILES_STORE);
-        if (!db.objectStoreNames.contains(META_STORE)) db.createObjectStore(META_STORE);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error('Failed to open export database.'));
@@ -56,37 +62,6 @@ const setFileStatus = async (libraryId: string, filename: string, status: FileSt
     db.close();
 };
 
-// Resume optimization only, never a correctness requirement -- every file's
-// own status above is what actually decides whether it's re-downloaded, so a
-// stale or missing cursor just means re-paging some already-'saved' entries,
-// not re-fetching their bytes.
-const getSavedCursor = async (libraryId: string): Promise<string | null> => {
-    const db = await openExportDb();
-    const result = await new Promise<string | null>((resolve, reject) => {
-        const tx = db.transaction(META_STORE, 'readonly');
-        const req = tx.objectStore(META_STORE).get(libraryId);
-        req.onsuccess = () => resolve((req.result as string | undefined) || null);
-        req.onerror = () => reject(req.error || new Error('Failed to read export cursor.'));
-    });
-    db.close();
-    return result;
-};
-
-const setSavedCursor = async (libraryId: string, cursor: string | null): Promise<void> => {
-    const db = await openExportDb();
-    await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(META_STORE, 'readwrite');
-        if (cursor) {
-            tx.objectStore(META_STORE).put(cursor, libraryId);
-        } else {
-            tx.objectStore(META_STORE).delete(libraryId);
-        }
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error('Failed to persist export cursor.'));
-    });
-    db.close();
-};
-
 export interface ExportError {
     filename: string;
     message: string;
@@ -112,12 +87,27 @@ export interface ExportController {
     cancel: () => void;
 }
 
+// A manifest entry with its actual URL already built from that page's shared
+// baseUrl/sas (see libraryClient.buildExportFileUrl) -- computed once when a
+// page is listed rather than carrying the page's token around separately.
+interface QueuedFile {
+    filename: string;
+    url: string;
+}
+
 const EXPORT_CONCURRENCY = 4;
 // Rapid, fully automatic downloads without further user interaction trip
 // most browsers' "this site is downloading many files" heuristics -- pacing
 // the final save step (not the fetch/stage step, which stays fully
 // concurrent) keeps well under that without slowing the actual transfer.
-const MIN_SAVE_INTERVAL_MS = 350;
+// There's no code-level fix for a save a browser silently blocks under this
+// heuristic (page JS gets no signal either way, confirmed live 2026-09-05 by
+// a "Couldn't download - Network issue" report whose "(1)" filename means the
+// browser's own retry of a blocked save hit an already-revoked, one-shot
+// blob: URL) -- pacing only reduces how often it happens; LibraryPage's copy
+// tells the user to look for and approve a "multiple downloads" prompt near
+// the address bar if files seem to be failing.
+const MIN_SAVE_INTERVAL_MS = 500;
 // Bounds how many {filename, url} entries sit in memory waiting for a free
 // worker -- large enough that listing rarely blocks a worker, small enough
 // that a 500k-file library never holds more than a sliver of its manifest.
@@ -134,8 +124,11 @@ const triggerBrowserSave = (file: File, filename: string): void => {
     anchor.click();
     anchor.remove();
     // Revoking immediately can cancel the save in some browsers -- give the
-    // browser's own download handoff time to actually start reading it.
-    setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+    // browser's own download handoff generous time to actually start reading
+    // it before the data disappears out from under it (bumped from 30s after
+    // the "(1)"/network-issue report above -- a save queued behind Chrome's
+    // own multi-download throttling can sit longer than 30s before it starts).
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
 };
 
 export const startLibraryExport = (
@@ -144,7 +137,7 @@ export const startLibraryExport = (
     onDone: () => void,
 ): ExportController => {
     let cancelled = false;
-    const queue: library.ExportManifestFile[] = [];
+    const queue: QueuedFile[] = [];
     let listingComplete = false;
     let listingError: string | null = null;
     let filesSeen = 0;
@@ -157,7 +150,7 @@ export const startLibraryExport = (
     };
 
     const listManifest = async () => {
-        let cursor = await getSavedCursor(libraryId);
+        let cursor: string | null = null;
         while (!cancelled) {
             if (queue.length >= QUEUE_HIGH_WATER) {
                 await wait(200);
@@ -170,10 +163,9 @@ export const startLibraryExport = (
                 listingError = e instanceof Error ? e.message : 'Could not list the library for export.';
                 return;
             }
-            queue.push(...page.files);
+            queue.push(...page.files.map((f) => ({ filename: f.filename, url: library.buildExportFileUrl(page, f.blobName) })));
             filesSeen += page.files.length;
             cursor = page.nextCursor;
-            await setSavedCursor(libraryId, cursor);
             emitProgress(null);
             if (!cursor) {
                 listingComplete = true;
@@ -182,7 +174,7 @@ export const startLibraryExport = (
         }
     };
 
-    const stageAndSaveOne = async (entry: library.ExportManifestFile): Promise<void> => {
+    const stageAndSaveOne = async (entry: QueuedFile): Promise<void> => {
         const { filename, url } = entry;
         const existing = await getFileStatus(libraryId, filename);
         if (existing !== 'saved') {
@@ -237,7 +229,6 @@ export const startLibraryExport = (
         const workers = Array.from({ length: EXPORT_CONCURRENCY }, () => runWorker());
         await Promise.all([listing, ...workers]);
         if (!cancelled) {
-            await setSavedCursor(libraryId, null);
             emitProgress(null);
             onDone();
         }

@@ -391,7 +391,9 @@ const LibraryPage: React.FC = () => {
                             download location — there's no folder picker, so if you want them somewhere
                             specific, point your browser's download setting there first. Turning off "ask
                             where to save each file" beforehand is also worth doing, or a large library turns
-                            into a save dialog per file.
+                            into a save dialog per file. If a file shows as failed partway through, check for
+                            a "this site is downloading multiple files" notice near your address bar and
+                            allow it — most browsers pause automatic downloads until you approve that once.
                         </p>
                         {!isOpfsSupported() ? (
                             <p className="status error">

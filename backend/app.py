@@ -28,7 +28,10 @@ from azure.core import MatchConditions
 from azure.core.exceptions import AzureError, ResourceExistsError, ResourceModifiedError
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobSasPermissions, BlobServiceClient, UserDelegationKey, generate_blob_sas
+from azure.storage.blob import (
+    BlobSasPermissions, BlobServiceClient, ContainerSasPermissions, UserDelegationKey,
+    generate_blob_sas, generate_container_sas,
+)
 from azure.storage.queue import QueueServiceClient
 from flask import Flask, Response, jsonify, make_response, request, stream_with_context
 from auth_utils import get_request_user_id as resolve_request_user_id
@@ -7910,8 +7913,20 @@ def _decode_export_manifest_cursor(cursor: str) -> Optional[Dict]:
 
 @app.route('/api/library/export/manifest', methods=['GET'])
 def library_export_manifest_page():
-    """One page of {filename, url} entries covering every non-deleted photo/
-    video in the caller's library.
+    """One page of {filename, blobName} entries covering every non-deleted
+    photo/video in the caller's library, plus a single container-scoped
+    baseUrl/sas shared by every file on every page -- the client builds each
+    file's actual URL itself as f'{baseUrl}/{encodeURIComponent(blobName)}?
+    {sas}'. One signature per request instead of one per file: at up to
+    ~500k rows that's the difference between the backend doing O(page size)
+    or O(library size) work per page (confirmed live 2026-09-05 after a user
+    asked for exactly this -- generate_container_sas is a pure local HMAC
+    computation, so per-file signing wasn't slow, just needless work repeated
+    thousands of times over a large export). The final download filename is
+    restored client-side (see libraryExportDownloader.ts's triggerBrowserSave,
+    which sets the <a download> attribute explicitly) rather than via a
+    per-blob Content-Disposition override, since a shared SAS can't carry a
+    per-blob response header anyway.
 
     Paginated via the Table service's own continuation token (opaque to the
     caller, base64'd for safe transport as a query param) rather than
@@ -7934,6 +7949,12 @@ def library_export_manifest_page():
     continuation_token = _decode_export_manifest_cursor(raw_cursor) if raw_cursor else None
     if raw_cursor and continuation_token is None:
         return jsonify({'error': 'Invalid cursor.'}), 400
+
+    try:
+        base_url, sas, _expires_at = _stable_container_read_sas(BLOB_IMAGE_CONTAINER)
+    except Exception:
+        app.logger.exception('Failed to sign library export manifest for %s', library_id)
+        return jsonify({'error': 'Could not prepare download links.'}), 503
 
     pk = _escape_odata(library_id)
     pager = None
@@ -7959,19 +7980,12 @@ def library_export_manifest_page():
             continue
         try:
             blob_name = resolve_physical_blob_name(library_id, filename, 'image')
-            # download_filename=filename: anonymized blobs need the SAS's
-            # Content-Disposition override so the browser's own save step
-            # (the plain <a download> in libraryExportDownloader.ts) restores
-            # the real name instead of the opaque UUID.
-            download_url, _expires_at = _create_stable_read_sas_url(
-                BLOB_IMAGE_CONTAINER, blob_name, download_filename=filename,
-            )
         except Exception:
-            app.logger.warning('Skipping %s from export manifest for %s: could not sign a URL', filename, library_id)
+            app.logger.warning('Skipping %s from export manifest for %s: could not resolve its blob', filename, library_id)
             continue
-        files.append({'filename': filename, 'url': download_url})
+        files.append({'filename': filename, 'blobName': blob_name})
 
-    return jsonify({'files': files, 'nextCursor': next_cursor})
+    return jsonify({'baseUrl': base_url, 'sas': sas, 'files': files, 'nextCursor': next_cursor})
 
 
 @app.route('/api/library/clean/request', methods=['POST'])
@@ -8606,6 +8620,34 @@ def _create_stable_read_sas_url(
     )
     blob_client = blob_service_client.get_blob_client(container=container_name, blob=filename)
     return f'{blob_client.url}?{sas}', expires_on.isoformat()
+
+
+def _stable_container_read_sas(container_name: str) -> Tuple[str, str, str]:
+    """One read-only SAS scoped to the whole container -- day-aligned and
+    deterministic like _create_stable_read_sas_url above, but signed ONCE per
+    call instead of once per blob. Returns (base_url, sas_query_string,
+    expires_at_iso); the caller builds each blob's URL as
+    f'{base_url}/{quote(blob_name)}?{sas}'.
+
+    generate_container_sas is a pure local HMAC computation against the
+    already-cached user-delegation-key (see _stable_delegation_key), so this
+    costs the same as signing one blob URL -- the saving comes from
+    library_export_manifest_page calling it once per page instead of once per
+    row, which is what actually matters at up to ~500k files per library.
+    """
+    if not account_name:
+        raise RuntimeError('Storage account name is not configured')
+    key, starts_on, expires_on = _stable_delegation_key()
+    sas = generate_container_sas(
+        account_name=account_name,
+        container_name=container_name,
+        user_delegation_key=key,
+        permission=ContainerSasPermissions(read=True),
+        start=starts_on,
+        expiry=expires_on,
+    )
+    container_client = blob_service_client.get_container_client(container_name)
+    return container_client.url, sas, expires_on.isoformat()
 
 
 _MEDIA_KIND_CONTAINERS = {

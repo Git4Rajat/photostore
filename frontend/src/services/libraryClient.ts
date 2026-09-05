@@ -335,17 +335,24 @@ export const getLibraryDownloadStatus = async (jobId: string): Promise<DownloadS
 
 export interface ExportManifestFile {
     filename: string;
-    url: string;
+    blobName: string;
 }
 
 export interface ExportManifestPage {
+    // One SAS shared by every file on every page of this export, not one per
+    // file -- signing a container-scoped token costs the backend the same as
+    // signing a single blob URL, so doing it once per page instead of once
+    // per row is what actually keeps a 500k-file export cheap for the
+    // backend. Build each file's URL as `${baseUrl}/${encodeURIComponent(blobName)}?${sas}`.
+    baseUrl: string;
+    sas: string;
     files: ExportManifestFile[];
     nextCursor: string | null;
 }
 
-// One page of {filename, url} entries for the client-orchestrated export
-// (see services/libraryExportDownloader.ts) -- the browser downloads every
-// original file directly from blob storage instead of waiting on a
+// One page of {filename, blobName} entries for the client-orchestrated
+// export (see services/libraryExportDownloader.ts) -- the browser downloads
+// every original file directly from blob storage instead of waiting on a
 // server-built zip. Pass the previous page's nextCursor to continue; omit it
 // (or pass null) to start from the beginning of the library.
 export const getLibraryExportManifestPage = async (cursor?: string | null): Promise<ExportManifestPage> => {
@@ -356,3 +363,9 @@ export const getLibraryExportManifestPage = async (cursor?: string | null): Prom
     }
     return response.json();
 };
+
+// Builds a file's actual downloadable URL from a manifest page's shared
+// baseUrl/sas and one entry's blobName.
+export const buildExportFileUrl = (page: Pick<ExportManifestPage, 'baseUrl' | 'sas'>, blobName: string): string => (
+    `${page.baseUrl}/${encodeURIComponent(blobName)}?${page.sas}`
+);
