@@ -3061,7 +3061,14 @@ def _create_person_entity(
     *,
     person_id: Optional[str] = None,
     name: str = '',
+    _defer_into: Optional[Dict[str, Dict]] = None,
 ) -> str:
+    """_defer_into lets a caller doing many of these in one pass (see
+    cluster_user_faces) stage entities into a dict keyed by person_id instead
+    of writing immediately -- last write per person_id naturally wins, same
+    final state as calling this repeatedly, but the caller can then flush
+    everything in one _batch_upsert_entities call instead of one network
+    round-trip per cluster."""
     if person_table_client is None:
         return ''
     person_id = person_id or str(uuid.uuid4())
@@ -3073,6 +3080,9 @@ def _create_person_entity(
         'repEmbedding': json.dumps(rep_embedding),
         'createdAt': None,
     }
+    if _defer_into is not None:
+        _defer_into[person_id] = entity
+        return person_id
     try:
         person_table_client.upsert_entity(entity)
     except Exception:
@@ -4326,7 +4336,17 @@ def cluster_user_faces(
     created_by_person_id: Dict[str, Dict[str, object]] = {}
     faces_to_update = []  # Batch updates instead of one-by-one
     metadata_updates: Dict[str, set] = {}  # filename -> person ids
-    
+    # Staged, not written yet -- _create_person_entity(_defer_into=...) below
+    # stashes each cluster's person entity here instead of upserting inline.
+    # 2026-09-04: this loop runs once per DBSCAN cluster (thousands, at this
+    # account's ~15k-face scale) and used to call upsert_entity() inline on
+    # every iteration -- one sequential network round-trip per cluster, the
+    # dominant cost of a full recluster once _split_cluster_by_max_pair_distance's
+    # O(n^3) hang (fixed the same day) was no longer masking it. Deduping by
+    # person_id here also means a person touched by multiple clusters gets
+    # written once with its final combined faceIds, not once per touch.
+    person_entities_to_write: Dict[str, Dict] = {}
+
     for label, indices in clusters.items():
         cluster_face_ids = [face_ids[i] for i in indices]
         cluster_faces = []
@@ -4382,6 +4402,7 @@ def cluster_user_faces(
                 combined_rep,
                 person_id=person_id,
                 name=str((existing_created or {}).get('name') or matched_name),
+                _defer_into=person_entities_to_write,
             )
             if existing_created is not None:
                 existing_created['faceIds'] = combined_face_ids
@@ -4410,6 +4431,7 @@ def cluster_user_faces(
                 combined_rep,
                 person_id=person_id,
                 name=matched_name,
+                _defer_into=person_entities_to_write,
             )
             created_entry = {
                 'personId': person_id,
@@ -4435,12 +4457,14 @@ def cluster_user_faces(
                     metadata_updates[filename] = set()
                 metadata_updates[filename].add(person_id)
 
-    # Batch update faces (more efficient than one-by-one)
-    for face_ent in faces_to_update:
-        try:
-            face_table_client.upsert_entity(face_ent)
-        except Exception:
-            pass
+    # Flush every cluster's staged person entity now, deduped by person_id,
+    # in real Table Storage transactional batches instead of the sequential
+    # upsert-per-cluster this used to be.
+    _batch_upsert_entities(person_table_client, list(person_entities_to_write.values()))
+
+    # Batch update faces -- was a sequential upsert-per-face loop despite the
+    # comment; see _batch_upsert_entities for why this is now a real batch.
+    _batch_upsert_entities(face_table_client, faces_to_update)
 
     candidate_face_ids = set(face_ids)
     assigned_face_ids = {str(face_ent.get('RowKey') or '') for face_ent in faces_to_update if face_ent.get('RowKey')}
@@ -4453,11 +4477,15 @@ def cluster_user_faces(
             'unexpectedFaceIds': sorted(assigned_face_ids - candidate_face_ids)[:50],
         }
 
-    # Batch update metadata
+    # Batch update metadata -- was a sequential upsert-per-photo loop despite
+    # the comment (same class of bug as the two loops above: fine at a
+    # handful of touched photos, thousands of sequential round-trips once a
+    # full recluster touches most of a ~15k-face library).
     if metadata_updates:
         try:
             query = f"PartitionKey eq '{_escape_odata(user_id)}'"
             metadata_rows = list(metadata_table_client.query_entities(query))
+            metadata_entities_to_update = []
             for metadata in metadata_rows:
                 if metadata.get('RowKey') in metadata_updates:
                     people_ids = parse_json_list(metadata.get('peopleIds', '[]'))
@@ -4465,10 +4493,8 @@ def cluster_user_faces(
                         if person_id not in people_ids:
                             people_ids.append(person_id)
                     metadata['peopleIds'] = json.dumps(people_ids)
-                    try:
-                        metadata_table_client.upsert_entity(metadata)
-                    except Exception:
-                        pass
+                    metadata_entities_to_update.append(metadata)
+            _batch_upsert_entities(metadata_table_client, metadata_entities_to_update)
         except Exception:
             pass
 
