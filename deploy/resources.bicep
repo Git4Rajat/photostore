@@ -825,10 +825,10 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             { name: 'PEOPLE_SCAN_CACHE_TTL_SECONDS', value: '120' }
             // How often the background orphaned-photo sweep runs per
             // replica (backend/app.py, _ipwork_sweep_loop). Kept in sync
-            // with the 'ipwork-sweep-wake' cron rule's 20-minute period
-            // above -- a replica only stays up for that rule's 5-minute
-            // window, so this only needs to fire once per wake.
-            { name: 'IPWORK_SWEEP_INTERVAL_SECONDS', value: '1200' }
+            // with the 'ipwork-sweep-wake' cron rule's ~5-day period below --
+            // a replica only stays up for that rule's 5-minute window, so
+            // this only needs to fire once per wake.
+            { name: 'IPWORK_SWEEP_INTERVAL_SECONDS', value: '432000' }
           ])
         }
       ]
@@ -876,20 +876,25 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // leaves the queue empty forever, so with only that rule
             // ipworker would never come up to run its own background
             // orphaned-photo sweep (_ipwork_sweep_loop in backend/app.py).
-            // This cron rule wakes one replica for a 5-minute window every
-            // 20 minutes purely so that sweep gets a chance to run,
+            // This cron rule wakes one replica for a 5-minute window roughly
+            // every 5 days purely so that sweep gets a chance to run,
             // independent of current queue depth; it scales back to 0
             // afterward same as the queue rule. Keep this in sync with
-            // IPWORK_SWEEP_INTERVAL_SECONDS below (also 20 min) -- a wider
+            // IPWORK_SWEEP_INTERVAL_SECONDS below (also 5 days) -- a wider
             // gap here would leave a wake cycle with nothing to do, and a
             // narrower one would waste replica time re-sweeping mid-cycle.
+            // Standard cron has no native "every N days" step that survives
+            // month boundaries -- day-of-month '*/5' fires on 1,6,11,...,26,31
+            // and simply skips a date that doesn't exist in a shorter month
+            // (e.g. Feb), so real gaps land at 5 days +/- a few, not exactly
+            // 5.00 days. Fine for a background safety-net sweep.
             name: 'ipwork-sweep-wake'
             custom: {
               type: 'cron'
               metadata: {
                 timezone: 'Etc/UTC'
-                start: '0,20,40 * * * *'
-                end: '5,25,45 * * * *'
+                start: '0 0 */5 * *'
+                end: '5 0 */5 * *'
                 desiredReplicas: '1'
               }
             }
