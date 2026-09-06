@@ -28,7 +28,7 @@ def _entity(**overrides):
     return base
 
 
-def test_meta_for_open_album_uses_real_name_and_photo_thumbnail(monkeypatch):
+def test_meta_for_open_album_uses_real_name_and_full_size_photo(monkeypatch):
     monkeypatch.setattr(app, 'SPA_BASE_URL', 'https://app.example.com')
     monkeypatch.setattr(app, '_get_metadata_entity', lambda owner_id, name: {})
 
@@ -37,11 +37,13 @@ def test_meta_for_open_album_uses_real_name_and_photo_thumbnail(monkeypatch):
 
     assert meta['title'] == 'Beach Trip 2026'
     assert '2 photo' in meta['description']
-    # Falls back to the relative proxy thumbnail route when no blob/SAS
-    # client is configured (as in this test environment); it must still be
-    # made absolute against the backend's own host, not left relative.
+    # Uses the full-size photo, not the 120x120 thumbnail -- WhatsApp/Facebook
+    # silently drop link-preview images below ~200x200. Falls back to the
+    # relative proxy image route when no blob/SAS client is configured (as in
+    # this test environment); it must still be made absolute against the
+    # backend's own host, not left relative.
     assert meta['image'].startswith('http')
-    assert '/public/photos/tok123/thumbnail/IMG_0001.jpg' in meta['image']
+    assert '/public/photos/tok123/image/IMG_0001.jpg' in meta['image']
     assert not meta['image_is_fallback']
 
 

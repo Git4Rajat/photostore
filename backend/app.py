@@ -6527,9 +6527,14 @@ def _public_album_share_meta(entity: Optional[Dict], token: str) -> Dict[str, st
         first_name = filenames[0]
         metadata = _get_metadata_entity(owner_id, first_name) if owner_id else {}
         blob_name = _blob_name_from_metadata(metadata, first_name)
-        thumb = _public_photo_urls(token, first_name, blob_name=blob_name).get('thumbnailUrl') or ''
-        if thumb:
-            image = thumb if thumb.startswith('http') else f"{request.host_url.rstrip('/')}{thumb}"
+        urls = _public_photo_urls(token, first_name, blob_name=blob_name)
+        # Thumbnails are bounded to 120x120 -- below WhatsApp/Facebook's ~200x200
+        # minimum for a link-preview image, so their crawler silently drops it.
+        # Prefer the full-size photo; previewUrl is the browser-viewable
+        # conversion for RAW/HEIC formats crawlers can't decode directly.
+        share_image = urls.get('previewUrl') or urls.get('url') or urls.get('thumbnailUrl') or ''
+        if share_image:
+            image = share_image if share_image.startswith('http') else f"{request.host_url.rstrip('/')}{share_image}"
             image_is_fallback = False
     return {
         'title': name,
