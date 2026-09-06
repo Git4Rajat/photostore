@@ -158,6 +158,25 @@ export const startLibraryExport = (
         return next;
     };
 
+    // A 500k-file library pages through this ~1000 times over a run that can
+    // span hours -- a single transient blip (one dropped connection, one
+    // backend 503 under load) shouldn't end the whole unattended export, so
+    // retry a few times with backoff before treating a page as a fatal
+    // listing error.
+    const MANIFEST_PAGE_RETRIES = 4;
+    const fetchManifestPageWithRetry = async (cursor: string | null): Promise<library.ExportManifestPage> => {
+        let lastError: unknown;
+        for (let attempt = 0; attempt < MANIFEST_PAGE_RETRIES; attempt += 1) {
+            if (attempt > 0) await wait(1000 * 2 ** (attempt - 1));
+            try {
+                return await library.getLibraryExportManifestPage(cursor);
+            } catch (e) {
+                lastError = e;
+            }
+        }
+        throw lastError instanceof Error ? lastError : new Error('Could not list the library for export.');
+    };
+
     const listManifest = async () => {
         let cursor: string | null = null;
         while (!cancelled) {
@@ -167,7 +186,7 @@ export const startLibraryExport = (
             }
             let page: library.ExportManifestPage;
             try {
-                page = await library.getLibraryExportManifestPage(cursor);
+                page = await fetchManifestPageWithRetry(cursor);
             } catch (e) {
                 listingError = e instanceof Error ? e.message : 'Could not list the library for export.';
                 return;
@@ -188,26 +207,37 @@ export const startLibraryExport = (
         const existing = await getFileStatus(libraryId, filename);
         if (existing !== 'saved') {
             if (existing !== 'staged') {
-                const offset = await stagedByteCount(filename);
+                const offset = await stagedByteCount(libraryId, filename);
                 const headers: Record<string, string> = offset > 0 ? { Range: `bytes=${offset}-` } : {};
                 const response = await fetch(url, { headers });
-                if (!response.ok && response.status !== 206) {
-                    throw new Error(`Download failed (${response.status}).`);
+                // 416 means the offset already covers the whole file -- the
+                // OPFS write finished in an earlier run but the 'staged'
+                // status write never landed (tab closed/reloaded between the
+                // two, which the hard-refresh recovery reload above can
+                // trigger more often than a normal close would). Without
+                // this, every retry re-requests the same past-the-end range,
+                // gets 416 again, and this file can never succeed.
+                if (response.status === 416) {
+                    await setFileStatus(libraryId, filename, 'staged');
+                } else {
+                    if (!response.ok && response.status !== 206) {
+                        throw new Error(`Download failed (${response.status}).`);
+                    }
+                    // A plain 200 with a nonzero offset means the server didn't
+                    // honor the Range request -- the body is the whole file, so
+                    // the partial staging copy must be discarded, not appended to.
+                    const actualOffset = response.status === 200 ? 0 : offset;
+                    await writeResponseToStaging(libraryId, filename, response, actualOffset);
+                    await setFileStatus(libraryId, filename, 'staged');
                 }
-                // A plain 200 with a nonzero offset means the server didn't
-                // honor the Range request -- the body is the whole file, so
-                // the partial staging copy must be discarded, not appended to.
-                const actualOffset = response.status === 200 ? 0 : offset;
-                await writeResponseToStaging(filename, response, actualOffset);
-                await setFileStatus(libraryId, filename, 'staged');
             }
         }
         if (existing !== 'saved') {
-            const file = await readStagedFile(filename);
+            const file = await readStagedFile(libraryId, filename);
             const downloadUrl = await prepareServiceWorkerDownload(filename, file);
             await scheduleTrigger(downloadUrl);
             await setFileStatus(libraryId, filename, 'saved');
-            await removeStagedFile(filename);
+            await removeStagedFile(libraryId, filename);
         }
         filesSaved += 1;
     };

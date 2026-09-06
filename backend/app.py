@@ -7938,7 +7938,15 @@ def library_export_manifest_page():
     if error:
         return error
     if metadata_table_client is None:
-        return jsonify({'files': [], 'nextCursor': None})
+        # An empty-but-shaped-like-success {files: [], nextCursor: None}
+        # response here would satisfy the client's type but not its actual
+        # contract (baseUrl/sas are also required, see ExportManifestPage in
+        # libraryClient.ts) -- the export would silently treat a backend
+        # storage outage as "this library has zero files" and report "Done"
+        # rather than surfacing the real problem, since a 200 response never
+        # makes getLibraryExportManifestPage throw. Matching the same-shaped
+        # failure a few lines below (SAS signing failing) instead.
+        return jsonify({'error': 'Could not list library contents.'}), 503
 
     try:
         page_size = max(1, min(int(request.args.get('pageSize', str(LIBRARY_EXPORT_MANIFEST_PAGE_SIZE))), 2000))

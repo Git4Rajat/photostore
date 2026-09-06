@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as library from '../services/libraryClient';
 import { startLibraryExport, ExportController, ExportProgress } from '../services/libraryExportDownloader';
-import { isOpfsSupported } from '../services/opfsDownloadStaging';
+import { verifyOpfsUsable } from '../services/opfsDownloadStaging';
 import { getRuntimeConfig } from '../config/appConfig';
 import { Loading } from './shared/Loading';
 import { confirmDialog } from './shared/dialogs';
@@ -46,6 +46,24 @@ const LibraryPage: React.FC = () => {
     const [exportOutcome, setExportOutcome] = useState<'idle' | 'running' | 'done'>('idle');
     const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
     const exportControllerRef = useRef<ExportController | null>(null);
+    // null while the async probe is still running -- confirmed live 2026-09-06
+    // that a browser can expose navigator.storage.getDirectory as a function
+    // while it actually rejects every call ("operation failed for an unknown
+    // transient reason"), observed consistently in WebKit. A shape check
+    // alone can't catch that, so this actually calls it once; without it,
+    // every file in the export failed individually with that cryptic message
+    // while the UI still ended on "Done". Kept as an initial-mount check
+    // rather than one call per export start -- if OPFS is unusable, its own
+    // handle stays unusable for the rest of the page's life.
+    const [opfsUsable, setOpfsUsable] = useState<boolean | null>(null);
+    // Idempotency guard for startExport itself (see there) -- the button
+    // below is only disabled via React state (`busy`, which this flow never
+    // sets), so two clicks landing before a re-render, or a manual click
+    // racing the auto-resume effect, would otherwise launch two concurrent
+    // startLibraryExport orchestrators against the same IndexedDB/OPFS
+    // records with no de-dup between them. Same class of bug the existing
+    // sendInFlightRef above guards against for the invite form.
+    const exportRunningRef = useRef(false);
 
     const load = useCallback(async () => {
         setError('');
@@ -98,6 +116,8 @@ const LibraryPage: React.FC = () => {
     // it active in localStorage so a reload can restart it automatically
     // instead of silently going idle mid-download.
     const startExport = useCallback((libraryId: string) => {
+        if (exportRunningRef.current) return;
+        exportRunningRef.current = true;
         try {
             window.localStorage.setItem(exportActiveStorageKey(libraryId), '1');
         } catch {
@@ -118,16 +138,29 @@ const LibraryPage: React.FC = () => {
                     // since every file is already marked 'saved'.
                 }
                 exportControllerRef.current = null;
+                exportRunningRef.current = false;
                 setExportOutcome('done');
             },
         );
     }, []);
 
+    useEffect(() => {
+        let cancelled = false;
+        verifyOpfsUsable().then((ok) => {
+            if (!cancelled) setOpfsUsable(ok);
+        });
+        return () => { cancelled = true; };
+    }, []);
+
     // Auto-resume an export that was still running when the page last
-    // unloaded.
+    // unloaded. Waits for opfsUsable === true (not just "not false") so a
+    // reload can't race ahead of the probe and start fetching/staging before
+    // we know OPFS actually works here. No separate de-dup guard needed here
+    // beyond startExport's own exportRunningRef -- that's the single choke
+    // point every caller (this effect, the button) goes through.
     useEffect(() => {
         const libraryId = mine?.activeLibraryId;
-        if (!libraryId) return;
+        if (!libraryId || opfsUsable !== true) return;
         let active = false;
         try {
             active = window.localStorage.getItem(exportActiveStorageKey(libraryId)) === '1';
@@ -135,16 +168,17 @@ const LibraryPage: React.FC = () => {
             active = false;
         }
         if (active) startExport(libraryId);
-    }, [mine?.activeLibraryId, startExport]);
+    }, [mine?.activeLibraryId, opfsUsable, startExport]);
 
     const handleStartExport = () => {
         const libraryId = mine?.activeLibraryId;
-        if (libraryId) startExport(libraryId);
+        if (libraryId && opfsUsable) startExport(libraryId);
     };
 
     const handleCancelExport = () => {
         exportControllerRef.current?.cancel();
         exportControllerRef.current = null;
+        exportRunningRef.current = false;
         const libraryId = mine?.activeLibraryId;
         if (libraryId) {
             try {
@@ -395,11 +429,14 @@ const LibraryPage: React.FC = () => {
                             a "this site is downloading multiple files" notice near your address bar and
                             allow it — most browsers pause automatic downloads until you approve that once.
                         </p>
-                        {!isOpfsSupported() ? (
+                        {opfsUsable === false ? (
                             <p className="status error">
-                                Your browser doesn't support the private storage this download needs in order
-                                to resume safely. Try the latest Chrome, Edge, Firefox, or Safari.
+                                Your browser is blocking the private storage this download needs in order to
+                                resume safely — this happens in Private/Incognito browsing in some browsers.
+                                Try a normal (non-private) window, or the latest Chrome, Edge, or Firefox.
                             </p>
+                        ) : opfsUsable === null ? (
+                            <p className="status">Checking browser support…</p>
                         ) : exportOutcome === 'running' ? (
                             <>
                                 <p className="status">
