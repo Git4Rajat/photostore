@@ -28,22 +28,19 @@ def _entity(**overrides):
     return base
 
 
-def test_meta_for_open_album_uses_real_name_and_full_size_photo(monkeypatch):
+def test_meta_for_open_album_uses_real_name_and_share_preview_route(monkeypatch):
     monkeypatch.setattr(app, 'SPA_BASE_URL', 'https://app.example.com')
-    monkeypatch.setattr(app, '_get_metadata_entity', lambda owner_id, name: {})
 
     with app.app.test_request_context('/public/album/tok123'):
         meta = app._public_album_share_meta(_entity(), 'tok123')
 
     assert meta['title'] == 'Beach Trip 2026'
     assert '2 photo' in meta['description']
-    # Uses the full-size photo, not the 120x120 thumbnail -- WhatsApp/Facebook
-    # silently drop link-preview images below ~200x200. Falls back to the
-    # relative proxy image route when no blob/SAS client is configured (as in
-    # this test environment); it must still be made absolute against the
-    # backend's own host, not left relative.
-    assert meta['image'].startswith('http')
-    assert '/public/photos/tok123/image/IMG_0001.jpg' in meta['image']
+    # Points at our own resized share-preview route rather than the raw
+    # thumbnail (120x120, below WhatsApp/Facebook's ~200x200 minimum -- gets
+    # silently dropped) or the full original (can be 10MB+, over most
+    # crawlers' size caps).
+    assert meta['image'] == 'http://localhost/public/photos/tok123/share-preview/IMG_0001.jpg'
     assert not meta['image_is_fallback']
 
 
@@ -103,7 +100,6 @@ def test_render_omits_dimensions_for_real_photo_thumbnail():
 def test_share_page_route_returns_html_with_meta_refresh(monkeypatch):
     monkeypatch.setattr(app, 'SPA_BASE_URL', 'https://app.example.com')
     monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: _entity())
-    monkeypatch.setattr(app, '_get_metadata_entity', lambda owner_id, name: {})
 
     client = app.app.test_client()
     resp = client.get('/public/album/tok123')
@@ -127,6 +123,42 @@ def test_share_page_route_handles_unknown_token_generically(monkeypatch):
     body = resp.get_data(as_text=True)
     assert 'Shared album' in body
     assert 'https://app.example.com/public/album/does-not-exist' in body
+
+
+def test_share_preview_route_returns_resized_jpeg(monkeypatch):
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: _entity())
+    monkeypatch.setattr(app, 'resolve_physical_blob_name', lambda owner_id, name, kind: 'blob-1')
+    monkeypatch.setattr(app, 'download_media_bytes', lambda kind, blob_name: b'raw-source-bytes')
+    monkeypatch.setattr(app, 'convert_image_to_jpeg', lambda data, filename: b'resized-jpeg-bytes')
+
+    client = app.app.test_client()
+    resp = client.get('/public/photos/tok123/share-preview/IMG_0001.jpg')
+
+    assert resp.status_code == 200
+    assert resp.content_type == 'image/jpeg'
+    assert resp.get_data() == b'resized-jpeg-bytes'
+    assert resp.headers['Cache-Control'] == 'public, max-age=86400'
+
+
+def test_share_preview_route_404s_for_locked_album(monkeypatch):
+    """A crawler request carries no access-code grant cookie, so a locked
+    album's real photo must never be served here even if the exact filename
+    is guessed."""
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: _entity(accessCode='1234'))
+
+    client = app.app.test_client()
+    resp = client.get('/public/photos/tok123/share-preview/IMG_0001.jpg')
+
+    assert resp.status_code == 404
+
+
+def test_share_preview_route_404s_for_filename_not_in_album(monkeypatch):
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: _entity())
+
+    client = app.app.test_client()
+    resp = client.get('/public/photos/tok123/share-preview/not-in-album.jpg')
+
+    assert resp.status_code == 404
 
 
 def test_public_url_in_album_payload_points_at_backend_share_page(monkeypatch):

@@ -6523,19 +6523,13 @@ def _public_album_share_meta(entity: Optional[Dict], token: str) -> Dict[str, st
     image = fallback_image
     image_is_fallback = True
     if filenames:
-        owner_id = str(entity.get('PartitionKey') or '')
+        # /public/photos/<token>/share-preview/<filename> always returns a
+        # properly link-preview-sized JPEG (2048px/~3.9MB bound) regardless of
+        # source format/resolution -- the raw thumbnail (120x120) is too small
+        # for WhatsApp/Facebook's crawler and the full original can be 10MB+.
         first_name = filenames[0]
-        metadata = _get_metadata_entity(owner_id, first_name) if owner_id else {}
-        blob_name = _blob_name_from_metadata(metadata, first_name)
-        urls = _public_photo_urls(token, first_name, blob_name=blob_name)
-        # Thumbnails are bounded to 120x120 -- below WhatsApp/Facebook's ~200x200
-        # minimum for a link-preview image, so their crawler silently drops it.
-        # Prefer the full-size photo; previewUrl is the browser-viewable
-        # conversion for RAW/HEIC formats crawlers can't decode directly.
-        share_image = urls.get('previewUrl') or urls.get('url') or urls.get('thumbnailUrl') or ''
-        if share_image:
-            image = share_image if share_image.startswith('http') else f"{request.host_url.rstrip('/')}{share_image}"
-            image_is_fallback = False
+        image = f"{request.host_url.rstrip('/')}/public/photos/{token}/share-preview/{first_name}"
+        image_is_fallback = False
     return {
         'title': name,
         'description': description,
@@ -15026,6 +15020,41 @@ def public_image(token: str, filename: str):
             return jsonify({'error': 'File not found in storage'}), 404
         app.logger.exception('Failed to serve public image for %s', safe_name)
         return jsonify({'error': 'Failed to retrieve image'}), 500
+
+
+@app.route('/public/photos/<token>/share-preview/<path:filename>', methods=['GET'])
+def public_photo_share_preview(token: str, filename: str):
+    """A properly link-preview-sized JPEG for a public album's OG image.
+
+    The original photo (used directly for `url`) can be many MB at full
+    sensor resolution -- too large for WhatsApp/Facebook/Slack/Twitter's
+    crawler size caps (5-8MB) -- while the 120x120 gallery thumbnail is below
+    their ~200x200 minimum and gets silently dropped instead. This reuses
+    `convert_image_to_jpeg` (already used by the RAW/HEIC preview route
+    above), which bounds to 2048px / ~3.9MB via `_encode_vision_jpeg` --
+    comfortably inside every major platform's limits.
+    """
+    entity = _find_public_album_by_token(token)
+    if not entity or not _coerce_bool(entity.get('isPublic', False)) or _album_is_expired(entity):
+        return jsonify({'error': 'Not found'}), 404
+    if not _album_grant_valid(entity, token):
+        return jsonify({'error': 'Not found'}), 404
+    safe_name = _validate_media_filename(filename)
+    if not safe_name or safe_name not in _album_filenames(entity):
+        return jsonify({'error': 'Not found'}), 404
+    try:
+        owner_id = str(entity.get('PartitionKey') or '')
+        blob_name = resolve_physical_blob_name(owner_id, safe_name, 'image') if owner_id else safe_name
+        image_bytes = download_media_bytes('image', blob_name)
+        preview_bytes = convert_image_to_jpeg(image_bytes, safe_name)
+        resp = Response(preview_bytes, mimetype='image/jpeg')
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        return resp
+    except Exception as exc:
+        if _is_missing_media_error(exc):
+            return jsonify({'error': 'File not found in storage'}), 404
+        app.logger.exception('Failed to build public share-preview image for %s', safe_name)
+        return jsonify({'error': 'Failed to build preview'}), 503
 
 
 @app.route('/public/photos/<token>/preview/<path:filename>', methods=['GET'])
