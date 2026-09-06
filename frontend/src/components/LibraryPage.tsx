@@ -115,7 +115,7 @@ const LibraryPage: React.FC = () => {
     // libraryExportDownloader.ts) the client-orchestrated export, and flags
     // it active in localStorage so a reload can restart it automatically
     // instead of silently going idle mid-download.
-    const startExport = useCallback((libraryId: string) => {
+    const startExport = useCallback((libraryId: string, options?: { forceRestart?: boolean }) => {
         if (exportRunningRef.current) return;
         exportRunningRef.current = true;
         try {
@@ -141,6 +141,7 @@ const LibraryPage: React.FC = () => {
                 exportRunningRef.current = false;
                 setExportOutcome('done');
             },
+            options,
         );
     }, []);
 
@@ -172,7 +173,18 @@ const LibraryPage: React.FC = () => {
 
     const handleStartExport = () => {
         const libraryId = mine?.activeLibraryId;
-        if (libraryId && opfsUsable) startExport(libraryId);
+        if (!libraryId || !opfsUsable) return;
+        // "Download again" (a fully-finished run, no fatalError) means the
+        // user deliberately wants everything a second time -- force a
+        // restart so it doesn't silently skip every file as already
+        // 'saved' and report a false "Done" with zero real downloads
+        // (confirmed live 2026-09-06). "Try again" (a run that stopped via
+        // fatalError, e.g. listing failed partway through) should still
+        // resume rather than restart -- some files in that run may already
+        // be genuinely saved and shouldn't be re-downloaded. The very first
+        // click (idle) has no prior records for this library either way.
+        const forceRestart = exportOutcome === 'done' && !exportProgress?.fatalError;
+        startExport(libraryId, { forceRestart });
     };
 
     const handleCancelExport = () => {

@@ -65,6 +65,38 @@ const setFileStatus = async (libraryId: string, filename: string, status: FileSt
     db.close();
 };
 
+// Wipes this library's 'saved'/'staged' records so a deliberate re-export
+// (LibraryPage's "Download again", after a run already finished) actually
+// re-downloads everything instead of silently no-op'ing -- confirmed live
+// 2026-09-06 that without this, stageAndSaveOne sees every file already
+// 'saved' from the prior run, skips both the fetch and the actual browser
+// download trigger for all of them, yet still counts them into filesSaved
+// and reports "Done — N file(s) saved" as if it had just done real work.
+// Auto-resume (reloading mid-run) must NOT go through this path -- that
+// case relies on exactly the records this clears to avoid re-downloading
+// files a previous, interrupted run already finished.
+const clearLibraryExportStatus = async (libraryId: string): Promise<void> => {
+    const db = await openExportDb();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(FILES_STORE, 'readwrite');
+        // Keys are `${libraryId}::${filename}` -- this range visits only this
+        // library's own entries, not every library ever exported on this
+        // device.
+        const range = IDBKeyRange.bound(`${libraryId}::`, `${libraryId}::￿`);
+        const request = tx.objectStore(FILES_STORE).openCursor(range);
+        request.onsuccess = () => {
+            const cursor = request.result;
+            if (cursor) {
+                cursor.delete();
+                cursor.continue();
+            }
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Failed to clear export status.'));
+    });
+    db.close();
+};
+
 export interface ExportError {
     filename: string;
     message: string;
@@ -120,6 +152,7 @@ export const startLibraryExport = (
     libraryId: string,
     onProgress: (progress: ExportProgress) => void,
     onDone: () => void,
+    options?: { forceRestart?: boolean },
 ): ExportController => {
     let cancelled = false;
     const queue: QueuedFile[] = [];
@@ -261,6 +294,10 @@ export const startLibraryExport = (
     };
 
     (async () => {
+        if (options?.forceRestart) {
+            await clearLibraryExportStatus(libraryId);
+        }
+        if (cancelled) return;
         const listing = listManifest();
         const workers = Array.from({ length: EXPORT_CONCURRENCY }, () => runWorker());
         await Promise.all([listing, ...workers]);
