@@ -3,7 +3,9 @@
 // own download mechanism, instead of waiting on a server-built zip. No
 // folder picker: every file lands wherever the browser already saves
 // downloads. See opfsDownloadStaging.ts for how a file survives a closed tab
-// or a restart mid-download.
+// or a restart mid-download, and serviceWorkerDownload.ts for how the final
+// save avoids both a real Safari blob: URL bug and cross-origin filename
+// restrictions.
 //
 // Progress and per-file status live in a dedicated IndexedDB database (not
 // localStorage -- this needs structured per-file records, not one blob) so a
@@ -21,6 +23,7 @@
 // correctness matters far more here than the resume-speed optimization did.
 import * as library from './libraryClient';
 import { stagedByteCount, writeResponseToStaging, readStagedFile, removeStagedFile } from './opfsDownloadStaging';
+import { prepareServiceWorkerDownload, triggerPreparedDownload } from './serviceWorkerDownload';
 
 const DB_NAME = 'photostore-library-export';
 const FILES_STORE = 'files';
@@ -101,12 +104,10 @@ const EXPORT_CONCURRENCY = 4;
 // the final save step (not the fetch/stage step, which stays fully
 // concurrent) keeps well under that without slowing the actual transfer.
 // There's no code-level fix for a save a browser silently blocks under this
-// heuristic (page JS gets no signal either way, confirmed live 2026-09-05 by
-// a "Couldn't download - Network issue" report whose "(1)" filename means the
-// browser's own retry of a blocked save hit an already-revoked, one-shot
-// blob: URL) -- pacing only reduces how often it happens; LibraryPage's copy
-// tells the user to look for and approve a "multiple downloads" prompt near
-// the address bar if files seem to be failing.
+// heuristic (page JS gets no signal either way) -- pacing only reduces how
+// often it happens; LibraryPage's copy tells the user to look for and
+// approve a "multiple downloads" prompt near the address bar if files seem
+// to be failing.
 const MIN_SAVE_INTERVAL_MS = 500;
 // Bounds how many {filename, url} entries sit in memory waiting for a free
 // worker -- large enough that listing rarely blocks a worker, small enough
@@ -114,22 +115,6 @@ const MIN_SAVE_INTERVAL_MS = 500;
 const QUEUE_HIGH_WATER = 2000;
 
 const wait = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
-
-const triggerBrowserSave = (file: File, filename: string): void => {
-    const objectUrl = URL.createObjectURL(file);
-    const anchor = document.createElement('a');
-    anchor.href = objectUrl;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    // Revoking immediately can cancel the save in some browsers -- give the
-    // browser's own download handoff generous time to actually start reading
-    // it before the data disappears out from under it (bumped from 30s after
-    // the "(1)"/network-issue report above -- a save queued behind Chrome's
-    // own multi-download throttling can sit longer than 30s before it starts).
-    setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
-};
 
 export const startLibraryExport = (
     libraryId: string,
@@ -144,9 +129,33 @@ export const startLibraryExport = (
     let filesSaved = 0;
     const errors: ExportError[] = [];
     let lastSaveAt = 0;
+    // Strictly serializes the actual save trigger across all EXPORT_CONCURRENCY
+    // workers -- confirmed live 2026-09-06 that two triggers landing close
+    // together are two overlapping main-frame navigations, and the browser
+    // silently cancels one with no signal to page JS. Pacing `lastSaveAt`
+    // alone wasn't enough: two workers can each pass the pacing check, then
+    // spend a different amount of time in prepareServiceWorkerDownload's own
+    // awaits, and still end up triggering within milliseconds of each other.
+    // Chaining onto this promise makes each trigger wait for the previous
+    // one's full completion (pacing included) no matter how the preparation
+    // work interleaves.
+    let clickChain: Promise<void> = Promise.resolve();
 
     const emitProgress = (currentFilename: string | null) => {
         onProgress({ filesSaved, filesSeen, listingComplete, currentFilename, errors: [...errors], fatalError: listingError });
+    };
+
+    const scheduleTrigger = (url: string): Promise<void> => {
+        const next = clickChain.then(async () => {
+            const waitFor = Math.max(0, MIN_SAVE_INTERVAL_MS - (Date.now() - lastSaveAt));
+            if (waitFor > 0) await wait(waitFor);
+            triggerPreparedDownload(url);
+            lastSaveAt = Date.now();
+        });
+        // Keep the chain alive even if this trigger's step throws, so one
+        // bad file can't wedge every save behind it forever.
+        clickChain = next.catch(() => {});
+        return next;
     };
 
     const listManifest = async () => {
@@ -194,12 +203,9 @@ export const startLibraryExport = (
             }
         }
         if (existing !== 'saved') {
-            const now = Date.now();
-            const waitFor = Math.max(0, MIN_SAVE_INTERVAL_MS - (now - lastSaveAt));
-            if (waitFor > 0) await wait(waitFor);
-            lastSaveAt = Date.now();
             const file = await readStagedFile(filename);
-            triggerBrowserSave(file, filename);
+            const downloadUrl = await prepareServiceWorkerDownload(filename, file);
+            await scheduleTrigger(downloadUrl);
             await setFileStatus(libraryId, filename, 'saved');
             await removeStagedFile(filename);
         }
