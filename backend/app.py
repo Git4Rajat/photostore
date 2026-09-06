@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import html
 import io
 import json
 import os
@@ -1495,7 +1496,10 @@ def _album_entity_to_payload(entity: Dict) -> Dict:
     is_expired = _album_is_expired(entity)
     public_url = ''
     if is_public and token and not is_expired:
-        public_url = f"{_get_spa_base_url()}/public/album/{token}"
+        # Points at this backend's own /public/album/<token> share page (not
+        # directly at the SPA) so link-preview bots see the album's real
+        # name/thumbnail; that page then redirects human visitors into the SPA.
+        public_url = f"{request.host_url.rstrip('/')}/public/album/{token}"
     return {
         'id': entity.get('RowKey'),
         'name': entity.get('name', ''),
@@ -6485,6 +6489,93 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
     else:
         candidates.sort(key=lambda item: (len(item['filenames']), item['latest'], item['name']), reverse=True)
     return candidates
+
+
+def _public_album_share_meta(entity: Optional[Dict], token: str) -> Dict[str, str]:
+    """Build the OG/Twitter preview values for a public album's share page.
+
+    Crawlers (iMessage/WhatsApp/Slack link unfurlers) fetch this page without
+    running JS, so an access-code-protected album must stay fully generic here
+    -- a bot can never supply the code, so it must not learn the album's name
+    or see a real photo either.
+    """
+    spa_base = _get_spa_base_url()
+    fallback_image = f'{spa_base}/og-image.png'
+    valid = bool(entity) and _coerce_bool(entity.get('isPublic', False)) and not _album_is_expired(entity)
+    if not valid:
+        return {
+            'title': 'Shared album',
+            'description': 'This shared album link is no longer available.',
+            'image': fallback_image,
+            'image_is_fallback': 'true',
+        }
+    if _album_access_code(entity):
+        return {
+            'title': 'Shared album (locked)',
+            'description': 'This album is protected by an access code.',
+            'image': fallback_image,
+            'image_is_fallback': 'true',
+        }
+    name = str(entity.get('name') or '').strip() or 'Shared album'
+    filenames = _album_filenames(entity)
+    photo_count = len(filenames)
+    description = f'{photo_count} photo{"s" if photo_count != 1 else ""} shared on Keepsake.'
+    image = fallback_image
+    image_is_fallback = True
+    if filenames:
+        owner_id = str(entity.get('PartitionKey') or '')
+        first_name = filenames[0]
+        metadata = _get_metadata_entity(owner_id, first_name) if owner_id else {}
+        blob_name = _blob_name_from_metadata(metadata, first_name)
+        thumb = _public_photo_urls(token, first_name, blob_name=blob_name).get('thumbnailUrl') or ''
+        if thumb:
+            image = thumb if thumb.startswith('http') else f"{request.host_url.rstrip('/')}{thumb}"
+            image_is_fallback = False
+    return {
+        'title': name,
+        'description': description,
+        'image': image,
+        'image_is_fallback': 'true' if image_is_fallback else '',
+    }
+
+
+def _render_public_album_share_page(meta: Dict[str, str], redirect_url: str) -> str:
+    title = html.escape(meta['title'])
+    description = html.escape(meta['description'])
+    image = html.escape(meta['image'], quote=True)
+    redirect = html.escape(redirect_url, quote=True)
+    # The branded fallback image is a fixed 1200x630 asset; a real photo
+    # thumbnail's rendered size varies with its source aspect ratio (thumbnails
+    # are generated bounded within 120x120, not cropped to a fixed box), so we
+    # only advertise dimensions when we know them.
+    dimensions_html = ''
+    if meta.get('image_is_fallback'):
+        dimensions_html = (
+            '\n<meta property="og:image:width" content="1200" />'
+            '\n<meta property="og:image:height" content="630" />'
+        )
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="refresh" content="0; url={redirect}" />
+<title>{title}</title>
+<meta name="description" content="{description}" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Keepsake" />
+<meta property="og:title" content="{title}" />
+<meta property="og:description" content="{description}" />
+<meta property="og:image" content="{image}" />{dimensions_html}
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="{title}" />
+<meta name="twitter:description" content="{description}" />
+<meta name="twitter:image" content="{image}" />
+</head>
+<body>
+<p>Opening the shared album&hellip; if nothing happens, <a href="{redirect}">tap here</a>.</p>
+</body>
+</html>'''
 
 
 def _find_public_album_by_token(token: str) -> Optional[Dict]:
@@ -14768,6 +14859,28 @@ def processing_status():
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
     return response
+
+
+@app.route('/public/album/<token>', methods=['GET'])
+def public_album_share_page(token: str):
+    """Crawler-facing share page for a public album.
+
+    This is the URL users actually copy/share (see `_album_entity_to_payload`).
+    It lives on the backend (not the SPA's own /public/album/<token> route)
+    because the SPA is a static single-page app -- every route serves the same
+    static index.html with fixed OG tags, so link-preview bots (iMessage,
+    WhatsApp, Slack) never see a given album's real name/photo. This page
+    returns real tags for the bot, then meta-refreshes real browsers into the
+    interactive SPA viewer.
+    """
+    entity = _find_public_album_by_token(token)
+    meta = _public_album_share_meta(entity, token)
+    redirect_url = f'{_get_spa_base_url()}/public/album/{_urlquote(str(token))}'
+    resp = make_response(_render_public_album_share_page(meta, redirect_url))
+    resp.headers['Content-Type'] = 'text/html; charset=utf-8'
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
 
 @app.route('/public/albums/<token>', methods=['GET'])
 @app.route('/public/albums/<token>', methods=['POST'])
