@@ -295,6 +295,15 @@ def record_login_success(table_client, row_key: str = _LOGIN_THROTTLE_ROW) -> No
         pass
 
 
+def seconds_until_unlocked(table_client, row_key: str = _LOGIN_THROTTLE_ROW) -> int:
+    """Seconds remaining on a lockout set by ``record_login_failure``, or 0 if unlocked."""
+    try:
+        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=row_key)
+    except Exception:
+        return 0
+    return max(0, int(entity.get('lockedUntil', 0) or 0) - int(time.time()))
+
+
 def consume_reset_token(table_client, raw: str) -> bool:
     """Validate a reset token and invalidate it (single use)."""
     if not raw:

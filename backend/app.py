@@ -1457,6 +1457,7 @@ _ALBUM_GRANT_SECRET = (
     or secrets.token_hex(32)
 )
 _ALBUM_GRANT_COOKIE_PREFIX = 'album_grant_'
+MIN_ALBUM_ACCESS_CODE_LENGTH = 4
 
 
 def _album_access_code(entity: Dict) -> str:
@@ -1482,6 +1483,31 @@ def _album_grant_valid(entity: Dict, token: str) -> bool:
     if not provided:
         return False
     return hmac.compare_digest(provided, _sign_album_grant(token, access_code))
+
+
+def _album_access_code_gate(entity: Dict, token: str, provided: str):
+    """None if the caller may proceed past a public album's access code, else an
+    (response, status) tuple to return as-is.
+
+    Wrong-code attempts are throttled per album token with the same
+    exponential-backoff lockout `password_auth` uses for login attempts, so a
+    public album's access code (which has no format/complexity requirement --
+    it's a plain user-chosen string) can't be brute-forced by an automated
+    caller that already knows the (unguessable) share token.
+    """
+    access_code = _album_access_code(entity)
+    if not access_code or _album_grant_valid(entity, token):
+        return None
+    row_key = f'album-code-throttle:{token}'
+    if not password_auth.login_attempt_allowed(config_table_client, row_key):
+        retry_after = password_auth.seconds_until_unlocked(config_table_client, row_key)
+        return jsonify({'codeRequired': True, 'retryAfterSeconds': retry_after}), 429
+    if provided and hmac.compare_digest(access_code, provided):
+        password_auth.record_login_success(config_table_client, row_key)
+        return None
+    if provided:
+        password_auth.record_login_failure(config_table_client, row_key=row_key)
+    return jsonify({'codeRequired': True, 'retryAfterSeconds': 0}), 401
 
 
 def _album_entity_to_payload(entity: Dict) -> Dict:
@@ -13200,6 +13226,8 @@ def share_album(album_id: str):
     expires_in_days = int(data.get('expiresInDays', 0) or 0)
     access_code = (data.get('accessCode') or '').strip()
     clear_access_code = _coerce_bool(data.get('clearAccessCode', False))
+    if access_code and not clear_access_code and len(access_code) < MIN_ALBUM_ACCESS_CODE_LENGTH:
+        return jsonify({'error': f'Access code must be at least {MIN_ALBUM_ACCESS_CODE_LENGTH} characters.'}), 400
 
     entity['isPublic'] = enabled
     if enabled and not entity.get('publicToken'):
@@ -14900,11 +14928,9 @@ def public_album(token: str):
         data = request.get_json(silent=True) or {}
         provided = (data.get('accessCode') or '').strip()
 
-    if access_code and not (
-        (provided and hmac.compare_digest(access_code, provided))
-        or _album_grant_valid(entity, token)
-    ):
-        return jsonify({'codeRequired': True, 'retryAfterSeconds': 0}), 401
+    gate = _album_access_code_gate(entity, token, provided)
+    if gate is not None:
+        return gate
 
     filenames = _album_filenames(entity)
     owner_id = str(entity.get('PartitionKey') or '')
@@ -15146,17 +15172,12 @@ def public_album_download(token: str):
     if not entity or not _coerce_bool(entity.get('isPublic', False)) or _album_is_expired(entity):
         return jsonify({'error': 'Not found'}), 404
 
-    access_code = _album_access_code(entity)
-    if access_code:
-        data_for_auth = request.form.to_dict(flat=True) if request.form else (request.get_json(silent=True) or {})
-        provided = (data_for_auth.get('accessCode') or '').strip()
-        if not (
-            (provided and hmac.compare_digest(access_code, provided))
-            or _album_grant_valid(entity, token)
-        ):
-            return jsonify({'codeRequired': True, 'retryAfterSeconds': 0}), 401
-
     data = request.form.to_dict(flat=True) if request.form else (request.get_json(silent=True) or {})
+    provided = (data.get('accessCode') or '').strip()
+    gate = _album_access_code_gate(entity, token, provided)
+    if gate is not None:
+        return gate
+
     raw_filenames = data.get('filenames', [])
     filenames: List[str]
     if isinstance(raw_filenames, str) and raw_filenames.strip():
