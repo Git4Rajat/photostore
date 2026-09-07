@@ -20,6 +20,12 @@ interface PhotoTileProps {
     title: string;
     kind?: string;
     animationDelayMs?: number;
+    // When false, skips the mount fade/scale-in ('card-appear'). Default true
+    // matches every existing caller's behavior byte-for-byte. Callers that
+    // virtualize (mount/unmount tiles as they scroll in/out) should pass
+    // false for tiles that have already appeared once, so scrolling back
+    // over previously-seen content doesn't replay the entrance animation.
+    animateEntrance?: boolean;
     className?: string;
     selectableOverlay?: React.ReactNode;
     bodyContent?: React.ReactNode;
@@ -78,6 +84,7 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     title,
     kind,
     animationDelayMs,
+    animateEntrance = true,
     className = '',
     selectableOverlay,
     bodyContent,
@@ -94,7 +101,7 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
     const longPressHandlers = useLongPress(onLongPress);
     const classes = [
         'photo-card',
-        'card-appear',
+        animateEntrance ? 'card-appear' : '',
         selected ? 'selected' : '',
         className,
     ]

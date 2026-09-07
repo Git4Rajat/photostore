@@ -8568,13 +8568,31 @@ def photo_access_url_batch():
     if not blob_service_client or not account_name:
         return jsonify({'error': 'Media access is not configured'}), 503
 
+    # Resolve metadata from the same cached full-account scan /photos uses,
+    # instead of one Table Storage get_entity round trip per filename. That
+    # per-filename loop was the dominant cost of this endpoint -- it scales
+    # directly with batch size, and a zoomed-out gallery page can request
+    # 100+ filenames in one call (see pageSizeForZoomLevel), turning into
+    # 100+ sequential round trips (tens of seconds). The scan is normally
+    # already warm here: /photos populates it moments earlier for the same
+    # page, on the same 20s TTL (_metadata_scan_cache).
+    try:
+        cached_rows = _cached_metadata_rows_for_user(user_id, purpose='photos.access_batch')
+        metadata_map = {row['RowKey']: row for row in cached_rows if row.get('RowKey')}
+    except Exception:
+        metadata_map = {}
+
     urls: Dict[str, str] = {}
     expires_at = ''
     for raw_name in filenames:
         safe_name = _validate_media_filename(str(raw_name or ''))
         if not safe_name:
             continue
-        metadata = _get_metadata_entity(user_id, safe_name)
+        # Fall back to a direct lookup only for a cache miss (e.g. uploaded
+        # in the last few seconds, before the scan cache refreshed) so a
+        # brand-new photo's thumbnail still resolves instead of silently
+        # dropping from the response.
+        metadata = metadata_map.get(safe_name) or _get_metadata_entity(user_id, safe_name)
         if not metadata:
             continue
         if kind == 'preview':

@@ -24,7 +24,10 @@ import { plural } from '../utils/format';
 import { confirmDialog } from './shared/dialogs';
 import { useAppServices, browserProcessingActionSteps } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
-import PhotoTile from './shared/PhotoTile';
+import PhotoTile, { shouldFetchScopedThumbnail } from './shared/PhotoTile';
+import { isAuthEnabled } from '../services/authClient';
+import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
+import { useWindowedGrid } from '../services/useWindowedGrid';
 import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { libraryFocusHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
@@ -295,11 +298,37 @@ const ToolsPage: React.FC = () => {
     const [pendingFocusFilename, setPendingFocusFilename] = useState<string | null>(null);
     const focusTargetRef = useRef<HTMLDivElement | null>(null);
     const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
+    // filename -> batch-resolved access URL, shared with PhotoGallery/AlbumsPage
+    // via thumbnailAccessCache's module-level cache (see PhotoGallery.tsx).
+    const [thumbAccessUrls, setThumbAccessUrls] = useState<Map<string, string>>(new Map());
     const activeToolsPage = getToolsPageKey(location.pathname);
     const isOverviewPage = activeToolsPage === 'overview';
     const isQueueStatusPage = activeToolsPage === 'queue-status';
     const isBrowserWorkbenchPage = activeToolsPage === 'browser-workbench';
     const isRecoveryPage = activeToolsPage === 'recovery';
+
+    // One batched access-token request per fetched list, not one per tile --
+    // same reasoning as PhotoGallery.tsx (see thumbnailAccessCache.ts). The
+    // underlying cache is a module-level singleton, so a filename already
+    // resolved while browsing the Gallery/Albums resolves here for free.
+    const resolveAccessForBatch = (list: Photo[]) => {
+        if (!isAuthEnabled()) {
+            return;
+        }
+        const needsAccess = list
+            .filter((p) => shouldFetchScopedThumbnail(p.filename, p.thumbnailUrl))
+            .map((p) => p.filename);
+        if (needsAccess.length === 0) {
+            return;
+        }
+        resolveThumbnailAccessUrls(needsAccess).then((resolved) => {
+            setThumbAccessUrls((prev) => {
+                const next = new Map(prev);
+                resolved.forEach((url, filename) => next.set(filename, url));
+                return next;
+            });
+        });
+    };
 
     const loadPhotos = async (queryText: string = '') => {
         setLoading(true);
@@ -312,6 +341,7 @@ const ToolsPage: React.FC = () => {
                 : await get(`/photos?offset=0&limit=${PAGE_SIZE}`);
             const fetched = Array.isArray(response?.photos) ? response.photos : [];
             setPhotos(fetched);
+            resolveAccessForBatch(fetched);
             setPhotosTotal(Number(response?.total ?? fetched.length));
             setPhotosOffset(fetched.length);
         } catch (err) {
@@ -331,6 +361,7 @@ const ToolsPage: React.FC = () => {
             const response = await get(`/photos?offset=${photosOffset}&limit=${PAGE_SIZE}`);
             const fetched = Array.isArray(response?.photos) ? response.photos : [];
             setPhotos((prev) => [...prev, ...fetched]);
+            resolveAccessForBatch(fetched);
             setPhotosTotal(Number(response?.total ?? (photosOffset + fetched.length)));
             setPhotosOffset((prev) => prev + fetched.length);
         } catch (err) {
@@ -485,6 +516,18 @@ const ToolsPage: React.FC = () => {
     const overviewPhotos = useMemo(() => {
         return viewMode === 'recent' ? previewPhotos : workbenchPhotos;
     }, [viewMode, previewPhotos, workbenchPhotos]);
+
+    const overviewWindow = useWindowedGrid({
+        items: overviewPhotos,
+        getKey: (photo: Photo) => photo.filename,
+        overscanRows: 4,
+    });
+    const workbenchWindow = useWindowedGrid({
+        items: workbenchPhotos,
+        getKey: (photo: Photo) => photo.filename,
+        overscanRows: 4,
+        layoutDeps: [expandedInfo.size],
+    });
 
     const selectedVisibleCount = useMemo(
         () => workbenchPhotos.filter((photo) => selected.has(photo.filename)).length,
@@ -1274,13 +1317,19 @@ const ToolsPage: React.FC = () => {
                     />
                 )}
                 {!loading && photos.length > 0 && overviewPhotos.length === 0 && <p className="empty">No photos match the current filters.</p>}
-                <div className="gallery-grid">
-                    {overviewPhotos.map((photo, index) => (
+                <div ref={overviewWindow.containerRef} style={overviewWindow.spacerStyle}>
+                <div ref={overviewWindow.innerRef} className="gallery-grid" style={overviewWindow.innerStyle}>
+                    {overviewWindow.visibleItems.map((photo, localIndex) => {
+                        const index = overviewWindow.startIndex + localIndex;
+                        return (
                         <PhotoTile
                             key={photo.filename}
                             photo={photo}
                             title={photo.filename}
                             selected={selected.has(photo.filename)}
+                            animateEntrance={overviewWindow.shouldAnimateEntrance(photo.filename)}
+                            useBatchedAccess
+                            resolvedAccessUrl={thumbAccessUrls.get(photo.filename)}
                             selectableOverlay={(
                                 <input
                                     type="checkbox"
@@ -1300,7 +1349,9 @@ const ToolsPage: React.FC = () => {
                                 </>
                             )}
                         />
-                    ))}
+                        );
+                    })}
+                </div>
                 </div>
                 {hasMorePhotos && viewMode !== 'recent' && (
                     <div className="tools-load-more">
@@ -1436,8 +1487,10 @@ const ToolsPage: React.FC = () => {
                     <EmptyState icon={<PhotoIcon />} title="Nothing to work on" message="No photos match this view right now." />
                 )}
 
-                <div className="gallery-grid">
-                    {workbenchPhotos.map((photo, index) => {
+                <div ref={workbenchWindow.containerRef} style={workbenchWindow.spacerStyle}>
+                <div ref={workbenchWindow.innerRef} className="gallery-grid" style={workbenchWindow.innerStyle}>
+                    {workbenchWindow.visibleItems.map((photo, localIndex) => {
+                        const index = workbenchWindow.startIndex + localIndex;
                         const selectedFlag = selected.has(photo.filename);
                         const tile = (
                             <PhotoTile
@@ -1445,6 +1498,9 @@ const ToolsPage: React.FC = () => {
                                 photo={photo}
                                 title={photo.filename}
                                 selected={selectedFlag}
+                                animateEntrance={workbenchWindow.shouldAnimateEntrance(photo.filename)}
+                                useBatchedAccess
+                                resolvedAccessUrl={thumbAccessUrls.get(photo.filename)}
                                 onCardClick={() => toggleOne(photo.filename)}
                                 onLongPress={() => setActionSheetTarget({ filenames: [photo.filename], people: photo.people })}
                                 selectableOverlay={(
@@ -1481,6 +1537,7 @@ const ToolsPage: React.FC = () => {
                             </div>
                         );
                     })}
+                </div>
                 </div>
                 {hasMorePhotos && viewMode !== 'recent' && (
                     <div className="tools-load-more">

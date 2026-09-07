@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import {
     ArrowPathIcon,
@@ -32,7 +32,10 @@ import { confirmDialog, promptDialog } from './shared/dialogs';
 import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
 import { Loading } from './shared/Loading';
-import PhotoTile from './shared/PhotoTile';
+import PhotoTile, { shouldFetchScopedThumbnail } from './shared/PhotoTile';
+import { isAuthEnabled } from '../services/authClient';
+import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
+import { useWindowedGrid } from '../services/useWindowedGrid';
 import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
@@ -174,6 +177,9 @@ const AlbumsPage: React.FC = () => {
     const [loadingMore, setLoadingMore] = useState<boolean>(false);
     const [downloading, setDownloading] = useState<boolean>(false);
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+    // filename -> batch-resolved access URL, shared with PhotoGallery/ToolsPage
+    // via thumbnailAccessCache's module-level cache (see PhotoGallery.tsx).
+    const [thumbAccessUrls, setThumbAccessUrls] = useState<Map<string, string>>(new Map());
 
     const observerRef = useRef<IntersectionObserver | null>(null);
     const loadMoreRef = useRef<HTMLDivElement | null>(null);
@@ -329,12 +335,61 @@ const AlbumsPage: React.FC = () => {
         });
     }, [visiblePhotos, searchQuery, filterLikedOnly, filterMinRating, semanticPhotos]);
 
+    // The grid (and the tall spacer div that gives the page its scrollable
+    // height) unmounts while the photo viewer is open, so the browser clamps
+    // window scroll to 0. Restore it here, in a layout effect declared
+    // before useWindowedGrid's own, so this runs first and the grid's
+    // recompute() sees the real (restored) scroll position instead of
+    // momentarily recomputing its visible row range for a page pinned to
+    // the top.
+    const preViewerScrollYRef = useRef<number>(0);
+    useLayoutEffect(() => {
+        if (viewerIndex === null) {
+            window.scrollTo(0, preViewerScrollYRef.current);
+        }
+    }, [viewerIndex]);
+
+    const {
+        containerRef: albumsGridContainerRef,
+        innerRef: albumsGridInnerRef,
+        spacerStyle: albumsSpacerStyle,
+        innerStyle: albumsInnerStyle,
+        visibleItems: visibleAlbumPhotos,
+        shouldAnimateEntrance: shouldAnimateAlbumTile,
+    } = useWindowedGrid({
+        items: filteredPhotos,
+        getKey: (photo: Photo) => photo.filename,
+    });
+
     const publicAlbumCount = useMemo(
         () => albums.filter((album) => album.isPublic).length,
         [albums]
     );
 
     const selectedCount = selectedPhotos.size;
+
+    // One batched access-token request per fetched list, not one per tile --
+    // same reasoning as PhotoGallery.tsx (see thumbnailAccessCache.ts). The
+    // underlying cache is a module-level singleton, so a filename already
+    // resolved while browsing the Gallery resolves here for free.
+    const resolveAccessForBatch = useCallback((list: Photo[]) => {
+        if (!isAuthEnabled()) {
+            return;
+        }
+        const needsAccess = list
+            .filter((p) => shouldFetchScopedThumbnail(p.filename, p.thumbnailUrl))
+            .map((p) => p.filename);
+        if (needsAccess.length === 0) {
+            return;
+        }
+        resolveThumbnailAccessUrls(needsAccess).then((resolved) => {
+            setThumbAccessUrls((prev) => {
+                const next = new Map(prev);
+                resolved.forEach((url, filename) => next.set(filename, url));
+                return next;
+            });
+        });
+    }, []);
 
     const fetchPhotosPage = useCallback(async (nextOffset = 0, append = false) => {
         const isInitialLoad = !append && nextOffset === 0;
@@ -353,6 +408,7 @@ const AlbumsPage: React.FC = () => {
             const total = typeof response?.total === 'number' ? response.total : nextOffset + list.length;
 
             setPhotos((prev) => (append ? [...prev, ...list] : list));
+            resolveAccessForBatch(list);
             setOffset(nextOffset + list.length);
             setHasMore(list.length === PAGE_SIZE && nextOffset + list.length < total);
         } catch (err) {
@@ -368,7 +424,7 @@ const AlbumsPage: React.FC = () => {
                 setLoadingMore(false);
             }
         }
-    }, []);
+    }, [resolveAccessForBatch]);
 
     const fetchSemanticPhotos = useCallback(async (queryText: string) => {
         const trimmedQuery = queryText.trim();
@@ -383,13 +439,14 @@ const AlbumsPage: React.FC = () => {
             const response = await get(`/photos/search?q=${encodeURIComponent(trimmedQuery)}&offset=0&limit=500`);
             const list = Array.isArray(response?.photos) ? (response.photos as Photo[]) : [];
             setSemanticPhotos(list);
+            resolveAccessForBatch(list);
         } catch (err) {
             setSemanticPhotos([]);
             notifyApiError(err, { context: 'Unable to run AI search for albums.', retry: () => { void fetchSemanticPhotos(trimmedQuery); } });
         } finally {
             setSemanticLoading(false);
         }
-    }, []);
+    }, [resolveAccessForBatch]);
 
     const loadAlbums = useCallback(async () => {
         setAlbumsLoading(true);
@@ -416,11 +473,12 @@ const AlbumsPage: React.FC = () => {
             }
             const list = Array.isArray(response?.photos) ? (response.photos as Photo[]) : [];
             setActiveAlbumPhotos(list);
+            resolveAccessForBatch(list);
             setActiveAlbumVisibleCount(Math.min(PAGE_SIZE, list.length));
         } catch {
             // Ignore refresh errors and keep previous state.
         }
-    }, [activeAlbumId]);
+    }, [activeAlbumId, resolveAccessForBatch]);
 
     useEffect(() => {
         void loadAlbums();
@@ -1421,8 +1479,9 @@ const AlbumsPage: React.FC = () => {
 
                     {viewerIndex === null ? (
                         <>
-                            <div className="gallery-grid albums-photo-grid">
-                                {filteredPhotos.map((photo) => {
+                            <div ref={albumsGridContainerRef} style={albumsSpacerStyle}>
+                            <div ref={albumsGridInnerRef} className="gallery-grid albums-photo-grid" style={albumsInnerStyle}>
+                                {visibleAlbumPhotos.map((photo) => {
                                     const isSelected = selectedPhotos.has(photo.filename);
                                     const rating = Math.max(0, Math.min(5, Math.round(photo.rating || 0)));
                                     return (
@@ -1430,11 +1489,15 @@ const AlbumsPage: React.FC = () => {
                                             key={photo.filename}
                                             photo={photo}
                                             selected={isSelected}
+                                            animateEntrance={shouldAnimateAlbumTile(photo.filename)}
                                             title={photo.filename}
                                             showBody={false}
+                                            useBatchedAccess
+                                            resolvedAccessUrl={thumbAccessUrls.get(photo.filename)}
                                             onMediaClick={(e) => {
                                                 e.stopPropagation();
                                                 e.preventDefault();
+                                                preViewerScrollYRef.current = window.scrollY;
                                                 setViewerIndex(filteredPhotos.findIndex((item) => item.filename === photo.filename));
                                             }}
                                             onLongPress={() => handleTileLongPress(photo)}
@@ -1482,6 +1545,7 @@ const AlbumsPage: React.FC = () => {
                                         />
                                     );
                                 })}
+                            </div>
                             </div>
 
                             {((activeAlbumId && !showAddFromGallery && activeAlbumVisibleCount < activeAlbumPhotos.length)

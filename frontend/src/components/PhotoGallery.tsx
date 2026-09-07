@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { Link, useLocation } from 'react-router-dom';
@@ -28,6 +28,7 @@ import PhotoTile, { shouldFetchScopedThumbnail } from './shared/PhotoTile';
 import { useDragSelect } from '../services/useDragSelect';
 import { isAuthEnabled } from '../services/authClient';
 import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
+import { useWindowedGrid } from '../services/useWindowedGrid';
 import type { FileSystemFileHandle } from '../services/fileSystemAccess';
 import PhotoQuickActions, { workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
@@ -4229,7 +4230,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     // an absent key means resolution for that page hasn't finished yet.
     const [thumbAccessUrls, setThumbAccessUrls] = useState<Map<string, string>>(new Map());
     const [galleryZoomLevel, setGalleryZoomLevel] = useState<number>(loadGalleryZoomLevel);
-    const galleryGridRef = useRef<HTMLDivElement | null>(null);
     const pinchPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
     // Distance between the two pointers the last time the zoom level stepped —
     // reset on every step so each subsequent step needs the same relative
@@ -4858,11 +4858,17 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     };
 
     useEffect(() => {
+        // rootMargin fires the next page's fetch (list + batched thumbnail
+        // access tokens) well before the sentinel reaches the viewport,
+        // instead of once the user has already scrolled to the bottom edge
+        // — the previous 0px default made every page boundary a visible
+        // stall while the round trip ran. Same pattern as FaceClusters.tsx's
+        // pagination observer.
         observerRef.current = new IntersectionObserver(entries => {
             if (entries[0].isIntersecting && hasMore && !loadingMore && !loading && !error) {
                 fetchPhotos(sortBy, offset, true, searchQuery);
             }
-        }, { threshold: 0.1 });
+        }, { threshold: 0.1, rootMargin: '1200px 0px' });
 
         if (loadMoreRef.current) {
             observerRef.current.observe(loadMoreRef.current);
@@ -5042,6 +5048,34 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         }
         return photos;
     }, [mediaFilter, photos]);
+
+    // The grid (and the tall spacer div that gives the page its scrollable
+    // height) unmounts while the lightbox is open, so the browser clamps
+    // window scroll to 0. Restore it here, in a layout effect declared
+    // before useWindowedGrid's own, so this runs first and the grid's
+    // recompute() sees the real (restored) scroll position instead of
+    // momentarily recomputing its visible row range for a page pinned to
+    // the top.
+    const preLightboxScrollYRef = useRef<number>(0);
+    useLayoutEffect(() => {
+        if (lightboxIndex === null) {
+            window.scrollTo(0, preLightboxScrollYRef.current);
+        }
+    }, [lightboxIndex]);
+
+    const {
+        containerRef: galleryWindowContainerRef,
+        innerRef: galleryWindowInnerRef,
+        spacerStyle: gallerySpacerStyle,
+        innerStyle: galleryInnerStyle,
+        visibleItems: visibleGalleryPhotos,
+        startIndex: galleryWindowStartIndex,
+        shouldAnimateEntrance: shouldAnimateGalleryTile,
+    } = useWindowedGrid({
+        items: filteredPhotos,
+        getKey: (photo: Photo) => photo.filename,
+        layoutDeps: [galleryZoomLevel],
+    });
     const totalPhotos = totalAvailable;
     const showingPhotos = filteredPhotos.length;
     const selectedCount = selectedPhotos.size;
@@ -5054,6 +5088,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         if (index < 0 || index >= filteredPhotos.length) {
             return;
         }
+        preLightboxScrollYRef.current = window.scrollY;
         setLightboxIndex(index);
     }, [filteredPhotos.length]);
 
@@ -5498,24 +5533,28 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             )}
 
             {lightboxIndex === null ? (
+                <div ref={galleryWindowContainerRef} style={gallerySpacerStyle}>
                 <div
-                    ref={galleryGridRef}
+                    ref={galleryWindowInnerRef}
                     className="gallery-grid gallery-grid--zoomable"
-                    style={{ '--gallery-zoom-scale': GALLERY_ZOOM_SCALES[galleryZoomLevel] } as React.CSSProperties}
+                    style={{ ...galleryInnerStyle, '--gallery-zoom-scale': GALLERY_ZOOM_SCALES[galleryZoomLevel] } as React.CSSProperties}
                     onPointerDown={handleGalleryPointerDown}
                     onPointerMove={handleGalleryPointerMove}
                     onPointerUp={handleGalleryPointerEnd}
                     onPointerCancel={handleGalleryPointerEnd}
                 >
-                    {filteredPhotos.map((photo, index) => {
+                    {visibleGalleryPhotos.map((photo, localIndex) => {
+                        const index = galleryWindowStartIndex + localIndex;
                         const isSelected = selectedPhotos.has(photo.filename);
                         const rating = Math.max(0, Math.min(5, Math.round(photo.rating || 0)));
+                        const isNewTile = shouldAnimateGalleryTile(photo.filename);
                         return (
                             <PhotoTile
                                 key={photo.filename}
                                 photo={photo}
                                 selected={isSelected}
-                                animationDelayMs={(index % 8) * 36}
+                                animateEntrance={isNewTile}
+                                animationDelayMs={isNewTile ? (index % 8) * 36 : undefined}
                                 title={photo.filename}
                                 showBody={false}
                                 useBatchedAccess
@@ -5586,6 +5625,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         );
                     })}
                 </div>
+                </div>
             ) : (
                 <PhotoViewer
                     photos={filteredPhotos}
@@ -5600,7 +5640,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             )}
 
             <div ref={loadMoreRef} className="load-more">
-                {hasMore && !loading && (
+                {hasMore && !loading && !loadingMore && (
                     <button
                         type="button"
                         onClick={() => fetchPhotos(sortBy, offset, true, searchQuery)}
