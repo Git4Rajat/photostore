@@ -205,7 +205,19 @@ export const isConstrainedUploadDevice = (): boolean => {
     const isMobileViewport = window.matchMedia?.('(max-width: 760px)').matches || false;
     const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches || false;
     const lowMemory = typeof deviceMemory === 'number' && deviceMemory <= 4;
-    return isMobileViewport || coarsePointer || lowMemory;
+    // iPadOS Safari has presented a desktop-class UA and viewport by default
+    // since iPadOS 13 -- most iPads are wider than the 760px check above even
+    // in portrait, and a paired trackpad/Magic Keyboard can make `pointer`
+    // report `fine` instead of `coarse`. Without this, an iPad can slip past
+    // every check above and be treated as unconstrained, which defeats
+    // CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES's cap on the upload resume cache
+    // (AppServicesProvider.tsx) entirely -- a large batch's full bytes all get
+    // duplicated into IndexedDB with no total-size limit, which is how Safari's
+    // on-disk storage for this origin has been observed reaching the tens of
+    // GB. maxTouchPoints reflects real touchscreen hardware and isn't affected
+    // by the desktop-site UA masquerade, so it catches this regardless.
+    const isIPad = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+    return isMobileViewport || coarsePointer || lowMemory || isIPad;
 };
 
 export const getAdaptiveUploadProfile = (

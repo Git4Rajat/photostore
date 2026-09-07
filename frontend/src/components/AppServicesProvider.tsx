@@ -436,6 +436,17 @@ const MAX_FRESH_UPLOAD_BATCH_SIZE = 900;
 // mobile-safari-large-batch-upload-crash memory.
 const MAX_MOBILE_SELECTION_SIZE = 5000;
 
+// A paused session (some files failed, none reselected/retried/discarded)
+// left untouched this long is treated as abandoned rather than restored on
+// the next app load. Left alone, it blocks every subsequent upload attempt
+// forever (see startUpload's pendingUploadSession guard below) while keeping
+// its still-cached IndexedDB blobs alive indefinitely -- up to
+// CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES per session on mobile, and unbounded
+// on a device isConstrainedUploadDevice() fails to catch. Most users never
+// find the Retry/Discard banner; auto-discarding after a day self-heals both
+// problems instead of requiring that.
+const STALE_UPLOAD_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 // The only intervention point that isn't gated on the native picker
 // cooperating: warn *before* it opens, once per browser, rather than only
 // reacting after the fact via MAX_MOBILE_SELECTION_SIZE above.
@@ -4251,7 +4262,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                     `${plural(unmatchedFiles.length, 'file')} in this selection weren't part of the paused upload -- queued to start once it resumes.`,
                                 );
                             } else {
-                                startUploadInBatches(unmatchedFiles);
+                                // Zero overlap with the paused session -- a
+                                // genuinely new, unrelated selection.
+                                // startUploadInBatches would route straight
+                                // into startUpload's own pendingUploadSession
+                                // guard (a paused session is still sitting
+                                // here, by definition of this whole branch)
+                                // and get rejected with nothing but an
+                                // easy-to-miss toast -- these files would
+                                // never upload. Queue them instead: the drain
+                                // effect below starts them automatically once
+                                // the paused session is resolved (Retry or
+                                // Discard).
+                                enqueueUploadFilesInBatches(unmatchedFiles);
+                                addNotification(
+                                    'Upload queued',
+                                    `${plural(unmatchedFiles.length, 'file')} queued -- resolve the paused upload (Retry or Discard) to start them.`,
+                                );
                             }
                         }
                         if (matchedCount > 0) {
@@ -4328,6 +4355,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return;
         }
 
+        // See STALE_UPLOAD_SESSION_MAX_AGE_MS: a paused session this old is
+        // treated as abandoned rather than restored, so it stops blocking new
+        // uploads and its cached IndexedDB blobs get freed instead of sitting
+        // there indefinitely.
+        if (Date.now() - restored.createdAt > STALE_UPLOAD_SESSION_MAX_AGE_MS) {
+            void cleanupUnfinishedUploadArtifacts(restored).then(() => clearPersistedSession());
+            return;
+        }
+
         persistSession(restored);
         setPendingUploadSession(restored);
         addNotification('Upload paused', `${plural(restored.files.filter((file) => file.status !== 'done').length, 'file')} need retry approval.`);
@@ -4335,7 +4371,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             autoResumeAttemptedRef.current = true;
             void retryPersistedUploadSession();
         }
-    }, [addNotification, clearPersistedSession, loadPersistedSession, persistSession]);
+    }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, persistSession]);
 
     // Keep the backend warm only for browser-side processing, not for uploads.
     // Uploads are already direct-to-blob (see uploadFileInChunks) -- the backend
