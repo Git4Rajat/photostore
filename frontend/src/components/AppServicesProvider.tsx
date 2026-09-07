@@ -528,6 +528,20 @@ const WARMUP_POLL_INTERVAL_MS = 5000;
 // transfers. AbortSignal.timeout is supported iOS Safari 16+.
 const WARMUP_REQUEST_TIMEOUT_MS = 8000;
 const BACKEND_KEEPALIVE_INTERVAL_MS = 30000;
+// requestUpload already fires a warm-up poll before the native picker opens
+// (pollUntilWarm(warmUpload, ...)), and warmBackend/warmUpload both hit the
+// exact same backend /health endpoint (APP_CONFIG_API_BASE_URL and
+// APP_CONFIG_UPLOAD_BASE_URL are provisioned identically -- see
+// deploy/resources.bicep). By the time a user taps "Done" on iOS, they've
+// typically spent several seconds to a minute inside the native picker --
+// long enough for that pre-picker probe to already prove the backend warm.
+// startUpload used to re-probe from scratch anyway (a blocking round trip,
+// PLUS a second one to get a clean, non-cold-start RTT reading), adding real
+// wall-clock time to the "picker closed, nothing visibly happening yet"
+// window users were reporting on iOS. Reusing a still-fresh reading skips
+// both round trips entirely in the common case; this window just bounds how
+// stale a reused reading is allowed to be.
+const RTT_CACHE_MAX_AGE_MS = 45000;
 // While a batch is draining, the keep-alive heartbeat worker drives the loop at
 // this cadence so it keeps running at full speed in a hidden/minimized tab.
 const BROWSER_PROCESSING_HEARTBEAT_INTERVAL_MS = 1000;
@@ -1007,8 +1021,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return true;
         }
         inFlightRef.current = true;
+        const startedAt = performance.now();
         try {
             await runner();
+            // Only a real, uncontended call is a trustworthy RTT sample --
+            // the inFlightRef check above already excludes dedup
+            // short-circuits from ever reaching here.
+            lastWarmProbeRef.current = { ms: performance.now() - startedAt, at: Date.now() };
             return true;
         } catch {
             return false;
@@ -1172,6 +1191,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const backendKeepaliveTimerRef = useRef<number | null>(null);
     const backendWarmupInFlightRef = useRef<boolean>(false);
     const uploadWarmupInFlightRef = useRef<boolean>(false);
+    // Last real (non-dedup-shortcircuited) health-probe RTT, from ANY caller
+    // of warmEndpoint -- the pre-picker poll, the background keepalive, or
+    // startUpload's own probe. Since warmBackend/warmUpload hit the same
+    // backend endpoint, a recent reading from one is just as valid for the
+    // other. See RTT_CACHE_MAX_AGE_MS above for how this gets reused.
+    const lastWarmProbeRef = useRef<{ ms: number; at: number } | null>(null);
     const autoResumeAttemptedRef = useRef<boolean>(false);
     const browserAiModelStateRef = useRef<SharedBrowserAiModelState>(browserAiModelState);
     const browserAiLoadInFlightRef = useRef<boolean>(false);
@@ -3887,64 +3912,77 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         setUploading(true);
         uploadingRef.current = true;
         setUploadError(null);
+        // requestUpload already probes this same backend before the native
+        // picker even opens (pollUntilWarm(warmUpload, ...)), and on iOS the
+        // gap between that and this point is however long the user spent
+        // inside the picker -- almost always long enough for that probe to
+        // have already landed. Re-probing from scratch here (twice, per the
+        // cold-start reasoning below) was pure dead weight in that common
+        // case: real network round trips the user sits through staring at a
+        // picker that already closed, which is exactly the "waiting a while
+        // before upload starts" gap reported on iOS. Reuse that reading
+        // instead of re-earning it whenever it's still fresh.
+        const cachedProbe = lastWarmProbeRef.current;
+        const hasFreshProbe = Boolean(cachedProbe) && (Date.now() - cachedProbe!.at) < RTT_CACHE_MAX_AGE_MS;
+        let measuredRttMs: number | undefined = hasFreshProbe ? cachedProbe!.ms : undefined;
         const warmupNotificationId = addNotification(
-            'Warming up upload path',
-            'Waiting for backend storage and upload readiness before upload starts.',
+            hasFreshProbe ? 'Upload path ready' : 'Warming up upload path',
+            hasFreshProbe
+                ? 'Backend storage is ready. Starting upload.'
+                : 'Waiting for backend storage and upload readiness before upload starts.',
         );
-        // Piggyback a real-latency reading on this warm-up call rather than
-        // firing a dedicated probe request: only trust the timing when we
-        // know it's actually making a fresh network call (not a dedup
-        // short-circuit off some other concurrent warm-up) -- otherwise a
-        // near-instant "0ms" short-circuit would look like great latency.
-        const measuringRtt = !backendWarmupInFlightRef.current;
-        const warmupStartedAt = performance.now();
-        try {
-            await Promise.all([
-                warmEndpoint(warmBackend, backendWarmupInFlightRef),
-            ]);
-        } catch (err) {
-            const message = getUploadErrorMessage(err, 'Warm-up failed before upload could start.');
-            setUploadError(message);
-            setUploading(false);
-            uploadingRef.current = false;
-            // Without this, a single warm-up failure (cold-start timeout, a
-            // transient network blip, backend capacity pressure) wedges this
-            // flag true forever -- every future requestUpload()/startUpload()
-            // call bails at its own early-return guard for the rest of the
-            // tab session, with no visible way out: `uploading` is already
-            // false here, so the Stop button (the only other place this gets
-            // reset) isn't even rendered to click.
-            uploadStartInProgressRef.current = false;
-            updateNotification(warmupNotificationId, {
-                title: 'Upload warm-up failed',
-                details: message,
-            });
-            return;
-        }
-        let measuredRttMs = measuringRtt ? performance.now() - warmupStartedAt : undefined;
-        // A cold-started backend (minReplicas: 0) pays its scale-up cost on
-        // this FIRST warm-up call, making its timing look like bad network
-        // latency to getAdaptiveUploadProfile's RTT gate even though the
-        // network itself is fine -- fileParallelism then gets pinned low for
-        // the whole session (see that gate's own comment for a prior
-        // incident this caused). Re-probe now that inFlightRef is clear: a
-        // cold start resolves after the first request, so this second call
-        // reflects genuine RTT, while a truly slow/congested network is
-        // still slow here too and correctly keeps parallelism low.
-        if (measuringRtt) {
-            const secondProbeStartedAt = performance.now();
+        if (!hasFreshProbe) {
+            // Piggyback a real-latency reading on this warm-up call rather than
+            // firing a dedicated probe request: only trust the timing when we
+            // know it's actually making a fresh network call (not a dedup
+            // short-circuit off some other concurrent warm-up) -- otherwise a
+            // near-instant "0ms" short-circuit would look like great latency.
+            const measuringRtt = !backendWarmupInFlightRef.current;
             try {
                 await warmEndpoint(warmBackend, backendWarmupInFlightRef);
-                measuredRttMs = performance.now() - secondProbeStartedAt;
-            } catch {
-                // Second probe failing is itself evidence of a bad
-                // connection, not grounds to discard the first reading.
+            } catch (err) {
+                const message = getUploadErrorMessage(err, 'Warm-up failed before upload could start.');
+                setUploadError(message);
+                setUploading(false);
+                uploadingRef.current = false;
+                // Without this, a single warm-up failure (cold-start timeout, a
+                // transient network blip, backend capacity pressure) wedges this
+                // flag true forever -- every future requestUpload()/startUpload()
+                // call bails at its own early-return guard for the rest of the
+                // tab session, with no visible way out: `uploading` is already
+                // false here, so the Stop button (the only other place this gets
+                // reset) isn't even rendered to click.
+                uploadStartInProgressRef.current = false;
+                updateNotification(warmupNotificationId, {
+                    title: 'Upload warm-up failed',
+                    details: message,
+                });
+                return;
             }
+            measuredRttMs = measuringRtt ? lastWarmProbeRef.current?.ms : undefined;
+            // A cold-started backend (minReplicas: 0) pays its scale-up cost on
+            // this FIRST warm-up call, making its timing look like bad network
+            // latency to getAdaptiveUploadProfile's RTT gate even though the
+            // network itself is fine -- fileParallelism then gets pinned low for
+            // the whole session (see that gate's own comment for a prior
+            // incident this caused). Re-probe now that inFlightRef is clear: a
+            // cold start resolves after the first request, so this second call
+            // reflects genuine RTT, while a truly slow/congested network is
+            // still slow here too and correctly keeps parallelism low.
+            if (measuringRtt) {
+                try {
+                    await warmEndpoint(warmBackend, backendWarmupInFlightRef);
+                    measuredRttMs = lastWarmProbeRef.current?.ms;
+                } catch {
+                    // Second probe failing is itself evidence of a bad
+                    // connection, not grounds to discard the first reading.
+                }
+            }
+            updateNotification(warmupNotificationId, {
+                title: 'Upload path ready',
+                details: 'Backend storage is ready. Starting upload.',
+            });
         }
-        updateNotification(warmupNotificationId, {
-            title: 'Upload path ready',
-            details: 'Backend storage is ready. Starting upload.',
-        });
         const totalBytes = filesToUpload.reduce((sum, file) => sum + file.size, 0);
         const uploadProfile = getAdaptiveUploadProfile(filesToUpload, { measuredRttMs });
         const preparingNotificationId = addNotification(
