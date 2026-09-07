@@ -9,11 +9,12 @@ import { getBackendStatusSnapshot } from '../services/backendStatus';
 import { showToast } from '../services/toast';
 import PhotoTile from './shared/PhotoTile';
 import { useDragSelect } from '../services/useDragSelect';
-import PhotoViewer from './shared/PhotoViewer';
+import PhotoViewer, { getMainMediaPath } from './shared/PhotoViewer';
 import { Logo } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
+import { isVideoFilename } from '../utils/photoDisplay';
 
 interface PublicPhoto {
     filename: string;
@@ -28,6 +29,26 @@ interface PublicAlbum {
     name: string;
     photoCount: number;
 }
+
+// Thumbnails are cheap (small, day-stable SAS/proxy URLs) so warming them all
+// up front makes scrolling feel instant instead of waiting on native
+// loading="lazy" as each tile enters the viewport (see PhotoTile). Concurrency
+// is capped to stay under a browser's per-host connection limit rather than
+// firing hundreds of Image() loads at once.
+const BUFFER_CONCURRENCY = 6;
+// Caps how long the grid stays hidden behind the buffering screen. Prefetch
+// keeps running past this point (see the effect below) -- this only bounds
+// how long a large or slow-to-load album blocks the initial reveal.
+const BUFFER_REVEAL_TIMEOUT_MS = 6000;
+
+// Full-size previews/originals can be multi-MB each (unlike thumbnails), so
+// eagerly warming every photo in a large album would mean downloading
+// hundreds of MB in the background for visitors who only open a handful.
+// Warming just the first screen's worth covers the common case -- clicking
+// one of the first photos -- while PhotoViewer's own neighbor preload (see
+// PRELOAD_NEIGHBOR_COUNT there) takes over once the viewer is open.
+const PREVIEW_PREFETCH_COUNT = 20;
+const PREVIEW_PREFETCH_CONCURRENCY = 3;
 
 const parsePublicAlbumError = (err: unknown): Record<string, unknown> => {
     // requestJson() always throws a classified ApiError, never the raw axios
@@ -69,6 +90,11 @@ const PublicAlbumPage: React.FC = () => {
     const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
     const [downloading, setDownloading] = useState<boolean>(false);
     const downloadFormRef = useRef<HTMLFormElement | null>(null);
+    // bufferReady gates the initial grid reveal; bufferPercent keeps updating
+    // past that point so the ongoing background prefetch can still surface a
+    // running percentage (see the meta line below) until it finishes.
+    const [bufferReady, setBufferReady] = useState<boolean>(true);
+    const [bufferPercent, setBufferPercent] = useState<number>(100);
 
     const loadPublicAlbum = useCallback(async (code: string = '') => {
             if (!token) {
@@ -120,6 +146,117 @@ const PublicAlbumPage: React.FC = () => {
     }, [token]);
 
     useBackendRecoveryRetry(loadError, () => { void loadPublicAlbum(accessCode); });
+
+    // Warms every thumbnail into the browser's HTTP cache as soon as the photo
+    // list arrives, instead of waiting for each tile's native loading="lazy"
+    // to fire as it scrolls into view. Re-runs only when a fresh photo list
+    // comes in (loadPublicAlbum always sets a brand-new array), not on
+    // unrelated re-renders like selection toggling.
+    useEffect(() => {
+        if (photos.length === 0) {
+            setBufferReady(true);
+            setBufferPercent(100);
+            return undefined;
+        }
+        let cancelled = false;
+        let settled = 0;
+        const total = photos.length;
+        setBufferReady(false);
+        setBufferPercent(0);
+
+        const resolveThumbSrc = (url?: string): string => {
+            if (!url) {
+                return '';
+            }
+            return url.startsWith('http') ? url : resolveApiUrl(url);
+        };
+
+        const prefetchOne = (photo: PublicPhoto) => new Promise<void>((resolve) => {
+            const src = resolveThumbSrc(photo.thumbnailUrl);
+            if (!src) {
+                resolve();
+                return;
+            }
+            const img = new Image();
+            img.onload = () => resolve();
+            img.onerror = () => resolve();
+            img.src = src;
+        });
+
+        const queue = [...photos];
+        const runWorker = async () => {
+            while (!cancelled) {
+                const next = queue.shift();
+                if (!next) {
+                    return;
+                }
+                await prefetchOne(next);
+                if (cancelled) {
+                    return;
+                }
+                settled += 1;
+                setBufferPercent(Math.round((settled / total) * 100));
+            }
+        };
+        const workerCount = Math.min(BUFFER_CONCURRENCY, total);
+        void Promise.all(Array.from({ length: workerCount }, runWorker)).then(() => {
+            if (!cancelled) {
+                setBufferReady(true);
+            }
+        });
+
+        const timeoutId = window.setTimeout(() => {
+            if (!cancelled) {
+                setBufferReady(true);
+            }
+        }, BUFFER_REVEAL_TIMEOUT_MS);
+
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timeoutId);
+        };
+    }, [photos]);
+
+    // Warms the full-size preview/original for the first screen's worth of
+    // photos so opening one of them in the lightbox doesn't need a cold fetch.
+    // Deferred until bufferReady so this heavier download doesn't compete with
+    // (and slow down) the thumbnail buffering above; photos beyond this
+    // window still get warmed on-demand by PhotoViewer's neighbor preload.
+    useEffect(() => {
+        if (!bufferReady || photos.length === 0) {
+            return undefined;
+        }
+        let cancelled = false;
+        const resolveSrc = (path: string) => (path.startsWith('http') ? path : resolveApiUrl(path));
+        const queue = photos
+            .slice(0, PREVIEW_PREFETCH_COUNT)
+            .filter((photo) => !isVideoFilename(photo.filename))
+            .map((photo) => getMainMediaPath(photo))
+            .filter((path): path is string => Boolean(path));
+
+        const prefetchOne = (path: string) => new Promise<void>((resolve) => {
+            const img = new Image();
+            img.onload = () => resolve();
+            img.onerror = () => resolve();
+            img.src = resolveSrc(path);
+        });
+
+        const runWorker = async () => {
+            while (!cancelled) {
+                const next = queue.shift();
+                if (!next) {
+                    return;
+                }
+                await prefetchOne(next);
+            }
+        };
+        const workerCount = Math.min(PREVIEW_PREFETCH_CONCURRENCY, queue.length);
+        void Promise.all(Array.from({ length: workerCount }, runWorker));
+
+        return () => {
+            cancelled = true;
+        };
+    }, [photos, bufferReady]);
 
     const selectedCount = selectedPhotos.size;
     const dragSelectHandlers = useDragSelect({
@@ -199,12 +336,15 @@ const PublicAlbumPage: React.FC = () => {
                             <span> photos</span>
                             <span className="gallery-meta-dim"> · read-only</span>
                             {codeRequired && <span className="gallery-meta-dim"> · code required</span>}
+                            {bufferReady && bufferPercent < 100 && (
+                                <span className="gallery-meta-dim"> · caching {bufferPercent}%</span>
+                            )}
                         </p>
                     </div>
                 </div>
             </div>
 
-            {!loading && !error && photos.length > 0 && (
+            {!loading && !error && bufferReady && photos.length > 0 && (
                 <div className="toolbar public-album-toolbar">
                     <div className="toolbar-left">
                         <button
@@ -252,6 +392,14 @@ const PublicAlbumPage: React.FC = () => {
             </form>
 
             {loading && <Loading label="Loading shared album…" fullPage={false} />}
+            {!loading && !error && !codeRequired && !bufferReady && photos.length > 0 && (
+                <div className="public-album-buffering">
+                    <Loading label={`Loading photos… ${bufferPercent}%`} fullPage={false} />
+                    <div className="progress-track">
+                        <div className="progress-bar" style={{ width: `${bufferPercent}%` }} />
+                    </div>
+                </div>
+            )}
             {!loading && error && !codeRequired && (
                 <ErrorState
                     title="Album unavailable"
@@ -290,7 +438,7 @@ const PublicAlbumPage: React.FC = () => {
                 <EmptyState icon={<PhotoIcon />} title="Nothing here yet" message="This shared album doesn't have any photos in it right now." />
             )}
 
-            {!loading && !error && photos.length > 0 && viewerIndex === null && (
+            {!loading && !error && bufferReady && photos.length > 0 && viewerIndex === null && (
                 <div className="gallery-grid public-gallery-grid">
                     {photos.map((photo, index) => {
                         const isSelected = selectedPhotos.has(photo.filename);

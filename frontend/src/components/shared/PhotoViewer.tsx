@@ -53,7 +53,11 @@ const thumbnailDisplayRotation = (photo?: ViewerPhoto | null) => (
     normalizeRotation(normalizeRotation(photo?.rotation) - normalizeRotation(photo?.thumbnailRotation))
 );
 
-const getMainMediaPath = (photo?: ViewerPhoto | null) => {
+// Exported so callers that warm caches ahead of opening the viewer (e.g.
+// PublicAlbumPage's initial-screen preview prefetch) resolve the exact same
+// path the viewer itself will request -- otherwise a mismatched path warms
+// the wrong URL and the later <img src> is still a cold fetch.
+export const getMainMediaPath = (photo?: ViewerPhoto | null) => {
     if (!photo) {
         return '';
     }

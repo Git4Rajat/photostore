@@ -3905,6 +3905,16 @@ html[data-theme='light'] .notification-item.unread {
   background: rgba(10, 132, 255, 0.07);
 }
 
+.public-album-buffering {
+  max-width: 280px;
+  margin: 0 auto;
+  padding: 12px 0 28px;
+}
+
+.public-album-buffering .progress-track {
+  margin-top: 2px;
+}
+
 .public-gallery-grid .photo-card {
   border-radius: var(--r-xl);
 }
