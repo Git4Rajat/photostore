@@ -3320,6 +3320,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         uploadAbortControllersRef.current.add(controller);
                         const chunkSizeBytes = fileMeta.chunkSizeBytes || uploadProfile.chunkSizeBytes;
                         let staged: Awaited<ReturnType<typeof uploadFileInChunks>>;
+                        // updatePersistedFile below writes the freshly-minted blobName into
+                        // a brand new session object (immutable update) -- it never mutates
+                        // this `fileMeta` (a plain object pulled from `pendingFiles`), so
+                        // `fileMeta.blobName` stays stale (usually undefined, for a fresh
+                        // upload) for the rest of this closure. Both finalizeUploadedFile's
+                        // own blobName echo and kickOffThumbnailForFile's (see their
+                        // matching comments) need the real value, not this stale one.
+                        let resolvedBlobName = fileMeta.blobName;
                         try {
                             staged = await uploadFileInChunks(resolvedFile, {
                                 startByte: fileMeta.uploadedBytes,
@@ -3327,6 +3335,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 existingBlockIds: fileMeta.blockIds,
                                 existingBlobName: fileMeta.blobName,
                                 onUploadInitialized: (uploadId, blobName) => {
+                                    resolvedBlobName = blobName;
                                     updatePersistedFile(fileMeta.key, { uploadId, blobName });
                                 },
                                 onChunkCommitted: (bytesReceived) => {
@@ -3415,7 +3424,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             // /upload/finalize) to the background and grab the
                             // next file immediately instead of idling this
                             // lane's connection budget for 20-90s+.
-                            const finalizeTask = finalizeUploadedFile(resolvedFile, fileMeta, controller, staged)
+                            const finalizeTask = finalizeUploadedFile(resolvedFile, { ...fileMeta, blobName: resolvedBlobName }, controller, staged)
                                 .finally(() => { pendingFinalizeTasks.delete(finalizeTask); });
                             pendingFinalizeTasks.add(finalizeTask);
                         }
