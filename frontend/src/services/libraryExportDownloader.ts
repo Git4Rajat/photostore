@@ -24,6 +24,7 @@
 import * as library from './libraryClient';
 import { stagedByteCount, writeResponseToStaging, readStagedFile, removeStagedFile } from './opfsDownloadStaging';
 import { prepareServiceWorkerDownload, triggerPreparedDownload } from './serviceWorkerDownload';
+import { ScreenWakeLockController } from './screenWakeLock';
 
 const DB_NAME = 'photostore-library-export';
 const FILES_STORE = 'files';
@@ -155,6 +156,12 @@ export const startLibraryExport = (
     options?: { forceRestart?: boolean },
 ): ExportController => {
     let cancelled = false;
+    // A 500k-file library can take hours -- don't let the device sleep/lock
+    // mid-export. See screenWakeLock.ts for why this doesn't reuse the
+    // upload/browser-AI keep-alive (that one also drives a heartbeat worker
+    // this fetch/IndexedDB-driven loop doesn't need).
+    const wakeLock = new ScreenWakeLockController();
+    wakeLock.acquire();
     const queue: QueuedFile[] = [];
     let listingComplete = false;
     let listingError: string | null = null;
@@ -301,6 +308,7 @@ export const startLibraryExport = (
         const listing = listManifest();
         const workers = Array.from({ length: EXPORT_CONCURRENCY }, () => runWorker());
         await Promise.all([listing, ...workers]);
+        wakeLock.release();
         if (!cancelled) {
             emitProgress(null);
             onDone();
@@ -308,6 +316,6 @@ export const startLibraryExport = (
     })();
 
     return {
-        cancel: () => { cancelled = true; },
+        cancel: () => { cancelled = true; wakeLock.release(); },
     };
 };
