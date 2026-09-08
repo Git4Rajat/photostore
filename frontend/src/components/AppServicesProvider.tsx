@@ -436,6 +436,16 @@ const MAX_FRESH_UPLOAD_BATCH_SIZE = 900;
 // mobile-safari-large-batch-upload-crash memory.
 const MAX_MOBILE_SELECTION_SIZE = 5000;
 
+// A deliberate Cancel closes the native picker almost immediately (well
+// under this); the picker returning zero files after sitting open longer
+// than this is the same silent OS-level failure mode documented above (the
+// picker itself never handing files back to onChange for an oversized
+// selection) rather than the user just changing their mind. There's no way
+// to tell these apart with certainty -- this is a heuristic, not a real
+// signal -- but it's the only lever available to turn an otherwise-totally-
+// silent failure into visible feedback instead of nothing.
+const PICKER_LIKELY_FAILED_THRESHOLD_MS = 45000;
+
 // A paused session (some files failed, none reselected/retried/discarded)
 // left untouched this long is treated as abandoned rather than restored on
 // the next app load. Left alone, it blocks every subsequent upload attempt
@@ -1088,6 +1098,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, []);
 
     const uploadInputRef = useRef<HTMLInputElement | null>(null);
+    // Timestamp of the most recent classic-picker uploadInputRef.click() --
+    // used only to tell a fast, deliberate Cancel apart from the picker
+    // coming back with zero files after sitting open a long time (see the
+    // PICKER_LIKELY_FAILED_THRESHOLD_MS usage in handleUploadSelection).
+    // Nothing in this file runs between click() and onChange firing -- the
+    // native picker is a full-screen modal on iOS, so this is the only
+    // signal available about that gap at all.
+    const pickerOpenedAtRef = useRef<number | null>(null);
     // Mirrors the `uploading` state synchronously (no render-commit delay), so
     // startBrowserProcessing's automatic-pull gate can check it mid-tick without
     // a stale closure. Written directly alongside every setUploading(...) call
@@ -4109,7 +4127,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             try {
                 if (!localStorage.getItem(MOBILE_SELECTION_TIP_STORAGE_KEY)) {
                     localStorage.setItem(MOBILE_SELECTION_TIP_STORAGE_KEY, '1');
-                    const tipMessage = `For reliable uploads on this device, select up to ${MAX_MOBILE_SELECTION_SIZE.toLocaleString()} photos at a time -- very large single selections can fail to open.`;
+                    const tipMessage = `For reliable uploads on this device, select up to ${MAX_MOBILE_SELECTION_SIZE.toLocaleString()} photos at a time (a couple thousand is even safer). After tapping Add, the picker can take a couple of minutes to close on its own for large selections -- that's normal, don't tap Add again, just wait.`;
                     addNotification('Large libraries: select in batches', tipMessage);
                     showToast(tipMessage, { timeout: 8000 });
                 }
@@ -4140,6 +4158,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             })();
             return;
         }
+        pickerOpenedAtRef.current = Date.now();
         uploadInputRef.current?.click();
     }, [addNotification, pollUntilWarm, startUpload, uploading, warmUpload]);
 
@@ -4186,6 +4205,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [addNotification, startUpload, enqueueUploadFilesInBatches]);
 
     const handleUploadSelection = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+        const pickerOpenedAt = pickerOpenedAtRef.current;
+        pickerOpenedAtRef.current = null;
+        const pickerOpenDurationMs = pickerOpenedAt !== null ? Date.now() - pickerOpenedAt : null;
         const selectedFiles = event.target.files ? Array.from(event.target.files) : [];
         if (selectedFiles.length > MAX_MOBILE_SELECTION_SIZE && isConstrainedUploadDevice()) {
             console.warn('Rejected oversized mobile upload selection.', {
@@ -4210,7 +4232,26 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // mobile-safari-large-batch-upload-crash). A console breadcrumb
             // costs nothing for ordinary users but gives the next devtools
             // session something HAR alone can't show.
-            console.warn('Upload picker closed with no files selected.', { rawFileListLength: event.target.files?.length ?? null });
+            console.warn('Upload picker closed with no files selected.', {
+                rawFileListLength: event.target.files?.length ?? null,
+                pickerOpenDurationMs,
+            });
+            // A deliberate Cancel dismisses the picker almost instantly. The
+            // picker sitting open far longer than that and STILL coming back
+            // empty is the one case where "no files" is very unlikely to be
+            // an ordinary cancel -- surface it instead of leaving the user
+            // with a picker that just closed and nothing else. See
+            // PICKER_LIKELY_FAILED_THRESHOLD_MS's own comment.
+            if (
+                pickerOpenDurationMs !== null
+                && pickerOpenDurationMs > PICKER_LIKELY_FAILED_THRESHOLD_MS
+                && isConstrainedUploadDevice()
+            ) {
+                const message = 'The photo picker closed without selecting anything. This can happen with very large '
+                    + 'selections on iPhone/iPad -- try again with a smaller batch (around 1,500-2,000 photos at a time).';
+                addNotification('Selection didn\'t come through', message);
+                showToast(message, { variant: 'error', timeout: 8000 });
+            }
         }
         if (selectedFiles.length > 0) {
             // loadPersistedSession() reflects the live session while a healthy
