@@ -64,6 +64,17 @@ const PLACEHOLDER_THUMBNAIL = `data:image/svg+xml,${encodeURIComponent(
 
 export const isHttpUrl = (value?: string) => Boolean(value && value.startsWith('http'));
 
+// URLs the browser has already painted at least once, across every PhotoTile
+// instance on every page (module-level, not component state). Windowed grids
+// (Gallery/Albums/Tools) mount/unmount tiles repeatedly as they cross the
+// viewport boundary while scrolling -- without this, every remount replayed
+// the shimmer-then-fade-in reveal from scratch even though the URL is
+// day-stable and the browser paints it instantly from cache, which reads as
+// the whole grid flickering while scrolling. Unbounded, but bounded in
+// practice by the number of distinct thumbnail URLs a session ever displays
+// (a few thousand short strings at most).
+const paintedThumbnailUrls = new Set<string>();
+
 const resolveThumbnailSource = (thumbnailUrl?: string) => {
     if (!thumbnailUrl) {
         return PLACEHOLDER_THUMBNAIL;
@@ -114,9 +125,18 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
 
     const shouldUseProtectedMedia = useProtectedMedia && isAuthEnabled();
     const [scopedThumbnailUrl, setScopedThumbnailUrl] = useState<string | undefined>(undefined);
-    const [imgLoaded, setImgLoaded] = useState(false);
     const imgElRef = useRef<HTMLImageElement | null>(null);
     const fallbackThumbnailUrl = resolveThumbnailSource(photo.thumbnailUrl);
+    const resolvedThumbnailUrl = shouldUseProtectedMedia
+        ? (useBatchedAccess
+            ? (!shouldFetchScopedThumbnail(photo.filename, photo.thumbnailUrl)
+                ? (isHttpUrl(photo.thumbnailUrl) ? photo.thumbnailUrl! : PLACEHOLDER_THUMBNAIL)
+                : (resolvedAccessUrl || PLACEHOLDER_THUMBNAIL))
+            : (scopedThumbnailUrl || PLACEHOLDER_THUMBNAIL))
+        : fallbackThumbnailUrl;
+    // Seed as already-loaded when this exact URL has painted before (in this
+    // tile or any other) -- see paintedThumbnailUrls above.
+    const [imgLoaded, setImgLoaded] = useState(() => Boolean(resolvedThumbnailUrl && paintedThumbnailUrls.has(resolvedThumbnailUrl)));
 
     useEffect(() => {
         if (useBatchedAccess) {
@@ -160,13 +180,6 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
         };
     }, [fallbackThumbnailUrl, photo.filename, photo.thumbnailUrl, shouldUseProtectedMedia, useBatchedAccess]);
 
-    const resolvedThumbnailUrl = shouldUseProtectedMedia
-        ? (useBatchedAccess
-            ? (!shouldFetchScopedThumbnail(photo.filename, photo.thumbnailUrl)
-                ? (isHttpUrl(photo.thumbnailUrl) ? photo.thumbnailUrl! : PLACEHOLDER_THUMBNAIL)
-                : (resolvedAccessUrl || PLACEHOLDER_THUMBNAIL))
-            : (scopedThumbnailUrl || PLACEHOLDER_THUMBNAIL))
-        : fallbackThumbnailUrl;
     const mediaClassName = ['photo-media', onMediaClick ? 'interactive' : '']
         .filter(Boolean)
         .join(' ');
@@ -188,15 +201,30 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
         </span>
     ) : null;
 
-    // Reset the fade when the source changes; catch already-cached images whose
-    // load event may have fired before the handler was attached.
+    // Reset the fade when the source changes to a URL we haven't already
+    // painted; catch already-cached images whose load event may have fired
+    // before the handler was attached.
     useEffect(() => {
+        if (resolvedThumbnailUrl && paintedThumbnailUrls.has(resolvedThumbnailUrl)) {
+            setImgLoaded(true);
+            return;
+        }
         setImgLoaded(false);
         const el = imgElRef.current;
         if (el && el.complete && el.naturalWidth > 0) {
             setImgLoaded(true);
+            if (resolvedThumbnailUrl) {
+                paintedThumbnailUrls.add(resolvedThumbnailUrl);
+            }
         }
     }, [resolvedThumbnailUrl]);
+
+    const markLoaded = () => {
+        setImgLoaded(true);
+        if (resolvedThumbnailUrl) {
+            paintedThumbnailUrls.add(resolvedThumbnailUrl);
+        }
+    };
 
     return (
         <div className={classes} style={style} onClick={onCardClick} data-tile-id={photo.filename} {...longPressHandlers}>
@@ -209,8 +237,8 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
                     className={`${mediaClassName} photo-media--fade${imgLoaded ? ' is-loaded' : ''}`}
                     style={mediaStyle}
                     loading="lazy"
-                    onLoad={() => setImgLoaded(true)}
-                    onError={() => setImgLoaded(true)}
+                    onLoad={markLoaded}
+                    onError={markLoaded}
                     onClick={onMediaClick}
                 />
                 {videoOverlay}
