@@ -40,10 +40,9 @@ from typing import Dict, Optional
 
 from PIL import Image, ImageOps
 
-try:
-    import tesserocr
-except Exception:  # pragma: no cover - only absent outside the ipworker image
-    tesserocr = None
+from optional_deps import try_import
+
+tesserocr = try_import('tesserocr')
 
 MAX_OCR_TEXT_LENGTH = 2048
 

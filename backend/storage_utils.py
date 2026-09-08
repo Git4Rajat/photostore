@@ -58,6 +58,33 @@ FACE_LOW_CONFIDENCE_MAX_AREA_RATIO = float(os.getenv('FACE_LOW_CONFIDENCE_MAX_AR
 FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO = float(os.getenv('FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', '0.42'))
 CLIENT_PROCESSING_ALLOWED_STEPS = {'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'}
 CLIENT_PROCESSING_ALLOWED_STATUSES = {'done', 'skipped', 'failed', 'timeout', 'unsupported'}
+
+
+def _safe_json_load(value, default=None):
+    """Best-effort JSON parse: returns ``default`` (a fresh ``{}`` when
+    ``default`` is omitted) instead of raising for missing, empty, or
+    malformed JSON payloads read back from table/blob storage. Centralizes
+    the ``try: json.loads(x) except Exception: x = {}`` pattern that used to
+    be repeated at every metadata/table read site."""
+    if not value:
+        return {} if default is None else default
+    try:
+        return json.loads(value)
+    except Exception:
+        return {} if default is None else default
+
+
+def _safe_get_entity(table_client, partition_key: str, row_key: str, default=None):
+    """Best-effort single-entity fetch: returns ``default`` instead of raising
+    when the row is missing or the table call otherwise fails. Centralizes the
+    ``try: table.get_entity(...) except Exception: <default>`` pattern used at
+    read sites where a missing row is an expected, non-error outcome."""
+    if table_client is None:
+        return default
+    try:
+        return table_client.get_entity(partition_key=partition_key, row_key=row_key)
+    except Exception:
+        return default
 CLIENT_PROCESSING_TERMINAL_STATUSES = {'done', 'skipped', 'failed', 'timeout', 'unsupported'}
 BROWSER_PROCESSING_STEPS = ('thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face')
 HEIF_EXTENSIONS = {'heic', 'heif'}
@@ -334,15 +361,12 @@ def _get_original_filename(library_id: str, anonymous_id: str) -> Optional[str]:
     if image_names_table_client is None:
         return None
 
-    try:
-        entity = image_names_table_client.get_entity(partition_key=library_id, row_key=anonymous_id)
-        if entity:
-            original = str(entity.get('original_filename') or '').strip()
-            kind = str(entity.get('kind') or 'image').strip() or 'image'
-            _cache_image_name(library_id, anonymous_id, original, kind)
-            return original if original else None
-    except Exception:
-        pass
+    entity = _safe_get_entity(image_names_table_client, library_id, anonymous_id)
+    if entity:
+        original = str(entity.get('original_filename') or '').strip()
+        kind = str(entity.get('kind') or 'image').strip() or 'image'
+        _cache_image_name(library_id, anonymous_id, original, kind)
+        return original if original else None
 
     return None
 
@@ -496,10 +520,10 @@ def reserve_pending_anonymous_blob(user_id: str, original_filename: str, expecte
     metadata_table_client = _CTX['metadata_table_client']
     if not user_id or not original_filename:
         return None
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=original_filename)
-    except Exception:
-        entity = {'PartitionKey': user_id, 'RowKey': original_filename}
+    entity = _safe_get_entity(
+        metadata_table_client, user_id, original_filename,
+        default={'PartitionKey': user_id, 'RowKey': original_filename},
+    )
     existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
     existing_hash = str(entity.get('upload_sha256_expected') or '').strip()
     if existing and (not expected_hash or not existing_hash or existing_hash == expected_hash):
@@ -521,9 +545,8 @@ def read_pending_anonymous_blob(user_id: str, original_filename: str) -> Optiona
     metadata_table_client = _CTX['metadata_table_client']
     if not user_id or not original_filename:
         return None
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=original_filename)
-    except Exception:
+    entity = _safe_get_entity(metadata_table_client, user_id, original_filename)
+    if entity is None:
         return None
     value = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or entity.get('anonymousImageId') or '').strip()
     return value or None
@@ -572,10 +595,7 @@ def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
 def _normalize_face_bbox(face: Dict) -> Dict[str, int]:
     bbox = face.get('bbox', {}) if isinstance(face, dict) else {}
     if isinstance(bbox, str):
-        try:
-            bbox = json.loads(bbox or '{}')
-        except Exception:
-            bbox = {}
+        bbox = _safe_json_load(bbox)
     def px(key: str) -> int:
         try:
             return int(round(float(bbox.get(key, 0) or 0)))
@@ -1642,10 +1662,7 @@ def _apply_client_report_statuses(metadata: Dict, report: List[Dict]) -> None:
                 # working thumbnail as failed when the browser hits memory pressure
                 # or a canvas API hiccup during the heavier reprocessing pipeline.
                 if step == 'thumbnail' and status in {'failed', 'unsupported', 'timeout'}:
-                    try:
-                        prior_meta = json.loads(metadata.get('processing_metadata') or '{}')
-                    except Exception:
-                        prior_meta = {}
+                    prior_meta = _safe_json_load(metadata.get('processing_metadata'))
                     if isinstance(prior_meta, dict) and isinstance(prior_meta.get('client_thumbnail'), dict):
                         continue
                 metadata[field] = status
@@ -2022,10 +2039,7 @@ def _refresh_semantic_fields(filename: str, metadata: Dict) -> None:
 
 
 def _merge_processing_metadata(entity: Dict, key: str, value) -> None:
-    try:
-        processing = json.loads(entity.get('processing_metadata') or '{}')
-    except Exception:
-        processing = {}
+    processing = _safe_json_load(entity.get('processing_metadata'))
     processing[key] = value
     entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
 
@@ -2182,10 +2196,7 @@ def _apply_client_processing_results(
         })
         _apply_client_report_statuses(metadata, report)
         if _client_report_has_retryable_ai_vision_failure(report):
-            try:
-                processing = json.loads(metadata.get('processing_metadata') or '{}')
-            except Exception:
-                processing = {}
+            processing = _safe_json_load(metadata.get('processing_metadata'))
             previous_ai = processing.get('client_ai_vision') if isinstance(processing, dict) else None
             if isinstance(previous_ai, dict) and _is_local_vision_fallback_provenance(previous_ai):
                 _clear_previous_local_vision_fallback_metadata(metadata)
@@ -2428,10 +2439,7 @@ def _apply_client_processing_results(
     face_result_version = str(face_result.get('modelTaxonomyVersion') or '').strip() if isinstance(face_result, dict) else ''
     face_reembed_new_version = False
     if face_result_version:
-        try:
-            prior_processing_peek = json.loads(metadata.get('processing_metadata') or '{}')
-        except Exception:
-            prior_processing_peek = {}
+        prior_processing_peek = _safe_json_load(metadata.get('processing_metadata'))
         prior_client_face_peek = prior_processing_peek.get('client_face') if isinstance(prior_processing_peek, dict) else None
         stored_face_version = str(prior_client_face_peek.get('modelTaxonomyVersion') or '').strip() if isinstance(prior_client_face_peek, dict) else ''
         # A genuine re-embed under a different model (e.g. the stale-embedding-
@@ -2452,10 +2460,7 @@ def _apply_client_processing_results(
         # processing_metadata. Distinguishes an explicit forced re-run (Tools >
         # Backfill all photos) from ordinary/opportunistic re-processing, so
         # only the former is allowed to clean up rows the new pass superseded.
-        try:
-            prior_processing = json.loads(metadata.get('processing_metadata') or '{}')
-        except Exception:
-            prior_processing = {}
+        prior_processing = _safe_json_load(metadata.get('processing_metadata'))
         prior_face_meta = prior_processing.get('face') if isinstance(prior_processing, dict) else None
         face_was_forced = isinstance(prior_face_meta, dict) and bool(prior_face_meta.get('forced'))
         faces = face_result.get('faces')
@@ -2994,10 +2999,7 @@ def update_processing_status(
     status_field = f'{step}_status'
     entity[status_field] = status
 
-    try:
-        processing = json.loads(entity.get('processing_metadata') or '{}')
-    except Exception:
-        processing = {}
+    processing = _safe_json_load(entity.get('processing_metadata'))
 
     if result is not None:
         processing[step] = result

@@ -9,6 +9,7 @@ import { showToast } from '../services/toast';
 import { requestJobPoll } from '../services/jobNotifications';
 import { notifyApiError } from '../services/requestFeedback';
 import { isAuthEnabled } from '../services/authClient';
+import { fetchPageWithCorrection } from '../services/pagedFetch';
 import { useAppServices } from './AppServicesProvider';
 import { useLocation, useNavigate } from 'react-router-dom';
 import type { FlatFace, MergeHistoryItem, PersonFace, PersonSummary, SuggestionItem } from '../types/people';
@@ -316,18 +317,15 @@ const FaceClusters: React.FC = () => {
             setInitialLoading(true);
         }
         try {
-            const limit = CLUSTER_PER_PAGE;
-            let effectivePage = Math.max(1, targetPage);
-            let offset = (effectivePage - 1) * limit;
-            let res = await faceService.listPersons(q || '', offset, limit);
-            let total = res.total ?? (res.persons || []).length;
-            if ((res.persons || []).length === 0 && total > 0 && effectivePage > 1) {
-                effectivePage = Math.max(1, Math.ceil(total / limit));
-                offset = (effectivePage - 1) * limit;
-                res = await faceService.listPersons(q || '', offset, limit);
-                total = res.total ?? total;
-            }
-            setPersons((res.persons || []) as PersonSummary[]);
+            const { items, total, page: effectivePage } = await fetchPageWithCorrection(
+                async (offset, limit) => {
+                    const res = await faceService.listPersons(q || '', offset, limit);
+                    return { items: (res.persons || []) as PersonSummary[], total: res.total ?? (res.persons || []).length };
+                },
+                targetPage,
+                CLUSTER_PER_PAGE,
+            );
+            setPersons(items);
             setPersonsTotal(total);
             setPage(effectivePage);
         } catch (e: unknown) {
@@ -356,18 +354,14 @@ const FaceClusters: React.FC = () => {
     const loadFaces = async (q?: string, targetPage = page) => {
         setFacesLoading(true);
         try {
-            const limit = FACES_PER_PAGE;
-            let effectivePage = Math.max(1, targetPage);
-            let offset = (effectivePage - 1) * limit;
-            let res = await faceService.listFaces(q || '', offset, limit);
-            let total = res.total ?? (res.faces || []).length;
-            if ((res.faces || []).length === 0 && total > 0 && effectivePage > 1) {
-                effectivePage = Math.max(1, Math.ceil(total / limit));
-                offset = (effectivePage - 1) * limit;
-                res = await faceService.listFaces(q || '', offset, limit);
-                total = res.total ?? total;
-            }
-            const nextFaces = (res.faces || []) as FlatFace[];
+            const { items: nextFaces, total, page: effectivePage } = await fetchPageWithCorrection(
+                async (offset, limit) => {
+                    const res = await faceService.listFaces(q || '', offset, limit);
+                    return { items: (res.faces || []) as FlatFace[], total: res.total ?? (res.faces || []).length };
+                },
+                targetPage,
+                FACES_PER_PAGE,
+            );
             setFaces(nextFaces);
             setFacesTotal(total);
             setPage(effectivePage);

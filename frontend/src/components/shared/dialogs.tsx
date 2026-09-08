@@ -95,7 +95,7 @@ export const DialogHost: React.FC = () => {
             window.clearTimeout(focusTimer);
             window.removeEventListener('keydown', onKeyDown, true);
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+         
     }, [active]);
 
     if (!active) {

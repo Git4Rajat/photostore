@@ -28,13 +28,13 @@ import {
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { get, post } from '../services/apiClient';
 import { plural } from '../utils/format';
+import { useThumbnailAccessResolver } from '../services/useThumbnailAccessResolver';
+import { useMultiSelect } from '../services/useMultiSelect';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
 import { Loading } from './shared/Loading';
-import PhotoTile, { shouldFetchScopedThumbnail } from './shared/PhotoTile';
-import { isAuthEnabled } from '../services/authClient';
-import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
+import PhotoTile from './shared/PhotoTile';
 import { useWindowedGrid } from '../services/useWindowedGrid';
 import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
@@ -152,9 +152,9 @@ const AlbumsPage: React.FC = () => {
     const [activeAlbumVisibleCount, setActiveAlbumVisibleCount] = useState<number>(PAGE_SIZE);
     const [albumName, setAlbumName] = useState<string>('');
     const [addAlbumOpen, setAddAlbumOpen] = useState<boolean>(false);
-    const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
+    const { selected: selectedPhotos, setSelected: setSelectedPhotos } = useMultiSelect();
     const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
-    const [selectedAlbumIds, setSelectedAlbumIds] = useState<Set<string>>(new Set());
+    const { selected: selectedAlbumIds, setSelected: setSelectedAlbumIds } = useMultiSelect();
     const [showAddFromGallery, setShowAddFromGallery] = useState<boolean>(false);
     const [searchInput, setSearchInput] = useState<string>('');
     const [searchQuery, setSearchQuery] = useState<string>('');
@@ -179,7 +179,7 @@ const AlbumsPage: React.FC = () => {
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
     // filename -> batch-resolved access URL, shared with PhotoGallery/ToolsPage
     // via thumbnailAccessCache's module-level cache (see PhotoGallery.tsx).
-    const [thumbAccessUrls, setThumbAccessUrls] = useState<Map<string, string>>(new Map());
+    const { thumbAccessUrls, resolveAccessForBatch } = useThumbnailAccessResolver();
 
     const observerRef = useRef<IntersectionObserver | null>(null);
     const loadMoreRef = useRef<HTMLDivElement | null>(null);
@@ -367,29 +367,6 @@ const AlbumsPage: React.FC = () => {
     );
 
     const selectedCount = selectedPhotos.size;
-
-    // One batched access-token request per fetched list, not one per tile --
-    // same reasoning as PhotoGallery.tsx (see thumbnailAccessCache.ts). The
-    // underlying cache is a module-level singleton, so a filename already
-    // resolved while browsing the Gallery resolves here for free.
-    const resolveAccessForBatch = useCallback((list: Photo[]) => {
-        if (!isAuthEnabled()) {
-            return;
-        }
-        const needsAccess = list
-            .filter((p) => shouldFetchScopedThumbnail(p.filename, p.thumbnailUrl))
-            .map((p) => p.filename);
-        if (needsAccess.length === 0) {
-            return;
-        }
-        resolveThumbnailAccessUrls(needsAccess).then((resolved) => {
-            setThumbAccessUrls((prev) => {
-                const next = new Map(prev);
-                resolved.forEach((url, filename) => next.set(filename, url));
-                return next;
-            });
-        });
-    }, []);
 
     const fetchPhotosPage = useCallback(async (nextOffset = 0, append = false) => {
         const isInitialLoad = !append && nextOffset === 0;

@@ -5,7 +5,6 @@ import { Link, useLocation } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
 import { isApiError } from '../services/apiError';
 import { notifyApiError } from '../services/requestFeedback';
-import { getActiveLibraryFromToken } from '../services/passwordAuthClient';
 import {
     ARCFACE_EMBEDDING_DIMENSIONS,
     ARCFACE_EMBEDDING_VERSION,
@@ -30,6 +29,26 @@ import { isAuthEnabled } from '../services/authClient';
 import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
 import { useWindowedGrid } from '../services/useWindowedGrid';
 import type { FileSystemFileHandle } from '../services/fileSystemAccess';
+import {
+    idbPut,
+    idbGet,
+    idbDelete,
+    loadPhotoCache,
+    writePhotoCache,
+} from '../services/photoCache';
+import {
+    dataUrlToBlob,
+    readBlobArrayBuffer,
+    sha256ArrayBuffer,
+    blobSha256,
+} from '../utils/blobIo';
+import { parseJpegGpsExif, parseRawGpsExif } from '../utils/exifGpsParser';
+import type { ParsedGpsExif } from '../utils/exifGpsParser';
+// Re-exported so AppServicesProvider's `withPhotoGalleryRuntime` lazy-import
+// boundary (`typeof import('./PhotoGallery')`) keeps resolving idbPut/idbGet/
+// idbDelete/dataUrlToBlob/readBlobArrayBuffer/sha256ArrayBuffer -- the actual
+// implementations live in services/photoCache.ts and utils/blobIo.ts.
+export { idbPut, idbGet, idbDelete, dataUrlToBlob, readBlobArrayBuffer, sha256ArrayBuffer };
 import PhotoQuickActions, { workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
@@ -58,11 +77,7 @@ import type {
 } from '../types/browserProcessing';
 import type { Photo } from '../types/uiTypes';
 
-export const UPLOAD_SESSION_STORAGE_KEY = 'photostore.upload.session.v1';
-const UPLOAD_DB_NAME = 'photostore-upload-db';
-const UPLOAD_DB_STORE = 'files';
-export const PHOTO_CACHE_STORAGE_KEY = 'photostore.photo.cache.v1';
-const PHOTO_CACHE_MAX_AGE_MS = 1000 * 60 * 30;
+const UPLOAD_SESSION_STORAGE_KEY = 'photostore.upload.session.v1';
 const PHOTO_LIST_REQUEST_TIMEOUT_MS = 15000;
 
 // Discrete pinch-zoom density levels for the gallery grid. Index 0 is the
@@ -341,13 +356,6 @@ interface BrowserVisionSource {
     skipReason?: ClientProcessingReason;
     isRaw: boolean;
     thumbnailOnly?: boolean;
-}
-
-interface ParsedGpsExif {
-    exif: Record<string, string>;
-    latitude?: string;
-    longitude?: string;
-    hasExif: boolean;
 }
 
 export type BrowserAiModelState = SharedBrowserAiModelState & {
@@ -633,7 +641,6 @@ const createHeicDecodeWorker = () => new Worker(new URL('../workers/heicDecodeWo
 // browsers with native HEIC support (some Safari builds) never pay this cost.
 const decodeHeicToCanvas = (source: Blob): Promise<HTMLCanvasElement> => new Promise((resolve, reject) => {
     let settled = false;
-    let timer: number | undefined;
     const worker = createHeicDecodeWorker();
     const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const finish = (err?: unknown, canvas?: HTMLCanvasElement) => {
@@ -651,7 +658,7 @@ const decodeHeicToCanvas = (source: Blob): Promise<HTMLCanvasElement> => new Pro
             resolve(canvas);
         }
     };
-    timer = window.setTimeout(() => finish(new Error('heic_decode_timeout')), CLIENT_BROWSER_STEP_BUDGET_MS);
+    const timer = window.setTimeout(() => finish(new Error('heic_decode_timeout')), CLIENT_BROWSER_STEP_BUDGET_MS);
     worker.onmessage = (event) => {
         const data = event.data || {};
         if (data.type !== 'heic-decode-result' || data.requestId !== requestId) {
@@ -1237,7 +1244,7 @@ const detectFacesWithEmbeddings = async (sourceCanvas: HTMLCanvasElement): Promi
     const shouldAbortFaceDetection = () => (
         performance.now() - faceDetectionStartedAt >= FACE_DETECTION_SOFT_BUDGET_MS
     );
-    let candidates: BrowserFaceDetection[] = [];
+    const candidates: BrowserFaceDetection[] = [];
     let lastError: unknown = null;
     const debugStages: FaceDetectionDebugStage[] = ['model_load_started'];
     const metrics: FaceDetectionMetrics = {
@@ -1265,7 +1272,7 @@ const detectFacesWithEmbeddings = async (sourceCanvas: HTMLCanvasElement): Promi
         return null;
     });
     debugStages.push('model_load_done', 'detection_started');
-    let blazeFaceModel: any = await blazeFaceModelPromise;
+    const blazeFaceModel: any = await blazeFaceModelPromise;
     if (!blazeFaceModel && !lastError) {
         const timeoutError = new FaceDetectionUnavailableError('model_load_failed', 'blazeface_load_timeout');
         (timeoutError as any).debugStages = [...debugStages];
@@ -1333,44 +1340,6 @@ const detectFacesWithEmbeddings = async (sourceCanvas: HTMLCanvasElement): Promi
     };
 };
 
-export const dataUrlToBlob = async (dataUrl: string): Promise<Blob> => {
-    // Decoded locally rather than via fetch(dataUrl): fetching a data: URI is
-    // treated as a connect-src-governed request, which the app's CSP blocks.
-    const match = dataUrl.match(/^data:([^;,]*)(;base64)?,([\s\S]*)$/);
-    if (!match) {
-        throw new Error('Failed to convert thumbnail data URL to blob.');
-    }
-    const [, mimeType, isBase64, data] = match;
-    const contentType = mimeType || 'application/octet-stream';
-    if (isBase64) {
-        const byteString = atob(data);
-        const bytes = new Uint8Array(byteString.length);
-        for (let i = 0; i < byteString.length; i += 1) {
-            bytes[i] = byteString.charCodeAt(i);
-        }
-        return new Blob([bytes], { type: contentType });
-    }
-    return new Blob([decodeURIComponent(data)], { type: contentType });
-};
-
-export const readBlobArrayBuffer = (blob: Blob): Promise<ArrayBuffer> => {
-    if (typeof blob.arrayBuffer === 'function') {
-        return blob.arrayBuffer();
-    }
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-            if (reader.result instanceof ArrayBuffer) {
-                resolve(reader.result);
-            } else {
-                reject(new Error('Blob did not produce an ArrayBuffer.'));
-            }
-        };
-        reader.onerror = () => reject(reader.error || new Error('Failed to read blob.'));
-        reader.readAsArrayBuffer(blob);
-    });
-};
-
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T | null> => {
     let timer: number | undefined;
     try {
@@ -1406,14 +1375,6 @@ const withTimeoutOutcome = async <T,>(promise: Promise<T>, timeoutMs: number): P
 };
 
 const yieldToBrowser = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
-
-export const sha256ArrayBuffer = async (buffer: ArrayBuffer): Promise<string> => {
-    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
-};
-
-const blobSha256 = async (blob: Blob): Promise<string> => sha256ArrayBuffer(await readBlobArrayBuffer(blob));
 
 const getRuntimeConfig = (): AppRuntimeConfig => {
     if (typeof window === 'undefined') {
@@ -1902,7 +1863,6 @@ const warmBrowserAiWorker = (
     onProgress?: (stage: BrowserAiLoadStage) => void,
 ): Promise<BrowserAiWarmupResult> => new Promise((resolve, reject) => {
     let settled = false;
-    let timer: number | undefined;
     let lastPhase = 'worker_created';
     const worker = createBrowserAiWorker();
     const finish = (err?: unknown, result?: BrowserAiWarmupResult) => {
@@ -1920,7 +1880,7 @@ const warmBrowserAiWorker = (
             resolve(result || {});
         }
     };
-    timer = window.setTimeout(() => finish(new Error(`model_budget_exceeded:${lastPhase}`)), timeoutMs);
+    const timer = window.setTimeout(() => finish(new Error(`model_budget_exceeded:${lastPhase}`)), timeoutMs);
     worker.onmessage = (event) => {
         const data = event.data || {};
         if (data.type === 'browser-ai-warmup-progress') {
@@ -2053,7 +2013,6 @@ const runBrowserAiVisionInWorker = (
             return;
         }
         let settled = false;
-        let timer: number | undefined;
         const worker = createBrowserAiWorker();
         const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const finish = (err?: unknown, result?: Record<string, any>) => {
@@ -2071,7 +2030,7 @@ const runBrowserAiVisionInWorker = (
                 resolve(result || {});
             }
         };
-        timer = window.setTimeout(() => finish(new Error('inference_timeout')), timeoutMs);
+        const timer = window.setTimeout(() => finish(new Error('inference_timeout')), timeoutMs);
         worker.onmessage = (event) => {
             const data = event.data || {};
             if (data.type !== 'browser-ai-analyze-result' || data.requestId !== requestId) {
@@ -2472,7 +2431,7 @@ const acquireBrowserAiModelInner = async (
         });
     }
 
-    let warmupResult: BrowserAiWarmupResult = {};
+    let warmupResult: BrowserAiWarmupResult;
     try {
         warmupResult = await warmBrowserAiWorker(manifest, CLIENT_MODEL_WARMUP_BUDGET_MS, onProgress);
     } catch (err) {
@@ -2665,7 +2624,7 @@ const createRawConvertedVisionSource = async (
     if (!convertedPreview || convertedPreview.size <= 0) {
         return null;
     }
-    let dimensions: { width: number; height: number } | null = null;
+    let dimensions: { width: number; height: number } | null;
     try {
         dimensions = await validateImageBlob(convertedPreview);
     } catch {
@@ -2698,7 +2657,7 @@ const extractEmbeddedJpegPreview = async (file: File): Promise<BrowserVisionSour
         return createRawFallbackVisionSource(file, base, range?.timedOut ? 'raw_container_unsupported' : 'raw_preview_missing');
     }
     const previewBlob = file.slice(range.start, range.end, 'image/jpeg');
-    let dimensions: { width: number; height: number } | null = null;
+    let dimensions: { width: number; height: number } | null;
     try {
         dimensions = await validateImageBlob(previewBlob);
     } catch {
@@ -2945,406 +2904,7 @@ const createBrowserAiImagePayload = async (source: Blob | File): Promise<Browser
     };
 };
 
-const readAscii = (view: DataView, offset: number, length: number) => {
-    let value = '';
-    for (let i = 0; i < length; i += 1) {
-        value += String.fromCharCode(view.getUint8(offset + i));
-    }
-    return value;
-};
 
-const gpsRational = (view: DataView, offset: number, little: boolean) => {
-    const numerator = view.getUint32(offset, little);
-    const denominator = view.getUint32(offset + 4, little);
-    return denominator === 0 ? 0 : numerator / denominator;
-};
-
-const TIFF_TYPE_BYTES: Record<number, number> = {
-    1: 1,
-    2: 1,
-    3: 2,
-    4: 4,
-    5: 8,
-    7: 1,
-    9: 4,
-    10: 8,
-};
-
-const TIFF_IFD0_TAGS: Record<number, string> = {
-    0x010f: 'Make',
-    0x0110: 'Model',
-    0x0112: 'Orientation',
-    0x0132: 'DateTime',
-    0x8769: 'ExifIFDPointer',
-};
-
-const TIFF_EXIF_TAGS: Record<number, string> = {
-    0x829a: 'ExposureTime',
-    0x829d: 'FNumber',
-    0x8827: 'ISOSpeedRatings',
-    0x9003: 'DateTimeOriginal',
-    0x920a: 'FocalLength',
-    0xa002: 'ExifImageWidth',
-    0xa003: 'ExifImageHeight',
-    0xa405: 'FocalLengthIn35mmFilm',
-    0xa434: 'LensModel',
-};
-
-const GPS_TAGS: Record<number, string> = {
-    1: 'GPSLatitudeRef',
-    2: 'GPSLatitude',
-    3: 'GPSLongitudeRef',
-    4: 'GPSLongitude',
-    5: 'GPSAltitudeRef',
-    6: 'GPSAltitude',
-    7: 'GPSTimeStamp',
-    29: 'GPSDateStamp',
-};
-
-const tiffValueOffset = (view: DataView, tiff: number, entry: number, type: number, count: number, little: boolean) => {
-    const typeBytes = TIFF_TYPE_BYTES[type] || 0;
-    if (!typeBytes || count < 0) {
-        return -1;
-    }
-    const byteCount = typeBytes * count;
-    if (byteCount <= 4) {
-        return entry + 8;
-    }
-    return tiff + view.getUint32(entry + 8, little);
-};
-
-const tiffAscii = (view: DataView, offset: number, count: number) => {
-    if (offset < 0 || count <= 0 || offset + count > view.byteLength) {
-        return '';
-    }
-    return readAscii(view, offset, count).replace(/\0+$/, '').trim();
-};
-
-const tiffValueString = (view: DataView, offset: number, type: number, count: number, little: boolean) => {
-    if (offset < 0 || offset >= view.byteLength) {
-        return '';
-    }
-    try {
-        if (type === 2) {
-            return tiffAscii(view, offset, count);
-        }
-        if (type === 3 && offset + 2 <= view.byteLength) {
-            const values = Array.from({ length: Math.min(count, 4) }, (_, idx) => (
-                offset + idx * 2 + 2 <= view.byteLength ? String(view.getUint16(offset + idx * 2, little)) : ''
-            )).filter(Boolean);
-            return values.join(', ');
-        }
-        if (type === 4 && offset + 4 <= view.byteLength) {
-            const values = Array.from({ length: Math.min(count, 4) }, (_, idx) => (
-                offset + idx * 4 + 4 <= view.byteLength ? String(view.getUint32(offset + idx * 4, little)) : ''
-            )).filter(Boolean);
-            return values.join(', ');
-        }
-        if (type === 5 && offset + 8 <= view.byteLength) {
-            const values = Array.from({ length: Math.min(count, 4) }, (_, idx) => {
-                const valueOffset = offset + idx * 8;
-                if (valueOffset + 8 > view.byteLength) {
-                    return '';
-                }
-                const numerator = view.getUint32(valueOffset, little);
-                const denominator = view.getUint32(valueOffset + 4, little);
-                return denominator ? `${numerator}/${denominator}` : String(numerator);
-            }).filter(Boolean);
-            return values.join(', ');
-        }
-    } catch {
-        return '';
-    }
-    return '';
-};
-
-const parseTiffGpsExif = (view: DataView, tiff: number): ParsedGpsExif | null => {
-    if (tiff + 8 > view.byteLength) {
-        return null;
-    }
-    const endian = readAscii(view, tiff, 2);
-    const little = endian === 'II';
-    if (!little && endian !== 'MM') {
-        return null;
-    }
-    if (view.getUint16(tiff + 2, little) !== 42) {
-        return null;
-    }
-    const ifd0 = tiff + view.getUint32(tiff + 4, little);
-    if (ifd0 + 2 > view.byteLength) {
-        return null;
-    }
-    const exif: Record<string, string> = {};
-    const entries = view.getUint16(ifd0, little);
-    let gpsIfd = 0;
-    let exifIfd = 0;
-    for (let i = 0; i < entries; i += 1) {
-        const entry = ifd0 + 2 + i * 12;
-        if (entry + 12 > view.byteLength) {
-            break;
-        }
-        const tag = view.getUint16(entry, little);
-        const type = view.getUint16(entry + 2, little);
-        const count = view.getUint32(entry + 4, little);
-        const valueOffset = tiffValueOffset(view, tiff, entry, type, count, little);
-        const tagName = TIFF_IFD0_TAGS[tag];
-        if (tagName && tagName !== 'ExifIFDPointer') {
-            const value = tiffValueString(view, valueOffset, type, count, little);
-            if (value) {
-                exif[tagName] = value;
-            }
-        }
-        if (tag === 0x8825) {
-            gpsIfd = tiff + view.getUint32(entry + 8, little);
-        } else if (tag === 0x8769) {
-            exifIfd = tiff + view.getUint32(entry + 8, little);
-        }
-    }
-    if (exifIfd && exifIfd + 2 <= view.byteLength) {
-        const exifEntries = view.getUint16(exifIfd, little);
-        for (let i = 0; i < exifEntries; i += 1) {
-            const entry = exifIfd + 2 + i * 12;
-            if (entry + 12 > view.byteLength) {
-                break;
-            }
-            const tag = view.getUint16(entry, little);
-            const tagName = TIFF_EXIF_TAGS[tag];
-            if (!tagName) {
-                continue;
-            }
-            const type = view.getUint16(entry + 2, little);
-            const count = view.getUint32(entry + 4, little);
-            const valueOffset = tiffValueOffset(view, tiff, entry, type, count, little);
-            const value = tiffValueString(view, valueOffset, type, count, little);
-            if (value) {
-                exif[tagName] = value;
-            }
-        }
-    }
-    if (!gpsIfd || gpsIfd + 2 > view.byteLength) {
-        return { exif, hasExif: true };
-    }
-    const gpsEntries = view.getUint16(gpsIfd, little);
-    let latRef = 'N';
-    let lonRef = 'E';
-    let latValues: number[] | null = null;
-    let lonValues: number[] | null = null;
-    for (let i = 0; i < gpsEntries; i += 1) {
-        const entry = gpsIfd + 2 + i * 12;
-        if (entry + 12 > view.byteLength) {
-            break;
-        }
-        const tag = view.getUint16(entry, little);
-        const type = view.getUint16(entry + 2, little);
-        const count = view.getUint32(entry + 4, little);
-        const valueOffset = tiff + view.getUint32(entry + 8, little);
-        const gpsName = GPS_TAGS[tag];
-        if (gpsName) {
-            const gpsValueOffset = tiffValueOffset(view, tiff, entry, type, count, little);
-            const value = tiffValueString(view, gpsValueOffset, type, count, little);
-            if (value) {
-                exif[`GPS.${gpsName}`] = value;
-            }
-        }
-        if ((tag === 1 || tag === 3) && type === 2) {
-            const ref = String.fromCharCode(view.getUint8(entry + 8));
-            if (tag === 1) latRef = ref;
-            if (tag === 3) lonRef = ref;
-        }
-        if ((tag === 2 || tag === 4) && type === 5 && count >= 3 && valueOffset + 24 <= view.byteLength) {
-            const values = [0, 1, 2].map((idx) => gpsRational(view, valueOffset + idx * 8, little));
-            if (tag === 2) latValues = values;
-            if (tag === 4) lonValues = values;
-        }
-    }
-    const toDecimal = (values: number[], ref: string) => {
-        const decimal = values[0] + values[1] / 60 + values[2] / 3600;
-        return (ref === 'S' || ref === 'W' ? -decimal : decimal).toFixed(7).replace(/\.?0+$/, '');
-    };
-    if (latValues && lonValues) {
-        const latitude = toDecimal(latValues, latRef);
-        const longitude = toDecimal(lonValues, lonRef);
-        exif['GPS.GPSLatitudeRef'] = latRef;
-        exif['GPS.GPSLongitudeRef'] = lonRef;
-        exif['GPS.LatitudeDecimal'] = latitude;
-        exif['GPS.LongitudeDecimal'] = longitude;
-        return { exif, latitude, longitude, hasExif: true };
-    }
-    return { exif, hasExif: true };
-};
-
-const parseJpegGpsExif = async (source: Blob | File, sourceName = ''): Promise<ParsedGpsExif | null> => {
-    const contentType = source.type || '';
-    if (!/^image\/jpe?g$/i.test(contentType) && !/\.(jpe?g)$/i.test(sourceName)) {
-        return null;
-    }
-    const buffer = await readBlobArrayBuffer(source.slice(0, Math.min(source.size, 512 * 1024)));
-    const view = new DataView(buffer);
-    if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) {
-        return null;
-    }
-    let offset = 2;
-    while (offset + 4 < view.byteLength) {
-        if (view.getUint8(offset) !== 0xff) {
-            break;
-        }
-        const marker = view.getUint8(offset + 1);
-        const size = view.getUint16(offset + 2);
-        if (marker === 0xe1 && size > 8 && readAscii(view, offset + 4, 6) === 'Exif\0\0') {
-            return parseTiffGpsExif(view, offset + 10) || { exif: {}, hasExif: true };
-        }
-        offset += 2 + size;
-    }
-    return { exif: {}, hasExif: false };
-};
-
-const bytesMatchAscii = (bytes: Uint8Array, offset: number, text: string) => {
-    if (offset < 0 || offset + text.length > bytes.length) {
-        return false;
-    }
-    for (let i = 0; i < text.length; i += 1) {
-        if (bytes[offset + i] !== text.charCodeAt(i)) {
-            return false;
-        }
-    }
-    return true;
-};
-
-const isTiffHeaderAt = (bytes: Uint8Array, offset: number) => (
-    offset >= 0
-    && offset + 4 <= bytes.length
-    && (
-        (bytes[offset] === 0x49 && bytes[offset + 1] === 0x49 && bytes[offset + 2] === 0x2a && bytes[offset + 3] === 0x00)
-        || (bytes[offset] === 0x4d && bytes[offset + 1] === 0x4d && bytes[offset + 2] === 0x00 && bytes[offset + 3] === 0x2a)
-    )
-);
-
-const mergeParsedExif = (existing: ParsedGpsExif | null, next: ParsedGpsExif | null): ParsedGpsExif | null => {
-    if (!next) {
-        return existing;
-    }
-    if (!existing) {
-        return next;
-    }
-    return {
-        exif: { ...existing.exif, ...next.exif },
-        latitude: existing.latitude || next.latitude,
-        longitude: existing.longitude || next.longitude,
-        hasExif: existing.hasExif || next.hasExif,
-    };
-};
-
-const parseTiffCandidates = (view: DataView, bytes: Uint8Array, start = 0, end = bytes.length): ParsedGpsExif | null => {
-    let best: ParsedGpsExif | null = null;
-    const safeStart = Math.max(0, start);
-    const safeEnd = Math.min(bytes.length - 4, end);
-    for (let offset = safeStart; offset <= safeEnd; offset += 1) {
-        if (!isTiffHeaderAt(bytes, offset)) {
-            continue;
-        }
-        const parsed = parseTiffGpsExif(view, offset);
-        if (!parsed) {
-            continue;
-        }
-        best = mergeParsedExif(best, parsed);
-        if (parsed.latitude && parsed.longitude) {
-            return best;
-        }
-    }
-    return best;
-};
-
-const parseExifSignatureCandidates = (view: DataView, bytes: Uint8Array): ParsedGpsExif | null => {
-    let best: ParsedGpsExif | null = null;
-    for (let offset = 0; offset <= bytes.length - 10; offset += 1) {
-        if (!bytesMatchAscii(bytes, offset, 'Exif\0\0')) {
-            continue;
-        }
-        const tiffOffset = offset + 6;
-        if (!isTiffHeaderAt(bytes, tiffOffset)) {
-            continue;
-        }
-        const parsed = parseTiffGpsExif(view, tiffOffset);
-        if (!parsed) {
-            continue;
-        }
-        best = mergeParsedExif(best, parsed);
-        if (parsed.latitude && parsed.longitude) {
-            return best;
-        }
-    }
-    return best;
-};
-
-const parseIsoBmffExifCandidates = (view: DataView, bytes: Uint8Array, start = 0, end = bytes.length, depth = 0): ParsedGpsExif | null => {
-    if (depth > 4) {
-        return null;
-    }
-    let best: ParsedGpsExif | null = null;
-    let offset = Math.max(0, start);
-    const safeEnd = Math.min(bytes.length, end);
-    const containerBoxes = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl', 'meta', 'iprp', 'ipco', 'iinf']);
-    while (offset + 8 <= safeEnd) {
-        let size = view.getUint32(offset);
-        const type = readAscii(view, offset + 4, 4);
-        let header = 8;
-        if (size === 1 && offset + 16 <= safeEnd) {
-            const high = view.getUint32(offset + 8);
-            const low = view.getUint32(offset + 12);
-            if (high > 0 || low <= 16) {
-                break;
-            }
-            size = low;
-            header = 16;
-        } else if (size === 0) {
-            size = safeEnd - offset;
-        }
-        if (size < header || offset + size > safeEnd) {
-            break;
-        }
-        const payloadStart = offset + header + (type === 'uuid' ? 16 : 0) + (type === 'meta' ? 4 : 0);
-        const payloadEnd = offset + size;
-        if (payloadStart < payloadEnd) {
-            if (type.toLowerCase().includes('exif') || type === 'uuid') {
-                best = mergeParsedExif(best, parseExifSignatureCandidates(view, bytes));
-                best = mergeParsedExif(best, parseTiffCandidates(view, bytes, payloadStart, payloadEnd));
-                if (best?.latitude && best.longitude) {
-                    return best;
-                }
-            }
-            if (containerBoxes.has(type)) {
-                best = mergeParsedExif(best, parseIsoBmffExifCandidates(view, bytes, payloadStart, payloadEnd, depth + 1));
-                if (best?.latitude && best.longitude) {
-                    return best;
-                }
-            }
-        }
-        offset += size;
-    }
-    return best;
-};
-
-const parseRawGpsExif = async (file: File): Promise<ParsedGpsExif | null> => {
-    if (!isRawFile(file)) {
-        return null;
-    }
-    const buffer = await readBlobArrayBuffer(file.slice(0, Math.min(file.size, CLIENT_RAW_EXIF_SCAN_MAX_BYTES)));
-    const view = new DataView(buffer);
-    const bytes = new Uint8Array(buffer);
-    const directTiff = parseTiffGpsExif(view, 0);
-    if (directTiff?.latitude && directTiff.longitude) {
-        return directTiff;
-    }
-    const exifMarker = parseExifSignatureCandidates(view, bytes);
-    if (exifMarker?.latitude && exifMarker.longitude) {
-        return exifMarker;
-    }
-    const isoExif = parseIsoBmffExifCandidates(view, bytes);
-    if (isoExif?.latitude && isoExif.longitude) {
-        return isoExif;
-    }
-    return mergeParsedExif(mergeParsedExif(directTiff, exifMarker), isoExif) || parseTiffCandidates(view, bytes);
-};
 
 export const runBrowserProcessing = async (
     file: File,
@@ -3532,7 +3092,7 @@ export const runBrowserProcessing = async (
         }));
     } else try {
         const exif = await withTimeout(
-            visionSource.isRaw ? parseRawGpsExif(file) : parseJpegGpsExif(file, file.name),
+            visionSource.isRaw ? parseRawGpsExif(file, CLIENT_RAW_EXIF_SCAN_MAX_BYTES) : parseJpegGpsExif(file, file.name),
             CLIENT_BROWSER_STEP_BUDGET_MS,
         );
         parsedGpsExif = exif;
@@ -4096,109 +3656,7 @@ export const withFinalizeGrace = async (
 };
 
 
-interface PersistedPhotoCache {
-    timestamp: number;
-    photos: Photo[];
-    totalAvailable: number;
-    offset: number;
-    hasMore: boolean;
-    sortBy: string;
-    searchQuery: string;
-    filters: FilterOptions;
-    captureStartDate: string;
-    captureEndDate: string;
-}
 
-// Scope the boot cache to the active library so switching libraries never
-// replays the previous library's photos. Falls back to the base key when there
-// is no session (local dev / unauthenticated).
-const photoCacheKey = (): string => {
-    const lib = getActiveLibraryFromToken();
-    return lib ? `${PHOTO_CACHE_STORAGE_KEY}.${lib}` : PHOTO_CACHE_STORAGE_KEY;
-};
-
-const loadPhotoCache = (): PersistedPhotoCache | null => {
-    try {
-        const raw = localStorage.getItem(photoCacheKey());
-        if (!raw) {
-            return null;
-        }
-        const parsed = JSON.parse(raw) as PersistedPhotoCache;
-        if (!parsed || !Array.isArray(parsed.photos) || typeof parsed.timestamp !== 'number') {
-            return null;
-        }
-        if (Date.now() - parsed.timestamp > PHOTO_CACHE_MAX_AGE_MS) {
-            return null;
-        }
-        return parsed;
-    } catch {
-        return null;
-    }
-};
-
-const writePhotoCache = (cache: PersistedPhotoCache) => {
-    try {
-        const key = photoCacheKey();
-        // Purge the pre-scoping global cache entry (written before caches were
-        // scoped per library) so it can never be replayed under another library.
-        if (key !== PHOTO_CACHE_STORAGE_KEY) {
-            localStorage.removeItem(PHOTO_CACHE_STORAGE_KEY);
-        }
-        localStorage.setItem(key, JSON.stringify(cache));
-    } catch {
-        // Ignore storage quota or serialization errors.
-    }
-};
-
-const openUploadDb = (): Promise<IDBDatabase> => new Promise((resolve, reject) => {
-    const request = indexedDB.open(UPLOAD_DB_NAME, 1);
-    request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(UPLOAD_DB_STORE)) {
-            db.createObjectStore(UPLOAD_DB_STORE);
-        }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error || new Error('Failed to open upload database.'));
-});
-
-// Also accepts a FileSystemFileHandle (Chrome/Edge desktop's resume path --
-// see fileSystemAccess.ts): IndexedDB's structured clone algorithm supports
-// storing handles directly, and they're far cheaper to persist than the
-// file's actual bytes.
-export const idbPut = async (key: string, value: Blob | FileSystemFileHandle): Promise<void> => {
-    const db = await openUploadDb();
-    await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(UPLOAD_DB_STORE, 'readwrite');
-        tx.objectStore(UPLOAD_DB_STORE).put(value, key);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error('Failed to persist upload blob.'));
-    });
-    db.close();
-};
-
-export const idbGet = async (key: string): Promise<Blob | FileSystemFileHandle | null> => {
-    const db = await openUploadDb();
-    const result = await new Promise<Blob | FileSystemFileHandle | null>((resolve, reject) => {
-        const tx = db.transaction(UPLOAD_DB_STORE, 'readonly');
-        const req = tx.objectStore(UPLOAD_DB_STORE).get(key);
-        req.onsuccess = () => resolve((req.result as Blob | FileSystemFileHandle | undefined) || null);
-        req.onerror = () => reject(req.error || new Error('Failed to load upload blob.'));
-    });
-    db.close();
-    return result;
-};
-
-export const idbDelete = async (key: string): Promise<void> => {
-    const db = await openUploadDb();
-    await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(UPLOAD_DB_STORE, 'readwrite');
-        tx.objectStore(UPLOAD_DB_STORE).delete(key);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error('Failed to delete upload blob.'));
-    });
-    db.close();
-};
 
 
 interface PhotoGalleryProps {
@@ -4223,7 +3681,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     releaseKnownHashesForFilenames,
 }) => {
     const location = useLocation();
-    const cachedBoot = loadPhotoCache();
+    const cachedBoot = loadPhotoCache<Photo, FilterOptions>();
     const [photos, setPhotos] = useState<Photo[]>(cachedBoot?.photos || []);
     // filename -> batch-resolved access URL (see thumbnailAccessCache). '' means
     // "resolved, but the thumbnail isn't generated yet" (render placeholder);
@@ -4538,13 +3996,12 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             // Prevent infinite-scroll from hammering the API when requests are failing.
             setHasMore(false);
         } finally {
-            if (requestSeq !== photoListRequestSeqRef.current) {
-                return;
-            }
-            if (isInitialLoad) {
-                setLoading(false);
-            } else {
-                setLoadingMore(false);
+            if (requestSeq === photoListRequestSeqRef.current) {
+                if (isInitialLoad) {
+                    setLoading(false);
+                } else {
+                    setLoadingMore(false);
+                }
             }
         }
     }, [sortBy, filters, searchQuery, buildCaptureQuery, galleryZoomLevel]);

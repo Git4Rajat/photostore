@@ -24,9 +24,8 @@ import { plural } from '../utils/format';
 import { confirmDialog } from './shared/dialogs';
 import { useAppServices, browserProcessingActionSteps } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
-import PhotoTile, { shouldFetchScopedThumbnail } from './shared/PhotoTile';
-import { isAuthEnabled } from '../services/authClient';
-import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
+import PhotoTile from './shared/PhotoTile';
+import { useThumbnailAccessResolver } from '../services/useThumbnailAccessResolver';
 import { useWindowedGrid } from '../services/useWindowedGrid';
 import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { libraryFocusHref } from './shared/PhotoQuickActions';
@@ -300,35 +299,12 @@ const ToolsPage: React.FC = () => {
     const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
     // filename -> batch-resolved access URL, shared with PhotoGallery/AlbumsPage
     // via thumbnailAccessCache's module-level cache (see PhotoGallery.tsx).
-    const [thumbAccessUrls, setThumbAccessUrls] = useState<Map<string, string>>(new Map());
+    const { thumbAccessUrls, resolveAccessForBatch } = useThumbnailAccessResolver();
     const activeToolsPage = getToolsPageKey(location.pathname);
     const isOverviewPage = activeToolsPage === 'overview';
     const isQueueStatusPage = activeToolsPage === 'queue-status';
     const isBrowserWorkbenchPage = activeToolsPage === 'browser-workbench';
     const isRecoveryPage = activeToolsPage === 'recovery';
-
-    // One batched access-token request per fetched list, not one per tile --
-    // same reasoning as PhotoGallery.tsx (see thumbnailAccessCache.ts). The
-    // underlying cache is a module-level singleton, so a filename already
-    // resolved while browsing the Gallery/Albums resolves here for free.
-    const resolveAccessForBatch = (list: Photo[]) => {
-        if (!isAuthEnabled()) {
-            return;
-        }
-        const needsAccess = list
-            .filter((p) => shouldFetchScopedThumbnail(p.filename, p.thumbnailUrl))
-            .map((p) => p.filename);
-        if (needsAccess.length === 0) {
-            return;
-        }
-        resolveThumbnailAccessUrls(needsAccess).then((resolved) => {
-            setThumbAccessUrls((prev) => {
-                const next = new Map(prev);
-                resolved.forEach((url, filename) => next.set(filename, url));
-                return next;
-            });
-        });
-    };
 
     const loadPhotos = async (queryText: string = '') => {
         setLoading(true);

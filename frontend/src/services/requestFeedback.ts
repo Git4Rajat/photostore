@@ -27,7 +27,7 @@ export const notifyApiError = (error: unknown, options: NotifyApiErrorOptions = 
     const apiError = classifyApiError(error);
 
     // Always log the specifics so "it failed" is traceable to a request.
-    // eslint-disable-next-line no-console
+     
     console.error(
         `[api] ${apiError.kind}${apiError.status ? ` ${apiError.status}` : ''} (ref ${apiError.requestId}): ${apiError.rawMessage}`,
     );

@@ -12,6 +12,7 @@
     "prebuild": "npm run sync:blazeface-model && npm run sync:browser-ai-runtime",
     "build": "vite build && chmod -R a+rX build/models",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -35,17 +36,22 @@
     "onnxruntime-web": "^1.27.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.15.0"
-    ,
+    "react-router-dom": "^6.15.0",
     "tesseract.js": "^2.1.5"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@testing-library/react": "^16.1.0",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^5.0.0",
+    "eslint": "^10.10.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.6",
+    "globals": "^17.12.0",
     "jsdom": "^29.1.1",
     "typescript": "^4.9.5",
+    "typescript-eslint": "^8.70.0",
     "vite": "^8.0.16",
     "vitest": "^4.1.8"
   }

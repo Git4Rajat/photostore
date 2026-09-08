@@ -515,8 +515,8 @@ const classify = async (manifest: BrowserAiManifest, image: BrowserAiImagePayloa
 };
 
 const analyze = async (manifest: BrowserAiManifest, image: BrowserAiImagePayload) => {
-    let predictions: BrowserAiPrediction[] = [];
-    let imageEmbedding: number[] = [];
+    let predictions: BrowserAiPrediction[];
+    let imageEmbedding: number[];
     try {
         const result = await classify(manifest, image);
         predictions = result.predictions;

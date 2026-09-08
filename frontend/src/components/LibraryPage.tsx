@@ -162,7 +162,7 @@ const LibraryPage: React.FC = () => {
     useEffect(() => {
         const libraryId = mine?.activeLibraryId;
         if (!libraryId || opfsUsable !== true) return;
-        let active = false;
+        let active: boolean;
         try {
             active = window.localStorage.getItem(exportActiveStorageKey(libraryId)) === '1';
         } catch {

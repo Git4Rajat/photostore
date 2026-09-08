@@ -130,7 +130,7 @@ const runProbe = async () => {
     }
     probeInFlight = true;
     setState({ checking: true, attempts: state.attempts + 1 });
-    let reachable = false;
+    let reachable: boolean;
     try {
         reachable = await probeHealthOnce();
     } finally {

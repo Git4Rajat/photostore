@@ -39,21 +39,15 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
+from optional_deps import try_import
 
 # cv2/onnxruntime/mediapipe are ipworker-only deps (requirements-ipworker.txt),
 # not in backend/requirements.txt -- guarded the same way ipwork_ocr.py guards
 # tesserocr, so importing this module never hard-crashes outside the
 # ipworker image (it shouldn't be imported there at all, but defense in depth
 # costs nothing here).
-try:
-    import cv2
-except Exception:  # pragma: no cover - only absent outside the ipworker image
-    cv2 = None
-
-try:
-    import onnxruntime as ort
-except Exception:  # pragma: no cover - only absent outside the ipworker image
-    ort = None
+cv2 = try_import('cv2')
+ort = try_import('onnxruntime')
 
 try:
     import mediapipe as mp
