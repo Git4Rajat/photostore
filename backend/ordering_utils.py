@@ -76,6 +76,15 @@ def parse_capture_date(exif_data: Dict[str, str]) -> Optional[datetime]:
     raw = (
         exif_data.get('DateTimeOriginal')
         or exif_data.get('DateTime')
+        # QuickTime's "CreationDate" (com.apple.quicktime.creationdate) is
+        # checked ahead of the container-level CreateDate/MediaCreateDate/
+        # TrackCreateDate atoms: those get silently rewritten to the
+        # export/transfer time whenever a video is re-saved, shared, or
+        # re-encoded (AirDrop, WhatsApp, "Save Video", etc.), while
+        # CreationDate is the local-time-with-offset field iOS writes and
+        # is what Photos.app itself displays -- it survives that far more
+        # reliably.
+        or exif_data.get('CreationDate')
         or exif_data.get('CreateDate')
         or exif_data.get('MediaCreateDate')
         or exif_data.get('TrackCreateDate')

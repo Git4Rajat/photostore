@@ -172,6 +172,26 @@ def test_client_last_modified_ignored_when_missing_or_invalid():
         assert ordering_utils.metadata_capture_datetime(row_with_upload).year == 2026
 
 
+def test_creation_date_preferred_over_container_create_date_for_video():
+    # Regression: video container atoms (CreateDate/MediaCreateDate/
+    # TrackCreateDate) get silently rewritten to the export/transfer time
+    # whenever a video is re-saved, shared, or re-encoded, while exiftool's
+    # "CreationDate" (com.apple.quicktime.creationdate) is the local-time
+    # field iOS writes and survives that -- it must outrank the container
+    # atoms, not be ignored entirely.
+    dataset = {
+        'reshared.mov': {
+            'exifData': json.dumps({
+                'CreationDate': '2020:06:01 12:00:00-07:00',
+                'CreateDate': '2026:01:05 09:00:00',
+                'MediaCreateDate': '2026:01:05 09:00:00',
+            }),
+        },
+    }
+    captured = ordering_utils.metadata_capture_datetime(dataset['reshared.mov'])
+    assert captured.year == 2020
+
+
 def test_epoch_millis_to_iso():
     assert ordering_utils.epoch_millis_to_iso(1717200000000).startswith('2024-06-01')
     assert ordering_utils.epoch_millis_to_iso(None) is None
