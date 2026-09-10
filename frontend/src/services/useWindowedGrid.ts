@@ -113,6 +113,18 @@ export function useWindowedGrid<T>({
     const containerRef = useRef<HTMLDivElement | null>(null);
     const innerRef = useRef<HTMLDivElement | null>(null);
     const seenKeysRef = useRef<Set<string>>(new Set());
+    // recompute() is expected to bail out (no setState) once measurements
+    // settle, but it's driven by live browser layout (getBoundingClientRect /
+    // getComputedStyle), which isn't guaranteed to converge to a fixed point
+    // every time -- a measurement that ping-pongs between two values would
+    // otherwise re-trigger this effect synchronously forever and crash the
+    // whole page with "Maximum update depth exceeded". This counts
+    // consecutive recomputes within a single synchronous burst and bails
+    // out (leaving the grid in whatever state it last reached) rather than
+    // letting React hit that ceiling. The counter resets on the next
+    // macrotask, since a burst caused by legitimate rapid re-renders never
+    // runs that many times before yielding back to the browser.
+    const recomputeGuardRef = useRef({ count: 0, resetScheduled: false });
     const [metrics, setMetrics] = useState<Metrics>(() => (
         { columnCount: estimateInitialColumnCount(), rowHeight: INITIAL_ROW_HEIGHT_GUESS, rowGap: 16 }
     ));
@@ -166,9 +178,25 @@ export function useWindowedGrid<T>({
         ));
     };
 
-    // Runs after every commit; each setState call above is a no-op when the
-    // value hasn't actually changed, so this can't loop.
+    // Runs after every commit; each setState call above is normally a no-op
+    // once measurements settle, so this doesn't loop in practice. The guard
+    // above is the backstop for when it doesn't.
     useLayoutEffect(() => {
+        const guard = recomputeGuardRef.current;
+        guard.count += 1;
+        if (!guard.resetScheduled) {
+            guard.resetScheduled = true;
+            window.setTimeout(() => {
+                guard.count = 0;
+                guard.resetScheduled = false;
+            }, 0);
+        }
+        if (guard.count > 30) {
+            if (typeof console !== 'undefined') {
+                console.error('useWindowedGrid: recompute() re-triggered itself too many times in a row; bailing out to avoid an infinite render loop.');
+            }
+            return;
+        }
         recompute();
     });
 

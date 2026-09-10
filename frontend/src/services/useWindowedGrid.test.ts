@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { renderHook } from '@testing-library/react';
+import React from 'react';
+import { describe, expect, it, vi } from 'vitest';
+import { renderHook, render } from '@testing-library/react';
 import { computeWindowRange, useWindowedGrid } from './useWindowedGrid';
 
 describe('computeWindowRange', () => {
@@ -81,5 +82,63 @@ describe('useWindowedGrid', () => {
         const items = [{ filename: 'a.jpg' }];
         const { result } = renderHook(() => useWindowedGrid({ items, getKey: (p) => p.filename, enabled: false }));
         expect(result.current.shouldAnimateEntrance('a.jpg')).toBe(false);
+    });
+
+    it('bails out instead of crashing when live layout measurements never settle', () => {
+        // Regression test: recompute() trusts getComputedStyle/getBoundingClientRect
+        // to converge across repeated calls. If real browser layout ever fails to
+        // (e.g. a measurement that ping-pongs between two states), the
+        // useLayoutEffect-with-no-deps that drives recompute() would otherwise
+        // re-trigger itself synchronously forever and React would throw
+        // "Maximum update depth exceeded", crashing the whole page. Force that
+        // oscillation here and assert it degrades (console.error) instead of throwing.
+        const items = Array.from({ length: 40 }, (_, i) => ({ filename: `photo-${i}.jpg` }));
+
+        const realGetComputedStyle = window.getComputedStyle;
+        let call = 0;
+        const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation((el, ...rest) => {
+            const real = realGetComputedStyle(el, ...rest);
+            call += 1;
+            const columns = call % 2 === 0 ? '100px 100px 100px' : '100px 100px 100px 100px';
+            return new Proxy(real, {
+                get(target, prop) {
+                    if (prop === 'gridTemplateColumns') {
+                        return columns;
+                    }
+                    if (prop === 'rowGap') {
+                        return '10px';
+                    }
+                    return Reflect.get(target, prop);
+                },
+            });
+        });
+
+        let rectCall = 0;
+        const rectSpy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
+            rectCall += 1;
+            const height = rectCall % 2 === 0 ? 300 : 301;
+            return {
+                top: 0, left: 0, right: 0, bottom: height, width: 400, height,
+                x: 0, y: 0, toJSON: () => ({}),
+            } as DOMRect;
+        });
+
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        function Harness() {
+            const { containerRef, innerRef, visibleItems } = useWindowedGrid({
+                items, getKey: (p) => p.filename,
+            });
+            return React.createElement('div', { ref: containerRef },
+                React.createElement('div', { ref: innerRef },
+                    visibleItems.map((item) => React.createElement('div', { key: item.filename }))));
+        }
+
+        expect(() => render(React.createElement(Harness))).not.toThrow();
+        expect(consoleErrorSpy.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('recompute() re-triggered itself too many times'))).toBe(true);
+
+        getComputedStyleSpy.mockRestore();
+        rectSpy.mockRestore();
+        consoleErrorSpy.mockRestore();
     });
 });
