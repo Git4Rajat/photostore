@@ -284,6 +284,18 @@
               ]
             },
             {
+              "type": "Microsoft.Communication/emailServices/domains/senderUsernames",
+              "apiVersion": "2023-04-01",
+              "name": "[format('{0}/{1}/{2}', format('{0}-email', parameters('appName')), 'AzureManagedDomain', 'DoNotReply')]",
+              "properties": {
+                "username": "DoNotReply",
+                "displayName": "Keepsake"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]"
+              ]
+            },
+            {
               "type": "Microsoft.Communication/communicationServices",
               "apiVersion": "2023-04-01",
               "name": "[format('{0}-comm', parameters('appName'))]",

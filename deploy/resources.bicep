@@ -122,6 +122,19 @@ resource emailDomain 'Microsoft.Communication/emailServices/domains@2023-04-01' 
   }
 }
 
+// Gives the default DoNotReply@<managed-domain> sender a friendly display
+// name, so recipient inboxes show "Keepsake" instead of the raw "DoNotReply"
+// local-part (ACS has no display-name field on the send API itself — this
+// sub-resource is the only place it can be set).
+resource emailSenderUsername 'Microsoft.Communication/emailServices/domains/senderUsernames@2023-04-01' = {
+  parent: emailDomain
+  name: 'DoNotReply'
+  properties: {
+    username: 'DoNotReply'
+    displayName: 'Keepsake'
+  }
+}
+
 resource communicationService 'Microsoft.Communication/communicationServices@2023-04-01' = {
   name: '${appName}-comm'
   location: 'global'
