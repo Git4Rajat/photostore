@@ -87,7 +87,9 @@ def env(monkeypatch):
     queue = _FakeQueue()
     blob_service = _FakeBlobServiceClient()
     monkeypatch.setattr(app, 'metadata_table_client', table)
-    monkeypatch.setattr(app, 'clustering_queue_client', queue)
+    # library_download now runs on its own priority queue, not the general
+    # clustering queue -- see LIBRARY_OPS_QUEUE_NAME.
+    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
     monkeypatch.setattr(app, 'blob_service_client', blob_service)
     monkeypatch.setattr(app, '_jobs_partition_scan_cache', app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS))
 

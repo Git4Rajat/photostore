@@ -89,7 +89,12 @@ def test_sigterm_finishes_in_flight_message_and_stops_polling(monkeypatch):
     assert queue_client.delete_calls == ['in-flight']
     assert 'never-claimed' not in queue_client.delete_calls
     # Only one receive_messages call should have gone through before the
-    # signal landed and the loop condition stopped further polling.
+    # signal landed and the loop condition stopped further polling. Holds
+    # even with run_clustering_worker's priority library-ops queue check
+    # added (both resolve to this same fake client): finding a message on
+    # the first (library-ops) poll short-circuits the second (clustering)
+    # poll for that iteration, and the SIGTERM lands during that message's
+    # processing, stopping the loop before a second iteration ever starts.
     assert len(queue_client.receive_calls) == 1
     # Returns promptly since the in-flight work finished on its own in ~0.2s
     # -- no grace-period wait needed for this (synchronous, one-at-a-time)

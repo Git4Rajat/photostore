@@ -712,6 +712,19 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             // Past this many dequeues, the message is dropped and its job
             // marked 'failed' instead of retried again.
             { name: 'CLUSTERING_WORKER_MAX_RETRIES', value: '5' }
+            // library_clean/library_download run on their own queue (checked
+            // by the worker before the general clustering queue -- see
+            // run_clustering_worker) so a user-initiated destructive wipe or
+            // export never sits FIFO behind auto-triggered clustering
+            // backfill. _execute_library_clean/_execute_library_download are
+            // idempotent/resumable, and most redeliveries on this queue come
+            // from worker restarts/redeploys/KEDA scale-down SIGTERMs rather
+            // than the job's own logic failing (see
+            // clustering-worker-sigterm-job-loss writeup), so this ceiling is
+            // deliberately much higher than CLUSTERING_WORKER_MAX_RETRIES --
+            // still finite so a genuinely poisoned library eventually stops
+            // instead of retrying forever.
+            { name: 'LIBRARY_CLEAN_MAX_RETRIES', value: '30' }
             // The worker sends the "cleanup complete" email once a library_clean
             // job finishes; without this it silently no-ops (is_configured()
             // false) since ACS_CONNECTION_STRING lived only on the backend's env.
@@ -730,6 +743,22 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
               metadata: {
                 accountName: storageAccountName
                 queueName: 'photostore-clustering'
+                queueLength: '1'
+              }
+              identity: 'system'
+            }
+          }
+          {
+            // Separate rule (not just a higher-priority poll order inside the
+            // worker) so a library-ops backlog alone -- with the clustering
+            // queue empty -- still scales the worker up from zero instead of
+            // waiting for the next unrelated clustering trigger.
+            name: 'library-ops-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-library-ops'
                 queueLength: '1'
               }
               identity: 'system'

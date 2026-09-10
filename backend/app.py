@@ -481,6 +481,27 @@ CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS = int(os.getenv('CLUSTERING_WORKER_LEASE
 # instead of retried again -- the user can retry manually from the UI if the
 # job is still wanted.
 CLUSTERING_WORKER_MAX_RETRIES = int(os.getenv('CLUSTERING_WORKER_MAX_RETRIES', '5'))
+# library_clean/library_download used to share the clustering queue with every
+# auto-triggered clustering job (people_cluster, recluster, propagate...) --
+# a user-initiated destructive wipe had no priority over routine backfill
+# traffic and could sit FIFO behind it. Their own queue means the worker
+# checks for one before ever touching the general clustering backlog (see
+# run_clustering_worker), so a clean/download request gets picked up within
+# one poll cycle regardless of how deep the clustering queue is.
+LIBRARY_OPS_QUEUE_NAME = os.getenv('LIBRARY_OPS_QUEUE_NAME', 'photostore-library-ops')
+# _execute_library_clean (and _execute_library_download) are naturally
+# idempotent/resumable -- they walk-and-delete/export whatever's still there,
+# so redelivering the same message is always safe, unlike a generic
+# clustering job. CLUSTERING_WORKER_MAX_RETRIES's 5-strike ceiling exists to
+# stop a genuinely poisoned message from retrying forever, but on this queue
+# most redeliveries come from worker restarts/redeploys/KEDA scale-down
+# SIGTERMs killing an in-flight job (see clustering-worker-sigterm-job-loss),
+# not from the clean logic itself failing -- a slow clean can plausibly
+# survive more than 5 of those across a busy deploy day. Give it a much
+# higher ceiling instead of none, so a truly poisoned library (every attempt
+# throws immediately) still eventually stops instead of burning compute
+# forever.
+LIBRARY_CLEAN_MAX_RETRIES = int(os.getenv('LIBRARY_CLEAN_MAX_RETRIES', '30'))
 IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
 # ipworker's job: thumbnail, exif, ocr, geo (map_detection), vision (ai_vision),
 # face -- the full set the browser can do client-side. Thumbnail used to be a
@@ -817,6 +838,7 @@ library_store = None
 clustering_queue_client = None
 queue_service_client = None
 ipwork_queue_client = None
+library_ops_queue_client = None
 
 
 class _UserScanCache:
@@ -1021,7 +1043,7 @@ def _init_storage_clients():
     global config_table_client
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
-    global clustering_queue_client, queue_service_client, ipwork_queue_client
+    global clustering_queue_client, queue_service_client, ipwork_queue_client, library_ops_queue_client
 
     account_name = STORAGE_ACCOUNT_NAME or os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
 
@@ -1051,6 +1073,7 @@ def _init_storage_clients():
         queue_service_client_local = QueueServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
+        library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
     else:
         # Managed identity mode (Azure)
         credential = DefaultAzureCredential()
@@ -1070,6 +1093,7 @@ def _init_storage_clients():
         )
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
+        library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
 
         # Table clients
         tbl_svc = TableServiceClient(endpoint=f'https://{account_name}.table.core.windows.net', credential=credential)
@@ -1110,6 +1134,7 @@ def _init_storage_clients():
     clean_requests_table_client = clean_requests_table_client_local
     clustering_queue_client = clustering_queue_client_local
     ipwork_queue_client = ipwork_queue_client_local
+    library_ops_queue_client = library_ops_queue_client_local
     queue_service_client = queue_service_client_local
 
     # Ensure the multi-tenant tables exist and wire up the library store.
@@ -1136,6 +1161,10 @@ def _init_storage_clients():
         ipwork_queue_client.create_queue()
     except Exception as exc:
         app.logger.debug('Queue ensure skipped for %s: %s', IPWORKER_QUEUE_NAME, exc)
+    try:
+        library_ops_queue_client.create_queue()
+    except Exception as exc:
+        app.logger.debug('Queue ensure skipped for %s: %s', LIBRARY_OPS_QUEUE_NAME, exc)
 
     # Password-mode: ensure the config table exists and seed the initial owner
     # credential from OWNER_EMAIL/OWNER_PASSWORD on first boot (no-op afterwards).
@@ -7577,10 +7606,10 @@ def _execute_library_clean(library_id: str) -> Dict:
 
 def _enqueue_library_clean_job(library_id: str, actor_user_id: str, request_id: str) -> Dict[str, str]:
     job_id = f"libclean:{library_id}:{uuid.uuid4().hex}"
-    if clustering_queue_client is None:
+    if library_ops_queue_client is None:
         # No queue configured (e.g. local dev) — run inline rather than silently
         # dropping a destructive action the caller believes is in progress.
-        app.logger.warning('Clustering queue client is unavailable; running library clean %s inline', job_id)
+        app.logger.warning('Library-ops queue client is unavailable; running library clean %s inline', job_id)
         try:
             library_store.set_cleanup_in_progress(library_id, job_id)
             summary = _execute_library_clean(library_id)
@@ -7603,7 +7632,7 @@ def _enqueue_library_clean_job(library_id: str, actor_user_id: str, request_id: 
     }
     try:
         library_store.set_cleanup_in_progress(library_id, job_id)
-        clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
+        library_ops_queue_client.send_message(json.dumps(message, separators=(',', ':')))
     except Exception:
         app.logger.exception('Failed to enqueue library clean job %s', job_id)
         library_store.set_cleanup_failed(library_id, 'Failed to queue cleanup job')
@@ -7925,10 +7954,10 @@ def _has_active_library_download_job(library_id: str) -> Optional[str]:
 
 def _enqueue_library_download_job(library_id: str, actor_user_id: str, library_name: str) -> Dict[str, str]:
     job_id = f"libdownload:{library_id}:{uuid.uuid4().hex}"
-    if clustering_queue_client is None:
+    if library_ops_queue_client is None:
         # No queue configured (e.g. local dev) — run inline rather than
         # silently dropping the request.
-        app.logger.warning('Clustering queue client is unavailable; running library download %s inline', job_id)
+        app.logger.warning('Library-ops queue client is unavailable; running library download %s inline', job_id)
         try:
             summary = _execute_library_download(library_id, library_name, job_id=job_id, user_id=actor_user_id)
             _upsert_job_status(job_id, actor_user_id, 'library_download', 'done', result=summary, libraryId=library_id)
@@ -7946,7 +7975,7 @@ def _enqueue_library_download_job(library_id: str, actor_user_id: str, library_n
         'type': 'library_download',
     }
     try:
-        clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
+        library_ops_queue_client.send_message(json.dumps(message, separators=(',', ':')))
     except Exception:
         app.logger.exception('Failed to enqueue library download job %s', job_id)
         _upsert_job_status(job_id, actor_user_id, 'library_download', 'failed', error='Failed to queue download job', libraryId=library_id)
@@ -14210,6 +14239,129 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         _maybe_enqueue_coalesced_rerun(job_id, user_id)
 
 
+def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int) -> bool:
+    """Receive and fully process at most one message from ``queue_client``.
+
+    Factored out of run_clustering_worker so the same dequeue-count ceiling +
+    lease-renewal + dispatch + delete logic can run against either the
+    priority library-ops queue or the general clustering queue. Returns
+    whether a message was found at all (whether it completed, errored, or was
+    dropped for exceeding max_retries) -- callers use this to distinguish
+    "this queue is empty, fall through to the next one" from "this queue had
+    work", so the priority queue gets drained before the general one is ever
+    touched in a given poll cycle.
+    """
+    messages = list(queue_client.receive_messages(
+        messages_per_page=1,
+        max_messages=1,
+        visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
+    ))
+    if not messages:
+        return False
+    message = messages[0]
+    payload: Dict = {}
+    job_id = ''
+    user_id = ''
+    job_type = ''
+
+    dequeue_count = int(getattr(message, 'dequeue_count', 0) or 0)
+    if dequeue_count > max_retries:
+        try:
+            payload = json.loads(message.content or '{}')
+            if isinstance(payload, dict):
+                job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
+                user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+                job_type = str(payload.get('type') or '').strip()
+        except Exception:
+            pass
+        reason = (
+            f'Exceeded max retries ({max_retries}); '
+            f'redelivered {dequeue_count} times without completing. '
+            'Retry manually if this job is still wanted.'
+        )
+        if job_id and user_id:
+            try:
+                _upsert_job_status(job_id, user_id, job_type or 'clustering', 'failed', error=reason)
+            except Exception:
+                pass
+        if job_type == 'library_clean' and library_store is not None:
+            # _upsert_job_status above only writes the jobs-table row; the
+            # normal library_clean failure path (_handle_clustering_queue_payload)
+            # also stamps the photolibraries row via set_cleanup_failed so
+            # uploads unblock immediately instead of waiting on
+            # _reconcile_in_progress_from_job_row to notice on the next
+            # upload attempt.
+            library_id = str(payload.get('libraryId') or user_id) if isinstance(payload, dict) else ''
+            if library_id:
+                try:
+                    library_store.set_cleanup_failed(library_id, reason)
+                except Exception:
+                    pass
+        worker_logger.warning(
+            'Dropping %s queue message after %s dequeues (max %s), job_id=%s',
+            queue_name, dequeue_count, max_retries, job_id,
+        )
+        try:
+            queue_client.delete_message(message)
+        except Exception:
+            worker_logger.exception('Failed to delete %s queue message exceeding max retries', queue_name)
+        return True
+
+    # Keep this message's lease alive for as long as we're actively working
+    # it, no matter how long that takes -- see
+    # CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS's comment above.
+    # update_message() returns a new message object with a fresh pop receipt
+    # each time, which the eventual delete_message must use -- hence the
+    # lock-guarded holder rather than reusing the original `message` variable
+    # directly.
+    message_holder = [message]
+    message_lock = threading.Lock()
+    stop_renewal = threading.Event()
+
+    def _renew_lease() -> None:
+        while not stop_renewal.wait(CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS):
+            try:
+                with message_lock:
+                    current = message_holder[0]
+                renewed = queue_client.update_message(
+                    current, visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
+                )
+                with message_lock:
+                    message_holder[0] = renewed
+            except Exception:
+                # Transient renewal failures shouldn't abort the job -- if the
+                # message is genuinely gone the next attempt just fails
+                # harmlessly again until stop_renewal is set below.
+                worker_logger.exception('Failed to renew %s queue message lease', queue_name)
+
+    renewal_thread = threading.Thread(target=_renew_lease, daemon=True)
+    renewal_thread.start()
+    try:
+        payload = json.loads(message.content or '{}')
+        if isinstance(payload, dict):
+            job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
+            user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+            job_type = str(payload.get('type') or '').strip()
+            _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
+    except Exception as exc:
+        if job_id and user_id:
+            try:
+                _upsert_job_status(job_id, user_id, 'clustering', 'failed', error=str(exc))
+            except Exception:
+                pass
+        worker_logger.exception('Failed to process %s queue message', queue_name)
+    finally:
+        stop_renewal.set()
+        renewal_thread.join(timeout=5)
+        with message_lock:
+            final_message = message_holder[0]
+        try:
+            queue_client.delete_message(final_message)
+        except Exception:
+            worker_logger.exception('Failed to delete %s queue message', queue_name)
+    return True
+
+
 def run_clustering_worker() -> None:
     """Poll clustering queue jobs in a standalone container."""
     logging.basicConfig(
@@ -14224,13 +14376,20 @@ def run_clustering_worker() -> None:
     if queue_service_client_local is None:
         raise RuntimeError('Queue service client unavailable')
     queue_client = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
-    for ensure_client in (queue_client,):
+    # library_ops_client is checked first every poll cycle (see the main loop
+    # below) so a user-initiated library_clean/library_download never sits
+    # FIFO behind an auto-triggered clustering backlog -- see
+    # LIBRARY_OPS_QUEUE_NAME's comment. One extra empty-queue receive_messages
+    # call per idle poll cycle is a negligible transaction cost next to that.
+    library_ops_client = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
+    for ensure_client in (queue_client, library_ops_client):
         try:
             ensure_client.create_queue()
         except Exception:
             pass
     worker_logger.info(
-        'Worker polling queue %s every %ss',
+        'Worker polling queue %s (priority) then %s every %ss',
+        LIBRARY_OPS_QUEUE_NAME,
         CLUSTERING_QUEUE_NAME,
         poll_seconds,
     )
@@ -14261,104 +14420,21 @@ def run_clustering_worker() -> None:
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
     while not shutdown_requested.is_set():
-        processed_any = False
         try:
-            messages = list(queue_client.receive_messages(
-                messages_per_page=1,
-                max_messages=1,
-                visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
-            ))
-            for message in messages:
-                processed_any = True
-                payload = {}
-                job_id = ''
-                user_id = ''
-                job_type = ''
-
-                dequeue_count = int(getattr(message, 'dequeue_count', 0) or 0)
-                if dequeue_count > CLUSTERING_WORKER_MAX_RETRIES:
-                    try:
-                        payload = json.loads(message.content or '{}')
-                        if isinstance(payload, dict):
-                            job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
-                            user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
-                            job_type = str(payload.get('type') or '').strip()
-                    except Exception:
-                        pass
-                    if job_id and user_id:
-                        try:
-                            _upsert_job_status(
-                                job_id, user_id, job_type or 'clustering', 'failed',
-                                error=(
-                                    f'Exceeded max retries ({CLUSTERING_WORKER_MAX_RETRIES}); '
-                                    f'redelivered {dequeue_count} times without completing. '
-                                    'Retry manually if this job is still wanted.'
-                                ),
-                            )
-                        except Exception:
-                            pass
-                    worker_logger.warning(
-                        'Dropping clustering queue message after %s dequeues (max %s), job_id=%s',
-                        dequeue_count, CLUSTERING_WORKER_MAX_RETRIES, job_id,
-                    )
-                    try:
-                        queue_client.delete_message(message)
-                    except Exception:
-                        worker_logger.exception('Failed to delete clustering queue message exceeding max retries')
-                    continue
-
-                # Keep this message's lease alive for as long as we're actively
-                # working it, no matter how long that takes -- see
-                # CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS's comment above.
-                # update_message() returns a new message object with a fresh
-                # pop receipt each time, which the eventual delete_message
-                # must use -- hence the lock-guarded holder rather than
-                # reusing the original `message` variable directly.
-                message_holder = [message]
-                message_lock = threading.Lock()
-                stop_renewal = threading.Event()
-
-                def _renew_lease() -> None:
-                    while not stop_renewal.wait(CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS):
-                        try:
-                            with message_lock:
-                                current = message_holder[0]
-                            renewed = queue_client.update_message(
-                                current, visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
-                            )
-                            with message_lock:
-                                message_holder[0] = renewed
-                        except Exception:
-                            # Transient renewal failures shouldn't abort the job --
-                            # if the message is genuinely gone the next attempt just
-                            # fails harmlessly again until stop_renewal is set below.
-                            worker_logger.exception('Failed to renew clustering queue message lease')
-
-                renewal_thread = threading.Thread(target=_renew_lease, daemon=True)
-                renewal_thread.start()
-                try:
-                    payload = json.loads(message.content or '{}')
-                    if isinstance(payload, dict):
-                        job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
-                        user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
-                        job_type = str(payload.get('type') or '').strip()
-                        _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
-                except Exception as exc:
-                    if job_id and user_id:
-                        try:
-                            _upsert_job_status(job_id, user_id, 'clustering', 'failed', error=str(exc))
-                        except Exception:
-                            pass
-                    worker_logger.exception('Failed to process clustering queue message')
-                finally:
-                    stop_renewal.set()
-                    renewal_thread.join(timeout=5)
-                    with message_lock:
-                        final_message = message_holder[0]
-                    try:
-                        queue_client.delete_message(final_message)
-                    except Exception:
-                        worker_logger.exception('Failed to delete clustering queue message')
+            # Priority queue first: only fall through to the general
+            # clustering queue once library-ops has nothing waiting, so a
+            # library_clean/library_download never queues behind backfill
+            # traffic. A sustained library-ops backlog can starve clustering
+            # entirely under maxReplicas=1 -- accepted deliberately, since
+            # these are rare, user-initiated, "someone is staring at a
+            # spinner" actions and the whole point is that they win.
+            processed_any = _poll_clustering_queue_once(
+                library_ops_client, LIBRARY_OPS_QUEUE_NAME, LIBRARY_CLEAN_MAX_RETRIES,
+            )
+            if not processed_any:
+                processed_any = _poll_clustering_queue_once(
+                    queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
+                )
             if not processed_any:
                 time.sleep(poll_seconds)
         except Exception:
