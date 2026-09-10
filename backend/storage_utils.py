@@ -56,7 +56,7 @@ _TRANSIENT_FACE_FAILURE_STAGES = {
 }
 FACE_LOW_CONFIDENCE_MAX_AREA_RATIO = float(os.getenv('FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', '0.08'))
 FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO = float(os.getenv('FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', '0.42'))
-CLIENT_PROCESSING_ALLOWED_STEPS = {'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'}
+CLIENT_PROCESSING_ALLOWED_STEPS = {'preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'}
 CLIENT_PROCESSING_ALLOWED_STATUSES = {'done', 'skipped', 'failed', 'timeout', 'unsupported'}
 
 
@@ -86,7 +86,7 @@ def _safe_get_entity(table_client, partition_key: str, row_key: str, default=Non
     except Exception:
         return default
 CLIENT_PROCESSING_TERMINAL_STATUSES = {'done', 'skipped', 'failed', 'timeout', 'unsupported'}
-BROWSER_PROCESSING_STEPS = ('thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face')
+BROWSER_PROCESSING_STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face')
 HEIF_EXTENSIONS = {'heic', 'heif'}
 CLIENT_PROCESSING_ALLOWED_REASONS = {
     'done',
@@ -121,6 +121,7 @@ CLIENT_PROCESSING_ALLOWED_SOURCE_KINDS = {
     'backend_converted_jpeg',
     'raw_exif_only',
     'unsupported',
+    'browser_shrunk',
 }
 CLIENT_PROCESSING_ALLOWED_MODEL_AVAILABILITY = {
     'available',
@@ -2006,6 +2007,20 @@ def _client_report_needs_server_exif_fallback(report: List[Dict]) -> bool:
     return False
 
 
+def _client_report_needs_server_preview_fallback(report: List[Dict]) -> bool:
+    # Mirrors _client_report_needs_server_thumbnail_fallback below exactly,
+    # for the 'preview' step -- an explicit failed/timeout/unsupported report
+    # for preview (not just "no preview field in this payload") is what
+    # triggers the synchronous server-side retry.
+    for item in report:
+        if str(item.get('step') or '').strip() != 'preview':
+            continue
+        status = str(item.get('status') or '').strip().lower()
+        if status in {'unsupported', 'failed', 'timeout'}:
+            return True
+    return False
+
+
 def _client_report_needs_server_thumbnail_fallback(report: List[Dict]) -> bool:
     # Deliberately excludes 'skipped': that status is only ever reported for
     # RAW/video (see rawFallback / createVideoBrowserThumbnail in
@@ -2129,6 +2144,41 @@ def _apply_server_thumbnail_fallback(
     return status_updates
 
 
+def _apply_server_preview_fallback(
+    user_id: str,
+    filename: str,
+    metadata: Dict,
+    image_bytes: bytes,
+    *,
+    fallback_for: str,
+) -> Dict[str, object]:
+    # Mirrors _apply_server_thumbnail_fallback above -- same self-heal shape,
+    # convert_image_to_jpeg does the actual resize/quality-ladder work
+    # (image_utils.py), reused as-is from the RAW/HEIC-only preview route.
+    status_updates: Dict[str, object] = {}
+    try:
+        preview_bytes = convert_image_to_jpeg(image_bytes, filename)
+    except Exception:
+        preview_bytes = None
+    if not preview_bytes:
+        status_updates['preview_status'] = 'failed'
+        return status_updates
+    thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
+    preview_blob_name = f'preview/{thumbnail_blob_name}.jpg'
+    upload_media_file('thumbnail', preview_blob_name, preview_bytes, 'image/jpeg')
+    mark_step_done(user_id, filename, 'preview', result={
+        'source': 'server',
+        'reason': fallback_for,
+    })
+    status_updates['preview_status'] = 'done'
+    _merge_processing_metadata(metadata, 'server_preview', {
+        'source': 'server',
+        'acceptedAt': _utc_now(),
+        'fallbackFor': fallback_for,
+    })
+    return status_updates
+
+
 def _step_locked_done(metadata: Dict, step: str) -> bool:
     """True if `step` is already 'done' on this photo.
 
@@ -2182,6 +2232,7 @@ def _apply_client_processing_results(
     # after -- otherwise a report of this call's own failure would always look
     # like "no existing thumbnail" even when a prior successful one exists.
     had_thumbnail_before = str(metadata.get('thumbnail_status') or '').strip().lower() == 'done'
+    had_preview_before = str(metadata.get('preview_status') or '').strip().lower() == 'done'
     face_report_background_throttled = any(
         str(item.get('step') or '').strip() == 'face'
         and str(item.get('reason') or '').strip().lower() == 'background_throttled'
@@ -2298,6 +2349,62 @@ def _apply_client_processing_results(
             ))
         else:
             status_updates['thumbnail_status'] = 'failed'
+
+    # 'preview' mirrors the thumbnail block above exactly -- same race guard,
+    # same accept-and-upload shape, same fallback trigger -- just producing
+    # the ~2048px/~1MB shrunk JPEG (image_utils.convert_image_to_jpeg) that's
+    # now the default lightbox image for every photo, not only RAW/HEIC.
+    preview_blob_name = f'preview/{thumbnail_blob_name}.jpg'
+    preview_payload = payload.get('preview')
+    preview_already_uploaded = False
+    if preview_payload is not None and had_preview_before:
+        pass
+    elif preview_payload is not None:
+        preview_provenance = _client_source_provenance(preview_payload)
+        preview_data = str(preview_payload.get('data') or '').strip()
+        if preview_data:
+            try:
+                preview_bytes = base64.b64decode(preview_data)
+                if preview_bytes:
+                    upload_media_file('thumbnail', preview_blob_name, preview_bytes, str(preview_payload.get('contentType') or 'image/jpeg'))
+                    preview_already_uploaded = True
+            except Exception:
+                pass
+        if preview_already_uploaded:
+            mark_step_done(user_id, filename, 'preview', result={
+                'source': origin,
+                'clientAssetId': client_asset_id,
+                **preview_provenance,
+            })
+            status_updates['preview_status'] = 'done'
+            _merge_processing_metadata(metadata, 'client_preview', {
+                'source': origin,
+                'acceptedAt': _utc_now(),
+                'clientAssetId': client_asset_id,
+                **preview_provenance,
+            })
+    if (
+        not preview_already_uploaded
+        and not had_preview_before
+        and not is_video_file(filename)
+        and (
+            _client_report_needs_server_preview_fallback(report)
+            # ipworker/browser report failure inline via clientProcessing.preview's
+            # hasData, same as thumbnail above.
+            or (isinstance(preview_payload, dict) and preview_payload.get('hasData') is False)
+        )
+    ):
+        source_bytes = _try_get_image_bytes(get_image_bytes)
+        if source_bytes is not None:
+            status_updates.update(_apply_server_preview_fallback(
+                user_id,
+                filename,
+                metadata,
+                source_bytes,
+                fallback_for='client_preview_failed',
+            ))
+        else:
+            status_updates['preview_status'] = 'failed'
 
     exif_result = payload.get('exif')
     if isinstance(exif_result, dict) and _step_locked_done(metadata, 'exif'):
@@ -2902,7 +3009,7 @@ def finalize_uploaded_file(
     # just written two lines earlier, purely to set these fields and write it
     # right back. Same final state, one fewer read + write per file.
     file_is_video = is_video_file(final_filename)
-    video_status_overrides = {'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
+    video_status_overrides = {'preview': 'skipped', 'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
     status_overrides = video_status_overrides if file_is_video else {}
     for step in PROCESSING_STEPS:
         metadata[f'{step}_status'] = status_overrides.get(step, 'pending')

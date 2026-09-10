@@ -512,7 +512,7 @@ IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
 # point of 'backend' mode for unattended bulk reprocessing. ipwork_thumbnail.py
 # reuses the same PIL/rawpy/ffmpeg path as storage_utils's existing reactive
 # server-side thumbnail fallback, so this needed no new ipworker-only deps.
-IPWORK_STEPS = ('thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detection')
+IPWORK_STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detection')
 # How long ipworker holds the per-photo processing lease while it works.
 # Generous relative to the browser's 120s because a single ipworker pass runs
 # every step server-side inference in sequence (face + OCR + vision + geo)
@@ -8514,7 +8514,9 @@ def _is_supported_photo_access_kind(kind: str) -> bool:
 def _photo_access_container(kind: str) -> Optional[str]:
     if kind == 'image':
         return BLOB_IMAGE_CONTAINER
-    if kind == 'thumbnail':
+    if kind in ('thumbnail', 'preview'):
+        # Preview blobs live in the same container as thumbnails, under a
+        # preview/{blob}.jpg key -- see _preview_cache_blob_name.
         return BLOB_THUMBNAIL_CONTAINER
     return None
 
@@ -8533,6 +8535,26 @@ def _thumbnail_access_response(safe_name: str, metadata: Optional[Dict]) -> Opti
         'expiresAt': '',
         'filename': safe_name,
         'kind': 'thumbnail',
+    }
+
+
+def _preview_access_response(safe_name: str, metadata: Optional[Dict]) -> Optional[Dict]:
+    """Route to the proxy (which caches + enqueues generation on a miss) when
+    no real preview blob exists yet, same shape as _thumbnail_access_response.
+
+    Every photo view used to always proxy through proxy_preview for RAW/HEIC
+    only; now that preview is the default lightbox image for every photo,
+    minting a real SAS whenever one's ready (like thumbnail already does)
+    matters a lot more -- otherwise every single photo view round-trips
+    through the Flask app instead of hitting blob storage directly.
+    """
+    if str((metadata or {}).get('preview_status') or '').strip().lower() == 'done':
+        return None
+    return {
+        'url': _preview_proxy_url(safe_name),
+        'expiresAt': '',
+        'filename': safe_name,
+        'kind': 'preview',
     }
 
 
@@ -8561,7 +8583,9 @@ def photo_access_url(kind: str, filename: str):
     if not blob_service_client or not account_name:
         return jsonify({'error': 'Media access is not configured'}), 503
     if kind == 'preview':
-        return jsonify(_access_url_response(_preview_proxy_url(safe_name), '', safe_name, kind))
+        fallback = _preview_access_response(safe_name, metadata)
+        if fallback is not None:
+            return jsonify(fallback)
     if kind == 'thumbnail':
         fallback = _thumbnail_access_response(safe_name, metadata)
         if fallback is not None:
@@ -8570,9 +8594,12 @@ def photo_access_url(kind: str, filename: str):
     if container is None:
         return jsonify({'error': 'Invalid media kind'}), 400
     try:
+        blob_name = _blob_name_from_metadata(metadata, safe_name)
+        if kind == 'preview':
+            blob_name = _preview_cache_blob_name(blob_name)
         url, expires_at = _create_stable_read_sas_url(
             container,
-            _blob_name_from_metadata(metadata, safe_name),
+            blob_name,
             download_filename=safe_name if kind == 'image' else None,
         )
         return jsonify(_access_url_response(url, expires_at, safe_name, kind))
@@ -8624,9 +8651,6 @@ def photo_access_url_batch():
         metadata = metadata_map.get(safe_name) or _get_metadata_entity(user_id, safe_name)
         if not metadata:
             continue
-        if kind == 'preview':
-            urls[safe_name] = _preview_proxy_url(safe_name)
-            continue
         container = _photo_access_container(kind)
         if container is None:
             continue
@@ -8635,10 +8659,18 @@ def photo_access_url_batch():
             if fallback is not None:
                 urls[safe_name] = fallback['url']
                 continue
+        if kind == 'preview':
+            fallback = _preview_access_response(safe_name, metadata)
+            if fallback is not None:
+                urls[safe_name] = fallback['url']
+                continue
         try:
+            blob_name = _blob_name_from_metadata(metadata, safe_name)
+            if kind == 'preview':
+                blob_name = _preview_cache_blob_name(blob_name)
             url, expires_at = _create_stable_read_sas_url(
                 container,
-                _blob_name_from_metadata(metadata, safe_name),
+                blob_name,
                 download_filename=safe_name if kind == 'image' else None,
             )
             urls[safe_name] = url
@@ -8872,7 +8904,18 @@ def proxy_preview(filename: str):
         return jsonify({'error': 'Not found'}), 404
     preview_blob_name = _blob_name_from_metadata(preview_metadata, safe_name)
 
-    if _filename_requires_backend_preview(safe_name):
+    # Used to be gated to _filename_requires_backend_preview(safe_name) (RAW/
+    # HEIC/JXL only, formats the browser can't render directly at all). Now
+    # that the shrunk preview is the default lightbox image for every photo,
+    # the cached-blob-or-enqueue-and-503 branch below needs to cover every
+    # image file, not just the browser-unviewable ones -- otherwise an
+    # ordinary JPEG falls into the synchronous, uncached convert-on-every-
+    # request branch further down, which was only ever meant as a rare
+    # defensive fallback, not a path fit to serve every photo view.
+    # _filename_requires_backend_preview itself is left as-is: it still means
+    # exactly what it says ("browser can't display the original directly")
+    # and is used elsewhere for that narrower question.
+    if not is_video_file(safe_name):
         try:
             cached = _stream_cached_preview(safe_name, cache_control='private, max-age=3600', blob_name=preview_blob_name)
         except Exception:
@@ -13709,7 +13752,7 @@ def admin_backfill_photos():
     if data.get('repair') is not True or data.get('confirm') != 'BACKFILL_ALL_PHOTOS':
         return jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
 
-    all_steps = ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
+    all_steps = ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
     requested_steps = data.get('steps')
     if requested_steps is None:
         steps_to_run = all_steps
@@ -13785,7 +13828,7 @@ def admin_enqueue_ipwork():
         return error
     data = request.get_json(silent=True) or {}
 
-    all_steps = ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
+    all_steps = ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
     requested_steps = data.get('steps')
     if not isinstance(requested_steps, list) or not requested_steps:
         return jsonify({'error': 'steps must be a non-empty list', 'code': 'invalid_steps'}), 400
@@ -14468,6 +14511,11 @@ def _register_ipwork_processors() -> None:
     not all four at once.
     """
     try:
+        import ipwork_preview
+        IPWORK_STEP_PROCESSORS['preview'] = ipwork_preview.process_preview
+    except Exception:
+        worker_logger.exception('ipwork_preview unavailable; preview step will report not_implemented')
+    try:
         import ipwork_thumbnail
         IPWORK_STEP_PROCESSORS['thumbnail'] = ipwork_thumbnail.process_thumbnail
     except Exception:
@@ -14553,6 +14601,16 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             client_processing[step] = _failure_shape(step, str(exc))
         finally:
             step_ms[step] = round((time.monotonic() - step_started) * 1000)
+        # 'preview' is meant to run first (see IPWORK_STEPS/callers): once it
+        # succeeds, swap the ~2048px shrunk bytes into the shared cache so
+        # every later step this call (thumbnail/face/ocr/ai_vision) decodes
+        # that instead of re-downloading/re-decoding the full original --
+        # this is the whole point of ordering it first (see ipwork_preview.py).
+        if step == 'preview' and client_processing[step].get('hasData'):
+            try:
+                image_bytes_cache[0] = base64.b64decode(str(client_processing[step].get('data') or ''))
+            except Exception:
+                worker_logger.exception('ipworker failed to swap in shrunk preview bytes for %s/%s', user_id, filename)
     worker_logger.info(
         'ipwork step timings user=%s file=%s download_ms=%s step_ms=%s',
         user_id, filename, download_ms, step_ms,
@@ -14951,7 +15009,7 @@ def processing_status():
     user_id, error = _require_user_id()
     if error:
         return error
-    counts = _count_processing_statuses(user_id, ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'])
+    counts = _count_processing_statuses(user_id, ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'])
 
     def _pending(summary: Dict[str, int]) -> int:
         return int(summary.get('queued', 0) or 0) + int(summary.get('pending', 0) or 0)
@@ -15151,7 +15209,7 @@ def public_photo_share_preview(token: str, filename: str):
     crawler size caps (5-8MB) -- while the 120x120 gallery thumbnail is below
     their ~200x200 minimum and gets silently dropped instead. This reuses
     `convert_image_to_jpeg` (already used by the RAW/HEIC preview route
-    above), which bounds to 2048px / ~3.9MB via `_encode_vision_jpeg` --
+    above), which bounds to 2048px / ~1MB via `_encode_preview_jpeg` --
     comfortably inside every major platform's limits.
     """
     entity = _find_public_album_by_token(token)

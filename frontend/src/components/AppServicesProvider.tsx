@@ -586,7 +586,7 @@ export const browserProcessingActionSteps: Record<BrowserProcessingAction, strin
 // only baseline steps (thumbnail, exif, map geocode) run; these stay pending so
 // they can be backfilled once the model is loaded.
 const BROWSER_AI_GATED_STEPS = new Set(['ocr', 'ai_vision', 'face']);
-const ALL_BROWSER_PROCESSING_STEPS = ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
+const ALL_BROWSER_PROCESSING_STEPS = ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
 
 // Restrict the steps a processing pass may run to what the current model state allows.
 // When browser AI is available this is a no-op (returns the request unchanged, where
@@ -606,7 +606,7 @@ const restrictStepsForModel = (requestedSteps: Set<string> | null, modelAvailabl
 // Filtered out here too so this queue-picker doesn't download a photo (a
 // real bandwidth cost -- see fetchProcessingBlob below) just to discover
 // there's nothing left the browser can actually do with it.
-const BACKEND_MODE_OWNED_STEPS = new Set(['thumbnail', 'exif']);
+const BACKEND_MODE_OWNED_STEPS = new Set(['preview', 'thumbnail', 'exif']);
 const restrictStepsForProcessingMode = (requestedSteps: Set<string> | null, processingMode: string): Set<string> | null => {
     if (processingMode !== 'backend') {
         return requestedSteps;

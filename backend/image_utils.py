@@ -64,8 +64,8 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 THUMBNAIL_SIZE = (120, 120)
 THUMBNAIL_QUALITY = 65
 THUMBNAIL_FORMAT = 'JPEG'
-VISION_MAX_BYTES = 3_900_000
-VISION_MAX_DIMENSION = 2048
+PREVIEW_MAX_BYTES = 1_000_000
+PREVIEW_MAX_DIMENSION = 2048
 MIN_SIZE_CINEMA = 1 * 1024 * 1024
 MIN_SIZE_RAW = 512 * 1024
 MIN_SIZE_VIDEO = 1024
@@ -157,9 +157,9 @@ def _save_image_to_bytes(image: Image.Image, fmt: str) -> bytes:
     return output.read()
 
 
-def _encode_vision_jpeg(image: Image.Image) -> bytes:
-    if max(image.size) > VISION_MAX_DIMENSION:
-        image.thumbnail((VISION_MAX_DIMENSION, VISION_MAX_DIMENSION), RESAMPLING_LANCZOS)
+def _encode_preview_jpeg(image: Image.Image) -> bytes:
+    if max(image.size) > PREVIEW_MAX_DIMENSION:
+        image.thumbnail((PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION), RESAMPLING_LANCZOS)
 
     if image.mode != 'RGB':
         image = image.convert('RGB')
@@ -168,7 +168,7 @@ def _encode_vision_jpeg(image: Image.Image) -> bytes:
         output = io.BytesIO()
         image.save(output, format='JPEG', quality=quality, optimize=True)
         data = output.getvalue()
-        if len(data) <= VISION_MAX_BYTES:
+        if len(data) <= PREVIEW_MAX_BYTES:
             return data
 
     image.thumbnail((1400, 1400), RESAMPLING_LANCZOS)
@@ -187,7 +187,7 @@ def _normalize_preview_bytes(image_bytes: bytes) -> Optional[bytes]:
             image = ImageOps.exif_transpose(image)
             if image.format == 'JPEG':
                 return image_bytes
-            return _encode_vision_jpeg(image)
+            return _encode_preview_jpeg(image)
     except Exception:
         return None
 
@@ -200,7 +200,7 @@ def _encode_preview_for_browser(image_bytes: bytes) -> Optional[bytes]:
             image = ImageOps.exif_transpose(image)
             if image.mode != 'RGB':
                 image = image.convert('RGB')
-            return _encode_vision_jpeg(image)
+            return _encode_preview_jpeg(image)
     except Exception:
         return None
 
@@ -395,7 +395,7 @@ def _extract_rawpy_preview_from_path(path: str) -> Optional[bytes]:
             if _preview_good_enough_for_vision(preview):
                 return preview
             rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
-        return _encode_vision_jpeg(Image.fromarray(rgb))
+        return _encode_preview_jpeg(Image.fromarray(rgb))
     except Exception:
         return None
 
@@ -408,7 +408,7 @@ def _extract_rawpy_preview_from_bytes(image_bytes: bytes) -> Optional[bytes]:
             if _preview_good_enough_for_vision(preview):
                 return preview
             rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
-        return _encode_vision_jpeg(Image.fromarray(rgb))
+        return _encode_preview_jpeg(Image.fromarray(rgb))
     except Exception:
         return None
 
@@ -424,7 +424,7 @@ def _extract_rawpy_thumbnail(raw, rawpy_module) -> Optional[bytes]:
             # raw byte scan would find -- apply the RAW's own detected orientation explicitly.
             return _apply_raw_flip(_normalize_preview_bytes(thumbnail.data), raw.sizes.flip)
         if thumbnail.format == rawpy_module.ThumbFormat.BITMAP:
-            return _apply_raw_flip(_encode_vision_jpeg(Image.fromarray(thumbnail.data)), raw.sizes.flip)
+            return _apply_raw_flip(_encode_preview_jpeg(Image.fromarray(thumbnail.data)), raw.sizes.flip)
     except Exception:
         return None
     return None
@@ -651,7 +651,7 @@ def convert_image_to_jpeg(image_bytes: bytes, filename: str = '') -> bytes:
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
             image = ImageOps.exif_transpose(image)
-            return _encode_vision_jpeg(image)
+            return _encode_preview_jpeg(image)
     except Exception:
         preview = extract_raw_preview_bytes(image_bytes, filename)
         if preview:

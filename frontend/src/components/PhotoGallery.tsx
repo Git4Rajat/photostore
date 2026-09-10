@@ -747,6 +747,51 @@ const resizeCanvasToMaxSide = (sourceCanvas: HTMLCanvasElement, maxSide: number)
     return canvas;
 };
 
+// Mirrors backend/image_utils.py's _encode_preview_jpeg (PREVIEW_MAX_DIMENSION
+// / PREVIEW_MAX_BYTES / quality ladder) so a browser-generated preview and an
+// ipworker-generated one land on the same ~2048px/~1MB target regardless of
+// which side made it -- this is the shrunk image shown by default in the
+// lightbox for every photo, and the shared source every other browser AI step
+// (thumbnail/face/ocr/ai_vision) reads from once resolveBrowserVisionSource
+// produces it, instead of each independently decoding the full original.
+const CLIENT_PREVIEW_MAX_SIDE = 2048;
+const CLIENT_PREVIEW_MAX_BYTES = 1_000_000;
+const CLIENT_PREVIEW_QUALITY_STEPS = [0.9, 0.82, 0.74, 0.66, 0.58];
+
+const createBrowserPreview = async (source: Blob | File): Promise<{ blob: Blob; width: number; height: number } | null> => {
+    if (typeof createImageBitmap !== 'function') {
+        return null;
+    }
+    const orientedCanvas = await createOrientedImageCanvas(source);
+    const canvas = resizeCanvasToMaxSide(orientedCanvas, CLIENT_PREVIEW_MAX_SIDE);
+    let smallestSoFar: Blob | null = null;
+    for (const quality of CLIENT_PREVIEW_QUALITY_STEPS) {
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality));
+        if (!blob) {
+            continue;
+        }
+        if (blob.size <= CLIENT_PREVIEW_MAX_BYTES) {
+            return { blob, width: canvas.width, height: canvas.height };
+        }
+        smallestSoFar = blob;
+    }
+    // Every quality step stayed over budget (unusually busy/high-detail
+    // content) -- return the smallest one produced rather than nothing, same
+    // last-resort behavior as _encode_preview_jpeg's own fallback.
+    return smallestSoFar ? { blob: smallestSoFar, width: canvas.width, height: canvas.height } : null;
+};
+
+const blobToBase64 = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+        const result = String(reader.result || '');
+        const commaIndex = result.indexOf(',');
+        resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error('Failed to read blob.'));
+    reader.readAsDataURL(blob);
+});
+
 const normalizeFaceEmbedding = (embedding: unknown): number[] | undefined => {
     if (!embedding || typeof embedding !== 'object' || typeof (embedding as ArrayLike<number>).length !== 'number') {
         return undefined;
@@ -2710,7 +2755,40 @@ const createHeicDecodedVisionSource = async (
     }
 };
 
+// Resolves the base vision source (RAW-converted, HEIC-decoded, or the plain
+// original), then always applies one final shrink pass so every downstream
+// browser AI step (thumbnail/face/ocr/ai_vision -- see runBrowserProcessing)
+// reads a ~2048px/~1MB image instead of independently decoding the full
+// original or an unresized RAW/HEIC conversion. sourceKind becomes
+// 'browser_shrunk' whenever the shrink succeeds, which is also how
+// runBrowserProcessing recognizes there's a fresh preview to upload
+// alongside the thumbnail (see clientProcessing.preview below).
 const resolveBrowserVisionSource = async (file: File, convertedPreview?: Blob | File): Promise<BrowserVisionSource> => {
+    const resolved = await resolveBrowserVisionSourceBase(file, convertedPreview);
+    if (!resolved.imageSource) {
+        return resolved;
+    }
+    try {
+        const shrunk = await withTimeout(createBrowserPreview(resolved.imageSource), CLIENT_BROWSER_STEP_BUDGET_MS);
+        if (shrunk) {
+            return {
+                ...resolved,
+                imageSource: shrunk.blob,
+                sourceKind: 'browser_shrunk',
+                sourceBytes: shrunk.blob.size,
+                previewWidth: shrunk.width,
+                previewHeight: shrunk.height,
+            };
+        }
+    } catch {
+        // Fall through and use the unshrunk source below -- worse for
+        // bandwidth/decode cost downstream, but strictly better than failing
+        // every AI step for this photo over a canvas hiccup.
+    }
+    return resolved;
+};
+
+const resolveBrowserVisionSourceBase = async (file: File, convertedPreview?: Blob | File): Promise<BrowserVisionSource> => {
     const sourceFormat = getFileExtension(file.name) || file.type || 'unknown';
     if (!isRawFile(file)) {
         const converted = await createRawConvertedVisionSource(convertedPreview, {
@@ -2977,7 +3055,7 @@ export const runBrowserProcessing = async (
                 ...videoSourceFields,
             }));
         }
-        const videoSkippedSteps: ClientProcessingStep[] = ['exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
+        const videoSkippedSteps: ClientProcessingStep[] = ['preview', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
         videoSkippedSteps.forEach((step) => {
             clientProcessingReport.push(makeClientReport(clientAssetId, step, 'skipped', 'video_unsupported', videoStartedAt, {
                 runtime: 'browser-video',
@@ -3024,6 +3102,49 @@ export const runBrowserProcessing = async (
         isRaw: fileIsRaw,
     };
     const sourceFields = getSourceReportFields(visionSource);
+
+    // 'preview' uploads the already-shrunk imageSource resolveBrowserVisionSource
+    // produced (sourceKind 'browser_shrunk') as its own clientProcessing field --
+    // separate from the thumbnail block below, which now also reads that same
+    // shrunk source rather than the full original. See ipwork_preview.py for the
+    // server-side equivalent and _apply_client_processing_results in
+    // storage_utils.py for how this field gets persisted.
+    const previewStartedAt = performance.now();
+    if (processingMode === 'backend') {
+        clientProcessingReport.push(makeClientReport(clientAssetId, 'preview', 'skipped', 'backend_processing_mode', previewStartedAt, {
+            runtime: 'canvas',
+            ...sourceFields,
+        }));
+    } else if (visionSource.sourceKind === 'browser_shrunk' && visionSource.imageSource) {
+        try {
+            const previewData = await blobToBase64(visionSource.imageSource);
+            clientProcessing.preview = {
+                hasData: true,
+                contentType: 'image/jpeg',
+                data: previewData,
+                source: 'browser',
+                ...sourceFields,
+            };
+            clientProcessingReport.push(makeClientReport(clientAssetId, 'preview', 'done', 'done', previewStartedAt, {
+                runtime: 'canvas',
+                ...sourceFields,
+            }));
+        } catch {
+            clientProcessingReport.push(makeClientReport(clientAssetId, 'preview', 'failed', 'unknown_error', previewStartedAt, {
+                runtime: 'canvas',
+                ...sourceFields,
+            }));
+        }
+    } else {
+        // The shrink itself either failed (falls back to the unshrunk source --
+        // see resolveBrowserVisionSource) or there's no image source at all (RAW
+        // with no usable preview, JXL, etc.) -- either way there's nothing to
+        // upload as a preview this pass.
+        clientProcessingReport.push(makeClientReport(clientAssetId, 'preview', visionSource.skipReason ? 'skipped' : 'timeout', visionSource.skipReason || 'inference_timeout', previewStartedAt, {
+            runtime: 'browser-source-resolver',
+            ...sourceFields,
+        }));
+    }
 
     let startedAt = performance.now();
     if (processingMode === 'backend') {
@@ -3641,7 +3762,7 @@ export const withFinalizeGrace = async (
         return result;
     }
     const now = performance.now();
-    const steps: ClientProcessingStep[] = ['thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
+    const steps: ClientProcessingStep[] = ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
     const reportedSteps = new Set((partialResult?.clientProcessingReport || []).map((item) => item.step));
     return {
         clientProcessing: { ...(partialResult?.clientProcessing || {}) },

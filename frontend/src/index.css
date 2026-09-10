@@ -4563,6 +4563,22 @@ html[data-theme='light'] .notification-item.unread {
   opacity: 0.45;
 }
 
+.photo-preview-fr-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.photo-preview-fr.is-active {
+  background: rgba(120, 200, 255, 0.28);
+  border-color: rgba(120, 200, 255, 0.55);
+}
+
+.photo-preview-fr-ring {
+  width: 22px;
+  height: 22px;
+}
+
 .photo-preview-icon.is-dirty {
   border-color: rgba(255, 255, 255, 0.45);
   background: rgba(70, 160, 120, 0.32);

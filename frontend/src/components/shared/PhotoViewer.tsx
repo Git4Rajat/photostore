@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, HeartIcon, InformationCircleIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { postUploadJson, resolveApiUrl } from '../../services/apiClient';
-import { isAuthEnabled } from '../../services/authClient';
+import { getAccessToken, isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl } from '../../services/imageClient';
 import { getMediaKind, isVideoFilename, requiresBackendPreview } from '../../utils/photoDisplay';
 
@@ -64,7 +64,11 @@ export const getMainMediaPath = (photo?: ViewerPhoto | null) => {
     if (photo.previewUrl) {
         return photo.previewUrl;
     }
-    if (requiresBackendPreview(photo.filename)) {
+    // The shrunk preview is the default lightbox image for every non-video
+    // photo now, not just RAW/HEIC/JXL -- see access-batch's 'preview' kind
+    // and proxy_preview in app.py. The original is only ever shown after an
+    // explicit "full resolution" request (see the FR button).
+    if (!isVideoFilename(photo.filename)) {
         return `/api/photos/preview/${encodeURIComponent(photo.filename)}`;
     }
     if (photo.url && !photo.url.includes('/thumbnail/') && !photo.url.includes('/thumb-')) {
@@ -116,6 +120,61 @@ const fetchPublicBlobUrl = async (path: string): Promise<string> => {
     return URL.createObjectURL(await response.blob());
 };
 
+// Used by the "FR" (full resolution) control: fetches the original with a
+// streaming read so download progress can drive a round progress indicator,
+// and supports an AbortSignal so navigating to another photo mid-download
+// cancels the in-flight original fetch instead of letting it finish in the
+// background. Mirrors fetchProtectedBlobUrl/fetchPublicBlobUrl's auth
+// handling (SAS URLs carry their own auth in the query string; only
+// backend-relative paths need a bearer token) rather than importing those,
+// since neither supports progress/abort.
+const fetchBlobUrlWithProgress = async (
+    path: string,
+    shouldProtect: boolean,
+    options: { signal?: AbortSignal; onProgress?: (loadedBytes: number, totalBytes: number) => void } = {},
+): Promise<string> => {
+    const url = resolveApiUrl(path);
+    const headers: Record<string, string> = {};
+    const isSignedStorageUrl = isAbsoluteHttpUrl(path);
+    if (shouldProtect && !isSignedStorageUrl && isAuthEnabled()) {
+        const token = await getAccessToken();
+        if (!token) {
+            throw new Error('Authentication required for full-resolution fetch');
+        }
+        headers.Authorization = `Bearer ${token}`;
+    }
+    const response = await fetch(url, {
+        headers,
+        mode: 'cors',
+        credentials: 'omit',
+        signal: options.signal,
+    });
+    if (!response.ok) {
+        const body = await response.text();
+        throw new Error(body || `Failed to fetch original: ${response.status}`);
+    }
+    const totalBytes = Number(response.headers.get('Content-Length') || 0);
+    if (!response.body || !options.onProgress) {
+        return URL.createObjectURL(await response.blob());
+    }
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let loadedBytes = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+            break;
+        }
+        if (value) {
+            chunks.push(value);
+            loadedBytes += value.byteLength;
+            options.onProgress(loadedBytes, totalBytes);
+        }
+    }
+    const blob = new Blob(chunks as BlobPart[], { type: response.headers.get('Content-Type') || 'image/jpeg' });
+    return URL.createObjectURL(blob);
+};
+
 const formatPreviewError = (filename: string, detail?: string) => {
     const kind = getMediaKind(filename);
     const normalized = detail?.trim();
@@ -152,6 +211,15 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
     const [mediaLoading, setMediaLoading] = useState(false);
     const [mediaError, setMediaError] = useState<string | null>(null);
     const [mediaPathOverride, setMediaPathOverride] = useState<string | null>(null);
+    // "FR" (full resolution): the lightbox shows the shrunk preview by default;
+    // these track the on-demand original fetch triggered by the FR button.
+    // fullResUrl (once set) becomes the mediaPathOverride for the active photo.
+    const [fullResUrl, setFullResUrl] = useState<string | null>(null);
+    const [fullResLoading, setFullResLoading] = useState(false);
+    const [fullResProgress, setFullResProgress] = useState(0);
+    const [fullResError, setFullResError] = useState<string | null>(null);
+    const fullResAbortRef = useRef<AbortController | null>(null);
+    const fullResObjectUrlRef = useRef<string | null>(null);
     const [scopedMediaUrls, setScopedMediaUrls] = useState<Record<string, string>>({});
     const [rotationDraft, setRotationDraft] = useState(0);
     const [rotationSaving, setRotationSaving] = useState(false);
@@ -194,15 +262,20 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
     const rotationFitStyle = isQuarterTurn && stageSize.width > 0 && stageSize.height > 0
         ? { width: `${stageSize.height}px`, height: `${stageSize.width}px` }
         : undefined;
-    const imageUrl = activePhoto && mainMediaPath
-        ? (shouldProtect
-            // Signed storage URLs are already directly browser-fetchable and do
-            // not need scoped proxy resolution; using them directly prevents
-            // the viewer from waiting forever on an unresolved cache key.
-            ? (isAbsoluteHttpUrl(mainMediaPath)
-                ? mainMediaPath
-                : (scopedMediaUrls[mainMediaPath] || resolvedUrls[mainMediaPath]))
-            : resolveApiUrl(mainMediaPath))
+    const imageUrl = activePhoto && (fullResUrl || mainMediaPath)
+        // fullResUrl is an already-fetched local object URL (see
+        // fetchFullResolution) -- pass it through directly rather than
+        // through the SAS-resolution paths below, which don't know about it.
+        ? (fullResUrl
+            ? fullResUrl
+            : (shouldProtect
+                // Signed storage URLs are already directly browser-fetchable and do
+                // not need scoped proxy resolution; using them directly prevents
+                // the viewer from waiting forever on an unresolved cache key.
+                ? (isAbsoluteHttpUrl(mainMediaPath)
+                    ? mainMediaPath
+                    : (scopedMediaUrls[mainMediaPath] || resolvedUrls[mainMediaPath]))
+                : resolveApiUrl(mainMediaPath)))
         : '';
 
     const filmstripIndexes = useMemo(() => {
@@ -244,14 +317,11 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         pushTarget(primaryMediaPath, activePhoto.filename);
         pushTarget(activePhoto.thumbnailUrl, activePhoto.filename);
         pushTarget(activePhoto.previewUrl, activePhoto.filename);
-        // Only pre-sign/warm the original when the browser can actually decode it. For
-        // RAW/HEIC the lightbox displays the backend preview proxy (primaryMediaPath),
-        // never the original — warming activePhoto.url here would download the full
-        // source file (often tens of MB) into an <img> that can never render, wasting
-        // bandwidth and starving the real preview request.
-        if (!requiresBackendPreview(activePhoto.filename)) {
-            pushTarget(activePhoto.url, activePhoto.filename);
-        }
+        // The original is never pre-signed/warmed here, even for the active photo:
+        // the lightbox shows the shrunk preview (primaryMediaPath) by default for
+        // every photo now, and the original is only ever fetched on an explicit
+        // "full resolution" request (see the FR button below) -- warming it
+        // automatically just because the lightbox opened would defeat that.
         previewPreloadIndexes.forEach((photoIndex) => {
             const neighbor = photos[photoIndex];
             if (neighbor && !isVideoFilename(neighbor.filename || '')) {
@@ -361,6 +431,70 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         }
     }, [activePhoto, mainMediaPath, shouldProtect]);
 
+    // Cancels an in-flight (or discards an already-fetched) full-resolution
+    // original: aborts the fetch, revokes its object URL, and resets FR state
+    // back to "showing the preview". Called on navigation (the "moved to next
+    // photo, stop downloading the one I left" behavior) and on close.
+    const cancelFullResolution = useCallback(() => {
+        fullResAbortRef.current?.abort();
+        fullResAbortRef.current = null;
+        if (fullResObjectUrlRef.current) {
+            URL.revokeObjectURL(fullResObjectUrlRef.current);
+            fullResObjectUrlRef.current = null;
+        }
+        setFullResUrl(null);
+        setFullResLoading(false);
+        setFullResProgress(0);
+        setFullResError(null);
+    }, []);
+
+    useEffect(() => {
+        cancelFullResolution();
+        // Deliberately keyed only on which photo is active, not on
+        // cancelFullResolution's identity (stable via useCallback's empty
+        // deps anyway) -- this is the abort-on-navigate behavior itself.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activePhoto?.filename]);
+
+    const fetchFullResolution = useCallback(async () => {
+        if (!activePhoto || fullResLoading || fullResUrl) {
+            return;
+        }
+        const originalPath = activePhoto.url || primaryMediaPath || activePhoto.thumbnailUrl || '';
+        if (!originalPath) {
+            return;
+        }
+        const controller = new AbortController();
+        fullResAbortRef.current = controller;
+        setFullResLoading(true);
+        setFullResProgress(0);
+        setFullResError(null);
+        try {
+            const objectUrl = await fetchBlobUrlWithProgress(originalPath, shouldProtect, {
+                signal: controller.signal,
+                onProgress: (loadedBytes, totalBytes) => {
+                    setFullResProgress(totalBytes > 0 ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100)) : 0);
+                },
+            });
+            if (controller.signal.aborted) {
+                URL.revokeObjectURL(objectUrl);
+                return;
+            }
+            fullResObjectUrlRef.current = objectUrl;
+            setFullResUrl(objectUrl);
+            setFullResProgress(100);
+        } catch (err) {
+            if (!controller.signal.aborted) {
+                setFullResError(err instanceof Error ? err.message : 'Failed to load full resolution.');
+            }
+        } finally {
+            if (fullResAbortRef.current === controller) {
+                fullResAbortRef.current = null;
+            }
+            setFullResLoading(false);
+        }
+    }, [activePhoto, fullResLoading, fullResUrl, primaryMediaPath, shouldProtect]);
+
     const close = useCallback(() => {
         onClose();
         setZoom(1);
@@ -369,6 +503,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         setMediaLoading(false);
         setMediaError(null);
         setMediaPathOverride(null);
+        cancelFullResolution();
         setRotationError(null);
         setRotationSaving(false);
         touchStartRef.current = null;
@@ -377,7 +512,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         activePointerRef.current = null;
         warmedPathsRef.current.clear();
         filmstripHasCenteredRef.current = false;
-    }, [onClose]);
+    }, [onClose, cancelFullResolution]);
 
     const showPrevious = useCallback(() => {
         if (index === null || photos.length === 0) {
@@ -876,6 +1011,46 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                         {rotationError && <p className="photo-preview-error">{rotationError}</p>}
                     </div>
                     <div className="photo-preview-tools">
+                        {!activeIsVideo && (
+                            <button
+                                type="button"
+                                className={`photo-preview-icon photo-preview-fr${fullResUrl ? ' is-active' : ''}`}
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (fullResLoading) {
+                                        cancelFullResolution();
+                                    } else if (!fullResUrl) {
+                                        void fetchFullResolution();
+                                    }
+                                }}
+                                aria-label={
+                                    fullResUrl
+                                        ? 'Showing full resolution'
+                                        : (fullResLoading ? `Loading full resolution, ${fullResProgress}%. Click to cancel.` : 'Load full resolution')
+                                }
+                                title={fullResError || undefined}
+                            >
+                                {fullResLoading ? (
+                                    <svg viewBox="0 0 36 36" className="photo-preview-fr-ring" aria-hidden="true">
+                                        <circle cx="18" cy="18" r="16" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                                        <circle
+                                            cx="18"
+                                            cy="18"
+                                            r="16"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            strokeWidth="3"
+                                            strokeLinecap="round"
+                                            strokeDasharray={100.53}
+                                            strokeDashoffset={100.53 * (1 - fullResProgress / 100)}
+                                            transform="rotate(-90 18 18)"
+                                        />
+                                    </svg>
+                                ) : (
+                                    <span className="photo-preview-fr-label">FR</span>
+                                )}
+                            </button>
+                        )}
                         <button type="button" className="photo-preview-icon" onClick={(e) => { e.stopPropagation(); void downloadCurrentPhoto(); }} aria-label="Download photo">
                             <ArrowDownTrayIcon className="toolbar-icon" />
                         </button>

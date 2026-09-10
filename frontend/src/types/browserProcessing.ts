@@ -72,9 +72,9 @@ export interface UploadProfile {
     reason: string;
 }
 
-export type ClientProcessingStep = 'thumbnail' | 'exif' | 'ocr' | 'ai_vision' | 'map_detection' | 'face';
+export type ClientProcessingStep = 'preview' | 'thumbnail' | 'exif' | 'ocr' | 'ai_vision' | 'map_detection' | 'face';
 export type ClientProcessingStatus = 'done' | 'skipped' | 'failed' | 'timeout' | 'unsupported';
-export type ClientProcessingSourceKind = 'original' | 'raw_embedded_jpeg' | 'raw_converted_jpeg' | 'backend_converted_jpeg' | 'raw_exif_only' | 'unsupported';
+export type ClientProcessingSourceKind = 'original' | 'raw_embedded_jpeg' | 'raw_converted_jpeg' | 'backend_converted_jpeg' | 'raw_exif_only' | 'unsupported' | 'browser_shrunk';
 type BrowserAiModelAvailability = 'available' | 'cached' | 'downloaded' | 'unavailable' | 'skipped';
 export type BrowserAiModelCacheStatus = 'hit' | 'miss' | 'downloaded' | 'failed';
 export type BrowserAiModelUiStatus = 'checking' | 'idle' | 'loading' | 'available' | 'unavailable' | 'unsupported';
