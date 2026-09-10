@@ -756,13 +756,30 @@ const resizeCanvasToMaxSide = (sourceCanvas: HTMLCanvasElement, maxSide: number)
 // produces it, instead of each independently decoding the full original.
 const CLIENT_PREVIEW_MAX_SIDE = 2048;
 const CLIENT_PREVIEW_MAX_BYTES = 1_000_000;
+// Deliberately above CLIENT_PREVIEW_MAX_BYTES -- mirrors
+// PREVIEW_SKIP_THRESHOLD_BYTES in backend/image_utils.py: a source already
+// this close to the target isn't worth a canvas re-encode for a marginal
+// size win, and re-encoding an already-well-compressed JPEG through the
+// quality ladder can end up BIGGER than the original.
+const CLIENT_PREVIEW_SKIP_THRESHOLD_BYTES = 1_500_000;
 const CLIENT_PREVIEW_QUALITY_STEPS = [0.9, 0.82, 0.74, 0.66, 0.58];
+
+const isJpegBlob = (source: Blob | File): boolean => (
+    source.type === 'image/jpeg' || source.type === 'image/jpg'
+);
 
 const createBrowserPreview = async (source: Blob | File): Promise<{ blob: Blob; width: number; height: number } | null> => {
     if (typeof createImageBitmap !== 'function') {
         return null;
     }
     const orientedCanvas = await createOrientedImageCanvas(source);
+    if (
+        isJpegBlob(source)
+        && Math.max(orientedCanvas.width, orientedCanvas.height) <= CLIENT_PREVIEW_MAX_SIDE
+        && source.size <= CLIENT_PREVIEW_SKIP_THRESHOLD_BYTES
+    ) {
+        return { blob: source, width: orientedCanvas.width, height: orientedCanvas.height };
+    }
     const canvas = resizeCanvasToMaxSide(orientedCanvas, CLIENT_PREVIEW_MAX_SIDE);
     let smallestSoFar: Blob | null = null;
     for (const quality of CLIENT_PREVIEW_QUALITY_STEPS) {

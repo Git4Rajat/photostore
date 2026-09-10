@@ -66,6 +66,13 @@ THUMBNAIL_QUALITY = 65
 THUMBNAIL_FORMAT = 'JPEG'
 PREVIEW_MAX_BYTES = 1_000_000
 PREVIEW_MAX_DIMENSION = 2048
+# Deliberately above PREVIEW_MAX_BYTES: a source already this close to the
+# target isn't worth the CPU to re-encode for a marginal size win, and since
+# the quality ladder always starts at quality=90, re-encoding an
+# already-well-compressed source can produce a BIGGER file than the original
+# (confirmed empirically -- a real ~600KB source came back at 769KB). See
+# convert_image_to_jpeg's skip check below.
+PREVIEW_SKIP_THRESHOLD_BYTES = 1_500_000
 MIN_SIZE_CINEMA = 1 * 1024 * 1024
 MIN_SIZE_RAW = 512 * 1024
 MIN_SIZE_VIDEO = 1024
@@ -650,6 +657,20 @@ def convert_image_to_jpeg(image_bytes: bytes, filename: str = '') -> bytes:
             return _encode_preview_for_browser(preview) or preview
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
+            # Already a JPEG, already within the dimension cap, and already
+            # small -- decoding/re-encoding it would only cost CPU for no
+            # real benefit (see PREVIEW_SKIP_THRESHOLD_BYTES above). Checked
+            # before exif_transpose so image.format still reflects the
+            # source file, not a post-transform copy; the returned bytes
+            # keep their original EXIF orientation tag unbaked, same as how
+            # the original-image serving path already relies on the browser
+            # to auto-orient (see [[portrait-thumbnail-rotation-bug]]).
+            if (
+                image.format == 'JPEG'
+                and max(image.size) <= PREVIEW_MAX_DIMENSION
+                and len(image_bytes) <= PREVIEW_SKIP_THRESHOLD_BYTES
+            ):
+                return image_bytes
             image = ImageOps.exif_transpose(image)
             return _encode_preview_jpeg(image)
     except Exception:
