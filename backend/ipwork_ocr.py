@@ -40,6 +40,7 @@ from typing import Dict, Optional
 
 from PIL import Image, ImageOps
 
+from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
 from optional_deps import try_import
 
 tesserocr = try_import('tesserocr')
@@ -57,11 +58,32 @@ def _get_api():
     return api
 
 
+def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
+    """See ipwork_face.py's copy of this helper: RAW formats (e.g. CR3) have no
+    generic PIL codec, so Image.open() below raises 'cannot identify image
+    file' on the raw bytes. Unlike ipwork_face.py/ipwork_vision.py, this module
+    never got the same fallback -- 'preview' only lands in this same ipworker
+    batch (and gets swapped into the shared image-bytes cache ahead of 'ocr')
+    when it's still runnable; in 'both' mode the browser's client-processing
+    request almost always finishes 'preview' synchronously first, so by the
+    time the async ocr step runs it's excluded from that batch and this
+    function would otherwise be handed the raw CR3 bytes directly. The
+    resulting UnidentifiedImageError was being swallowed into the same
+    terminal 'no_data' status as a genuine empty-OCR result (see
+    storage_utils.py's ocr_result handling), permanently hiding real text."""
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
+    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
+        preview = extract_raw_preview_bytes(image_bytes, filename)
+        if preview:
+            return preview
+    return image_bytes
+
+
 def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
     if tesserocr is None:
         return {'hasData': False, 'error': 'tesserocr_unavailable'}
     try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
+        with Image.open(io.BytesIO(_decodable_image_bytes(image_bytes, filename))) as image:
             # Phone photos are commonly stored with an EXIF orientation tag
             # rather than physically rotated pixels (confirmed against real
             # photos during face-pipeline validation -- see ipwork_face.py);
