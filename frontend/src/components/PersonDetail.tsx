@@ -12,6 +12,7 @@ import { classifyApiError, type ApiError } from '../services/apiError';
 import { notifyApiError } from '../services/requestFeedback';
 import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 import { ErrorState } from './shared/ErrorState';
+import { ErrorBoundary } from './shared/ErrorBoundary';
 import { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
 import type { PersonDetailModel, PersonFace, PersonSummary } from '../types/people';
 import { compareNamedFirstThenAlpha } from '../utils/people';
@@ -492,7 +493,8 @@ const PersonDetail: React.FC = () => {
                                 const suspicious = isSuspiciousFace(f);
                                 const singleFaceCluster = displayFaces.length === 1 && (person?.name || '').toLowerCase().startsWith('unnamed');
                                 return (
-                                    <div key={faceId || `${f.filename}-${f.bbox?.left}-${f.bbox?.top}`} className={`photo-card person-face-card ${suspicious ? 'is-suspicious-face' : ''}`}>
+                                    <ErrorBoundary key={faceId || `${f.filename}-${f.bbox?.left}-${f.bbox?.top}`} context="person-face-card" fallback={null}>
+                                    <div className={`photo-card person-face-card ${suspicious ? 'is-suspicious-face' : ''}`}>
                                         <div className="person-face-media">
                                             {thumbSrc ? (
                                                 <FaceDetectionImage face={f} src={thumbSrc} />
@@ -563,6 +565,7 @@ const PersonDetail: React.FC = () => {
                                             </div>
                                         </div>
                                     </div>
+                                    </ErrorBoundary>
                                 );
                             })}
                         </div>
@@ -603,7 +606,8 @@ const PersonDetail: React.FC = () => {
                                         : (protectedSuggestionUrls[path] || (isAuthEnabled() ? '' : resolveApiUrl(path)));
                                     const matchPct = typeof f.similarity === 'number' ? Math.round(f.similarity * 100) : null;
                                     return (
-                                        <div key={faceId || `${f.filename}-${f.bbox?.left}-${f.bbox?.top}`} className="photo-card person-face-card">
+                                        <ErrorBoundary key={faceId || `${f.filename}-${f.bbox?.left}-${f.bbox?.top}`} context="person-suggested-face-card" fallback={null}>
+                                        <div className="photo-card person-face-card">
                                             <div className="person-face-media">
                                                 {thumbSrc ? (
                                                     <FaceDetectionImage face={f} src={thumbSrc} />
@@ -666,6 +670,7 @@ const PersonDetail: React.FC = () => {
                                                 </div>
                                             </div>
                                         </div>
+                                        </ErrorBoundary>
                                     );
                                 })}
                             </div>

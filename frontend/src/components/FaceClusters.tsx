@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { EmptyState } from './shared/EmptyState';
 import { confirmDialog } from './shared/dialogs';
 import { Loading } from './shared/Loading';
+import { ErrorBoundary } from './shared/ErrorBoundary';
 import { ArrowsRightLeftIcon, ArrowRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, ExclamationTriangleIcon, FaceSmileIcon, MagnifyingGlassIcon, NoSymbolIcon, SparklesIcon, Squares2X2Icon, TrashIcon, UserCircleIcon, UsersIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import faceService from '../services/faceService';
 import { resolveFaceCropUrl, resolveFaceFallbackUrl } from '../services/faceMediaCache';
@@ -1053,7 +1054,8 @@ const FaceClusters: React.FC = () => {
                     {persons.map((p, index: number) => {
                         const suspiciousRepresentative = isSuspiciousFace(p.representativeFace);
                         return (
-                            <div key={p.personId} className={`person-tile ${selected[p.personId] ? 'is-selected' : ''} ${suspiciousRepresentative ? 'has-suspicious-face' : ''}`} style={{ ['--stagger' as string]: `${Math.min(index, 18) * 24}ms` }}>
+                            <ErrorBoundary key={p.personId} context="person-tile" fallback={null}>
+                            <div className={`person-tile ${selected[p.personId] ? 'is-selected' : ''} ${suspiciousRepresentative ? 'has-suspicious-face' : ''}`} style={{ ['--stagger' as string]: `${Math.min(index, 18) * 24}ms` }}>
                                 <button className="person-tile-main" onClick={() => openPerson(p.personId)} type="button">
                                     <div className="person-avatar" style={getAvatarStyle(p.personId)}>
                                         {p.representativeFace?.filename ? (
@@ -1098,6 +1100,7 @@ const FaceClusters: React.FC = () => {
                                     <TrashIcon />
                                 </button>
                             </div>
+                            </ErrorBoundary>
                         );
                     })}
                 </div>
@@ -1154,8 +1157,8 @@ const FaceClusters: React.FC = () => {
                                 const suspicious = isSuspiciousFace(face);
                                 const isSelected = !!selectedFaces[faceId];
                                 return (
+                                    <ErrorBoundary key={faceId || `${face.filename}-${face.bbox?.left}-${face.bbox?.top}`} context="face-tile" fallback={null}>
                                     <div
-                                        key={faceId || `${face.filename}-${face.bbox?.left}-${face.bbox?.top}`}
                                         className={`face-tile ${isSelected ? 'is-selected' : ''} ${suspicious ? 'is-suspicious' : ''}`}
                                         style={{ ['--stagger' as string]: `${Math.min(index, 24) * 16}ms` }}
                                     >
@@ -1189,6 +1192,7 @@ const FaceClusters: React.FC = () => {
                                         </button>
                                         {face.personName && <div className="face-caption">{face.personName}</div>}
                                     </div>
+                                    </ErrorBoundary>
                                 );
                             })}
                         </div>
@@ -1265,7 +1269,8 @@ const FaceClusters: React.FC = () => {
                             const score = typeof s.similarity === 'number' ? s.similarity : 0;
                             const rowKey = suggestionKey(s);
                             return (
-                                <div key={`${s.sourcePersonId}-${s.targetPersonId}`} className={`people-suggestion-row ${selectedSuggestions[rowKey] ? 'is-selected' : ''}`}>
+                                <ErrorBoundary key={`${s.sourcePersonId}-${s.targetPersonId}`} context="suggestion-row" fallback={null}>
+                                <div className={`people-suggestion-row ${selectedSuggestions[rowKey] ? 'is-selected' : ''}`}>
                                     <label className="person-select" title="Select suggestion">
                                         <input
                                             type="checkbox"
@@ -1338,6 +1343,7 @@ const FaceClusters: React.FC = () => {
                                         </button>
                                     </div>
                                 </div>
+                                </ErrorBoundary>
                             );
                         })}
                     </div>
@@ -1374,35 +1380,39 @@ const FaceClusters: React.FC = () => {
                         <div className="people-panel-meta">Undo merges</div>
                     </div>
                     {lastMergeId && (
-                        <div className="people-merge-latest">
-                            <div className="people-merge-history-main">
-                                <div className="people-merge-history-title">
-                                    <span className="people-merge-chip">
-                                        {formatMergeSummary(merges.find((m) => m.mergeId === lastMergeId))}
-                                    </span>
+                        <ErrorBoundary context="merge-history-latest" fallback={null}>
+                            <div className="people-merge-latest">
+                                <div className="people-merge-history-main">
+                                    <div className="people-merge-history-title">
+                                        <span className="people-merge-chip">
+                                            {formatMergeSummary(merges.find((m) => m.mergeId === lastMergeId))}
+                                        </span>
+                                    </div>
                                 </div>
+                                <button className="people-merge-btn" disabled={busy} aria-label="Undo last merge" onClick={() => lastMergeId && void handleUndoMerge(lastMergeId)} type="button">
+                                    <XMarkIcon />
+                                    <span className="sr-only">Undo last merge</span>
+                                </button>
                             </div>
-                            <button className="people-merge-btn" disabled={busy} aria-label="Undo last merge" onClick={() => lastMergeId && void handleUndoMerge(lastMergeId)} type="button">
-                                <XMarkIcon />
-                                <span className="sr-only">Undo last merge</span>
-                            </button>
-                        </div>
+                        </ErrorBoundary>
                     )}
                     <div className="people-merge-history-list">
                         {merges.slice(0, 5).map((m) => (
-                            <div key={m.mergeId} className="people-merge-history-row">
-                                <div className="people-merge-history-main">
-                                    <div className="people-merge-history-title">
-                                        <span className="people-merge-chip">{formatMergeSummary(m)}</span>
-                                        <span className="people-merge-chip">{m.createdAt}</span>
+                            <ErrorBoundary key={m.mergeId} context="merge-history-row" fallback={null}>
+                                <div className="people-merge-history-row">
+                                    <div className="people-merge-history-main">
+                                        <div className="people-merge-history-title">
+                                            <span className="people-merge-chip">{formatMergeSummary(m)}</span>
+                                            <span className="people-merge-chip">{m.createdAt}</span>
+                                        </div>
+                                    </div>
+                                    <div className="people-merge-history-actions">
+                                        <button className="people-icon-btn" disabled={busy} onClick={() => m.mergeId && void handleUndoMerge(m.mergeId)} aria-label="Undo merge" type="button">
+                                            <XMarkIcon />
+                                        </button>
                                     </div>
                                 </div>
-                                <div className="people-merge-history-actions">
-                                    <button className="people-icon-btn" disabled={busy} onClick={() => m.mergeId && void handleUndoMerge(m.mergeId)} aria-label="Undo merge" type="button">
-                                        <XMarkIcon />
-                                    </button>
-                                </div>
-                            </div>
+                            </ErrorBoundary>
                         ))}
                     </div>
                 </div>

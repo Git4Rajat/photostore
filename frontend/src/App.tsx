@@ -30,6 +30,7 @@ import { TimelineMetadataProvider } from './components/TimelineMetadataProvider'
 import { Logo } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
 import { BackendStatusBanner } from './components/shared/BackendStatusBanner';
+import { ErrorBoundary } from './components/shared/ErrorBoundary';
 import NotFoundPage from './components/NotFoundPage';
 import { DialogHost } from './components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
@@ -247,7 +248,9 @@ const RootServiceActions: React.FC = () => {
 
     return (
         <div className="root-service-actions" aria-label="Library actions" ref={wrapRef}>
-            <NotificationBell />
+            <ErrorBoundary context="notification-bell" fallback={null}>
+                <NotificationBell />
+            </ErrorBoundary>
 
             <button
                 type="button"
@@ -263,64 +266,76 @@ const RootServiceActions: React.FC = () => {
             </button>
 
             <div className="root-service-secondary" data-expanded={expanded}>
-                <button
-                    type="button"
-                    onClick={appServices.requestUpload}
-                    className="btn btn-primary icon-btn"
-                    aria-label={uploadButtonLabel}
-                    title={uploadButtonLabel}
-                >
-                    <PlusIcon className="toolbar-icon" />
-                    <span className="sr-only">{uploadButtonLabel}</span>
-                </button>
-
-                {getRuntimeConfig().processingMode !== 'backend' && (() => {
-                    const loadStage = appServices.browserAiLoadProgress;
-                    const isLoading = appServices.browserAiModelState.status === 'loading' || appServices.browserAiModelState.status === 'checking';
-                    const browserAiTitle = isLoading && loadStage
-                        ? `${appServices.browserAiButtonLabel} — ${loadStage.label} (${loadStage.index}/${loadStage.total})`
-                        : appServices.browserAiButtonLabel;
-                    return (
-                        <button
-                            type="button"
-                            onClick={() => void appServices.loadBrowserAiModel()}
-                            className={appServices.browserAiButtonClass}
-                            disabled={appServices.browserAiButtonDisabled}
-                            aria-label={browserAiTitle}
-                            title={browserAiTitle}
-                        >
-                            {isLoading ||
-                             (appServices.browserAiModelState.status === 'available' && appServices.browserProcessingActive) ? (
-                                <ArrowPathIcon className="toolbar-icon browser-ai-model-spinner" />
-                            ) : (
-                                <CpuChipIcon className="toolbar-icon" />
-                            )}
-                            {isLoading && loadStage && (
-                                <span
-                                    className="browser-ai-load-progress"
-                                    style={{ width: `${Math.round((loadStage.index / loadStage.total) * 100)}%` }}
-                                />
-                            )}
-                            <span className="sr-only">{browserAiTitle}</span>
-                        </button>
-                    );
-                })()}
-
-                {appServices.uploading && (
+                <ErrorBoundary context="upload-button" fallback={null}>
                     <button
                         type="button"
-                        onClick={appServices.stopActiveUpload}
-                        className="btn btn-danger icon-btn"
-                        aria-label="Stop upload"
-                        title="Stop upload"
+                        onClick={appServices.requestUpload}
+                        className="btn btn-primary icon-btn"
+                        aria-label={uploadButtonLabel}
+                        title={uploadButtonLabel}
                     >
-                        <XMarkIcon className="toolbar-icon" />
-                        <span className="sr-only">Stop upload</span>
+                        <PlusIcon className="toolbar-icon" />
+                        <span className="sr-only">{uploadButtonLabel}</span>
                     </button>
+                </ErrorBoundary>
+
+                {getRuntimeConfig().processingMode !== 'backend' && (
+                    <ErrorBoundary context="browser-ai-button" fallback={null}>
+                        {(() => {
+                            const loadStage = appServices.browserAiLoadProgress;
+                            const isLoading = appServices.browserAiModelState.status === 'loading' || appServices.browserAiModelState.status === 'checking';
+                            const browserAiTitle = isLoading && loadStage
+                                ? `${appServices.browserAiButtonLabel} — ${loadStage.label} (${loadStage.index}/${loadStage.total})`
+                                : appServices.browserAiButtonLabel;
+                            return (
+                                <button
+                                    type="button"
+                                    onClick={() => void appServices.loadBrowserAiModel()}
+                                    className={appServices.browserAiButtonClass}
+                                    disabled={appServices.browserAiButtonDisabled}
+                                    aria-label={browserAiTitle}
+                                    title={browserAiTitle}
+                                >
+                                    {isLoading ||
+                                     (appServices.browserAiModelState.status === 'available' && appServices.browserProcessingActive) ? (
+                                        <ArrowPathIcon className="toolbar-icon browser-ai-model-spinner" />
+                                    ) : (
+                                        <CpuChipIcon className="toolbar-icon" />
+                                    )}
+                                    {isLoading && loadStage && (
+                                        <span
+                                            className="browser-ai-load-progress"
+                                            style={{ width: `${Math.round((loadStage.index / loadStage.total) * 100)}%` }}
+                                        />
+                                    )}
+                                    <span className="sr-only">{browserAiTitle}</span>
+                                </button>
+                            );
+                        })()}
+                    </ErrorBoundary>
                 )}
 
-                <ClusteringActivityIndicator />
-                <IpworkActivityIndicator />
+                {appServices.uploading && (
+                    <ErrorBoundary context="stop-upload-button" fallback={null}>
+                        <button
+                            type="button"
+                            onClick={appServices.stopActiveUpload}
+                            className="btn btn-danger icon-btn"
+                            aria-label="Stop upload"
+                            title="Stop upload"
+                        >
+                            <XMarkIcon className="toolbar-icon" />
+                            <span className="sr-only">Stop upload</span>
+                        </button>
+                    </ErrorBoundary>
+                )}
+
+                <ErrorBoundary context="clustering-activity-indicator" fallback={null}>
+                    <ClusteringActivityIndicator />
+                </ErrorBoundary>
+                <ErrorBoundary context="ipwork-activity-indicator" fallback={null}>
+                    <IpworkActivityIndicator />
+                </ErrorBoundary>
             </div>
         </div>
     );
@@ -484,37 +499,39 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
                     </div>
 
                     {getRuntimeConfig().processingMode !== 'backend' && (
-                        <div className="account-menu-section">
-                            <p className="account-menu-label">Processing</p>
-                            <button
-                                type="button"
-                                className={`account-menu-toggle${turbo ? ' is-on' : ''}`}
-                                role="switch"
-                                aria-checked={turbo}
-                                onClick={() => {
-                                    setTurbo((value) => {
-                                        const next = !value;
-                                        setBrowserProcessingTurbo(next);
-                                        return next;
-                                    });
-                                }}
-                            >
-                                <span className="account-menu-toggle-copy">
-                                    <span className="account-menu-toggle-title">
-                                        <RocketLaunchIcon className="account-menu-item-icon" aria-hidden="true" />
-                                        Turbo mode
+                        <ErrorBoundary context="browser-ai-turbo-toggle" fallback={null}>
+                            <div className="account-menu-section">
+                                <p className="account-menu-label">Processing</p>
+                                <button
+                                    type="button"
+                                    className={`account-menu-toggle${turbo ? ' is-on' : ''}`}
+                                    role="switch"
+                                    aria-checked={turbo}
+                                    onClick={() => {
+                                        setTurbo((value) => {
+                                            const next = !value;
+                                            setBrowserProcessingTurbo(next);
+                                            return next;
+                                        });
+                                    }}
+                                >
+                                    <span className="account-menu-toggle-copy">
+                                        <span className="account-menu-toggle-title">
+                                            <RocketLaunchIcon className="account-menu-item-icon" aria-hidden="true" />
+                                            Turbo mode
+                                        </span>
+                                        <span className="account-menu-toggle-note">
+                                            {turbo
+                                                ? `Processes up to ${turboConcurrency} photos at once — faster, uses more CPU and memory.`
+                                                : 'Processes one photo at a time — gentle on this device.'}
+                                        </span>
                                     </span>
-                                    <span className="account-menu-toggle-note">
-                                        {turbo
-                                            ? `Processes up to ${turboConcurrency} photos at once — faster, uses more CPU and memory.`
-                                            : 'Processes one photo at a time — gentle on this device.'}
+                                    <span className="account-menu-switch" aria-hidden="true">
+                                        <span className="account-menu-switch-thumb" />
                                     </span>
-                                </span>
-                                <span className="account-menu-switch" aria-hidden="true">
-                                    <span className="account-menu-switch-thumb" />
-                                </span>
-                            </button>
-                        </div>
+                                </button>
+                            </div>
+                        </ErrorBoundary>
                     )}
 
                     {showAuth && (
@@ -625,10 +642,30 @@ const AppContent: React.FC = () => {
         document.title = page ? `${page} · ${APP_NAME}` : APP_NAME;
     }, [location.pathname]);
 
+    // Every routed page gets its own boundary, outside the Suspense so it also
+    // catches a failed lazy-chunk load (e.g. a stale bundle after a deploy),
+    // not just render errors from the loaded page. This is what keeps the
+    // header/nav/upload button (siblings of <main>, not inside it) alive when
+    // a specific page -- the gallery grid, People, a person's detail view --
+    // crashes: only <main>'s subtree unmounts, not the whole app.
+    //
+    // key={location.pathname} is load-bearing, not decoration: every route
+    // renders this same ErrorBoundary/Suspense wrapper shape, so without a
+    // key that changes with the route, React reconciles them as the *same*
+    // instance across navigations (only the lazy child underneath swaps) --
+    // a crash's `state.error` would then keep showing on every later page
+    // instead of clearing. The key forces a real remount per route.
     const renderLazyPage = (element: JSX.Element, fallback = 'Loading…') => (
-        <React.Suspense fallback={<Loading label={fallback} />}>
-            {element}
-        </React.Suspense>
+        <ErrorBoundary
+            key={location.pathname}
+            context={`route:${location.pathname}`}
+            title="This page hit a problem"
+            message="Something went wrong loading this page. You can try again, or use the navigation above to go elsewhere."
+        >
+            <React.Suspense fallback={<Loading label={fallback} />}>
+                {element}
+            </React.Suspense>
+        </ErrorBoundary>
     );
 
     const renderProtectedLazyPage = (element: JSX.Element, fallback = 'Loading…') => (
@@ -855,7 +892,11 @@ const AppContent: React.FC = () => {
                         <p className="ios-subtitle">An elegant home for your memories.</p>
                     </div>
                     <div className="app-header-actions">
-                        {isSignedIntoPrivateArea && <RootServiceActions />}
+                        {isSignedIntoPrivateArea && (
+                            <ErrorBoundary context="root-service-actions" fallback={null}>
+                                <RootServiceActions />
+                            </ErrorBoundary>
+                        )}
                         <AccountMenu
                             themePreference={themePreference}
                             onPreferenceChange={setThemePreference}

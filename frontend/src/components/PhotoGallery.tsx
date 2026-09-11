@@ -56,6 +56,7 @@ import Timeline from './shared/Timeline';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
+import { ErrorBoundary } from './shared/ErrorBoundary';
 import { useTimelineMetadata } from './TimelineMetadataProvider';
 import type {
     BrowserAiLoadStage,
@@ -5012,26 +5013,30 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                     {focusLoading && <Loading label="Loading photo…" fullPage={false} />}
                     {!focusLoading && focusError && <p className="empty">{focusError}</p>}
                     {!focusLoading && focusedPhoto && (
-                        <div className="gallery-grid gallery-focus-grid">
-                            <PhotoTile
-                                photo={focusedPhoto}
-                                title={focusedPhoto.filename}
-                                showBody={false}
-                                onMediaClick={(e) => {
-                                    e.stopPropagation();
-                                    setFocusLightboxOpen(true);
-                                }}
-                            />
-                        </div>
+                        <ErrorBoundary context="gallery-focus-tile" fallback={null}>
+                            <div className="gallery-grid gallery-focus-grid">
+                                <PhotoTile
+                                    photo={focusedPhoto}
+                                    title={focusedPhoto.filename}
+                                    showBody={false}
+                                    onMediaClick={(e) => {
+                                        e.stopPropagation();
+                                        setFocusLightboxOpen(true);
+                                    }}
+                                />
+                            </div>
+                        </ErrorBoundary>
                     )}
                     {focusLightboxOpen && focusedPhoto && (
-                        <PhotoViewer
-                            photos={[focusedPhoto]}
-                            index={0}
-                            onClose={() => setFocusLightboxOpen(false)}
-                            onIndexChange={() => {}}
-                            useProtectedMedia={true}
-                        />
+                        <ErrorBoundary context="gallery-focus-lightbox" fallback={null}>
+                            <PhotoViewer
+                                photos={[focusedPhoto]}
+                                index={0}
+                                onClose={() => setFocusLightboxOpen(false)}
+                                onIndexChange={() => {}}
+                                useProtectedMedia={true}
+                            />
+                        </ErrorBoundary>
                     )}
                 </div>
             )}
@@ -5113,8 +5118,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         const rating = Math.max(0, Math.min(5, Math.round(photo.rating || 0)));
                         const isNewTile = shouldAnimateGalleryTile(photo.filename);
                         return (
+                            <ErrorBoundary key={photo.filename} context="gallery-tile" fallback={null}>
                             <PhotoTile
-                                key={photo.filename}
                                 photo={photo}
                                 selected={isSelected}
                                 animateEntrance={isNewTile}
@@ -5186,21 +5191,37 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                     </>
                                 )}
                             />
+                            </ErrorBoundary>
                         );
                     })}
                 </div>
                 </div>
             ) : (
-                <PhotoViewer
-                    photos={filteredPhotos}
-                    index={lightboxIndex}
-                    onClose={closeLightbox}
-                    onIndexChange={setLightboxIndex}
-                    useProtectedMedia={true}
-                    onRotationSave={handleSaveRotation}
-                    onRate={handleRatePhoto}
-                    onToggleLike={handleToggleLike}
-                />
+                <ErrorBoundary
+                    context="gallery-lightbox"
+                    fallback={(reset) => (
+                        <ErrorState
+                            title="Couldn't display this photo"
+                            message="Something went wrong opening the viewer."
+                            onRetry={() => {
+                                reset();
+                                closeLightbox();
+                            }}
+                            retryLabel="Back to gallery"
+                        />
+                    )}
+                >
+                    <PhotoViewer
+                        photos={filteredPhotos}
+                        index={lightboxIndex}
+                        onClose={closeLightbox}
+                        onIndexChange={setLightboxIndex}
+                        useProtectedMedia={true}
+                        onRotationSave={handleSaveRotation}
+                        onRate={handleRatePhoto}
+                        onToggleLike={handleToggleLike}
+                    />
+                </ErrorBoundary>
             )}
 
             <div ref={loadMoreRef} className="load-more">
