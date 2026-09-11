@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createPersistentBrowserAiWorker } from './PhotoGallery';
+import { createPersistentBrowserAiWorker, getBrowserAiNetworkGate } from './PhotoGallery';
 import type { BrowserAiModelState } from './PhotoGallery';
 
 // createPersistentBrowserAiWorker() internally still builds an image payload via
@@ -141,5 +141,49 @@ describe('createPersistentBrowserAiWorker', () => {
         worker.onerror?.({ message: 'boom' } as ErrorEvent);
         await expect(pending).rejects.toThrow('boom');
         handle.dispose();
+    });
+});
+
+describe('getBrowserAiNetworkGate', () => {
+    const withConnection = (connection: Record<string, unknown> | undefined) => {
+        Object.defineProperty(window.navigator, 'onLine', { value: true, configurable: true });
+        Object.defineProperty(window.navigator, 'connection', { value: connection, configurable: true });
+    };
+
+    afterEach(() => {
+        Object.defineProperty(window.navigator, 'connection', { value: undefined, configurable: true });
+    });
+
+    it('does not block on a noisy high RTT sample when effectiveType already says 4g', () => {
+        // Regression test: VPNs, corporate proxies, and satellite links all add
+        // latency without hurting throughput, so a >=400ms rtt sample alongside
+        // effectiveType 4g is the noisy outlier, not the connection -- same
+        // reasoning already applied to the downlink check below.
+        withConnection({ effectiveType: '4g', downlink: 10, rtt: 450 });
+        const gate = getBrowserAiNetworkGate();
+        expect(gate.allowed).toBe(true);
+        expect(gate.reason).toBeNull();
+    });
+
+    it('still blocks on a high RTT sample when effectiveType is not 4g', () => {
+        withConnection({ effectiveType: '3g', downlink: 5, rtt: 450 });
+        const gate = getBrowserAiNetworkGate();
+        expect(gate.allowed).toBe(false);
+        expect(gate.reason).toBe('poor_network');
+        expect(gate.detail).toBe('RTT 450ms is 400ms or higher');
+    });
+
+    it('does not block on a noisy low downlink sample when effectiveType already says 4g', () => {
+        withConnection({ effectiveType: '4g', downlink: 1.2, rtt: 50 });
+        const gate = getBrowserAiNetworkGate();
+        expect(gate.allowed).toBe(true);
+    });
+
+    it('reports a real, human-readable detail instead of the bare reason code', () => {
+        withConnection({ effectiveType: 'slow-2g', downlink: 0.2, rtt: 50 });
+        const gate = getBrowserAiNetworkGate();
+        expect(gate.reason).toBe('poor_network');
+        expect(gate.detail).not.toBe('poor_network');
+        expect(gate.detail).toBe('slow-2g connection');
     });
 });

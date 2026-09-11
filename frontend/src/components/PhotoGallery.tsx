@@ -78,7 +78,11 @@ import type {
 import type { Photo } from '../types/uiTypes';
 
 const UPLOAD_SESSION_STORAGE_KEY = 'photostore.upload.session.v1';
-const PHOTO_LIST_REQUEST_TIMEOUT_MS = 15000;
+// 36k+-photo libraries can take 60-75s for the backend's full metadata scan
+// (see search_photos/_cached_metadata_rows_for_user) -- 15s guaranteed a
+// timeout on every search for those libraries. This doesn't fix the scan's
+// underlying cost, just stops search from failing outright while it's slow.
+const PHOTO_LIST_REQUEST_TIMEOUT_MS = 120000;
 
 // Discrete pinch-zoom density levels for the gallery grid. Index 0 is the
 // default/comfortable tile size (matches the un-zoomed .gallery-grid CSS);
@@ -355,7 +359,6 @@ interface BrowserVisionSource {
     sourceBytes: number;
     skipReason?: ClientProcessingReason;
     isRaw: boolean;
-    thumbnailOnly?: boolean;
 }
 
 export type BrowserAiModelState = SharedBrowserAiModelState & {
@@ -1791,7 +1794,12 @@ export const getBrowserAiNetworkGate = (): BrowserAiNetworkGate => {
             hasNetworkInfo,
         };
     }
-    if (rtt >= 400) {
+    // Same reasoning as the downlink check above: RTT comes from the same noisy
+    // Network Information API sample and can read high on a connection that's
+    // actually fine (VPNs, corporate proxies, satellite links all add latency
+    // without hurting throughput). Don't let it override an effectiveType that
+    // already says the connection behaves like 4g.
+    if (rtt >= 400 && effectiveType !== '4g') {
         return {
             allowed: false,
             reason: 'poor_network',
@@ -2233,7 +2241,9 @@ const acquireBrowserAiModelInner = async (
     const manifestUrl = resolveManifestUrl(BROWSER_AI_MODEL_MANIFEST_URL);
     let manifestResponse = await cache.match(manifestUrl);
     let modelCacheStatus: BrowserAiModelCacheStatus = manifestResponse ? 'hit' : 'miss';
-    const networkReason = getPoorNetworkReason();
+    const networkGate = getBrowserAiNetworkGate();
+    const networkReason = networkGate.reason === 'network_info_unavailable' ? null : networkGate.reason;
+    const networkDetail = networkGate.detail;
     const cachedManifestContentType = String(manifestResponse?.headers.get('content-type') || '').toLowerCase();
     if (manifestResponse && cachedManifestContentType && !cachedManifestContentType.includes('json')) {
         await cache.delete(manifestUrl);
@@ -2245,7 +2255,7 @@ const acquireBrowserAiModelInner = async (
             return finish({
                 status: 'unavailable',
                 reason: networkReason,
-                detail: networkReason,
+                detail: networkDetail,
                 modelAvailability: 'unavailable',
                 modelCacheStatus: 'miss',
                 runtime: 'browser-ai-worker',
@@ -2375,7 +2385,7 @@ const acquireBrowserAiModelInner = async (
                     return finish({
                         status: 'unavailable',
                         reason: networkReason,
-                        detail: networkReason,
+                        detail: networkDetail,
                         modelAvailability: 'unavailable',
                         modelCacheStatus,
                         modelManifestVersion: manifestVersion,
@@ -2624,60 +2634,23 @@ const findLargestEmbeddedJpegRange = async (file: File): Promise<{ start: number
     return { start: bestStart, end: bestEnd, timedOut };
 };
 
-const createRawFallbackPreviewBlob = async (file: File): Promise<{ blob: Blob; width: number; height: number } | null> => {
-    if (typeof document === 'undefined') {
-        return null;
-    }
-    const canvas = document.createElement('canvas');
-    const width = 320;
-    const height = 240;
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx || typeof canvas.toBlob !== 'function') {
-        return null;
-    }
-
-    const ext = (getFileExtension(file.name) || 'raw').toUpperCase();
-    ctx.fillStyle = '#111827';
-    ctx.fillRect(0, 0, width, height);
-    ctx.fillStyle = '#1f2937';
-    ctx.fillRect(16, 16, width - 32, height - 32);
-    ctx.strokeStyle = '#94a3b8';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(16, 16, width - 32, height - 32);
-    ctx.fillStyle = '#f8fafc';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.font = '700 54px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-    ctx.fillText(ext, width / 2, 102);
-    ctx.font = '600 20px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-    ctx.fillText('RAW preview unavailable', width / 2, 154);
-
-    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.78));
-    return blob ? { blob, width, height } : null;
-};
-
-const createRawFallbackVisionSource = async (
-    file: File,
+// No usable embedded preview could be found for this RAW file. Deliberately
+// returns imageSource: null (not a synthetic placeholder graphic) so every
+// downstream consumer (thumbnail/preview/ocr/face/ai_vision) takes the same
+// "nothing to process" path as any other unsupported source -- a rendered
+// "RAW preview unavailable" card used to be uploaded here as if it were a
+// real photo thumbnail, which made the client-side clientProcessing.thumbnail
+// payload report hasData: true/status 'done'. That's a terminal state
+// (storage_utils.py's _step_locked_done), so it permanently blocked the far
+// more capable server-side fallback (_apply_server_thumbnail_fallback, which
+// extracts via exiftool across several embedded-preview tags rather than this
+// function's raw byte-scan) from ever getting a chance to produce a real
+// thumbnail. Skipping cleanly instead lets ipworker's already-queued
+// 'thumbnail' step (active in 'both'/'backend' processing mode) do that.
+const createRawFallbackVisionSource = (
     base: Omit<BrowserVisionSource, 'imageSource' | 'sourceKind' | 'skipReason' | 'sourceBytes'>,
     reason: ClientProcessingReason,
-): Promise<BrowserVisionSource> => {
-    const fallback = await createRawFallbackPreviewBlob(file);
-    if (!fallback) {
-        return { ...base, imageSource: null, sourceKind: 'unsupported', sourceBytes: 0, skipReason: reason };
-    }
-    return {
-        ...base,
-        imageSource: fallback.blob,
-        sourceKind: 'unsupported',
-        sourceBytes: fallback.blob.size,
-        previewWidth: fallback.width,
-        previewHeight: fallback.height,
-        skipReason: reason,
-        thumbnailOnly: true,
-    };
-};
+): BrowserVisionSource => ({ ...base, imageSource: null, sourceKind: 'unsupported', sourceBytes: 0, skipReason: reason });
 
 const createRawConvertedVisionSource = async (
     convertedPreview: Blob | File | undefined,
@@ -2716,7 +2689,7 @@ const extractEmbeddedJpegPreview = async (file: File): Promise<BrowserVisionSour
     };
     const range = await findLargestEmbeddedJpegRange(file);
     if (!range || range.start < 0 || range.end <= range.start) {
-        return createRawFallbackVisionSource(file, base, range?.timedOut ? 'raw_container_unsupported' : 'raw_preview_missing');
+        return createRawFallbackVisionSource(base, range?.timedOut ? 'raw_container_unsupported' : 'raw_preview_missing');
     }
     const previewBlob = file.slice(range.start, range.end, 'image/jpeg');
     let dimensions: { width: number; height: number } | null;
@@ -2726,7 +2699,7 @@ const extractEmbeddedJpegPreview = async (file: File): Promise<BrowserVisionSour
         dimensions = null;
     }
     if (!dimensions) {
-        return createRawFallbackVisionSource(file, base, 'raw_preview_invalid');
+        return createRawFallbackVisionSource(base, 'raw_preview_invalid');
     }
     return {
         ...base,
@@ -2869,7 +2842,7 @@ const resolveBrowserVisionSourceBase = async (file: File, convertedPreview?: Blo
     try {
         return await extractEmbeddedJpegPreview(file);
     } catch {
-        return createRawFallbackVisionSource(file, base, 'raw_container_unsupported');
+        return createRawFallbackVisionSource(base, 'raw_container_unsupported');
     }
 };
 
@@ -3655,7 +3628,7 @@ export const runBrowserProcessing = async (
         : 'model_unavailable';
     let aiVisionEvaluated = false;
     const aiVisionSource = visionSource.imageSource;
-    const hasUsableAiVisionSource = Boolean(aiVisionSource) && !visionSource.thumbnailOnly;
+    const hasUsableAiVisionSource = Boolean(aiVisionSource);
     const aiSkipReason: ClientProcessingReason | null = networkReason || (
         admissionExpired
             ? 'model_budget_exceeded'
@@ -3738,14 +3711,10 @@ export const runBrowserProcessing = async (
     }
 
     if (!aiVisionEvaluated) {
-        const finalAiSkipReason = visionSource.thumbnailOnly
-            ? (visionSource.skipReason || 'raw_preview_missing')
-            : (aiSkipReason || 'model_unavailable');
+        const finalAiSkipReason = aiSkipReason || 'model_unavailable';
         clientProcessingReport.push(makeClientReport(clientAssetId, 'ai_vision', 'skipped', finalAiSkipReason, performance.now(), {
             ...modelReportFields,
-            runtime: visionSource.thumbnailOnly
-                ? 'browser-raw-fallback-thumbnail'
-                : (conservative ? 'conservative-browser-mode' : 'browser-no-model-configured'),
+            runtime: conservative ? 'conservative-browser-mode' : 'browser-no-model-configured',
             detail: browserAiModelState?.detail || finalAiSkipReason,
             ...sourceFields,
         }));
