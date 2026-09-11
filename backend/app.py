@@ -86,7 +86,11 @@ from storage_utils import (
     refresh_user_vector_index,
     invalidate_user_vector_index_cache,
     delete_user_vector_index_data,
-    touch_user_vector_index_state,
+    touch_user_search_indexes_state,
+    metadata_updates_affect_search_indexes,
+    get_user_lexical_index,
+    invalidate_user_lexical_index_cache,
+    delete_user_lexical_index_data,
     vector_search_candidates,
     reserve_pending_anonymous_blob,
     read_pending_anonymous_blob,
@@ -422,6 +426,7 @@ LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY = int(os.getenv('LIBRARY_EXPORT_DOWNLOAD_CON
 # minting is impossible (no AAD credential, e.g. Azurite/local dev).
 MEDIA_URL_MODE = os.getenv('MEDIA_URL_MODE', 'sas').strip().lower()
 BLOB_VECTOR_INDEX_CONTAINER = os.getenv('BLOB_VECTOR_INDEX_CONTAINER', 'vector-index').strip()
+BLOB_LEXICAL_INDEX_CONTAINER = os.getenv('BLOB_LEXICAL_INDEX_CONTAINER', 'lexical-index').strip()
 VECTOR_INDEX_PRIME_ON_STARTUP = os.getenv('VECTOR_INDEX_PRIME_ON_STARTUP', 'false').lower() in ('1', 'true', 'yes')
 VECTOR_INDEX_PRIME_MAX_USERS = max(0, int(os.getenv('VECTOR_INDEX_PRIME_MAX_USERS', '200')))
 SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS = os.getenv(
@@ -1194,6 +1199,7 @@ def _init_storage_clients():
         blob_thumbnail_container=BLOB_THUMBNAIL_CONTAINER,
         blob_cover_container=BLOB_COVER_CONTAINER,
         blob_vector_index_container=BLOB_VECTOR_INDEX_CONTAINER,
+        blob_lexical_index_container=BLOB_LEXICAL_INDEX_CONTAINER,
         image_names_table_client=image_names_table_client,
         hash_index_table_client=hash_index_table_client,
         filename_owners_table_client=filename_owners_table_client,
@@ -1293,7 +1299,7 @@ def create_filename_owners_table() -> None:
 def create_blob_containers() -> None:
     if blob_service_client is None:
         return
-    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER):
+    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER):
         if not container_name:
             continue
         try:
@@ -2391,14 +2397,8 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
         try:
             metadata_table_client.upsert_entity(entity)
             _invalidate_metadata_scan_cache(user_id)
-            if any(key in {
-                'tags', 'objects', 'caption', 'ocrText', 'address', 'locationCity', 'locationCountry',
-                'semanticText', 'semanticEmbedding', 'semanticEmbeddingVersion', 'faceCount', 'faces',
-                'peopleIds', 'aiPersonLabel', 'aiPersonScore', 'subjectTags', 'backgroundTags',
-                'weakTags', 'tagBuckets', 'tagMetadata', 'semanticLayers',
-                'photoEmbedding', 'photoEmbeddingVersion',
-            } for key in (updates or {}).keys()):
-                touch_user_vector_index_state(user_id)
+            if metadata_updates_affect_search_indexes(updates or {}):
+                touch_user_search_indexes_state(user_id)
             return entity
         except Exception as exc:
             last_exc = exc
@@ -7270,6 +7270,7 @@ def library_delete():
     _purge_library_data(library_id)
     try:
         invalidate_user_vector_index_cache(library_id)
+        invalidate_user_lexical_index_cache(library_id)
     except Exception:
         pass
     return jsonify({'status': 'ok'})
@@ -7599,6 +7600,7 @@ def _execute_library_clean(library_id: str) -> Dict:
         pass
     _delete_cover_blobs_for_library(library_id)
     delete_user_vector_index_data(library_id)
+    delete_user_lexical_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
     return {'photosDeleted': len(metadata_rows), 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}
@@ -12043,7 +12045,7 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> None:
     entity['processing_lease_expires_at'] = ''
     entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
     metadata_table_client.upsert_entity(entity)
-    touch_user_vector_index_state(user_id)
+    touch_user_search_indexes_state(user_id)
 
 
 def _delete_upload_temp_files_for_filename(filename: str, upload_id: str = '') -> Tuple[List[str], List[str]]:
@@ -12507,10 +12509,20 @@ def search_photos():
     if error:
         return error
 
+    rows = None
     try:
-        rows = _cached_metadata_rows_for_user(user_id, purpose='photos.search')
+        lexical_index = get_user_lexical_index(user_id, allow_refresh=True)
+        if lexical_index is not None:
+            rows = lexical_index.get('rows')
     except Exception as exc:
-        return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+        app.logger.warning('Lexical index unavailable for user=%s, falling back to full scan: %s', user_id, exc)
+        rows = None
+
+    if rows is None:
+        try:
+            rows = _cached_metadata_rows_for_user(user_id, purpose='photos.search')
+        except Exception as exc:
+            return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
 
     pid_to_name, name_to_ids = _load_people_name_index(user_id)
     matched_person_groups = _matched_query_people_groups(query, name_to_ids)
@@ -12997,7 +13009,7 @@ def delete_multiple_photos():
         # vector index dirty since the library's photo set changed.
         _invalidate_metadata_scan_cache(user_id)
         try:
-            touch_user_vector_index_state(user_id)
+            touch_user_search_indexes_state(user_id)
         except Exception:
             pass
 

@@ -520,21 +520,24 @@ def test_default_origin_is_browser(processing_ctx):
 
 
 def test_applying_results_marks_vector_index_dirty_without_eager_rebuild(monkeypatch, processing_ctx):
-    """A per-photo apply must not trigger a full-library vector-index
-    rebuild (refresh_user_vector_index scans + re-embeds every photo in the
-    library, and re-uploads the whole index) -- it should just mark the
-    index stale via the cheap touch_user_vector_index_state and let the
-    existing lazy on-search rebuild path pick it up later."""
+    """A per-photo apply must not trigger a full-library vector-index or
+    lexical-index rebuild (refresh_user_vector_index/refresh_user_lexical_index
+    each scan the whole library, and re-upload the whole index) -- it should
+    just mark both indexes stale via the cheap touch_user_search_indexes_state
+    and let the existing lazy on-search rebuild paths pick it up later."""
     metadata, _ = processing_ctx
     user_id, filename = 'lib-A', 'photo.jpg'
     _seed_row(metadata, user_id, filename, ocr_status='pending')
 
     def _boom(*a, **k):
-        raise AssertionError('eager full-library refresh_user_vector_index must not run per photo')
+        raise AssertionError('eager full-library refresh must not run per photo')
 
     monkeypatch.setattr(storage_utils, 'refresh_user_vector_index', _boom)
+    monkeypatch.setattr(storage_utils, 'refresh_user_lexical_index', _boom)
     touched = []
+    touched_lexical = []
     monkeypatch.setattr(storage_utils, 'touch_user_vector_index_state', lambda *a, **k: touched.append(a))
+    monkeypatch.setattr(storage_utils, 'touch_user_lexical_index_state', lambda *a, **k: touched_lexical.append(a))
 
     storage_utils.apply_client_processing_results_for_file(
         user_id, filename,
@@ -545,3 +548,4 @@ def test_applying_results_marks_vector_index_dirty_without_eager_rebuild(monkeyp
     )
 
     assert touched == [(user_id,)]
+    assert touched_lexical == [(user_id,)]
