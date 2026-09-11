@@ -11694,7 +11694,13 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
         # whichever browser tabs happen to be open, and ipworker's sweep
         # would silently skip this entire class of "pending" work forever.
         face_version_retry = step == 'face' and face_version_stale
-        if status in BROWSER_PROCESSING_TERMINAL_STATUSES and not retryable_no_data and not face_version_retry:
+        # Same reasoning as _handle_ipwork_queue_payload's runnable_steps carve-out:
+        # a browser-reported 'skipped'/'no_data'/'unsupported' thumbnail only means
+        # its lightweight embedded-preview scan gave up, not that no real thumbnail
+        # exists -- ipworker's own exiftool-based extraction is strictly more
+        # capable and must still get a chance via this safety-net sweep too.
+        thumbnail_retry = step == 'thumbnail' and status in {'skipped', 'no_data', 'unsupported'}
+        if status in BROWSER_PROCESSING_TERMINAL_STATUSES and not retryable_no_data and not face_version_retry and not thumbnail_retry:
             continue
         if status == 'running' and not lease_expired:
             continue
@@ -14689,10 +14695,24 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     # sitting in the queue (e.g. a redelivered retry, or two ipwork messages
     # for the same photo) -- claim_processing_lease just computed fresh
     # statuses, so this is free and avoids redoing completed inference.
+    #
+    # 'thumbnail' is excluded from that general rule: unlike ocr/face/
+    # map_detection (where 'no_data'/'skipped' is a trustworthy "we checked,
+    # there's genuinely nothing there"), a browser-reported 'skipped'/
+    # 'no_data'/'unsupported' thumbnail only means the browser's lightweight
+    # embedded-preview scan gave up -- it says nothing about whether a real
+    # thumbnail exists. ipworker's own extraction (exiftool across several
+    # embedded-preview tags) is strictly more capable, so it must still get a
+    # chance to run; only a genuinely-produced 'done' thumbnail should block
+    # it. Without this, kickOffThumbnailForFile's early browser-only report
+    # (written before this queue message is even picked up) permanently
+    # locked every such RAW photo out of ipworker's better fallback.
     lease_statuses = lease.get('statuses') or {}
     runnable_steps = [
         step for step in steps
-        if str(lease_statuses.get(f'{step}Status') or '').strip().lower() not in {'done', 'no_data', 'skipped', 'unsupported'}
+        if str(lease_statuses.get(f'{step}Status') or '').strip().lower() not in (
+            {'done'} if step == 'thumbnail' else {'done', 'no_data', 'skipped', 'unsupported'}
+        )
     ]
     # claim_processing_lease reads the raw face_status field, which doesn't
     # know about embedding-version staleness -- a 'done' status there just
