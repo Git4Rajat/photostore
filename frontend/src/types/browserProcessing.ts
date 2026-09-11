@@ -113,6 +113,7 @@ export type ClientProcessingReason =
     | 'raw_preview_missing'
     | 'raw_preview_invalid'
     | 'raw_container_unsupported'
+    | 'raw_orientation_unknown'
     | 'raw_exif_only'
     | 'jxl_preview_missing'
     | 'video_unsupported'

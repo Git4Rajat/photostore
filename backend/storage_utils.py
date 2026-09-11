@@ -111,6 +111,7 @@ CLIENT_PROCESSING_ALLOWED_REASONS = {
     'raw_preview_missing',
     'raw_preview_invalid',
     'raw_container_unsupported',
+    'raw_orientation_unknown',
     'raw_exif_only',
     'video_unsupported',
     'unknown_error',

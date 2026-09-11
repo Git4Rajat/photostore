@@ -360,6 +360,14 @@ interface BrowserVisionSource {
     sourceBytes: number;
     skipReason?: ClientProcessingReason;
     isRaw: boolean;
+    // True only for sourceKind 'raw_embedded_jpeg' (see extractEmbeddedJpegPreview):
+    // that bytes-scan pulls the RAW container's largest embedded/thumbnail JPEG
+    // as-is, which is always sensor-orientation with EXIF Orientation=1 regardless
+    // of the shot's actual rotation -- the real orientation only lives in the RAW
+    // container's own header (rawpy's raw.sizes.flip, see backend/image_utils.py's
+    // _apply_raw_flip), which nothing client-side can read. A thumbnail rendered
+    // from this source can be confidently wrong, so it must not be generated here.
+    rawOrientationUnknown?: boolean;
 }
 
 export type BrowserAiModelState = SharedBrowserAiModelState & {
@@ -2709,6 +2717,7 @@ const extractEmbeddedJpegPreview = async (file: File): Promise<BrowserVisionSour
         previewWidth: dimensions.width,
         previewHeight: dimensions.height,
         sourceBytes: previewBlob.size,
+        rawOrientationUnknown: true,
     };
 };
 
@@ -3106,6 +3115,18 @@ export const runBrowserProcessing = async (
             runtime: 'canvas',
             ...sourceFields,
         }));
+    } else if (visionSource.rawOrientationUnknown) {
+        // Same reasoning as the thumbnail step below: this is the "shrunk" preview
+        // that's now the default lightbox image for every photo (see
+        // getMainMediaPath in PhotoViewer.tsx), so uploading it un-flip-corrected
+        // would bake the wrong rotation into the lightbox too, not just the tile.
+        // Reporting 'failed' triggers the server-side fallback in this same
+        // request (_apply_server_preview_fallback -> convert_image_to_jpeg),
+        // which applies the RAW container's real flip.
+        clientProcessingReport.push(makeClientReport(clientAssetId, 'preview', 'failed', 'raw_orientation_unknown', previewStartedAt, {
+            runtime: 'canvas',
+            ...sourceFields,
+        }));
     } else if (visionSource.sourceKind === 'browser_shrunk' && visionSource.imageSource) {
         try {
             const previewData = await blobToBase64(visionSource.imageSource);
@@ -3140,6 +3161,17 @@ export const runBrowserProcessing = async (
     let startedAt = performance.now();
     if (processingMode === 'backend') {
         clientProcessingReport.push(makeClientReport(clientAssetId, 'thumbnail', 'skipped', 'backend_processing_mode', startedAt, {
+            runtime: 'canvas',
+            ...sourceFields,
+        }));
+    } else if (visionSource.imageSource && visionSource.rawOrientationUnknown) {
+        // Don't render (and permanently upload as 'done') a thumbnail whose
+        // orientation is a coin flip -- see rawOrientationUnknown's definition
+        // above. Reporting 'failed' (not 'skipped') keeps this retryable and
+        // immediately triggers the server-side fallback in the same request
+        // (_apply_server_thumbnail_fallback -> _create_server_thumbnail_for_upload),
+        // which applies the RAW container's real flip and gets it right.
+        clientProcessingReport.push(makeClientReport(clientAssetId, 'thumbnail', 'failed', 'raw_orientation_unknown', startedAt, {
             runtime: 'canvas',
             ...sourceFields,
         }));
