@@ -54,6 +54,7 @@ from image_utils import (
     allowed_file,
     convert_image_to_jpeg,
     create_placeholder_thumbnail,
+    extract_raw_native_preview_bytes,
     is_video_file,
 )
 import vision_utils
@@ -9017,6 +9018,58 @@ def proxy_image(filename: str):
         # Other errors
         print(f"Unexpected error serving image for {safe_name}: {str(e)}", flush=True)
         return jsonify({'error': 'Failed to retrieve image'}), 503
+
+
+@app.route('/api/photos/raw-full-preview/<path:filename>', methods=['GET'])
+def proxy_raw_full_preview(filename: str):
+    """Serve the largest embedded RAW preview at native size for the lightbox's
+    FR ("full resolution") button.
+
+    Deliberately never falls back to a full demosaic (rawpy.postprocess()) --
+    that call has no timeout or resource guard anywhere in this codebase and is
+    only safe today because it's confined to the async preview-generation
+    worker job, not a synchronous web request. A RAW file with no embedded
+    preview simply has no native preview available here.
+    """
+    user_id, error = _require_user_id()
+    if error:
+        return error
+    safe_name = _validate_media_filename(filename)
+    if not safe_name:
+        return jsonify({'error': 'Invalid filename'}), 400
+
+    ext = safe_name.rsplit('.', 1)[-1].lower() if '.' in safe_name else ''
+    if ext not in RAW_EXTENSIONS_RAWPY and ext not in RAW_EXTENSIONS_CINEMA:
+        return jsonify({'error': 'Not a RAW file'}), 400
+
+    metadata_entity = _get_metadata_entity(user_id, safe_name)
+    if not metadata_entity:
+        return jsonify({'error': 'Not found'}), 404
+
+    if not blob_service_client:
+        return jsonify({'error': 'Image service not configured'}), 503
+
+    blob_name_to_serve = _resolve_media_blob_name(user_id, safe_name, metadata_entity)
+
+    try:
+        image_bytes = download_media_bytes('image', blob_name_to_serve)
+    except Exception as e:
+        if '404' in str(e) or 'ResourceNotFound' in str(e) or 'does not exist' in str(e).lower():
+            return jsonify({'error': 'File not found in storage'}), 404
+        print(f"Unexpected error reading RAW original for {safe_name}: {str(e)}", flush=True)
+        return jsonify({'error': 'Failed to retrieve image'}), 503
+
+    preview_bytes = extract_raw_native_preview_bytes(image_bytes, safe_name)
+    if not preview_bytes:
+        return jsonify({
+            'error': 'No native preview available',
+            'reason': 'raw_native_preview_unavailable',
+            'detail': 'No higher-resolution preview is available for this RAW file — showing the standard preview.',
+        }), 404
+
+    response = Response(preview_bytes, mimetype='image/jpeg')
+    response.headers['Cache-Control'] = 'private, max-age=3600'
+    return response
 
 
 @app.route('/api/photos/cover/<path:filename>', methods=['GET'])

@@ -628,6 +628,51 @@ def extract_raw_preview_from_path(path: str) -> Optional[bytes]:
     return _best_preview(candidates)
 
 
+def _extract_rawpy_thumb_only_from_path(path: str) -> Optional[bytes]:
+    # Unlike _extract_rawpy_preview_from_path, this never falls through to
+    # raw.postprocess() -- that's a real demosaic with no timeout/resource guard
+    # anywhere in this codebase (it's only ever safe today because it's confined
+    # to the async preview-generation worker job, not a synchronous web request).
+    try:
+        import rawpy
+        with rawpy.imread(path) as raw:
+            return _extract_rawpy_thumbnail(raw, rawpy)
+    except Exception:
+        return None
+
+
+def extract_raw_native_preview_from_path(path: str) -> Optional[bytes]:
+    # Used by the FR ("full resolution") lightbox button: the largest embedded
+    # preview at its native size (no PREVIEW_MAX_DIMENSION shrink). Deliberately
+    # restricted to extractors that only pull an *existing* embedded JPEG --
+    # never a demosaic -- so this is always cheap and bounded. If a RAW file has
+    # no embedded preview at all, that's a genuine "nothing better available"
+    # case here, not a trigger to fall back to a synchronous full decode.
+    raw_flip = _raw_container_flip_from_path(path)
+    candidates = []
+    for extractor, args in (
+        (_extract_exiftool_preview_from_path, (path, raw_flip)),
+        (extract_embedded_jpeg_from_path, (path, raw_flip)),
+        (_extract_rawpy_thumb_only_from_path, (path,)),
+    ):
+        preview = extractor(*args)
+        if preview:
+            candidates.append(preview)
+    return _best_preview(candidates)
+
+
+def extract_raw_native_preview_bytes(image_bytes: bytes, filename: str) -> Optional[bytes]:
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else 'raw'
+    suffix = f'.{ext}' if ext else '.raw'
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
+            temp_file.write(image_bytes)
+            temp_file.flush()
+            return extract_raw_native_preview_from_path(temp_file.name)
+    except Exception:
+        return None
+
+
 def extract_raw_preview_bytes(image_bytes: bytes, filename: str = '') -> Optional[bytes]:
     candidates = []
     preview = extract_embedded_jpeg(image_bytes, _raw_container_flip_from_bytes(image_bytes))

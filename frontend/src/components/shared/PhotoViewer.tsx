@@ -460,7 +460,15 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         if (!activePhoto || fullResLoading || fullResUrl) {
             return;
         }
-        const originalPath = activePhoto.url || primaryMediaPath || activePhoto.thumbnailUrl || '';
+        // RAW originals aren't browser-decodable -- fetch the backend's native-size
+        // embedded-preview extraction instead (same flip-corrected extraction the
+        // default shrunk preview uses, just without the 2048px cap). See
+        // extract_raw_native_preview_bytes in image_utils.py for why this never
+        // falls back to a full demosaic.
+        const isRaw = getMediaKind(activePhoto.filename) === 'RAW';
+        const originalPath = isRaw
+            ? `/api/photos/raw-full-preview/${encodeURIComponent(activePhoto.filename)}`
+            : (activePhoto.url || primaryMediaPath || activePhoto.thumbnailUrl || '');
         if (!originalPath) {
             return;
         }
@@ -485,7 +493,8 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
             setFullResProgress(100);
         } catch (err) {
             if (!controller.signal.aborted) {
-                setFullResError(err instanceof Error ? err.message : 'Failed to load full resolution.');
+                const rawMessage = err instanceof Error ? err.message : undefined;
+                setFullResError(isRaw ? describePreviewFailure(activePhoto.filename, rawMessage) : (rawMessage || 'Failed to load full resolution.'));
             }
         } finally {
             if (fullResAbortRef.current === controller) {
@@ -1140,6 +1149,17 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                             }}
                             onLoad={() => setMediaLoading(false)}
                             onError={() => {
+                                // imageUrl prioritizes fullResUrl unconditionally (see its
+                                // definition above), so if a fetched "full resolution" image
+                                // fails to decode, showPreviewFailure()'s thumbnail-fallback
+                                // branch would never actually change what's rendered -- the
+                                // broken fullResUrl would stay pinned forever. Cancel it first
+                                // so imageUrl falls back to the shrunk preview, then surface why.
+                                if (fullResUrl) {
+                                    cancelFullResolution();
+                                    setFullResError(formatPreviewError(activePhoto.filename));
+                                    return;
+                                }
                                 showPreviewFailure();
                             }}
                         />
