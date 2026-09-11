@@ -613,11 +613,19 @@ def extract_raw_preview_from_path(path: str) -> Optional[bytes]:
     # risk a blind correction on.
     raw_flip = _raw_container_flip_from_path(path)
     candidates = []
+    # rawpy/libraw are structural parsers (they read the container's own IFD/offset
+    # tables), so they're tried before the blind byte-scan fallback. The byte scan just
+    # hunts for FFD8..FFD9 pairs and picks the largest one that happens to decode -- for
+    # DNGs whose real preview is itself a multi-picture (MPO) blob with a secondary
+    # auxiliary frame (e.g. Apple ProRAW's embedded HDR gain map), a stray marker-like
+    # byte elsewhere in the file can corrupt the real preview's apparent boundary, and
+    # the scanner falls through past dozens of undecodable raw-tile candidates straight
+    # to that small, technically-decodable-but-wrong auxiliary frame.
     for extractor, args in (
         (_extract_exiftool_preview_from_path, (path, raw_flip)),
-        (extract_embedded_jpeg_from_path, (path, raw_flip)),
         (_extract_rawpy_preview_from_path, (path,)),
         (_extract_libraw_preview_from_path, (path, raw_flip)),
+        (extract_embedded_jpeg_from_path, (path, raw_flip)),
         (_extract_ffmpeg_preview_from_path, (path,)),
     ):
         preview = extractor(*args)
