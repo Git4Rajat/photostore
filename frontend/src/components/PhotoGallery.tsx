@@ -2995,6 +2995,14 @@ export const runBrowserProcessing = async (
         thumbnailRotationDegrees?: number;
         convertedPreview?: Blob | File;
         aiWorkerHandle?: BrowserAiWorkerHandle;
+        // Restricts which steps this call actually computes (not just reports).
+        // null/undefined means "all steps" (the historical full-sweep behavior).
+        // A caller that only needs one step (e.g. kickOffThumbnailForFile's fast
+        // upload-time thumbnail) should pass its exact step set so this function
+        // never spins up OCR/face-detection/CLIP inference just to discard the
+        // result -- see the 'wantsStep' gates below and the matching
+        // claimedSteps sent alongside the report to /upload/client-processing.
+        requestedSteps?: Set<string> | null;
     } = {},
 ): Promise<ClientProcessingResult> => {
     const clientProcessing: Record<string, any> = partialResult?.clientProcessing || {};
@@ -3010,6 +3018,9 @@ export const runBrowserProcessing = async (
     // (geocode is gated separately below, transitively via exif).
     const processingMode = getRuntimeConfig().processingMode || 'browser';
     const browserAiReady = processingMode !== 'backend' && browserAiModelState?.status === 'available';
+    const wantsStep = (step: string): boolean => (
+        !processingOptions.requestedSteps || processingOptions.requestedSteps.has(step)
+    );
 
     if (isVideoFile(file)) {
         // Videos only get a poster-frame thumbnail in the browser; EXIF metadata
@@ -3110,7 +3121,12 @@ export const runBrowserProcessing = async (
     // server-side equivalent and _apply_client_processing_results in
     // storage_utils.py for how this field gets persisted.
     const previewStartedAt = performance.now();
-    if (processingMode === 'backend') {
+    if (!wantsStep('preview')) {
+        // Not requested this pass (e.g. kickOffThumbnailForFile only wants
+        // 'thumbnail') -- skip computing it entirely rather than computing it
+        // and discarding the result, and push no report row so the backend
+        // never sees a false "checked, nothing there" signal for it.
+    } else if (processingMode === 'backend') {
         clientProcessingReport.push(makeClientReport(clientAssetId, 'preview', 'skipped', 'backend_processing_mode', previewStartedAt, {
             runtime: 'canvas',
             ...sourceFields,
@@ -3159,7 +3175,9 @@ export const runBrowserProcessing = async (
     }
 
     let startedAt = performance.now();
-    if (processingMode === 'backend') {
+    if (!wantsStep('thumbnail')) {
+        // Not requested this pass -- see the matching 'preview' gate above.
+    } else if (processingMode === 'backend') {
         clientProcessingReport.push(makeClientReport(clientAssetId, 'thumbnail', 'skipped', 'backend_processing_mode', startedAt, {
             runtime: 'canvas',
             ...sourceFields,
@@ -3229,7 +3247,13 @@ export const runBrowserProcessing = async (
     // In 'backend' mode ipworker owns exif (and, by extension below, geocode --
     // it depends on parsedGpsExif) entirely; leaving parsedGpsExif null here
     // naturally skips the geocode block too without a second gate there.
-    if (processingMode === 'backend') {
+    // map_detection reads parsedGpsExif below, so exif still needs to actually
+    // run (just not be reported) when only 'map_detection' was requested --
+    // e.g. the Tools page's "retry map only" action, which intentionally
+    // re-derives GPS from the file without resubmitting/overwriting 'exif'.
+    if (!wantsStep('exif') && !wantsStep('map_detection')) {
+        // Neither requested this pass -- see the 'preview' gate above.
+    } else if (processingMode === 'backend') {
         clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'skipped', 'backend_processing_mode', startedAt, {
             runtime: 'browser-dataview',
             ...sourceFields,
@@ -3283,7 +3307,11 @@ export const runBrowserProcessing = async (
     }
 
     startedAt = performance.now();
-    if (visionSource.imageSource && !browserAiReady) {
+    if (!wantsStep('ocr')) {
+        // Not requested this pass -- see the 'preview' gate above. This is the
+        // main win for kickOffThumbnailForFile: skips spinning up a whole
+        // tesseract.js worker (seconds of CPU) just to throw the result away.
+    } else if (visionSource.imageSource && !browserAiReady) {
         clientProcessingReport.push(makeClientReport(clientAssetId, 'ocr', 'skipped', 'model_unavailable', startedAt, {
             runtime: 'tesseract.js',
             detail: 'browser_ai_not_loaded',
@@ -3332,7 +3360,10 @@ export const runBrowserProcessing = async (
     }
 
     const exifGps = visionSource.imageSource ? parsedGpsExif : null;
-    if (exifGps?.latitude && exifGps.longitude) {
+    if (!wantsStep('map_detection')) {
+        // Not requested this pass -- see the 'preview' gate above. Also
+        // avoids an unrequested real network call to /geocode/reverse.
+    } else if (exifGps?.latitude && exifGps.longitude) {
         startedAt = performance.now();
         try {
             const location = await withTimeout(geocodeWithThrottle(exifGps.latitude, exifGps.longitude), CLIENT_BROWSER_STEP_BUDGET_MS);
@@ -3371,6 +3402,10 @@ export const runBrowserProcessing = async (
     }
 
     startedAt = performance.now();
+    if (wantsStep('face')) {
+    // Not re-indented (see 'preview' gate above for the pattern) -- this whole
+    // block is unchanged, just wrapped so kickOffThumbnailForFile's
+    // thumbnail-only pass never spins up face detection/embedding.
     try {
         const faceSource = visionSource.imageSource;
         if (!faceSource) {
@@ -3654,6 +3689,7 @@ export const runBrowserProcessing = async (
             ...sourceFields,
         }));
     }
+    }
 
     const modelReportFields = makeModelReportFields(browserAiModelState);
     const modelSkipReason: ClientProcessingReason = browserAiModelState?.status === 'unavailable' || browserAiModelState?.status === 'unsupported'
@@ -3669,7 +3705,14 @@ export const runBrowserProcessing = async (
                 ? null
                 : modelSkipReason
     );
-    if (!aiSkipReason && aiVisionSource && hasUsableAiVisionSource && browserAiReady) {
+    if (!wantsStep('ai_vision')) {
+        // Not requested this pass -- see the 'preview' gate above. This is the
+        // other big win for kickOffThumbnailForFile: skips the CLIP model
+        // (observed 25-40s+ one-time acquisition cost) just to discard the
+        // result. aiVisionEvaluated stays false, so the existing 'skipped'
+        // report below still fires (truthfully -- it wasn't run) and gets
+        // filtered out by the caller before submission either way.
+    } else if (!aiSkipReason && aiVisionSource && hasUsableAiVisionSource && browserAiReady) {
         const aiStartedAt = performance.now();
         aiVisionEvaluated = true;
         try {

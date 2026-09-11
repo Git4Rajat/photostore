@@ -2061,6 +2061,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             thumbnailRotationDegrees: itemRotation,
                             convertedPreview,
                             aiWorkerHandle,
+                            requestedSteps: effectiveSteps,
                         },
                     );
                     const filteredResult = filterBrowserProcessingResult(result, effectiveSteps);
@@ -2097,6 +2098,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         clientAssetId: `browser-${filename}`,
                         uploadId: `browser-${filename}`,
                         thumbnailAlreadyUploaded,
+                        // null (no explicit action filter -- the common automatic-pull
+                        // case) means this pass covered every step, matching the
+                        // backend's default full-sweep assumption when claimedSteps is
+                        // omitted; a narrower Tools-page action (e.g. "retry OCR only")
+                        // sends its exact scope so other steps aren't touched.
+                        ...(effectiveSteps ? { claimedSteps: Array.from(effectiveSteps) } : {}),
                     });
                     leaseReleasedByReport = true;
                     reportBrowserProcessingOutcome(true);
@@ -2850,15 +2857,27 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         // guaranteed-to-fail round trip (see
                         // freshlyUploadedFilenamesRef's comment).
                         const convertedPreview: Blob | undefined = undefined;
+                        // requestedSteps restricts this call to actually computing just
+                        // 'thumbnail' -- this claim only ever asked for 'thumbnail'
+                        // (see /upload/processing/claim above), so there is no point
+                        // running (and discarding) OCR/face/ai_vision/exif/map here;
+                        // the drain loop's own pass picks those up later for real. This
+                        // used to run the full pipeline and filter the result down to
+                        // 'thumbnail' afterward, which both wasted real inference time
+                        // (tesseract/CLIP/face models, tens of seconds combined) and
+                        // fed the bug described where the resulting thumbnail-only
+                        // report made the backend think every other step had been
+                        // checked and found nothing (see claimedSteps below).
+                        const kickoffRequestedSteps = new Set(['thumbnail']);
                         const result = await runBrowserProcessing(
                             file,
                             `browser-${filename}`,
                             processingStartedAt,
                             browserAiModelStateRef.current as Parameters<PhotoGalleryRuntime['runBrowserProcessing']>[3],
                             { clientProcessing: {}, clientProcessingReport: [] },
-                            { thumbnailRotationDegrees: 0, faceRotationDegrees: 0, convertedPreview },
+                            { thumbnailRotationDegrees: 0, faceRotationDegrees: 0, convertedPreview, requestedSteps: kickoffRequestedSteps },
                         );
-                        const filteredResult = filterBrowserProcessingResult(result, new Set(['thumbnail']));
+                        const filteredResult = filterBrowserProcessingResult(result, kickoffRequestedSteps);
                         let thumbnailAlreadyUploaded = false;
                         if (filteredResult?.clientProcessing?.thumbnail) {
                             try {
@@ -2896,6 +2915,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             clientAssetId: `browser-${filename}`,
                             uploadId: `browser-${filename}`,
                             thumbnailAlreadyUploaded,
+                            // Tells the backend this report only ever covered 'thumbnail'
+                            // -- without this it can't distinguish "we checked every
+                            // other step and found nothing" from "we only checked
+                            // thumbnail," and used to permanently mark every other step
+                            // no_data the moment this landed (see
+                            // _apply_client_report_statuses in storage_utils.py).
+                            claimedSteps: Array.from(kickoffRequestedSteps),
                         });
                         leaseReleasedByReport = true;
                     } catch (err) {

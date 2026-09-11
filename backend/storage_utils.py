@@ -1974,7 +1974,7 @@ def _status_from_client_report(item: Dict) -> Optional[str]:
     return None
 
 
-def _apply_client_report_statuses(metadata: Dict, report: List[Dict]) -> None:
+def _apply_client_report_statuses(metadata: Dict, report: List[Dict], claimed_steps: Optional[List[str]] = None) -> None:
     reported_steps = set()
     for item in report:
         step = str(item.get('step') or '').strip()
@@ -1997,7 +1997,22 @@ def _apply_client_report_statuses(metadata: Dict, report: List[Dict]) -> None:
                         continue
                 metadata[field] = status
     if reported_steps:
-        for step in BROWSER_PROCESSING_STEPS:
+        # Only steps this submission actually claimed responsibility for are
+        # eligible to be defaulted to 'no_data' here -- this cleanup exists to
+        # unstick a step whose evaluation silently vanished (e.g. an exception
+        # mid-function) during what was meant to be a full sweep, NOT to
+        # penalize a step that was never part of this call's job in the first
+        # place. Without claimed_steps (e.g. a full-sweep caller that doesn't
+        # know/care about scoping), fall back to the old "every browser step"
+        # behavior. See kickOffThumbnailForFile (AppServicesProvider.tsx),
+        # which claims and reports only 'thumbnail' -- treating every other
+        # still-'running' step as silently abandoned used to permanently lock
+        # them at 'no_data' before the real, later full pipeline pass ever got
+        # a chance to run (2026-09 stcontainerapp-dv OCR incident).
+        cleanup_candidates = claimed_steps if claimed_steps is not None else BROWSER_PROCESSING_STEPS
+        for step in cleanup_candidates:
+            if step not in BROWSER_PROCESSING_STEPS:
+                continue
             field = f'{step}_status'
             if step not in reported_steps and str(metadata.get(field) or '').strip().lower() == 'running':
                 metadata[field] = 'no_data'
@@ -2558,6 +2573,7 @@ def _apply_client_processing_results(
     client_asset_id: str,
     thumbnail_already_uploaded: bool = False,
     origin: str = 'browser',
+    claimed_steps: Optional[List[str]] = None,
 ) -> None:
     metadata_table_client = _CTX['metadata_table_client']
     payload = client_processing if isinstance(client_processing, dict) else {}
@@ -2582,7 +2598,7 @@ def _apply_client_processing_results(
             'receivedAt': _utc_now(),
             'items': report,
         })
-        _apply_client_report_statuses(metadata, report)
+        _apply_client_report_statuses(metadata, report, claimed_steps)
         if _client_report_has_retryable_ai_vision_failure(report):
             processing = _safe_json_load(metadata.get('processing_metadata'))
             previous_ai = processing.get('client_ai_vision') if isinstance(processing, dict) else None
@@ -3192,12 +3208,19 @@ def apply_client_processing_results_for_file(
     client_asset_id: str = '',
     thumbnail_already_uploaded: bool = False,
     origin: str = 'browser',
+    claimed_steps: Optional[List[str]] = None,
 ) -> Dict:
     """Validate and apply late processing results to an existing asset.
 
     `origin` identifies who computed these results ('browser' or 'ipworker')
     and is stamped into each step's provenance; it does not change which
     fields get written.
+
+    `claimed_steps`: the steps this specific call was actually responsible
+    for (e.g. a thumbnail-only kickoff pass). Steps outside that set are left
+    untouched even if this report doesn't mention them -- see
+    _apply_client_report_statuses. None means "assume a full sweep", the
+    historical behavior, for callers that don't track scoping.
     """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
@@ -3227,6 +3250,7 @@ def apply_client_processing_results_for_file(
         client_asset_id,
         thumbnail_already_uploaded=thumbnail_already_uploaded,
         origin=origin,
+        claimed_steps=claimed_steps,
     )
     refresh_metadata_entity(user_id, filename, {
         'processing_lease_owner': '',

@@ -11356,6 +11356,11 @@ def upload_client_processing_results():
     filename = _validate_media_filename(data.get('filename', ''))
     if not filename:
         return jsonify({'error': 'Invalid filename'}), 400
+    claimed_steps_raw = data.get('claimedSteps')
+    claimed_steps = (
+        [str(s).strip() for s in claimed_steps_raw if str(s).strip()]
+        if isinstance(claimed_steps_raw, list) else None
+    )
     t = time.monotonic()
     try:
         metadata = apply_client_processing_results_for_file(
@@ -11365,6 +11370,7 @@ def upload_client_processing_results():
             client_processing_report=data.get('clientProcessingReport'),
             client_asset_id=str(data.get('clientAssetId') or data.get('uploadId') or ''),
             thumbnail_already_uploaded=bool(data.get('thumbnailAlreadyUploaded')),
+            claimed_steps=claimed_steps,
         )
     except Exception as exc:
         app.logger.exception('Late browser processing update failed for %s', filename)
