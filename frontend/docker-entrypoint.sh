@@ -49,9 +49,21 @@ EOF
 # unpkg.com, and connect-src needs the data: scheme --
 # tesseract-core.wasm.js fetches its embedded wasm binary as a data: URI --
 # added alongside this).
-CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com data:"
+#
+# huggingface.co + *.hf.co: the manifest sets allowLocalModels: false for the
+# CLIP model (unlike AdaFace/YOLO, it isn't bundled under
+# /models/browser-ai/models/), so @xenova/transformers fetches it live from
+# HF's default remoteHost (huggingface.co) every time the Tools page's image
+# tagging/search warms up. Without both origins here that fetch is
+# CSP-blocked outright (confirmed via a live browser console capture). The
+# small JSON config/tokenizer files redirect same-origin
+# (huggingface.co/api/resolve-cache/...), but the large .onnx weight file
+# redirects off to HF's CDN on a *.hf.co subdomain (e.g. us.aws.cdn.hf.co) --
+# confirmed via `curl -I .../resolve/main/model_quantized.onnx` -- hence the
+# wildcard rather than just huggingface.co.
+CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
 if [ -n "$API_BASE_URL" ]; then
-  CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com data:"
+  CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
 fi
 
 cat > /etc/nginx/csp.conf <<EOF
