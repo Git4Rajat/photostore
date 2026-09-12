@@ -4454,7 +4454,13 @@ html[data-theme='light'] .notification-item.unread {
   position: relative;
   margin: 0 auto;
   width: min(100%, 1240px);
-  min-height: calc(100vh - 220px);
+  /* Fixed (not min-) height: the stage row below is `minmax(0, 1fr)`, so
+     with a definite container height it always resolves to the same size
+     regardless of the active photo's aspect ratio. Without this, an
+     auto-height grid container's 1fr row is sized from each image's
+     intrinsic aspect ratio, making the whole panel visibly grow/shrink as
+     you navigate between portrait and landscape photos. */
+  height: calc(100vh - 220px);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto auto;
   box-sizing: border-box;
@@ -6648,7 +6654,7 @@ video.photo-preview-media.is-loading {
 
   .photo-preview-panel {
     width: calc(100% - 4px);
-    min-height: calc(100vh - 180px);
+    height: calc(100vh - 180px);
     padding: 14px;
     border-radius: var(--r-lg);
   }
