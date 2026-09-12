@@ -489,6 +489,13 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
         }
 
     faces: List[Dict] = []
+    # Mirrors PhotoGallery.tsx's candidateFaceCount/filteredFaceCount/filteredReason
+    # shape (storage_utils.py already passes these through to processing_metadata.
+    # client_face) so a YOLO-detected-but-embedding-never-stored face is diagnosable
+    # from stored data instead of a guess -- previously neither continue below
+    # recorded anything, matching the exact gap the 2026-08-01 face_reject_diagnostic
+    # comment above describes for the browser-reported path.
+    filtered_reasons: List[str] = []
     for detection in detections:
         bbox = {k: detection[k] for k in ('left', 'top', 'width', 'height')}
         try:
@@ -497,10 +504,12 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
             landmarks = None
         crop_result = crop_and_align_face(image_bgr, bbox, landmarks)
         if crop_result is None:
+            filtered_reasons.append('landmark_detection_failed' if landmarks is None else 'alignment_transform_rejected')
             continue
         aligned, alignment_method = crop_result
         embedding = compute_face_embedding(aligned)
         if embedding is None:
+            filtered_reasons.append('embedding_computation_failed')
             continue
         faces.append({
             'bbox': bbox,
@@ -530,5 +539,10 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
         'modelAvailability': 'available',
     }
     if not faces:
-        return {'hasData': False, 'faces': [], 'rawFaceCount': len(detections), **model_fields}
+        result = {'hasData': False, 'faces': [], 'rawFaceCount': len(detections), **model_fields}
+        if filtered_reasons:
+            result['candidateFaceCount'] = len(detections)
+            result['filteredFaceCount'] = len(filtered_reasons)
+            result['filteredReason'] = filtered_reasons[0]
+        return result
     return {'hasData': True, 'faces': faces, 'rawFaceCount': len(detections), **model_fields}
