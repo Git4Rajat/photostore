@@ -6651,9 +6651,13 @@ def _find_public_album_by_token(token: str) -> Optional[Dict]:
 
 
 def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = None) -> Dict[str, str]:
-    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    preview_required = ext in BROWSER_UNVIEWABLE_EXTENSIONS
-    preview_url = f'/public/photos/{token}/preview/{filename}' if preview_required else ''
+    # The shrunk preview is the default lightbox image for every non-video photo now
+    # (see getMainMediaPath in PhotoViewer.tsx), not just RAW/HEIC/JXL. previewUrl must
+    # therefore be populated here for every image, or the frontend falls back to its
+    # hardcoded `/api/photos/preview/...` path -- an authenticated route anonymous
+    # album visitors can't reach, which 404s and silently downgrades the lightbox to
+    # the low-res thumbnail instead.
+    preview_url = f'/public/photos/{token}/preview/{filename}' if not is_video_file(filename) else ''
     # Direct SAS URLs point at storage, so they must name the physical blob (the
     # anonymous UUID for anonymized photos). The proxy fallbacks keep the original
     # filename since the public routes resolve the anonymous id internally.
