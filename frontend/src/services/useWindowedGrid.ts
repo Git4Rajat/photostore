@@ -252,9 +252,18 @@ export function useWindowedGrid<T>({
     return {
         containerRef,
         innerRef,
-        spacerStyle: enabled ? { position: 'relative', height: slice.totalHeightPx } : {},
+        // overflow-anchor: none opts both elements out of the browser's CSS
+        // scroll anchoring, which otherwise tries to compensate for the
+        // hand-rolled windowing below it (tiles mounting/unmounting as the
+        // window slides) by nudging scrollY on its own -- a correction that
+        // fights with, and can undo, the translateY-based positioning this
+        // hook already does itself. Without it, scrolling can silently snap
+        // back toward the top with no error, since the browser's anchor
+        // heuristics aren't designed for absolutely-positioned virtualized
+        // content.
+        spacerStyle: enabled ? { position: 'relative', height: slice.totalHeightPx, overflowAnchor: 'none' } : {},
         innerStyle: enabled
-            ? { position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${slice.offsetPx}px)` }
+            ? { position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${slice.offsetPx}px)`, overflowAnchor: 'none' }
             : {},
         visibleItems,
         startIndex,
