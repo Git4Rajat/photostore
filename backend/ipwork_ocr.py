@@ -34,6 +34,7 @@ down the whole ipworker replica's process, not just this one OCR call.
 """
 from __future__ import annotations
 
+import glob
 import io
 import os
 import threading
@@ -47,6 +48,26 @@ from optional_deps import try_import
 tesserocr = try_import('tesserocr')
 
 MAX_OCR_TEXT_LENGTH = 2048
+
+# tesserocr has no compiled-in default and falls back to a relative './' when
+# neither an explicit path nor TESSDATA_PREFIX is set -- which silently fails
+# PyTessBaseAPI() init in this container (apt's tesseract-ocr installs to
+# /usr/share/tesseract-ocr/<major>/tessdata, not cwd), turning every single
+# OCR call into the same 'no_data' result as a genuinely blank image. Resolved
+# once at import time via glob (rather than hardcoding the major version)
+# so an apt tesseract upgrade doesn't silently reintroduce this.
+def _resolve_tessdata_path() -> Optional[str]:
+    override = os.getenv('TESSDATA_PREFIX', '').strip()
+    if override:
+        return override
+    for pattern in ('/usr/share/tesseract-ocr/*/tessdata', '/usr/share/tessdata'):
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            return matches[-1]
+    return None
+
+
+_TESSDATA_PATH = _resolve_tessdata_path()
 # Tesseract's own confidence scale is 0-100 (or -1 for non-text lines). This
 # only drops individual low-confidence words -- not a recall-affecting PSM/OEM
 # change like the ones already evaluated and rejected in
@@ -63,7 +84,7 @@ _thread_local = threading.local()
 def _get_api():
     api = getattr(_thread_local, 'api', None)
     if api is None:
-        api = tesserocr.PyTessBaseAPI()
+        api = tesserocr.PyTessBaseAPI(path=_TESSDATA_PATH) if _TESSDATA_PATH else tesserocr.PyTessBaseAPI()
         _thread_local.api = api
     return api
 
@@ -102,6 +123,11 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
             image = ImageOps.exif_transpose(image)
             api = _get_api()
             api.SetImage(image.convert('RGB'))
+            # MapWordConfidences() reads back the last Recognize() pass rather
+            # than running one itself (unlike GetUTF8Text(), which recognizes
+            # on demand) -- without this explicit call it silently returns an
+            # empty list on every image, indistinguishable from "no text found".
+            api.Recognize()
             word_confidences = api.MapWordConfidences()
     except Exception as exc:
         return {'hasData': False, 'error': str(exc)}

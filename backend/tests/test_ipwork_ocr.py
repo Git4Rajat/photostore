@@ -68,12 +68,16 @@ def test_process_ocr_passes_decoded_bytes_to_tesseract(monkeypatch):
         def SetImage(self, image):
             received['size'] = image.size
 
+        def Recognize(self):
+            received['recognized'] = True
+
         def MapWordConfidences(self):
+            assert received.get('recognized'), 'MapWordConfidences called before Recognize()'
             return [('TPLINE', 92.0)]
 
     class FakeTesserocr:
         @staticmethod
-        def PyTessBaseAPI():
+        def PyTessBaseAPI(path=None):
             return FakeApi()
 
     monkeypatch.setattr(ipwork_ocr, 'tesserocr', FakeTesserocr())
@@ -93,12 +97,15 @@ def test_process_ocr_drops_low_confidence_words(monkeypatch):
         def SetImage(self, image):
             pass
 
+        def Recognize(self):
+            pass
+
         def MapWordConfidences(self):
             return [('REAL', 95.0), ('noise', 12.0), ('WORD', 41.0), ('junk', -1.0)]
 
     class FakeTesserocr:
         @staticmethod
-        def PyTessBaseAPI():
+        def PyTessBaseAPI(path=None):
             return FakeApi()
 
     monkeypatch.setattr(ipwork_ocr, 'tesserocr', FakeTesserocr())
@@ -117,12 +124,15 @@ def test_process_ocr_reports_no_data_when_all_words_low_confidence(monkeypatch):
         def SetImage(self, image):
             pass
 
+        def Recognize(self):
+            pass
+
         def MapWordConfidences(self):
             return [('noise', 10.0), ('junk', -1.0)]
 
     class FakeTesserocr:
         @staticmethod
-        def PyTessBaseAPI():
+        def PyTessBaseAPI(path=None):
             return FakeApi()
 
     monkeypatch.setattr(ipwork_ocr, 'tesserocr', FakeTesserocr())
@@ -131,6 +141,65 @@ def test_process_ocr_reports_no_data_when_all_words_low_confidence(monkeypatch):
     result = ipwork_ocr.process_ocr('owner', 'photo.jpg', jpeg_bytes)
 
     assert result == {'hasData': False}
+
+
+def test_process_ocr_calls_recognize_before_reading_confidences(monkeypatch):
+    """The real regression: tesserocr's MapWordConfidences() reads back the
+    last Recognize() pass rather than running one itself (unlike
+    GetUTF8Text(), which recognizes on demand) -- calling it without an
+    explicit Recognize() first silently returns [] on every real image,
+    indistinguishable from a genuine empty-OCR result. Confirmed live: every
+    ipworker OCR call since the 2026-08-28 tesserocr migration returned
+    'no_data' regardless of actual image content."""
+    jpeg_bytes = _make_jpeg_bytes()
+    monkeypatch.setattr(ipwork_ocr, 'extract_raw_preview_bytes', lambda image_bytes, filename: jpeg_bytes)
+
+    calls = []
+
+    class FakeApi:
+        def SetImage(self, image):
+            calls.append('SetImage')
+
+        def Recognize(self):
+            calls.append('Recognize')
+
+        def MapWordConfidences(self):
+            calls.append('MapWordConfidences')
+            return [('REAL', 95.0)]
+
+    class FakeTesserocr:
+        @staticmethod
+        def PyTessBaseAPI(path=None):
+            return FakeApi()
+
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', FakeTesserocr())
+    monkeypatch.setattr(ipwork_ocr, '_thread_local', __import__('threading').local())
+
+    ipwork_ocr.process_ocr('owner', 'photo.jpg', jpeg_bytes)
+
+    assert calls == ['SetImage', 'Recognize', 'MapWordConfidences']
+
+
+def test_resolve_tessdata_path_prefers_env_override(monkeypatch):
+    monkeypatch.setenv('TESSDATA_PREFIX', '/custom/tessdata')
+    assert ipwork_ocr._resolve_tessdata_path() == '/custom/tessdata'
+
+
+def test_resolve_tessdata_path_falls_back_to_glob(monkeypatch, tmp_path):
+    monkeypatch.delenv('TESSDATA_PREFIX', raising=False)
+    fake_tessdata = tmp_path / 'usr' / 'share' / 'tesseract-ocr' / '5' / 'tessdata'
+    fake_tessdata.mkdir(parents=True)
+    monkeypatch.setattr(
+        ipwork_ocr.glob, 'glob',
+        lambda pattern: [str(fake_tessdata)] if 'tesseract-ocr' in pattern else [],
+    )
+    assert ipwork_ocr._resolve_tessdata_path() == str(fake_tessdata)
+
+
+def test_resolve_tessdata_path_returns_none_when_nothing_found(monkeypatch):
+    monkeypatch.delenv('TESSDATA_PREFIX', raising=False)
+    monkeypatch.setattr(ipwork_ocr.glob, 'glob', lambda pattern: [])
+    assert ipwork_ocr._resolve_tessdata_path() is None
 
 
 def test_process_ocr_on_raw_bytes_without_fallback_would_fail():
