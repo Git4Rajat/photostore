@@ -225,6 +225,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
     const [rotationSaving, setRotationSaving] = useState(false);
     const [rotationError, setRotationError] = useState<string | null>(null);
     const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+    const [stagePadding, setStagePadding] = useState({ left: 0, top: 0 });
     const [resolvedUrls, setResolvedUrls] = useState<Record<string, string>>({});
     const [playbackRate, setPlaybackRate] = useState(1);
     const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -259,8 +260,32 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
     // quarter-turn we swap the element's width and height to the stage's content box, so
     // that once it's rotated 90° the contained image maps back onto the full stage instead
     // of overflowing. stageSize is the stage content box (padding excluded).
+    //
+    // The swapped box is deliberately larger than the stage in one axis (e.g. a landscape
+    // stage swapped to width=stage-height/height=stage-width is much taller than the stage).
+    // .photo-preview-stage is a grid with place-items:center, but that only centers an item
+    // within its track -- when the item's own size forces the track bigger than the (now
+    // fixed-height, see .photo-preview-panel) container, the grid pins the overflowing track
+    // to the start edge instead of centering it, so the rotated photo visibly sinks toward
+    // the bottom. Taking the element out of grid flow (position: absolute) and placing it
+    // with explicit pixel coordinates sidesteps that grid-overflow behavior entirely --
+    // rotate/scale still pivot around the box's own center (the CSS default transform-origin),
+    // which now sits exactly on the stage's true center regardless of how oversized the
+    // pre-rotation box is.
     const rotationFitStyle = isQuarterTurn && stageSize.width > 0 && stageSize.height > 0
-        ? { width: `${stageSize.height}px`, height: `${stageSize.width}px` }
+        ? {
+            position: 'absolute' as const,
+            width: `${stageSize.height}px`,
+            height: `${stageSize.width}px`,
+            left: `${stagePadding.left + (stageSize.width - stageSize.height) / 2}px`,
+            top: `${stagePadding.top + (stageSize.height - stageSize.width) / 2}px`,
+            // The mobile breakpoint caps .photo-preview-media at max-width/max-height:
+            // 100% (of this now-absolutely-positioned element's containing block, i.e.
+            // the stage) -- which would silently clamp the deliberately oversized
+            // pre-rotation box back down and reintroduce the off-center rotation bug.
+            maxWidth: 'none' as const,
+            maxHeight: 'none' as const,
+        }
         : undefined;
     const imageUrl = activePhoto && (fullResUrl || mainMediaPath)
         // fullResUrl is an already-fetched local object URL (see
@@ -832,12 +857,15 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
             // actually fills via width/height: 100%, and so quarter-turn swapping lands the
             // rotated image on the same region rather than under the nav arrows.
             const styles = window.getComputedStyle(stage);
-            const padX = parseFloat(styles.paddingLeft) + parseFloat(styles.paddingRight);
-            const padY = parseFloat(styles.paddingTop) + parseFloat(styles.paddingBottom);
+            const paddingLeft = parseFloat(styles.paddingLeft);
+            const paddingTop = parseFloat(styles.paddingTop);
+            const padX = paddingLeft + parseFloat(styles.paddingRight);
+            const padY = paddingTop + parseFloat(styles.paddingBottom);
             setStageSize({
                 width: Math.max(0, stage.clientWidth - padX),
                 height: Math.max(0, stage.clientHeight - padY),
             });
+            setStagePadding({ left: paddingLeft, top: paddingTop });
         };
         updateStageSize();
 
