@@ -38,5 +38,6 @@ def process_geo(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
         'longitude': lon,
         'address': place.get('address', ''),
         'city': place.get('city', ''),
+        'region': place.get('region', ''),
         'country': place.get('country', ''),
     }

@@ -92,6 +92,9 @@ from storage_utils import (
     get_user_lexical_index,
     invalidate_user_lexical_index_cache,
     delete_user_lexical_index_data,
+    get_user_tag_embedding_index,
+    delete_user_tag_embedding_index_data,
+    nearest_tags_for_word,
     vector_search_candidates,
     reserve_pending_anonymous_blob,
     read_pending_anonymous_blob,
@@ -2169,7 +2172,7 @@ def _matched_query_people_groups(query_text: str, name_to_ids: Dict[str, List[st
 def _known_location_terms(rows: List[Dict]) -> List[str]:
     terms = []
     for row in rows:
-        for field in ('locationCity', 'locationCountry', 'address'):
+        for field in ('locationCity', 'locationRegion', 'locationCountry', 'address'):
             term = _normalize_search_phrase(str(row.get(field) or ''))
             for part in term.split(' '):
                 if len(part) >= 3 and part not in terms:
@@ -2190,6 +2193,7 @@ def _metadata_matches_locations(metadata: Dict, location_terms: List[str]) -> bo
     location_text = _normalize_search_phrase(' '.join([
         str(metadata.get('address', '')),
         str(metadata.get('locationCity', '')),
+        str(metadata.get('locationRegion', '')),
         str(metadata.get('locationCountry', '')),
     ]))
     return any(term in location_text for term in location_terms)
@@ -7602,6 +7606,7 @@ def _execute_library_clean(library_id: str) -> Dict:
     _delete_cover_blobs_for_library(library_id)
     delete_user_vector_index_data(library_id)
     delete_user_lexical_index_data(library_id)
+    delete_user_tag_embedding_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
     return {'photosDeleted': len(metadata_rows), 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}
@@ -11813,6 +11818,40 @@ def _sweep_stale_processing_into_ipwork() -> Dict[str, int]:
     return stats
 
 
+def _sweep_tag_embedding_indexes() -> Dict[str, int]:
+    """Rebuild any library's tag-embedding index (see storage_utils.py's
+    "Per-user tag-embedding index" section) that a tag-affecting write has
+    marked dirty since the last rebuild. Only meaningful here: this loop only
+    runs inside run_ipworker(), the one role that actually has real CLIP
+    loaded (see docs/ipworker-architecture.md) -- the plain backend role that
+    serves /photos/search deliberately never triggers this rebuild inline
+    (get_user_tag_embedding_index(..., allow_refresh=False) there), the same
+    reason its lexical/vector-index siblings avoid an expensive synchronous
+    rebuild during an interactive request."""
+    stats = {'librariesChecked': 0, 'indexesAvailable': 0}
+    if library_store is None or not vision_utils.image_encoder_available():
+        return stats
+    try:
+        library_ids = library_store.list_all_library_ids()
+    except Exception:
+        worker_logger.exception('tag-embedding sweep: failed to list libraries')
+        return stats
+
+    for library_id in library_ids:
+        stats['librariesChecked'] += 1
+        try:
+            # Only actually re-embeds when the manifest is dirty or missing --
+            # otherwise this is one cheap manifest blob read per library, same
+            # cost shape as get_user_lexical_index's own lazy-rebuild check.
+            index = get_user_tag_embedding_index(library_id, allow_refresh=True)
+        except Exception:
+            worker_logger.exception('tag-embedding sweep: rebuild failed for library %s', library_id)
+            continue
+        if index is not None:
+            stats['indexesAvailable'] += 1
+    return stats
+
+
 def _ipwork_sweep_loop() -> None:
     """Runs for the lifetime of the ipworker process on its own daemon
     thread, independent of the queue-polling loop in run_ipworker, so a
@@ -11832,6 +11871,12 @@ def _ipwork_sweep_loop() -> None:
                     worker_logger.info(
                         'ipwork sweep: released %d stale photo(s), %d step(s), across %d librar(y/ies)',
                         stats['photosQueued'], stats['stepsQueued'], stats['libraries'],
+                    )
+                tag_embedding_stats = _sweep_tag_embedding_indexes()
+                if tag_embedding_stats['librariesChecked']:
+                    worker_logger.info(
+                        'tag-embedding sweep: %d/%d librar(y/ies) have a usable index',
+                        tag_embedding_stats['indexesAvailable'], tag_embedding_stats['librariesChecked'],
                     )
         except Exception:
             worker_logger.exception('ipwork sweep iteration failed')
@@ -12553,6 +12598,171 @@ def performance_throughput():
     return jsonify(_get_throughput_metrics())
 
 
+def _row_passes_search_filters(
+    row: Dict,
+    capture_start: Optional[datetime],
+    capture_end: Optional[datetime],
+    matched_person_groups: List[List[str]],
+    matched_location_terms: List[str],
+) -> bool:
+    """Hard exclusion checks -- a row failing any of these can never appear
+    in results no matter how well it scores, so these must run before (and
+    independently of) any lexical/semantic scoring. Kept as its own tier
+    (mirroring Apple's Core Spotlight "filtered results" concept -- exact
+    metadata matching, separate from semantic ranking) so a future filter
+    added here can't accidentally end up gating a scoring signal the way
+    two real bugs already did in this function's history: a zero lexical
+    score used to veto semantic scoring outright, and a stray location
+    filler-word ("the"/"a") used to veto an otherwise-perfect match."""
+    if capture_start or capture_end:
+        if not _capture_in_range(row, capture_start, capture_end):
+            return False
+    if matched_person_groups:
+        try:
+            people_ids = set(str(pid) for pid in json.loads(row.get('peopleIds', '[]') or '[]'))
+        except Exception:
+            people_ids = set()
+        # Every distinct queried person must appear (at least one id from
+        # each group) -- "alice and bob" means both, not either.
+        if not all(any(pid in people_ids for pid in group) for group in matched_person_groups):
+            return False
+    if not _metadata_matches_locations(row, matched_location_terms):
+        return False
+    return True
+
+
+def _score_search_row(
+    tokens: Dict[str, List[str]],
+    filename: str,
+    row: Dict,
+    exif_data: Dict[str, str],
+    *,
+    query_embedding: List[float],
+    vector_scores: Dict[str, float],
+    current_embedding_version: str,
+    semantic_threshold: float,
+    matched_person_groups: List[List[str]],
+    matched_location_terms: List[str],
+) -> Tuple[float, float, str]:
+    """Pure scoring tier: always computes both the lexical and semantic
+    signals in full for a row that already passed _row_passes_search_filters,
+    then blends them into one combined score. Deliberately has no early
+    return/continue of its own -- a row's lexical score being zero (e.g. a
+    query word that isn't literally one of its tags) must never prevent its
+    semantic score from being computed and considered, and vice versa.
+    Returns (combined_score, lexical_score, semantic_text) -- lexical_score
+    and semantic_text are returned alongside the combined score because two
+    downstream callers (the exact-modifier-match check and the vector-index
+    fallback path) need them independently of the blended total."""
+    semantic_text = build_semantic_text(filename, row)
+    lexical_score = lexical_search_score(tokens, filename, row, exif_data)
+
+    semantic_score = 0.0
+    if query_embedding:
+        # Blend semantic similarity into every candidate's score, not just as a
+        # fallback when lexical matching finds nothing -- otherwise embeddings
+        # (image or text) never influence ranking for queries that also happen
+        # to hit a tag/filename keyword.
+        semantic_score = vector_scores.get(filename, 0.0)
+        if semantic_score <= 0 and not vector_scores:
+            row_embedding, semantic_text = _semantic_embedding_for_row(
+                filename,
+                row,
+                current_embedding_version,
+                allow_compute=SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS,
+            )
+            semantic_score = cosine_similarity(query_embedding, row_embedding)
+
+    score = lexical_score
+    if semantic_score >= semantic_threshold:
+        score += semantic_score * 10.0
+    if matched_person_groups:
+        # Reward matching more of the named people more, so "alice and bob"
+        # ranks a photo with both above one that merely passed the AND gate.
+        score += 8.0 * len(matched_person_groups)
+    if matched_location_terms:
+        score += 5.0
+    return score, lexical_score, semantic_text
+
+
+def _search_row_belongs_in_fallback_bucket(
+    score: float,
+    lexical_score: float,
+    semantic_text: str,
+    tokens: Dict[str, List[str]],
+    filename: str,
+    row: Dict,
+    *,
+    has_context_intent: bool,
+) -> bool:
+    """Ranking/bucketing tier: decides whether an already-scored, already-
+    positive-score row belongs in the primary results or the "no exact
+    <modifier> <object> found" fallback bucket (only relevant for
+    modifier+object queries like "red car"). Separated from scoring itself
+    so a bucketing rule can never be mistaken for (or accidentally turned
+    into) an exclusion rule -- every row reaching this tier has already
+    unconditionally cleared both the filter and scoring tiers above."""
+    if not has_context_intent:
+        return False
+    if tokens.get('modifiers'):
+        searchable_text = ' '.join([
+            filename,
+            row.get('caption', ''),
+            semantic_text,
+            row.get('ocrText', ''),
+            ' '.join(parse_json_list(row.get('objects', '[]'))),
+            ' '.join(parse_json_list(row.get('peopleNames', '[]'))),
+            row.get('address', ''),
+            row.get('locationCity', ''),
+            row.get('locationRegion', ''),
+            row.get('locationCountry', ''),
+        ]).lower()
+        exact_modifier_match = any(
+            modifier and (
+                modifier in searchable_text
+                or modifier in ' '.join(parse_tags(row.get('tags', '[]'))).lower()
+            )
+            for modifier in tokens.get('modifiers', [])
+        )
+        if not exact_modifier_match:
+            return True
+    return lexical_score < 12.0
+
+
+TAG_EMBEDDING_EXPANSION_MIN_SIMILARITY = float(os.getenv('TAG_EMBEDDING_EXPANSION_MIN_SIMILARITY', '0.75'))
+
+
+def _expand_tokens_with_tag_embeddings(tokens: Dict[str, List[str]], user_id: str) -> None:
+    """Mutates tokens['expanded'] in place with real tags from this user's own
+    library that are semantically close (via CLIP embeddings) to any query
+    word that isn't already one of those tags -- e.g. "puppy" expands to
+    "dog" if that's what the library's photos are actually tagged with. Reads
+    two precomputed caches only (a static common-word vocabulary table and
+    this user's ipworker-built tag-embedding index); never runs live model
+    inference, so it's safe to call from the backend role, which never loads
+    real CLIP (see docs/ipworker-architecture.md and storage_utils.py's
+    "Per-user tag-embedding index" section for the full design)."""
+    all_tokens = tokens.get('all') or []
+    if not all_tokens:
+        return
+    tag_index = get_user_tag_embedding_index(user_id, allow_refresh=False)
+    if not tag_index or not tag_index.get('tags'):
+        return
+    known_tags = set(tag_index['tags'])
+    expanded = tokens.setdefault('expanded', [])
+    seen = set(all_tokens) | set(expanded)
+    for token in all_tokens:
+        if token in known_tags:
+            continue  # already an exact match, no expansion needed
+        word_embedding = vision_utils.common_word_embedding(token)
+        if not word_embedding:
+            continue  # outside the fixed static vocabulary -- no expansion, not an error
+        for tag in nearest_tags_for_word(word_embedding, tag_index, top_k=3, min_similarity=TAG_EMBEDDING_EXPANSION_MIN_SIMILARITY):
+            if tag not in seen:
+                expanded.append(tag)
+                seen.add(tag)
+
+
 @app.route('/photos/search', methods=['GET'])
 @app.route('/photos/search/', methods=['GET'])
 @app.route('/api/photos/search', methods=['GET'])
@@ -12593,6 +12803,7 @@ def search_photos():
     matched_person_groups = _matched_query_people_groups(query, name_to_ids)
     matched_location_terms = _matched_query_locations(query, rows)
     tokens = parse_search_query(query)
+    _expand_tokens_with_tag_embeddings(tokens, user_id)
     query_embedding = vision_utils.encode_text_embedding(build_expanded_query_text(query, tokens))
     current_embedding_version = vision_utils.get_text_embedding_version()
     vector_scores: Dict[str, float] = {}
@@ -12610,77 +12821,33 @@ def search_photos():
         if not filename:
             continue
         row = _metadata_with_people_names(row, pid_to_name)
-        if capture_start or capture_end:
-            if not _capture_in_range(row, capture_start, capture_end):
-                continue
-        if matched_person_groups:
-            try:
-                people_ids = set(str(pid) for pid in json.loads(row.get('peopleIds', '[]') or '[]'))
-            except Exception:
-                people_ids = set()
-            # Every distinct queried person must appear (at least one id from
-            # each group) -- "alice and bob" means both, not either.
-            if not all(any(pid in people_ids for pid in group) for group in matched_person_groups):
-                continue
-        if not _metadata_matches_locations(row, matched_location_terms):
+
+        # Tier 1: hard filters. A row failing any of these is excluded
+        # unconditionally, before scoring ever runs.
+        if not _row_passes_search_filters(row, capture_start, capture_end, matched_person_groups, matched_location_terms):
             continue
 
+        # Tier 2: scoring. Always computes both lexical and semantic signals
+        # in full -- neither can veto the other.
         exif_data = parse_exif_data(row.get('exifData', '{}'))
-        semantic_text = build_semantic_text(filename, row)
-        lexical_score = lexical_search_score(tokens, filename, row, exif_data)
-        if has_context_intent and lexical_score <= 0:
-            continue
-        semantic_score = 0.0
-        if query_embedding:
-            # Blend semantic similarity into every candidate's score, not just as a
-            # fallback when lexical matching finds nothing -- otherwise embeddings
-            # (image or text) never influence ranking for queries that also happen
-            # to hit a tag/filename keyword.
-            semantic_score = vector_scores.get(filename, 0.0)
-            if semantic_score <= 0 and not vector_scores:
-                row_embedding, semantic_text = _semantic_embedding_for_row(
-                    filename,
-                    row,
-                    current_embedding_version,
-                    allow_compute=SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS,
-                )
-                semantic_score = cosine_similarity(query_embedding, row_embedding)
-
-        score = lexical_score
-        if semantic_score >= semantic_threshold:
-            score += semantic_score * 10.0
-        if matched_person_groups:
-            # Reward matching more of the named people more, so "alice and bob"
-            # ranks a photo with both above one that merely passed the AND gate.
-            score += 8.0 * len(matched_person_groups)
-        if matched_location_terms:
-            score += 5.0
-
+        score, lexical_score, semantic_text = _score_search_row(
+            tokens, filename, row, exif_data,
+            query_embedding=query_embedding,
+            vector_scores=vector_scores,
+            current_embedding_version=current_embedding_version,
+            semantic_threshold=semantic_threshold,
+            matched_person_groups=matched_person_groups,
+            matched_location_terms=matched_location_terms,
+        )
         if score <= 0:
             continue
-        if has_context_intent and tokens.get('modifiers'):
-            searchable_text = ' '.join([
-                filename,
-                row.get('caption', ''),
-                semantic_text,
-                row.get('ocrText', ''),
-                ' '.join(parse_json_list(row.get('objects', '[]'))),
-                ' '.join(parse_json_list(row.get('peopleNames', '[]'))),
-                row.get('address', ''),
-                row.get('locationCity', ''),
-                row.get('locationCountry', ''),
-            ]).lower()
-            exact_modifier_match = any(
-                modifier and (
-                    modifier in searchable_text
-                    or modifier in ' '.join(parse_tags(row.get('tags', '[]'))).lower()
-                )
-                for modifier in tokens.get('modifiers', [])
-            )
-            if not exact_modifier_match:
-                fallback_scored.append((score, filename, row))
-                continue
-        if has_context_intent and lexical_score < 12.0:
+
+        # Tier 3: bucketing/ranking. Every row reaching here already has a
+        # positive combined score; this only decides primary vs. fallback.
+        if _search_row_belongs_in_fallback_bucket(
+            score, lexical_score, semantic_text, tokens, filename, row,
+            has_context_intent=has_context_intent,
+        ):
             fallback_scored.append((score, filename, row))
         else:
             scored.append((score, filename, row))

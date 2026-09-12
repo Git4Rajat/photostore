@@ -1475,6 +1475,7 @@ const geocodeWithThrottle = async (latitude: string, longitude: string): Promise
     return {
         address: data.address || '',
         city: data.city || '',
+        region: data.region || '',
         country: data.country || '',
         latitude,
         longitude,
@@ -3373,6 +3374,7 @@ export const runBrowserProcessing = async (
                 longitude: exifGps.longitude,
                 address: location?.address || '',
                 city: location?.city || '',
+                region: location?.region || '',
                 country: location?.country || '',
                 source: 'browser',
                 ...sourceFields,

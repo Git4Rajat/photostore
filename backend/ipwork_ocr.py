@@ -35,6 +35,7 @@ down the whole ipworker replica's process, not just this one OCR call.
 from __future__ import annotations
 
 import io
+import os
 import threading
 from typing import Dict, Optional
 
@@ -46,6 +47,15 @@ from optional_deps import try_import
 tesserocr = try_import('tesserocr')
 
 MAX_OCR_TEXT_LENGTH = 2048
+# Tesseract's own confidence scale is 0-100 (or -1 for non-text lines). This
+# only drops individual low-confidence words -- not a recall-affecting PSM/OEM
+# change like the ones already evaluated and rejected in
+# docs/ipworker-architecture.md -- so it can only improve precision of what's
+# already recognized, never find text PSM 3 would otherwise miss. Exposed as
+# an env var (matching FACE_MIN_STORE_CONFIDENCE/YOLO_SCORE_THRESHOLD's
+# pattern) since the right cutoff needs real-data validation this session
+# doesn't have the corpus on hand to run.
+OCR_MIN_WORD_CONFIDENCE = float(os.getenv('OCR_MIN_WORD_CONFIDENCE', '40'))
 
 _thread_local = threading.local()
 
@@ -92,10 +102,16 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
             image = ImageOps.exif_transpose(image)
             api = _get_api()
             api.SetImage(image.convert('RGB'))
-            text = api.GetUTF8Text()
+            word_confidences = api.MapWordConfidences()
     except Exception as exc:
         return {'hasData': False, 'error': str(exc)}
-    text = (text or '').strip()
+    # MapWordConfidences() (not GetUTF8Text()) so individually low-confidence
+    # words -- texture/grain tesseract hallucinated as "text", the dominant
+    # false-positive mode documented in docs/ipworker-architecture.md's PSM
+    # sweep -- can be dropped before they ever reach ocrText/search, without
+    # touching recall for words it's actually confident about.
+    words = [word for word, confidence in (word_confidences or []) if confidence >= OCR_MIN_WORD_CONFIDENCE and word.strip()]
+    text = ' '.join(words).strip()
     if not text:
         return {'hasData': False}
     return {'hasData': True, 'text': text[:MAX_OCR_TEXT_LENGTH]}

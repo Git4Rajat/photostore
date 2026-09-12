@@ -18,10 +18,21 @@ TOKEN_CANONICAL_MAP = {
     'bikes': 'bicycle',
     'building': 'architecture',
     'buildings': 'architecture',
+    'campus': 'campus',
+    'canvas': 'canvas',
     'child': 'child',
     'children': 'child',
+    'circus': 'circus',
     'colours': 'color',
+    'focus': 'focus',
     'grey': 'gray',
+    # These already-singular nouns end in a lone "s" and would otherwise be
+    # mis-stemmed by _singularize_word's blind trailing-"s" strip (e.g.
+    # "lens" -> "len"), diverging from their correctly-reduced plural form
+    # ("lenses" -> "lens") and becoming unsearchable via either spelling.
+    'lens': 'lens',
+    'octopus': 'octopus',
+    'virus': 'virus',
     'human': 'person',
     'humans': 'person',
     'leaves': 'leaf',
@@ -129,10 +140,19 @@ SOURCE_RANK = {
     'ai_prediction': 1.0,
 }
 VISUAL_MODIFIERS = {
+    # Colors (original set)
     'black', 'blue', 'brown', 'gold', 'gray', 'green', 'grey', 'orange',
     'pink', 'purple', 'red', 'silver', 'tan', 'teal', 'white', 'yellow',
+    # Size -- "big dog", "small table"
+    'big', 'small', 'large', 'tiny', 'huge', 'little', 'tall', 'short',
+    # Age/condition -- "old car", "vintage camera"
+    'old', 'new', 'vintage', 'antique', 'young',
+    # Material -- "wooden table", "glass door" (single-word adjectives only,
+    # same shape as the color set above; a genuinely open-ended parser is a
+    # separate, larger project -- see the search-gap-analysis discussion)
+    'wooden', 'metal', 'glass', 'plastic', 'leather', 'stone',
 }
-SEARCH_STOP_WORDS = {'in', 'at', 'near', 'from', 'by', 'with', 'wearing', 'holding', 'beside', 'next', 'to', 'and'}
+SEARCH_STOP_WORDS = {'in', 'at', 'near', 'from', 'by', 'with', 'wearing', 'holding', 'beside', 'next', 'to', 'and', 'the', 'a', 'an'}
 MODIFIER_FILLER_WORDS = {'color', 'colour'}
 PREDICTION_TAG_MIN_SCORE = float(os.getenv('SEMANTIC_PREDICTION_TAG_MIN_SCORE', '0.08'))
 MAX_PREDICTION_TAGS = int(os.getenv('SEMANTIC_PREDICTION_TAG_LIMIT', '160'))
@@ -419,6 +439,7 @@ def prediction_tags(metadata: Dict) -> List[str]:
 def location_tags(metadata: Dict) -> List[str]:
     return normalize_tags([
         str(metadata.get('locationCity', '')),
+        str(metadata.get('locationRegion', '')),
         str(metadata.get('locationCountry', '')),
         str(metadata.get('address', '')),
     ])
@@ -492,12 +513,21 @@ def build_semantic_text(filename: str, metadata: Dict) -> str:
     for tag in sorted(semantic_candidates):
         text_parts.append(tag)
 
-    for field in [filename, metadata.get('caption'), metadata.get('ocrText'), metadata.get('address'), metadata.get('locationCity'), metadata.get('locationCountry')]:
+    for field in [filename, metadata.get('caption'), metadata.get('address'), metadata.get('locationCity'), metadata.get('locationRegion'), metadata.get('locationCountry')]:
         text = str(field or '').strip()
         if not text:
             continue
         for token in _normalize_token(text).split(' '):
             if token and token in semantic_candidates:
+                text_parts.append(token)
+
+    # OCR text is searchable verbatim (unlike filename/caption/etc above) since it's
+    # literal document/sign content a user would search for directly, not noise to filter
+    # against vision tags.
+    ocr_text = str(metadata.get('ocrText') or '').strip()
+    if ocr_text:
+        for token in _normalize_token(ocr_text).split(' '):
+            if token:
                 text_parts.append(token)
 
     return ' '.join(dict.fromkeys(text_parts))[:10000]
@@ -543,11 +573,11 @@ def parse_search_query(query: str) -> Dict[str, List[str]]:
 
     split = re.split(r'\b(?:in|at|near|from)\b', clean, maxsplit=1)
     if len(split) == 2:
-        subject_tokens = [token for token in split[0].split(' ') if token]
+        subject_tokens = [token for token in split[0].split(' ') if token and token not in SEARCH_STOP_WORDS]
         location_part = re.split(r'\b(?:by|with|wearing|holding|beside|next to)\b', split[1], maxsplit=1)[0]
-        location_tokens = [token for token in location_part.split(' ') if token]
+        location_tokens = [token for token in location_part.split(' ') if token and token not in SEARCH_STOP_WORDS]
     else:
-        subject_tokens = [token for token in clean.split(' ') if token]
+        subject_tokens = [token for token in clean.split(' ') if token and token not in SEARCH_STOP_WORDS]
         location_tokens = []
 
     if not subject_tokens and location_tokens:
@@ -673,6 +703,7 @@ def lexical_search_score(tokens: Dict[str, List[str]], filename: str, metadata: 
     location_text = _normalize_token(' '.join([
         str(metadata.get('address', '')),
         str(metadata.get('locationCity', '')),
+        str(metadata.get('locationRegion', '')),
         str(metadata.get('locationCountry', '')),
     ]))
     location_text_with_tags = _normalize_token(' '.join([

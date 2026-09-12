@@ -3,7 +3,7 @@ import os
 import re
 import threading
 import unicodedata
-from typing import List
+from typing import Dict, List, Optional
 
 import numpy as np
 from sklearn.feature_extraction.text import HashingVectorizer
@@ -196,6 +196,50 @@ def encode_text_embeddings_batch(texts: List[str]) -> List[List[float]]:
         return text_features.cpu().tolist()
     except Exception:
         return []
+
+
+_COMMON_WORD_EMBEDDINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'common_word_embeddings.npz')
+_COMMON_WORD_EMBEDDINGS_LOCK = threading.Lock()
+_COMMON_WORD_EMBEDDINGS_CACHE: Optional[Dict[str, object]] = None
+
+
+def _load_common_word_embeddings() -> Dict[str, object]:
+    """Static, precomputed CLIP text embeddings for a fixed common-word
+    vocabulary (see scripts/generate_common_word_embeddings.py) -- a plain
+    numpy file load, not a live model, so this works in the backend role too
+    (which never installs torch/open_clip -- see docs/ipworker-architecture.md).
+    Mirrors how Apple's on-device NLEmbedding is a shipped, precomputed word-
+    vector table rather than something re-inferred per query."""
+    global _COMMON_WORD_EMBEDDINGS_CACHE
+    if _COMMON_WORD_EMBEDDINGS_CACHE is not None:
+        return _COMMON_WORD_EMBEDDINGS_CACHE
+    with _COMMON_WORD_EMBEDDINGS_LOCK:
+        if _COMMON_WORD_EMBEDDINGS_CACHE is not None:
+            return _COMMON_WORD_EMBEDDINGS_CACHE
+        try:
+            data = np.load(_COMMON_WORD_EMBEDDINGS_PATH)
+            words = [str(w) for w in data['words']]
+            embeddings = np.asarray(data['embeddings'], dtype=np.float32)
+        except Exception:
+            words, embeddings = [], np.zeros((0, 0), dtype=np.float32)
+        _COMMON_WORD_EMBEDDINGS_CACHE = {
+            'words': words,
+            'embeddings': embeddings,
+            'index': {word: i for i, word in enumerate(words)},
+        }
+        return _COMMON_WORD_EMBEDDINGS_CACHE
+
+
+def common_word_embedding(word: str) -> List[float]:
+    """Embedding for `word` from the fixed vocabulary above, or [] if it's
+    outside that vocabulary -- a query word with no entry simply gets no
+    semantic expansion (graceful degradation), rather than a wrong or
+    incompatible-vector-space comparison."""
+    cache = _load_common_word_embeddings()
+    idx = cache['index'].get(str(word or '').strip())
+    if idx is None:
+        return []
+    return cache['embeddings'][idx].tolist()
 
 
 def get_logit_scale() -> float:

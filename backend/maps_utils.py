@@ -101,6 +101,13 @@ def _reverse_geocode_offline(latitude: str, longitude: str) -> Dict[str, str]:
     return {
         'address': ', '.join(dict.fromkeys(bit for bit in address_bits if bit)),
         'city': city,
+        # Previously computed only as a city fallback (when name/admin2 are
+        # missing) and folded into the address string, then discarded as its
+        # own field -- so a query like "california" or "provence" could never
+        # match a photo whose city/country fields don't happen to repeat the
+        # region name, even though this exact value was already sitting in
+        # `result` on every call.
+        'region': admin1 if admin1 != city else '',
         'country': country,
     }
 
@@ -137,10 +144,14 @@ def reverse_geocode(latitude: str, longitude: str) -> Dict[str, str]:
 
     address = location.raw.get('address', {}) if hasattr(location, 'raw') else {}
     city = address.get('city') or address.get('town') or address.get('village') or address.get('state') or ''
+    state = address.get('state') or ''
     country = address.get('country', '')
     return {
         'address': location.address or '',
         'city': city,
+        # See _reverse_geocode_offline's matching comment: only report a
+        # distinct region when it isn't just a repeat of the city fallback.
+        'region': state if state != city else '',
         'country': country,
     }
 
@@ -164,6 +175,7 @@ def _reverse_geocode_photon(latitude: str, longitude: str) -> Dict[str, str]:
         return {}
     props = features[0].get('properties') or {}
     city = props.get('city') or props.get('county') or props.get('state') or ''
+    state = props.get('state') or ''
     country = props.get('country') or ''
     address_bits = [
         props.get('name') or '',
@@ -174,5 +186,8 @@ def _reverse_geocode_photon(latitude: str, longitude: str) -> Dict[str, str]:
     return {
         'address': ', '.join(dict.fromkeys([bit for bit in address_bits if bit])),
         'city': city,
+        # See _reverse_geocode_offline's matching comment: only report a
+        # distinct region when it isn't just a repeat of the city fallback.
+        'region': state if state != city else '',
         'country': country,
     }

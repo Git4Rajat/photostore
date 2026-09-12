@@ -26,7 +26,7 @@ from image_utils import (
     RAW_EXTENSIONS_RAWPY,
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
-from search_utils import MAX_TAGS_STORED, build_semantic_layers, build_semantic_text, curate_tag_records, normalize_tags
+from search_utils import MAX_TAGS_STORED, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
 import maps_utils
 import vision_utils
 
@@ -189,6 +189,7 @@ _VECTOR_INDEX_RELEVANT_FIELDS = {
     'faces',
     'locationCity',
     'locationCountry',
+    'locationRegion',
     'objects',
     'ocrText',
     'peopleIds',
@@ -249,6 +250,16 @@ class LexicalIndexSnapshot:
     schema_version: str
     updated_at: str
     rows: List[Dict[str, object]]
+
+
+@dataclass
+class TagEmbeddingIndexSnapshot:
+    user_id: str
+    source_version: str
+    embedding_version: str
+    updated_at: str
+    tags: List[str]
+    embeddings: np.ndarray
 
 
 @dataclass
@@ -1288,6 +1299,328 @@ def get_user_vector_index(user_id: str, *, allow_refresh: bool = True) -> Option
     }
 
 
+# --- Per-user tag-embedding index --------------------------------------------
+# Lets search expand an out-of-vocabulary query word (e.g. "puppy") to
+# whichever of a user's *actual* tags are nearest to it in CLIP's embedding
+# space (e.g. "dog"), the same generalization Apple's NLEmbedding gives their
+# fixed-taxonomy tagger (see machinelearning.apple.com/research/on-device-scene-analysis
+# and WWDC19's "Advances in Natural Language Framework"). Real CLIP text
+# embeddings are only ever available where torch/open_clip are installed --
+# ipworker, never the plain backend role that serves /photos/search (see
+# docs/ipworker-architecture.md) -- so this mirrors the vector index's
+# blob-cache-plus-dirty-flag shape exactly, but the expensive rebuild is only
+# ever attempted where vision_utils.image_encoder_available() is true
+# (_build_user_tag_embedding_index_snapshot short-circuits otherwise). Reading
+# the cached result back is pure numpy, so backend can do that part fine.
+_TAG_EMBEDDING_INDEX_CACHE_LOCK = threading.RLock()
+_TAG_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+
+
+def _tag_embedding_index_container_name() -> str:
+    return str(
+        _CTX.get('blob_tag_embedding_index_container')
+        or os.getenv('BLOB_TAG_EMBEDDING_INDEX_CONTAINER', 'tag-embedding-index')
+    ).strip()
+
+
+def _tag_embedding_index_blob_key(user_id: str) -> str:
+    return hashlib.sha256(str(user_id or '').encode('utf-8')).hexdigest()
+
+
+def _tag_embedding_index_npz_blob_name(user_id: str) -> str:
+    return f'{_tag_embedding_index_blob_key(user_id)}.npz'
+
+
+def _tag_embedding_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_tag_embedding_index_blob_key(user_id)}.json'
+
+
+def _tag_embedding_index_blob_client(blob_name: str):
+    container_name = _tag_embedding_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_tag_embedding_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _TAG_EMBEDDING_INDEX_CACHE_LOCK:
+        _TAG_EMBEDDING_INDEX_CACHE.pop(key, None)
+
+
+def delete_user_tag_embedding_index_data(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for blob_name in (_tag_embedding_index_npz_blob_name(key), _tag_embedding_index_manifest_blob_name(key)):
+        blob_client = _tag_embedding_index_blob_client(blob_name)
+        if blob_client is None:
+            continue
+        try:
+            blob_client.delete_blob()
+        except Exception:
+            pass
+    invalidate_user_tag_embedding_index_cache(key)
+
+
+def touch_user_tag_embedding_index_state(user_id: str) -> str:
+    key = str(user_id or '').strip()
+    if not key:
+        return ''
+    source_version = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        'userId': key,
+        'sourceVersion': source_version,
+        'embeddingVersion': vision_utils.get_text_embedding_version(),
+        'dirty': True,
+        'updatedAt': source_version,
+    }
+    blob_client = _tag_embedding_index_blob_client(_tag_embedding_index_manifest_blob_name(key))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    invalidate_user_tag_embedding_index_cache(key)
+    return source_version
+
+
+def _load_tag_embedding_index_manifest(user_id: str) -> Dict[str, str]:
+    blob_client = _tag_embedding_index_blob_client(_tag_embedding_index_manifest_blob_name(user_id))
+    if blob_client is None:
+        return {}
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_tag_embedding_index_npz(user_id: str) -> Optional[TagEmbeddingIndexSnapshot]:
+    blob_client = _tag_embedding_index_blob_client(_tag_embedding_index_npz_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as data:
+            embeddings = np.asarray(data['embeddings'], dtype=np.float32)
+            tags_raw = data['tags']
+            source_version = str(data['source_version'].item() if np.asarray(data['source_version']).shape == () else data['source_version'][0])
+            embedding_version = str(data['embedding_version'].item() if np.asarray(data['embedding_version']).shape == () else data['embedding_version'][0])
+            updated_at = str(data['updated_at'].item() if np.asarray(data['updated_at']).shape == () else data['updated_at'][0])
+            tags_json = str(tags_raw.item() if np.asarray(tags_raw).shape == () else tags_raw[0])
+            tags = json.loads(tags_json) if tags_json else []
+            if not isinstance(tags, list):
+                tags = []
+            tags = [str(item) for item in tags if str(item).strip()]
+            if embeddings.ndim != 2 or len(tags) != int(embeddings.shape[0]):
+                return None
+            return TagEmbeddingIndexSnapshot(
+                user_id=str(user_id),
+                source_version=source_version,
+                embedding_version=embedding_version,
+                updated_at=updated_at,
+                tags=tags,
+                embeddings=embeddings,
+            )
+    except Exception:
+        return None
+
+
+def _serialize_tag_embedding_index(snapshot: TagEmbeddingIndexSnapshot) -> bytes:
+    buffer = io.BytesIO()
+    np.savez_compressed(
+        buffer,
+        embeddings=np.asarray(snapshot.embeddings, dtype=np.float32),
+        tags=np.asarray([json.dumps(snapshot.tags, ensure_ascii=False, separators=(',', ':'))]),
+        source_version=np.asarray([snapshot.source_version]),
+        embedding_version=np.asarray([snapshot.embedding_version]),
+        updated_at=np.asarray([snapshot.updated_at]),
+    )
+    return buffer.getvalue()
+
+
+def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str) -> Optional[TagEmbeddingIndexSnapshot]:
+    # The one guard that matters: only ever build where real CLIP is loaded.
+    # Building this from the backend role would silently produce hash-
+    # fallback vectors that could never meaningfully compare against the
+    # static common-word CLIP table search_photos() looks query words up in.
+    if not vision_utils.image_encoder_available():
+        return None
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return None
+    try:
+        rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        rows = []
+
+    embedding_version = vision_utils.get_text_embedding_version()
+    tag_set = set()
+    for row in rows:
+        tag_set.update(effective_tags(row))
+    tags = sorted(tag_set)
+    if not tags:
+        return TagEmbeddingIndexSnapshot(
+            user_id=str(user_id), source_version=source_version, embedding_version=embedding_version,
+            updated_at=source_version, tags=[], embeddings=np.zeros((0, 0), dtype=np.float32),
+        )
+
+    raw_embeddings = vision_utils.encode_text_embeddings_batch(tags)
+    if not raw_embeddings or len(raw_embeddings) != len(tags):
+        return None
+    matrix = np.asarray(raw_embeddings, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    matrix = (matrix / norms).astype(np.float32, copy=False)
+    return TagEmbeddingIndexSnapshot(
+        user_id=str(user_id), source_version=source_version, embedding_version=embedding_version,
+        updated_at=source_version, tags=tags, embeddings=matrix,
+    )
+
+
+def refresh_user_tag_embedding_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[TagEmbeddingIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+    snapshot = _build_user_tag_embedding_index_snapshot(key, source_version)
+    if snapshot is None:
+        return None
+    container_name = _tag_embedding_index_container_name()
+    if container_name:
+        blob_client = _get_blob_client(container_name, _tag_embedding_index_npz_blob_name(key))
+        if blob_client is not None:
+            try:
+                blob_client.upload_blob(
+                    _serialize_tag_embedding_index(snapshot),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/octet-stream'),
+                )
+            except Exception:
+                pass
+        manifest = {
+            'userId': key,
+            'sourceVersion': snapshot.source_version,
+            'embeddingVersion': snapshot.embedding_version,
+            'tagCount': len(snapshot.tags),
+            'dirty': False,
+            'updatedAt': snapshot.updated_at,
+        }
+        manifest_client = _get_blob_client(container_name, _tag_embedding_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            try:
+                manifest_client.upload_blob(
+                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json'),
+                )
+            except Exception:
+                pass
+    with _TAG_EMBEDDING_INDEX_CACHE_LOCK:
+        _TAG_EMBEDDING_INDEX_CACHE[key] = {
+            'source_version': snapshot.source_version,
+            'embedding_version': snapshot.embedding_version,
+            'updated_at': snapshot.updated_at,
+            'tags': snapshot.tags,
+            'embeddings': snapshot.embeddings,
+        }
+    return snapshot
+
+
+def get_user_tag_embedding_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    manifest = _load_tag_embedding_index_manifest(key)
+    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
+    manifest_dirty = bool(manifest.get('dirty'))
+    current_embedding_version = vision_utils.get_text_embedding_version()
+
+    with _TAG_EMBEDDING_INDEX_CACHE_LOCK:
+        cached = _TAG_EMBEDDING_INDEX_CACHE.get(key)
+        if cached:
+            if (
+                cached.get('source_version') == manifest_source_version
+                and cached.get('embedding_version') == current_embedding_version
+                and not manifest_dirty
+            ):
+                return cached
+
+    snapshot = _load_tag_embedding_index_npz(key)
+    if snapshot and snapshot.source_version == manifest_source_version and snapshot.embedding_version == current_embedding_version and not manifest_dirty:
+        data = {
+            'source_version': snapshot.source_version,
+            'embedding_version': snapshot.embedding_version,
+            'updated_at': snapshot.updated_at,
+            'tags': snapshot.tags,
+            'embeddings': snapshot.embeddings,
+        }
+        with _TAG_EMBEDDING_INDEX_CACHE_LOCK:
+            _TAG_EMBEDDING_INDEX_CACHE[key] = data
+        return data
+
+    if not allow_refresh:
+        return None
+
+    source_version = manifest_source_version or datetime.now(timezone.utc).isoformat()
+    refreshed = refresh_user_tag_embedding_index(key, source_version=source_version)
+    if refreshed is None:
+        return None
+    return {
+        'source_version': refreshed.source_version,
+        'embedding_version': refreshed.embedding_version,
+        'updated_at': refreshed.updated_at,
+        'tags': refreshed.tags,
+        'embeddings': refreshed.embeddings,
+    }
+
+
+def nearest_tags_for_word(
+    word_embedding: List[float],
+    tag_index: Dict[str, object],
+    *,
+    top_k: int = 3,
+    min_similarity: float = 0.75,
+) -> List[str]:
+    """Cosine-similarity nearest neighbors of `word_embedding` among a user's
+    actual tags -- pure numpy, safe to call from the backend role. Used to
+    expand an out-of-vocabulary query word (looked up in the static
+    common-word CLIP table) to whichever real tags in this library are
+    semantically closest to it."""
+    if not word_embedding or not tag_index:
+        return []
+    tags = tag_index.get('tags') or []
+    embeddings = tag_index.get('embeddings')
+    if not tags or not isinstance(embeddings, np.ndarray) or embeddings.ndim != 2 or embeddings.shape[0] == 0:
+        return []
+    query = np.asarray(word_embedding, dtype=np.float32)
+    if query.ndim != 1 or query.size != embeddings.shape[1]:
+        return []
+    norm = float(np.linalg.norm(query))
+    if norm <= 0:
+        return []
+    query = query / norm
+    scores = embeddings @ query
+    candidate_count = min(top_k, scores.size)
+    if candidate_count <= 0:
+        return []
+    ranked_indices = np.argsort(scores)[::-1][:candidate_count]
+    return [tags[int(idx)] for idx in ranked_indices if scores[int(idx)] >= min_similarity]
+
+
 _LEXICAL_INDEX_SCHEMA_VERSION = 'v1'
 # The only two fields no consumer of the lexical index (search's lexical/
 # location/people/date matching, or any of the other listing endpoints that
@@ -1377,13 +1710,14 @@ def touch_user_lexical_index_state(user_id: str) -> str:
 
 
 def touch_user_search_indexes_state(user_id: str, *, embedding_version: Optional[str] = None) -> None:
-    """Mark both the vector index and the lexical index stale for user_id.
-    The two are dirtied by the exact same condition today
+    """Mark the vector, lexical, and tag-embedding indexes stale for user_id.
+    All three are dirtied by the exact same condition today
     (metadata_updates_affect_search_indexes) -- call this instead of either
-    touch_*_state function directly so the two triggers can't drift apart
+    touch_*_state function directly so the triggers can't drift apart
     at a call site the way the old duplicated field lists already did."""
     touch_user_vector_index_state(user_id, embedding_version=embedding_version)
     touch_user_lexical_index_state(user_id)
+    touch_user_tag_embedding_index_state(user_id)
 
 
 def _load_lexical_index_manifest(user_id: str) -> Dict[str, str]:
@@ -1718,6 +2052,7 @@ def get_or_create_metadata(user_id: str, filename: str) -> Dict:
             'address': '',
             'locationCity': '',
             'locationCountry': '',
+            'locationRegion': '',
             'fileHash': '',
             'perceptualHash': '',
             'faces': json.dumps([]),
@@ -2428,6 +2763,7 @@ def _apply_server_exif_fallback(
                 if place.get('address'):
                     metadata['address'] = place['address']
                 metadata['locationCity'] = place.get('city', '')
+                metadata['locationRegion'] = place.get('region', '')
                 metadata['locationCountry'] = place.get('country', '')
                 metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
                 metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
@@ -2868,6 +3204,7 @@ def _apply_client_processing_results(
             metadata['longitude'] = lon
             metadata['address'] = _sanitize_client_text(map_result.get('address'), 512)
             metadata['locationCity'] = _sanitize_client_text(map_result.get('city'), 256)
+            metadata['locationRegion'] = _sanitize_client_text(map_result.get('region'), 256)
             metadata['locationCountry'] = _sanitize_client_text(map_result.get('country'), 256)
             # The browser's reverse-geocode call is a single best-effort request to a
             # public third-party API (rate-limited, no SLA); when it fails or comes
@@ -2880,6 +3217,7 @@ def _apply_client_processing_results(
                     if place.get('address'):
                         metadata['address'] = place['address']
                     metadata['locationCity'] = place.get('city', '')
+                    metadata['locationRegion'] = place.get('region', '')
                     metadata['locationCountry'] = place.get('country', '')
             metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
             metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
@@ -3439,6 +3777,11 @@ def _finalize_server_side_exif(user_id: str, filename: str, image_bytes: bytes, 
         pass
     entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
     metadata_table_client.upsert_entity(entity)
+    # Unlike apply_client_processing_results_for_file, this path writes location/
+    # semantic fields directly and was the one caller that never marked the
+    # cached search indexes stale -- a video's geocoded location silently never
+    # became searchable until something unrelated dirtied the index.
+    touch_user_search_indexes_state(user_id)
 
 
 PROCESSING_STEPS = (*BROWSER_PROCESSING_STEPS, 'verify')

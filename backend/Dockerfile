@@ -28,6 +28,7 @@ RUN pip install -r requirements.txt
 
 # Copy runtime Python modules used by app.py
 COPY *.py ./
+COPY data/ ./data/
 COPY entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh
 

@@ -59,7 +59,7 @@ def test_server_exif_fallback_geocodes_gps_before_marking_map_detection_done(mon
     monkeypatch.setattr(
         storage_utils.maps_utils,
         'reverse_geocode',
-        lambda lat, lon: {'address': 'Copenhagen, Denmark', 'city': 'Copenhagen', 'country': 'Denmark'},
+        lambda lat, lon: {'address': 'Copenhagen, Denmark', 'city': 'Copenhagen', 'region': 'Capital Region', 'country': 'Denmark'},
     )
 
     metadata: dict = {}
@@ -69,6 +69,7 @@ def test_server_exif_fallback_geocodes_gps_before_marking_map_detection_done(mon
 
     assert status_updates['map_detection_status'] == 'done'
     assert metadata['locationCity'] == 'Copenhagen'
+    assert metadata['locationRegion'] == 'Capital Region'
     assert metadata['locationCountry'] == 'Denmark'
     assert metadata['address'] == 'Copenhagen, Denmark'
 

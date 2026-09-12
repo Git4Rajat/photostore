@@ -54,6 +54,7 @@ RUN pip install -r requirements.txt -r requirements-ipworker.txt
 # exif_utils.py, maps_utils.py, vision_utils.py, ...) plus the ipworker-only
 # ipwork_*.py step processors, all in the same directory/import namespace.
 COPY backend/*.py ./
+COPY backend/data/ ./data/
 COPY backend/entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh
 

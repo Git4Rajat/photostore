@@ -68,8 +68,8 @@ def test_process_ocr_passes_decoded_bytes_to_tesseract(monkeypatch):
         def SetImage(self, image):
             received['size'] = image.size
 
-        def GetUTF8Text(self):
-            return 'TPLINE'
+        def MapWordConfidences(self):
+            return [('TPLINE', 92.0)]
 
     class FakeTesserocr:
         @staticmethod
@@ -83,6 +83,54 @@ def test_process_ocr_passes_decoded_bytes_to_tesseract(monkeypatch):
 
     assert received['size'] == (8, 8)
     assert result == {'hasData': True, 'text': 'TPLINE'}
+
+
+def test_process_ocr_drops_low_confidence_words(monkeypatch):
+    jpeg_bytes = _make_jpeg_bytes()
+    monkeypatch.setattr(ipwork_ocr, 'extract_raw_preview_bytes', lambda image_bytes, filename: jpeg_bytes)
+
+    class FakeApi:
+        def SetImage(self, image):
+            pass
+
+        def MapWordConfidences(self):
+            return [('REAL', 95.0), ('noise', 12.0), ('WORD', 41.0), ('junk', -1.0)]
+
+    class FakeTesserocr:
+        @staticmethod
+        def PyTessBaseAPI():
+            return FakeApi()
+
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', FakeTesserocr())
+    monkeypatch.setattr(ipwork_ocr, '_thread_local', __import__('threading').local())
+
+    result = ipwork_ocr.process_ocr('owner', 'photo.jpg', jpeg_bytes)
+
+    assert result == {'hasData': True, 'text': 'REAL WORD'}
+
+
+def test_process_ocr_reports_no_data_when_all_words_low_confidence(monkeypatch):
+    jpeg_bytes = _make_jpeg_bytes()
+    monkeypatch.setattr(ipwork_ocr, 'extract_raw_preview_bytes', lambda image_bytes, filename: jpeg_bytes)
+
+    class FakeApi:
+        def SetImage(self, image):
+            pass
+
+        def MapWordConfidences(self):
+            return [('noise', 10.0), ('junk', -1.0)]
+
+    class FakeTesserocr:
+        @staticmethod
+        def PyTessBaseAPI():
+            return FakeApi()
+
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', FakeTesserocr())
+    monkeypatch.setattr(ipwork_ocr, '_thread_local', __import__('threading').local())
+
+    result = ipwork_ocr.process_ocr('owner', 'photo.jpg', jpeg_bytes)
+
+    assert result == {'hasData': False}
 
 
 def test_process_ocr_on_raw_bytes_without_fallback_would_fail():
