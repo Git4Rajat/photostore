@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 
-import { AutoModel, AutoProcessor, AutoTokenizer, env, RawImage, softmax } from '@xenova/transformers';
+import { AutoModel, AutoProcessor, AutoTokenizer, env, RawImage } from '@xenova/transformers';
 
 import type {
     BrowserAiImagePayload,
@@ -33,14 +33,18 @@ const IMAGE_EMBEDDING_DIMENSION = 512;
 // classes and no generic "person", "water", "beach", or "sunset" concept at
 // all), photos are tagged using CLIP's own zero-shot classification --
 // comparing the image against a broader, photo-relevant vocabulary of
-// candidate text labels (photostore/tools/generate_browser_ai_vocabulary.py).
-// The installed @xenova/transformers version only exposes CLIP as a single
-// combined image+text ONNX graph (no separate image/text encoder pipelines),
-// so the vocabulary's text is tokenized and encoded once per worker session
-// (cached) and reused for every photo -- only the image side changes per call.
+// candidate text labels (backend/scripts/generate_tag_vocabulary.py, ~10k
+// nouns). Label embeddings are precomputed offline
+// (backend/scripts/generate_tag_vocabulary_embeddings.py) and shipped as a
+// binary asset rather than encoded here at runtime -- see getClipSession's
+// comment for why.
 const DEFAULT_TAG_VOCABULARY_URL = '/models/browser-ai/vocab/tag-vocabulary.v1.json';
+const DEFAULT_TAG_VOCABULARY_EMBEDDINGS_URL = '/models/browser-ai/vocab/tag-vocabulary-embeddings.v1.bin';
 const DEFAULT_VOCAB_TOP_K = 15;
-const ZERO_SHOT_HYPOTHESIS_TEMPLATE = 'a photo of a {}';
+// Baked into the precomputed vocabulary embeddings now (see
+// generate_tag_vocabulary_embeddings.py) instead of being applied here at
+// runtime.
+const CLIP_FORWARD_PLACEHOLDER_TEXT = 'a photo';
 
 type TagVocabulary = {
     version: string;
@@ -128,13 +132,16 @@ type ClipSession = {
     model: any;
     processor: any;
     labels: string[];
-    textInputs: Record<string, any>;
+    vocabEmbeddings: Float32Array;
+    dummyTextInputs: Record<string, any>;
 };
 
 let clipSessionPromise: Promise<ClipSession> | null = null;
 let clipSessionConfiguredKey = '';
 let vocabularyPromise: Promise<TagVocabulary | null> | null = null;
 let vocabularyConfiguredUrl = '';
+let vocabularyEmbeddingsPromise: Promise<Float32Array> | null = null;
+let vocabularyEmbeddingsConfiguredUrl = '';
 
 const toArray = <T,>(value: unknown): T[] => (Array.isArray(value) ? value : []);
 
@@ -240,14 +247,44 @@ const getVocabulary = async (manifest: BrowserAiManifest): Promise<TagVocabulary
     return vocabularyPromise;
 };
 
+const getVocabularyEmbeddings = async (manifest: BrowserAiManifest, expectedLabelCount: number): Promise<Float32Array> => {
+    const url = manifest.tagVocabularyEmbeddingsUrl || DEFAULT_TAG_VOCABULARY_EMBEDDINGS_URL;
+    if (!vocabularyEmbeddingsPromise || vocabularyEmbeddingsConfiguredUrl !== url) {
+        vocabularyEmbeddingsConfiguredUrl = url;
+        vocabularyEmbeddingsPromise = (async () => {
+            postWarmupProgress('vocabulary_embeddings_loading');
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`vocabulary_embeddings_fetch_failed:${response.status}`);
+            }
+            const buffer = await response.arrayBuffer();
+            const embeddings = new Float32Array(buffer);
+            if (embeddings.length !== expectedLabelCount * IMAGE_EMBEDDING_DIMENSION) {
+                throw new Error('vocabulary_embeddings_shape_invalid');
+            }
+            postWarmupProgress('vocabulary_embeddings_loaded');
+            return embeddings;
+        })().catch((err) => {
+            vocabularyEmbeddingsPromise = null;
+            throw err;
+        });
+    }
+    return vocabularyEmbeddingsPromise;
+};
+
 // The installed @xenova/transformers version has no standalone image/text
 // encoder pipeline for CLIP -- only the combined "clip" model, which requires
-// both pixel_values and tokenized text in the same forward call. So the
-// vocabulary's text is tokenized once here (image-independent, safe to cache
-// and reuse across every photo this worker processes) and combined with each
-// photo's pixel_values at inference time in a single forward pass that yields
-// both the zero-shot tag logits and (if the ONNX graph exposes it) the raw
-// image embedding used for search.
+// both pixel_values and tokenized text in the same forward call. Previously
+// the *entire* vocabulary's text was tokenized and run through the text
+// tower on every single classify() call (only the tokenized *input* was
+// cached, not the resulting embeddings) -- tolerable at ~230 labels, but at
+// ~10k it would multiply per-photo cost roughly 40x. Instead, only a single
+// fixed placeholder string is tokenized here: CLIP's image tower has no
+// cross-attention to text, so the `image_embeds` output classify() actually
+// needs is unaffected by what text is passed alongside it. Real per-label
+// similarity is computed afterward in JS against the precomputed
+// vocabEmbeddings matrix (see toPredictions) -- this also removes the
+// vocab-wide softmax from the scoring math, see toPredictions's comment.
 const getClipSession = async (manifest: BrowserAiManifest): Promise<ClipSession> => {
     const key = JSON.stringify({
         model: IMAGE_EMBEDDING_MODEL,
@@ -255,6 +292,7 @@ const getClipSession = async (manifest: BrowserAiManifest): Promise<ClipSession>
         allowRemoteModels: manifest.allowRemoteModels !== false,
         allowLocalModels: manifest.allowLocalModels !== false,
         vocabUrl: manifest.tagVocabularyUrl || DEFAULT_TAG_VOCABULARY_URL,
+        vocabEmbeddingsUrl: manifest.tagVocabularyEmbeddingsUrl || DEFAULT_TAG_VOCABULARY_EMBEDDINGS_URL,
     });
     if (!clipSessionPromise || clipSessionConfiguredKey !== key) {
         clipSessionConfiguredKey = key;
@@ -265,15 +303,15 @@ const getClipSession = async (manifest: BrowserAiManifest): Promise<ClipSession>
             if (!vocabulary) {
                 throw new Error('vocabulary_unavailable');
             }
-            const [model, processor, tokenizer] = await Promise.all([
+            const [model, processor, tokenizer, vocabEmbeddings] = await Promise.all([
                 AutoModel.from_pretrained(IMAGE_EMBEDDING_MODEL, { quantized: true }),
                 AutoProcessor.from_pretrained(IMAGE_EMBEDDING_MODEL),
                 AutoTokenizer.from_pretrained(IMAGE_EMBEDDING_MODEL),
+                getVocabularyEmbeddings(manifest, vocabulary.labels.length),
             ]);
-            const texts = vocabulary.labels.map((label) => ZERO_SHOT_HYPOTHESIS_TEMPLATE.replace('{}', label));
-            const textInputs = tokenizer(texts, { padding: true, truncation: true });
+            const dummyTextInputs = tokenizer([CLIP_FORWARD_PLACEHOLDER_TEXT], { padding: true, truncation: true });
             postWarmupProgress('clip_loaded');
-            return { model, processor, labels: vocabulary.labels, textInputs };
+            return { model, processor, labels: vocabulary.labels, vocabEmbeddings, dummyTextInputs };
         })().catch((err) => {
             clipSessionPromise = null;
             throw err;
@@ -294,17 +332,34 @@ export const l2Normalize = (values: number[]): number[] => {
     return values.map((value) => value / norm);
 };
 
-// CLIP's own zero-shot classification math: softmax over logits_per_image,
-// exactly what transformers.js's built-in ZeroShotImageClassificationPipeline
-// does (using the same imported `softmax`) -- reusing that instead of
-// hand-rolling cosine-similarity scoring keeps this aligned with CLIP's own
-// learned temperature/calibration rather than an approximation of it.
-export const toPredictions = (labels: string[], logits: ArrayLike<number>, topK: number): BrowserAiPrediction[] => {
-    const probs = softmax(Array.from(logits));
-    return labels
-        .map((label, index) => ({ label, score: probs[index] }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, topK);
+// Independent per-label cosine similarity (both sides L2-normalized),
+// replacing a previous single softmax over the whole vocabulary. Softmax
+// normalizes probability mass across every candidate label, so a genuine
+// match's score shrinks as the vocabulary grows -- this is exactly what let
+// a small foreground subject (e.g. a fighter jet) lose to a dominant
+// background match ("sky") even when a real, specific label existed as a
+// candidate. Cosine similarity stays on a fixed, vocab-size-independent
+// scale instead. See ipwork_vision.py's process_vision for the matching
+// server-side change, and search_utils.py's AI_TAG_MIN_CONFIDENCE comment
+// for how real photos were used to recalibrate confidence thresholds against
+// this new scale.
+export const toPredictions = (
+    labels: string[],
+    vocabEmbeddings: Float32Array,
+    imageEmbedding: number[],
+    topK: number,
+): BrowserAiPrediction[] => {
+    const dimension = imageEmbedding.length;
+    const scored: BrowserAiPrediction[] = new Array(labels.length);
+    for (let i = 0; i < labels.length; i += 1) {
+        const offset = i * dimension;
+        let dot = 0;
+        for (let d = 0; d < dimension; d += 1) {
+            dot += vocabEmbeddings[offset + d] * imageEmbedding[d];
+        }
+        scored[i] = { label: labels[i], score: Math.max(0, dot) };
+    }
+    return scored.sort((a, b) => b.score - a.score).slice(0, topK);
 };
 
 export const extractImageEmbedding = (rawValues: ArrayLike<number> | undefined, dimension: number): number[] => {
@@ -502,15 +557,14 @@ const classify = async (manifest: BrowserAiManifest, image: BrowserAiImagePayloa
     postWarmupProgress('warmup_inference');
     const session = await getClipSession(manifest);
     const { pixel_values: pixelValues } = await session.processor([toRawImage(image)]);
-    const output = await session.model({ ...session.textInputs, pixel_values: pixelValues });
+    const output = await session.model({ ...session.dummyTextInputs, pixel_values: pixelValues });
 
-    const logits = firstRow(output?.logits_per_image);
-    if (!logits) {
+    const imageEmbedding = extractImageEmbedding(firstRow(output?.image_embeds), IMAGE_EMBEDDING_DIMENSION);
+    if (!imageEmbedding.length) {
         throw new Error('clip_forward_failed');
     }
     const topK = Math.max(1, Math.min(Number(manifest.vocabTopK || manifest.topK || DEFAULT_VOCAB_TOP_K), session.labels.length));
-    const predictions = toPredictions(session.labels, logits, topK);
-    const imageEmbedding = extractImageEmbedding(firstRow(output?.image_embeds), IMAGE_EMBEDDING_DIMENSION);
+    const predictions = toPredictions(session.labels, session.vocabEmbeddings, imageEmbedding, topK);
     return { predictions, imageEmbedding };
 };
 
@@ -535,7 +589,9 @@ const analyze = async (manifest: BrowserAiManifest, image: BrowserAiImagePayload
     // score to make that call per tag instead of a flat per-source default.
     const accepted = predictions.slice(0, topK);
     const bestPerson = predictions.find((item) => PERSON_LABELS.has(item.label));
-    const personScoreThreshold = Number(manifest.personScoreThreshold || 0.2);
+    // Matches search_utils.PERSON_SCORE_THRESHOLD's recalibrated default --
+    // see that constant's comment for the cosine-similarity-scale rationale.
+    const personScoreThreshold = Number(manifest.personScoreThreshold || 0.28);
     const tags = mergeTags(
         accepted.map((item) => item.label),
         inferClothingColorTags(image, accepted),

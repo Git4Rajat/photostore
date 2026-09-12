@@ -242,16 +242,37 @@ def common_word_embedding(word: str) -> List[float]:
     return cache['embeddings'][idx].tolist()
 
 
-def get_logit_scale() -> float:
-    """CLIP's learned temperature (logit_scale.exp()), applied before the
-    softmax in zero-shot classification -- the same scaling transformers.js's
-    exported ONNX graph bakes into `logits_per_image`
-    (frontend/src/workers/browserAiWorker.ts's `classify`), so ipworker's
-    from-scratch computation reproduces the same calibration instead of an
-    unscaled cosine-similarity softmax."""
-    if not _load_model():
-        return 100.0
-    try:
-        return float(_MODEL.logit_scale.exp().item())
-    except Exception:
-        return 100.0
+_TAG_VOCABULARY_EMBEDDINGS_PATH = os.getenv(
+    'TAG_VOCABULARY_EMBEDDINGS_PATH',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'tag_vocabulary_embeddings.npz'),
+)
+_TAG_VOCABULARY_EMBEDDINGS_LOCK = threading.Lock()
+_TAG_VOCABULARY_EMBEDDINGS_CACHE: Optional[Dict[str, object]] = None
+
+
+def load_tag_vocabulary_embeddings() -> Dict[str, object]:
+    """Static, precomputed CLIP text embeddings for ipwork_vision.py's ~10k
+    zero-shot tagging vocabulary (see scripts/generate_tag_vocabulary_embeddings.py)
+    -- the same offline-precomputed-npz pattern as
+    _load_common_word_embeddings() above, for the same reason (a plain numpy
+    load works in the backend role without torch/open_clip) plus a second
+    one: ipworker used to re-encode this vocabulary's text tower once per
+    process at startup (vision_utils.encode_text_embeddings_batch), which at
+    10k labels adds real CPU cost to every cold start under this fleet's
+    frequent KEDA scale-out. Loading a shipped file instead makes cold start
+    cost independent of vocabulary size. Returns {'words': [...],
+    'embeddings': np.ndarray} with empty values if the file is missing."""
+    global _TAG_VOCABULARY_EMBEDDINGS_CACHE
+    if _TAG_VOCABULARY_EMBEDDINGS_CACHE is not None:
+        return _TAG_VOCABULARY_EMBEDDINGS_CACHE
+    with _TAG_VOCABULARY_EMBEDDINGS_LOCK:
+        if _TAG_VOCABULARY_EMBEDDINGS_CACHE is not None:
+            return _TAG_VOCABULARY_EMBEDDINGS_CACHE
+        try:
+            data = np.load(_TAG_VOCABULARY_EMBEDDINGS_PATH)
+            words = [str(w) for w in data['words']]
+            embeddings = np.asarray(data['embeddings'], dtype=np.float32)
+        except Exception:
+            words, embeddings = [], np.zeros((0, 0), dtype=np.float32)
+        _TAG_VOCABULARY_EMBEDDINGS_CACHE = {'words': words, 'embeddings': embeddings}
+        return _TAG_VOCABULARY_EMBEDDINGS_CACHE

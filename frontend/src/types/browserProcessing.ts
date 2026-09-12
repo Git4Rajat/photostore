@@ -253,6 +253,7 @@ export interface BrowserAiManifest {
     localModelPath?: string;
     wasmPath?: string;
     tagVocabularyUrl?: string;
+    tagVocabularyEmbeddingsUrl?: string;
     vocabTopK?: number;
     topK?: number;
     minStoredLabels?: number;

@@ -9,8 +9,25 @@ from exif_utils import parse_exif_data
 MAX_TAG_LENGTH = int(os.getenv('MAX_TAG_LENGTH', '48'))
 MAX_TAGS_STORED = int(os.getenv('MAX_TAGS_STORED', '40'))
 MAX_WEAK_TAGS_STORED = int(os.getenv('MAX_WEAK_TAGS_STORED', '40'))
-AI_TAG_MIN_CONFIDENCE = float(os.getenv('AI_TAG_MIN_CONFIDENCE', '0.18'))
-GENERIC_TAG_MIN_CONFIDENCE = float(os.getenv('GENERIC_TAG_MIN_CONFIDENCE', '0.55'))
+# Both recalibrated for the ~10k-label vocabulary's raw-cosine-similarity
+# scoring (see ipwork_vision.py / browserAiWorker.ts) -- the old values
+# (0.18 / 0.55) were tuned against a softmax-over-vocabulary probability,
+# a completely different scale that shrinks as the vocabulary grows. Real
+# photos measured via scripts/calibrate_tag_confidence_thresholds.py show
+# genuinely-matching top labels clustering ~0.26-0.32 and irrelevant/noise
+# labels clustering ~0.17-0.22, with the gap between them holding across a
+# person-free/jet/bird/food/landscape/night-sky sample. GENERIC_TAG_MIN_CONFIDENCE
+# sits near the top of that range specifically so a merely-present background
+# tag (e.g. "sky" scored 0.249 on a fighter-jet photo where "jet"/"aircraft"
+# scored 0.28-0.30) doesn't outrank/replace a more specific real match.
+AI_TAG_MIN_CONFIDENCE = float(os.getenv('AI_TAG_MIN_CONFIDENCE', '0.24'))
+GENERIC_TAG_MIN_CONFIDENCE = float(os.getenv('GENERIC_TAG_MIN_CONFIDENCE', '0.27'))
+# Single source of truth for the CLIP "is this photo a person candidate"
+# score gate -- both ipwork_vision.py and storage_utils.py apply it (the
+# latter as a belt-and-suspenders re-check), previously as two separately
+# hardcoded 0.2 literals that had to be kept in sync by hand. See
+# ipwork_vision.py's own comment for why this sits above AI_TAG_MIN_CONFIDENCE.
+PERSON_SCORE_THRESHOLD = float(os.getenv('AI_PERSON_SCORE_THRESHOLD', '0.28'))
 TOKEN_CANONICAL_MAP = {
     'automobile': 'car',
     'automobiles': 'car',
@@ -154,7 +171,11 @@ VISUAL_MODIFIERS = {
 }
 SEARCH_STOP_WORDS = {'in', 'at', 'near', 'from', 'by', 'with', 'wearing', 'holding', 'beside', 'next', 'to', 'and', 'the', 'a', 'an'}
 MODIFIER_FILLER_WORDS = {'color', 'colour'}
-PREDICTION_TAG_MIN_SCORE = float(os.getenv('SEMANTIC_PREDICTION_TAG_MIN_SCORE', '0.08'))
+# Recalibrated alongside AI_TAG_MIN_CONFIDENCE above for raw-cosine-similarity
+# scores; deliberately looser than that stricter storage-time filter since
+# this only screens raw predictions for search-time consideration, not final
+# tag curation.
+PREDICTION_TAG_MIN_SCORE = float(os.getenv('SEMANTIC_PREDICTION_TAG_MIN_SCORE', '0.2'))
 MAX_PREDICTION_TAGS = int(os.getenv('SEMANTIC_PREDICTION_TAG_LIMIT', '160'))
 SEMANTIC_TERM_EXPANSIONS = {
     'water': [

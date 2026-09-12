@@ -12,17 +12,23 @@
   "faceEmbeddingDescriptorDimensions": 512,
   "faceEmbeddingModelUrl": "/models/browser-ai/models/adaface/model.onnx",
   "modelVersion": "clip-vit-base-patch32-transformers-js-2.17.2",
-  "modelTaxonomyVersion": "photostore-browser-clip-openvocab-v1",
+  "modelTaxonomyVersion": "photostore-browser-clip-openvocab-v2",
   "tagVocabularyUrl": "/models/browser-ai/vocab/tag-vocabulary.v1.json",
+  "tagVocabularyEmbeddingsUrl": "/models/browser-ai/vocab/tag-vocabulary-embeddings.v1.bin",
   "allowLocalModels": false,
   "allowRemoteModels": true,
   "enableLocalVisionFallback": true,
   "localModelPath": "/models/browser-ai/models/",
   "wasmPath": "/models/browser-ai/runtime/",
   "vocabTopK": 15,
-  "personScoreThreshold": 0.2,
+  "personScoreThreshold": 0.28,
   "faceScoreThreshold": 0.12,
   "assets": [
+    {
+      "path": "vocab/tag-vocabulary-embeddings.v1.bin",
+      "bytes": 20480000,
+      "sha256": "610894938588318e720002a63f8b7f9ffe71bf8257530c0a5b3b1b44d5219562"
+    },
     {
       "path": "runtime/ort-wasm.wasm",
       "bytes": 9223228,

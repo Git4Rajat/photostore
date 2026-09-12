@@ -27,6 +27,7 @@ import numpy as np
 
 import vision_utils
 from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
+from search_utils import PERSON_SCORE_THRESHOLD
 
 # Same vocabulary file the browser fetches at runtime (manifest.tagVocabularyUrl,
 # default frontend/public/models/browser-ai/vocab/tag-vocabulary.v1.json) --
@@ -42,7 +43,6 @@ PERSON_LABELS = {
     'boy', 'girl', 'child', 'baby', 'toddler', 'adult', 'group', 'family', 'crowd',
 }
 DEFAULT_VOCAB_TOP_K = 15
-PERSON_SCORE_THRESHOLD = 0.2
 
 _vocab_labels: Optional[List[str]] = None
 _vocab_version = ''
@@ -61,19 +61,26 @@ def _load_vocabulary() -> bool:
             return False
     except Exception:
         return False
-    embeddings = vision_utils.encode_text_embeddings_batch(labels)
-    if not embeddings or len(embeddings) != len(labels):
-        return False
+
+    # Precomputed via scripts/generate_tag_vocabulary_embeddings.py (shared
+    # with the browser worker, same CLIP checkpoint + prompt template) --
+    # avoids re-encoding ~10k labels' text tower on every ipworker cold
+    # start, which under this fleet's frequent KEDA scale-out would add real
+    # CPU cost cluster-wide. Falls back to live encoding (the old behavior)
+    # if the shipped file is missing or out of sync with the vocabulary JSON
+    # (e.g. one was regenerated without the other) rather than failing hard.
+    precomputed = vision_utils.load_tag_vocabulary_embeddings()
+    if precomputed['words'] == labels and len(precomputed['words']) > 0:
+        embeddings = precomputed['embeddings']
+    else:
+        embeddings = vision_utils.encode_text_embeddings_batch(labels)
+        if not embeddings or len(embeddings) != len(labels):
+            return False
+
     _vocab_labels = labels
     _vocab_version = str(payload.get('version') or '')
     _vocab_embeddings = np.asarray(embeddings, dtype=np.float32)
     return True
-
-
-def _softmax(logits: np.ndarray) -> np.ndarray:
-    shifted = logits - np.max(logits)
-    exp = np.exp(shifted)
-    return exp / np.sum(exp)
 
 
 def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
@@ -100,15 +107,19 @@ def process_vision(user_id: str, filename: str, image_bytes: bytes) -> Optional[
         return {'hasData': False, 'error': 'image_embedding_failed'}
 
     image_vec = np.asarray(image_embedding, dtype=np.float32)
-    # CLIP's own zero-shot classification math (logit_scale-scaled cosine
-    # similarity -> softmax over the whole vocabulary), matching how
-    # transformers.js's exported "clip" ONNX graph computes logits_per_image
-    # -- see get_logit_scale()'s docstring in vision_utils.py.
-    logits = vision_utils.get_logit_scale() * (_vocab_embeddings @ image_vec)
-    probs = _softmax(logits)
+    # Raw cosine similarity per label (both sides L2-normalized), scored
+    # independently rather than via a softmax over the whole vocabulary --
+    # softmax normalizes probability mass across every candidate label, so
+    # a correct match's score shrinks as the vocabulary grows (this is what
+    # let a small foreground subject like a jet lose to a dominant "sky"
+    # background even when "airplane" was a real candidate). Cosine
+    # similarity stays on a fixed, vocab-size-independent scale instead.
+    # See browserAiWorker.ts's toPredictions for the matching browser-side
+    # change.
+    scores = _vocab_embeddings @ image_vec
     top_k = min(DEFAULT_VOCAB_TOP_K, len(_vocab_labels))
-    top_indices = np.argsort(-probs)[:top_k]
-    predictions = [{'label': _vocab_labels[i], 'score': float(probs[i])} for i in top_indices]
+    top_indices = np.argsort(-scores)[:top_k]
+    predictions = [{'label': _vocab_labels[i], 'score': float(max(0.0, scores[i]))} for i in top_indices]
     tags = [p['label'] for p in predictions]
 
     best_person = next((p for p in predictions if p['label'] in PERSON_LABELS), None)

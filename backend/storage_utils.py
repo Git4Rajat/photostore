@@ -26,7 +26,7 @@ from image_utils import (
     RAW_EXTENSIONS_RAWPY,
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
-from search_utils import MAX_TAGS_STORED, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
+from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
 import maps_utils
 import vision_utils
 
@@ -3464,7 +3464,7 @@ def _apply_client_processing_results(
             if person_label:
                 metadata['aiPersonLabel'] = person_label[0]
                 metadata['aiPersonScore'] = person_score
-                metadata['aiPersonCandidate'] = bool(ai_result.get('aiPersonCandidate')) and person_score >= 0.2
+                metadata['aiPersonCandidate'] = bool(ai_result.get('aiPersonCandidate')) and person_score >= PERSON_SCORE_THRESHOLD
             image_embedding = _sanitize_client_image_embedding(ai_result.get('imageEmbedding'))
             if image_embedding:
                 metadata['photoEmbedding'] = _json_compact(image_embedding)

@@ -48,7 +48,6 @@ def test_process_vision_passes_decoded_bytes_to_encoder(monkeypatch):
     monkeypatch.setattr(ipwork_vision, '_load_vocabulary', lambda: True)
     monkeypatch.setattr(ipwork_vision, '_vocab_labels', ['cat', 'dog'])
     monkeypatch.setattr(ipwork_vision, '_vocab_embeddings', np.eye(2, dtype='float32'))
-    monkeypatch.setattr(ipwork_vision.vision_utils, 'get_logit_scale', lambda: 100.0)
     monkeypatch.setattr(ipwork_vision.vision_utils, 'get_text_embedding_version', lambda: 'test-version')
 
     monkeypatch.setattr(ipwork_vision, 'extract_raw_preview_bytes', lambda image_bytes, filename: b'decoded-preview')
