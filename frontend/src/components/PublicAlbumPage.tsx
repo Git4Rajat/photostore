@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowDownTrayIcon, CheckIcon, LockOpenIcon, PhotoIcon } from '@heroicons/react/24/outline';
 import { useParams } from 'react-router-dom';
 import { get, post, resolveApiUrl } from '../services/apiClient';
@@ -95,6 +95,23 @@ const PublicAlbumPage: React.FC = () => {
     // running percentage (see the meta line below) until it finishes.
     const [bufferReady, setBufferReady] = useState<boolean>(true);
     const [bufferPercent, setBufferPercent] = useState<number>(100);
+
+    // The grid unmounts entirely while the viewer is open (see the
+    // viewerIndex === null gate below), so the page collapses to the
+    // viewer's own height and the browser clamps window scroll to 0.
+    // Save the scroll position before opening and restore it on close,
+    // in a layout effect so it lands before the browser paints the
+    // remounted grid.
+    const preViewerScrollYRef = useRef<number>(0);
+    useLayoutEffect(() => {
+        if (viewerIndex === null) {
+            window.scrollTo(0, preViewerScrollYRef.current);
+        }
+    }, [viewerIndex]);
+    const openViewerAt = useCallback((index: number) => {
+        preViewerScrollYRef.current = window.scrollY;
+        setViewerIndex(index);
+    }, []);
 
     const loadPublicAlbum = useCallback(async (code: string = '') => {
             if (!token) {
@@ -482,7 +499,7 @@ const PublicAlbumPage: React.FC = () => {
                                 onMediaClick={(e) => {
                                     e.stopPropagation();
                                     e.preventDefault();
-                                    setViewerIndex(index);
+                                    openViewerAt(index);
                                 }}
                             />
                         );
