@@ -1838,7 +1838,8 @@ def _resolve_session_payload(require_auth: bool):
         try:
             return password_auth.validate_session_token(SESSION_SECRET, token), None
         except Exception as exc:
-            return None, (jsonify({'error': f'Invalid or expired session: {exc}'}), 401)
+            app.logger.warning('Session token validation failed: %s', exc)
+            return None, (jsonify({'error': 'Invalid or expired session'}), 401)
     if AUTH_REQUIRED or require_auth:
         return None, (jsonify({'error': 'Authorization token is required.'}), 401)
     return None, None
@@ -4822,7 +4823,8 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
         import numpy as np
         from sklearn.cluster import DBSCAN
     except Exception as exc:
-        return {'error': f'clustering unavailable: {exc}'}
+        app.logger.exception('Clustering dependencies unavailable')
+        return {'error': 'clustering unavailable'}
 
     try:
         rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
@@ -6861,7 +6863,8 @@ def auth_exchange():
             ms_token, AZURE_AD_TENANT_ID, AZURE_AD_CLIENT_ID, AZURE_AD_API_AUDIENCE,
         )
     except Exception as exc:
-        return jsonify({'error': f'Invalid Microsoft token: {exc}'}), 401
+        app.logger.warning('Microsoft token validation failed: %s', exc)
+        return jsonify({'error': 'Invalid Microsoft token'}), 401
     user_id = str(payload.get('oid') or payload.get('sub') or payload.get('preferred_username') or '').strip()
     if not user_id:
         return jsonify({'error': 'Token does not contain a usable user identifier claim.'}), 401
@@ -7072,7 +7075,6 @@ def library_invite():
             library_store.revoke_invite(library_id, str(invite.get('RowKey') or ''))
         return jsonify({
             'error': 'The invitation email could not be sent. Please try again.',
-            'detail': str(exc),
         }), 502
     library_store.audit(library_id, actor=account_id, action=f'invite:{target_type}', target=email)
     # Uniform response: never reveal whether the email already had an account.
@@ -7648,8 +7650,8 @@ def _enqueue_library_clean_job(library_id: str, actor_user_id: str, request_id: 
             return {'status': 'done', 'jobId': job_id}
         except Exception as exc:
             app.logger.exception('Inline library clean failed for %s', library_id)
-            library_store.set_cleanup_failed(library_id, str(exc))
-            _upsert_job_status(job_id, actor_user_id, 'library_clean', 'failed', error=str(exc), libraryId=library_id)
+            library_store.set_cleanup_failed(library_id, 'Library clean failed')
+            _upsert_job_status(job_id, actor_user_id, 'library_clean', 'failed', error='Library clean failed', libraryId=library_id)
             return {'status': 'failed', 'jobId': job_id}
     message = {
         'jobId': job_id,
@@ -7993,7 +7995,7 @@ def _enqueue_library_download_job(library_id: str, actor_user_id: str, library_n
             return {'status': 'done', 'jobId': job_id}
         except Exception as exc:
             app.logger.exception('Inline library download failed for %s', library_id)
-            _upsert_job_status(job_id, actor_user_id, 'library_download', 'failed', error=str(exc), libraryId=library_id)
+            _upsert_job_status(job_id, actor_user_id, 'library_download', 'failed', error='Library download failed', libraryId=library_id)
             return {'status': 'failed', 'jobId': job_id}
     message = {
         'jobId': job_id,
@@ -8204,7 +8206,6 @@ def library_clean_request():
     requester_email = str((library_store.get_user(account_id) or {}).get('email') or '')
     base = (PUBLIC_APP_BASE_URL or '').rstrip('/')
     sent_to = []
-    send_errors = []
     for user_id, raw in tokens_by_user.items():
         recipient_email = str((library_store.get_user(user_id) or {}).get('email') or '')
         if not recipient_email:
@@ -8219,13 +8220,11 @@ def library_clean_request():
             sent_to.append(email_utils.masked_recipient(recipient_email))
         except Exception as exc:
             app.logger.warning('Library clean confirmation email failed for %s: %s', user_id, exc)
-            send_errors.append(str(exc))
 
     if not sent_to:
         library_store.cancel_clean_request(library_id, request_id)
         return jsonify({
             'error': 'Could not send confirmation email(s). Please try again.',
-            'detail': send_errors[0] if send_errors else '',
         }), 502
 
     library_store.audit(library_id, actor=account_id, action='clean-requested', target=request_id)
@@ -8634,7 +8633,7 @@ def photo_access_url(kind: str, filename: str):
         return jsonify(_access_url_response(url, expires_at, safe_name, kind))
     except Exception as exc:
         app.logger.exception('Failed to mint %s access URL for %s', kind, safe_name)
-        return jsonify({'error': f'Failed to create {kind} access URL', 'detail': str(exc)}), 503
+        return jsonify({'error': f'Failed to create {kind} access URL'}), 503
 
 @app.route('/api/photos/access-batch', methods=['POST'])
 def photo_access_url_batch():
@@ -9163,7 +9162,7 @@ def trigger_clustering():
         return jsonify(response)
     except Exception as exc:
         app.logger.exception('People clustering endpoint failed')
-        return jsonify({'error': 'People clustering failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'People clustering failed'}), 500
 
 
 @app.route('/api/persons', methods=['GET'])
@@ -9323,7 +9322,7 @@ def list_persons():
         return jsonify({'persons': persons, 'total': total})
     except Exception as exc:
         app.logger.exception('List persons endpoint failed')
-        return jsonify({'error': 'List persons failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'List persons failed'}), 500
 
 
 @app.route('/api/persons/<person_id>', methods=['GET'])
@@ -9412,7 +9411,7 @@ def list_person_suggestions():
         return jsonify({'suggestions': suggestions})
     except Exception as exc:
         app.logger.exception('List person suggestions endpoint failed')
-        return jsonify({'error': 'List person suggestions failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'List person suggestions failed'}), 500
 
 
 @app.route('/api/persons/suggestions/decline', methods=['POST'])
@@ -9437,7 +9436,7 @@ def decline_person_suggestion():
         return jsonify({'success': True})
     except Exception as exc:
         app.logger.exception('Decline person suggestion endpoint failed')
-        return jsonify({'error': 'Decline person suggestion failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'Decline person suggestion failed'}), 500
 
 
 @app.route('/api/persons/<person_id>/label', methods=['POST'])
@@ -9703,7 +9702,7 @@ def find_person_faces(person_id: str):
         result = _propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=True)
     except Exception as exc:
         app.logger.exception('find_person_faces failed for %s', person_id)
-        return jsonify({'error': 'Find faces failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'Find faces failed'}), 500
     return jsonify({
         'success': True,
         'queued': False,
@@ -10421,7 +10420,8 @@ def _delete_faces_bulk(user_id: str, face_ids: List[str]) -> Dict:
         try:
             face_table_client.upsert_entity(face)
         except Exception as exc:
-            errors.append({'faceId': face_id, 'error': str(exc)})
+            app.logger.warning('Face reject upsert failed for %s: %s', face_id, exc)
+            errors.append({'faceId': face_id, 'error': 'update failed'})
             continue
         deleted.append(face_id)
         if filename:
@@ -10508,11 +10508,12 @@ def _split_face_into_new_person(user_id: str, person_id: str, face_id: str) -> D
     try:
         face_table_client.upsert_entity(face)
     except Exception as exc:
+        app.logger.exception('Face split upsert failed for %s', face_id)
         try:
             person_table_client.delete_entity(partition_key=user_id, row_key=new_person_id)
         except Exception:
             pass
-        return {'success': False, 'error': str(exc), 'status': 500}
+        return {'success': False, 'error': 'Failed to split face into new person', 'status': 500}
 
     _remove_face_from_other_people(user_id, face_id, new_person_id)
     _update_person_rep_embedding(user_id, new_person_id)
@@ -10650,7 +10651,7 @@ def list_faces():
         return jsonify({'faces': faces, 'total': total})
     except Exception as exc:
         app.logger.exception('List faces endpoint failed')
-        return jsonify({'error': 'List faces failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'List faces failed'}), 500
 
 
 @app.route('/api/faces/delete', methods=['POST'])
@@ -10737,7 +10738,7 @@ def init_upload():
             blob_url, expires_at = _create_direct_upload_blob_url(anonymous_blob_name or filename)
         except Exception as exc:
             app.logger.exception('Failed to create direct upload SAS for %s', filename)
-            return jsonify({'error': 'Direct upload is not configured', 'detail': str(exc)}), 503
+            return jsonify({'error': 'Direct upload is not configured'}), 503
     thumbnail_blob_url = None
     thumbnail_sas_expires_at = None
     try:
@@ -10857,7 +10858,8 @@ def init_upload_batch():
         try:
             blob_url, expires_at = _create_direct_upload_blob_url(anonymous_blob_name or filename)
         except Exception as exc:
-            results.append({'index': p['index'], 'filename': filename, 'error': 'Direct upload is not configured', 'detail': str(exc)})
+            app.logger.exception('Direct upload blob URL creation failed')
+            results.append({'index': p['index'], 'filename': filename, 'error': 'Direct upload is not configured'})
             continue
         thumbnail_blob_url = None
         thumbnail_sas_expires_at = None
@@ -11146,7 +11148,8 @@ def finalize_direct_upload():
         if int(getattr(props, 'size', 0) or 0) != total_size:
             return jsonify({'error': 'Uploaded blob size mismatch'}), 409
     except Exception as exc:
-        return jsonify({'error': 'Uploaded blob not found', 'detail': str(exc)}), 404
+        app.logger.exception('Uploaded blob property check failed')
+        return jsonify({'error': 'Uploaded blob not found'}), 404
 
     try:
         duplicates, final_name = finalize_uploaded_file(
@@ -11161,7 +11164,7 @@ def finalize_direct_upload():
         )
     except Exception as exc:
         app.logger.exception('Direct upload finalization failed for %s', filename)
-        return jsonify({'error': 'Upload finalization failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'Upload finalization failed'}), 500
     # finalize_uploaded_file writes metadata via storage_utils (bypassing
     # _update_metadata_entity_fields), so drop the scan cache explicitly: the
     # gallery refetches right after an upload and must see the new photo.
@@ -11317,7 +11320,8 @@ def finalize_upload_batch():
                 continue
         except Exception as exc:
             t = _accum('blob_check', t)
-            results.append({'index': idx, 'filename': filename, 'error': 'Uploaded blob not found', 'detail': str(exc)})
+            app.logger.exception('Batch upload blob property check failed')
+            results.append({'index': idx, 'filename': filename, 'error': 'Uploaded blob not found'})
             continue
         t = _accum('blob_check', t)
 
@@ -11335,7 +11339,7 @@ def finalize_upload_batch():
         except Exception as exc:
             t = _accum('finalize_write', t)
             app.logger.exception('Batch finalize failed for %s', filename)
-            results.append({'index': idx, 'filename': filename, 'error': 'Upload finalization failed', 'detail': str(exc)})
+            results.append({'index': idx, 'filename': filename, 'error': 'Upload finalization failed'})
             continue
         t = _accum('finalize_write', t)
 
@@ -11456,7 +11460,7 @@ def upload_client_processing_results():
         message = str(exc)
         if 'deleted' in message.lower():
             return jsonify({'error': 'Photo has been deleted'}), 410
-        return jsonify({'error': 'Client processing update failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'Client processing update failed'}), 500
     apply_ms = round((time.monotonic() - t) * 1000)
 
     # apply_client_processing_results_for_file writes via storage_utils,
@@ -11977,9 +11981,10 @@ def _claim_processing_lease_response(
         lease = claim_processing_lease(user_id, filename, lease_owner, lease_seconds=120, steps=steps)
     except Exception as exc:
         message = str(exc)
+        app.logger.warning('Processing lease claim failed for %s: %s', filename, exc)
         if 'already held by another client' in message.lower() or 'lease is already held' in message.lower():
-            return {'claimed': False, 'reason': 'lease_active', 'detail': message}, 200
-        return {'claimed': False, 'reason': 'lease_active', 'detail': message}, 409
+            return {'claimed': False, 'reason': 'lease_active'}, 200
+        return {'claimed': False, 'reason': 'lease_active'}, 409
     response = {
         'claimed': True,
         'leaseId': lease_owner,
@@ -12087,7 +12092,8 @@ def upload_processing_heartbeat():
     try:
         lease = heartbeat_processing_lease(user_id, filename, lease_id, lease_seconds=120)
     except Exception as exc:
-        return jsonify({'ok': False, 'reason': 'lease_missing', 'detail': str(exc)}), 409
+        app.logger.exception('Processing lease heartbeat failed')
+        return jsonify({'ok': False, 'reason': 'lease_missing'}), 409
     return jsonify({'ok': True, 'expiresAt': lease.get('leaseExpiresAt') or ''})
 
 
@@ -12142,7 +12148,8 @@ def _delete_blob_if_present(container_name: str, blob_name: str) -> Optional[str
     except Exception as exc:
         if _is_not_found_storage_error(exc):
             return None
-        return str(exc)
+        app.logger.warning('Blob delete failed for %s/%s: %s', container_name, blob_name, exc)
+        return 'delete failed'
     return None
 
 
@@ -12203,9 +12210,11 @@ def _delete_upload_temp_files_for_filename(filename: str, upload_id: str = '') -
                 os.remove(path)
                 deleted.append(entry)
             except OSError as exc:
-                errors.append(f'{entry}: {str(exc)}')
+                app.logger.warning('Temp file delete failed for %s: %s', entry, exc)
+                errors.append(f'{entry}: delete failed')
     except OSError as exc:
-        errors.append(str(exc))
+        app.logger.warning('Temp directory scan failed for %s: %s', temp_dir, exc)
+        errors.append('temp directory scan failed')
     return deleted, errors
 
 
@@ -12258,7 +12267,8 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
                 metadata_table_client.upsert_entity(metadata)
                 cleanup['metadataAction'] = 'trackingCleared'
             except Exception as exc:
-                cleanup['errors'].append(f'metadata: {str(exc)}')
+                app.logger.warning('Cleanup metadata update failed for %s: %s', filename, exc)
+                cleanup['errors'].append('metadata: update failed')
         else:
             # A failed/incomplete direct upload wrote its blob under the anonymous
             # UUID reserved at /upload/init. finalize may not have run, so read the
@@ -12305,7 +12315,8 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
                 metadata_table_client.delete_entity(partition_key=user_id, row_key=filename)
                 cleanup['metadataAction'] = 'deleted'
             except Exception as exc:
-                cleanup['errors'].append(f'metadata: {str(exc)}')
+                app.logger.warning('Cleanup metadata delete failed for %s: %s', filename, exc)
+                cleanup['errors'].append('metadata: delete failed')
 
     return cleanup
 
@@ -12373,7 +12384,8 @@ def list_photos():
         entries = [row['RowKey'] for row in metadata_rows if row.get('RowKey')]
         metadata_map = {row['RowKey']: row for row in metadata_rows if row.get('RowKey')}
     except Exception as exc:
-        return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+        app.logger.exception('Photo list metadata read failed')
+        return jsonify({'error': 'Unable to read photo metadata.'}), 503
 
     # Backfill: rows uploaded before finalize persisted uploadDate sort via the
     # volatile last_processing_update fallback. Stamp the derived value as their
@@ -12543,7 +12555,8 @@ def photos_timeline():
     try:
         metadata_rows = _cached_metadata_rows_for_user(user_id, purpose='photos.timeline')
     except Exception as exc:
-        return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+        app.logger.exception('Timeline metadata read failed')
+        return jsonify({'error': 'Unable to read photo metadata.'}), 503
     return jsonify(build_timeline_summary(metadata_rows))
 
 
@@ -12558,7 +12571,8 @@ def list_corrupted_uploads():
     try:
         rows = _cached_metadata_rows_for_user(user_id, purpose='uploads.corrupted')
     except Exception as exc:
-        return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+        app.logger.exception('Corrupted uploads metadata read failed')
+        return jsonify({'error': 'Unable to read photo metadata.'}), 503
 
     items = []
     for row in rows:
@@ -12848,7 +12862,8 @@ def search_photos():
         try:
             rows = _cached_metadata_rows_for_user(user_id, purpose='photos.search')
         except Exception as exc:
-            return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+            app.logger.exception('Photo search metadata read failed')
+            return jsonify({'error': 'Unable to read photo metadata.'}), 503
 
     pid_to_name, name_to_ids = _load_people_name_index(user_id)
     matched_person_groups = _matched_query_people_groups(query, name_to_ids)
@@ -13230,7 +13245,8 @@ def delete_multiple_photos():
                 metadata_table_client.delete_entity(partition_key=user_id, row_key=safe_name)
                 removed_any = True
             except Exception as exc:
-                file_errors.append(f'metadata: {str(exc)}')
+                app.logger.warning('Metadata delete failed for %s: %s', safe_name, exc)
+                file_errors.append('metadata: delete failed')
             # Best-effort: drop this library's dedup/collision index rows too,
             # so a deleted photo's hash/filename doesn't linger and confuse a
             # later upload (detect_duplicates self-heals a stale hit anyway).
@@ -13324,7 +13340,8 @@ def delete_multiple_albums_people():
             albums_table_client.delete_entity(partition_key=user_id, row_key=str(album_id))
             deleted_albums.append(album_id)
         except Exception as exc:
-            album_errors.append({'albumId': album_id, 'error': str(exc)})
+            app.logger.warning('Album delete failed for %s: %s', album_id, exc)
+            album_errors.append({'albumId': album_id, 'error': 'delete failed'})
 
     if person_ids:
         person_set = set(str(pid) for pid in person_ids)
@@ -13333,7 +13350,8 @@ def delete_multiple_albums_people():
                 person_table_client.delete_entity(partition_key=user_id, row_key=pid)
                 deleted_persons.append(pid)
             except Exception as exc:
-                person_errors.append({'personId': pid, 'error': str(exc)})
+                app.logger.warning('Person delete failed for %s: %s', pid, exc)
+                person_errors.append({'personId': pid, 'error': 'delete failed'})
 
         try:
             rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
@@ -13524,7 +13542,8 @@ def delete_album(album_id: str):
     try:
         albums_table_client.delete_entity(partition_key=user_id, row_key=album_id)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception('delete_album failed')
+        return jsonify({'error': 'Internal server error'}), 500
     return jsonify({'success': True})
 
 
@@ -13549,7 +13568,8 @@ def autocreate_albums():
     try:
         metadata_rows = _cached_metadata_rows_for_user(user_id, purpose='albums.smart_create')
     except Exception as exc:
-        return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+        app.logger.exception('Smart album metadata read failed')
+        return jsonify({'error': 'Unable to read photo metadata.'}), 503
 
     try:
         existing_rows = list(albums_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
@@ -13746,7 +13766,7 @@ def people_diagnostic():
         })
     except Exception as exc:
         app.logger.exception('People diagnostic failed')
-        return jsonify({'error': 'Diagnostic failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'Diagnostic failed'}), 500
 
 
 @app.route('/people/recluster', methods=['POST'])
@@ -13775,7 +13795,7 @@ def recluster_people():
         return jsonify(response)
     except Exception as exc:
         app.logger.exception('People recluster route failed')
-        return jsonify({'error': 'People recluster failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'People recluster failed'}), 500
 
 
 @app.route('/api/jobs/status', methods=['GET'])
@@ -13845,7 +13865,7 @@ def jobs_status():
         return jsonify({'jobs': jobs[:50]})
     except Exception as exc:
         app.logger.exception('Job status route failed')
-        return jsonify({'jobs': [], 'error': str(exc)}), 500
+        return jsonify({'jobs': [], 'error': 'Internal server error'}), 500
 
 
 @app.route('/api/people/assign-unclustered', methods=['POST'])
@@ -13860,7 +13880,7 @@ def assign_unclustered_people():
         return jsonify(_assign_unclustered_faces(user_id))
     except Exception as exc:
         app.logger.exception('Assign unclustered faces route failed')
-        return jsonify({'error': 'Assign unclustered faces failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'Assign unclustered faces failed'}), 500
 
 
 @app.route('/api/admin/people/recluster', methods=['POST'])
@@ -13889,7 +13909,7 @@ def admin_recluster_people():
         return jsonify(response)
     except Exception as exc:
         app.logger.exception('Admin people recluster route failed')
-        return jsonify({'error': 'Admin people recluster failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'Admin people recluster failed'}), 500
 
 
 @app.route('/api/admin/people/recluster/restore', methods=['POST'])
@@ -14004,7 +14024,7 @@ def admin_rebuild_vector_index():
         })
     except Exception as exc:
         app.logger.exception('Admin vector index rebuild failed')
-        return jsonify({'error': 'Admin vector index rebuild failed', 'detail': str(exc)}), 500
+        return jsonify({'error': 'Admin vector index rebuild failed'}), 500
 
 
 @app.route('/api/admin/people/repair-stale-memberships', methods=['POST'])
@@ -14063,7 +14083,7 @@ def admin_backfill_photos():
         metadata_rows = _cached_metadata_rows_for_user(user_id, purpose='admin.backfill')
     except Exception as exc:
         app.logger.exception('Backfill: failed to load metadata for %s', user_id)
-        return jsonify({'error': 'Failed to load photo metadata', 'detail': str(exc)}), 503
+        return jsonify({'error': 'Failed to load photo metadata'}), 503
 
     queued = 0
     skipped = 0
@@ -14289,7 +14309,8 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
         real_blobs: set = {b.name for b in container.list_blobs()}
         result['blobsFound'] = len(real_blobs)
     except Exception as exc:
-        result['errors'].append(f'Failed to list blobs: {exc}')
+        app.logger.exception('Purge: failed to list blobs')
+        result['errors'].append('Failed to list blobs')
         return result
 
     # Step 2: find metadata rows with no backing blob
@@ -14299,7 +14320,8 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
             select=['PartitionKey', 'RowKey', 'anonymousImageId', 'deleted'],
         ))
     except Exception as exc:
-        result['errors'].append(f'Failed to query metadata: {exc}')
+        app.logger.exception('Purge: failed to query metadata')
+        result['errors'].append('Failed to query metadata')
         return result
 
     orphaned_filenames: set = set()
@@ -14319,7 +14341,8 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
                     metadata_table_client.delete_entity(partition_key=user_id, row_key=filename)
                     result['orphanedMetadataDeleted'] += 1
                 except Exception as exc:
-                    result['errors'].append(f'metadata delete failed for {filename}: {exc}')
+                    app.logger.warning('Purge: metadata delete failed for %s: %s', filename, exc)
+                    result['errors'].append(f'metadata delete failed for {filename}')
 
     if not orphaned_filenames:
         return result
@@ -14343,7 +14366,8 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
                 1 for f in face_rows if str(f.get('filename') or '') in orphaned_filenames
             )
         except Exception as exc:
-            result['errors'].append(f'Failed to count orphaned face rows: {exc}')
+            app.logger.exception('Purge: failed to count orphaned face rows')
+            result['errors'].append('Failed to count orphaned face rows')
     else:
         try:
             face_rows_before = list(face_table_client.query_entities(
@@ -14367,7 +14391,8 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
             result['orphanedFacesDeleted'] = orphaned_face_count - remaining_orphaned
             result['personRecordsDeleted'] = len(deleted_person_ids)
         except Exception as exc:
-            result['errors'].append(f'Face/person cleanup failed: {exc}')
+            app.logger.exception('Purge: face/person cleanup failed')
+            result['errors'].append('Face/person cleanup failed')
 
     return result
 
@@ -14453,7 +14478,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             worker_logger.exception('Async preview generation failed for %s', filename)
             _update_metadata_entity_fields(user_id, filename, {'preview_status': 'failed'})
             if job_id:
-                _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'failed', error=str(exc), filename=filename)
+                _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'failed', error='Preview generation failed', filename=filename)
         return
 
     if job_type == 'library_clean':
@@ -14474,9 +14499,9 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         except Exception as exc:
             worker_logger.exception('Library clean failed for %s', target_library_id)
             if library_store is not None:
-                library_store.set_cleanup_failed(target_library_id, str(exc))
+                library_store.set_cleanup_failed(target_library_id, 'Library clean failed')
             if job_id:
-                _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error=str(exc), libraryId=target_library_id)
+                _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error='Library clean failed', libraryId=target_library_id)
         return
 
     if job_type == 'library_download':
@@ -14491,7 +14516,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         except Exception as exc:
             worker_logger.exception('Library download failed for %s', target_library_id)
             if job_id:
-                _upsert_job_status(job_id, user_id, 'library_download', 'failed', error=str(exc), libraryId=target_library_id)
+                _upsert_job_status(job_id, user_id, 'library_download', 'failed', error='Library download failed', libraryId=target_library_id)
         return
 
     if job_type == 'people_incremental_assign':
@@ -14622,7 +14647,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             except Exception as exc:
                 worker_logger.exception('Async identity propagation failed for %s', person_id)
                 if job_id:
-                    _upsert_job_status(job_id, user_id, 'clustering', 'failed', error=str(exc))
+                    _upsert_job_status(job_id, user_id, 'clustering', 'failed', error='Identity propagation failed')
                 return
             if job_id:
                 _upsert_job_status(
@@ -14777,7 +14802,7 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
     except Exception as exc:
         if job_id and user_id:
             try:
-                _upsert_job_status(job_id, user_id, 'clustering', 'failed', error=str(exc))
+                _upsert_job_status(job_id, user_id, 'clustering', 'failed', error='Clustering failed')
             except Exception:
                 pass
         worker_logger.exception('Failed to process %s queue message', queue_name)
@@ -14978,7 +15003,7 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             image_bytes = get_image_bytes()
         except Exception as exc:
             worker_logger.exception('ipworker image download failed for %s/%s', user_id, filename)
-            client_processing[step] = _failure_shape(step, str(exc))
+            client_processing[step] = _failure_shape(step, 'download_failed')
             continue
         step_started = time.monotonic()
         try:
@@ -14986,7 +15011,7 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             client_processing[step] = result if isinstance(result, dict) else _failure_shape(step, 'invalid_result_shape')
         except Exception as exc:
             worker_logger.exception('ipworker step %r failed for %s/%s', step, user_id, filename)
-            client_processing[step] = _failure_shape(step, str(exc))
+            client_processing[step] = _failure_shape(step, 'processing_failed')
         finally:
             step_ms[step] = round((time.monotonic() - step_started) * 1000)
         # 'preview' is meant to run first (see IPWORK_STEPS/callers): once it
@@ -15231,7 +15256,7 @@ def _process_ipwork_message(message) -> str:
     except Exception as exc:
         if job_id and user_id:
             try:
-                _upsert_job_status(job_id, user_id, 'ipwork', 'failed', error=str(exc))
+                _upsert_job_status(job_id, user_id, 'ipwork', 'failed', error='Photo processing failed')
             except Exception:
                 pass
         worker_logger.exception('Failed to process ipwork queue message')
@@ -15848,7 +15873,8 @@ def set_photo_rating(filename: str):
         _update_metadata_entity_fields(user_id, safe_name, {'rating': rating})
         return jsonify({'success': True, 'filename': filename, 'rating': rating})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception('set_photo_rating failed')
+        return jsonify({'error': 'Internal server error'}), 500
 
 
 @app.route('/photos/<filename>/like', methods=['POST'])
@@ -15888,7 +15914,8 @@ def toggle_like_photo(filename: str):
             'liked': user_id in liked_by,
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception('toggle_like_photo failed')
+        return jsonify({'error': 'Internal server error'}), 500
 
 
 @app.route('/photos/<filename>/rotation', methods=['POST'])
@@ -15918,7 +15945,8 @@ def set_photo_rotation(filename: str):
         })
         return jsonify({'success': True, 'filename': filename, 'rotation': rotation})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception('set_photo_rotation failed')
+        return jsonify({'error': 'Internal server error'}), 500
 
 
 @app.route('/photos/<filename>/metadata', methods=['GET'])
@@ -15972,7 +16000,8 @@ def get_photo_metadata(filename: str):
             'uploadDate': metadata.get('uploadDate'),
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception('get_photo_metadata failed')
+        return jsonify({'error': 'Internal server error'}), 500
 
 
 @app.route('/photos/filter', methods=['GET'])
@@ -16003,7 +16032,8 @@ def filter_photos():
         # preserves that order, so no per-request re-sort is needed.
         all_photos = _cached_sorted_metadata_rows_for_user(user_id, purpose='photos.filter')
     except Exception as exc:
-        return jsonify({'error': 'Unable to read photo metadata.', 'details': str(exc)}), 503
+        app.logger.exception('Photo filter metadata read failed')
+        return jsonify({'error': 'Unable to read photo metadata.'}), 503
 
     try:
         filtered = []
@@ -16042,7 +16072,8 @@ def filter_photos():
 
         return jsonify({'photos': photos, 'total': len(filtered), 'offset': offset, 'limit': limit})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception('filter_photos failed')
+        return jsonify({'error': 'Internal server error'}), 500
 
 
 # Guard other optional startup helpers to avoid import-time failures

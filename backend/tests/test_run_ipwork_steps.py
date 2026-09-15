@@ -45,7 +45,10 @@ def test_processor_exception_produces_diagnosable_face_shape(monkeypatch, steps_
     assert result['face']['hasData'] is False
     assert result['face']['faces'] == []
     assert result['face']['faceFailureStage'] == 'unsupported_runtime'
-    assert 'face model crashed' in result['face']['error']
+    # The raw exception text is logged server-side (worker_logger.exception)
+    # but not handed back in the shape -- it can carry internal paths/details
+    # that shouldn't reach the client, even the account's own owner.
+    assert result['face']['error'] == 'processing_failed'
 
 
 def test_non_dict_result_produces_diagnosable_face_shape(monkeypatch, steps_ctx):

@@ -106,7 +106,9 @@ def test_dispatch_exception_returns_error_not_done(metadata_table, monkeypatch):
     assert outcome == 'error'
     row = metadata_table.get_entity('jobs', app._job_row_key('ipwork:u1:f1'))
     assert row['status'] == 'failed'
-    assert 'boom' in row['error']
+    # The raw exception text is logged server-side, not stored on the job row
+    # (that row's 'error' field is read back by /api/jobs/status).
+    assert row['error'] == 'Photo processing failed'
 
 
 def test_dispatch_exception_past_max_retries_still_drops(metadata_table, monkeypatch):

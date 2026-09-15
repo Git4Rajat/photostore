@@ -206,6 +206,20 @@ def _valid_decimal_from_exiftool(value, ref: str, minimum: float, maximum: float
     return str(round(parsed, 7))
 
 
+_SAFE_EXT_RE = re.compile(r'[a-z0-9]{1,10}')
+
+
+def _safe_temp_suffix(filename: str, default_ext: str) -> str:
+    """Derive a ``NamedTemporaryFile`` suffix from a (possibly attacker-
+    controlled) filename's extension, restricted to a plain alphanumeric
+    charset so a crafted filename (e.g. containing ``/`` or ``..``) can't
+    inject a path separator into the resulting temp-file path."""
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else default_ext
+    if not _SAFE_EXT_RE.fullmatch(ext or ''):
+        ext = default_ext
+    return f'.{ext}'
+
+
 def extract_exif_from_path(path: str) -> Dict[str, str]:
     exif = _extract_exiftool_from_path(path)
     if exif:
@@ -225,8 +239,7 @@ def extract_exif_from_bytes(image_bytes: bytes, filename: str = '') -> Dict[str,
         pass
     if not image_bytes:
         return {}
-    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else 'raw'
-    suffix = f'.{ext}' if ext else '.raw'
+    suffix = _safe_temp_suffix(filename, 'raw')
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
             temp_file.write(image_bytes)

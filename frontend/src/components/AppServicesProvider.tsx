@@ -3863,7 +3863,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             },
         );
 
-        const sessionId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const sessionId = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
         const session: PersistedUploadSession = {
             id: sessionId,
             createdAt: Date.now(),

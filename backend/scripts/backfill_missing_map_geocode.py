@@ -103,7 +103,7 @@ def main() -> int:
         candidates += 1
         library_id = str(row.get("PartitionKey") or "")
         filename = str(row.get("RowKey") or "")
-        print(f"  candidate: {library_id}/{filename}  ({lat}, {lon})")
+        print(f"  candidate: {library_id}/{filename}")
 
         place = maps_utils.reverse_geocode(lat, lon)
         if not place or not (place.get("city") or place.get("country")):

@@ -1,6 +1,7 @@
 import hashlib
 import io
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -114,6 +115,20 @@ def allowed_file(filename: str) -> bool:
 
 def is_video_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in VIDEO_EXTENSIONS
+
+
+_SAFE_EXT_RE = re.compile(r'[a-z0-9]{1,10}')
+
+
+def _safe_temp_suffix(filename: str, default_ext: str) -> str:
+    """Derive a ``NamedTemporaryFile``/path suffix from a (possibly attacker-
+    controlled) filename's extension, restricted to a plain alphanumeric
+    charset so a crafted filename (e.g. containing ``/`` or ``..``) can't
+    inject a path separator into the resulting temp-file path."""
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else default_ext
+    if not _SAFE_EXT_RE.fullmatch(ext or ''):
+        ext = default_ext
+    return f'.{ext}'
 
 
 def _check_raw_header(content: bytes) -> Optional[Exception]:
@@ -450,8 +465,7 @@ def _extract_rawpy_thumbnail(raw, rawpy_module) -> Optional[bytes]:
 
 
 def _temporary_preview_from_bytes(image_bytes: bytes, filename: str) -> Optional[bytes]:
-    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else 'raw'
-    suffix = f'.{ext}' if ext else '.raw'
+    suffix = _safe_temp_suffix(filename, 'raw')
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
             temp_file.write(image_bytes)
@@ -498,9 +512,9 @@ def extract_video_frame_jpeg(video_bytes: bytes, filename: str = '') -> Optional
     ffmpeg = shutil.which('ffmpeg')
     if not ffmpeg or not video_bytes:
         return None
-    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else 'mp4'
+    suffix = _safe_temp_suffix(filename, 'mp4')
     with tempfile.TemporaryDirectory() as temp_dir:
-        source_path = os.path.join(temp_dir, f'source.{ext}')
+        source_path = os.path.join(temp_dir, f'source{suffix}')
         frame_path = os.path.join(temp_dir, 'frame.jpg')
         with open(source_path, 'wb') as source_file:
             source_file.write(video_bytes)
@@ -682,8 +696,7 @@ def extract_raw_native_preview_from_path(path: str) -> Optional[bytes]:
 
 
 def extract_raw_native_preview_bytes(image_bytes: bytes, filename: str) -> Optional[bytes]:
-    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else 'raw'
-    suffix = f'.{ext}' if ext else '.raw'
+    suffix = _safe_temp_suffix(filename, 'raw')
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
             temp_file.write(image_bytes)
