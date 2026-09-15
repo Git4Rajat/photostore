@@ -1,0 +1,103 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "config": {
+      "isWizard": false,
+      "basics": {
+        "description": "Deploy Photostore into your own Azure subscription. Set a login email and password below — that is your sign-in, no Microsoft account or app registration required.",
+        "location": {
+          "label": "Region",
+          "toolTip": "Azure region for the resource group and all resources.",
+          "resourceTypes": [
+            "Microsoft.App/containerApps"
+          ],
+          "visible": true
+        }
+      }
+    },
+    "basics": [
+      {
+        "name": "appName",
+        "type": "Microsoft.Common.TextBox",
+        "label": "App name",
+        "defaultValue": "photostore",
+        "toolTip": "Base name used as a prefix for resources. Lowercase letters and numbers only.",
+        "constraints": {
+          "required": true,
+          "regex": "^[a-z0-9]{3,17}$",
+          "validationMessage": "Use 3–17 lowercase letters and numbers only."
+        }
+      },
+      {
+        "name": "adminEmail",
+        "type": "Microsoft.Common.TextBox",
+        "label": "Login email",
+        "toolTip": "Used to sign in and to receive password-reset emails.",
+        "constraints": {
+          "required": true,
+          "regex": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+          "validationMessage": "Enter a valid email address."
+        }
+      },
+      {
+        "name": "adminPassword",
+        "type": "Microsoft.Common.PasswordBox",
+        "label": {
+          "password": "Login password",
+          "confirmPassword": "Confirm password"
+        },
+        "toolTip": "At least 8 characters. You can change it later inside the app.",
+        "constraints": {
+          "required": true,
+          "regex": "^.{8,}$",
+          "validationMessage": "Password must be at least 8 characters."
+        },
+        "options": {
+          "hideConfirmation": false
+        }
+      },
+      {
+        "name": "emailDataLocation",
+        "type": "Microsoft.Common.DropDown",
+        "label": "Email data location",
+        "defaultValue": "United States",
+        "toolTip": "Where Azure Communication Services stores email data. Pick the option closest to you.",
+        "constraints": {
+          "required": true,
+          "allowedValues": [
+            { "label": "United States", "value": "United States" },
+            { "label": "Europe", "value": "Europe" },
+            { "label": "Australia", "value": "Australia" },
+            { "label": "United Kingdom", "value": "United Kingdom" }
+          ]
+        }
+      },
+      {
+        "name": "processingMode",
+        "type": "Microsoft.Common.DropDown",
+        "label": "Photo processing",
+        "defaultValue": "browser",
+        "toolTip": "Where OCR/face/vision/geo processing runs. Browser: entirely client-side, same as today. Server (ipworker): the browser skips this work and a new container processes it instead -- better for low-power/mobile clients and enables bulk background reprocessing, but ipworker needs meaningfully more CPU/memory. Both: browser and server both attempt it and whichever finishes first wins -- doubles compute cost per step.",
+        "constraints": {
+          "required": true,
+          "allowedValues": [
+            { "label": "In your browser (default, no extra cost)", "value": "browser" },
+            { "label": "On the server (ipworker container)", "value": "backend" },
+            { "label": "Both (race, first result wins)", "value": "both" }
+          ]
+        }
+      }
+    ],
+    "steps": [],
+    "outputs": {
+      "appName": "[basics('appName')]",
+      "adminEmail": "[basics('adminEmail')]",
+      "adminPassword": "[basics('adminPassword')]",
+      "emailDataLocation": "[basics('emailDataLocation')]",
+      "processingMode": "[basics('processingMode')]",
+      "location": "[location()]"
+    }
+  }
+}

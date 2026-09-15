@@ -1,0 +1,1363 @@
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, HeartIcon, InformationCircleIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { postUploadJson, resolveApiUrl } from '../../services/apiClient';
+import { getAccessToken, isAuthEnabled } from '../../services/authClient';
+import { fetchProtectedBlobUrl } from '../../services/imageClient';
+import { getMediaKind, isVideoFilename, requiresBackendPreview } from '../../utils/photoDisplay';
+
+export interface ViewerPhoto {
+    filename: string;
+    url: string;
+    thumbnailUrl?: string;
+    previewUrl?: string;
+    rotation?: number;
+    thumbnailRotation?: number;
+    exifSummary?: {
+        camera?: string;
+        capturedAt?: string;
+        lens?: string;
+    };
+    location?: {
+        address?: string;
+    };
+    tags?: string[];
+    rating?: number;
+    likes?: number;
+    liked?: boolean;
+}
+
+interface PhotoViewerProps {
+    photos: ViewerPhoto[];
+    index: number | null;
+    onClose: () => void;
+    onIndexChange: (index: number) => void;
+    useProtectedMedia?: boolean;
+    onRotationSave?: (filename: string, rotation: number) => Promise<void> | void;
+    onRate?: (filename: string, rating: number) => Promise<void> | void;
+    onToggleLike?: (filename: string) => Promise<void> | void;
+}
+
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+const PLAYBACK_RATES = [0.25, 0.5, 1, 1.25, 1.5, 2] as const;
+const TOUCH_PAN_START_THRESHOLD = 8;
+const PRELOAD_NEIGHBOR_COUNT = 5;
+const normalizeRotation = (value?: number | null) => {
+    const rotation = Number(value || 0) % 360;
+    return rotation < 0 ? rotation + 360 : rotation;
+};
+
+// Thumbnail blobs may already have EXIF/RAW rotation baked in at generation time
+// (photo.thumbnailRotation); only the rotation on top of that needs to be applied
+// as a CSS transform, matching PhotoTile's gallery-tile behavior.
+const thumbnailDisplayRotation = (photo?: ViewerPhoto | null) => (
+    normalizeRotation(normalizeRotation(photo?.rotation) - normalizeRotation(photo?.thumbnailRotation))
+);
+
+// Exported so callers that warm caches ahead of opening the viewer (e.g.
+// PublicAlbumPage's initial-screen preview prefetch) resolve the exact same
+// path the viewer itself will request -- otherwise a mismatched path warms
+// the wrong URL and the later <img src> is still a cold fetch.
+export const getMainMediaPath = (photo?: ViewerPhoto | null) => {
+    if (!photo) {
+        return '';
+    }
+    if (photo.previewUrl) {
+        return photo.previewUrl;
+    }
+    // The shrunk preview is the default lightbox image for every non-video
+    // photo now, not just RAW/HEIC/JXL -- see access-batch's 'preview' kind
+    // and proxy_preview in app.py. The original is only ever shown after an
+    // explicit "full resolution" request (see the FR button).
+    if (!isVideoFilename(photo.filename)) {
+        return `/api/photos/preview/${encodeURIComponent(photo.filename)}`;
+    }
+    if (photo.url && !photo.url.includes('/thumbnail/') && !photo.url.includes('/thumb-')) {
+        return photo.url;
+    }
+    return photo.filename ? `/api/photos/image/${encodeURIComponent(photo.filename)}` : (photo.url || photo.thumbnailUrl || '');
+};
+
+const getThumbnailPath = (photo?: ViewerPhoto | null) => photo?.thumbnailUrl || photo?.url || '';
+const getNeighborIndexes = (index: number | null, total: number, range: number) => {
+    if (index === null || total <= 1) {
+        return [];
+    }
+    const indexes: number[] = [];
+    const seen = new Set<number>([index]);
+    for (let offset = 1; offset <= range; offset += 1) {
+        const previous = (index - offset + total) % total;
+        const next = (index + offset) % total;
+        if (!seen.has(previous)) {
+            indexes.push(previous);
+            seen.add(previous);
+        }
+        if (!seen.has(next)) {
+            indexes.push(next);
+            seen.add(next);
+        }
+    }
+    return indexes;
+};
+const getAccessKindForPath = (path: string): 'image' | 'preview' | 'thumbnail' => {
+    if (path.includes('/preview/')) {
+        return 'preview';
+    }
+    if (path.includes('/thumbnail/')) {
+        return 'thumbnail';
+    }
+    return 'image';
+};
+
+const isProtectedProxyPath = (path: string) => path.startsWith('/api/') || path.startsWith('/public/');
+const isAbsoluteHttpUrl = (path: string) => /^https?:\/\//i.test(path);
+
+const fetchPublicBlobUrl = async (path: string): Promise<string> => {
+    const response = await fetch(resolveApiUrl(path), { mode: 'cors', credentials: 'omit' });
+    if (!response.ok) {
+        const body = await response.text();
+        throw new Error(body || `Failed to fetch photo: ${response.status}`);
+    }
+    return URL.createObjectURL(await response.blob());
+};
+
+// Used by the "FR" (full resolution) control: fetches the original with a
+// streaming read so download progress can drive a round progress indicator,
+// and supports an AbortSignal so navigating to another photo mid-download
+// cancels the in-flight original fetch instead of letting it finish in the
+// background. Mirrors fetchProtectedBlobUrl/fetchPublicBlobUrl's auth
+// handling (SAS URLs carry their own auth in the query string; only
+// backend-relative paths need a bearer token) rather than importing those,
+// since neither supports progress/abort.
+const fetchBlobUrlWithProgress = async (
+    path: string,
+    shouldProtect: boolean,
+    options: { signal?: AbortSignal; onProgress?: (loadedBytes: number, totalBytes: number) => void } = {},
+): Promise<string> => {
+    const url = resolveApiUrl(path);
+    const headers: Record<string, string> = {};
+    const isSignedStorageUrl = isAbsoluteHttpUrl(path);
+    if (shouldProtect && !isSignedStorageUrl && isAuthEnabled()) {
+        const token = await getAccessToken();
+        if (!token) {
+            throw new Error('Authentication required for full-resolution fetch');
+        }
+        headers.Authorization = `Bearer ${token}`;
+    }
+    const response = await fetch(url, {
+        headers,
+        mode: 'cors',
+        credentials: 'omit',
+        signal: options.signal,
+    });
+    if (!response.ok) {
+        const body = await response.text();
+        throw new Error(body || `Failed to fetch original: ${response.status}`);
+    }
+    const totalBytes = Number(response.headers.get('Content-Length') || 0);
+    if (!response.body || !options.onProgress) {
+        return URL.createObjectURL(await response.blob());
+    }
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let loadedBytes = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+            break;
+        }
+        if (value) {
+            chunks.push(value);
+            loadedBytes += value.byteLength;
+            options.onProgress(loadedBytes, totalBytes);
+        }
+    }
+    const blob = new Blob(chunks as BlobPart[], { type: response.headers.get('Content-Type') || 'image/jpeg' });
+    return URL.createObjectURL(blob);
+};
+
+const formatPreviewError = (filename: string, detail?: string) => {
+    const kind = getMediaKind(filename);
+    const normalized = detail?.trim();
+    if (normalized) {
+        return normalized;
+    }
+    return kind === 'RAW'
+        ? 'We couldn’t build a preview for this RAW file — its format has no usable embedded preview or couldn’t be decoded on the server.'
+        : 'We couldn’t build a preview for this image.';
+};
+
+// The backend returns a JSON body ({ error, reason, detail }) on preview failures.
+// fetchProtectedBlobUrl surfaces that body as the thrown Error's message, so parse it
+// back out to show the specific, human-readable reason instead of a raw JSON string.
+const describePreviewFailure = (filename: string, rawMessage?: string | null): string => {
+    const message = rawMessage?.trim();
+    if (message) {
+        try {
+            const parsed = JSON.parse(message);
+            if (parsed && typeof parsed.detail === 'string' && parsed.detail.trim()) {
+                return parsed.detail.trim();
+            }
+        } catch {
+            // Not JSON (e.g. a network/transport error) — fall through to the generic text.
+        }
+    }
+    return formatPreviewError(filename);
+};
+
+const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onIndexChange, useProtectedMedia = true, onRotationSave, onRate, onToggleLike }) => {
+    const [zoom, setZoom] = useState(1);
+    const [pan, setPan] = useState({ x: 0, y: 0 });
+    const [isPanning, setIsPanning] = useState(false);
+    const [mediaLoading, setMediaLoading] = useState(false);
+    const [mediaError, setMediaError] = useState<string | null>(null);
+    const [mediaPathOverride, setMediaPathOverride] = useState<string | null>(null);
+    // Details (rating/likes/EXIF/tags) are hidden by default so the stage can use the
+    // full frame -- toggled via the "i" button superimposed on the photo.
+    const [showDetails, setShowDetails] = useState(false);
+    // Mobile-only "focus mode": tapping the photo hides the overlaid chrome (top bar,
+    // nav arrows, info toggle) so the stage reads as an unobstructed photo. Toggled from
+    // plain JS on any screen size, but only has a visual effect under the existing
+    // 720px mobile breakpoint (see .controls-hidden in index.css) -- desktop keeps chrome
+    // always visible since screen space isn't at a premium there.
+    const [controlsHidden, setControlsHidden] = useState(false);
+    // "FR" (full resolution): the lightbox shows the shrunk preview by default;
+    // these track the on-demand original fetch triggered by the FR button.
+    // fullResUrl (once set) becomes the mediaPathOverride for the active photo.
+    const [fullResUrl, setFullResUrl] = useState<string | null>(null);
+    const [fullResLoading, setFullResLoading] = useState(false);
+    const [fullResProgress, setFullResProgress] = useState(0);
+    const [fullResError, setFullResError] = useState<string | null>(null);
+    const fullResAbortRef = useRef<AbortController | null>(null);
+    const fullResObjectUrlRef = useRef<string | null>(null);
+    const [scopedMediaUrls, setScopedMediaUrls] = useState<Record<string, string>>({});
+    const [rotationDraft, setRotationDraft] = useState(0);
+    const [rotationSaving, setRotationSaving] = useState(false);
+    const [rotationError, setRotationError] = useState<string | null>(null);
+    const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+    const [stagePadding, setStagePadding] = useState({ left: 0, top: 0 });
+    const [resolvedUrls, setResolvedUrls] = useState<Record<string, string>>({});
+    const [playbackRate, setPlaybackRate] = useState(1);
+    const videoRef = useRef<HTMLVideoElement | null>(null);
+    const stageRef = useRef<HTMLDivElement | null>(null);
+    const panRef = useRef(pan);
+    const zoomRef = useRef(zoom);
+    const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+    const pinchDistanceRef = useRef<number | null>(null);
+    const panStartRef = useRef<{ x: number; y: number; panX: number; panY: number; started: boolean; pointerType: string } | null>(null);
+    const activePointerRef = useRef<number | null>(null);
+    const filmstripPointerRef = useRef<{ pointerId: number; x: number; y: number; scrollLeft: number; targetIndex: number | null; moved: boolean } | null>(null);
+    const suppressFilmstripClickRef = useRef(false);
+    const objectUrlsRef = useRef<string[]>([]);
+    const warmedPathsRef = useRef<Set<string>>(new Set());
+    // Paths already resolved (or in-flight) via the scoped access-batch mechanism, kept
+    // across navigation so we never re-request a signed URL we already hold.
+    const scopedResolvedRef = useRef<Set<string>>(new Set());
+    const filmstripRef = useRef<HTMLDivElement | null>(null);
+    const filmstripItemRefs = useRef<Record<number, HTMLButtonElement | null>>({});
+    const filmstripHasCenteredRef = useRef(false);
+
+    const activePhoto = index !== null ? photos[index] : null;
+    const activeIsVideo = Boolean(activePhoto && isVideoFilename(activePhoto.filename));
+    const primaryMediaPath = getMainMediaPath(activePhoto);
+    const mainMediaPath = mediaPathOverride || primaryMediaPath;
+    const shouldProtect = useProtectedMedia && isAuthEnabled();
+    const savedRotation = normalizeRotation(activePhoto?.rotation);
+    const rotationChanged = activePhoto ? rotationDraft !== savedRotation : false;
+    const canSaveRotation = Boolean(onRotationSave && activePhoto);
+    const isQuarterTurn = rotationDraft % 180 !== 0;
+    // The media normally fills the stage (width/height: 100% + object-fit: contain). For a
+    // quarter-turn we swap the element's width and height to the stage's content box, so
+    // that once it's rotated 90° the contained image maps back onto the full stage instead
+    // of overflowing. stageSize is the stage content box (padding excluded).
+    //
+    // The swapped box is deliberately larger than the stage in one axis (e.g. a landscape
+    // stage swapped to width=stage-height/height=stage-width is much taller than the stage).
+    // .photo-preview-stage is a grid with place-items:center, but that only centers an item
+    // within its track -- when the item's own size forces the track bigger than the (now
+    // fixed-height, see .photo-preview-panel) container, the grid pins the overflowing track
+    // to the start edge instead of centering it, so the rotated photo visibly sinks toward
+    // the bottom. Taking the element out of grid flow (position: absolute) and placing it
+    // with explicit pixel coordinates sidesteps that grid-overflow behavior entirely --
+    // rotate/scale still pivot around the box's own center (the CSS default transform-origin),
+    // which now sits exactly on the stage's true center regardless of how oversized the
+    // pre-rotation box is.
+    const rotationFitStyle = isQuarterTurn && stageSize.width > 0 && stageSize.height > 0
+        ? {
+            position: 'absolute' as const,
+            width: `${stageSize.height}px`,
+            height: `${stageSize.width}px`,
+            left: `${stagePadding.left + (stageSize.width - stageSize.height) / 2}px`,
+            top: `${stagePadding.top + (stageSize.height - stageSize.width) / 2}px`,
+            // The mobile breakpoint caps .photo-preview-media at max-width/max-height:
+            // 100% (of this now-absolutely-positioned element's containing block, i.e.
+            // the stage) -- which would silently clamp the deliberately oversized
+            // pre-rotation box back down and reintroduce the off-center rotation bug.
+            maxWidth: 'none' as const,
+            maxHeight: 'none' as const,
+        }
+        : undefined;
+    const imageUrl = activePhoto && (fullResUrl || mainMediaPath)
+        // fullResUrl is an already-fetched local object URL (see
+        // fetchFullResolution) -- pass it through directly rather than
+        // through the SAS-resolution paths below, which don't know about it.
+        ? (fullResUrl
+            ? fullResUrl
+            : (shouldProtect
+                // Signed storage URLs are already directly browser-fetchable and do
+                // not need scoped proxy resolution; using them directly prevents
+                // the viewer from waiting forever on an unresolved cache key.
+                ? (isAbsoluteHttpUrl(mainMediaPath)
+                    ? mainMediaPath
+                    : (scopedMediaUrls[mainMediaPath] || resolvedUrls[mainMediaPath]))
+                : resolveApiUrl(mainMediaPath)))
+        : '';
+
+    const filmstripIndexes = useMemo(() => {
+        if (index === null || photos.length === 0) {
+            return [];
+        }
+        const range = 60;
+        const indexes: number[] = [];
+        for (let offset = -range; offset <= range; offset += 1) {
+            const next = index + offset;
+            if (next >= 0 && next < photos.length) {
+                indexes.push(next);
+            }
+        }
+        return indexes;
+    }, [index, photos.length]);
+    const previewPreloadIndexes = useMemo(
+        () => getNeighborIndexes(index, photos.length, PRELOAD_NEIGHBOR_COUNT),
+        [index, photos.length],
+    );
+
+    useEffect(() => {
+        if (!activePhoto || !shouldProtect) {
+            setScopedMediaUrls({});
+            scopedResolvedRef.current.clear();
+            return undefined;
+        }
+
+        // Resolve the active photo's media plus each neighbor's main media through the
+        // scoped access-batch endpoint. Neighbors are resolved (and their bytes warmed)
+        // ahead of time and cached across navigation, so moving to a preloaded photo
+        // reuses an already-signed, already-fetched URL instead of re-downloading it.
+        const targets: Array<{ path: string; filename: string }> = [];
+        const pushTarget = (path: string | undefined, filename: string) => {
+            if (typeof path === 'string' && path.length > 0 && !path.startsWith('http')) {
+                targets.push({ path, filename });
+            }
+        };
+        pushTarget(primaryMediaPath, activePhoto.filename);
+        pushTarget(activePhoto.thumbnailUrl, activePhoto.filename);
+        pushTarget(activePhoto.previewUrl, activePhoto.filename);
+        // The original is never pre-signed/warmed here, even for the active photo:
+        // the lightbox shows the shrunk preview (primaryMediaPath) by default for
+        // every photo now, and the original is only ever fetched on an explicit
+        // "full resolution" request (see the FR button below) -- warming it
+        // automatically just because the lightbox opened would defeat that.
+        previewPreloadIndexes.forEach((photoIndex) => {
+            const neighbor = photos[photoIndex];
+            if (neighbor && !isVideoFilename(neighbor.filename || '')) {
+                pushTarget(getMainMediaPath(neighbor), neighbor.filename);
+            }
+        });
+
+        const seen = new Set<string>();
+        const pending = targets.filter(({ path }) => {
+            if (seen.has(path) || scopedResolvedRef.current.has(path)) {
+                return false;
+            }
+            seen.add(path);
+            return true;
+        });
+        if (pending.length === 0) {
+            return undefined;
+        }
+        pending.forEach(({ path }) => scopedResolvedRef.current.add(path));
+
+        // Gates only the surfacing of a failure message: a superseded run must still
+        // commit its resolved URLs (see below), but it must not flash an error for a
+        // photo the user has already navigated away from.
+        let runCurrent = true;
+        void (async () => {
+            const entries = await Promise.all(pending.map(async ({ path, filename }) => {
+                try {
+                    const result = await postUploadJson('/api/photos/access-batch', {
+                        kind: getAccessKindForPath(path),
+                        filenames: [filename],
+                    });
+                    const url = typeof result?.urls?.[filename] === 'string' ? result.urls[filename] : '';
+                    if (!url) {
+                        return { path, url: '', error: '' };
+                    }
+                    if (isProtectedProxyPath(url)) {
+                        const objectUrl = await fetchProtectedBlobUrl(url);
+                        objectUrlsRef.current.push(objectUrl);
+                        return { path, url: objectUrl, error: '' };
+                    }
+                    // Direct signed storage URL: warm the bytes so the eventual <img src>
+                    // (identical URL string) is served from cache without a visible reload.
+                    try {
+                        const img = new Image();
+                        img.src = url;
+                    } catch {
+                        /* image warming is best-effort */
+                    }
+                    return { path, url, error: '' };
+                } catch (err) {
+                    return { path, url: '', error: err instanceof Error ? err.message : '' };
+                }
+            }));
+            // Always commit, even if this run was superseded by fast navigation. The
+            // paths were already claimed in scopedResolvedRef (so they won't be
+            // re-requested), and scopedMediaUrls is a path-keyed cache merged into prior
+            // state — dropping a superseded run's results would leave the photo it
+            // resolved marked "resolved" but with no URL, stranding it on the loading
+            // spinner forever. Failed paths are released so a later pass can retry them.
+            const resolved = entries.filter((entry) => Boolean(entry.url)).map((entry) => [entry.path, entry.url] as const);
+            entries.filter((entry) => !entry.url).forEach((entry) => scopedResolvedRef.current.delete(entry.path));
+            if (resolved.length > 0) {
+                setScopedMediaUrls((prev) => ({ ...prev, ...Object.fromEntries(resolved) }));
+            }
+            // If the media the viewer is currently showing failed to resolve, replace the
+            // indefinite loading spinner with a specific, actionable failure message.
+            if (runCurrent) {
+                const primaryFailure = entries.find((entry) => entry.path === primaryMediaPath && !entry.url);
+                if (primaryFailure) {
+                    setMediaLoading(false);
+                    setMediaError(describePreviewFailure(activePhoto.filename, primaryFailure.error));
+                }
+            }
+        })();
+        return () => {
+            runCurrent = false;
+        };
+    }, [activePhoto, primaryMediaPath, shouldProtect, previewPreloadIndexes, photos]);
+
+    const downloadCurrentPhoto = useCallback(async () => {
+        if (!activePhoto) {
+            return;
+        }
+        try {
+            const downloadPath = activePhoto.url || mainMediaPath || activePhoto.thumbnailUrl || '';
+            if (!downloadPath) {
+                return;
+            }
+
+            const objectUrl = shouldProtect
+                ? await fetchProtectedBlobUrl(downloadPath)
+                : await fetchPublicBlobUrl(downloadPath);
+            objectUrlsRef.current.push(objectUrl);
+            const anchor = document.createElement('a');
+            anchor.href = objectUrl;
+            anchor.download = activePhoto.filename;
+            anchor.rel = 'noreferrer';
+            anchor.style.display = 'none';
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+            setTimeout(() => {
+                URL.revokeObjectURL(objectUrl);
+            }, 5000);
+        } catch {
+            setMediaError(formatPreviewError(activePhoto.filename, 'Download failed.'));
+        }
+    }, [activePhoto, mainMediaPath, shouldProtect]);
+
+    // Cancels an in-flight (or discards an already-fetched) full-resolution
+    // original: aborts the fetch, revokes its object URL, and resets FR state
+    // back to "showing the preview". Called on navigation (the "moved to next
+    // photo, stop downloading the one I left" behavior) and on close.
+    const cancelFullResolution = useCallback(() => {
+        fullResAbortRef.current?.abort();
+        fullResAbortRef.current = null;
+        if (fullResObjectUrlRef.current) {
+            URL.revokeObjectURL(fullResObjectUrlRef.current);
+            fullResObjectUrlRef.current = null;
+        }
+        setFullResUrl(null);
+        setFullResLoading(false);
+        setFullResProgress(0);
+        setFullResError(null);
+    }, []);
+
+    useEffect(() => {
+        cancelFullResolution();
+        // Deliberately keyed only on which photo is active, not on
+        // cancelFullResolution's identity (stable via useCallback's empty
+        // deps anyway) -- this is the abort-on-navigate behavior itself.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activePhoto?.filename]);
+
+    const fetchFullResolution = useCallback(async () => {
+        if (!activePhoto || fullResLoading || fullResUrl) {
+            return;
+        }
+        // RAW originals aren't browser-decodable -- fetch the backend's native-size
+        // embedded-preview extraction instead (same flip-corrected extraction the
+        // default shrunk preview uses, just without the 2048px cap). See
+        // extract_raw_native_preview_bytes in image_utils.py for why this never
+        // falls back to a full demosaic.
+        const isRaw = getMediaKind(activePhoto.filename) === 'RAW';
+        const originalPath = isRaw
+            ? `/api/photos/raw-full-preview/${encodeURIComponent(activePhoto.filename)}`
+            : (activePhoto.url || primaryMediaPath || activePhoto.thumbnailUrl || '');
+        if (!originalPath) {
+            return;
+        }
+        const controller = new AbortController();
+        fullResAbortRef.current = controller;
+        setFullResLoading(true);
+        setFullResProgress(0);
+        setFullResError(null);
+        try {
+            const objectUrl = await fetchBlobUrlWithProgress(originalPath, shouldProtect, {
+                signal: controller.signal,
+                onProgress: (loadedBytes, totalBytes) => {
+                    setFullResProgress(totalBytes > 0 ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100)) : 0);
+                },
+            });
+            if (controller.signal.aborted) {
+                URL.revokeObjectURL(objectUrl);
+                return;
+            }
+            fullResObjectUrlRef.current = objectUrl;
+            setFullResUrl(objectUrl);
+            setFullResProgress(100);
+        } catch (err) {
+            if (!controller.signal.aborted) {
+                const rawMessage = err instanceof Error ? err.message : undefined;
+                setFullResError(isRaw ? describePreviewFailure(activePhoto.filename, rawMessage) : (rawMessage || 'Failed to load full resolution.'));
+            }
+        } finally {
+            if (fullResAbortRef.current === controller) {
+                fullResAbortRef.current = null;
+            }
+            setFullResLoading(false);
+        }
+    }, [activePhoto, fullResLoading, fullResUrl, primaryMediaPath, shouldProtect]);
+
+    const close = useCallback(() => {
+        onClose();
+        setZoom(1);
+        setPan({ x: 0, y: 0 });
+        setIsPanning(false);
+        setMediaLoading(false);
+        setMediaError(null);
+        setMediaPathOverride(null);
+        cancelFullResolution();
+        setRotationError(null);
+        setRotationSaving(false);
+        setShowDetails(false);
+        setControlsHidden(false);
+        touchStartRef.current = null;
+        pinchDistanceRef.current = null;
+        panStartRef.current = null;
+        activePointerRef.current = null;
+        warmedPathsRef.current.clear();
+        filmstripHasCenteredRef.current = false;
+    }, [onClose, cancelFullResolution]);
+
+    const showPrevious = useCallback(() => {
+        if (index === null || photos.length === 0) {
+            return;
+        }
+        setMediaPathOverride(null);
+        onIndexChange((index - 1 + photos.length) % photos.length);
+        setZoom(1);
+        setPan({ x: 0, y: 0 });
+        setIsPanning(false);
+    }, [index, onIndexChange, photos.length]);
+
+    const showNext = useCallback(() => {
+        if (index === null || photos.length === 0) {
+            return;
+        }
+        setMediaPathOverride(null);
+        onIndexChange((index + 1) % photos.length);
+        setZoom(1);
+        setPan({ x: 0, y: 0 });
+        setIsPanning(false);
+    }, [index, onIndexChange, photos.length]);
+
+    const changePlaybackRate = useCallback((rate: number) => {
+        setPlaybackRate(rate);
+        if (videoRef.current) {
+            videoRef.current.playbackRate = rate;
+        }
+    }, []);
+
+    const rotateBy = useCallback((delta: number) => {
+        setRotationDraft((current) => normalizeRotation(current + delta));
+        setRotationError(null);
+    }, []);
+
+    const saveRotation = useCallback(async () => {
+        if (!activePhoto || !onRotationSave || rotationSaving || !rotationChanged) {
+            return;
+        }
+        setRotationSaving(true);
+        setRotationError(null);
+        try {
+            await onRotationSave(activePhoto.filename, rotationDraft);
+        } catch {
+            setRotationError('Rotation save failed.');
+        } finally {
+            setRotationSaving(false);
+        }
+    }, [activePhoto, onRotationSave, rotationChanged, rotationDraft, rotationSaving]);
+
+    const selectFilmstripPhoto = useCallback((photoIndex: number) => {
+        if (photoIndex < 0 || photoIndex >= photos.length) {
+            return;
+        }
+        setMediaPathOverride(null);
+        onIndexChange(photoIndex);
+        setZoom(1);
+        setPan({ x: 0, y: 0 });
+        setIsPanning(false);
+    }, [onIndexChange, photos.length]);
+
+    const handleFilmstripPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const target = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('.photo-preview-thumb');
+        const targetIndexValue = target?.dataset.photoIndex;
+        const targetIndex = targetIndexValue ? Number(targetIndexValue) : null;
+        filmstripPointerRef.current = {
+            pointerId: event.pointerId,
+            x: event.clientX,
+            y: event.clientY,
+            scrollLeft: event.currentTarget.scrollLeft,
+            targetIndex: Number.isFinite(targetIndex) ? targetIndex : null,
+            moved: false,
+        };
+        suppressFilmstripClickRef.current = false;
+    }, []);
+
+    const handleFilmstripPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const state = filmstripPointerRef.current;
+        if (!state || state.pointerId !== event.pointerId) {
+            return;
+        }
+        const movedByPointer = Math.hypot(event.clientX - state.x, event.clientY - state.y) > 10;
+        const movedByScroll = Math.abs(event.currentTarget.scrollLeft - state.scrollLeft) > 2;
+        if (movedByPointer || movedByScroll) {
+            state.moved = true;
+            suppressFilmstripClickRef.current = true;
+        }
+    }, []);
+
+    const handleFilmstripPointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const state = filmstripPointerRef.current;
+        if (!state || state.pointerId !== event.pointerId) {
+            return;
+        }
+        const endTarget = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('.photo-preview-thumb');
+        const endTargetIndexValue = endTarget?.dataset.photoIndex;
+        const endTargetIndex = endTargetIndexValue ? Number(endTargetIndexValue) : null;
+        const moved = state.moved
+            || Math.hypot(event.clientX - state.x, event.clientY - state.y) > 10
+            || Math.abs(event.currentTarget.scrollLeft - state.scrollLeft) > 2;
+        filmstripPointerRef.current = null;
+        suppressFilmstripClickRef.current = true;
+        if (!moved && state.targetIndex !== null && endTargetIndex === state.targetIndex) {
+            selectFilmstripPhoto(state.targetIndex);
+        }
+        window.setTimeout(() => {
+            suppressFilmstripClickRef.current = false;
+        }, 350);
+    }, [selectFilmstripPhoto]);
+
+    const handleFilmstripPointerCancel = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const state = filmstripPointerRef.current;
+        if (!state || state.pointerId !== event.pointerId) {
+            return;
+        }
+        state.moved = true;
+        filmstripPointerRef.current = null;
+        suppressFilmstripClickRef.current = true;
+        window.setTimeout(() => {
+            suppressFilmstripClickRef.current = false;
+        }, 350);
+    }, []);
+
+    const handleFilmstripScroll = useCallback(() => {
+        const state = filmstripPointerRef.current;
+        if (!state) {
+            return;
+        }
+        state.moved = true;
+        suppressFilmstripClickRef.current = true;
+    }, []);
+
+    const stopFilmstripTouchPropagation = useCallback((event: React.TouchEvent<HTMLDivElement>) => {
+        event.stopPropagation();
+    }, []);
+
+    const showPreviewFailure = useCallback((detail?: string) => {
+        const fallbackPath = activePhoto?.thumbnailUrl || '';
+        if (fallbackPath && fallbackPath !== mainMediaPath && mediaPathOverride !== fallbackPath) {
+            setMediaPathOverride(fallbackPath);
+            setMediaLoading(true);
+            setMediaError(null);
+            return;
+        }
+        if (activePhoto && requiresBackendPreview(activePhoto.filename)) {
+            setMediaLoading(false);
+            setMediaError(formatPreviewError(activePhoto.filename, detail));
+            return;
+        }
+        setMediaLoading(false);
+        setMediaError(formatPreviewError(activePhoto?.filename || '', detail));
+    }, [activePhoto, mainMediaPath, mediaPathOverride]);
+
+    const centerSelectedFilmstripItem = useCallback((behavior: ScrollBehavior = 'smooth') => {
+        const container = filmstripRef.current;
+        const selectedButton = index !== null ? filmstripItemRefs.current[index] : null;
+        if (!container || !selectedButton) {
+            return;
+        }
+
+        const selectedCenter = selectedButton.offsetLeft + (selectedButton.offsetWidth / 2);
+        const targetLeft = selectedCenter - (container.clientWidth / 2);
+        const maxLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+        const left = clamp(targetLeft, 0, maxLeft);
+
+        if (typeof container.scrollTo === 'function') {
+            container.scrollTo({ left, behavior });
+        } else {
+            container.scrollLeft = left;
+        }
+    }, [index]);
+
+    useEffect(() => {
+        panRef.current = pan;
+    }, [pan]);
+
+    useEffect(() => {
+        zoomRef.current = zoom;
+        if (zoom <= 1 && (panRef.current.x !== 0 || panRef.current.y !== 0)) {
+            setPan({ x: 0, y: 0 });
+            setIsPanning(false);
+        }
+    }, [zoom]);
+
+    useLayoutEffect(() => {
+        if (index === null || filmstripIndexes.length === 0) {
+            return;
+        }
+        const behavior: ScrollBehavior = filmstripHasCenteredRef.current ? 'smooth' : 'auto';
+        centerSelectedFilmstripItem(behavior);
+        const frame = window.requestAnimationFrame(() => {
+            centerSelectedFilmstripItem(behavior);
+            filmstripHasCenteredRef.current = true;
+        });
+        return () => window.cancelAnimationFrame(frame);
+    }, [centerSelectedFilmstripItem, filmstripIndexes, index]);
+
+    useEffect(() => {
+        if (index === null) {
+            return;
+        }
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                close();
+            } else if (event.key === 'ArrowLeft') {
+                showPrevious();
+            } else if (event.key === 'ArrowRight') {
+                showNext();
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [close, index, showNext, showPrevious]);
+
+    useEffect(() => {
+        if (index === null || photos.length === 0) {
+            return;
+        }
+        // Video blobs are streamed straight from their scoped URLs; prefetching
+        // them here would download the entire file.
+        // In protected mode the main images are prefetched (and byte-warmed) by the
+        // scoped access-batch effect via signed URLs, so warming proxy blobs for them
+        // here as well would download every neighbour twice — only warm thumbnails.
+        const mainPreloadPaths = shouldProtect
+            ? []
+            : [
+                ...(activeIsVideo ? [] : [mainMediaPath]),
+                ...previewPreloadIndexes
+                    .filter((photoIndex) => !isVideoFilename(photos[photoIndex]?.filename || ''))
+                    .map((photoIndex) => getMainMediaPath(photos[photoIndex])),
+            ];
+        const paths = [
+            ...mainPreloadPaths,
+            ...filmstripIndexes.map((photoIndex) => getThumbnailPath(photos[photoIndex])),
+        ].filter(Boolean);
+        paths.forEach((path) => {
+            if (warmedPathsRef.current.has(path)) {
+                return;
+            }
+            warmedPathsRef.current.add(path);
+            if (shouldProtect) {
+                void fetchProtectedBlobUrl(path).then((objectUrl) => {
+                    objectUrlsRef.current.push(objectUrl);
+                    setResolvedUrls((prev) => (prev[path] ? prev : { ...prev, [path]: objectUrl }));
+                }).catch(() => {
+                    warmedPathsRef.current.delete(path);
+                    if (path === mainMediaPath) {
+                        showPreviewFailure('Preview fetch failed.');
+                    }
+                });
+            } else {
+                const img = new Image();
+                img.src = resolveApiUrl(path);
+            }
+        });
+    }, [activeIsVideo, activePhoto, filmstripIndexes, index, mainMediaPath, photos, previewPreloadIndexes, shouldProtect, showPreviewFailure]);
+
+    useEffect(() => {
+        if (!activePhoto) {
+            setMediaLoading(false);
+            setMediaError(null);
+            setMediaPathOverride(null);
+            setRotationDraft(0);
+            setRotationError(null);
+            setRotationSaving(false);
+            return;
+        }
+        setMediaPathOverride(null);
+        setMediaLoading(true);
+        setMediaError(null);
+        setRotationDraft(normalizeRotation(activePhoto.rotation));
+        setRotationError(null);
+        setRotationSaving(false);
+        setZoom(1);
+        setPan({ x: 0, y: 0 });
+        setIsPanning(false);
+        // Key on the photo identity, not the object reference: a metadata-only update such
+        // as saving a rotation replaces the photo object while keeping the same filename and
+        // media URL. Re-running this reset then would flip mediaLoading back on without the
+        // <img> (whose src is unchanged) ever firing onLoad to clear it, leaving the preview
+        // stuck under the loading overlay until you navigate away and back.
+    }, [activePhoto?.filename]);
+
+    useEffect(() => {
+        if (!activePhoto || !imageUrl) {
+            return;
+        }
+        setMediaLoading(true);
+        setMediaError(null);
+    }, [activePhoto?.filename, imageUrl]);
+
+    useEffect(() => () => {
+        objectUrlsRef.current.forEach((url) => {
+            if (url.startsWith('blob:')) {
+                URL.revokeObjectURL(url);
+            }
+        });
+    }, []);
+
+    useEffect(() => {
+        const stage = stageRef.current;
+        if (!stage) {
+            return undefined;
+        }
+
+        const updateStageSize = () => {
+            // Report the content box (excluding padding) so it matches the area the media
+            // actually fills via width/height: 100%, and so quarter-turn swapping lands the
+            // rotated image on the same region rather than under the nav arrows.
+            const styles = window.getComputedStyle(stage);
+            const paddingLeft = parseFloat(styles.paddingLeft);
+            const paddingTop = parseFloat(styles.paddingTop);
+            const padX = paddingLeft + parseFloat(styles.paddingRight);
+            const padY = paddingTop + parseFloat(styles.paddingBottom);
+            setStageSize({
+                width: Math.max(0, stage.clientWidth - padX),
+                height: Math.max(0, stage.clientHeight - padY),
+            });
+            setStagePadding({ left: paddingLeft, top: paddingTop });
+        };
+        updateStageSize();
+
+        if (typeof ResizeObserver !== 'undefined') {
+            const observer = new ResizeObserver(updateStageSize);
+            observer.observe(stage);
+            return () => observer.disconnect();
+        }
+
+        window.addEventListener('resize', updateStageSize);
+        return () => window.removeEventListener('resize', updateStageSize);
+    }, [activePhoto]);
+
+    useEffect(() => {
+        if (!stageRef.current) {
+            return undefined;
+        }
+        const stage = stageRef.current;
+        const onWheel = (event: WheelEvent) => {
+            if (!event.ctrlKey && !event.metaKey) {
+                return;
+            }
+            event.preventDefault();
+            setZoom((current) => clamp(Number((current + (event.deltaY < 0 ? 0.18 : -0.18)).toFixed(2)), 1, 4));
+        };
+        const onTouchMove = (event: TouchEvent) => {
+            if (event.touches.length !== 2) {
+                return;
+            }
+            event.preventDefault();
+            const [first, second] = Array.from(event.touches);
+            const nextDistance = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
+            const previousDistance = pinchDistanceRef.current;
+            pinchDistanceRef.current = nextDistance;
+            if (!previousDistance) {
+                return;
+            }
+            setZoom((current) => clamp(Number((current * (nextDistance / previousDistance)).toFixed(2)), 1, 4));
+        };
+        const onPointerDown = (event: PointerEvent) => {
+            const currentZoom = zoomRef.current;
+            if ((event.pointerType === 'mouse' && event.button !== 0) || currentZoom <= 1) {
+                return;
+            }
+            activePointerRef.current = event.pointerId;
+            const currentPan = panRef.current;
+            panStartRef.current = {
+                x: event.clientX,
+                y: event.clientY,
+                panX: currentPan.x,
+                panY: currentPan.y,
+                started: event.pointerType !== 'touch',
+                pointerType: event.pointerType,
+            };
+            if (event.pointerType !== 'touch') {
+                event.preventDefault();
+                setIsPanning(true);
+                stage.setPointerCapture(event.pointerId);
+            }
+        };
+        const onPointerMove = (event: PointerEvent) => {
+            if (activePointerRef.current !== event.pointerId || !panStartRef.current || zoomRef.current <= 1) {
+                return;
+            }
+            const dx = event.clientX - panStartRef.current.x;
+            const dy = event.clientY - panStartRef.current.y;
+
+            if (!panStartRef.current.started) {
+                if (Math.hypot(dx, dy) < TOUCH_PAN_START_THRESHOLD) {
+                    return;
+                }
+                if (Math.abs(dy) > Math.abs(dx) * 1.15) {
+                    activePointerRef.current = null;
+                    panStartRef.current = null;
+                    setIsPanning(false);
+                    return;
+                }
+                panStartRef.current.started = true;
+                setIsPanning(true);
+                try {
+                    stage.setPointerCapture(event.pointerId);
+                } catch {
+                    // Some touch sequences are already owned by native page scroll.
+                }
+            }
+
+            event.preventDefault();
+            setPan({
+                x: panStartRef.current.panX + dx,
+                y: panStartRef.current.panY + dy,
+            });
+        };
+        const onPointerUp = (event: PointerEvent) => {
+            if (activePointerRef.current !== event.pointerId) {
+                return;
+            }
+            activePointerRef.current = null;
+            panStartRef.current = null;
+            setIsPanning(false);
+            if (zoomRef.current <= 1) {
+                setPan({ x: 0, y: 0 });
+            }
+            try {
+                stage.releasePointerCapture(event.pointerId);
+            } catch {
+                // Ignore capture release failures on older browsers / interrupted gestures.
+            }
+        };
+        stage.addEventListener('wheel', onWheel, { passive: false });
+        stage.addEventListener('touchmove', onTouchMove, { passive: false });
+        stage.addEventListener('pointerdown', onPointerDown);
+        stage.addEventListener('pointermove', onPointerMove, { passive: false });
+        stage.addEventListener('pointerup', onPointerUp);
+        stage.addEventListener('pointercancel', onPointerUp);
+        return () => {
+            stage.removeEventListener('wheel', onWheel);
+            stage.removeEventListener('touchmove', onTouchMove);
+            stage.removeEventListener('pointerdown', onPointerDown);
+            stage.removeEventListener('pointermove', onPointerMove);
+            stage.removeEventListener('pointerup', onPointerUp);
+            stage.removeEventListener('pointercancel', onPointerUp);
+        };
+    }, [activePhoto]);
+
+    if (!activePhoto) {
+        return null;
+    }
+
+    return (
+        <section
+            className="photo-preview"
+            role="region"
+            aria-label={activePhoto.filename}
+            onTouchStart={(event) => {
+                if (event.touches.length === 2) {
+                    const [first, second] = Array.from(event.touches);
+                    pinchDistanceRef.current = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
+                    touchStartRef.current = null;
+                    return;
+                }
+                const touch = event.touches[0];
+                touchStartRef.current = { x: touch.clientX, y: touch.clientY };
+            }}
+            onTouchEnd={(event) => {
+                if (event.touches.length < 2) {
+                    pinchDistanceRef.current = null;
+                }
+                if (zoomRef.current > 1) {
+                    touchStartRef.current = null;
+                    return;
+                }
+                const start = touchStartRef.current;
+                const touch = event.changedTouches[0];
+                touchStartRef.current = null;
+                if (!start || !touch) {
+                    return;
+                }
+                const dx = touch.clientX - start.x;
+                const dy = touch.clientY - start.y;
+                if (Math.abs(dx) < 48 || Math.abs(dx) < Math.abs(dy) * 1.2) {
+                    return;
+                }
+                if (dx < 0) {
+                    showNext();
+                } else {
+                    showPrevious();
+                }
+            }}
+        >
+            <div className={`photo-preview-panel${controlsHidden ? ' controls-hidden' : ''}`}>
+                <div className={`photo-preview-top${activeIsVideo ? ' is-video' : ''}`}>
+                    <div className="photo-preview-meta">
+                        <p className="photo-preview-title">{activePhoto.filename}</p>
+                        <p className="photo-preview-counter">
+                            {index !== null ? `${index + 1}/${photos.length}` : `0/${photos.length}`}
+                            {getMediaKind(activePhoto.filename) === 'RAW' ? ' · RAW preview' : ''}
+                            {rotationDraft ? ` · rotated ${rotationDraft}°${rotationChanged ? ' unsaved' : ''}` : (rotationChanged ? ' · rotation unsaved' : '')}
+                            {zoom > 1 ? ` · ${Math.round(zoom * 100)}%` : ''}
+                        </p>
+                        {rotationError && <p className="photo-preview-error">{rotationError}</p>}
+                    </div>
+                    <div className="photo-preview-tools">
+                        {!activeIsVideo && (
+                            <button
+                                type="button"
+                                className={`photo-preview-icon photo-preview-fr${fullResUrl ? ' is-active' : ''}`}
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (fullResLoading) {
+                                        cancelFullResolution();
+                                    } else if (!fullResUrl) {
+                                        void fetchFullResolution();
+                                    }
+                                }}
+                                aria-label={
+                                    fullResUrl
+                                        ? 'Showing full resolution'
+                                        : (fullResLoading ? `Loading full resolution, ${fullResProgress}%. Click to cancel.` : 'Load full resolution')
+                                }
+                                title={fullResError || undefined}
+                            >
+                                {fullResLoading ? (
+                                    <svg viewBox="0 0 36 36" className="photo-preview-fr-ring" aria-hidden="true">
+                                        <circle cx="18" cy="18" r="16" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                                        <circle
+                                            cx="18"
+                                            cy="18"
+                                            r="16"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            strokeWidth="3"
+                                            strokeLinecap="round"
+                                            strokeDasharray={100.53}
+                                            strokeDashoffset={100.53 * (1 - fullResProgress / 100)}
+                                            transform="rotate(-90 18 18)"
+                                        />
+                                    </svg>
+                                ) : (
+                                    <span className="photo-preview-fr-label">FR</span>
+                                )}
+                            </button>
+                        )}
+                        <button type="button" className="photo-preview-icon" onClick={(e) => { e.stopPropagation(); void downloadCurrentPhoto(); }} aria-label="Download photo">
+                            <ArrowDownTrayIcon className="toolbar-icon" />
+                        </button>
+                        {canSaveRotation && (
+                            <>
+                                <button type="button" className="photo-preview-icon" onClick={(e) => { e.stopPropagation(); rotateBy(-90); }} disabled={rotationSaving} aria-label="Rotate left">
+                                    <ArrowUturnLeftIcon className="toolbar-icon" />
+                                </button>
+                                <button type="button" className="photo-preview-icon" onClick={(e) => { e.stopPropagation(); rotateBy(90); }} disabled={rotationSaving} aria-label="Rotate right">
+                                    <ArrowUturnRightIcon className="toolbar-icon" />
+                                </button>
+                                <button type="button" className={`photo-preview-icon ${rotationChanged ? 'is-dirty' : ''}`} onClick={(e) => { e.stopPropagation(); void saveRotation(); }} disabled={!rotationChanged || rotationSaving} aria-label="Save rotation">
+                                    {rotationSaving ? <ArrowPathIcon className="toolbar-icon spin-icon" /> : <CheckIcon className="toolbar-icon" />}
+                                </button>
+                            </>
+                        )}
+                        <button type="button" className="photo-preview-icon" onClick={close} aria-label="Close">
+                            <XMarkIcon className="toolbar-icon" />
+                        </button>
+                    </div>
+                </div>
+                <button type="button" className="photo-preview-nav previous" onClick={showPrevious} aria-label="Previous photo">
+                    <ChevronLeftIcon className="photo-preview-nav-icon" />
+                </button>
+                <div
+                    ref={stageRef}
+                    className="photo-preview-stage"
+                    style={{ cursor: zoom > 1 ? (isPanning ? 'grabbing' : 'grab') : 'default' }}
+                    onClick={() => {
+                        // Only a plain tap toggles -- a real drag/swipe doesn't reach here as a
+                        // click at all (mobile browsers suppress the synthetic click once touch
+                        // movement exceeds their own small threshold), and while zoomed in a tap
+                        // is more likely an attempt to pan/inspect than a request to hide chrome.
+                        if (zoom <= 1) {
+                            setControlsHidden((current) => !current);
+                        }
+                    }}
+                >
+                    {mediaLoading && (
+                        <div className="photo-preview-loading" role="status">
+                            <ArrowPathIcon className="photo-preview-loading-icon" />
+                            <span>Loading preview…</span>
+                        </div>
+                    )}
+                    {mediaError && (
+                        <div className="photo-preview-loading photo-preview-error-panel" role="alert">
+                            <InformationCircleIcon className="photo-preview-loading-icon" />
+                            <div className="photo-preview-error-body">
+                                <span>{mediaError}</span>
+                                <button
+                                    type="button"
+                                    className="btn btn-soft photo-preview-download-original"
+                                    onClick={(e) => { e.stopPropagation(); void downloadCurrentPhoto(); }}
+                                >
+                                    <ArrowDownTrayIcon className="toolbar-icon" />
+                                    Download original
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    {imageUrl && !mediaError && (activeIsVideo ? (
+                        <video
+                            key={imageUrl}
+                            ref={videoRef}
+                            src={imageUrl}
+                            controls
+                            playsInline
+                            preload="metadata"
+                            poster={shouldProtect
+                                ? resolvedUrls[getThumbnailPath(activePhoto)]
+                                : (activePhoto.thumbnailUrl ? resolveApiUrl(activePhoto.thumbnailUrl) : undefined)}
+                            className={`photo-preview-media ${mediaLoading ? 'is-loading' : ''}`}
+                            // Cleared on loadedmetadata rather than loadeddata: iOS/WebKit mobile
+                            // browsers withhold loadeddata (any actual frame data) until the user
+                            // taps play, but still fire loadedmetadata for preload="metadata". Gating
+                            // on loadeddata would leave mobile stuck on the loading spinner forever.
+                            onLoadedMetadata={(event) => {
+                                event.currentTarget.playbackRate = playbackRate;
+                                setMediaLoading(false);
+                            }}
+                            onError={() => {
+                                showPreviewFailure('Video playback failed.');
+                            }}
+                        />
+                    ) : (
+                        <img
+                            key={imageUrl}
+                            src={imageUrl}
+                            alt={activePhoto.filename}
+                            draggable={false}
+                            onDragStart={(event) => event.preventDefault()}
+                            className={`photo-preview-media ${mediaLoading ? 'is-loading' : ''}`}
+                            style={{
+                                ...rotationFitStyle,
+                                transform: `translate3d(${pan.x}px, ${pan.y}px, 0) rotate(${rotationDraft}deg) scale(${zoom})`,
+                            }}
+                            onLoad={() => setMediaLoading(false)}
+                            onError={() => {
+                                // imageUrl prioritizes fullResUrl unconditionally (see its
+                                // definition above), so if a fetched "full resolution" image
+                                // fails to decode, showPreviewFailure()'s thumbnail-fallback
+                                // branch would never actually change what's rendered -- the
+                                // broken fullResUrl would stay pinned forever. Cancel it first
+                                // so imageUrl falls back to the shrunk preview, then surface why.
+                                if (fullResUrl) {
+                                    cancelFullResolution();
+                                    setFullResError(formatPreviewError(activePhoto.filename));
+                                    return;
+                                }
+                                showPreviewFailure();
+                            }}
+                        />
+                    ))}
+                    <button
+                        type="button"
+                        className={`photo-preview-icon photo-preview-info-toggle ${showDetails ? 'is-active' : ''}`}
+                        onClick={(e) => { e.stopPropagation(); setShowDetails((current) => !current); }}
+                        aria-label={showDetails ? 'Hide photo details' : 'Show photo details'}
+                        aria-pressed={showDetails}
+                    >
+                        <InformationCircleIcon className="toolbar-icon" />
+                    </button>
+                    {showDetails && (
+                        <div className="photo-preview-details" onClick={(event) => event.stopPropagation()}>
+                            {(onRate || onToggleLike) && (
+                                <div className="photo-preview-engage" onClick={(event) => event.stopPropagation()}>
+                                    {onRate && (
+                                        <div className="photo-preview-rate" role="group" aria-label="Rate photo">
+                                            {[1, 2, 3, 4, 5].map((star) => (
+                                                <button
+                                                    key={star}
+                                                    type="button"
+                                                    className={`photo-preview-star ${star <= Math.round(activePhoto.rating || 0) ? 'is-on' : ''}`}
+                                                    onClick={() => { void onRate(activePhoto.filename, star); }}
+                                                    aria-label={`Rate ${star} ${star === 1 ? 'star' : 'stars'}`}
+                                                    title={`Rate ${star}/5`}
+                                                >
+                                                    ★
+                                                </button>
+                                            ))}
+                                        </div>
+                                    )}
+                                    {onToggleLike && (
+                                        <button
+                                            type="button"
+                                            className={`photo-preview-like ${activePhoto.liked ? 'is-liked' : ''}`}
+                                            onClick={() => { void onToggleLike(activePhoto.filename); }}
+                                            aria-pressed={Boolean(activePhoto.liked)}
+                                            aria-label={activePhoto.liked ? 'Remove like' : 'Like photo'}
+                                        >
+                                            <HeartIcon className="toolbar-icon" />
+                                            <span>{activePhoto.likes || 0}</span>
+                                        </button>
+                                    )}
+                                </div>
+                            )}
+                            <div>
+                                <span className="photo-preview-label">Kind</span>
+                                <span>{getMediaKind(activePhoto.filename)}</span>
+                            </div>
+                            {activePhoto.exifSummary?.capturedAt && (
+                                <div>
+                                    <span className="photo-preview-label">Captured</span>
+                                    <span>{activePhoto.exifSummary.capturedAt}</span>
+                                </div>
+                            )}
+                            {activePhoto.exifSummary?.camera && (
+                                <div>
+                                    <span className="photo-preview-label">Camera</span>
+                                    <span>{activePhoto.exifSummary.camera}</span>
+                                </div>
+                            )}
+                            {activePhoto.location?.address && (
+                                <div>
+                                    <span className="photo-preview-label">Location</span>
+                                    <span>{activePhoto.location.address}</span>
+                                </div>
+                            )}
+                            {(activePhoto.tags || []).length > 0 && (
+                                <div className="photo-preview-tags">
+                                    {(activePhoto.tags || []).slice(0, 6).map((tag) => (
+                                        <span key={tag} className="tag-chip">{tag}</span>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+                {activeIsVideo && !mediaError && (
+                    <div className="photo-preview-speed" role="group" aria-label="Playback speed">
+                        <span className="photo-preview-label">Speed</span>
+                        {PLAYBACK_RATES.map((rate) => (
+                            <button
+                                key={rate}
+                                type="button"
+                                className={`photo-preview-speed-btn ${playbackRate === rate ? 'active' : ''}`}
+                                onClick={(e) => { e.stopPropagation(); changePlaybackRate(rate); }}
+                                aria-pressed={playbackRate === rate}
+                            >
+                                {rate}x
+                            </button>
+                        ))}
+                    </div>
+                )}
+                <button type="button" className="photo-preview-nav next" onClick={showNext} aria-label="Next photo">
+                    <ChevronRightIcon className="photo-preview-nav-icon" />
+                </button>
+                <div
+                    ref={filmstripRef}
+                    className="photo-preview-filmstrip"
+                    aria-label="Nearby photos"
+                    onPointerDown={handleFilmstripPointerDown}
+                    onPointerMove={handleFilmstripPointerMove}
+                    onPointerUp={handleFilmstripPointerUp}
+                    onPointerCancel={handleFilmstripPointerCancel}
+                    onScroll={handleFilmstripScroll}
+                    onTouchStart={stopFilmstripTouchPropagation}
+                    onTouchMove={stopFilmstripTouchPropagation}
+                    onTouchEnd={stopFilmstripTouchPropagation}
+                    onTouchCancel={stopFilmstripTouchPropagation}
+                >
+                    {filmstripIndexes.map((photoIndex) => {
+                        const photo = photos[photoIndex];
+                        const thumbPath = getThumbnailPath(photo);
+                        const thumbUrl = shouldProtect ? resolvedUrls[thumbPath] : resolveApiUrl(thumbPath);
+                        const selected = photoIndex === index;
+                        return (
+                            <button
+                                key={photo.filename}
+                                type="button"
+                                className={`photo-preview-thumb ${selected ? 'selected' : ''}`}
+                                data-photo-index={photoIndex}
+                                aria-current={selected ? 'true' : undefined}
+                                aria-pressed={selected}
+                                ref={(node) => {
+                                    filmstripItemRefs.current[photoIndex] = node;
+                                }}
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (suppressFilmstripClickRef.current) {
+                                        return;
+                                    }
+                                    selectFilmstripPhoto(photoIndex);
+                                }}
+                                aria-label={`View ${photo.filename}`}
+                            >
+                                <img
+                                    src={thumbUrl || undefined}
+                                    alt={photo.filename}
+                                    loading="lazy"
+                                    style={{ transform: `rotate(${thumbnailDisplayRotation(photo)}deg)` }}
+                                />
+                            </button>
+                        );
+                    })}
+                </div>
+            </div>
+        </section>
+    );
+};
+
+export default PhotoViewer;

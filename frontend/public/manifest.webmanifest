@@ -1,0 +1,29 @@
+{
+  "name": "Keepsake",
+  "short_name": "Keepsake",
+  "description": "Your own private photo library. Your memories stay yours.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f4ef",
+  "theme_color": "#1e6ae1",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ]
+}

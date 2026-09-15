@@ -1,0 +1,759 @@
+import hashlib
+import io
+import os
+import shutil
+import subprocess
+import tempfile
+from typing import Optional
+
+from PIL import Image, ImageDraw, ImageOps
+
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
+
+try:
+    import pillow_jxl  # noqa: F401 -- import side effect registers JXL with Pillow's Image.open()
+except Exception:
+    pass
+
+RESAMPLING_LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+
+RAW_EXTENSIONS_RAWPY = {
+    'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2',
+    'dng', 'orf', 'rw2', 'pef', 'ptx', 'raf', 'raw',
+    'rwl', '3fr', 'fff', 'mrw', 'x3f', 'erf', 'mef',
+    'mos', 'kdc', 'k25', 'dcr', 'dcs', 'drf', 'mdc',
+    'srw', 'rwz', 'bay', 'cap', 'eip', 'gpr', 'pxn', 'iiq',
+}
+
+RAW_EXTENSIONS_CINEMA = {
+    'ari',
+    'braw',
+    'r3d',
+}
+
+PILLOW_NATIVE = {
+    'tif', 'tiff', 'jpg', 'jpeg', 'png',
+    'webp', 'heic', 'heif', 'bmp', 'gif', 'jxl',
+}
+
+VIDEO_EXTENSIONS = {
+    'mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv',
+    '3gp', '3g2', 'mts', 'm2ts', 'mpg', 'mpeg', 'wmv',
+}
+
+ALLOWED_EXTENSIONS = PILLOW_NATIVE | RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | VIDEO_EXTENSIONS
+
+# Formats Pillow can decode server-side but that browsers can't render directly via
+# <img src>, so the frontend must fetch a backend-converted JPEG preview instead of
+# trying to display the original bytes (mirrors frontend/src/utils/photoDisplay.ts's
+# requiresBackendPreview).
+BROWSER_UNVIEWABLE_EXTENSIONS = RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | {'heic', 'heif', 'jxl'}
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+THUMBNAIL_SIZE = (120, 120)
+THUMBNAIL_QUALITY = 65
+THUMBNAIL_FORMAT = 'JPEG'
+PREVIEW_MAX_BYTES = 1_000_000
+PREVIEW_MAX_DIMENSION = 2048
+# Deliberately above PREVIEW_MAX_BYTES: a source already this close to the
+# target isn't worth the CPU to re-encode for a marginal size win, and since
+# the quality ladder always starts at quality=90, re-encoding an
+# already-well-compressed source can produce a BIGGER file than the original
+# (confirmed empirically -- a real ~600KB source came back at 769KB). See
+# convert_image_to_jpeg's skip check below.
+PREVIEW_SKIP_THRESHOLD_BYTES = 1_500_000
+MIN_SIZE_CINEMA = 1 * 1024 * 1024
+MIN_SIZE_RAW = 512 * 1024
+MIN_SIZE_VIDEO = 1024
+MIN_SIZE_DEFAULT = 1024
+VIDEO_THUMBNAIL_TIMEOUT_SECONDS = _env_int('VIDEO_THUMBNAIL_TIMEOUT_SECONDS', 30)
+RAW_PREVIEW_SCAN_CHUNK_BYTES = 1024 * 1024
+RAW_PREVIEW_SCAN_MAX_BYTES = _env_int('RAW_PREVIEW_SCAN_MAX_BYTES', 512 * 1024 * 1024)
+RAW_PREVIEW_MAX_EMBEDDED_JPEG_BYTES = _env_int('RAW_PREVIEW_MAX_EMBEDDED_JPEG_BYTES', 128 * 1024 * 1024)
+RAW_PREVIEW_TIMEOUT_SECONDS = _env_int('RAW_PREVIEW_TIMEOUT_SECONDS', 20)
+RAW_PREVIEW_EXIFTOOL_TAGS = (
+    'PreviewImage',
+    'JpgFromRaw',
+    'OtherImage',
+    'ThumbnailImage',
+    'PreviewTIFF',
+    'ThumbnailTIFF',
+    'FullSizePreview',
+    'RawThermalImage',
+)
+
+
+def compute_file_hash(content: bytes) -> str:
+    digest = hashlib.sha256()
+    digest.update(content)
+    return digest.hexdigest()
+
+
+def compute_file_hash_from_path(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, 'rb') as file_handle:
+        for chunk in iter(lambda: file_handle.read(8192), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def allowed_file(filename: str) -> bool:
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def is_video_file(filename: str) -> bool:
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in VIDEO_EXTENSIONS
+
+
+def _check_raw_header(content: bytes) -> Optional[Exception]:
+    if not content[:4096].strip(b'\x00'):
+        return ValueError('RAW file header is empty or zero-filled')
+    return None
+
+
+def verify_image(content: bytes, filename: str) -> Optional[Exception]:
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+    if ext in VIDEO_EXTENSIONS:
+        if len(content) < MIN_SIZE_VIDEO:
+            return ValueError(f'Video file too small ({len(content)} bytes) - likely corrupted')
+        return _check_raw_header(content)
+
+    if ext in PILLOW_NATIVE or ext not in (RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA):
+        try:
+            with Image.open(io.BytesIO(content)) as image:
+                image.verify()
+            return None
+        except Exception as exc:
+            return exc
+
+    if ext in RAW_EXTENSIONS_CINEMA:
+        if len(content) < MIN_SIZE_CINEMA:
+            return ValueError(f'Cinema RAW file too small ({len(content)} bytes) - likely corrupted')
+        header_error = _check_raw_header(content)
+        if header_error is not None:
+            return header_error
+        return None
+
+    if ext in RAW_EXTENSIONS_RAWPY:
+        if len(content) < MIN_SIZE_RAW:
+            return ValueError(f'RAW file too small ({len(content)} bytes) - likely corrupted')
+        header_error = _check_raw_header(content)
+        if header_error is not None:
+            return header_error
+        return None
+
+    return None
+
+
+def _save_image_to_bytes(image: Image.Image, fmt: str) -> bytes:
+    output = io.BytesIO()
+    image.save(output, format=fmt, quality=THUMBNAIL_QUALITY, optimize=True)
+    output.seek(0)
+    return output.read()
+
+
+def _encode_preview_jpeg(image: Image.Image) -> bytes:
+    if max(image.size) > PREVIEW_MAX_DIMENSION:
+        image.thumbnail((PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION), RESAMPLING_LANCZOS)
+
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+
+    for quality in (90, 82, 74, 66, 58):
+        output = io.BytesIO()
+        image.save(output, format='JPEG', quality=quality, optimize=True)
+        data = output.getvalue()
+        if len(data) <= PREVIEW_MAX_BYTES:
+            return data
+
+    image.thumbnail((1400, 1400), RESAMPLING_LANCZOS)
+    output = io.BytesIO()
+    image.save(output, format='JPEG', quality=58, optimize=True)
+    return output.getvalue()
+
+
+def _normalize_preview_bytes(image_bytes: bytes) -> Optional[bytes]:
+    # Deliberately does NOT apply ImageOps.exif_transpose -- every call site
+    # immediately feeds this function's output into _apply_raw_flip(raw_flip),
+    # which is the codebase's single authoritative orientation correction (see
+    # _RAW_FLIP_TRANSPOSE's comment on why raw.sizes.flip must be trusted over
+    # the embedded JPEG's own EXIF tag). An extracted RAW preview usually has
+    # no orientation tag of its own (Orientation=1), but on at least one real
+    # Apple ProRAW DNG the extracted PreviewImage carried a genuine, correct
+    # Orientation tag -- exif_transpose-ing it here and then applying raw_flip
+    # on top rotated it twice, landing on a wrong orientation (confirmed
+    # 2026-09-14: IMG_9206.DNG's regenerated preview/thumbnail came out
+    # rotated after the extract_raw_preview_bytes fix started actually
+    # reaching this real preview instead of a wrong/monochrome byte-scan
+    # result that happened not to carry its own orientation tag).
+    if not image_bytes:
+        return None
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            if image.format == 'JPEG':
+                return image_bytes
+            return _encode_preview_jpeg(image)
+    except Exception:
+        return None
+
+
+def _encode_preview_for_browser(image_bytes: bytes) -> Optional[bytes]:
+    if not image_bytes:
+        return None
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image = ImageOps.exif_transpose(image)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            return _encode_preview_jpeg(image)
+    except Exception:
+        return None
+
+
+RAW_PREVIEW_MIN_VISION_EDGE = 512
+
+# LibRaw's raw.sizes.flip values (0=none, 3=180, 5=90CCW-needed, 6=90CW-needed) mapped to
+# the Pillow transpose that corrects for them. Verified against real CR3 files: the embedded
+# preview/thumbnail JPEGs pulled out of a RAW container (via exiftool, a raw byte scan, or
+# LibRaw's extract_thumb) are sensor-orientation and carry no orientation tag of their own --
+# the largest embedded preview has EXIF Orientation=1 regardless of the shot's actual rotation,
+# so `raw.sizes.flip` (ground truth from LibRaw's header parse) has to be applied explicitly
+# rather than trusting the embedded JPEG's own EXIF.
+_RAW_FLIP_TRANSPOSE = {
+    3: Image.Transpose.ROTATE_180,
+    5: Image.Transpose.ROTATE_90,
+    6: Image.Transpose.ROTATE_270,
+}
+
+
+def _apply_raw_flip(jpeg_bytes: Optional[bytes], flip: int) -> Optional[bytes]:
+    method = _RAW_FLIP_TRANSPOSE.get(flip)
+    if not jpeg_bytes or method is None:
+        return jpeg_bytes
+    try:
+        with Image.open(io.BytesIO(jpeg_bytes)) as image:
+            rotated = image.convert('RGB').transpose(method)
+            output = io.BytesIO()
+            rotated.save(output, format='JPEG', quality=92)
+            return output.getvalue()
+    except Exception:
+        return jpeg_bytes
+
+
+def _raw_container_flip_from_path(path: str) -> int:
+    # Header-only read (no demosaic), so this is cheap to call before picking an extractor.
+    try:
+        import rawpy
+        with rawpy.imread(path) as raw:
+            return raw.sizes.flip
+    except Exception:
+        return 0
+
+
+def _raw_container_flip_from_bytes(image_bytes: bytes) -> int:
+    try:
+        import rawpy
+        with rawpy.imread(io.BytesIO(image_bytes)) as raw:
+            return raw.sizes.flip
+    except Exception:
+        return 0
+
+
+def _preview_score(image_bytes: Optional[bytes]) -> tuple[int, int]:
+    if not image_bytes:
+        return (0, 0)
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+        return (max(width, height), width * height)
+    except Exception:
+        return (0, 0)
+
+
+def _preview_good_enough_for_vision(image_bytes: Optional[bytes]) -> bool:
+    return _preview_score(image_bytes)[0] >= RAW_PREVIEW_MIN_VISION_EDGE
+
+
+def _best_preview(candidates) -> Optional[bytes]:
+    best: Optional[bytes] = None
+    best_score = (0, 0)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        score = _preview_score(candidate)
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
+def _run_preview_command(args: list[str]) -> Optional[bytes]:
+    try:
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=RAW_PREVIEW_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except Exception:
+        return None
+    return _normalize_preview_bytes(result.stdout)
+
+
+def _extract_exiftool_preview_from_path(path: str, raw_flip: int = 0) -> Optional[bytes]:
+    exiftool = shutil.which('exiftool')
+    if not exiftool:
+        return None
+    candidates = []
+    for tag in RAW_PREVIEW_EXIFTOOL_TAGS:
+        preview = _apply_raw_flip(_run_preview_command([exiftool, '-b', f'-{tag}', path]), raw_flip)
+        if _preview_good_enough_for_vision(preview):
+            return preview
+        if preview:
+            candidates.append(preview)
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_pattern = os.path.join(temp_dir, 'preview_%t%-c.%s')
+            subprocess.run(
+                [exiftool, '-q', '-q', '-a', '-b', '-preview:all', '-W', output_pattern, path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=RAW_PREVIEW_TIMEOUT_SECONDS,
+                check=False,
+            )
+            file_candidates = []
+            for name in os.listdir(temp_dir):
+                candidate_path = os.path.join(temp_dir, name)
+                try:
+                    size = os.path.getsize(candidate_path)
+                except OSError:
+                    continue
+                if 0 < size <= RAW_PREVIEW_MAX_EMBEDDED_JPEG_BYTES:
+                    file_candidates.append((size, candidate_path))
+            for _, candidate_path in sorted(file_candidates, reverse=True):
+                try:
+                    with open(candidate_path, 'rb') as candidate_file:
+                        preview = _apply_raw_flip(_normalize_preview_bytes(candidate_file.read()), raw_flip)
+                except Exception:
+                    preview = None
+                if _preview_good_enough_for_vision(preview):
+                    return preview
+                if preview:
+                    candidates.append(preview)
+    except Exception:
+        pass
+    return _best_preview(candidates)
+
+
+def _extract_ffmpeg_preview_from_path(path: str) -> Optional[bytes]:
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        return None
+    return _run_preview_command([
+        ffmpeg,
+        '-nostdin',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-i',
+        path,
+        '-frames:v',
+        '1',
+        '-an',
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'mjpeg',
+        'pipe:1',
+    ])
+
+
+def _extract_libraw_preview_from_path(path: str, raw_flip: int = 0) -> Optional[bytes]:
+    decoder = shutil.which('dcraw_emu') or shutil.which('dcraw')
+    if not decoder:
+        return None
+    candidates = []
+    # Only the first (embedded-thumbnail) variant is sensor-orientation and needs raw_flip
+    # applied manually -- the full-decode variants (`-w`) auto-rotate via dcraw's own default
+    # orientation handling, same as rawpy.postprocess()'s default `user_flip`.
+    for args, needs_flip in (
+        ([decoder, '-c', '-e', path], True),
+        ([decoder, '-c', '-w', '-h', path], False),
+        ([decoder, '-c', '-w', '-q', '0', '-H', '1', path], False),
+    ):
+        preview = _run_preview_command(args)
+        if needs_flip:
+            preview = _apply_raw_flip(preview, raw_flip)
+        if _preview_good_enough_for_vision(preview):
+            return preview
+        if preview:
+            candidates.append(preview)
+    return _best_preview(candidates)
+
+
+def _extract_rawpy_preview_from_path(path: str) -> Optional[bytes]:
+    try:
+        import rawpy
+        with rawpy.imread(path) as raw:
+            preview = _extract_rawpy_thumbnail(raw, rawpy)
+            if _preview_good_enough_for_vision(preview):
+                return preview
+            rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
+        return _encode_preview_jpeg(Image.fromarray(rgb))
+    except Exception:
+        return None
+
+
+def _extract_rawpy_preview_from_bytes(image_bytes: bytes) -> Optional[bytes]:
+    try:
+        import rawpy
+        with rawpy.imread(io.BytesIO(image_bytes)) as raw:
+            preview = _extract_rawpy_thumbnail(raw, rawpy)
+            if _preview_good_enough_for_vision(preview):
+                return preview
+            rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
+        return _encode_preview_jpeg(Image.fromarray(rgb))
+    except Exception:
+        return None
+
+
+def _extract_rawpy_thumbnail(raw, rawpy_module) -> Optional[bytes]:
+    try:
+        thumbnail = raw.extract_thumb()
+    except Exception:
+        return None
+    try:
+        if thumbnail.format == rawpy_module.ThumbFormat.JPEG:
+            # extract_thumb() pulls the same sensor-orientation embedded JPEG that exiftool/the
+            # raw byte scan would find -- apply the RAW's own detected orientation explicitly.
+            return _apply_raw_flip(_normalize_preview_bytes(thumbnail.data), raw.sizes.flip)
+        if thumbnail.format == rawpy_module.ThumbFormat.BITMAP:
+            return _apply_raw_flip(_encode_preview_jpeg(Image.fromarray(thumbnail.data)), raw.sizes.flip)
+    except Exception:
+        return None
+    return None
+
+
+def _temporary_preview_from_bytes(image_bytes: bytes, filename: str) -> Optional[bytes]:
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else 'raw'
+    suffix = f'.{ext}' if ext else '.raw'
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
+            temp_file.write(image_bytes)
+            temp_file.flush()
+            return extract_raw_preview_from_path(temp_file.name)
+    except Exception:
+        return None
+
+
+def create_placeholder_thumbnail() -> bytes:
+    image = Image.new('RGB', THUMBNAIL_SIZE, (232, 236, 242))
+    draw = ImageDraw.Draw(image)
+    # Make placeholder visually obvious so users can distinguish fallback tiles.
+    draw.rectangle((0, 0, THUMBNAIL_SIZE[0] - 1, THUMBNAIL_SIZE[1] - 1), outline=(110, 120, 140), width=2)
+    draw.line((0, 0, THUMBNAIL_SIZE[0] - 1, THUMBNAIL_SIZE[1] - 1), fill=(150, 160, 180), width=2)
+    draw.line((THUMBNAIL_SIZE[0] - 1, 0, 0, THUMBNAIL_SIZE[1] - 1), fill=(150, 160, 180), width=2)
+    draw.rectangle((34, 44, 86, 76), outline=(110, 120, 140), width=2)
+    return _save_image_to_bytes(image, THUMBNAIL_FORMAT)
+
+
+def create_thumbnail_data(source_bytes: bytes) -> bytes:
+    try:
+        with Image.open(io.BytesIO(source_bytes)) as image:
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail(THUMBNAIL_SIZE, RESAMPLING_LANCZOS)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            return _save_image_to_bytes(image, THUMBNAIL_FORMAT)
+    except Exception:
+        converted = convert_image_to_jpeg(source_bytes)
+        if converted != source_bytes:
+            try:
+                with Image.open(io.BytesIO(converted)) as image:
+                    image.thumbnail(THUMBNAIL_SIZE, RESAMPLING_LANCZOS)
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                    return _save_image_to_bytes(image, THUMBNAIL_FORMAT)
+            except Exception:
+                pass
+        return create_placeholder_thumbnail()
+
+
+def extract_video_frame_jpeg(video_bytes: bytes, filename: str = '') -> Optional[bytes]:
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg or not video_bytes:
+        return None
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else 'mp4'
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source_path = os.path.join(temp_dir, f'source.{ext}')
+        frame_path = os.path.join(temp_dir, 'frame.jpg')
+        with open(source_path, 'wb') as source_file:
+            source_file.write(video_bytes)
+        for seek in ('1', '0'):
+            try:
+                result = subprocess.run(
+                    [ffmpeg, '-y', '-ss', seek, '-i', source_path, '-frames:v', '1', '-q:v', '3', frame_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=VIDEO_THUMBNAIL_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            except Exception:
+                return None
+            if result.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                with open(frame_path, 'rb') as frame_file:
+                    return frame_file.read()
+    return None
+
+
+def create_video_thumbnail_data(video_bytes: bytes, filename: str = '') -> Optional[bytes]:
+    frame_bytes = extract_video_frame_jpeg(video_bytes, filename)
+    if not frame_bytes:
+        return None
+    return create_thumbnail_data(frame_bytes)
+
+
+def create_thumbnail_data_from_path(path: str) -> bytes:
+    try:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail(THUMBNAIL_SIZE, RESAMPLING_LANCZOS)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            return _save_image_to_bytes(image, THUMBNAIL_FORMAT)
+    except Exception:
+        preview = extract_raw_preview_from_path(path)
+        if preview:
+            try:
+                with Image.open(io.BytesIO(preview)) as image:
+                    image = ImageOps.exif_transpose(image)
+                    image.thumbnail(THUMBNAIL_SIZE, RESAMPLING_LANCZOS)
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                    return _save_image_to_bytes(image, THUMBNAIL_FORMAT)
+            except Exception:
+                pass
+        return create_placeholder_thumbnail()
+
+
+def extract_embedded_jpeg(raw_bytes: bytes, raw_flip: int = 0) -> Optional[bytes]:
+    candidates = []
+    start = 0
+    while True:
+        soi = raw_bytes.find(b'\xff\xd8', start)
+        if soi == -1:
+            break
+        eoi = raw_bytes.find(b'\xff\xd9', soi + 2)
+        if eoi == -1:
+            break
+        segment = raw_bytes[soi:eoi + 2]
+        if len(segment) > 2:
+            candidates.append(segment)
+        start = eoi + 2
+
+    if not candidates:
+        return None
+
+    # Prefer the largest segment that is actually a decodable JPEG. DNG (and some
+    # other RAWs) store their raw sensor data as a lossless JPEG that is larger
+    # than the embedded preview but cannot be decoded, so picking "largest" alone
+    # yields an undecodable stream; fall through to the next-largest instead.
+    for segment in sorted(candidates, key=len, reverse=True):
+        normalized = _apply_raw_flip(_normalize_preview_bytes(segment), raw_flip)
+        if normalized:
+            return normalized
+    return None
+
+
+def extract_embedded_jpeg_from_path(path: str, raw_flip: int = 0) -> Optional[bytes]:
+    best: Optional[bytes] = None
+    pending = b''
+    scanned = 0
+    try:
+        with open(path, 'rb') as file_handle:
+            while scanned < RAW_PREVIEW_SCAN_MAX_BYTES:
+                chunk = file_handle.read(min(RAW_PREVIEW_SCAN_CHUNK_BYTES, RAW_PREVIEW_SCAN_MAX_BYTES - scanned))
+                if not chunk:
+                    break
+                scanned += len(chunk)
+                data = pending + chunk
+                next_pending = data[-1:]
+                start = 0
+                while True:
+                    soi = data.find(b'\xff\xd8', start)
+                    if soi == -1:
+                        break
+                    eoi = data.find(b'\xff\xd9', soi + 2)
+                    if eoi == -1:
+                        next_pending = data[soi:]
+                        if len(next_pending) > RAW_PREVIEW_MAX_EMBEDDED_JPEG_BYTES:
+                            next_pending = b''
+                        break
+                    segment = data[soi:eoi + 2]
+                    if len(segment) > 16_384 and (best is None or len(segment) > len(best)):
+                        normalized = _apply_raw_flip(_normalize_preview_bytes(segment), raw_flip)
+                        if normalized:
+                            best = normalized
+                    start = eoi + 2
+                pending = next_pending
+        return best
+    except Exception:
+        return None
+
+
+def extract_raw_preview_from_path(path: str) -> Optional[bytes]:
+    # Computed once up front (cheap header-only read) and passed to whichever extractors
+    # return sensor-orientation embedded previews/thumbnails; see _RAW_FLIP_TRANSPOSE.
+    # _extract_rawpy_preview_from_path and _extract_ffmpeg_preview_from_path are excluded:
+    # rawpy applies raw.sizes.flip itself (both in its extract_thumb path and its default
+    # postprocess() orientation), and the ffmpeg preview is too rare/unverified a path to
+    # risk a blind correction on.
+    raw_flip = _raw_container_flip_from_path(path)
+    candidates = []
+    # rawpy/libraw are structural parsers (they read the container's own IFD/offset
+    # tables), so they're tried before the blind byte-scan fallback. The byte scan just
+    # hunts for FFD8..FFD9 pairs and picks the largest one that happens to decode -- for
+    # DNGs whose real preview is itself a multi-picture (MPO) blob with a secondary
+    # auxiliary frame (e.g. Apple ProRAW's embedded HDR gain map), a stray marker-like
+    # byte elsewhere in the file can corrupt the real preview's apparent boundary, and
+    # the scanner falls through past dozens of undecodable raw-tile candidates straight
+    # to that small, technically-decodable-but-wrong auxiliary frame.
+    for extractor, args in (
+        (_extract_exiftool_preview_from_path, (path, raw_flip)),
+        (_extract_rawpy_preview_from_path, (path,)),
+        (_extract_libraw_preview_from_path, (path, raw_flip)),
+        (extract_embedded_jpeg_from_path, (path, raw_flip)),
+        (_extract_ffmpeg_preview_from_path, (path,)),
+    ):
+        preview = extractor(*args)
+        if _preview_good_enough_for_vision(preview):
+            return preview
+        if preview:
+            candidates.append(preview)
+    return _best_preview(candidates)
+
+
+def _extract_rawpy_thumb_only_from_path(path: str) -> Optional[bytes]:
+    # Unlike _extract_rawpy_preview_from_path, this never falls through to
+    # raw.postprocess() -- that's a real demosaic with no timeout/resource guard
+    # anywhere in this codebase (it's only ever safe today because it's confined
+    # to the async preview-generation worker job, not a synchronous web request).
+    try:
+        import rawpy
+        with rawpy.imread(path) as raw:
+            return _extract_rawpy_thumbnail(raw, rawpy)
+    except Exception:
+        return None
+
+
+def extract_raw_native_preview_from_path(path: str) -> Optional[bytes]:
+    # Used by the FR ("full resolution") lightbox button: the largest embedded
+    # preview at its native size (no PREVIEW_MAX_DIMENSION shrink). Deliberately
+    # restricted to extractors that only pull an *existing* embedded JPEG --
+    # never a demosaic -- so this is always cheap and bounded. If a RAW file has
+    # no embedded preview at all, that's a genuine "nothing better available"
+    # case here, not a trigger to fall back to a synchronous full decode.
+    raw_flip = _raw_container_flip_from_path(path)
+    candidates = []
+    for extractor, args in (
+        (_extract_exiftool_preview_from_path, (path, raw_flip)),
+        (extract_embedded_jpeg_from_path, (path, raw_flip)),
+        (_extract_rawpy_thumb_only_from_path, (path,)),
+    ):
+        preview = extractor(*args)
+        if preview:
+            candidates.append(preview)
+    return _best_preview(candidates)
+
+
+def extract_raw_native_preview_bytes(image_bytes: bytes, filename: str) -> Optional[bytes]:
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else 'raw'
+    suffix = f'.{ext}' if ext else '.raw'
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
+            temp_file.write(image_bytes)
+            temp_file.flush()
+            return extract_raw_native_preview_from_path(temp_file.name)
+    except Exception:
+        return None
+
+
+def extract_raw_preview_bytes(image_bytes: bytes, filename: str = '') -> Optional[bytes]:
+    candidates = []
+    # Structural parsers (exiftool/rawpy/libraw, via _temporary_preview_from_bytes's
+    # temp-file + extract_raw_preview_from_path) are tried before the blind
+    # byte-scan fallback below -- mirrors extract_raw_preview_from_path's own
+    # ordering (see its docstring) and for the same reason: a stray marker-like
+    # byte inside a RAW's compressed sensor-tile data, which sits immediately
+    # before the real embedded preview on formats like Apple ProRAW DNG, can
+    # poison extract_embedded_jpeg's blind scan into picking a
+    # decodable-but-wrong monochrome auxiliary image instead of the real color
+    # preview. This bytes-only variant had drifted from that safer ordering --
+    # confirmed against a real ProRAW DNG (2026-09-14): the blind scan returned
+    # a perfectly monochrome result that then got served to every caller of
+    # convert_image_to_jpeg (thumbnail/ocr/face/ai_vision/preview) and, once
+    # accepted, permanently locked in as the stored preview blob (subsequent
+    # requests just re-fetch that same blob instead of re-extracting).
+    if filename:
+        preview = _temporary_preview_from_bytes(image_bytes, filename)
+        if _preview_good_enough_for_vision(preview):
+            return preview
+        if preview:
+            candidates.append(preview)
+    preview = extract_embedded_jpeg(image_bytes, _raw_container_flip_from_bytes(image_bytes))
+    if _preview_good_enough_for_vision(preview):
+        return preview
+    if preview:
+        candidates.append(preview)
+    preview = _extract_rawpy_preview_from_bytes(image_bytes)
+    if _preview_good_enough_for_vision(preview):
+        return preview
+    if preview:
+        candidates.append(preview)
+    return _best_preview(candidates)
+
+
+def convert_image_to_jpeg(image_bytes: bytes, filename: str = '') -> bytes:
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
+    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
+        preview = extract_raw_preview_bytes(image_bytes, filename)
+        if preview:
+            return _encode_preview_for_browser(preview) or preview
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            # Already a JPEG, already within the dimension cap, and already
+            # small -- decoding/re-encoding it would only cost CPU for no
+            # real benefit (see PREVIEW_SKIP_THRESHOLD_BYTES above). Checked
+            # before exif_transpose so image.format still reflects the
+            # source file, not a post-transform copy; the returned bytes
+            # keep their original EXIF orientation tag unbaked, same as how
+            # the original-image serving path already relies on the browser
+            # to auto-orient (see [[portrait-thumbnail-rotation-bug]]).
+            if (
+                image.format == 'JPEG'
+                and max(image.size) <= PREVIEW_MAX_DIMENSION
+                and len(image_bytes) <= PREVIEW_SKIP_THRESHOLD_BYTES
+            ):
+                return image_bytes
+            image = ImageOps.exif_transpose(image)
+            return _encode_preview_jpeg(image)
+    except Exception:
+        preview = extract_raw_preview_bytes(image_bytes, filename)
+        if preview:
+            return _encode_preview_for_browser(preview) or preview
+        return image_bytes

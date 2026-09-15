@@ -1,0 +1,291 @@
+"""Unit tests for the ipwork stale-processing sweep.
+
+A photo can miss the one-time upload-time race between the browser tab and
+ipworker (e.g. uploaded while ipworker was admin-stopped, or briefly while
+PROCESSING_MODE was 'browser') and end up stuck pending forever: ipworker
+only ever sees what's explicitly queued to it, and the browser's own
+/upload/processing/pending poll only covers whichever one library a
+currently-open tab has active. _sweep_stale_processing_into_ipwork runs on
+a background thread inside every ipworker replica and re-offers exactly
+that class of orphaned photo -- across every library, not just one -- back
+to ipworker, without re-touching photos that are already done or already
+have a message legitimately in flight.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+from azure.data.tables import TableEntity
+
+import app
+
+
+def _iso(seconds_ago: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+
+
+def _entity(**overrides):
+    base = {
+        'RowKey': 'photo.jpg',
+        'processing_state': 'active',
+        'processing_lease_expires_at': '',
+        'last_processing_update': '',
+    }
+    base.update(overrides)
+    return base
+
+
+class TestEligibleSteps:
+    def test_all_done_yields_nothing(self):
+        entity = _entity(**{f'{step}_status': 'done' for step in app.IPWORK_STEPS})
+        assert app._ipwork_sweep_eligible_steps(entity) == []
+
+    def test_deleted_photo_yields_nothing_even_if_pending(self):
+        entity = _entity(processing_state='deleted', thumbnail_status='pending')
+        assert app._ipwork_sweep_eligible_steps(entity) == []
+
+    def test_never_touched_step_is_eligible(self):
+        entity = _entity(thumbnail_status='', exif_status='done')
+        assert 'thumbnail' in app._ipwork_sweep_eligible_steps(entity)
+        assert 'exif' not in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_running_with_live_lease_is_left_alone(self):
+        entity = _entity(
+            face_status='running',
+            processing_lease_expires_at=_iso(-60),  # expires 60s in the future
+        )
+        assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_running_with_expired_lease_is_eligible(self):
+        entity = _entity(
+            face_status='running',
+            processing_lease_expires_at=_iso(60),  # expired 60s ago
+        )
+        assert 'face' in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_freshly_queued_step_is_not_resent(self):
+        entity = _entity(ocr_status='queued', last_processing_update=_iso(5))
+        assert 'ocr' not in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_stale_queued_step_is_eligible(self, monkeypatch):
+        monkeypatch.setattr(app, 'IPWORK_SWEEP_STALE_QUEUED_SECONDS', 100)
+        entity = _entity(ocr_status='queued', last_processing_update=_iso(200))
+        assert 'ocr' in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_ai_vision_raw_no_data_retry_case(self, monkeypatch):
+        monkeypatch.setattr(app, '_raw_ai_vision_no_data_should_retry', lambda entity: True)
+        entity = _entity(RowKey='photo.cr3', ai_vision_status='no_data')
+        assert 'ai_vision' in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_ai_vision_non_retryable_no_data_is_left_done(self, monkeypatch):
+        monkeypatch.setattr(app, '_raw_ai_vision_no_data_should_retry', lambda entity: False)
+        entity = _entity(ai_vision_status='no_data')
+        assert 'ai_vision' not in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_stale_face_embedding_version_is_eligible_despite_done_status(self, monkeypatch):
+        """Regression test: a 'done' face_status doesn't mean this photo is
+        actually finished if the stored embedding predates the current
+        FACE_CLUSTER_EMBEDDING_VERSION -- _browser_processing_pending_item
+        already re-queues these for the browser (see
+        _browser_processing_face_version_stale). Before this fix, the sweep
+        treated 'done' as terminal unconditionally and silently skipped this
+        entire class of pending work forever, since it never checked the
+        embedding version at all."""
+        monkeypatch.setattr(app, 'FACE_CLUSTER_EMBEDDING_VERSION', 'current-version')
+        entity = _entity(
+            face_status='done',
+            processing_metadata=json.dumps({
+                'client_face': {'hasData': True, 'modelTaxonomyVersion': 'old-version'},
+            }),
+        )
+        assert 'face' in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_current_face_embedding_version_is_left_done(self, monkeypatch):
+        monkeypatch.setattr(app, 'FACE_CLUSTER_EMBEDDING_VERSION', 'current-version')
+        entity = _entity(
+            face_status='done',
+            processing_metadata=json.dumps({
+                'client_face': {'hasData': True, 'modelTaxonomyVersion': 'current-version'},
+            }),
+        )
+        assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_ipworker_tagged_version_is_also_accepted_as_current(self, monkeypatch):
+        """Regression test: browser and ipworker tag faces with their own
+        distinct version strings for the same underlying AdaFace model (see
+        IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION's definition in app.py).
+        Before this fix, _browser_processing_face_version_stale only compared
+        against FACE_CLUSTER_EMBEDDING_VERSION (the browser's string), so an
+        ipworker-processed photo was permanently flagged stale -- even
+        immediately after a successful re-embed under the current ipworker
+        model -- causing it to be re-queued and re-detected on every sweep
+        cycle forever."""
+        monkeypatch.setattr(app, 'FACE_CLUSTER_EMBEDDING_VERSION', 'browser-current')
+        monkeypatch.setattr(app, 'IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION', 'ipworker-current')
+        entity = _entity(
+            face_status='done',
+            processing_metadata=json.dumps({
+                'client_face': {'hasData': True, 'modelTaxonomyVersion': 'ipworker-current'},
+            }),
+        )
+        assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
+
+    def test_stale_version_with_no_face_data_is_left_done(self, monkeypatch):
+        """A 'no_data' result (no faces detected) has nothing to re-embed,
+        so a version mismatch shouldn't force it back into the queue."""
+        monkeypatch.setattr(app, 'FACE_CLUSTER_EMBEDDING_VERSION', 'current-version')
+        entity = _entity(
+            face_status='no_data',
+            processing_metadata=json.dumps({
+                'client_face': {'hasData': False, 'modelTaxonomyVersion': 'old-version'},
+            }),
+        )
+        assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
+
+
+class TestSweepLoop:
+    def test_sweeps_across_every_library_and_skips_done_photos(self, monkeypatch):
+        done_except_thumbnail = {f'{s}_status': 'done' for s in app.IPWORK_STEPS if s != 'thumbnail'}
+        rows_by_library = {
+            'lib-a': [
+                _entity(RowKey='stuck.jpg', thumbnail_status='pending', **done_except_thumbnail),
+                _entity(RowKey='finished.jpg', **{f'{s}_status': 'done' for s in app.IPWORK_STEPS}),
+            ],
+            'lib-b': [
+                _entity(RowKey='video.mov', thumbnail_status='pending', **done_except_thumbnail),
+            ],
+        }
+
+        class _FakeLibraryStore:
+            def list_all_library_ids(self):
+                return list(rows_by_library.keys())
+
+        queued_calls = []
+
+        monkeypatch.setattr(app, 'library_store', _FakeLibraryStore())
+        monkeypatch.setattr(app, 'metadata_table_client', object())
+        monkeypatch.setattr(
+            app, '_query_metadata_rows_for_user',
+            lambda library_id, select=None, purpose='metadata': rows_by_library[library_id],
+        )
+        monkeypatch.setattr(app, 'is_video_file', lambda filename: filename.endswith('.mov'))
+        monkeypatch.setattr(
+            app, '_queue_ipwork_processing',
+            lambda user_id, filename, steps=None: queued_calls.append((user_id, filename, tuple(steps or ()))),
+        )
+
+        stats = app._sweep_stale_processing_into_ipwork()
+
+        assert queued_calls == [('lib-a', 'stuck.jpg', ('thumbnail',))]
+        assert stats == {'libraries': 2, 'photosQueued': 1, 'stepsQueued': 1}
+
+    def test_no_library_store_is_a_noop(self, monkeypatch):
+        monkeypatch.setattr(app, 'library_store', None)
+        stats = app._sweep_stale_processing_into_ipwork()
+        assert stats == {'libraries': 0, 'photosQueued': 0, 'stepsQueued': 0}
+
+    def test_one_librarys_scan_failure_does_not_stop_the_others(self, monkeypatch):
+        class _FakeLibraryStore:
+            def list_all_library_ids(self):
+                return ['broken-lib', 'lib-b']
+
+        def _scan(library_id, select=None, purpose='metadata'):
+            if library_id == 'broken-lib':
+                raise RuntimeError('table scan exploded')
+            return [_entity(RowKey='stuck.jpg', thumbnail_status='pending')]
+
+        monkeypatch.setattr(app, 'library_store', _FakeLibraryStore())
+        monkeypatch.setattr(app, 'metadata_table_client', object())
+        monkeypatch.setattr(app, '_query_metadata_rows_for_user', _scan)
+        monkeypatch.setattr(app, 'is_video_file', lambda filename: False)
+        queued_calls = []
+        monkeypatch.setattr(
+            app, '_queue_ipwork_processing',
+            lambda user_id, filename, steps=None: queued_calls.append((user_id, filename)),
+        )
+
+        stats = app._sweep_stale_processing_into_ipwork()
+
+        assert queued_calls == [('lib-b', 'stuck.jpg')]
+        assert stats['libraries'] == 2
+        assert stats['photosQueued'] == 1
+
+
+class _FakeLockTable:
+    """Minimal metadata_table_client stand-in for the sweep lock's
+    create-then-steal-if-expired claim, with real ETag semantics (same
+    shape as _FakePersonTable in test_person_entity_concurrency.py)."""
+
+    def __init__(self) -> None:
+        self.rows: dict = {}
+        self._etags: dict = {}
+        self._version = 0
+
+    def create_entity(self, entity):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        if key in self.rows:
+            raise ResourceExistsError('already exists')
+        self.rows[key] = dict(entity)
+        self._version += 1
+        self._etags[key] = f'W/"{self._version}"'
+
+    def get_entity(self, partition_key, row_key):
+        key = (partition_key, row_key)
+        if key not in self.rows:
+            raise ResourceNotFoundError(f'{key} not found')
+        entity = TableEntity(dict(self.rows[key]))
+        entity._metadata = {'etag': self._etags[key], 'timestamp': None}
+        return entity
+
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        if key not in self.rows:
+            raise ResourceNotFoundError(f'{key} not found')
+        if etag is not None and etag != self._etags[key]:
+            raise ResourceModifiedError('etag mismatch')
+        self.rows[key] = dict(entity)
+        self._version += 1
+        self._etags[key] = f'W/"{self._version}"'
+
+
+class TestSweepLock:
+    """Regression tests for the actual production bug: every ipworker
+    replica ran _ipwork_sweep_loop independently, so N replicas redundantly
+    re-enqueued the exact same stale backlog on every cycle -- confirmed
+    live 2026-08-28 to cause a ~5x queue-depth blowup during a single
+    backfill. _try_claim_ipwork_sweep_lock ensures only one replica's sweep
+    actually runs per cycle."""
+
+    def test_first_claim_succeeds(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is True
+
+    def test_second_replica_is_blocked_while_lease_is_live(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is True
+        assert app._try_claim_ipwork_sweep_lock('replica-b', ttl_seconds=1200) is False
+
+    def test_same_owner_can_renew_its_own_lease(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is True
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is True
+
+    def test_another_replica_can_steal_an_expired_lease(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=-10) is True  # already expired
+        assert app._try_claim_ipwork_sweep_lock('replica-b', ttl_seconds=1200) is True
+
+    def test_four_replicas_racing_only_one_wins(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', _FakeLockTable())
+        results = [
+            app._try_claim_ipwork_sweep_lock(owner, ttl_seconds=1200)
+            for owner in ('replica-a', 'replica-b', 'replica-c', 'replica-d')
+        ]
+        assert results == [True, False, False, False]
+
+    def test_no_metadata_table_client_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(app, 'metadata_table_client', None)
+        assert app._try_claim_ipwork_sweep_lock('replica-a', ttl_seconds=1200) is False
