@@ -1444,6 +1444,7 @@ const ToolsPage: React.FC = () => {
         gallerySearchOpen ? (
             <div className="gallery-search-open" ref={gallerySearchRef}>
                 <input
+                    id="tools-gallery-search"
                     type="text"
                     placeholder="Search photos…"
                     value={gallerySearchInput}
@@ -1532,26 +1533,28 @@ const ToolsPage: React.FC = () => {
 
     const renderOverviewPage = () => (
         <>
-            <details
-                className="tools-panel tools-queue tools-queue-toggle"
-                open={isQueueStatusExpanded}
-                onToggle={(event) => setIsQueueStatusExpanded((event.currentTarget as HTMLDetailsElement).open)}
-            >
-                <summary className="tools-panel-header tools-queue-summary">
-                    <div>
-                        <h2 className="tools-panel-title">Queue status</h2>
-                        <p className="tools-panel-meta">
-                            {queueUpdatedLabel ? `Updated ${queueUpdatedLabel} · ` : ''}refreshes every 30 seconds
-                        </p>
-                    </div>
-                    <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.preventDefault(); void loadQueueStatus(); }} aria-label="Refresh queue status" title="Refresh queue status">
-                        <ArrowPathIcon className="toolbar-icon" />
-                        <span className="sr-only">Refresh queue status</span>
-                    </button>
-                </summary>
-                {queueLoadWarning && <p className="status error tools-queue-warning">{queueLoadWarning}</p>}
-                {renderQueueGrid()}
-            </details>
+            <div className="tools-queue-wrapper">
+                <details
+                    className="tools-panel tools-queue tools-queue-toggle"
+                    open={isQueueStatusExpanded}
+                    onToggle={(event) => setIsQueueStatusExpanded((event.currentTarget as HTMLDetailsElement).open)}
+                >
+                    <summary className="tools-panel-header tools-queue-summary">
+                        <div>
+                            <h2 className="tools-panel-title">Queue status</h2>
+                            <p className="tools-panel-meta">
+                                {queueUpdatedLabel ? `Updated ${queueUpdatedLabel} · ` : ''}refreshes every 30 seconds
+                            </p>
+                        </div>
+                    </summary>
+                    {queueLoadWarning && <p className="status error tools-queue-warning">{queueLoadWarning}</p>}
+                    {renderQueueGrid()}
+                </details>
+                <button type="button" className="btn btn-soft icon-btn tools-queue-refresh-btn" onClick={(event) => { event.preventDefault(); void loadQueueStatus(); }} aria-label="Refresh queue status" title="Refresh queue status">
+                    <ArrowPathIcon className="toolbar-icon" />
+                    <span className="sr-only">Refresh queue status</span>
+                </button>
+            </div>
 
             <div className="tools-panel tools-actions-panel">
                 <div className="tools-panel-header">

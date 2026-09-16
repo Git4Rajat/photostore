@@ -453,6 +453,7 @@ const PersonDetail: React.FC = () => {
                 <div className="person-detail-body">
                     <div className="person-detail-toolbar">
                         <input
+                            id="person-detail-name"
                             className="field person-detail-input"
                             value={name}
                             onChange={(e) => setName(e.target.value)}

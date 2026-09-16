@@ -5002,6 +5002,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         {searchOpen ? (
                             <div className="gallery-search-open" ref={searchRef}>
                                 <input
+                                    id="gallery-search"
                                     type="text"
                                     placeholder="Search by meaning…"
                                     value={searchInput}

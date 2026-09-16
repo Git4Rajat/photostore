@@ -897,6 +897,7 @@ const FaceClusters: React.FC = () => {
                         <div className="people-searchbar" ref={searchRef}>
                             <MagnifyingGlassIcon className="people-search-icon" />
                             <input
+                                id="people-search"
                                 type="text"
                                 placeholder="Search people…"
                                 value={searchQuery}

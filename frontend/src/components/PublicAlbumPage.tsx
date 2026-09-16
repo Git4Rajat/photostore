@@ -428,9 +428,11 @@ const PublicAlbumPage: React.FC = () => {
             {!loading && codeRequired && (
                 <div className="toolbar-left public-album-lock">
                     <input
+                        id="public-album-access-code"
                         type="password"
                         className="field field-compact"
                         placeholder="Access code"
+                        autoComplete="current-password"
                         value={accessCode}
                         onChange={(e) => setAccessCode(e.target.value)}
                     />

@@ -1053,6 +1053,7 @@ const AlbumsPage: React.FC = () => {
                         {addAlbumOpen ? (
                             <div className="gallery-search-open" style={{ flex: 1 }}>
                                 <input
+                                    id="new-album-name"
                                     type="text"
                                     className="field gallery-search-field"
                                     placeholder="New album name"
@@ -1211,6 +1212,7 @@ const AlbumsPage: React.FC = () => {
                             {searchOpen ? (
                                 <div className="gallery-search-open" ref={searchRef}>
                                     <input
+                                        id="album-search"
                                         type="text"
                                         className="field gallery-search-field"
                                         placeholder="Search by meaning…"
@@ -1440,7 +1442,7 @@ const AlbumsPage: React.FC = () => {
                     {error && <p className="status error">{error}</p>}
                     {lastSharedUrl && (
                         <div className="albums-actions-row">
-                            <input type="text" className="field" value={lastSharedUrl} readOnly />
+                            <input id="last-shared-url" type="text" className="field" value={lastSharedUrl} readOnly />
                             <button
                                 type="button"
                                 className="btn btn-soft icon-btn"

@@ -6253,6 +6253,10 @@ video.photo-preview-media.is-loading {
   margin-top: 10px;
 }
 
+.tools-queue-wrapper {
+  position: relative;
+}
+
 .tools-queue-toggle {
   padding: 0;
   overflow: clip;
@@ -6261,7 +6265,6 @@ video.photo-preview-media.is-loading {
 .tools-queue-summary {
   list-style: none;
   cursor: pointer;
-  position: relative;
   padding: 12px;
   padding-right: 56px;
 }
@@ -6270,7 +6273,7 @@ video.photo-preview-media.is-loading {
   display: none;
 }
 
-.tools-queue-summary > button {
+.tools-queue-refresh-btn {
   position: absolute;
   top: 12px;
   right: 12px;
