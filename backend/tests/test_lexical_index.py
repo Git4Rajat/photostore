@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 import json
 import threading
+import time
 
 import pytest
 
@@ -178,15 +179,30 @@ def test_get_user_lexical_index_returned_rows_are_a_copy_not_the_shared_cache(le
     assert second['rows'][0]['tags'] == '[]'
 
 
-def test_touch_marks_dirty_and_forces_a_rebuild_on_next_read(lexical_ctx):
+def test_touch_marks_dirty_and_serves_stale_while_rebuilding_in_background(lexical_ctx):
+    """A dirty index must not block the caller on a synchronous full rebuild
+    (that was the 504-on-/photos/search-index bug): the read serves the last
+    good snapshot immediately and the rebuild happens off-thread."""
     table, _ = lexical_ctx
     _seed_row(table, 'lib-E', 'a.jpg', tags='[]')
     storage_utils.get_user_lexical_index('lib-E', allow_refresh=True)
 
     _seed_row(table, 'lib-E', 'b.jpg', tags='[]')  # library changed
     storage_utils.touch_user_lexical_index_state('lib-E')
-    result = storage_utils.get_user_lexical_index('lib-E', allow_refresh=True)
 
+    immediate = storage_utils.get_user_lexical_index('lib-E', allow_refresh=True)
+    assert sorted(row['RowKey'] for row in immediate['rows']) == ['a.jpg']
+
+    lock = storage_utils._LEXICAL_INDEX_REBUILD_LOCKS.lock_for('lib-E')
+    for _ in range(50):
+        if lock.acquire(blocking=False):
+            lock.release()
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail('background lexical index rebuild never completed')
+
+    result = storage_utils.get_user_lexical_index('lib-E', allow_refresh=True)
     assert sorted(row['RowKey'] for row in result['rows']) == ['a.jpg', 'b.jpg']
 
 
@@ -259,6 +275,51 @@ def test_get_user_lexical_index_coalesces_concurrent_rebuilds(monkeypatch, lexic
 
     assert len(calls) == 1
     assert all(r is not None for r in results)
+
+
+def test_get_user_lexical_index_never_blocks_once_a_stale_snapshot_exists(monkeypatch, lexical_ctx):
+    """Regression pin for the 504 fix: once a snapshot has ever been built for
+    a user, a subsequent dirty/stale read must return immediately (serving
+    the stale snapshot) no matter how slow the real rebuild is -- the rebuild
+    happens on a background thread, never inline in the caller."""
+    table, _ = lexical_ctx
+    _seed_row(table, 'lib-I', 'a.jpg', tags='[]')
+    storage_utils.get_user_lexical_index('lib-I', allow_refresh=True)  # cold-start build, synchronous
+    storage_utils.touch_user_lexical_index_state('lib-I')
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_build(user_id, source_version):
+        entered.set()
+        release.wait(timeout=5)
+        return storage_utils.LexicalIndexSnapshot(
+            user_id=user_id, source_version=source_version,
+            schema_version=storage_utils._LEXICAL_INDEX_SCHEMA_VERSION,
+            updated_at=source_version, rows=[{'RowKey': 'b.jpg'}],
+        )
+
+    monkeypatch.setattr(storage_utils, '_build_user_lexical_index_snapshot', slow_build)
+
+    start = time.monotonic()
+    result = storage_utils.get_user_lexical_index('lib-I', allow_refresh=True)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, f'get_user_lexical_index blocked for {elapsed:.2f}s on a warm-but-dirty index'
+    assert [row['RowKey'] for row in result['rows']] == ['a.jpg']  # stale snapshot, served immediately
+    assert entered.wait(timeout=5), 'background rebuild never started'
+
+    # Let the slow rebuild finish and the lock release before monkeypatch
+    # teardown, so nothing leaks into later tests.
+    release.set()
+    lock = storage_utils._LEXICAL_INDEX_REBUILD_LOCKS.lock_for('lib-I')
+    for _ in range(50):
+        if lock.acquire(blocking=False):
+            lock.release()
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail('background lexical index rebuild never completed')
 
 
 # --- search_photos fallback --------------------------------------------------

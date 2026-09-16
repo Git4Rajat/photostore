@@ -2,6 +2,7 @@ import gzip
 import io
 import hashlib
 import json
+import logging
 import os
 import uuid
 import base64
@@ -14,6 +15,15 @@ import numpy as np
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError, ResourceModifiedError
 from azure.storage.blob import ContentSettings as BlobContentSettings
 from werkzeug.utils import secure_filename
+
+# This module otherwise swallows failures silently (`except Exception: pass`)
+# because they happen inside a request a caller will retry or already
+# handles the None/fallback case for. The one exception is
+# _rebuild_lexical_index_in_background below: it runs on a detached daemon
+# thread with no request/caller to report to, so a failure there would
+# otherwise be invisible forever. Root logger is configured by app.py
+# (logging.basicConfig) before this module's functions ever run.
+_LOGGER = logging.getLogger(__name__)
 
 from image_utils import (
     convert_image_to_jpeg,
@@ -1936,6 +1946,28 @@ def _lexical_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Opti
     return None
 
 
+def _rebuild_lexical_index_in_background(key: str, manifest: Dict[str, str]) -> None:
+    """Kicks off a rebuild off the request thread if one isn't already running
+    for this user; no-ops otherwise (the in-flight rebuild will refresh the
+    cache when it finishes). Non-blocking acquire -- this is only ever called
+    when we already have a stale snapshot to serve in the meantime, so a
+    caller never needs to wait on this lock."""
+    lock = _LEXICAL_INDEX_REBUILD_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+            refresh_user_lexical_index(key, source_version=source_version)
+        except Exception:
+            _LOGGER.exception('Background lexical index rebuild failed for user %s', key)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='lexical-index-rebuild', daemon=True).start()
+
+
 def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
     key = str(user_id or '').strip()
     if not key:
@@ -1944,20 +1976,40 @@ def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optio
     manifest = _load_lexical_index_manifest(key)
     fresh = _lexical_index_fresh_cache_entry(key, manifest)
     if fresh is None and allow_refresh:
-        with _LEXICAL_INDEX_REBUILD_LOCKS.lock_for(key):
-            # Re-check after acquiring: another thread may have just finished
-            # rebuilding while this one waited for the lock.
-            fresh = _lexical_index_fresh_cache_entry(key, _load_lexical_index_manifest(key))
-            if fresh is None:
-                source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-                refreshed = refresh_user_lexical_index(key, source_version=source_version)
-                if refreshed is not None:
-                    fresh = {
-                        'source_version': refreshed.source_version,
-                        'schema_version': refreshed.schema_version,
-                        'updated_at': refreshed.updated_at,
-                        'rows': refreshed.rows,
-                    }
+        # A full rebuild is a full unprojected Table scan -- 60-75s+ on a
+        # large library (the exact cost this index exists to avoid on the
+        # read side). Doing that synchronously in the request thread just
+        # relocated the blocking scan from search_photos into this function,
+        # and calls from /api/photos/search and /api/photos/search-index were
+        # 504ing whenever a concurrent write had marked the index dirty. If a
+        # snapshot already exists (even stale/dirty), serve it immediately
+        # and rebuild off-thread; only a true cold start (no snapshot has
+        # ever been built) pays the synchronous cost, since there's nothing
+        # else to serve.
+        stale = _load_lexical_index_blob(key)
+        if stale is not None:
+            fresh = {
+                'source_version': stale.source_version,
+                'schema_version': stale.schema_version,
+                'updated_at': stale.updated_at,
+                'rows': stale.rows,
+            }
+            _rebuild_lexical_index_in_background(key, manifest)
+        else:
+            with _LEXICAL_INDEX_REBUILD_LOCKS.lock_for(key):
+                # Re-check after acquiring: another thread may have just
+                # finished rebuilding while this one waited for the lock.
+                fresh = _lexical_index_fresh_cache_entry(key, _load_lexical_index_manifest(key))
+                if fresh is None:
+                    source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                    refreshed = refresh_user_lexical_index(key, source_version=source_version)
+                    if refreshed is not None:
+                        fresh = {
+                            'source_version': refreshed.source_version,
+                            'schema_version': refreshed.schema_version,
+                            'updated_at': refreshed.updated_at,
+                            'rows': refreshed.rows,
+                        }
     if fresh is None:
         return None
     # Fresh per-call copy of the shared cached rows list -- multiple concurrent
