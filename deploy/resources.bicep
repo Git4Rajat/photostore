@@ -904,6 +904,21 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
       ]
     }
     template: {
+      // 2026-09-16: run_clustering_worker's SIGTERM handler (see
+      // clustering-worker-sigterm-job-loss writeup, 0ab311b) just sets a
+      // threading.Event and lets the in-flight message finish -- unlike
+      // ipworker's bounded drain-then-os._exit, it has no internal ceiling of
+      // its own, so it depends entirely on this platform grace period being
+      // long enough to cover the job. Confirmed live: a "Find more faces"
+      // full-face-table propagate job outlived the ACA default of 30s,
+      // KEDA scale-down SIGKILLed it mid-scan, and the orphaned jobs-table
+      // row surfaced 15 minutes later as "Job did not finish (worker
+      // restarted or timed out)" via /api/jobs/status's staleness sweep
+      // (CLUSTERING_ACTIVE_JOB_STALE_MINUTES). Set below that 15-minute
+      // cutoff so a job that's genuinely wedged still gets flagged failed
+      // instead of the platform keeping a dead replica alive for the full
+      // grace window.
+      terminationGracePeriodSeconds: 600
       containers: [
         {
           name: 'worker'
