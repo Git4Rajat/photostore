@@ -1,4 +1,4 @@
-import { postUploadJson } from './apiClient';
+import { post } from './apiClient';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 
 // PhotoTile used to mint its own access token per tile (one GET per photo).
@@ -111,7 +111,7 @@ export const resolveThumbnailAccessUrls = async (filenames: string[]): Promise<M
         return result;
     }
     try {
-        const response = await postUploadJson('/api/photos/access-batch', { kind: 'thumbnail', filenames: toFetch });
+        const response = await post('/api/photos/access-batch', { kind: 'thumbnail', filenames: toFetch });
         const urls = (response && typeof response.urls === 'object' && response.urls) || {};
         let gotNewUrl = false;
         for (const filename of toFetch) {

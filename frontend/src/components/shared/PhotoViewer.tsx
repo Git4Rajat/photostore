@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, HeartIcon, InformationCircleIcon, XMarkIcon } from '@heroicons/react/24/outline';
-import { postUploadJson, resolveApiUrl } from '../../services/apiClient';
+import { post, resolveApiUrl } from '../../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl } from '../../services/imageClient';
 import { getMediaKind, isVideoFilename, requiresBackendPreview } from '../../utils/photoDisplay';
@@ -383,7 +383,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         void (async () => {
             const entries = await Promise.all(pending.map(async ({ path, filename }) => {
                 try {
-                    const result = await postUploadJson('/api/photos/access-batch', {
+                    const result = await post('/api/photos/access-batch', {
                         kind: getAccessKindForPath(path),
                         filenames: [filename],
                     });

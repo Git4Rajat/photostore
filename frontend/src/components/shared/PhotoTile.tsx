@@ -1,5 +1,5 @@
 import React from 'react';
-import { getUploadJson, resolveApiUrl } from '../../services/apiClient';
+import { get, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
 import { useEffect, useRef, useState } from 'react';
 import { PlayCircleIcon } from '@heroicons/react/24/solid';
@@ -155,7 +155,7 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
         setScopedThumbnailUrl(undefined);
         void (async () => {
             try {
-                const result = await getUploadJson(`/api/photos/access/thumbnail/${encodeURIComponent(photo.filename)}`);
+                const result = await get(`/api/photos/access/thumbnail/${encodeURIComponent(photo.filename)}`);
                 if (!active) {
                     return;
                 }

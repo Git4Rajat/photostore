@@ -1,4 +1,4 @@
-import { getUploadJson, resolveApiUrl } from './apiClient';
+import { get, resolveApiUrl } from './apiClient';
 import { isAuthEnabled } from './authClient';
 import { fetchProtectedBlobUrl } from './imageClient';
 
@@ -99,7 +99,7 @@ export const resolveFaceCropUrl = (faceId: string): Promise<string> => {
         return inFlight;
     }
     const promise = limitCrop(async () => {
-        const result = await getUploadJson(`/api/faces/crop/${encodeURIComponent(faceId)}`);
+        const result = await get(`/api/faces/crop/${encodeURIComponent(faceId)}`);
         if (typeof result?.url !== 'string' || !result.url) {
             throw new Error('No crop url');
         }
@@ -141,7 +141,7 @@ export const resolveFaceFallbackUrl = (
     }
     const promise = limitFallback(async () => {
         try {
-            const result = await getUploadJson(`/api/photos/access/thumbnail/${encodeURIComponent(filename)}`);
+            const result = await get(`/api/photos/access/thumbnail/${encodeURIComponent(filename)}`);
             const rawFallback = typeof result?.url === 'string' && result.url ? result.url : proxyFallbackPath;
             return rawFallback ? await toDisplayableUrl(rawFallback) : '';
         } catch {

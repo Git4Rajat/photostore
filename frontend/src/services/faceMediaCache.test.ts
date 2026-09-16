@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const getUploadJson = vi.fn();
+const get = vi.fn();
 const resolveApiUrl = vi.fn((url: string) => `resolved:${url}`);
 const isAuthEnabled = vi.fn(() => false);
 const fetchProtectedBlobUrl = vi.fn(async (path: string) => `blob:${path}`);
 
-vi.mock('./apiClient', () => ({ getUploadJson, resolveApiUrl }));
+vi.mock('./apiClient', () => ({ get, resolveApiUrl }));
 vi.mock('./authClient', () => ({ isAuthEnabled }));
 vi.mock('./imageClient', () => ({ fetchProtectedBlobUrl }));
 
@@ -36,7 +36,7 @@ describe('faceMediaCache', () => {
 
     beforeEach(async () => {
         vi.resetModules();
-        getUploadJson.mockReset();
+        get.mockReset();
         resolveApiUrl.mockReset().mockImplementation((url: string) => `resolved:${url}`);
         isAuthEnabled.mockReset().mockReturnValue(false);
         fetchProtectedBlobUrl.mockReset().mockImplementation(async (path: string) => `blob:${path}`);
@@ -48,22 +48,22 @@ describe('faceMediaCache', () => {
     });
 
     it('resolves a crop URL from the backend response', async () => {
-        getUploadJson.mockResolvedValue({ url: 'https://sas.example/cover.jpg' });
+        get.mockResolvedValue({ url: 'https://sas.example/cover.jpg' });
         const url = await mod.resolveFaceCropUrl('face-v1-abc');
         expect(url).toBe('https://sas.example/cover.jpg');
-        expect(getUploadJson).toHaveBeenCalledWith('/api/faces/crop/face-v1-abc');
+        expect(get).toHaveBeenCalledWith('/api/faces/crop/face-v1-abc');
     });
 
     it('caches by faceId so a second call does not hit the network again', async () => {
-        getUploadJson.mockResolvedValue({ url: 'https://sas.example/cover.jpg' });
+        get.mockResolvedValue({ url: 'https://sas.example/cover.jpg' });
         await mod.resolveFaceCropUrl('face-v1-abc');
         await mod.resolveFaceCropUrl('face-v1-abc');
-        expect(getUploadJson).toHaveBeenCalledTimes(1);
+        expect(get).toHaveBeenCalledTimes(1);
     });
 
     it('dedupes concurrent in-flight requests for the same faceId', async () => {
         const d = deferred<{ url: string }>();
-        getUploadJson.mockReturnValue(d.promise);
+        get.mockReturnValue(d.promise);
 
         const first = mod.resolveFaceCropUrl('face-v1-abc');
         const second = mod.resolveFaceCropUrl('face-v1-abc');
@@ -71,14 +71,14 @@ describe('faceMediaCache', () => {
 
         await expect(first).resolves.toBe('https://sas.example/cover.jpg');
         await expect(second).resolves.toBe('https://sas.example/cover.jpg');
-        expect(getUploadJson).toHaveBeenCalledTimes(1);
+        expect(get).toHaveBeenCalledTimes(1);
     });
 
     it('caps concurrency so no more than 6 crop requests run at once', async () => {
         const pending: Array<{ resolve: (v: { url: string }) => void }> = [];
         let concurrent = 0;
         let maxConcurrent = 0;
-        getUploadJson.mockImplementation(
+        get.mockImplementation(
             () =>
                 new Promise<{ url: string }>((resolve) => {
                     concurrent += 1;
@@ -119,18 +119,18 @@ describe('faceMediaCache', () => {
     it('uses the inline thumbnail URL without any network call', async () => {
         const url = await mod.resolveFaceFallbackUrl('photo.jpg', 'https://sas.example/thumb.jpg', '/api/photos/thumbnail/photo.jpg');
         expect(url).toBe('https://sas.example/thumb.jpg');
-        expect(getUploadJson).not.toHaveBeenCalled();
+        expect(get).not.toHaveBeenCalled();
     });
 
     it('caches the fallback by filename, shared across faces from the same photo', async () => {
-        getUploadJson.mockResolvedValue({ url: 'https://sas.example/thumb.jpg' });
+        get.mockResolvedValue({ url: 'https://sas.example/thumb.jpg' });
         await mod.resolveFaceFallbackUrl('photo.jpg', '', '/api/photos/thumbnail/photo.jpg');
         await mod.resolveFaceFallbackUrl('photo.jpg', '', '/api/photos/thumbnail/photo.jpg');
-        expect(getUploadJson).toHaveBeenCalledTimes(1);
+        expect(get).toHaveBeenCalledTimes(1);
     });
 
     it('falls back to the proxy path when the thumbnail lookup fails', async () => {
-        getUploadJson.mockRejectedValue(new Error('network error'));
+        get.mockRejectedValue(new Error('network error'));
         const url = await mod.resolveFaceFallbackUrl('photo.jpg', '', '/api/photos/thumbnail/photo.jpg');
         expect(url).toBe('resolved:/api/photos/thumbnail/photo.jpg');
     });
@@ -140,7 +140,7 @@ describe('faceMediaCache', () => {
         // page full of slow (cache-miss) crop requests could starve every fast,
         // pre-generated fallback thumbnail behind them, stalling the whole grid.
         const stuckCrops: Array<{ resolve: (v: { url: string }) => void }> = [];
-        getUploadJson.mockImplementation((url: string) => {
+        get.mockImplementation((url: string) => {
             if (url.includes('/api/faces/crop/')) {
                 // Stays pending until this test explicitly resolves it below —
                 // simulates a page full of slow (still in-progress) misses.
