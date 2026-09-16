@@ -2705,6 +2705,43 @@ def _enqueue_clustering_job(
     return {'status': 'queued', 'jobId': job_id}
 
 
+def _enqueue_admin_repair_job(user_id: str, *, action: str, dry_run: bool) -> Dict[str, str]:
+    """Queue one of the Tools/Workbench admin repair actions (dedupe, suppress-
+    suspicious, unblock-low-confidence, rebuild-people-index, repair-stale-
+    memberships, purge-orphaned) instead of running its full-account scan
+    inline on a backend request thread. force=True: each is an explicit,
+    one-off click, not a recurring background trigger, so it shouldn't be
+    silently coalesced against an unrelated in-flight clustering job the way
+    automatic re-cluster triggers are."""
+    return _enqueue_clustering_job(
+        user_id,
+        force=True,
+        job_type='people_admin_repair',
+        payload={'action': action, 'dryRun': dry_run},
+    )
+
+
+def _enqueue_library_purge_job(library_id: str) -> bool:
+    """Fire-and-forget: queue the full-account data purge for a just-deleted
+    library (see library_delete) instead of running it inline on the request
+    thread -- _purge_library_data does a full row-by-row scan/delete across
+    6 tables, the same worst-case-sizing shape as the admin repair actions
+    (see _enqueue_admin_repair_job). No job_id/status bookkeeping: by the
+    time this could finish, the library and account rows are already gone,
+    so nothing can poll for a result and there's no jobs-table partition key
+    left to scope one to -- same reasoning as _enqueue_incremental_assign_job."""
+    if clustering_queue_client is None:
+        app.logger.warning('Clustering queue client is unavailable; purge for %s was not enqueued', library_id)
+        return False
+    message = {'user_id': library_id, 'type': 'library_delete_purge', 'libraryId': library_id}
+    try:
+        clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
+    except Exception:
+        app.logger.exception('Failed to enqueue library purge for %s', library_id)
+        return False
+    return True
+
+
 def _enqueue_incremental_assign_job(user_id: str, filename: str) -> Dict[str, str]:
     """Queue asynchronous face-to-person assignment for one just-processed
     photo, run by the standalone clustering worker instead of inline in the
@@ -9966,6 +10003,81 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             worker_logger.exception('Incremental face-to-person assignment failed for %s/%s', user_id, filename)
         return
 
+    if job_type == 'library_delete_purge':
+        library_id = str(payload.get('libraryId') or user_id)
+        try:
+            _purge_library_data(library_id)
+            invalidate_user_vector_index_cache(library_id)
+            invalidate_user_lexical_index_cache(library_id)
+        except Exception:
+            worker_logger.exception('Library purge failed for %s', library_id)
+        return
+
+    if job_type == 'people_admin_repair':
+        # Backs the Tools/Workbench dry-run+apply repair actions (dedupe,
+        # suppress-suspicious, unblock-low-confidence, rebuild-people-index,
+        # repair-stale-memberships, purge-orphaned). These used to run
+        # synchronously on a backend request thread -- full-account face/
+        # photo scans that could take long enough to force backend's own
+        # container sizing up to cover a worst-case single request, even
+        # though ordinary gallery browsing never hits this code path. Moved
+        # here so backend can be sized for browsing traffic instead.
+        action = str(payload.get('action') or '')
+        dry_run = _coerce_bool(payload.get('dryRun', True))
+        handlers = {
+            'dedupe_faces': _dedupe_duplicate_faces,
+            'suppress_suspicious': _suppress_suspicious_faces,
+            'unblock_low_confidence': _unblock_low_confidence_faces,
+            'rebuild_people_index': _rebuild_photo_people_index,
+            'repair_stale_memberships': _repair_face_memberships,
+            'purge_orphaned': _purge_orphaned_photo_data,
+        }
+        handler = handlers.get(action)
+        if job_id:
+            _upsert_job_status(job_id, user_id, 'people_admin_repair', 'running', action=action)
+        if handler is None:
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'people_admin_repair', 'failed', error='unknown repair action', action=action)
+            return
+        try:
+            result = handler(user_id, dry_run=dry_run)
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'people_admin_repair', 'done', result=result, action=action)
+        except Exception:
+            worker_logger.exception('Admin repair action %s failed for %s', action, user_id)
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'people_admin_repair', 'failed', error='Repair action failed', action=action)
+        return
+
+    if job_type == 'vector_index_rebuild':
+        if job_id:
+            _upsert_job_status(job_id, user_id, 'vector_index_rebuild', 'running')
+        try:
+            snapshot = refresh_user_vector_index(user_id)
+            if snapshot is None:
+                result = {
+                    'status': 'empty',
+                    'userId': user_id,
+                    'rowCount': 0,
+                    'message': 'No face embeddings were available to rebuild a vector index.',
+                }
+            else:
+                result = {
+                    'status': 'rebuilt',
+                    'userId': user_id,
+                    'rowCount': len(snapshot.row_keys),
+                    'sourceVersion': snapshot.source_version,
+                    'embeddingVersion': snapshot.embedding_version,
+                    'updatedAt': snapshot.updated_at,
+                }
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'vector_index_rebuild', 'done', result=result)
+        except Exception:
+            worker_logger.exception('Vector index rebuild failed for %s', user_id)
+            if job_id:
+                _upsert_job_status(job_id, user_id, 'vector_index_rebuild', 'failed', error='Vector index rebuild failed')
+        return
+
     if not (job_type in _clustering_job_types() and _people_features_available()):
         return
     if job_id:
@@ -10924,6 +11036,16 @@ if _app_role == 'tools':
     app.register_blueprint(tools_bp)
 elif _app_role == 'upload':
     app.register_blueprint(upload_bp)
+elif _app_role == 'admin':
+    # Isolated on its own container (2026-09-16, same reasoning as
+    # tools/upload above): admin's own routes now only ever enqueue to the
+    # clustering worker (see _enqueue_admin_repair_job) rather than running
+    # full-account scans inline, so there's no shared-cache coupling
+    # blocking the split -- and unlike tools/upload, isolating admin also
+    # keeps its mutate-everything endpoints (recluster, dedupe, purge,
+    # backfill) off the gallery-facing replica's attack surface even if
+    # auth were ever bypassed there.
+    app.register_blueprint(admin_bp)
 else:
-    for _bp in (auth_bp, photos_bp, people_bp, albums_bp, public_bp, library_bp, admin_bp, system_bp):
+    for _bp in (auth_bp, photos_bp, people_bp, albums_bp, public_bp, library_bp, system_bp):
         app.register_blueprint(_bp)

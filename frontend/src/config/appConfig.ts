@@ -5,6 +5,10 @@ export interface AppConfig {
      * history logging, see routes/tools.py) -- falls back to apiBaseUrl when
      * no separate tools deployment exists for this environment. */
     toolsApiBaseUrl?: string;
+    /** Base URL for the dedicated `admin` container app (Tools/Workbench
+     * recovery actions, see routes/admin.py) -- falls back to apiBaseUrl when
+     * no separate admin deployment exists for this environment. */
+    adminApiBaseUrl?: string;
     spaBaseUrl?: string;
     azureAdTenantId?: string;
     azureAdClientId?: string;

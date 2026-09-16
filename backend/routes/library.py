@@ -290,12 +290,7 @@ def library_delete():
     # (rather than re-creating it), so the caller's active session stops working
     # on its next request.
     app.library_store.delete_user(account_id)
-    app._purge_library_data(library_id)
-    try:
-        app.invalidate_user_vector_index_cache(library_id)
-        app.invalidate_user_lexical_index_cache(library_id)
-    except Exception:
-        pass
+    app._enqueue_library_purge_job(library_id)
     return app.jsonify({'status': 'ok'})
 
 @library_bp.route('/api/library/download/request', methods=['POST'])

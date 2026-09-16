@@ -69,7 +69,8 @@ def admin_dedupe_faces():
     if data.get('repair') is not True or data.get('confirm') != 'DEDUPE_FACES':
         return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
     dry_run = app._coerce_bool(data.get('dryRun', True))
-    return app.jsonify(app._dedupe_duplicate_faces(user_id, dry_run=dry_run))
+    queued = app._enqueue_admin_repair_job(user_id, action='dedupe_faces', dry_run=dry_run)
+    return app.jsonify(app._clustering_queue_response(queued))
 
 @admin_bp.route('/api/admin/people/suppress-suspicious-faces', methods=['POST'])
 @admin_bp.route('/admin/people/suppress-suspicious-faces', methods=['POST'])
@@ -83,7 +84,8 @@ def admin_suppress_suspicious_faces():
     if data.get('repair') is not True or data.get('confirm') != 'SUPPRESS_SUSPICIOUS_FACES':
         return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
     dry_run = app._coerce_bool(data.get('dryRun', True))
-    return app.jsonify(app._suppress_suspicious_faces(user_id, dry_run=dry_run))
+    queued = app._enqueue_admin_repair_job(user_id, action='suppress_suspicious', dry_run=dry_run)
+    return app.jsonify(app._clustering_queue_response(queued))
 
 @admin_bp.route('/api/admin/people/unblock-low-confidence-faces', methods=['POST'])
 @admin_bp.route('/admin/people/unblock-low-confidence-faces', methods=['POST'])
@@ -101,7 +103,8 @@ def admin_unblock_low_confidence_faces():
     if data.get('repair') is not True or data.get('confirm') != 'UNBLOCK_LOW_CONFIDENCE_FACES':
         return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
     dry_run = app._coerce_bool(data.get('dryRun', True))
-    return app.jsonify(app._unblock_low_confidence_faces(user_id, dry_run=dry_run))
+    queued = app._enqueue_admin_repair_job(user_id, action='unblock_low_confidence', dry_run=dry_run)
+    return app.jsonify(app._clustering_queue_response(queued))
 
 @admin_bp.route('/api/admin/people/rebuild-photo-people-index', methods=['POST'])
 @admin_bp.route('/admin/people/rebuild-photo-people-index', methods=['POST'])
@@ -115,7 +118,8 @@ def admin_rebuild_photo_people_index():
     if data.get('repair') is not True or data.get('confirm') != 'REBUILD_PEOPLE_INDEX':
         return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
     dry_run = app._coerce_bool(data.get('dryRun', True))
-    return app.jsonify(app._rebuild_photo_people_index(user_id, dry_run=dry_run))
+    queued = app._enqueue_admin_repair_job(user_id, action='rebuild_people_index', dry_run=dry_run)
+    return app.jsonify(app._clustering_queue_response(queued))
 
 @admin_bp.route('/api/admin/vector-index/rebuild', methods=['POST'])
 @admin_bp.route('/admin/vector-index/rebuild', methods=['POST'])
@@ -129,24 +133,10 @@ def admin_rebuild_vector_index():
         data = app.request.get_json(silent=True) or {}
         if data.get('repair') is not True or data.get('confirm') != 'REBUILD_VECTOR_INDEX':
             return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
-        snapshot = app.refresh_user_vector_index(user_id)
-        if snapshot is None:
-            return app.jsonify({
-                'status': 'empty',
-                'userId': user_id,
-                'rowCount': 0,
-                'message': 'No face embeddings were available to rebuild a vector index.',
-            })
-        return app.jsonify({
-            'status': 'rebuilt',
-            'userId': user_id,
-            'rowCount': len(snapshot.row_keys),
-            'sourceVersion': snapshot.source_version,
-            'embeddingVersion': snapshot.embedding_version,
-            'updatedAt': snapshot.updated_at,
-        })
+        queued = app._enqueue_clustering_job(user_id, force=True, job_type='vector_index_rebuild')
+        return app.jsonify(app._clustering_queue_response(queued))
     except Exception as exc:
-        app.app.logger.exception('Admin vector index rebuild failed')
+        app.app.logger.exception('Admin vector index rebuild enqueue failed')
         return app.jsonify({'error': 'Admin vector index rebuild failed'}), 500
 
 @admin_bp.route('/api/admin/people/repair-stale-memberships', methods=['POST'])
@@ -161,7 +151,8 @@ def admin_repair_stale_people_memberships():
     if data.get('repair') is not True or data.get('confirm') != 'REPAIR_STALE_MEMBERSHIPS':
         return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
     dry_run = app._coerce_bool(data.get('dryRun', True))
-    return app.jsonify(app._repair_face_memberships(user_id, dry_run=dry_run))
+    queued = app._enqueue_admin_repair_job(user_id, action='repair_stale_memberships', dry_run=dry_run)
+    return app.jsonify(app._clustering_queue_response(queued))
 
 @admin_bp.route('/api/admin/backfill/photos', methods=['POST'])
 @admin_bp.route('/admin/backfill/photos', methods=['POST'])
@@ -324,5 +315,32 @@ def admin_purge_orphaned_photo_data():
         or data.get('confirm') != 'PURGE_ORPHANED_PHOTO_DATA'
     ):
         return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
-    result = app._purge_orphaned_photo_data(user_id, dry_run=dry_run)
-    return app.jsonify(result)
+    queued = app._enqueue_admin_repair_job(user_id, action='purge_orphaned', dry_run=dry_run)
+    return app.jsonify(app._clustering_queue_response(queued))
+
+@admin_bp.route('/api/admin/jobs/status', methods=['GET'])
+def admin_job_status():
+    """Poll result for a job enqueued by one of the admin repair/rebuild
+    routes above (people_admin_repair, vector_index_rebuild) -- these run on
+    the standalone clustering worker instead of inline on a backend request
+    thread (see _enqueue_admin_repair_job), so the Tools page polls here for
+    the same dry-run preview / apply result it used to get synchronously."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    job_id = str(app.request.args.get('jobId', '') or '')
+    if not job_id or app.metadata_table_client is None:
+        return app.jsonify({'status': 'unknown'})
+    try:
+        row = app.metadata_table_client.get_entity(partition_key='jobs', row_key=app._job_row_key(job_id))
+    except Exception:
+        return app.jsonify({'status': 'unknown'})
+    if str(row.get('userId') or '') != user_id:
+        return app.jsonify({'status': 'unknown'})
+    result = row.get('result')
+    if isinstance(result, str):
+        try:
+            result = app.json.loads(result)
+        except Exception:
+            pass
+    return app.jsonify({'status': str(row.get('status') or 'unknown'), 'result': result, 'error': row.get('error')})

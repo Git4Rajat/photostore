@@ -20,7 +20,7 @@ import {
     UsersIcon,
     XMarkIcon,
 } from '@heroicons/react/24/outline';
-import { get, post, getTools, postTools, getUpload } from '../services/apiClient';
+import { get, post, getTools, postTools, getUpload, getAdmin, postAdmin } from '../services/apiClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import { requestJobPoll } from '../services/jobNotifications';
 import { plural } from '../utils/format';
@@ -820,7 +820,7 @@ const ToolsPage: React.FC = () => {
         setMessage(`Queueing ${label} for the entire library…`);
         try {
             const steps = combinedStepsForActions(actions);
-            const response = await post('/api/admin/backfill/photos', {
+            const response = await postAdmin('/api/admin/backfill/photos', {
                 repair: true,
                 confirm: 'BACKFILL_ALL_PHOTOS',
                 steps,
@@ -906,7 +906,7 @@ const ToolsPage: React.FC = () => {
             let ipworkQueued = 0;
             if (processingMode !== 'browser') {
                 try {
-                    const ipworkResponse = await post('/api/admin/ipwork/enqueue', {
+                    const ipworkResponse = await postAdmin('/api/admin/ipwork/enqueue', {
                         filenames,
                         steps,
                         force: forceRun,
@@ -984,6 +984,30 @@ const ToolsPage: React.FC = () => {
         void tick();
     };
 
+    // The dry-run/apply admin repair actions and the vector-index rebuild
+    // below used to return their full result synchronously -- they now run
+    // on the standalone clustering worker instead of a backend request
+    // thread (so backend no longer needs to be sized for a worst-case
+    // full-account scan), so the frontend polls for the same result here.
+    const pollAdminJob = async (
+        jobId: string,
+        { maxAttempts = 40, intervalMs = 2500 }: { maxAttempts?: number; intervalMs?: number } = {},
+    ): Promise<{ status: string; result?: Record<string, unknown>; error?: string }> => {
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+            const response = await getAdmin(`/api/admin/jobs/status?jobId=${encodeURIComponent(jobId)}`) as {
+                status?: string;
+                result?: Record<string, unknown>;
+                error?: string;
+            };
+            const status = String(response?.status || 'unknown');
+            if (status === 'done' || status === 'failed') {
+                return { status, result: response?.result, error: response?.error };
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+        }
+        throw new Error('Still running in the background — check back in a moment.');
+    };
+
     const runReclusterPeople = async () => {
         if (!(await confirmDialog({
             title: 'Recovery action',
@@ -996,7 +1020,7 @@ const ToolsPage: React.FC = () => {
         setRunning('peopleIndex');
         setMessage('Preparing protected people repair…');
         try {
-            const response = await post('/api/admin/people/recluster', {
+            const response = await postAdmin('/api/admin/people/recluster', {
                 queue: true,
                 allowReassignConfirmed: false,
                 confirm: 'RECLUSTER_REPAIR',
@@ -1035,8 +1059,17 @@ const ToolsPage: React.FC = () => {
         setDryRunPreview(null);
         setMessage(`Previewing ${cfg.label}…`);
         try {
-            const result = await post(cfg.endpoint, { repair: true, confirm: cfg.confirm, dryRun: true }) as Record<string, unknown>;
-            setDryRunPreview({ action, result });
+            const queued = await postAdmin(cfg.endpoint, { repair: true, confirm: cfg.confirm, dryRun: true }) as { jobId?: string; error?: string };
+            const jobId = String(queued?.jobId || '');
+            if (!jobId) {
+                throw new Error(queued?.error || 'Could not queue preview');
+            }
+            requestJobPoll();
+            const job = await pollAdminJob(jobId);
+            if (job.status !== 'done') {
+                throw new Error(job.error || 'Preview failed');
+            }
+            setDryRunPreview({ action, result: job.result || {} });
             setMessage('');
         } catch (err) {
             setMessage(`Preview failed: ${String(err)}`);
@@ -1095,7 +1128,17 @@ const ToolsPage: React.FC = () => {
         setDryRunPreview(null);
         setMessage(`Applying ${cfg.label}…`);
         try {
-            const result = await post(cfg.endpoint, { repair: true, confirm: cfg.confirm, dryRun: false }) as Record<string, unknown>;
+            const queued = await postAdmin(cfg.endpoint, { repair: true, confirm: cfg.confirm, dryRun: false }) as { jobId?: string; error?: string };
+            const jobId = String(queued?.jobId || '');
+            if (!jobId) {
+                throw new Error(queued?.error || `Could not queue ${cfg.label}`);
+            }
+            requestJobPoll();
+            const job = await pollAdminJob(jobId);
+            if (job.status !== 'done') {
+                throw new Error(job.error || `${cfg.label} failed`);
+            }
+            const result = job.result || {};
             const affectedCountFields: Record<AdminDryRunPreview['action'], string> = {
                 suppressSuspicious: 'markedSuspicious',
                 dedupeFaces: 'deletedFaces',
@@ -1131,7 +1174,7 @@ const ToolsPage: React.FC = () => {
         setRunning('restoreSnapshot');
         setMessage('Restoring snapshot…');
         try {
-            const result = await post('/api/admin/people/recluster/restore', { snapshotId: lastSnapshot.snapshotId }) as Record<string, unknown>;
+            const result = await postAdmin('/api/admin/people/recluster/restore', { snapshotId: lastSnapshot.snapshotId }) as Record<string, unknown>;
             if (result?.success) {
                 setMessage(`Snapshot restored: ${Number(result?.restoredPeople || 0)} people, ${Number(result?.restoredFaces || 0)} faces, ${Number(result?.restoredMetadata || 0)} metadata rows.`);
                 setLastSnapshot(null);
@@ -1158,7 +1201,7 @@ const ToolsPage: React.FC = () => {
         setRunning('backfillPhotos');
         setMessage('Queueing all photos for backfill…');
         try {
-            const response = await post('/api/admin/backfill/photos', {
+            const response = await postAdmin('/api/admin/backfill/photos', {
                 repair: true,
                 confirm: 'BACKFILL_ALL_PHOTOS',
             });
@@ -1192,10 +1235,20 @@ const ToolsPage: React.FC = () => {
         setRunning('vectorIndex');
         setMessage('Rebuilding vector index…');
         try {
-            const response = await post('/api/admin/vector-index/rebuild', {
+            const queued = await postAdmin('/api/admin/vector-index/rebuild', {
                 confirm: 'REBUILD_VECTOR_INDEX',
                 repair: true,
-            });
+            }) as { jobId?: string; error?: string };
+            const jobId = String(queued?.jobId || '');
+            if (!jobId) {
+                throw new Error(queued?.error || 'Could not queue vector index rebuild');
+            }
+            requestJobPoll();
+            const job = await pollAdminJob(jobId);
+            if (job.status !== 'done') {
+                throw new Error(job.error || 'Vector index rebuild failed');
+            }
+            const response = job.result || {};
             const rowCount = Number(response?.rowCount || 0);
             if (response?.status === 'empty' || rowCount === 0) {
                 setMessage('Vector index rebuild finished, but no embeddings were available to index.');

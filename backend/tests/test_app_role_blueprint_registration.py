@@ -45,6 +45,12 @@ def test_backend_role_does_not_serve_upload_routes():
     assert '/api/photos' in paths  # sanity: other groups still registered
 
 
+def test_backend_role_does_not_serve_admin_routes():
+    paths = _rule_paths_for_role(None)
+    assert '/api/admin/people/dedupe-faces' not in paths
+    assert '/api/photos' in paths  # sanity: other groups still registered
+
+
 def test_tools_role_serves_only_tools_routes():
     paths = _rule_paths_for_role('tools')
     non_static = {p for p in paths if not p.startswith('/static')}
@@ -57,3 +63,12 @@ def test_upload_role_serves_only_upload_routes():
     assert non_static  # non-empty
     assert all(p.startswith(('/upload', '/api/upload', '/uploads', '/api/uploads')) for p in non_static)
     assert '/api/upload/init' in non_static
+
+
+def test_admin_role_serves_only_admin_routes():
+    paths = _rule_paths_for_role('admin')
+    non_static = {p for p in paths if not p.startswith('/static')}
+    assert non_static  # non-empty
+    assert all(p.startswith(('/admin', '/api/admin')) for p in non_static)
+    assert '/api/admin/people/dedupe-faces' in non_static
+    assert '/api/admin/jobs/status' in non_static

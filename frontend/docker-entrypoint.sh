@@ -7,6 +7,9 @@ UPLOAD_BASE_URL="${APP_CONFIG_UPLOAD_BASE_URL:-$API_BASE_URL}"
 # tools container app (not every deploy has one) keep working unchanged --
 # see deploy/resources.bicep's `tools` containerApp resource.
 TOOLS_API_BASE_URL="${APP_CONFIG_TOOLS_API_BASE_URL:-$API_BASE_URL}"
+# Same fallback pattern as TOOLS_API_BASE_URL -- see deploy/resources.bicep's
+# `admin` containerApp resource.
+ADMIN_API_BASE_URL="${APP_CONFIG_ADMIN_API_BASE_URL:-$API_BASE_URL}"
 SPA_BASE_URL="${APP_CONFIG_SPA_BASE_URL:-}"
 AZURE_AD_TENANT_ID="${APP_CONFIG_AZURE_AD_TENANT_ID:-}"
 AZURE_AD_CLIENT_ID="${APP_CONFIG_AZURE_AD_CLIENT_ID:-}"
@@ -33,6 +36,7 @@ window.__APP_CONFIG__ = {
 	  apiBaseUrl: "${API_BASE_URL}",
 	  uploadBaseUrl: "${UPLOAD_BASE_URL}",
 	  toolsApiBaseUrl: "${TOOLS_API_BASE_URL}",
+	  adminApiBaseUrl: "${ADMIN_API_BASE_URL}",
 	  spaBaseUrl: "${SPA_BASE_URL}",
   azureAdTenantId: "${AZURE_AD_TENANT_ID}",
   azureAdClientId: "${AZURE_AD_CLIENT_ID}",
@@ -83,6 +87,9 @@ if [ -n "$TOOLS_API_BASE_URL" ] && [ "$TOOLS_API_BASE_URL" != "$API_BASE_URL" ];
 fi
 if [ -n "$UPLOAD_BASE_URL" ] && [ "$UPLOAD_BASE_URL" != "$API_BASE_URL" ]; then
   CONNECT_SRC="${CONNECT_SRC} ${UPLOAD_BASE_URL}"
+fi
+if [ -n "$ADMIN_API_BASE_URL" ] && [ "$ADMIN_API_BASE_URL" != "$API_BASE_URL" ]; then
+  CONNECT_SRC="${CONNECT_SRC} ${ADMIN_API_BASE_URL}"
 fi
 
 cat > /etc/nginx/csp.conf <<EOF

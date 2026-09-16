@@ -90,3 +90,6 @@ output toolsUrl string = app.outputs.toolsUrl
 
 @description('URL of the upload API.')
 output uploadUrl string = app.outputs.uploadUrl
+
+@description('URL of the admin (Tools/Workbench recovery actions) API.')
+output adminUrl string = app.outputs.adminUrl

@@ -24,6 +24,12 @@ const toolsUrl =
     env.VITE_TOOLS_API_BASE_URL ||
     env.REACT_APP_TOOLS_API_BASE_URL ||
     apiUrl;
+// Same fallback pattern as toolsUrl -- see routes/admin.py's APP_ROLE=admin split.
+const adminUrl =
+    runtimeConfig.adminApiBaseUrl ||
+    env.VITE_ADMIN_API_BASE_URL ||
+    env.REACT_APP_ADMIN_API_BASE_URL ||
+    apiUrl;
 
 if (!apiUrl && import.meta.env.MODE !== 'development') {
     console.warn(
@@ -34,6 +40,7 @@ if (!apiUrl && import.meta.env.MODE !== 'development') {
 const API_BASE_URL = apiUrl || '';
 const UPLOAD_BASE_URL = uploadUrl || '';
 const TOOLS_BASE_URL = toolsUrl || '';
+const ADMIN_BASE_URL = adminUrl || '';
 
 export const resolveApiUrl = (url?: string): string => {
     if (!url) {
@@ -51,6 +58,7 @@ export const resolveApiUrl = (url?: string): string => {
 const apiClient = createHttpClient(API_BASE_URL);
 const uploadClient = createHttpClient(UPLOAD_BASE_URL);
 const toolsClient = createHttpClient(TOOLS_BASE_URL);
+const adminClient = createHttpClient(ADMIN_BASE_URL);
 
 // Give the app-wide availability tracker the absolute /health URL so its
 // recovery probes hit the API origin (not the SPA origin) when a base URL is
@@ -61,10 +69,10 @@ configureBackendStatus({ healthUrl: resolveApiUrl('health') });
 const LOCAL_USER_KEY = 'photostore.localUserId';
 
 const setDefaultHeader = (userId: string | null) => {
-    // Only apiClient and toolsClient, matching the existing (pre-tools-split)
-    // behavior of leaving uploadClient out of this -- not touching that
-    // here, unrelated to the tools split.
-    for (const client of [apiClient, toolsClient]) {
+    // apiClient/toolsClient/adminClient, matching the existing (pre-tools-
+    // split) behavior of leaving uploadClient out of this -- not touching
+    // that here, unrelated to the tools/admin splits.
+    for (const client of [apiClient, toolsClient, adminClient]) {
         const headers = client.defaults.headers as Record<string, string | undefined>;
         if (userId) {
             headers['X-User-ID'] = userId;
@@ -115,3 +123,5 @@ export const getUploadJson = async <T = any>(url: string) => requestJson<T>(uplo
 export const postUploadJson = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
 export const getTools = async <T = any>(url: string, config?: Parameters<typeof toolsClient.get>[1]) => requestJson<T>(toolsClient, 'get', url, undefined, config);
 export const postTools = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(toolsClient, 'post', url, data);
+export const getAdmin = async <T = any>(url: string, config?: Parameters<typeof adminClient.get>[1]) => requestJson<T>(adminClient, 'get', url, undefined, config);
+export const postAdmin = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(adminClient, 'post', url, data);

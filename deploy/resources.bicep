@@ -80,6 +80,7 @@ var workerAppName = '${appName}-worker'
 var ipworkerAppName = '${appName}-ipworker'
 var toolsAppName = '${appName}-tools'
 var uploadAppName = '${appName}-upload'
+var adminAppName = '${appName}-admin'
 // Only deploy ipworker (and grant it storage access) when the deployment
 // actually needs it -- in 'browser' mode (the default) it would just sit
 // scaled to zero forever, so skip provisioning it at all.
@@ -678,6 +679,77 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+// 2026-09-16: third service split -- admin (Tools/Workbench recovery actions:
+// recluster, dedupe/suppress/unblock faces, rebuild people/vector index,
+// repair stale memberships, purge orphaned data, library-wide backfill,
+// per-selection ipwork enqueue). Sized like tools, not backend/upload: every
+// admin route now only ever enqueues to the clustering worker (see
+// _enqueue_admin_repair_job) instead of running a full-account scan inline,
+// so it no longer needs backend's larger footprint -- see
+// backend-cpu-optimization-2026-09 memory. Isolating this onto its own app
+// also keeps its mutate-everything endpoints off the gallery-facing
+// replica's attack surface.
+resource admin 'Microsoft.App/containerApps@2024-03-01' = {
+  name: adminAppName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      ingress: {
+        external: true
+        targetPort: 5000
+        transport: 'auto'
+        traffic: [
+          { latestRevision: true, weight: 100 }
+        ]
+      }
+      secrets: [
+        { name: 'owner-password', value: adminPassword }
+        { name: 'session-secret', value: sessionSecret }
+        { name: 'acs-connection-string', value: acsConnectionString }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'admin'
+          image: backendImage
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'admin' }
+            { name: 'GUNICORN_WORKERS', value: '1' }
+            { name: 'GUNICORN_THREADS', value: '4' }
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
+            { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+          ])
+        }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 2
+        rules: [
+          {
+            name: 'http-scaler'
+            http: {
+              metadata: {
+                concurrentRequests: '10'
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
 // 2026-09-15: second service split -- upload (init/finalize/processing-lease/
 // known-hashes/corrupted-uploads). Unlike tools, this IS the traffic pattern
 // that originally justified the backend's own 2vCPU/4Gi + maxReplicas=5 +
@@ -779,6 +851,7 @@ resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'APP_CONFIG_API_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_UPLOAD_BASE_URL', value: 'https://${upload.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_TOOLS_API_BASE_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_ADMIN_API_BASE_URL', value: 'https://${admin.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_SPA_BASE_URL', value: frontendUrl }
             { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
             // Without this, the frontend's docker-entrypoint.sh defaults
@@ -1158,6 +1231,18 @@ resource uploadStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01'
   }
 ]
 
+resource adminStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: {
+    name: guid(storage.id, admin.id, roleId)
+    scope: storage
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+      principalId: admin.identity.principalId
+      principalType: 'ServicePrincipal'
+    }
+  }
+]
+
 @description('Open this URL in your browser to use Photostore.')
 output appUrl string = frontendUrl
 
@@ -1169,3 +1254,6 @@ output toolsUrl string = 'https://${tools.properties.configuration.ingress.fqdn}
 
 @description('Upload API URL.')
 output uploadUrl string = 'https://${upload.properties.configuration.ingress.fqdn}'
+
+@description('Admin (Tools/Workbench recovery actions) API URL.')
+output adminUrl string = 'https://${admin.properties.configuration.ingress.fqdn}'
