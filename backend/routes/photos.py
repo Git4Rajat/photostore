@@ -115,7 +115,7 @@ def photo_access_url_batch():
     # already warm here: /photos populates it moments earlier for the same
     # page, on the same 20s TTL (_metadata_scan_cache).
     try:
-        cached_rows = app._cached_metadata_rows_for_user(user_id, purpose='photos.access_batch')
+        cached_rows = app._cached_metadata_list_rows_for_user(user_id, purpose='photos.access_batch')
         metadata_map = {row['RowKey']: row for row in cached_rows if row.get('RowKey')}
     except Exception:
         metadata_map = {}
@@ -403,7 +403,7 @@ def list_photos():
     if error:
         return error
     try:
-        metadata_rows = app._cached_metadata_rows_for_user(user_id, purpose='photos.list')
+        metadata_rows = app._cached_metadata_list_rows_for_user(user_id, purpose='photos.list')
         entries = [row['RowKey'] for row in metadata_rows if row.get('RowKey')]
         metadata_map = {row['RowKey']: row for row in metadata_rows if row.get('RowKey')}
     except Exception as exc:
@@ -572,7 +572,7 @@ def photos_timeline():
     if error:
         return error
     try:
-        metadata_rows = app._cached_metadata_rows_for_user(user_id, purpose='photos.timeline')
+        metadata_rows = app._cached_metadata_list_rows_for_user(user_id, purpose='photos.timeline')
     except Exception as exc:
         app.app.logger.exception('Timeline metadata read failed')
         return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
@@ -1117,7 +1117,7 @@ def filter_photos():
         # Already sorted (rating/likes -> recency -> filename, stable across
         # loads) -- see _cached_sorted_metadata_rows_for_user. Filtering below
         # preserves that order, so no per-request re-sort is needed.
-        all_photos = app._cached_sorted_metadata_rows_for_user(user_id, purpose='photos.filter')
+        all_photos = app._cached_sorted_metadata_list_rows_for_user(user_id, purpose='photos.filter')
     except Exception as exc:
         app.app.logger.exception('Photo filter metadata read failed')
         return app.jsonify({'error': 'Unable to read photo metadata.'}), 503

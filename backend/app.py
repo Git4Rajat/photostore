@@ -2959,10 +2959,44 @@ _metadata_scan_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
 # can't go stale relative to it.
 _photo_default_sort_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
 
+# Narrow-column counterpart of the scans above, for the highest-traffic
+# gallery-loading purposes (list/access_batch/timeline/filter). Found live
+# 2026-09-16: a 36,633-row account's full-column scan (every field, including
+# large ones like photoEmbedding/semanticEmbedding/tagMetadata/weakTags/
+# objects/ocrText/faces that these four purposes never read) took 60-80s --
+# far longer than METADATA_SCAN_CACHE_TTL_SECONDS, so the cache could never
+# actually stay warm: each scan was stale before the next request needed it,
+# collapsing into back-to-back full scans and making scrolling/loading feel
+# broken. select= cuts the transferred/parsed payload to just what
+# _build_photo_summary, order_photo_entries, and filter_photos's own
+# criteria actually read. Kept as a SEPARATE cache (not a select= parameter
+# on the caches above) deliberately: photos.search's fallback path (lexical/
+# semantic scoring over tags/ocrText/caption/objects/embeddings) and the
+# rarer albums.smart_create/admin.backfill/uploads.corrupted purposes
+# genuinely need the wider field set, and sharing one cache/select between
+# them and the hot path would either re-bloat the hot path or silently drop
+# fields those purposes rely on.
+PHOTO_LIST_SELECT_FIELDS = [
+    'PartitionKey', 'RowKey',
+    'size', 'lastModified', 'exifData', 'likedBy', 'processing_metadata',
+    'rating', 'likes', 'tags', 'rotation',
+    'latitude', 'longitude', 'address', 'locationCity', 'locationCountry',
+    'exifCount', 'faceCount', 'peopleIds',
+    'preview_status', 'thumbnail_status', 'exif_status', 'ocr_status',
+    'face_status', 'ai_vision_status', 'map_detection_status',
+    'processing_lease_owner', 'processing_lease_expires_at',
+    'anonymousImageId',
+    'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified',
+]
+_metadata_list_scan_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
+_photo_list_default_sort_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
+
 
 def _invalidate_metadata_scan_cache(user_id: str) -> None:
     _metadata_scan_cache.invalidate(user_id)
     _photo_default_sort_cache.invalidate(user_id)
+    _metadata_list_scan_cache.invalidate(user_id)
+    _photo_list_default_sort_cache.invalidate(user_id)
 
 
 def _cached_metadata_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
@@ -2987,6 +3021,27 @@ def _cached_sorted_metadata_rows_for_user(user_id: str, purpose: str) -> List[Di
         rows.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
         return rows
     return _photo_default_sort_cache.get(user_id, _compute)
+
+
+def _cached_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
+    """Narrow-column counterpart of _cached_metadata_rows_for_user -- see
+    PHOTO_LIST_SELECT_FIELDS above for which purposes this is safe for."""
+    return _metadata_list_scan_cache.get(
+        user_id,
+        lambda: _query_metadata_rows_for_user(user_id, select=list(PHOTO_LIST_SELECT_FIELDS), purpose=purpose),
+    )
+
+
+def _cached_sorted_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
+    """Narrow-column counterpart of _cached_sorted_metadata_rows_for_user, for
+    /photos/filter (see PHOTO_LIST_SELECT_FIELDS above)."""
+    def _compute() -> List[Dict]:
+        rows = list(_cached_metadata_list_rows_for_user(user_id, purpose=purpose))
+        rows.sort(key=lambda p: p.get('RowKey', ''))
+        rows.sort(key=lambda p: _metadata_upload_date(p), reverse=True)
+        rows.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
+        return rows
+    return _photo_list_default_sort_cache.get(user_id, _compute)
 
 
 def _query_metadata_rows_for_user(user_id: str, select: Optional[List[str]] = None, purpose: str = 'metadata') -> List[Dict]:
