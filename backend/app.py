@@ -9941,6 +9941,28 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         target_library_id = str(payload.get('libraryId') or user_id)
         if job_id:
             _upsert_job_status(job_id, user_id, 'library_clean', 'running', libraryId=target_library_id)
+
+        # Refresh updatedAt periodically while _execute_library_clean is still
+        # walking the library's partition -- without this, a large-enough
+        # library (many rows x several sequential blob/table deletes each)
+        # can legitimately run past CLUSTERING_ACTIVE_JOB_STALE_MINUTES, and
+        # /api/jobs/status's staleness sweep force-flips a perfectly healthy,
+        # still-running clean to 'failed' ("worker restarted or timed out").
+        # Mirrors the same fix already applied to the clustering job branches
+        # and _execute_library_download's _live_progress_heartbeat -- see
+        # CLUSTERING_JOB_HEARTBEAT_SECONDS's comment.
+        stop_heartbeat = threading.Event()
+
+        def _send_heartbeat() -> None:
+            while not stop_heartbeat.wait(CLUSTERING_JOB_HEARTBEAT_SECONDS):
+                if job_id:
+                    try:
+                        _upsert_job_status(job_id, user_id, 'library_clean', 'running', libraryId=target_library_id)
+                    except Exception:
+                        worker_logger.exception('Failed to send library clean job heartbeat')
+
+        heartbeat_thread = threading.Thread(target=_send_heartbeat, daemon=True)
+        heartbeat_thread.start()
         try:
             summary = _execute_library_clean(target_library_id)
             if library_store is not None:
@@ -9958,6 +9980,9 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 library_store.set_cleanup_failed(target_library_id, 'Library clean failed')
             if job_id:
                 _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error='Library clean failed', libraryId=target_library_id)
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=5)
         return
 
     if job_type == 'library_download':

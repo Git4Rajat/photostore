@@ -105,3 +105,67 @@ def test_heartbeat_thread_stops_after_job_finishes(monkeypatch, metadata_table):
     threading.Event().wait(0.2)
     row_after_wait = metadata_table.get_entity('jobs', app._job_row_key(job_id))
     assert row_after_wait['status'] == 'done'
+
+
+def test_slow_library_clean_job_gets_heartbeated_before_it_finishes(monkeypatch, metadata_table):
+    """library_clean is dispatched before _handle_clustering_queue_payload's
+    shared clustering-job heartbeat setup (it returns early), so it needs its
+    own heartbeat -- this was the actual live gap: a large-enough library's
+    walk-and-delete legitimately outran the 15-minute staleness cutoff with
+    no heartbeat ever refreshing updatedAt in between."""
+    monkeypatch.setattr(app, 'CLUSTERING_JOB_HEARTBEAT_SECONDS', 0.05)
+
+    class _FakeLibraryStore:
+        def set_cleanup_completed(self, library_id, photos_deleted, blobs_deleted):
+            pass
+
+        def set_cleanup_failed(self, library_id, reason):
+            pass
+
+    monkeypatch.setattr(app, 'library_store', _FakeLibraryStore())
+    monkeypatch.setattr(app, '_notify_cleanup_completed', lambda library_id, summary: None)
+
+    release = threading.Event()
+
+    def _slow_execute_library_clean(library_id):
+        release.wait(timeout=5)
+        return {'photosDeleted': 0, 'blobsDeleted': 0, 'blobErrors': 0}
+
+    monkeypatch.setattr(app, '_execute_library_clean', _slow_execute_library_clean)
+
+    job_id = 'libclean:lib1:job1'
+    thread = threading.Thread(
+        target=app._handle_clustering_queue_payload,
+        args=({'libraryId': 'lib1'}, job_id, 'u1', 'library_clean'),
+    )
+    thread.start()
+
+    for _ in range(100):
+        row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+        if row is not None:
+            break
+        threading.Event().wait(0.01)
+    row_after_start = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+    assert row_after_start['status'] == 'running'
+    first_updated_at = row_after_start['updatedAt']
+
+    heartbeat_seen = False
+    for _ in range(200):
+        row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+        if row['status'] == 'running' and row['updatedAt'] != first_updated_at:
+            heartbeat_seen = True
+            break
+        threading.Event().wait(0.01)
+
+    assert heartbeat_seen, (
+        'updatedAt never refreshed while _execute_library_clean was still running -- '
+        'a real cleanup this slow would get falsely flagged failed by the '
+        '15-minute staleness sweep even though the worker never crashed'
+    )
+
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    final_row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+    assert final_row['status'] == 'done'
