@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 import app
+from routes.photos import search_photos
 import storage_utils
 import vision_utils
 from tests.fakes import FakeTable
@@ -191,7 +192,7 @@ def test_search_photos_surfaces_photo_via_tag_embedding_expansion(monkeypatch):
     monkeypatch.setattr(app.vision_utils, 'common_word_embedding', lambda word: _unit([1.0, 0.01]).tolist() if word == 'puppy' else [])
 
     with app.app.test_request_context('/photos/search?q=puppy'):
-        response = app.search_photos()
+        response = search_photos()
 
     payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
     filenames = [p['filename'] for p in payload['photos']]

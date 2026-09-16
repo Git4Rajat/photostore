@@ -1,6 +1,10 @@
 export interface AppConfig {
     apiBaseUrl?: string;
     uploadBaseUrl?: string;
+    /** Base URL for the dedicated `tools` container app (workbench action
+     * history logging, see routes/tools.py) -- falls back to apiBaseUrl when
+     * no separate tools deployment exists for this environment. */
+    toolsApiBaseUrl?: string;
     spaBaseUrl?: string;
     azureAdTenantId?: string;
     azureAdClientId?: string;

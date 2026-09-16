@@ -84,3 +84,9 @@ output appUrl string = app.outputs.appUrl
 
 @description('URL of the backend API.')
 output apiUrl string = app.outputs.apiUrl
+
+@description('URL of the tools (workbench action-history) API.')
+output toolsUrl string = app.outputs.toolsUrl
+
+@description('URL of the upload API.')
+output uploadUrl string = app.outputs.uploadUrl

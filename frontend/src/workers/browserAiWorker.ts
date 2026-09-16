@@ -15,6 +15,7 @@ type BrowserAiPrediction = {
 type BrowserAiWorkerRequest =
     | { type: 'browser-ai-warmup'; manifest: BrowserAiManifest; timeoutMs?: number }
     | { type: 'browser-ai-analyze'; requestId: string; manifest: BrowserAiManifest; image: BrowserAiImagePayload; timeoutMs?: number }
+    | { type: 'browser-ai-encode-text'; requestId: string; manifest: BrowserAiManifest; text: string; timeoutMs?: number }
 
 const FALLBACK_MODEL = 'photostore-local-vision-fallback';
 const FALLBACK_MODEL_VERSION = 'visual-heuristics-v1';
@@ -131,9 +132,18 @@ const CLOTHING_LABEL_PHRASES = CLOTHING_LABEL_KEYWORDS.map((keyword) => ` ${keyw
 type ClipSession = {
     model: any;
     processor: any;
+    tokenizer: any;
     labels: string[];
     vocabEmbeddings: Float32Array;
     dummyTextInputs: Record<string, any>;
+    // Real per-photo pixel_values are unavailable when encoding a text-only
+    // search query -- CLIP's combined model still requires *some* image
+    // input for a forward pass, and (mirroring classify()'s own use of a
+    // dummy text input to get image_embeds) the text tower has no
+    // cross-attention to the image, so text_embeds is fully determined by
+    // the tokenized text regardless of which image accompanies it. Computed
+    // once per session rather than per query.
+    warmupPixelValues: any;
 };
 
 let clipSessionPromise: Promise<ClipSession> | null = null;
@@ -310,8 +320,9 @@ const getClipSession = async (manifest: BrowserAiManifest): Promise<ClipSession>
                 getVocabularyEmbeddings(manifest, vocabulary.labels.length),
             ]);
             const dummyTextInputs = tokenizer([CLIP_FORWARD_PLACEHOLDER_TEXT], { padding: true, truncation: true });
+            const { pixel_values: warmupPixelValues } = await processor([WARMUP_IMAGE]);
             postWarmupProgress('clip_loaded');
-            return { model, processor, labels: vocabulary.labels, vocabEmbeddings, dummyTextInputs };
+            return { model, processor, tokenizer, labels: vocabulary.labels, vocabEmbeddings, dummyTextInputs, warmupPixelValues };
         })().catch((err) => {
             clipSessionPromise = null;
             throw err;
@@ -550,6 +561,31 @@ const firstRow = (tensor: any): ArrayLike<number> | undefined => {
     return undefined;
 };
 
+// Real client-side counterpart to vision_utils.encode_text_embedding --
+// backend/photos runs on the lightweight backendImage, which never installs
+// torch/open_clip (only requirements-ipworker.txt does), so
+// encode_text_embedding there silently falls back to a hashed-ngram
+// pseudo-embedding in a completely different vector space from the real
+// CLIP embeddings stored per photo; vector_search_candidates' own dimension
+// guard (query.size != embeddings.shape[1]) means that fallback never even
+// matches anything. This is what makes semantic search real for the first
+// time, using the same CLIP model already loaded here for image tagging --
+// see localLexicalSearch.ts's semantic-blend scoring for how the result is
+// used. Runs the *same* combined CLIPModel forward call classify() does,
+// just with the real tokenized query text (not the placeholder) and a fixed
+// warm-up image (not a real photo) -- CLIP's image tower has no
+// cross-attention to text, so text_embeds only depends on the input text.
+const encodeTextQuery = async (manifest: BrowserAiManifest, text: string): Promise<number[]> => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+        return [];
+    }
+    const session = await getClipSession(manifest);
+    const textInputs = session.tokenizer([trimmed], { padding: true, truncation: true });
+    const output = await session.model({ ...textInputs, pixel_values: session.warmupPixelValues });
+    return extractImageEmbedding(firstRow(output?.text_embeds), IMAGE_EMBEDDING_DIMENSION);
+};
+
 const classify = async (manifest: BrowserAiManifest, image: BrowserAiImagePayload | RawImage): Promise<{
     predictions: BrowserAiPrediction[];
     imageEmbedding: number[];
@@ -668,6 +704,26 @@ self.onmessage = (event: MessageEvent<BrowserAiWorkerRequest>) => {
             .catch((err) => {
                 self.postMessage({
                     type: 'browser-ai-analyze-result',
+                    requestId: message.requestId,
+                    ok: false,
+                    reason: err instanceof Error ? err.message : 'model_load_failed',
+                });
+            });
+        return;
+    }
+    if (message.type === 'browser-ai-encode-text') {
+        void withWorkerTimeout(encodeTextQuery(message.manifest || {}, message.text), message.timeoutMs)
+            .then((embedding) => {
+                self.postMessage({
+                    type: 'browser-ai-encode-text-result',
+                    requestId: message.requestId,
+                    ok: true,
+                    embedding,
+                });
+            })
+            .catch((err) => {
+                self.postMessage({
+                    type: 'browser-ai-encode-text-result',
                     requestId: message.requestId,
                     ok: false,
                     reason: err instanceof Error ? err.message : 'model_load_failed',

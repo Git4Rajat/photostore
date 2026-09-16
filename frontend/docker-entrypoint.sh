@@ -3,6 +3,10 @@ set -eu
 
 API_BASE_URL="${APP_CONFIG_API_BASE_URL:-}"
 UPLOAD_BASE_URL="${APP_CONFIG_UPLOAD_BASE_URL:-$API_BASE_URL}"
+# Falls back to the main API origin so environments without a dedicated
+# tools container app (not every deploy has one) keep working unchanged --
+# see deploy/resources.bicep's `tools` containerApp resource.
+TOOLS_API_BASE_URL="${APP_CONFIG_TOOLS_API_BASE_URL:-$API_BASE_URL}"
 SPA_BASE_URL="${APP_CONFIG_SPA_BASE_URL:-}"
 AZURE_AD_TENANT_ID="${APP_CONFIG_AZURE_AD_TENANT_ID:-}"
 AZURE_AD_CLIENT_ID="${APP_CONFIG_AZURE_AD_CLIENT_ID:-}"
@@ -28,6 +32,7 @@ cat > /usr/share/nginx/html/env.js <<EOF
 window.__APP_CONFIG__ = {
 	  apiBaseUrl: "${API_BASE_URL}",
 	  uploadBaseUrl: "${UPLOAD_BASE_URL}",
+	  toolsApiBaseUrl: "${TOOLS_API_BASE_URL}",
 	  spaBaseUrl: "${SPA_BASE_URL}",
   azureAdTenantId: "${AZURE_AD_TENANT_ID}",
   azureAdClientId: "${AZURE_AD_CLIENT_ID}",
@@ -64,6 +69,20 @@ EOF
 CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
 if [ -n "$API_BASE_URL" ]; then
   CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
+fi
+# TOOLS_API_BASE_URL/UPLOAD_BASE_URL both fall back to API_BASE_URL above
+# when no dedicated container app is deployed for that path, so this is a
+# no-op duplicate origin in that case rather than a second one to add --
+# only append when actually different. UPLOAD_BASE_URL was a real,
+# pre-existing gap here (not just a new one from the tools split): it's been
+# a separately-configurable origin since uploadClient was introduced, just
+# never actually different from API_BASE_URL in any deployment until the
+# upload service split, so this bug was latent rather than never possible.
+if [ -n "$TOOLS_API_BASE_URL" ] && [ "$TOOLS_API_BASE_URL" != "$API_BASE_URL" ]; then
+  CONNECT_SRC="${CONNECT_SRC} ${TOOLS_API_BASE_URL}"
+fi
+if [ -n "$UPLOAD_BASE_URL" ] && [ "$UPLOAD_BASE_URL" != "$API_BASE_URL" ]; then
+  CONNECT_SRC="${CONNECT_SRC} ${UPLOAD_BASE_URL}"
 fi
 
 cat > /etc/nginx/csp.conf <<EOF

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import app
+from routes.system import jobs_status
 
 
 class _FakeJobsTable:
@@ -67,7 +68,7 @@ def _seed_job(table, job_id, job_type, status, *, age_minutes=0, user_id='owner'
 
 def _poll():
     with app.app.test_request_context('/api/jobs/status'):
-        response = app.jobs_status()
+        response = jobs_status()
     return response.get_json()['jobs']
 
 

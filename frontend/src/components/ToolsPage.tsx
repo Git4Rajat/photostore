@@ -20,7 +20,7 @@ import {
     UsersIcon,
     XMarkIcon,
 } from '@heroicons/react/24/outline';
-import { get, post } from '../services/apiClient';
+import { get, post, getTools, postTools, getUpload } from '../services/apiClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import { requestJobPoll } from '../services/jobNotifications';
 import { plural } from '../utils/format';
@@ -439,7 +439,7 @@ const ToolsPage: React.FC = () => {
 
     const loadQueueStatus = async () => {
         try {
-            const response = (await get(`/upload/processing/status?ts=${Date.now()}`)) as QueueStatusResponse;
+            const response = (await getUpload(`/upload/processing/status?ts=${Date.now()}`)) as QueueStatusResponse;
             setQueueStatus({
                 preview: response?.preview,
                 thumbnail: response?.thumbnail,
@@ -458,7 +458,7 @@ const ToolsPage: React.FC = () => {
 
     const refreshWorkbenchHistory = async () => {
         try {
-            const response = await get('/api/tools/workbench/actions');
+            const response = await getTools('/api/tools/workbench/actions');
             setHistory((response?.actions || []) as WorkbenchHistoryEntry[]);
         } catch {
             // Non-critical -- the history panel just stays empty/stale.
@@ -836,7 +836,7 @@ const ToolsPage: React.FC = () => {
                 await loadBrowserAiModel();
             }
             void startBrowserProcessing();
-            void post('/api/tools/workbench/actions', {
+            void postTools('/api/tools/workbench/actions', {
                 action: label,
                 steps,
                 scope: 'library',
@@ -926,7 +926,7 @@ const ToolsPage: React.FC = () => {
             setMessage(`Finished ${label}: ${processed} of ${plural(filenames.length, 'photo')} processed in-browser.${backendNote}`);
             await refreshPhotosByFilename(filenames);
             await loadQueueStatus();
-            void post('/api/tools/workbench/actions', {
+            void postTools('/api/tools/workbench/actions', {
                 action: label,
                 steps,
                 scope,

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { CheckCircleIcon } from '@heroicons/react/24/outline';
-import { get, post } from '../services/apiClient';
+import { post, getUpload, postUpload } from '../services/apiClient';
 import PhotoTile from './shared/PhotoTile';
 import PhotoQuickActions, { libraryFocusHref, workbenchFilenameHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
@@ -34,7 +34,7 @@ const CorruptedUploadsPage: React.FC = () => {
         setLoading(true);
         setError(null);
         try {
-            const data = await get('/api/uploads/corrupted');
+            const data = await getUpload('/api/uploads/corrupted');
             const nextItems = Array.isArray(data?.items) ? data.items : [];
             setItems(nextItems);
         } catch (err) {
@@ -53,7 +53,7 @@ const CorruptedUploadsPage: React.FC = () => {
     const clearCorruption = async (filename: string) => {
         setClearing(filename);
         try {
-            await post(`/api/uploads/corrupted/${encodeURIComponent(filename)}/clear`, {});
+            await postUpload(`/api/uploads/corrupted/${encodeURIComponent(filename)}/clear`, {});
             setItems((current) => current.filter((item) => item.filename !== filename));
         } catch (err) {
             notifyApiError(err, { context: "Couldn't mark as not corrupted", retry: () => { void clearCorruption(filename); } });

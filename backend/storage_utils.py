@@ -1003,6 +1003,15 @@ def _vector_index_container_name() -> str:
     ).strip()
 
 
+def get_vector_index_blob_location(user_id: str) -> Tuple[str, str]:
+    """(container_name, blob_name) for user_id's vector-index .npz blob --
+    mirrors get_lexical_index_blob_location, the pair a caller needs to mint
+    its own SAS URL (see routes/photos.py:photos_search_index, which hands
+    this straight to the browser for client-side semantic search -- Phase B
+    of backend-cpu-optimization-2026-09)."""
+    return _vector_index_container_name(), _vector_index_npz_blob_name(user_id)
+
+
 def _vector_index_blob_key(user_id: str) -> str:
     return hashlib.sha256(str(user_id or '').encode('utf-8')).hexdigest()
 
@@ -1069,6 +1078,39 @@ def touch_user_vector_index_state(user_id: str, *, embedding_version: Optional[s
             pass
     invalidate_user_vector_index_cache(key)
     return source_version
+
+
+def get_vector_index_manifest_summary(user_id: str) -> Optional[Dict[str, object]]:
+    """Best-effort manifest read for the vector-index blob, WITHOUT the
+    version-gated freshness check get_user_vector_index applies.
+
+    That gate compares the manifest's embeddingVersion against
+    vision_utils.get_text_embedding_version() -- which is always the
+    hashing-fallback string on any process without torch/open_clip
+    installed (backend/photos/upload/tools all run backendImage, which
+    never installs them; only requirements-ipworker.txt does). On this
+    deployment shape, get_user_vector_index(allow_refresh=False) always
+    returns None even when a perfectly good real-CLIP index exists in
+    storage (built by ipworker or the browser), and
+    allow_refresh=True would be actively destructive: _build_user_vector_index_snapshot
+    would treat every photo's real photoEmbedding as version-incompatible
+    and silently rebuild the whole index from the hashing fallback,
+    overwriting real embeddings with noise. This function exists so a
+    torch-less caller (routes/photos.py:photos_search_index, for Phase B
+    client-side semantic search) can still discover and hand out the blob's
+    SAS URL without ever touching that gate."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    manifest = _load_vector_index_manifest(key)
+    if not manifest:
+        return None
+    return {
+        'source_version': str(manifest.get('sourceVersion') or ''),
+        'embedding_version': str(manifest.get('embeddingVersion') or ''),
+        'updated_at': str(manifest.get('updatedAt') or ''),
+        'dirty': bool(manifest.get('dirty')),
+    }
 
 
 def _load_vector_index_manifest(user_id: str) -> Dict[str, str]:
@@ -1646,6 +1688,15 @@ def _lexical_index_container_name() -> str:
 
 def _lexical_index_json_blob_name(user_id: str) -> str:
     return f'{_vector_index_blob_key(user_id)}.json.gz'
+
+
+def get_lexical_index_blob_location(user_id: str) -> Tuple[str, str]:
+    """(container_name, blob_name) for user_id's lexical index data blob --
+    the pair a caller needs to mint its own SAS URL (see
+    routes/photos.py:photos_search_index, which hands this blob straight to
+    the browser for client-side lexical search instead of proxying it
+    through a backend request)."""
+    return _lexical_index_container_name(), _lexical_index_json_blob_name(user_id)
 
 
 def _lexical_index_manifest_blob_name(user_id: str) -> str:

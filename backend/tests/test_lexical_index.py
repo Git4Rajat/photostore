@@ -19,6 +19,7 @@ import threading
 import pytest
 
 import app
+from routes.photos import search_photos
 import storage_utils
 from tests.fakes import FakeTable
 
@@ -288,7 +289,7 @@ def test_search_falls_back_to_full_scan_when_lexical_index_unavailable(monkeypat
     monkeypatch.setattr(app, '_cached_metadata_rows_for_user', lambda *a, **k: [_fallback_row('vacation.jpg')])
 
     with app.app.test_request_context('/photos/search?q=vacation'):
-        response = app.search_photos()
+        response = search_photos()
 
     payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
     filenames = [p['filename'] for p in payload['photos']]
@@ -304,7 +305,7 @@ def test_search_503s_when_lexical_index_and_fallback_scan_both_fail(monkeypatch,
     monkeypatch.setattr(app, '_cached_metadata_rows_for_user', _boom)
 
     with app.app.test_request_context('/photos/search?q=vacation'):
-        response = app.search_photos()
+        response = search_photos()
 
     assert response[1] == 503
 
@@ -318,7 +319,7 @@ def test_search_uses_lexical_index_rows_when_available(monkeypatch, search_route
     monkeypatch.setattr(app, '_cached_metadata_rows_for_user', _boom)
 
     with app.app.test_request_context('/photos/search?q=fromindex'):
-        response = app.search_photos()
+        response = search_photos()
 
     payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
     filenames = [p['filename'] for p in payload['photos']]

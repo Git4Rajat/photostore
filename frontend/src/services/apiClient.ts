@@ -17,6 +17,13 @@ const uploadUrl =
     env.VITE_UPLOAD_BASE_URL ||
     env.REACT_APP_UPLOAD_BASE_URL ||
     apiUrl;
+// Falls back to apiUrl when no dedicated tools container app is deployed for
+// this environment -- see routes/tools.py's APP_ROLE=tools split.
+const toolsUrl =
+    runtimeConfig.toolsApiBaseUrl ||
+    env.VITE_TOOLS_API_BASE_URL ||
+    env.REACT_APP_TOOLS_API_BASE_URL ||
+    apiUrl;
 
 if (!apiUrl && import.meta.env.MODE !== 'development') {
     console.warn(
@@ -26,6 +33,7 @@ if (!apiUrl && import.meta.env.MODE !== 'development') {
 
 const API_BASE_URL = apiUrl || '';
 const UPLOAD_BASE_URL = uploadUrl || '';
+const TOOLS_BASE_URL = toolsUrl || '';
 
 export const resolveApiUrl = (url?: string): string => {
     if (!url) {
@@ -42,6 +50,7 @@ export const resolveApiUrl = (url?: string): string => {
 
 const apiClient = createHttpClient(API_BASE_URL);
 const uploadClient = createHttpClient(UPLOAD_BASE_URL);
+const toolsClient = createHttpClient(TOOLS_BASE_URL);
 
 // Give the app-wide availability tracker the absolute /health URL so its
 // recovery probes hit the API origin (not the SPA origin) when a base URL is
@@ -52,12 +61,17 @@ configureBackendStatus({ healthUrl: resolveApiUrl('health') });
 const LOCAL_USER_KEY = 'photostore.localUserId';
 
 const setDefaultHeader = (userId: string | null) => {
-    const headers = apiClient.defaults.headers as Record<string, string | undefined>;
-    if (userId) {
-        headers['X-User-ID'] = userId;
-        return;
+    // Only apiClient and toolsClient, matching the existing (pre-tools-split)
+    // behavior of leaving uploadClient out of this -- not touching that
+    // here, unrelated to the tools split.
+    for (const client of [apiClient, toolsClient]) {
+        const headers = client.defaults.headers as Record<string, string | undefined>;
+        if (userId) {
+            headers['X-User-ID'] = userId;
+        } else {
+            delete headers['X-User-ID'];
+        }
     }
-    delete headers['X-User-ID'];
 };
 
 export const setUserId = (userId: string | null) => {
@@ -99,3 +113,5 @@ export const post = async <T = any, D = unknown>(url: string, data: D) => reques
 export const postUpload = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
 export const getUploadJson = async <T = any>(url: string) => requestJson<T>(uploadClient, 'get', url);
 export const postUploadJson = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
+export const getTools = async <T = any>(url: string, config?: Parameters<typeof toolsClient.get>[1]) => requestJson<T>(toolsClient, 'get', url, undefined, config);
+export const postTools = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(toolsClient, 'post', url, data);

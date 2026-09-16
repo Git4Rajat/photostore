@@ -78,6 +78,8 @@ var backendAppName = '${appName}-backend'
 var frontendAppName = '${appName}-frontend'
 var workerAppName = '${appName}-worker'
 var ipworkerAppName = '${appName}-ipworker'
+var toolsAppName = '${appName}-tools'
+var uploadAppName = '${appName}-upload'
 // Only deploy ipworker (and grant it storage access) when the deployment
 // actually needs it -- in 'browser' mode (the default) it would just sit
 // scaled to zero forever, so skip provisioning it at all.
@@ -605,6 +607,150 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+// 2026-09-15: first real service split (see backend-cpu-optimization-2026-09
+// memory's coupling map -- tools/workbench action-history logging was the
+// least-entangled route group, touching only its own table, no shared
+// caches). Same image as backend, differing only by APP_ROLE=tools, which
+// app.py reads to register just tools_bp instead of the other 9 blueprints
+// (see app.py's blueprint-registration block). Runs the full backendEnv
+// (needs the same storage/session config to boot -- only the route
+// registration differs, not the module's own startup), sized much smaller
+// since this traffic is low-volume, best-effort history logging, not the
+// gallery/upload hot path.
+resource tools 'Microsoft.App/containerApps@2024-03-01' = {
+  name: toolsAppName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      ingress: {
+        external: true
+        targetPort: 5000
+        transport: 'auto'
+        traffic: [
+          { latestRevision: true, weight: 100 }
+        ]
+      }
+      secrets: [
+        { name: 'owner-password', value: adminPassword }
+        { name: 'session-secret', value: sessionSecret }
+        { name: 'acs-connection-string', value: acsConnectionString }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'tools'
+          image: backendImage
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'tools' }
+            { name: 'GUNICORN_WORKERS', value: '1' }
+            { name: 'GUNICORN_THREADS', value: '4' }
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
+            { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+          ])
+        }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 2
+        rules: [
+          {
+            name: 'http-scaler'
+            http: {
+              metadata: {
+                concurrentRequests: '10'
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
+// 2026-09-15: second service split -- upload (init/finalize/processing-lease/
+// known-hashes/corrupted-uploads). Unlike tools, this IS the traffic pattern
+// that originally justified the backend's own 2vCPU/4Gi + maxReplicas=5 +
+// GUNICORN_THREADS=4 + concurrentRequests=4 tuning (see backend resource's
+// comments above -- finalize/init-batch/client-processing/processing-claim
+// were the slow/thread-starved handlers those settings were tuned against),
+// so this app inherits that same profile rather than starting smaller.
+// Right-sizing the CORE backend now that it no longer carries this load is a
+// deliberate follow-up, not done here -- better done from real per-service
+// metrics post-split than guessed upfront.
+resource upload 'Microsoft.App/containerApps@2024-03-01' = {
+  name: uploadAppName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      ingress: {
+        external: true
+        targetPort: 5000
+        transport: 'auto'
+        traffic: [
+          { latestRevision: true, weight: 100 }
+        ]
+      }
+      secrets: [
+        { name: 'owner-password', value: adminPassword }
+        { name: 'session-secret', value: sessionSecret }
+        { name: 'acs-connection-string', value: acsConnectionString }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'upload'
+          image: backendImage
+          resources: {
+            cpu: json('2')
+            memory: '4Gi'
+          }
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'upload' }
+            { name: 'GUNICORN_WORKERS', value: '1' }
+            { name: 'GUNICORN_THREADS', value: '4' }
+            { name: 'GUNICORN_MAX_REQUESTS', value: '4000' }
+            { name: 'GUNICORN_MAX_REQUESTS_JITTER', value: '400' }
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
+            { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+          ])
+        }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 5
+        rules: [
+          {
+            name: 'http-scaler'
+            http: {
+              metadata: {
+                concurrentRequests: '4'
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
 resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
   name: frontendAppName
   location: location
@@ -631,7 +777,8 @@ resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: [
             { name: 'APP_CONFIG_API_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
-            { name: 'APP_CONFIG_UPLOAD_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_UPLOAD_BASE_URL', value: 'https://${upload.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_TOOLS_API_BASE_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_SPA_BASE_URL', value: frontendUrl }
             { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
             // Without this, the frontend's docker-entrypoint.sh defaults
@@ -987,8 +1134,38 @@ resource ipworkerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-0
   }
 ]
 
+resource toolsStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: {
+    name: guid(storage.id, tools.id, roleId)
+    scope: storage
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+      principalId: tools.identity.principalId
+      principalType: 'ServicePrincipal'
+    }
+  }
+]
+
+resource uploadStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: {
+    name: guid(storage.id, upload.id, roleId)
+    scope: storage
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+      principalId: upload.identity.principalId
+      principalType: 'ServicePrincipal'
+    }
+  }
+]
+
 @description('Open this URL in your browser to use Photostore.')
 output appUrl string = frontendUrl
 
 @description('Backend API URL.')
 output apiUrl string = 'https://${backend.properties.configuration.ingress.fqdn}'
+
+@description('Tools (workbench action-history) API URL.')
+output toolsUrl string = 'https://${tools.properties.configuration.ingress.fqdn}'
+
+@description('Upload API URL.')
+output uploadUrl string = 'https://${upload.properties.configuration.ingress.fqdn}'

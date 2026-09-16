@@ -1,0 +1,1113 @@
+[
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 7.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 7.5,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "dog"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "dog1.jpg",
+    "name": "simple_tag_match",
+    "nameToIds": {},
+    "query": "dog",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "dog1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "dog1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"dog\"]",
+      "tags": "[\"dog\", \"park\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 7.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 7.5,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "dog"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "dog1.jpg",
+    "name": "plural_stemming_match",
+    "nameToIds": {},
+    "query": "dogs",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "dog1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "dog1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"dog\"]",
+      "tags": "[\"dog\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 34.0,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 34.0,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "red",
+          "car"
+        ],
+        "exactPhrases": [
+          "red car",
+          "wearing red car",
+          "car color red",
+          "car colour red"
+        ],
+        "expanded": [
+          "rose",
+          "flower",
+          "sunset",
+          "festival",
+          "firework"
+        ],
+        "location": [],
+        "modifiers": [
+          "red"
+        ],
+        "requiredObject": [
+          "car"
+        ],
+        "subject": [
+          "red",
+          "car"
+        ]
+      }
+    },
+    "filename": "car1.jpg",
+    "name": "visual_modifier_object_tag_match",
+    "nameToIds": {},
+    "query": "red car",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "car1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "car1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"car\"]",
+      "tags": "[\"car\", \"red\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 13.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 13.5,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "red",
+          "car"
+        ],
+        "exactPhrases": [
+          "red car",
+          "wearing red car",
+          "car color red",
+          "car colour red"
+        ],
+        "expanded": [
+          "rose",
+          "flower",
+          "sunset",
+          "festival",
+          "firework"
+        ],
+        "location": [],
+        "modifiers": [
+          "red"
+        ],
+        "requiredObject": [
+          "car"
+        ],
+        "subject": [
+          "red",
+          "car"
+        ]
+      }
+    },
+    "filename": "car2.jpg",
+    "name": "visual_modifier_object_no_modifier_match",
+    "nameToIds": {},
+    "query": "red car",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "car2.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "car2.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"car\"]",
+      "tags": "[\"car\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 0.0,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 0.0,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "red",
+          "car"
+        ],
+        "exactPhrases": [
+          "red car",
+          "wearing red car",
+          "car color red",
+          "car colour red"
+        ],
+        "expanded": [
+          "rose",
+          "flower",
+          "sunset",
+          "festival",
+          "firework"
+        ],
+        "location": [],
+        "modifiers": [
+          "red"
+        ],
+        "requiredObject": [
+          "car"
+        ],
+        "subject": [
+          "red",
+          "car"
+        ]
+      }
+    },
+    "filename": "boat1.jpg",
+    "name": "visual_modifier_object_no_match_at_all",
+    "nameToIds": {},
+    "query": "red car",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "boat1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "boat1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"boat\"]",
+      "tags": "[\"boat\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 12.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 7.5,
+      "matchedLocationTerms": [
+        "malmo"
+      ],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "malmo"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "malmo"
+        ]
+      }
+    },
+    "filename": "trip1.jpg",
+    "name": "location_query_match",
+    "nameToIds": {},
+    "query": "malmo",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "trip1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "trip1.jpg",
+      "locationCity": "Malmo",
+      "locationCountry": "Sweden",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[]",
+      "tags": "[]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 23.0,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 18.0,
+      "matchedLocationTerms": [
+        "malmo"
+      ],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "dog",
+          "malmo"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [
+          "malmo"
+        ],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "trip2.jpg",
+    "name": "subject_in_location_combo",
+    "nameToIds": {},
+    "query": "dog in malmo",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "trip2.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "trip2.jpg",
+      "locationCity": "Malmo",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"dog\"]",
+      "tags": "[\"dog\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 9.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 1.5,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [
+        [
+          "p1"
+        ]
+      ],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "alice"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "alice"
+        ]
+      }
+    },
+    "filename": "alice1.jpg",
+    "name": "people_single_match",
+    "nameToIds": {
+      "alice": [
+        "p1"
+      ]
+    },
+    "query": "alice",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "alice1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "alice1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[\"p1\"]",
+      "peopleNames": "[]",
+      "subjectTags": "[]",
+      "tags": "[]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 16.0,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 0.0,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [
+        [
+          "p1"
+        ],
+        [
+          "p2"
+        ]
+      ],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "alice",
+          "bob"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "alice",
+          "bob"
+        ]
+      }
+    },
+    "filename": "both.jpg",
+    "name": "people_multi_match_both_required",
+    "nameToIds": {
+      "alice": [
+        "p1"
+      ],
+      "bob": [
+        "p2"
+      ]
+    },
+    "query": "alice and bob",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "both.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "both.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[\"p1\", \"p2\"]",
+      "peopleNames": "[]",
+      "subjectTags": "[]",
+      "tags": "[]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 16.0,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 0.0,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [
+        [
+          "p1"
+        ],
+        [
+          "p2"
+        ]
+      ],
+      "passesFilters": false,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "alice",
+          "bob"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "alice",
+          "bob"
+        ]
+      }
+    },
+    "filename": "onlyalice.jpg",
+    "name": "people_multi_match_only_one_present",
+    "nameToIds": {
+      "alice": [
+        "p1"
+      ],
+      "bob": [
+        "p2"
+      ]
+    },
+    "query": "alice and bob",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "onlyalice.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "onlyalice.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[\"p1\"]",
+      "peopleNames": "[]",
+      "subjectTags": "[]",
+      "tags": "[]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 8.6,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 8.6,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "water"
+        ],
+        "exactPhrases": [],
+        "expanded": [
+          "waterfall",
+          "river",
+          "lake",
+          "ocean",
+          "beach",
+          "waterfront",
+          "seaside",
+          "pool"
+        ],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "water"
+        ]
+      }
+    },
+    "filename": "fall1.jpg",
+    "name": "synonym_expansion_match",
+    "nameToIds": {},
+    "query": "water",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "fall1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "fall1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"waterfall\"]",
+      "tags": "[\"waterfall\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": "2026-06-30",
+    "captureStart": "2026-06-01",
+    "expected": {
+      "combinedScore": 7.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 7.5,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "dog"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "dated1.jpg",
+    "name": "capture_date_in_range",
+    "nameToIds": {},
+    "query": "dog",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "dated1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{\"DateTimeOriginal\": \"2026:06:15 10:00:00\"}",
+      "faceCount": 0,
+      "filename": "dated1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"dog\"]",
+      "tags": "[\"dog\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": "2026-06-30",
+    "captureStart": "2026-06-01",
+    "expected": {
+      "combinedScore": 7.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 7.5,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": false,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "dog"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "dated2.jpg",
+    "name": "capture_date_out_of_range",
+    "nameToIds": {},
+    "query": "dog",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "dated2.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{\"DateTimeOriginal\": \"2026:07:15 10:00:00\"}",
+      "faceCount": 0,
+      "filename": "dated2.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"dog\"]",
+      "tags": "[\"dog\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 0.0,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 0.0,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "dog"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "unrelated.jpg",
+    "name": "no_match_returns_zero",
+    "nameToIds": {},
+    "query": "dog",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "unrelated.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "unrelated.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"cat\"]",
+      "tags": "[\"cat\"]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 1.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 1.5,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "sunset"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "sunset"
+        ]
+      }
+    },
+    "filename": "sunset_beach_photo.jpg",
+    "name": "filename_only_match",
+    "nameToIds": {},
+    "query": "sunset",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "sunset_beach_photo.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "sunset_beach_photo.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[]",
+      "tags": "[]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 3.5,
+      "combinedScoreWithSemantic": null,
+      "lexicalScore": 3.5,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": null,
+      "tokens": {
+        "all": [
+          "springfield"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "springfield"
+        ]
+      }
+    },
+    "filename": "sign1.jpg",
+    "name": "ocr_text_match",
+    "nameToIds": {},
+    "query": "springfield",
+    "queryEmbedding": null,
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "sign1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "sign1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "Welcome to Springfield",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[]",
+      "tags": "[]"
+    },
+    "rowEmbedding": null
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 0.0,
+      "combinedScoreWithSemantic": 10.0,
+      "lexicalScore": 0.0,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": 1.0,
+      "tokens": {
+        "all": [
+          "dog"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "semantic1.jpg",
+    "name": "semantic_above_threshold_no_lexical_match",
+    "nameToIds": {},
+    "query": "dog",
+    "queryEmbedding": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "semantic1.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "semantic1.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"cat\"]",
+      "tags": "[\"cat\"]"
+    },
+    "rowEmbedding": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 0.0,
+      "combinedScoreWithSemantic": 0.0,
+      "lexicalScore": 0.0,
+      "matchedLocationTerms": [],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": 0.0,
+      "tokens": {
+        "all": [
+          "dog"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "semantic2.jpg",
+    "name": "semantic_below_threshold_no_lexical_match",
+    "nameToIds": {},
+    "query": "dog",
+    "queryEmbedding": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "semantic2.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "semantic2.jpg",
+      "locationCity": "",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"cat\"]",
+      "tags": "[\"cat\"]"
+    },
+    "rowEmbedding": [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "captureEnd": null,
+    "captureStart": null,
+    "expected": {
+      "combinedScore": 23.0,
+      "combinedScoreWithSemantic": 32.6,
+      "lexicalScore": 18.0,
+      "matchedLocationTerms": [
+        "malmo"
+      ],
+      "matchedPersonGroups": [],
+      "passesFilters": true,
+      "semanticScore": 0.96,
+      "tokens": {
+        "all": [
+          "dog",
+          "malmo"
+        ],
+        "exactPhrases": [],
+        "expanded": [],
+        "location": [
+          "malmo"
+        ],
+        "modifiers": [],
+        "requiredObject": [],
+        "subject": [
+          "dog"
+        ]
+      }
+    },
+    "filename": "semantic3.jpg",
+    "name": "semantic_plus_lexical_plus_location_all_stack",
+    "nameToIds": {},
+    "query": "dog in malmo",
+    "queryEmbedding": [
+      0.6,
+      0.8,
+      0.0,
+      0.0
+    ],
+    "row": {
+      "PartitionKey": "owner",
+      "RowKey": "semantic3.jpg",
+      "address": "",
+      "backgroundTags": "[]",
+      "caption": "",
+      "exifData": "{}",
+      "faceCount": 0,
+      "filename": "semantic3.jpg",
+      "locationCity": "Malmo",
+      "locationCountry": "",
+      "locationRegion": "",
+      "objects": "[]",
+      "ocrText": "",
+      "peopleIds": "[]",
+      "peopleNames": "[]",
+      "subjectTags": "[\"dog\"]",
+      "tags": "[\"dog\"]"
+    },
+    "rowEmbedding": [
+      0.8,
+      0.6,
+      0.0,
+      0.0
+    ]
+  }
+]

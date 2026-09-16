@@ -22,11 +22,13 @@ def process_exif(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
 
 
 def process_geo(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
-    # Re-extracts EXIF rather than sharing process_exif's result -- the two
-    # steps are dispatched independently by _run_ipwork_steps (app.py), and
-    # exiftool's subprocess cost is small next to face/vision inference, so
-    # this isn't worth a cross-step cache for now.
-    exif_data = extract_exif_from_bytes(image_bytes, filename)
+    # Reuses process_exif's result instead of re-parsing -- for RAW files
+    # extract_exif_from_bytes falls through to a temp-file + exiftool
+    # subprocess (exif_utils.extract_exif_from_path), so calling it twice per
+    # photo (both 'exif' and 'map_detection' steps run on every upload) meant
+    # spawning exiftool twice. Cheap for Pillow-readable formats either way.
+    exif_result = process_exif(user_id, filename, image_bytes)
+    exif_data = (exif_result or {}).get('data') or {}
     lat_str, lon_str = extract_gps_decimal_from_exif(exif_data)
     if not lat_str or not lon_str:
         return {'hasData': False}

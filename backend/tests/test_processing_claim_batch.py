@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 import app
+from routes.upload import upload_processing_claim_batch
 import storage_utils
 
 
@@ -96,7 +97,7 @@ def test_batch_route_claims_multiple_photos_in_one_call(metadata, monkeypatch):
             {'filename': 'c.jpg', 'leaseId': 'lane-3', 'steps': ['ocr']},
         ]},
     ):
-        response = app.upload_processing_claim_batch()
+        response = upload_processing_claim_batch()
 
     body = response.get_json()
     assert [item['filename'] for item in body['results']] == ['a.jpg', 'b.jpg', 'c.jpg']
@@ -121,7 +122,7 @@ def test_batch_route_isolates_one_failed_claim_from_the_rest(metadata, monkeypat
             {'filename': 'b.jpg', 'leaseId': 'lane-2', 'steps': ['ocr']},
         ]},
     ):
-        response = app.upload_processing_claim_batch()
+        response = upload_processing_claim_batch()
 
     body = response.get_json()
     results_by_name = {item['filename']: item for item in body['results']}
@@ -133,7 +134,7 @@ def test_batch_route_isolates_one_failed_claim_from_the_rest(metadata, monkeypat
 def test_batch_route_rejects_empty_items(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('lib-A', None))
     with app.app.test_request_context('/upload/processing/claim-batch', method='POST', json={'items': []}):
-        response, status = app.upload_processing_claim_batch()
+        response, status = upload_processing_claim_batch()
     assert status == 400
 
 
@@ -141,7 +142,7 @@ def test_batch_route_rejects_too_many_items(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('lib-A', None))
     too_many = [{'filename': f'{i}.jpg'} for i in range(app.MAX_CLAIM_BATCH_ITEMS + 1)]
     with app.app.test_request_context('/upload/processing/claim-batch', method='POST', json={'items': too_many}):
-        response, status = app.upload_processing_claim_batch()
+        response, status = upload_processing_claim_batch()
     assert status == 400
 
 
@@ -206,7 +207,7 @@ def test_batch_route_passes_each_items_own_blob_name_through(metadata, monkeypat
             {'filename': 'b.jpg', 'leaseId': 'lane-2'},
         ]},
     ):
-        response = app.upload_processing_claim_batch()
+        response = upload_processing_claim_batch()
 
     body = response.get_json()
     assert [item['claimed'] for item in body['results']] == [True, True]

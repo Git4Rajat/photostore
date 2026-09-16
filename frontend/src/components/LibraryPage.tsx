@@ -83,15 +83,32 @@ const LibraryPage: React.FC = () => {
         load();
     }, [load]);
 
-    // Poll for cleanup completion
+    // Poll for cleanup completion. A clean is a rare, deliberate action that
+    // also requires an emailed confirmation link (see requestLibraryClean
+    // below), so it can start or finish from an entirely different tab than
+    // this one -- this page can't just wait for a local trigger to know when
+    // to check. It used to poll every 3s unconditionally for as long as this
+    // page was open, regardless of whether a clean was actually running.
+    // Instead: check every 3s while a clean is actually in progress (so a
+    // completion is caught quickly), but back off to a 30s idle cadence the
+    // rest of the time -- the common case for this page.
     useEffect(() => {
-        const pollCleanupStatus = async () => {
+        const ACTIVE_DELAY_MS = 3000;
+        const IDLE_DELAY_MS = 30000;
+        let cancelled = false;
+        const schedule = (delayMs: number) => {
+            cleanupPollTimer.current = window.setTimeout(tick, delayMs);
+        };
+        const tick = async () => {
+            let nextDelay = IDLE_DELAY_MS;
             try {
                 const info = await library.getLibraryCleanupInfo();
-                if (info.lastCleanupStatus === 'completed' && info.lastCleanupTime > lastSeenCleanupTime.current) {
+                if (info.lastCleanupStatus === 'in_progress') {
+                    nextDelay = ACTIVE_DELAY_MS;
+                } else if (info.lastCleanupStatus === 'completed' && info.lastCleanupTime > lastSeenCleanupTime.current) {
                     lastSeenCleanupTime.current = info.lastCleanupTime;
-                    const photosStr = info.lastCleanupPhotosDeleted > 0 
-                        ? `${info.lastCleanupPhotosDeleted} photo(s)/video(s) removed` 
+                    const photosStr = info.lastCleanupPhotosDeleted > 0
+                        ? `${info.lastCleanupPhotosDeleted} photo(s)/video(s) removed`
                         : 'all photos and videos removed';
                     setCleanupNotice(`Cleanup complete — ${photosStr}. You can now upload new photos.`);
                     // Reload the gallery after cleanup
@@ -102,11 +119,15 @@ const LibraryPage: React.FC = () => {
             } catch {
                 // Silently ignore cleanup status check failures
             }
+            if (!cancelled) {
+                schedule(nextDelay);
+            }
         };
 
-        cleanupPollTimer.current = window.setInterval(pollCleanupStatus, 3000);
+        schedule(ACTIVE_DELAY_MS);
         return () => {
-            if (cleanupPollTimer.current) window.clearInterval(cleanupPollTimer.current);
+            cancelled = true;
+            if (cleanupPollTimer.current) window.clearTimeout(cleanupPollTimer.current);
         };
     }, [load]);
 

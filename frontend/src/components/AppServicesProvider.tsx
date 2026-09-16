@@ -1033,6 +1033,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const browserProcessingStartInFlightRef = useRef<boolean>(false);
     const browserProcessingCancelRef = useRef<boolean>(false);
     const browserProcessingTimerRef = useRef<number | null>(null);
+    const browserProcessingPollDelayRef = useRef<number>(30000);
     const browserProcessingDeferredRef = useRef<Map<string, number>>(new Map());
     const browserProcessingNotificationRef = useRef<BrowserProcessingNotificationState | null>(null);
     // Pending debounced "finished" finalize (see BROWSER_PROCESSING_FINALIZE_QUIET_MS).
@@ -1946,7 +1947,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             const pendingResponse = requestedFilenames.length > 0
                 ? { pending: requestedItems.map((item) => ({ ...item, statuses: {} })) }
-                : await get(`/upload/processing/pending?limit=${pendingBatchSize}`);
+                : await getUpload(`/upload/processing/pending?limit=${pendingBatchSize}`);
             const pending = Array.isArray(pendingResponse?.pending) ? pendingResponse.pending : [];
             if (pending.length === 0) {
                 // Queue drained: release the background keep-alive so the tab stops
@@ -2006,7 +2007,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     claim = preClaimed;
                 } else {
                     try {
-                        claim = await runGatedProcessingCall(() => post('/upload/processing/claim', {
+                        claim = await runGatedProcessingCall(() => postUpload('/upload/processing/claim', {
                             filename,
                             steps: effectiveSteps ? Array.from(effectiveSteps) : undefined,
                         }));
@@ -2051,7 +2052,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     const skipConvertedPreview = wasFreshlyUploaded
                         || shouldSkipConvertedRawPreview(Boolean(options.force), effectiveSteps);
                     const convertedPreview = skipConvertedPreview ? undefined : await fetchConvertedRawPreview(filename);
-                    await runGatedProcessingCall(() => post('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' })).catch(() => undefined);
+                    await runGatedProcessingCall(() => postUpload('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' })).catch(() => undefined);
                     const result = await runBrowserProcessing(
                         file,
                         `browser-${filename}`,
@@ -2156,7 +2157,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     syncBrowserProcessingNotification(browserProcessingNotification, `Failed ${filename}`);
                 } finally {
                     if (!leaseReleasedByReport) {
-                        await post('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                        await postUpload('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
                     }
                 }
             };
@@ -2191,7 +2192,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     browserAiModelStateRef.current.status === 'available',
                 );
                 try {
-                    const batchResponse = await post('/upload/processing/claim-batch', {
+                    const batchResponse = await postUpload('/upload/processing/claim-batch', {
                         items: pending.slice(0, workerCount).map((item: any) => ({
                             filename: String(item?.filename || ''),
                             steps: firstWaveSteps ? Array.from(firstWaveSteps) : undefined,
@@ -2842,7 +2843,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         // uploaded around the same time can have already moved on,
                         // pointing this direct thumbnail PUT at a different photo's
                         // (already correct) thumbnail blob and silently corrupting it.
-                        claim = await runGatedProcessingCall(() => post('/upload/processing/claim', { filename, steps: ['thumbnail'], blobName }));
+                        claim = await runGatedProcessingCall(() => postUpload('/upload/processing/claim', { filename, steps: ['thumbnail'], blobName }));
                     } catch {
                         return;
                     }
@@ -2933,7 +2934,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         console.warn(`Parallel thumbnail generation failed for ${filename}.`, err);
                     } finally {
                         if (!leaseReleasedByReport) {
-                            await post('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                            await postUpload('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
                         }
                     }
                 })();
@@ -4278,16 +4279,40 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         void startBrowserProcessing();
     }, [startBrowserProcessing]);
 
+    // Safety-net poll for pending browser-processing work that the explicit
+    // trigger sites (upload completion, notifications, keep-alive ticks, deep
+    // links) might have missed -- those already self-reschedule immediately
+    // while there's real work (see the setTimeout(0) re-arm inside
+    // startBrowserProcessing above), so this loop only matters once things go
+    // quiet. It used to run a flat 30s setInterval forever, which meant any
+    // tab that had ever loaded on-device AI kept waking a scaled-to-zero
+    // backend every 30s indefinitely, even long after the queue drained.
+    // Backing off (capped at 5 minutes) keeps the safety net -- pending work
+    // is still picked up eventually -- without paying for it at full
+    // frequency while genuinely idle.
     useEffect(() => {
-        if (browserProcessingTimerRef.current !== null) {
-            return undefined;
-        }
-        browserProcessingTimerRef.current = window.setInterval(() => {
-            void startBrowserProcessing();
-        }, 30000);
+        const BASE_DELAY_MS = 30000;
+        const MAX_DELAY_MS = 5 * 60 * 1000;
+        let cancelled = false;
+        const schedule = (delayMs: number) => {
+            browserProcessingTimerRef.current = window.setTimeout(tick, delayMs);
+        };
+        const tick = () => {
+            void startBrowserProcessing().then((processedCount) => {
+                if (cancelled) {
+                    return;
+                }
+                browserProcessingPollDelayRef.current = processedCount > 0
+                    ? BASE_DELAY_MS
+                    : Math.min(browserProcessingPollDelayRef.current * 2, MAX_DELAY_MS);
+                schedule(browserProcessingPollDelayRef.current);
+            });
+        };
+        schedule(browserProcessingPollDelayRef.current);
         return () => {
+            cancelled = true;
             if (browserProcessingTimerRef.current !== null) {
-                window.clearInterval(browserProcessingTimerRef.current);
+                window.clearTimeout(browserProcessingTimerRef.current);
                 browserProcessingTimerRef.current = null;
             }
         };

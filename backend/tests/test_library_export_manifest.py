@@ -10,6 +10,7 @@ import re
 import pytest
 
 import app
+from routes.library import library_export_manifest_page
 
 
 class _FakePager:
@@ -91,7 +92,7 @@ def env(monkeypatch):
 def _get_manifest(query_string: str = ''):
     path = '/api/library/export/manifest' + (f'?{query_string}' if query_string else '')
     with app.app.test_request_context(path):
-        return app.library_export_manifest_page()
+        return library_export_manifest_page()
 
 
 def test_manifest_pages_through_a_large_library(env):

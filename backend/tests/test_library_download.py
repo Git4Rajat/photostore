@@ -16,6 +16,7 @@ import zipfile
 import pytest
 
 import app
+from routes.library import library_download_request, library_download_status
 
 
 class _FakeTable:
@@ -342,7 +343,7 @@ def test_request_route_enqueues_then_dedupes_on_second_call(env):
     table, queue, _uploaded = env
 
     with app.app.test_request_context('/api/library/download/request', method='POST'):
-        response = app.library_download_request()
+        response = library_download_request()
     body = response.get_json()
     assert body['status'] == 'queued'
     job_id = body['jobId']
@@ -352,7 +353,7 @@ def test_request_route_enqueues_then_dedupes_on_second_call(env):
 
     # A second click before the job finishes must not enqueue a duplicate.
     with app.app.test_request_context('/api/library/download/request', method='POST'):
-        response2 = app.library_download_request()
+        response2 = library_download_request()
     body2 = response2.get_json()
     assert body2['jobId'] == job_id
     assert len(queue.messages) == 1  # unchanged
@@ -366,7 +367,7 @@ def test_worker_dispatch_and_status_route_end_to_end(env):
     app._handle_clustering_queue_payload(payload, job_id, 'owner', 'library_download')
 
     with app.app.test_request_context(f'/api/library/download/status?jobId={job_id}'):
-        response = app.library_download_status()
+        response = library_download_status()
     body = response.get_json()
     assert body['status'] == 'done'
     assert body['result']['photosIncluded'] == 2

@@ -11,6 +11,7 @@ both lexical and semantic scores are computed.
 from __future__ import annotations
 
 import app
+from routes.photos import search_photos
 
 
 def _row(filename: str, **overrides) -> dict:
@@ -39,7 +40,7 @@ def test_color_object_query_surfaces_a_photo_found_only_via_semantic_score(monke
     monkeypatch.setattr(app, 'vector_search_candidates', lambda *a, **k: [('vehicle.jpg', 0.9)])
 
     with app.app.test_request_context('/photos/search?q=red car'):
-        response = app.search_photos()
+        response = search_photos()
 
     payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
     filenames = [p['filename'] for p in payload['photos']]
