@@ -927,6 +927,17 @@ class _UserScanCache:
         with self._guard:
             self._cache.pop(key, None)
 
+    def set(self, key: str, rows: List[Dict]) -> None:
+        """Install a fresh, already-known-correct value directly, bypassing
+        fetch_fn. Used by hot paths that just wrote the underlying data and
+        already have the resulting state in memory (see
+        _assign_faces_to_people_incrementally) -- avoids the write triggering
+        _InvalidatingTableClient's invalidate() only to have the very next
+        call rebuild via a full Table Storage scan for data the caller could
+        hand back directly."""
+        with self._guard:
+            self._cache[key] = (time.monotonic() + self._ttl, [dict(row) for row in rows])
+
 
 # Person/face partitions are read in full by every People/Faces page load and
 # by every photo listing (for name lookups) -- see _cached_person_rows_for_user
@@ -3607,14 +3618,14 @@ def _face_is_owned_by_person(face: Optional[Dict], person_id: str) -> bool:
     return str(face.get('personId') or '') == str(person_id)
 
 
-def _update_person_rep_embedding(user_id: str, person_id: str) -> None:
+def _update_person_rep_embedding(user_id: str, person_id: str) -> List[float]:
     if face_table_client is None or person_table_client is None:
-        return
+        return []
     try:
         person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
         face_ids = json.loads(person.get('faceIds', '[]') or '[]')
     except Exception:
-        return
+        return []
 
     face_entities = []
     for face_id in face_ids:
@@ -3631,6 +3642,7 @@ def _update_person_rep_embedding(user_id: str, person_id: str) -> None:
     except Exception:
         rep = []
     _update_person_entity(user_id, person_id, {'repEmbedding': json.dumps(rep)})
+    return rep
 
 
 def _confirmed_face_count(user_id: str, face_ids: List[str], person_id: str = '') -> int:
@@ -3978,10 +3990,23 @@ def _remove_face_from_person_with_retry(
 def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: str) -> Dict:
     if person_table_client is None or not face_id:
         return {'removed': 0, 'deletedPeople': 0, 'touchedPeople': []}
-    try:
-        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
+    # Was an always-live person_table_client.query_entities call, bypassing
+    # _person_scan_cache entirely -- unlike the reads elsewhere in this file
+    # that share that cache, this one re-scanned the full person partition on
+    # every call regardless of TTL. _add_face_to_person's only caller
+    # (_assign_faces_to_people_incrementally) only ever passes face_ids
+    # already confirmed ownerless by _face_ids_awaiting_person_assignment, so
+    # in the common case every row here has to be examined just to find
+    # nothing to remove. Reading through the cache costs nothing when a
+    # concurrent read already warmed it (e.g. the same call's own
+    # _load_people_embedding_index at the top of _assign_faces_to_people_incrementally),
+    # and still self-heals within PEOPLE_SCAN_CACHE_TTL_SECONDS otherwise --
+    # same staleness tolerance every other reader of this cache already
+    # accepts; the removal below still re-reads fresh state per-candidate via
+    # _remove_face_from_person_with_retry before writing, so a stale
+    # candidate list can only cost a wasted no-op retry, never a missed
+    # removal it would have caught anyway.
+    rows = _cached_person_rows_for_user(user_id)
 
     removed = 0
     deleted_people = 0
@@ -4012,14 +4037,19 @@ def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: s
     return {'removed': removed, 'deletedPeople': deleted_people, 'touchedPeople': touched_people}
 
 
-def _add_face_to_person(user_id: str, person_id: str, face_id: str) -> None:
+def _add_face_to_person(user_id: str, person_id: str, face_id: str) -> bool:
+    """Returns whether the person's faceIds actually changed AND its
+    repEmbedding was refreshed as a result -- callers that need a refreshed
+    rep embedding (e.g. _assign_faces_to_people_incrementally) use this to
+    avoid a redundant second _update_person_rep_embedding call for a person
+    this function already just refreshed."""
     if person_table_client is None or not person_id or not face_id:
-        return
+        return False
     if face_table_client is not None:
         try:
             face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
             if _face_is_rejected(face) or (_face_is_suspicious(face) and not _face_is_confirmed(face)):
-                return
+                return False
         except Exception:
             pass
     _remove_face_from_other_people(user_id, face_id, person_id)
@@ -4038,6 +4068,8 @@ def _add_face_to_person(user_id: str, person_id: str, face_id: str) -> None:
     result = _update_person_entity_with_retry(user_id, person_id, _mutate)
     if result is not None:
         _update_person_rep_embedding(user_id, person_id)
+        return True
+    return False
 
 
 def _remove_faces_for_filename(user_id: str, filename: str) -> None:
@@ -4276,6 +4308,14 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
         return {}, set()
 
     session_embedding_index = [dict(entry) for entry in _load_people_embedding_index(user_id)]
+    # Keyed view of the same entries session_embedding_index holds, so the
+    # people_to_refresh loop below can patch a person's repEmbedding back
+    # into its entry in O(1) instead of re-scanning the list. Entries are the
+    # same dict objects in both structures, so mutating via this map mutates
+    # what _best_two_person_matches sees too.
+    index_by_person_id = {
+        str(entry.get('personId') or ''): entry for entry in session_embedding_index
+    }
     assignments: Dict[str, str] = {}
     created_person_ids: set = set()
     people_to_refresh = set()
@@ -4300,42 +4340,85 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
         )
 
         person_id = ''
+        # Whether _add_face_to_person already ran _update_person_rep_embedding
+        # for this person as part of this same write -- if so, the
+        # people_to_refresh loop below must not redo it (that used to happen
+        # unconditionally for every matched face: get person + get every one
+        # of its face entities + upsert, all a second time for no new data).
+        rep_already_refreshed = False
         if (
             best_person
             and best_score >= PEOPLE_CLUSTER_ASSIGN_THRESHOLD
             and (best_score - second_best_score) >= PEOPLE_CLUSTER_ASSIGN_MARGIN
         ):
             person_id = str(best_person.get('personId') or '')
-            _add_face_to_person(user_id, person_id, face_id)
+            rep_already_refreshed = _add_face_to_person(user_id, person_id, face_id)
+            if rep_already_refreshed:
+                best_person['faceIds'] = [*best_person.get('faceIds', []), face_id]
         else:
             name = next_unnamed_person_name()
             person_id = _create_person_entity(user_id, [face_id], emb, name=name)
             if person_id:
                 created_person_ids.add(person_id)
-            session_embedding_index.append({
+            new_entry = {
                 'personId': person_id,
                 'name': name,
                 'faceIds': [face_id],
                 'repEmbedding': emb,
                 '_normalized_rep_embedding': face_norm,
                 'confirmedFaceCount': 0,
-            })
+            }
+            session_embedding_index.append(new_entry)
+            index_by_person_id[person_id] = new_entry
 
         if not person_id:
             continue
         face_ent['personId'] = person_id
         try:
             face_table_client.upsert_entity(face_ent)
-            people_to_refresh.add(person_id)
+            if not rep_already_refreshed:
+                people_to_refresh.add(person_id)
         except Exception:
             pass
         assignments[face_id] = person_id
 
     for person_id in people_to_refresh:
-        _update_person_rep_embedding(user_id, person_id)
+        new_rep = _update_person_rep_embedding(user_id, person_id)
+        entry = index_by_person_id.get(person_id)
+        if entry is not None and new_rep:
+            entry['repEmbedding'] = new_rep
+            entry['_normalized_rep_embedding'] = _normalized_embedding(new_rep, np)
 
     if assignments:
-        _rebuild_metadata_faces_for_filename(user_id, filename)
+        # Pass the names already sitting in session_embedding_index instead
+        # of letting _rebuild_metadata_faces_for_filename fall back to
+        # _load_searchable_person_name_index -- that helper reads through
+        # _person_scan_cache, which the person-table writes above (via
+        # _add_face_to_person/_create_person_entity/_update_person_rep_embedding)
+        # just invalidated for this user, so the fallback would otherwise
+        # force yet another full person-partition scan this call already has
+        # the answer to in memory.
+        searchable_person_index = {
+            str(pid): str(entry.get('name') or '')
+            for pid, entry in index_by_person_id.items()
+            if entry.get('name') and not _is_unnamed_name(str(entry.get('name') or ''))
+        }
+        _rebuild_metadata_faces_for_filename(
+            user_id, filename, searchable_person_index=searchable_person_index,
+        )
+
+    # session_embedding_index now reflects every write this call just made
+    # (new persons appended, matched persons' faceIds/repEmbedding patched
+    # above) -- hand it straight back to the cache instead of leaving it
+    # invalidated by the writes above. Without this, the very next
+    # people_incremental_assign message for this user (typically seconds
+    # away during a backfill/upload burst, well under
+    # PEOPLE_SCAN_CACHE_TTL_SECONDS) would re-derive the exact same index
+    # from scratch: a full person-partition scan, a full face-summary scan
+    # for _confirmed_face_count, and renormalizing every person's embedding
+    # -- all Table Storage round-trips this process already has the answer
+    # to in memory.
+    _people_embedding_index_cache.set(user_id, session_embedding_index)
     return assignments, created_person_ids
 
 
