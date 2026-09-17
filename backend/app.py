@@ -3059,7 +3059,31 @@ def _cached_sorted_metadata_rows_for_user(user_id: str, purpose: str) -> List[Di
 
 def _cached_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
     """Narrow-column counterpart of _cached_metadata_rows_for_user -- see
-    PHOTO_LIST_SELECT_FIELDS above for which purposes this is safe for."""
+    PHOTO_LIST_SELECT_FIELDS above for which purposes this is safe for.
+
+    Tries the same lazily-rebuilt, blob-persisted lexical index
+    /photos/search already relies on (get_user_lexical_index) before ever
+    falling back to a live Table scan. That index's rows are a superset of
+    PHOTO_LIST_SELECT_FIELDS (it excludes only the embedding columns), and
+    its staleness/rebuild state lives in a blob manifest rather than this
+    process's own memory -- so unlike _metadata_list_scan_cache below, it
+    stays correctly invalidated even when the write (upload/admin) and read
+    (backend/tools) paths run in different container-app processes after the
+    tools/upload/admin service split (see backend-cpu-optimization-2026-09
+    memory). This also removes the ~20s synchronous full-partition scan that
+    a cold _metadata_list_scan_cache used to force onto every first gallery
+    request after a replica restart -- observed live to be the trigger for a
+    ContainerBackOff crash loop under sustained upload traffic (2026-09-17).
+    Only a genuinely cold account (no index has ever been built) still pays
+    the live-scan cost here, matching search_photos's own fallback.
+    """
+    try:
+        lexical_index = get_user_lexical_index(user_id, allow_refresh=True)
+    except Exception:
+        lexical_index = None
+        app.logger.exception('Lexical index lookup failed purpose=%s user=%s, falling back to full scan', purpose, user_id)
+    if lexical_index is not None:
+        return lexical_index.get('rows') or []
     return _metadata_list_scan_cache.get(
         user_id,
         lambda: _query_metadata_rows_for_user(user_id, select=list(PHOTO_LIST_SELECT_FIELDS), purpose=purpose),
