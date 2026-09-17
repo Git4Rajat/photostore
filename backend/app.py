@@ -9722,12 +9722,26 @@ def _shared_names_in_batch(names_set: set, user_id: str) -> set:
     """Which of ``names_set`` are content-addressed blobs still referenced by
     another library, so their blobs must NOT be deleted.
 
-    The per-file ``_is_filename_shared`` runs a full cross-partition scan of the
-    metadata table; doing that once for the whole batch (recording only rows
-    whose RowKey is in the batch, so memory stays bounded by the batch size)
-    replaces up to N such scans with one."""
+    Uses the filename-owners index (PartitionKey=filename) -- one small,
+    partition-scoped query per name -- instead of a full list_entities() scan
+    of the whole multi-tenant metadata table (every row of every user's every
+    photo, unfiltered). That scan was the dominant cost of bulk deletes on a
+    large table; see _query_filename_owners in storage_utils.py, which uses
+    the same index on the upload path. Falls back to the old full scan only
+    if the index table isn't configured."""
     shared: set = set()
-    if metadata_table_client is None or not names_set:
+    if not names_set:
+        return shared
+    if filename_owners_table_client is not None:
+        for name in names_set:
+            try:
+                rows = list(filename_owners_table_client.query_entities(f"PartitionKey eq '{_escape_odata(name)}'"))
+            except Exception:
+                continue
+            if any(str(row.get('RowKey') or '') != user_id for row in rows):
+                shared.add(name)
+        return shared
+    if metadata_table_client is None:
         return shared
     try:
         # Project only the keys we need so a large multi-tenant table doesn't
@@ -9813,11 +9827,23 @@ def _extract_job_filename(base: str, user_id: str) -> str:
 
 def _batch_remove_job_rows(user_id: str, names_set: set) -> int:
     """Delete stale job-status rows for any filename in ``names_set`` in a single
-    scan of the ``jobs`` partition (vs. one scan per file)."""
+    scan of the ``jobs`` partition (vs. one scan per file).
+
+    Reuses the cached whole-'jobs'-partition scan (_jobs_partition_scan_cache)
+    instead of issuing a fresh, unscoped query_entities("PartitionKey eq
+    'jobs'") -- see _has_active_clustering_job / _has_active_library_download_job,
+    whose identical scan was the target of repeated fixes (fa03bc9, e1114b7,
+    4b325c4) for this exact bug class. The 'jobs' partition has grown to
+    200k+ rows, so a direct scan here made every 100-file chunk of a bulk
+    delete pay a fresh multi-second full scan, which is what made large
+    deletes take minutes."""
     if metadata_table_client is None or not names_set:
         return 0
     try:
-        rows = list(metadata_table_client.query_entities("PartitionKey eq 'jobs'"))
+        rows = _jobs_partition_scan_cache.get(
+            _JOBS_PARTITION_SCAN_CACHE_KEY,
+            lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
+        )
     except Exception:
         return 0
     removed = 0
@@ -9844,6 +9870,8 @@ def _batch_remove_job_rows(user_id: str, names_set: set) -> int:
             removed += 1
         except Exception:
             pass
+    if removed:
+        _jobs_partition_scan_cache.invalidate(_JOBS_PARTITION_SCAN_CACHE_KEY)
     return removed
 
 
