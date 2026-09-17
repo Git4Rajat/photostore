@@ -924,14 +924,18 @@ def delete_multiple_photos():
     # photos that survive (their peopleIds may still name a now-deleted person).
     # Unlike the per-file lookups above, this genuinely needs the *whole*
     # library -- a stale peopleIds reference can be on any surviving photo,
-    # not just one in this chunk -- so it can't be a point-read. Scoped behind
-    # `deleted_person_ids` (only set when a person cluster was fully emptied,
-    # which is rare per chunk) and routed through the same cached scan the
-    # gallery-load endpoints use, rather than own_rows_by_name's per-chunk
-    # point-reads or a fresh raw partition scan.
+    # not just one in this chunk -- so it can't be a point-read. Deleting a
+    # person's whole photo set makes deleted_person_ids non-empty on nearly
+    # every chunk in practice (not the rare case assumed originally), so this
+    # must be cheap: select= just the two columns this loop reads instead of
+    # the full-column cached scan, which measured 73s and loaded every photo's
+    # embeddings/tags/OCR text into memory for a 36k-row account -- the actual
+    # cause of a live OOM kill (exit 137) during a bulk delete.
     if deleted_person_ids and app.metadata_table_client is not None:
         try:
-            surviving_rows = app._cached_metadata_rows_for_user(user_id, purpose='photos.delete_person_cleanup')
+            surviving_rows = app._query_metadata_rows_for_user(
+                user_id, select=['PartitionKey', 'RowKey', 'peopleIds'], purpose='photos.delete_person_cleanup',
+            )
         except Exception:
             surviving_rows = []
         for row in surviving_rows:
