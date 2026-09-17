@@ -345,17 +345,17 @@ const AlbumsPage: React.FC = () => {
 
     // The grid (and the tall spacer div that gives the page its scrollable
     // height) unmounts while the photo viewer is open, so the browser clamps
-    // window scroll to 0. Restore it here, in a layout effect declared
-    // before useWindowedGrid's own, so this runs first and the grid's
-    // recompute() sees the real (restored) scroll position instead of
-    // momentarily recomputing its visible row range for a page pinned to
-    // the top.
+    // window scroll to 0. Restore it on close -- unless in-viewer navigation
+    // (prev/next/filmstrip) left the user on a different photo than the one
+    // they opened, in which case scroll to and highlight that photo's row
+    // instead of the original position.
     const preViewerScrollYRef = useRef<number>(0);
-    useLayoutEffect(() => {
-        if (viewerIndex === null) {
-            window.scrollTo(0, preViewerScrollYRef.current);
-        }
-    }, [viewerIndex]);
+    const openedViewerIndexRef = useRef<number | null>(null);
+    const lastViewerIndexRef = useRef<number | null>(null);
+    const [returnHighlightFilename, setReturnHighlightFilename] = useState<string | null>(null);
+    if (viewerIndex !== null) {
+        lastViewerIndexRef.current = viewerIndex;
+    }
 
     const {
         containerRef: albumsGridContainerRef,
@@ -364,10 +364,57 @@ const AlbumsPage: React.FC = () => {
         innerStyle: albumsInnerStyle,
         visibleItems: visibleAlbumPhotos,
         shouldAnimateEntrance: shouldAnimateAlbumTile,
+        scrollToIndex: scrollAlbumsToIndex,
     } = useWindowedGrid({
         items: filteredPhotos,
         getKey: (photo: Photo) => photo.filename,
     });
+    // useWindowedGrid hands back a freshly-created scrollToIndex on every
+    // render, and filteredPhotos is a new array whenever the underlying data
+    // changes -- neither is safe to put in the effect's deps below without
+    // making it re-run (and re-jump/re-highlight) on renders unrelated to
+    // the viewer actually closing. Mirror the latest values into refs so the
+    // effect can still read current data but only fires on a real
+    // viewerIndex transition.
+    const latestFilteredPhotosRef = useRef(filteredPhotos);
+    latestFilteredPhotosRef.current = filteredPhotos;
+    const scrollAlbumsToIndexRef = useRef(scrollAlbumsToIndex);
+    scrollAlbumsToIndexRef.current = scrollAlbumsToIndex;
+
+    useLayoutEffect(() => {
+        if (viewerIndex !== null) {
+            return;
+        }
+        const closedAtIndex = lastViewerIndexRef.current;
+        const openedAtIndex = openedViewerIndexRef.current;
+        // Consume immediately: without this, an unrelated re-render while the
+        // viewer stays closed would see the same non-null/differing refs and
+        // redo the jump+highlight (or the scroll restore) again.
+        openedViewerIndexRef.current = null;
+        lastViewerIndexRef.current = null;
+        if (closedAtIndex !== null && openedAtIndex !== null && closedAtIndex !== openedAtIndex) {
+            // Navigated to a different photo inside the viewer before closing
+            // -- land back in the grid on that photo's row instead of where
+            // the viewer was opened from.
+            scrollAlbumsToIndexRef.current(closedAtIndex);
+            const returnedToPhoto = latestFilteredPhotosRef.current[closedAtIndex];
+            setReturnHighlightFilename(returnedToPhoto ? returnedToPhoto.filename : null);
+            return;
+        }
+        // The grid's own windowing state (metrics/visible range) was never
+        // touched while it sat unmounted behind the viewer (its recompute
+        // bails out with no containerRef to measure), so it's still valid
+        // for this exact scroll position.
+        window.scrollTo(0, preViewerScrollYRef.current);
+    }, [viewerIndex]);
+
+    useEffect(() => {
+        if (!returnHighlightFilename) {
+            return undefined;
+        }
+        const timer = window.setTimeout(() => setReturnHighlightFilename(null), 1800);
+        return () => window.clearTimeout(timer);
+    }, [returnHighlightFilename]);
 
     const publicAlbumCount = useMemo(
         () => albums.filter((album) => album.isPublic).length,
@@ -1496,6 +1543,7 @@ const AlbumsPage: React.FC = () => {
                                             photo={photo}
                                             selected={isSelected}
                                             animateEntrance={shouldAnimateAlbumTile(photo.filename)}
+                                            className={photo.filename === returnHighlightFilename ? 'tile-return-highlight' : undefined}
                                             title={photo.filename}
                                             showBody={false}
                                             useBatchedAccess
@@ -1503,8 +1551,10 @@ const AlbumsPage: React.FC = () => {
                                             onMediaClick={(e) => {
                                                 e.stopPropagation();
                                                 e.preventDefault();
+                                                const clickedIndex = filteredPhotos.findIndex((item) => item.filename === photo.filename);
                                                 preViewerScrollYRef.current = window.scrollY;
-                                                setViewerIndex(filteredPhotos.findIndex((item) => item.filename === photo.filename));
+                                                openedViewerIndexRef.current = clickedIndex;
+                                                setViewerIndex(clickedIndex);
                                             }}
                                             onLongPress={() => handleTileLongPress(photo)}
                                             mediaOverlay={(

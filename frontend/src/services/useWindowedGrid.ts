@@ -88,6 +88,17 @@ export interface UseWindowedGridResult<T> {
     startIndex: number;
     isVirtualized: boolean;
     shouldAnimateEntrance: (key: string) => boolean;
+    // Jumps the window scroll position so the row containing `index` lands
+    // near the top of the viewport, then immediately remeasures so the
+    // visible-item range reflects the new position in the same commit
+    // (matching how the hook's own scroll listener recomputes on a real
+    // user scroll, but synchronous so a caller reacting to e.g. a modal
+    // closing doesn't get one frame of the pre-scroll range).
+    scrollToIndex: (index: number) => void;
+    // Forces the same remeasure without moving scroll. Callers that scroll
+    // the window themselves (e.g. restoring a saved offset) can call this
+    // right after so the range doesn't wait for the next scroll/resize tick.
+    recompute: () => void;
 }
 
 const DEFAULT_OVERSCAN_ROWS = 3;
@@ -249,6 +260,23 @@ export function useWindowedGrid<T>({
         visibleItems.forEach((item) => seenKeysRef.current.add(getKey(item)));
     });
 
+    const scrollToIndex = (index: number) => {
+        const containerEl = containerRef.current;
+        if (!enabled || !containerEl || typeof window === 'undefined') {
+            return;
+        }
+        const safeColumnCount = Math.max(1, metrics.columnCount);
+        const rowPitch = Math.max(1, metrics.rowHeight + metrics.rowGap);
+        const row = Math.floor(Math.max(0, index) / safeColumnCount);
+        // Scroll-invariant: the container's top-of-document position, however
+        // far the window happens to be scrolled right now.
+        const containerTop = containerEl.getBoundingClientRect().top + window.scrollY;
+        const viewportOffset = Math.min(180, window.innerHeight * 0.25);
+        const targetY = Math.max(0, containerTop + row * rowPitch - viewportOffset);
+        window.scrollTo(0, targetY);
+        recompute();
+    };
+
     return {
         containerRef,
         innerRef,
@@ -269,5 +297,7 @@ export function useWindowedGrid<T>({
         startIndex,
         isVirtualized: enabled && endIndex - startIndex < items.length,
         shouldAnimateEntrance: (key: string) => !seenKeysRef.current.has(key),
+        scrollToIndex,
+        recompute,
     };
 }

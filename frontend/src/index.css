@@ -6531,6 +6531,31 @@ video.photo-preview-media.is-loading {
   }
 }
 
+/* Marks the tile the lightbox returned the user to after in-viewer
+   navigation carried them to a different photo than the one they opened. */
+.tile-return-highlight {
+  animation: tile-return-highlight 1.8s var(--ease-glass) both;
+}
+
+@keyframes tile-return-highlight {
+  0% {
+    box-shadow: 0 0 0 3px var(--accent);
+  }
+  70% {
+    box-shadow: 0 0 0 3px var(--accent);
+  }
+  100% {
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tile-return-highlight {
+    animation: none;
+    box-shadow: 0 0 0 3px var(--accent);
+  }
+}
+
 /* =================================================================
    Responsive Web Design — fluid layout in tiers
    Apple HIG treats every size as a first-class layout, not a phone

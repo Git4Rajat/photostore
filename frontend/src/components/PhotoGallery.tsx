@@ -4116,6 +4116,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [downloading, setDownloading] = useState<boolean>(false);
     const [downloadProgress, setDownloadProgress] = useState<{ completed: number; total: number } | null>(null);
     const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+    const [returnHighlightFilename, setReturnHighlightFilename] = useState<string | null>(null);
     const [focusedFilename, setFocusedFilename] = useState<string | null>(null);
     const [focusedPhoto, setFocusedPhoto] = useState<Photo | null>(null);
     const [focusLoading, setFocusLoading] = useState<boolean>(false);
@@ -4876,23 +4877,20 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     // chrome above it now hidden (see the body class toggle above), the
     // section's own top edge is where the viewer should sit -- measure and
     // scroll to it rather than assuming 0, since layout/safe-area padding
-    // can still leave a small residual offset. Restore the saved grid
-    // position on close. Declared before useWindowedGrid's own layout
-    // effect so this runs first and the grid's recompute() sees the real
-    // (restored) scroll position instead of momentarily recomputing its
-    // visible row range for a page pinned to the top.
+    // can still leave a small residual offset.
     const preLightboxScrollYRef = useRef<number>(0);
+    // The index the lightbox was opened at, and the last non-null index it
+    // held (i.e. wherever in-lightbox prev/next/filmstrip navigation left
+    // it, since lightboxIndex itself goes to null on close). Compared on
+    // close to tell "closed on the same photo" (restore the saved scroll
+    // position) apart from "navigated to a different photo, possibly off
+    // in an unmounted/unrendered window row" (scroll to that photo instead).
+    const openedLightboxIndexRef = useRef<number | null>(null);
+    const lastLightboxIndexRef = useRef<number | null>(null);
+    if (lightboxIndex !== null) {
+        lastLightboxIndexRef.current = lightboxIndex;
+    }
     const gallerySectionRef = useRef<HTMLElement | null>(null);
-    useLayoutEffect(() => {
-        const isLightboxOpen = lightboxIndex !== null;
-        document.body.classList.toggle('lightbox-active', isLightboxOpen);
-        if (!isLightboxOpen) {
-            window.scrollTo(0, preLightboxScrollYRef.current);
-        } else if (gallerySectionRef.current) {
-            const sectionTop = gallerySectionRef.current.getBoundingClientRect().top + window.scrollY;
-            window.scrollTo(0, sectionTop);
-        }
-    }, [lightboxIndex]);
 
     const {
         containerRef: galleryWindowContainerRef,
@@ -4902,11 +4900,69 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         visibleItems: visibleGalleryPhotos,
         startIndex: galleryWindowStartIndex,
         shouldAnimateEntrance: shouldAnimateGalleryTile,
+        scrollToIndex: scrollGalleryToIndex,
     } = useWindowedGrid({
         items: filteredPhotos,
         getKey: (photo: Photo) => photo.filename,
         layoutDeps: [galleryZoomLevel],
     });
+    // useWindowedGrid hands back freshly-created functions on every render,
+    // and filteredPhotos is a new array whenever photos/mediaFilter change --
+    // neither is safe to put in the effect's deps below without making it
+    // re-run (and re-jump/re-highlight) on renders that have nothing to do
+    // with the lightbox actually closing. Mirror the latest values into refs
+    // instead so the effect can still read current data but only *fires* on
+    // a real lightboxIndex transition.
+    const latestFilteredPhotosRef = useRef(filteredPhotos);
+    latestFilteredPhotosRef.current = filteredPhotos;
+    const scrollGalleryToIndexRef = useRef(scrollGalleryToIndex);
+    scrollGalleryToIndexRef.current = scrollGalleryToIndex;
+
+    useLayoutEffect(() => {
+        const isLightboxOpen = lightboxIndex !== null;
+        document.body.classList.toggle('lightbox-active', isLightboxOpen);
+        if (!isLightboxOpen) {
+            const closedAtIndex = lastLightboxIndexRef.current;
+            const openedAtIndex = openedLightboxIndexRef.current;
+            // Consume immediately: without this, an unrelated re-render while
+            // the lightbox stays closed would see the same non-null/differing
+            // refs and redo the jump+highlight (or, worse, the scroll
+            // restore) again.
+            openedLightboxIndexRef.current = null;
+            lastLightboxIndexRef.current = null;
+            if (closedAtIndex !== null && openedAtIndex !== null && closedAtIndex !== openedAtIndex) {
+                // Navigated to a different photo inside the lightbox (prev/next,
+                // filmstrip, keyboard) before closing -- land back in the grid on
+                // that photo's row instead of where the lightbox was opened from.
+                scrollGalleryToIndexRef.current(closedAtIndex);
+                const returnedToPhoto = latestFilteredPhotosRef.current[closedAtIndex];
+                setReturnHighlightFilename(returnedToPhoto ? returnedToPhoto.filename : null);
+            } else {
+                // The grid's own windowing state (metrics/visible range) was
+                // never touched while it sat unmounted behind the lightbox
+                // (its recompute bails out with no containerRef to measure),
+                // so it's still valid for this exact scroll position -- no
+                // recompute needed here, only for the jump-to-a-different-
+                // photo branch above, which lands somewhere that range never
+                // covered.
+                window.scrollTo(0, preLightboxScrollYRef.current);
+            }
+        } else if (gallerySectionRef.current) {
+            const sectionTop = gallerySectionRef.current.getBoundingClientRect().top + window.scrollY;
+            window.scrollTo(0, sectionTop);
+        }
+    }, [lightboxIndex]);
+
+    // Briefly highlight the tile the lightbox returned the user to, then
+    // clear it so it doesn't linger or re-trigger on unrelated re-renders.
+    useEffect(() => {
+        if (!returnHighlightFilename) {
+            return undefined;
+        }
+        const timer = window.setTimeout(() => setReturnHighlightFilename(null), 1800);
+        return () => window.clearTimeout(timer);
+    }, [returnHighlightFilename]);
+
     const totalPhotos = totalAvailable;
     const showingPhotos = filteredPhotos.length;
     const selectedCount = selectedPhotos.size;
@@ -4920,6 +4976,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             return;
         }
         preLightboxScrollYRef.current = window.scrollY;
+        openedLightboxIndexRef.current = index;
         setLightboxIndex(index);
     }, [filteredPhotos.length]);
 
@@ -5403,6 +5460,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                 selected={isSelected}
                                 animateEntrance={isNewTile}
                                 animationDelayMs={isNewTile ? (index % 8) * 36 : undefined}
+                                className={photo.filename === returnHighlightFilename ? 'tile-return-highlight' : undefined}
                                 title={photo.filename}
                                 showBody={false}
                                 useBatchedAccess
