@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const get = vi.fn();
+// resolveFaceCropUrl calls /api/faces/crop/* via getExtras (people_bp moved
+// to the dedicated `extras` container app, 2026-09-17) -- kept as a separate
+// mock from `get` (used by resolveFaceFallbackUrl's still-backend
+// /api/photos/... call) so tests can assert on each independently.
+const getExtras = vi.fn();
 const resolveApiUrl = vi.fn((url: string) => `resolved:${url}`);
 const isAuthEnabled = vi.fn(() => false);
 const fetchProtectedBlobUrl = vi.fn(async (path: string) => `blob:${path}`);
 
-vi.mock('./apiClient', () => ({ get, resolveApiUrl }));
+vi.mock('./apiClient', () => ({ get, getExtras, resolveApiUrl }));
 vi.mock('./authClient', () => ({ isAuthEnabled }));
 vi.mock('./imageClient', () => ({ fetchProtectedBlobUrl }));
 
@@ -37,6 +42,7 @@ describe('faceMediaCache', () => {
     beforeEach(async () => {
         vi.resetModules();
         get.mockReset();
+        getExtras.mockReset();
         resolveApiUrl.mockReset().mockImplementation((url: string) => `resolved:${url}`);
         isAuthEnabled.mockReset().mockReturnValue(false);
         fetchProtectedBlobUrl.mockReset().mockImplementation(async (path: string) => `blob:${path}`);
@@ -47,23 +53,23 @@ describe('faceMediaCache', () => {
         vi.restoreAllMocks();
     });
 
-    it('resolves a crop URL from the backend response', async () => {
-        get.mockResolvedValue({ url: 'https://sas.example/cover.jpg' });
+    it('resolves a crop URL from the extras-app response', async () => {
+        getExtras.mockResolvedValue({ url: 'https://sas.example/cover.jpg' });
         const url = await mod.resolveFaceCropUrl('face-v1-abc');
         expect(url).toBe('https://sas.example/cover.jpg');
-        expect(get).toHaveBeenCalledWith('/api/faces/crop/face-v1-abc');
+        expect(getExtras).toHaveBeenCalledWith('/api/faces/crop/face-v1-abc');
     });
 
     it('caches by faceId so a second call does not hit the network again', async () => {
-        get.mockResolvedValue({ url: 'https://sas.example/cover.jpg' });
+        getExtras.mockResolvedValue({ url: 'https://sas.example/cover.jpg' });
         await mod.resolveFaceCropUrl('face-v1-abc');
         await mod.resolveFaceCropUrl('face-v1-abc');
-        expect(get).toHaveBeenCalledTimes(1);
+        expect(getExtras).toHaveBeenCalledTimes(1);
     });
 
     it('dedupes concurrent in-flight requests for the same faceId', async () => {
         const d = deferred<{ url: string }>();
-        get.mockReturnValue(d.promise);
+        getExtras.mockReturnValue(d.promise);
 
         const first = mod.resolveFaceCropUrl('face-v1-abc');
         const second = mod.resolveFaceCropUrl('face-v1-abc');
@@ -71,14 +77,14 @@ describe('faceMediaCache', () => {
 
         await expect(first).resolves.toBe('https://sas.example/cover.jpg');
         await expect(second).resolves.toBe('https://sas.example/cover.jpg');
-        expect(get).toHaveBeenCalledTimes(1);
+        expect(getExtras).toHaveBeenCalledTimes(1);
     });
 
     it('caps concurrency so no more than 6 crop requests run at once', async () => {
         const pending: Array<{ resolve: (v: { url: string }) => void }> = [];
         let concurrent = 0;
         let maxConcurrent = 0;
-        get.mockImplementation(
+        getExtras.mockImplementation(
             () =>
                 new Promise<{ url: string }>((resolve) => {
                     concurrent += 1;
@@ -140,14 +146,13 @@ describe('faceMediaCache', () => {
         // page full of slow (cache-miss) crop requests could starve every fast,
         // pre-generated fallback thumbnail behind them, stalling the whole grid.
         const stuckCrops: Array<{ resolve: (v: { url: string }) => void }> = [];
-        get.mockImplementation((url: string) => {
-            if (url.includes('/api/faces/crop/')) {
+        getExtras.mockImplementation(
+            () =>
                 // Stays pending until this test explicitly resolves it below —
                 // simulates a page full of slow (still in-progress) misses.
-                return new Promise((resolve) => stuckCrops.push({ resolve }));
-            }
-            return Promise.resolve({ url: 'https://sas.example/thumb.jpg' });
-        });
+                new Promise((resolve) => stuckCrops.push({ resolve })),
+        );
+        get.mockImplementation(() => Promise.resolve({ url: 'https://sas.example/thumb.jpg' }));
 
         // Saturate the crop pool exactly to its capacity (not beyond — a queued
         // excess would need draining too, which isn't what this test is about).

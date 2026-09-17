@@ -11319,6 +11319,24 @@ elif _app_role == 'admin':
     # backfill) off the gallery-facing replica's attack surface even if
     # auth were ever bypassed there.
     app.register_blueprint(admin_bp)
+elif _app_role == 'extras':
+    # 2026-09-17: people/library/public split off the core 'backend' role so
+    # backend itself can shrink to a 0.5vCPU/1Gi tier sized for just the
+    # everyday gallery loop (auth+photos+albums+system) -- see
+    # backend-cpu-optimization-2026-09 memory. These three carry the heavier
+    # secondary features (People page's own per-partition face/embedding-
+    # index scans, library export/clean orchestration, and public share-link
+    # media streaming) that day-to-day browsing doesn't touch. Bundled
+    # together on one app rather than three, since none of them are hot
+    # enough individually to justify their own bicep/scaling footprint --
+    # revisit only if one of them needs independent scaling from the others.
+    for _bp in (people_bp, library_bp, public_bp):
+        app.register_blueprint(_bp)
 else:
-    for _bp in (auth_bp, photos_bp, people_bp, albums_bp, public_bp, library_bp, system_bp):
+    # system_bp stays here rather than moving to 'extras' -- it's negligible
+    # weight (a handful of point lookups, including /health) and Container
+    # Apps' default TCP probe doesn't need it, but losing a friendly
+    # same-origin /health on backend specifically wasn't worth it for zero
+    # real memory/CPU savings.
+    for _bp in (auth_bp, photos_bp, albums_bp, system_bp):
         app.register_blueprint(_bp)

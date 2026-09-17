@@ -9,7 +9,14 @@ import { getRuntimeConfig } from '../config/appConfig';
 import { getAccessToken } from './authClient';
 import * as passwordAuth from './passwordAuthClient';
 
-const apiBase = (): string => (getRuntimeConfig().apiBaseUrl || '').replace(/\/$/, '');
+// library_bp moved to the dedicated `extras` container app (2026-09-17, see
+// app.py's APP_ROLE=extras split) -- falls back to apiBaseUrl when no
+// separate extras deployment exists for this environment, same pattern as
+// apiClient.ts's toolsUrl/adminUrl.
+const apiBase = (): string => {
+    const config = getRuntimeConfig();
+    return (config.extrasApiBaseUrl || config.apiBaseUrl || '').replace(/\/$/, '');
+};
 const url = (path: string): string => `${apiBase()}${path}`;
 
 export interface LibrarySummary {

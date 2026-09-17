@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "2955013434803099676"
+      "templateHash": "11489273454299995130"
     }
   },
   "parameters": {
@@ -145,7 +145,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "7793693010783428787"
+              "templateHash": "6983318551163375359"
             }
           },
           "parameters": {
@@ -251,6 +251,7 @@
             "toolsAppName": "[format('{0}-tools', parameters('appName'))]",
             "uploadAppName": "[format('{0}-upload', parameters('appName'))]",
             "adminAppName": "[format('{0}-admin', parameters('appName'))]",
+            "extrasAppName": "[format('{0}-extras', parameters('appName'))]",
             "deployIpworker": "[not(equals(parameters('processingMode'), 'browser'))]",
             "roleBlobContributor": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
             "roleTableContributor": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
@@ -430,10 +431,10 @@
                       "name": "backend",
                       "image": "[parameters('backendImage')]",
                       "resources": {
-                        "cpu": "[json('2')]",
-                        "memory": "4Gi"
+                        "cpu": "[json('0.5')]",
+                        "memory": "1Gi"
                       },
-                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'PROCESSING_MODE', 'value', parameters('processingMode')), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.75'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'true'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'true'), createObject('name', 'PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', 'value', '1800')), createArray(createObject('name', 'APP_ROLE', 'value', 'backend'), createObject('name', 'GUNICORN_WORKERS', 'value', '1'), createObject('name', 'GUNICORN_THREADS', 'value', '4'), createObject('name', 'GUNICORN_MAX_REQUESTS', 'value', '4000'), createObject('name', 'GUNICORN_MAX_REQUESTS_JITTER', 'value', '400'), createObject('name', 'VECTOR_INDEX_PRIME_ON_STARTUP', 'value', 'false'), createObject('name', 'OWNER_PASSWORD', 'secretRef', 'owner-password'), createObject('name', 'SESSION_SECRET', 'secretRef', 'session-secret'), createObject('name', 'ACS_CONNECTION_STRING', 'secretRef', 'acs-connection-string')))]"
+                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'PROCESSING_MODE', 'value', parameters('processingMode')), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.75'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'true'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'true'), createObject('name', 'PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', 'value', '1800')), createArray(createObject('name', 'APP_ROLE', 'value', 'backend'), createObject('name', 'GUNICORN_WORKERS', 'value', '1'), createObject('name', 'GUNICORN_THREADS', 'value', '2'), createObject('name', 'GUNICORN_MAX_REQUESTS', 'value', '4000'), createObject('name', 'GUNICORN_MAX_REQUESTS_JITTER', 'value', '400'), createObject('name', 'VECTOR_INDEX_PRIME_ON_STARTUP', 'value', 'false'), createObject('name', 'OWNER_PASSWORD', 'secretRef', 'owner-password'), createObject('name', 'SESSION_SECRET', 'secretRef', 'session-secret'), createObject('name', 'ACS_CONNECTION_STRING', 'secretRef', 'acs-connection-string')))]"
                     }
                   ],
                   "scale": {
@@ -444,7 +445,7 @@
                         "name": "http-scaler",
                         "http": {
                           "metadata": {
-                            "concurrentRequests": "4"
+                            "concurrentRequests": "2"
                           }
                         }
                       }
@@ -603,6 +604,77 @@
             {
               "type": "Microsoft.App/containerApps",
               "apiVersion": "2024-03-01",
+              "name": "[variables('extrasAppName')]",
+              "location": "[parameters('location')]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+                "configuration": {
+                  "ingress": {
+                    "external": true,
+                    "targetPort": 5000,
+                    "transport": "auto",
+                    "traffic": [
+                      {
+                        "latestRevision": true,
+                        "weight": 100
+                      }
+                    ]
+                  },
+                  "secrets": [
+                    {
+                      "name": "owner-password",
+                      "value": "[parameters('adminPassword')]"
+                    },
+                    {
+                      "name": "session-secret",
+                      "value": "[variables('sessionSecret')]"
+                    },
+                    {
+                      "name": "acs-connection-string",
+                      "value": "[listKeys(resourceId('Microsoft.Communication/communicationServices', format('{0}-comm', parameters('appName'))), '2023-04-01').primaryConnectionString]"
+                    }
+                  ]
+                },
+                "template": {
+                  "containers": [
+                    {
+                      "name": "extras",
+                      "image": "[parameters('backendImage')]",
+                      "resources": {
+                        "cpu": "[json('1.0')]",
+                        "memory": "2Gi"
+                      },
+                      "env": "[concat(createArray(createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'PROCESSING_MODE', 'value', parameters('processingMode')), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.75'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'true'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'true'), createObject('name', 'PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', 'value', '1800')), createArray(createObject('name', 'APP_ROLE', 'value', 'extras'), createObject('name', 'GUNICORN_WORKERS', 'value', '1'), createObject('name', 'GUNICORN_THREADS', 'value', '4'), createObject('name', 'VECTOR_INDEX_PRIME_ON_STARTUP', 'value', 'false'), createObject('name', 'OWNER_PASSWORD', 'secretRef', 'owner-password'), createObject('name', 'SESSION_SECRET', 'secretRef', 'session-secret'), createObject('name', 'ACS_CONNECTION_STRING', 'secretRef', 'acs-connection-string')))]"
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": 0,
+                    "maxReplicas": 3,
+                    "rules": [
+                      {
+                        "name": "http-scaler",
+                        "http": {
+                          "metadata": {
+                            "concurrentRequests": "8"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Communication/communicationServices', format('{0}-comm', parameters('appName')))]",
+                "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
+                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2024-03-01",
               "name": "[variables('uploadAppName')]",
               "location": "[parameters('location')]",
               "identity": {
@@ -718,6 +790,10 @@
                           "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('adminAppName')), '2024-03-01').configuration.ingress.fqdn)]"
                         },
                         {
+                          "name": "APP_CONFIG_EXTRAS_API_BASE_URL",
+                          "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('extrasAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+                        },
+                        {
                           "name": "APP_CONFIG_SPA_BASE_URL",
                           "value": "[format('https://{0}.{1}', variables('frontendAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)]"
                         },
@@ -749,6 +825,7 @@
               "dependsOn": [
                 "[resourceId('Microsoft.App/containerApps', variables('adminAppName'))]",
                 "[resourceId('Microsoft.App/containerApps', variables('backendAppName'))]",
+                "[resourceId('Microsoft.App/containerApps', variables('extrasAppName'))]",
                 "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
                 "[resourceId('Microsoft.App/containerApps', variables('toolsAppName'))]",
                 "[resourceId('Microsoft.App/containerApps', variables('uploadAppName'))]"
@@ -773,6 +850,7 @@
                   ]
                 },
                 "template": {
+                  "terminationGracePeriodSeconds": 600,
                   "containers": [
                     {
                       "name": "worker",
@@ -997,6 +1075,25 @@
                 "[resourceId('Microsoft.App/containerApps', variables('adminAppName'))]",
                 "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
               ]
+            },
+            {
+              "copy": {
+                "name": "extrasStorageRoles",
+                "count": "[length(variables('storageRoleIds'))]"
+              },
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', variables('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.App/containerApps', variables('extrasAppName')), variables('storageRoleIds')[copyIndex()])]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageRoleIds')[copyIndex()])]",
+                "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('extrasAppName')), '2024-03-01', 'full').identity.principalId]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.App/containerApps', variables('extrasAppName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+              ]
             }
           ],
           "outputs": {
@@ -1034,6 +1131,13 @@
                 "description": "Admin (Tools/Workbench recovery actions) API URL."
               },
               "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('adminAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+            },
+            "extrasUrl": {
+              "type": "string",
+              "metadata": {
+                "description": "Extras (people/library/public) API URL."
+              },
+              "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('extrasAppName')), '2024-03-01').configuration.ingress.fqdn)]"
             }
           }
         }
@@ -1078,6 +1182,13 @@
         "description": "URL of the admin (Tools/Workbench recovery actions) API."
       },
       "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'photostore-resources'), '2022-09-01').outputs.adminUrl.value]"
+    },
+    "extrasUrl": {
+      "type": "string",
+      "metadata": {
+        "description": "URL of the extras (people/library/public) API."
+      },
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'photostore-resources'), '2022-09-01').outputs.extrasUrl.value]"
     }
   }
 }

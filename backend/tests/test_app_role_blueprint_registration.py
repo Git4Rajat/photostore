@@ -51,6 +51,19 @@ def test_backend_role_does_not_serve_admin_routes():
     assert '/api/photos' in paths  # sanity: other groups still registered
 
 
+def test_backend_role_does_not_serve_extras_routes():
+    """2026-09-17: people/library/public moved to their own 'extras' role so
+    backend can shrink to a 0.5vCPU/1Gi everyday-browsing tier -- see
+    backend-cpu-optimization-2026-09 memory."""
+    paths = _rule_paths_for_role(None)
+    assert '/api/persons' not in paths
+    assert '/api/faces' not in paths
+    assert '/api/library/mine' not in paths
+    assert '/public/albums/<token>' not in paths
+    assert '/api/photos' in paths  # sanity: other groups still registered
+    assert '/health' in paths  # system_bp stays on backend -- see app.py's comment
+
+
 def test_tools_role_serves_only_tools_routes():
     paths = _rule_paths_for_role('tools')
     non_static = {p for p in paths if not p.startswith('/static')}
@@ -72,3 +85,14 @@ def test_admin_role_serves_only_admin_routes():
     assert all(p.startswith(('/admin', '/api/admin')) for p in non_static)
     assert '/api/admin/people/dedupe-faces' in non_static
     assert '/api/admin/jobs/status' in non_static
+
+
+def test_extras_role_serves_only_extras_routes():
+    paths = _rule_paths_for_role('extras')
+    non_static = {p for p in paths if not p.startswith('/static')}
+    assert non_static  # non-empty
+    extras_prefixes = ('/api/persons', '/api/faces', '/api/people', '/persons', '/people', '/api/library', '/public', '/api/public')
+    assert all(p.startswith(extras_prefixes) for p in non_static)
+    assert '/api/persons' in non_static
+    assert '/api/library/mine' in non_static
+    assert '/public/albums/<token>' in non_static

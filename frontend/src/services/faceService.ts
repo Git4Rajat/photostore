@@ -1,4 +1,7 @@
-import { get, post } from './apiClient';
+// people_bp moved to the dedicated `extras` container app (2026-09-17, see
+// app.py's APP_ROLE=extras split) -- aliased so every call site below stays
+// unchanged.
+import { getExtras as get, postExtras as post } from './apiClient';
 
 type PersonListResponse = {
     persons?: unknown[];

@@ -1,7 +1,11 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowDownTrayIcon, CheckIcon, LockOpenIcon, PhotoIcon } from '@heroicons/react/24/outline';
 import { useParams } from 'react-router-dom';
-import { get, post, resolveApiUrl } from '../services/apiClient';
+// public_bp moved to the dedicated `extras` container app (2026-09-17, see
+// app.py's APP_ROLE=extras split) -- aliased so every call site below stays
+// unchanged. resolveApiUrl already routes /public/* paths to the extras
+// origin on its own (see apiClient.ts's EXTRAS_PATH_PREFIXES).
+import { getExtras as get, postExtras as post, resolveApiUrl } from '../services/apiClient';
 import { classifyApiError, isApiError, type ApiError } from '../services/apiError';
 import { notifyApiError } from '../services/requestFeedback';
 import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
@@ -101,15 +105,50 @@ const PublicAlbumPage: React.FC = () => {
     // viewer's own height and the browser clamps window scroll to 0.
     // Save the scroll position before opening and restore it on close,
     // in a layout effect so it lands before the browser paints the
-    // remounted grid.
+    // remounted grid. If in-viewer navigation (prev/next/filmstrip) left
+    // the user on a different photo than the one they opened, scroll to
+    // and highlight that photo's tile instead of the original position.
     const preViewerScrollYRef = useRef<number>(0);
+    const openedViewerIndexRef = useRef<number | null>(null);
+    const lastViewerIndexRef = useRef<number | null>(null);
+    const [returnHighlightFilename, setReturnHighlightFilename] = useState<string | null>(null);
+    if (viewerIndex !== null) {
+        lastViewerIndexRef.current = viewerIndex;
+    }
+    // `photos` only mirrored into a ref (not a dep below) so an unrelated
+    // re-render while the viewer stays closed can't re-fire this effect and
+    // redo the jump/highlight (or clobber the scroll restore) a second time.
+    const latestPhotosRef = useRef(photos);
+    latestPhotosRef.current = photos;
     useLayoutEffect(() => {
-        if (viewerIndex === null) {
-            window.scrollTo(0, preViewerScrollYRef.current);
+        if (viewerIndex !== null) {
+            return;
         }
+        const closedAtIndex = lastViewerIndexRef.current;
+        const openedAtIndex = openedViewerIndexRef.current;
+        openedViewerIndexRef.current = null;
+        lastViewerIndexRef.current = null;
+        if (closedAtIndex !== null && openedAtIndex !== null && closedAtIndex !== openedAtIndex) {
+            const returnedToPhoto = latestPhotosRef.current[closedAtIndex];
+            if (returnedToPhoto) {
+                const tileEl = document.querySelector(`[data-tile-id="${CSS.escape(returnedToPhoto.filename)}"]`);
+                tileEl?.scrollIntoView({ block: 'center' });
+                setReturnHighlightFilename(returnedToPhoto.filename);
+                return;
+            }
+        }
+        window.scrollTo(0, preViewerScrollYRef.current);
     }, [viewerIndex]);
+    useEffect(() => {
+        if (!returnHighlightFilename) {
+            return undefined;
+        }
+        const timer = window.setTimeout(() => setReturnHighlightFilename(null), 1800);
+        return () => window.clearTimeout(timer);
+    }, [returnHighlightFilename]);
     const openViewerAt = useCallback((index: number) => {
         preViewerScrollYRef.current = window.scrollY;
+        openedViewerIndexRef.current = index;
         setViewerIndex(index);
     }, []);
 
@@ -478,6 +517,7 @@ const PublicAlbumPage: React.FC = () => {
                                 photo={photo}
                                 selected={isSelected}
                                 animationDelayMs={(index % 8) * 36}
+                                className={photo.filename === returnHighlightFilename ? 'tile-return-highlight' : undefined}
                                 title={photo.filename}
                                 showBody={false}
                                 useProtectedMedia={false}

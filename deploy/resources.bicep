@@ -81,6 +81,7 @@ var ipworkerAppName = '${appName}-ipworker'
 var toolsAppName = '${appName}-tools'
 var uploadAppName = '${appName}-upload'
 var adminAppName = '${appName}-admin'
+var extrasAppName = '${appName}-extras'
 // Only deploy ipworker (and grant it storage access) when the deployment
 // actually needs it -- in 'browser' mode (the default) it would just sit
 // scaled to zero forever, so skip provisioning it at all.
@@ -502,8 +503,20 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // mid-restart replica stalled, which is what made pagination and
             // RAW/CR3 preview generation both feel "incredibly slow". Matches
             // worker/ipworker's existing 2vCPU/4Gi tier.
-            cpu: json('2')
-            memory: '4Gi'
+            //
+            // 2026-09-17: lowered to 0.5vCPU/1Gi now that upload (2026-09-16)
+            // and people/library/public (2026-09-17, see the 'extras' app
+            // below) have all moved off this role -- 'backend' now only
+            // carries auth+photos+albums+system, the everyday browse/search/
+            // delete/albums-CRUD loop, and the original OOM driver (upload's
+            // finalize/init-batch/client-processing) lives on its own app
+            // now. GUNICORN_THREADS dropped 4->2 to match (see below) --
+            // residual risk is a burst of concurrent RAW/CR3 on-demand
+            // preview decodes (still in photos_bp) pushing close to 1Gi;
+            // watch WorkingSetBytes after this ships and raise if it
+            // recurs near the ceiling the way the pre-split backend did.
+            cpu: json('0.5')
+            memory: '1Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
@@ -537,8 +550,15 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // 4 the same session. Don't re-raise this without first finding
             // and fixing (or moving off-thread) whatever CPU-bound work
             // those 3 handlers do per call -- more threads alone made it
-            // worse, not better.
-            { name: 'GUNICORN_THREADS', value: '4' }
+            // worse, not better. (That finding was about finalize/init-batch/
+            // client-processing specifically, which now live on the `upload`
+            // app -- irrelevant to backend's own remaining handlers.)
+            //
+            // 2026-09-17: lowered 4->2 alongside the 0.5vCPU/1Gi resize
+            // above -- 4 CPU-bound-capable threads on half a vCPU just
+            // increases GIL contention without adding real parallelism, and
+            // fewer concurrent threads bounds peak per-replica memory too.
+            { name: 'GUNICORN_THREADS', value: '2' }
             // entrypoint.sh's default (400, +/-50 jitter) recycles the sole
             // worker (GUNICORN_WORKERS=1, so no second worker covers the
             // gap -- see entrypoint.sh's own comment) far too often under a
@@ -580,25 +600,20 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
         maxReplicas: 5
         rules: [
           {
-            // Was 15, then 8 (2x GUNICORN_THREADS) -- see git history for
-            // that reasoning. 2026-08-30: 8 was coupled 1:1 with the
-            // frontend's UPLOAD_DISPATCH_CONCURRENCY cap (also 8, chosen to
-            // match this exact number), which meant total app-wide upload
-            // demand could sit AT this threshold but essentially never
-            // exceed it -- so it rarely triggered scale-out past 2-3
-            // replicas even during a sustained multi-hour upload (confirmed
-            // live: Replicas metric flat at 2-3 for 3+ hours despite
-            // maxReplicas=5, while total concurrent backend requests
-            // measured via HAR sat right at 8-10). Lowered to match
-            // GUNICORN_THREADS (4, "1x") instead of 2x, and
-            // UPLOAD_DISPATCH_CONCURRENCY raised well above it (20, see its
-            // own comment) so real sustained demand now clearly exceeds this
-            // threshold instead of sitting flush with it -- giving KEDA
-            // actual headroom to scale toward maxReplicas under load.
+            // Was 15, then 8 (2x GUNICORN_THREADS), then 4 (1x) -- see git
+            // history for that upload-era reasoning (finalize/client-
+            // processing/UPLOAD_DISPATCH_CONCURRENCY), all now moot here
+            // since upload runs on its own app (2026-09-16). 2026-09-17:
+            // lowered to 2 to stay 1x GUNICORN_THREADS (now 2, see above)
+            // for backend's remaining everyday browse/search/delete/albums
+            // traffic -- cheap 0.5vCPU/1Gi replicas scaling out sooner under
+            // a light-but-bursty gallery load is the intended trade, not a
+            // cost concern (minReplicas stays 0; this only affects the
+            // ceiling under real concurrent load).
             name: 'http-scaler'
             http: {
               metadata: {
-                concurrentRequests: '4'
+                concurrentRequests: '2'
               }
             }
           }
@@ -750,6 +765,84 @@ resource admin 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+// 2026-09-17: third service split -- people (person/face CRUD, merges,
+// clustering-adjacent reads), library (invites/switch/export/clean
+// orchestration), and public (share-link album/photo/thumbnail/preview
+// streaming) all move off the core 'backend' role together. None of the
+// three is hot enough alone to justify its own bicep footprint, but
+// bundled they're the bulk of what kept backend's OOM-driven 2vCPU/4Gi
+// sizing (see that resource's own comments) even after the tools/upload/
+// admin splits: People page's per-partition face/embedding-index scans and
+// library export/clean orchestration are secondary features, not the
+// every-day browse/search/delete/albums-CRUD loop backend now targets (see
+// backend-cpu-optimization-2026-09 memory). Sized moderately above the
+// tools/admin floor, not down at it -- unlike those two, public_bp serves
+// unauthenticated share-link traffic that can spike unpredictably (a link
+// going viral, or a crawler fetching a share preview), and people_bp still
+// does real per-partition Table scans for the People page (already
+// server-side paginated -- see people-page-server-side-pagination memory --
+// but real work all the same, unlike tools' pure history logging).
+resource extras 'Microsoft.App/containerApps@2024-03-01' = {
+  name: extrasAppName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      ingress: {
+        external: true
+        targetPort: 5000
+        transport: 'auto'
+        traffic: [
+          { latestRevision: true, weight: 100 }
+        ]
+      }
+      secrets: [
+        { name: 'owner-password', value: adminPassword }
+        { name: 'session-secret', value: sessionSecret }
+        { name: 'acs-connection-string', value: acsConnectionString }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'extras'
+          image: backendImage
+          resources: {
+            cpu: json('1.0')
+            memory: '2Gi'
+          }
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'extras' }
+            { name: 'GUNICORN_WORKERS', value: '1' }
+            { name: 'GUNICORN_THREADS', value: '4' }
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
+            { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+          ])
+        }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 3
+        rules: [
+          {
+            name: 'http-scaler'
+            http: {
+              metadata: {
+                concurrentRequests: '8'
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
 // 2026-09-15: second service split -- upload (init/finalize/processing-lease/
 // known-hashes/corrupted-uploads). Unlike tools, this IS the traffic pattern
 // that originally justified the backend's own 2vCPU/4Gi + maxReplicas=5 +
@@ -852,6 +945,7 @@ resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'APP_CONFIG_UPLOAD_BASE_URL', value: 'https://${upload.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_TOOLS_API_BASE_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_ADMIN_API_BASE_URL', value: 'https://${admin.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_EXTRAS_API_BASE_URL', value: 'https://${extras.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_SPA_BASE_URL', value: frontendUrl }
             { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
             // Without this, the frontend's docker-entrypoint.sh defaults
@@ -1258,6 +1352,18 @@ resource adminStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' 
   }
 ]
 
+resource extrasStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: {
+    name: guid(storage.id, extras.id, roleId)
+    scope: storage
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+      principalId: extras.identity.principalId
+      principalType: 'ServicePrincipal'
+    }
+  }
+]
+
 @description('Open this URL in your browser to use Photostore.')
 output appUrl string = frontendUrl
 
@@ -1272,3 +1378,6 @@ output uploadUrl string = 'https://${upload.properties.configuration.ingress.fqd
 
 @description('Admin (Tools/Workbench recovery actions) API URL.')
 output adminUrl string = 'https://${admin.properties.configuration.ingress.fqdn}'
+
+@description('Extras (people/library/public) API URL.')
+output extrasUrl string = 'https://${extras.properties.configuration.ingress.fqdn}'

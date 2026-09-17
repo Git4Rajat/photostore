@@ -9,6 +9,12 @@ export interface AppConfig {
      * recovery actions, see routes/admin.py) -- falls back to apiBaseUrl when
      * no separate admin deployment exists for this environment. */
     adminApiBaseUrl?: string;
+    /** Base URL for the dedicated `extras` container app (people/faces,
+     * library invites/export/clean, and public share-link routes -- see
+     * routes/people.py, routes/library.py, routes/public.py) -- falls back
+     * to apiBaseUrl when no separate extras deployment exists for this
+     * environment. */
+    extrasApiBaseUrl?: string;
     spaBaseUrl?: string;
     azureAdTenantId?: string;
     azureAdClientId?: string;

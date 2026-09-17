@@ -1,4 +1,4 @@
-import { get, resolveApiUrl } from './apiClient';
+import { get, getExtras, resolveApiUrl } from './apiClient';
 import { isAuthEnabled } from './authClient';
 import { fetchProtectedBlobUrl } from './imageClient';
 
@@ -99,7 +99,8 @@ export const resolveFaceCropUrl = (faceId: string): Promise<string> => {
         return inFlight;
     }
     const promise = limitCrop(async () => {
-        const result = await get(`/api/faces/crop/${encodeURIComponent(faceId)}`);
+        // people_bp -> the dedicated `extras` container app (2026-09-17).
+        const result = await getExtras(`/api/faces/crop/${encodeURIComponent(faceId)}`);
         if (typeof result?.url !== 'string' || !result.url) {
             throw new Error('No crop url');
         }
