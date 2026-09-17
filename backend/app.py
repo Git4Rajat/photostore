@@ -430,6 +430,11 @@ LIBRARY_EXPORT_PART_MAX_BYTES = int(os.getenv('LIBRARY_EXPORT_PART_MAX_BYTES', s
 # part boundaries, or resumability, only how much wall-clock time each
 # batch of downloads actually takes.
 LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY = int(os.getenv('LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY', '8'))
+# delete_multiple_photos does several point-reads/deletes (metadata, blobs,
+# hash/filename-owner index rows) per file, previously run one file at a time
+# -- pure network I/O wait each time, same shape as the library-export
+# downloads above, so overlapping them is the same low-risk win.
+DELETE_IO_CONCURRENCY = int(os.getenv('DELETE_IO_CONCURRENCY', '16'))
 # 'sas' hands the browser day-stable read SAS URLs pointing straight at blob
 # storage so media bytes never stream through this container; 'proxy' serves
 # every byte through the backend. 'sas' silently degrades to proxy URLs when
@@ -9733,13 +9738,22 @@ def _shared_names_in_batch(names_set: set, user_id: str) -> set:
     if not names_set:
         return shared
     if filename_owners_table_client is not None:
-        for name in names_set:
+        def _check(name: str) -> Optional[str]:
             try:
                 rows = list(filename_owners_table_client.query_entities(f"PartitionKey eq '{_escape_odata(name)}'"))
             except Exception:
-                continue
+                return None
             if any(str(row.get('RowKey') or '') != user_id for row in rows):
-                shared.add(name)
+                return name
+            return None
+        # Each name is an independent point-scoped query -- pure network I/O
+        # wait, so running them concurrently rather than one at a time is a
+        # large, low-risk throughput win (same shape as DELETE_IO_CONCURRENCY's
+        # other call sites in the delete path).
+        with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+            for name in executor.map(_check, names_set):
+                if name:
+                    shared.add(name)
         return shared
     if metadata_table_client is None:
         return shared
@@ -9772,18 +9786,24 @@ def _batch_remove_faces_for_filenames(user_id: str, names_set: set) -> set:
         face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         face_rows = []
+    matched_face_ids = [
+        str(row.get('RowKey') or '')
+        for row in face_rows
+        if str(row.get('filename') or '') in names_set and row.get('RowKey')
+    ]
     removed_face_ids: set = set()
-    for row in face_rows:
-        if str(row.get('filename') or '') not in names_set:
-            continue
-        face_id = str(row.get('RowKey') or '')
-        if not face_id:
-            continue
-        try:
-            face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
-        except Exception:
-            pass
-        removed_face_ids.add(face_id)
+    if matched_face_ids:
+        def _delete_face(face_id: str) -> None:
+            try:
+                face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
+            except Exception:
+                pass
+        # A photo can carry several faces, so a big chunk can mean hundreds of
+        # these -- independent point deletes, so run them concurrently rather
+        # than one at a time (same reasoning as DELETE_IO_CONCURRENCY above).
+        with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+            list(executor.map(_delete_face, matched_face_ids))
+        removed_face_ids.update(matched_face_ids)
     if not removed_face_ids or person_table_client is None:
         return deleted_person_ids
     try:

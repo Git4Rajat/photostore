@@ -6,6 +6,8 @@ as app.<name> throughout, matching the exact late-binding lookup semantics
 the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
+from concurrent.futures import ThreadPoolExecutor
+
 from flask import Blueprint
 
 import app
@@ -840,17 +842,24 @@ def delete_multiple_photos():
     # have helped here either: each chunk's deletions invalidate it via
     # _invalidate_metadata_scan_cache below, so the very next chunk would
     # still miss and pay the full scan again.
-    own_rows_by_name = {}
-    for safe_name in valid_names:
-        metadata = app._get_metadata_entity(user_id, safe_name)
-        if metadata is not None:
-            own_rows_by_name[safe_name] = metadata
+    # Each point-read is independent network I/O -- run them concurrently
+    # rather than one file at a time (up to ~100 per chunk sequentially was a
+    # meaningful chunk of the per-chunk wall time).
+    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
+        metadata_results = list(executor.map(lambda n: (n, app._get_metadata_entity(user_id, n)), valid_names))
+    own_rows_by_name = {name: metadata for name, metadata in metadata_results if metadata is not None}
 
     shared_names = app._shared_names_in_batch(names_set, user_id)
     temp_removed_names = app._batch_delete_upload_temp_files(names_set)
 
     # Per-file point operations only (no scans): blob + metadata-row deletes.
-    for safe_name in valid_names:
+    # Each file's work (blob deletes, metadata delete, index cleanup) is
+    # independent of every other file's, and dominated by network I/O wait,
+    # so it runs concurrently across the chunk instead of one file at a time
+    # -- this loop was the single largest contributor to per-chunk wall time.
+    def _delete_one_file(safe_name: str) -> app.Tuple[str, str, str]:
+        """Returns (safe_name, outcome, detail) where outcome is one of
+        'deleted', 'not_found', 'error' (detail holds the error text)."""
         metadata = own_rows_by_name.get(safe_name)
         shared_with_other_user = safe_name in shared_names
         file_errors = []
@@ -892,15 +901,25 @@ def delete_multiple_photos():
                 app.delete_hash_index_entry(user_id, file_hash)
             app.delete_filename_owner_entry(user_id, safe_name)
         elif not removed_any:
-            errors.append(f'{safe_name}: Not found')
-            continue
+            return safe_name, 'not_found', ''
 
         if file_errors:
-            errors.append(f'{safe_name}: {"; ".join(file_errors)}')
+            return safe_name, 'error', '; '.join(file_errors)
         elif removed_any:
-            deleted.append(safe_name)
+            return safe_name, 'deleted', ''
         else:
+            return safe_name, 'not_found', ''
+
+    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
+        file_results = list(executor.map(_delete_one_file, valid_names))
+
+    for safe_name, outcome, detail in file_results:
+        if outcome == 'deleted':
+            deleted.append(safe_name)
+        elif outcome == 'not_found':
             errors.append(f'{safe_name}: Not found')
+        else:
+            errors.append(f'{safe_name}: {detail}')
 
     # Faces / people, jobs, and albums reconciliation — one scan each.
     deleted_names_set = set(deleted)
