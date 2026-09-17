@@ -57,10 +57,11 @@ const inFlightGets = new Map<string, Promise<unknown>>();
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-// The backend runs scale-to-zero on Azure Container Apps, so after an idle
-// period the first request(s) hit the ingress with no healthy replica. The
-// ingress answers with a 503 (or the connection fails outright) *before* the
-// request ever reaches the app — which also means no CORS headers, so the
+// The backend runs scale-to-zero on Azure Container Apps by design (kept that
+// way deliberately for cost -- see azure-deployment-cost-work), so after an
+// idle period the first request(s) hit the ingress with no healthy replica.
+// The ingress answers with a 503 (or the connection fails outright) *before*
+// the request ever reaches the app -- which also means no CORS headers, so the
 // browser mislabels it as a "CORS policy" error. These failures are transient:
 // the same request wakes the replica and a retry moments later succeeds. We
 // retry only failures that provably never executed server-side, so retrying a
@@ -69,8 +70,19 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 //   - HTTP 503 from the ingress (no replica available)
 // A 502/504 (gateway reached the app but it timed out) is retried only for
 // idempotent GETs.
-const COLD_START_RETRIES = 4;
+//
+// The retry budget below (capped exponential backoff, ~90s total) is sized
+// for a real scale-from-zero wake, not just a warm replica hiccup: a cold
+// start means pulling the image and passing the readiness probe, measured at
+// 20-30s+ on this app's image before it can even accept a connection. A short
+// retry window here would surface a hard failure to the user mid-wake for
+// every request type (delete, search, add-to-album, ...) even though the
+// backend is about to come up -- forcing them to notice and retry manually.
+// Every call in the app goes through requestJson, so this budget covers all
+// of them uniformly.
+const COLD_START_RETRIES = 14;
 const COLD_START_BASE_DELAY_MS = 800;
+const COLD_START_MAX_DELAY_MS = 8000;
 
 const isRetriableColdStart = (error: unknown, method: string): boolean => {
     if (!axios.isAxiosError(error)) {
@@ -144,9 +156,19 @@ export const requestJson = async <T = any>(
                 return response.data;
             } catch (error: unknown) {
                 if (attempt < COLD_START_RETRIES && isRetriableColdStart(error, method)) {
-                    // Exponential backoff (0.8s, 1.6s, 3.2s, 6.4s) to span a
-                    // typical cold-start window without hammering the ingress.
-                    await sleep(COLD_START_BASE_DELAY_MS * 2 ** attempt);
+                    // First sign of trouble: surface the "waking up" banner right
+                    // away rather than only after the full ~90s budget below is
+                    // exhausted, so a long wake doesn't just look like a hang.
+                    // reportBackendUnreachable is a no-op if we're already
+                    // offline, and reportBackendReachable (above, on success)
+                    // clears it the moment any request gets through.
+                    if (attempt === 0) {
+                        reportBackendUnreachable(classifyApiError(error, requestId).message);
+                    }
+                    // Capped exponential backoff (0.8s, 1.6s, 3.2s, 6.4s, then
+                    // 8s) spanning ~90s total to span a real scale-from-zero
+                    // wake, not just a warm-replica hiccup.
+                    await sleep(Math.min(COLD_START_MAX_DELAY_MS, COLD_START_BASE_DELAY_MS * 2 ** attempt));
                     continue;
                 }
                 // Terminal outcome: classify once, then feed the app-wide

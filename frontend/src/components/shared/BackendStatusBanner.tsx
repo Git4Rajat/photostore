@@ -36,12 +36,12 @@ export const BackendStatusBanner = () => {
             <ArrowPathIcon className="backend-status-icon spin-icon" aria-hidden="true" />
             <div className="backend-status-copy">
                 <span className="backend-status-text">
-                    Can’t reach the server — waiting for it to come back online…
+                    Waking up the server — this can take up to a minute…
                 </span>
                 <span className="backend-status-sub">
                     {state.checking
                         ? 'Checking the connection now…'
-                        : 'This usually clears in a few seconds. We’ll reconnect automatically.'}
+                        : 'Your request will complete automatically once it’s back — no need to retry.'}
                 </span>
             </div>
             <button
