@@ -435,6 +435,20 @@ LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY = int(os.getenv('LIBRARY_EXPORT_DOWNLOAD_CON
 # -- pure network I/O wait each time, same shape as the library-export
 # downloads above, so overlapping them is the same low-risk win.
 DELETE_IO_CONCURRENCY = int(os.getenv('DELETE_IO_CONCURRENCY', '16'))
+# The azure-core SDK's default requests-based transport caps its underlying
+# urllib3 connection pool at 10 per host. That's invisible under sequential
+# per-file calls, but DELETE_IO_CONCURRENCY (and any other concurrent callers
+# sharing these same process-wide client singletons, e.g. library export's
+# LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY) can easily have more than 10 requests
+# in flight to the same storage account at once. Once the pool is full,
+# urllib3 doesn't queue -- it silently opens a new, unpooled connection and
+# discards it after the response ("Connection pool is full, discarding
+# connection" in the logs), paying a fresh TCP+TLS handshake on every such
+# call instead of reusing a warm one. Confirmed live: this made the
+# parallelized delete slower per-file than the sequential version it
+# replaced. Sized comfortably above the largest concurrency user in this
+# process so pooling stays effective under concurrent requests too.
+STORAGE_CONNECTION_POOL_MAXSIZE = int(os.getenv('STORAGE_CONNECTION_POOL_MAXSIZE', '64'))
 # 'sas' hands the browser day-stable read SAS URLs pointing straight at blob
 # storage so media bytes never stream through this container; 'proxy' serves
 # every byte through the backend. 'sas' silently degrades to proxy URLs when
@@ -1130,11 +1144,14 @@ def _init_storage_clients():
             raise RuntimeError('STORAGE_ACCOUNT_NAME must be set for managed identity authentication.')
 
         if BLOB_CONNECTION_STRING:
-            blob_service_client_local = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
+            blob_service_client_local = BlobServiceClient.from_connection_string(
+                BLOB_CONNECTION_STRING, connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
+            )
         else:
             blob_service_client_local = BlobServiceClient(
                 account_url=f'https://{account_name}.blob.core.windows.net',
                 credential=credential,
+                connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
             )
         queue_service_client_local = QueueServiceClient(
             account_url=f'https://{account_name}.queue.core.windows.net',
@@ -1145,7 +1162,11 @@ def _init_storage_clients():
         library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
 
         # Table clients
-        tbl_svc = TableServiceClient(endpoint=f'https://{account_name}.table.core.windows.net', credential=credential)
+        tbl_svc = TableServiceClient(
+            endpoint=f'https://{account_name}.table.core.windows.net',
+            credential=credential,
+            connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
+        )
         metadata_table_client_local = tbl_svc.get_table_client(METADATA_TABLE)
         albums_table_client_local = tbl_svc.get_table_client(ALBUMS_TABLE)
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
@@ -3102,21 +3123,6 @@ def _query_metadata_rows_for_user(user_id: str, select: Optional[List[str]] = No
     except Exception:
         app.logger.exception('Metadata scan failed purpose=%s user=%s', purpose, user_id)
         raise
-
-
-def _is_filename_shared(filename: str, user_id: str) -> bool:
-    """Returns True if the filename exists in any user's metadata except user_id."""
-    if metadata_table_client is None or not filename:
-        return False
-    try:
-        safe = _escape_odata(filename)
-        rows = list(metadata_table_client.query_entities(f"RowKey eq '{safe}'"))
-        for row in rows:
-            if row.get('PartitionKey') != user_id:
-                return True
-    except Exception:
-        return False
-    return False
 
 
 def _normalize_face_bbox(face_or_row: Dict) -> Dict[str, int]:
@@ -7297,12 +7303,21 @@ def _execute_library_clean(library_id: str) -> Dict:
     except Exception:
         metadata_rows = []
 
-    blobs_deleted = 0
-    blob_errors = 0
-    for row in metadata_rows:
+    # Was a per-photo call to _is_filename_shared, an *unscoped* `RowKey eq X`
+    # query -- no PartitionKey means Table Storage can't restrict it to this
+    # library, so it's a full scan of the entire multi-tenant metadata table,
+    # repeated once per photo. On a large account this dwarfed every other
+    # cost in this function. _shared_names_in_batch (added for bulk delete,
+    # see its docstring) answers the same question from the filename_owners
+    # index with one partition-scoped point query per name, run concurrently
+    # -- reusing it here instead of re-deriving the same fix twice.
+    filenames = {str(row.get('RowKey') or '') for row in metadata_rows if row.get('RowKey')}
+    shared_names = _shared_names_in_batch(filenames, library_id)
+
+    def _clean_one_photo(row: Dict) -> Tuple[int, int]:
         filename = str(row.get('RowKey') or '')
         if not filename:
-            continue
+            return (0, 0)
         _delete_upload_temp_files_for_filename(filename)
         # Drop this library's filename-ownership row regardless of the shared
         # check below -- it tracks "does THIS library have a row under this
@@ -7314,9 +7329,9 @@ def _execute_library_clean(library_id: str) -> Dict:
             except Exception:
                 pass
         anonymous_id = str(row.get('anonymousImageId') or '').strip()
-        if _is_filename_shared(filename, library_id):
+        if filename in shared_names:
             # Another library still references this content-addressed blob.
-            continue
+            return (0, 0)
         # Anonymized photos are stored under the anonymous UUID; delete that blob
         # (plus the original name as a safety net) and drop the name mapping.
         physical_name = anonymous_id or filename
@@ -7327,10 +7342,18 @@ def _execute_library_clean(library_id: str) -> Dict:
                 delete_image_name_mapping(library_id, anonymous_id)
             except Exception:
                 pass
-        if errors:
-            blob_errors += len(errors)
-        else:
-            blobs_deleted += 1
+        return (len(errors), 0) if errors else (0, 1)
+
+    blobs_deleted = 0
+    blob_errors = 0
+    if metadata_rows:
+        # Each photo's cleanup is independent, pure network I/O wait (temp
+        # files, a table delete, blob deletes) -- same reasoning as every
+        # other DELETE_IO_CONCURRENCY call site in the delete path.
+        with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+            for errors, deleted in executor.map(_clean_one_photo, metadata_rows):
+                blob_errors += errors
+                blobs_deleted += deleted
 
     for client in (metadata_table_client, face_table_client, person_table_client,
                    albums_table_client, merge_table_client, image_names_table_client,
@@ -7344,13 +7367,20 @@ def _execute_library_clean(library_id: str) -> Dict:
             # full rows just to read PartitionKey/RowKey materializes all of that
             # into memory at once and OOMs the worker (same bug class fixed for
             # list_merges).
-            for row in client.query_entities(f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey']):
-                try:
-                    client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
-                except Exception:
-                    pass
+            rows_to_delete = list(client.query_entities(f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey']))
         except Exception as exc:
             app.logger.warning('Library clean skipped a table for %s: %s', library_id, exc)
+            continue
+
+        def _delete_row(row: Dict, client=client) -> None:
+            try:
+                client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+            except Exception:
+                pass
+
+        if rows_to_delete:
+            with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+                list(executor.map(_delete_row, rows_to_delete))
 
     try:
         invalidate_image_names_cache(library_id)
