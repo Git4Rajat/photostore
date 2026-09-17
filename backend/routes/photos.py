@@ -829,11 +829,22 @@ def delete_multiple_photos():
     # --- Batch the expensive table/partition scans ONCE for the whole request.
     # The previous implementation ran several full scans PER file, which made
     # large deletions (hundreds of photos) take minutes. ---
-    try:
-        own_rows = list(app.metadata_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'")) if app.metadata_table_client else []
-    except Exception:
-        own_rows = []
-    own_rows_by_name = {str(row.get('RowKey') or ''): row for row in own_rows}
+    # This chunk only ever needs metadata for the <=100 filenames it was sent,
+    # never the whole account -- a per-name point-read (get_entity) is an O(1)
+    # lookup, unlike the full-partition scan this replaced. That scan pulled
+    # every row of the user's ENTIRE library (every field, no select=) on
+    # every single chunk; on a 36k+-photo account this alone measured 60-80s
+    # per chunk (see the sibling narrow-column fix on the gallery-load path,
+    # METADATA_SCAN_CACHE_TTL_SECONDS's comment in app.py), which is what
+    # actually made bulk deletes crawl and eventually 503. A cache wouldn't
+    # have helped here either: each chunk's deletions invalidate it via
+    # _invalidate_metadata_scan_cache below, so the very next chunk would
+    # still miss and pay the full scan again.
+    own_rows_by_name = {}
+    for safe_name in valid_names:
+        metadata = app._get_metadata_entity(user_id, safe_name)
+        if metadata is not None:
+            own_rows_by_name[safe_name] = metadata
 
     shared_names = app._shared_names_in_batch(names_set, user_id)
     temp_removed_names = app._batch_delete_upload_temp_files(names_set)
@@ -911,8 +922,20 @@ def delete_multiple_photos():
 
     # Strip references to any person that was emptied by this delete from the
     # photos that survive (their peopleIds may still name a now-deleted person).
+    # Unlike the per-file lookups above, this genuinely needs the *whole*
+    # library -- a stale peopleIds reference can be on any surviving photo,
+    # not just one in this chunk -- so it can't be a point-read. Scoped behind
+    # `deleted_person_ids` (only set when a person cluster was fully emptied,
+    # which is rare per chunk) and routed through the same cached scan the
+    # gallery-load endpoints use, rather than own_rows_by_name's per-chunk
+    # point-reads or a fresh raw partition scan.
     if deleted_person_ids and app.metadata_table_client is not None:
-        for name, row in own_rows_by_name.items():
+        try:
+            surviving_rows = app._cached_metadata_rows_for_user(user_id, purpose='photos.delete_person_cleanup')
+        except Exception:
+            surviving_rows = []
+        for row in surviving_rows:
+            name = str(row.get('RowKey') or '')
             if name in deleted_names_set:
                 continue
             try:
