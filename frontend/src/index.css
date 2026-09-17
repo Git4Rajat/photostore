@@ -318,6 +318,17 @@ html[data-theme='dark'] {
   }
 }
 
+html {
+  /* Reserves the scrollbar's width permanently so it appearing/disappearing
+     (as windowed grids' estimated content height crosses the viewport
+     threshold) never changes the page's available width. Without this, an
+     auto-fill grid track count can flip by one column each time the
+     scrollbar toggles, which toggles content height back, which toggles the
+     scrollbar again -- an oscillation useWindowedGrid's render-loop guard
+     has to bail out of (see its "re-triggered itself too many times" log). */
+  scrollbar-gutter: stable;
+}
+
 html,
 body,
 #root {
