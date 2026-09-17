@@ -515,8 +515,16 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // preview decodes (still in photos_bp) pushing close to 1Gi;
             // watch WorkingSetBytes after this ships and raise if it
             // recurs near the ceiling the way the pre-split backend did.
-            cpu: json('0.5')
-            memory: '1Gi'
+            //
+            // 2026-09-17 (same day): 0.5vCPU/1Gi/1-worker/2-thread was too
+            // small for real traffic -- live access-batch/processing-status
+            // calls were queueing past capacity and timing out into 502/503s
+            // within minutes of this shipping (RunningAtMaxScale at 5
+            // replicas, observed 30-115s response times). Raised to
+            // 1vCPU/2Gi (Container Apps requires memory to scale with CPU in
+            // lockstep -- 1.0 vCPU only pairs with 2Gi, not 1Gi).
+            cpu: json('1.0')
+            memory: '2Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
