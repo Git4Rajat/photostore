@@ -32,22 +32,26 @@ class FakeTable:
     def delete_entity(self, partition_key, row_key):
         self.rows.pop((partition_key, row_key), None)
 
-    def query_entities(self, filter_str):
+    def query_entities(self, filter_str, select=None):
         # Compound clause checked first -- the plain-PartitionKey pattern's
         # greedy '(.*)' would otherwise swallow " and field eq '...'" as part
         # of the partition key value itself.
         m = re.match(r"PartitionKey eq '(.*)' and (\w+) eq '(.*)'$", filter_str.strip())
         if m:
             pk, field, value = m.group(1), m.group(2), m.group(3)
-            return [
+            rows = [
                 dict(v) for (p, _), v in self.rows.items()
                 if p == pk and str(v.get(field, '')) == value
             ]
-        m = re.match(r"PartitionKey eq '(.*)'$", filter_str.strip())
-        if m:
+        else:
+            m = re.match(r"PartitionKey eq '(.*)'$", filter_str.strip())
+            if not m:
+                raise ValueError(f'Unsupported filter: {filter_str}')
             pk = m.group(1)
-            return [dict(v) for (p, _), v in self.rows.items() if p == pk]
-        raise ValueError(f'Unsupported filter: {filter_str}')
+            rows = [dict(v) for (p, _), v in self.rows.items() if p == pk]
+        if select:
+            rows = [{k: v[k] for k in select if k in v} for v in rows]
+        return rows
 
 
 def make_store():
