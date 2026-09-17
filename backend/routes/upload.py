@@ -12,6 +12,15 @@ import app
 
 upload_bp = Blueprint('upload', __name__)
 
+@upload_bp.route('/health', methods=['GET'])
+def health_check():
+    return app.jsonify({
+        'status': 'healthy',
+        'service': 'photo-store-upload',
+        'storage_account': app.account_name,
+        'uses_managed_identity': app.credential is not None,
+    })
+
 @upload_bp.route('/upload/init', methods=['POST'])
 @upload_bp.route('/upload/init/', methods=['POST'])
 @upload_bp.route('/api/upload/init', methods=['POST'])

@@ -74,7 +74,9 @@ def test_upload_role_serves_only_upload_routes():
     paths = _rule_paths_for_role('upload')
     non_static = {p for p in paths if not p.startswith('/static')}
     assert non_static  # non-empty
-    assert all(p.startswith(('/upload', '/api/upload', '/uploads', '/api/uploads')) for p in non_static)
+    assert '/health' in non_static  # own health route -- frontend's warm-up probe hits this origin directly
+    non_health = non_static - {'/health'}
+    assert all(p.startswith(('/upload', '/api/upload', '/uploads', '/api/uploads')) for p in non_health)
     assert '/api/upload/init' in non_static
 
 

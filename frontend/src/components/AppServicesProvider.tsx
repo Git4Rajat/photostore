@@ -535,6 +535,17 @@ export const getBrowserProcessingConcurrency = (): number => {
 const PENDING_PROCESSING_BATCH_SIZE = 40;
 
 const WARMUP_POLL_INTERVAL_MS = 5000;
+// Ceiling on how long the pre-picker upload warm-up (pollUntilWarm(warmUpload,
+// ...)) is allowed to keep retrying every WARMUP_POLL_INTERVAL_MS. A cancelled
+// native file picker never fires a reliable "cancelled" event in most
+// browsers, so there's no clean signal to stop on -- without a ceiling this
+// loop would ping /health forever after every single "Add" tap that doesn't
+// lead to an upload, for the rest of the tab session. 2 minutes comfortably
+// covers real picker dwell time (see MOBILE_SELECTION_TIP_STORAGE_KEY's own
+// "can take a couple of minutes to close" note) while still letting an idle
+// tab go quiet again well before BACKEND_KEEPALIVE_INTERVAL_MS-style always-on
+// billing becomes a concern.
+const UPLOAD_WARMUP_MAX_MS = 120000;
 // The shared HTTP client's own timeout is 600s (createHttpClient's default)
 // and a "no response" failure is retried up to COLD_START_RETRIES times with
 // backoff (httpClient.ts) -- fine for real work, but catastrophic for a
@@ -879,6 +890,26 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const warmUpload = useCallback(() => (
         getUpload('/health', { signal: AbortSignal.timeout(WARMUP_REQUEST_TIMEOUT_MS) }).then(() => undefined)
     ), []);
+    // Stops the pre-picker upload warm-up poll as soon as we know its outcome
+    // (files handed back, or the picker resolved with nothing) instead of
+    // waiting out the full UPLOAD_WARMUP_MAX_MS ceiling in the common case.
+    const stopUploadWarmup = useCallback(() => {
+        uploadWarmupStopRef.current = true;
+        if (uploadWarmupStopTimerRef.current !== null) {
+            window.clearTimeout(uploadWarmupStopTimerRef.current);
+            uploadWarmupStopTimerRef.current = null;
+        }
+    }, []);
+    const armUploadWarmupCeiling = useCallback(() => {
+        uploadWarmupStopRef.current = false;
+        if (uploadWarmupStopTimerRef.current !== null) {
+            window.clearTimeout(uploadWarmupStopTimerRef.current);
+        }
+        uploadWarmupStopTimerRef.current = window.setTimeout(() => {
+            uploadWarmupStopRef.current = true;
+            uploadWarmupStopTimerRef.current = null;
+        }, UPLOAD_WARMUP_MAX_MS);
+    }, []);
     const startBackendKeepalive = useCallback(() => {
         if (backendKeepaliveTimerRef.current !== null) {
             return;
@@ -1019,6 +1050,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const backendKeepaliveTimerRef = useRef<number | null>(null);
     const backendWarmupInFlightRef = useRef<boolean>(false);
     const uploadWarmupInFlightRef = useRef<boolean>(false);
+    const uploadWarmupStopRef = useRef<boolean>(false);
+    const uploadWarmupStopTimerRef = useRef<number | null>(null);
     // Last real (non-dedup-shortcircuited) health-probe RTT, from ANY caller
     // of warmEndpoint -- the pre-picker poll, the background keepalive, or
     // startUpload's own probe. Since warmBackend/warmUpload hit the same
@@ -3952,7 +3985,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // already warm) but still let the picker open so files from another
         // folder can be queued -- see startUpload's `uploading` branch.
         if (!uploading) {
-            void pollUntilWarm(warmUpload, uploadWarmupInFlightRef);
+            armUploadWarmupCeiling();
+            void pollUntilWarm(warmUpload, uploadWarmupInFlightRef, uploadWarmupStopRef);
         }
         // One-time, pre-picker warning for large libraries on constrained
         // devices. This fires before the native picker opens -- the one
@@ -3989,6 +4023,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (isFileSystemAccessSupported()) {
             void (async () => {
                 const picked = await pickUploadFilesViaFileSystemAccess();
+                stopUploadWarmup();
                 if (picked.length === 0) {
                     return;
                 }
@@ -3999,7 +4034,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         pickerOpenedAtRef.current = Date.now();
         uploadInputRef.current?.click();
-    }, [addNotification, pollUntilWarm, startUpload, uploading, warmUpload]);
+    }, [addNotification, armUploadWarmupCeiling, pollUntilWarm, startUpload, stopUploadWarmup, uploading, warmUpload]);
 
     const resumeAllPendingUploads = useCallback(async () => {
         await retryPersistedUploadSession();
@@ -4044,6 +4079,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [addNotification, startUpload, enqueueUploadFilesInBatches]);
 
     const handleUploadSelection = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+        stopUploadWarmup();
         const pickerOpenedAt = pickerOpenedAtRef.current;
         pickerOpenedAtRef.current = null;
         const pickerOpenDurationMs = pickerOpenedAt !== null ? Date.now() - pickerOpenedAt : null;
@@ -4192,6 +4228,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         retryPersistedUploadSession,
         setUploadError,
         startUploadInBatches,
+        stopUploadWarmup,
         uploading,
     ]);
 
