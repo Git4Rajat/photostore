@@ -2946,7 +2946,15 @@ def _count_processing_statuses(user_id: str, steps: List[str]) -> Dict[str, Dict
 # (Uses the same _UserScanCache as the person/face caches defined near
 # _init_storage_clients -- metadata writes go through many call sites rather
 # than a wrapped client, so this table still invalidates explicitly.)
-METADATA_SCAN_CACHE_TTL_SECONDS = float(os.getenv('METADATA_SCAN_CACHE_TTL_SECONDS', '20'))
+#
+# Must stay comfortably above the scan's own elapsed time or the cache can
+# never actually stay warm -- live 2026-09-16 on a 36,633-row account: even
+# the narrow-column scan below (PHOTO_LIST_SELECT_FIELDS) took 17-20s against
+# a 20s TTL, so entries were expiring before the next request could reuse
+# them, collapsing into the exact back-to-back full-partition-scan thrash
+# this cache exists to prevent. Same fix already applied once for ipwork's
+# people-scan cache (20s TTL < 77s/photo cadence -> 120s).
+METADATA_SCAN_CACHE_TTL_SECONDS = float(os.getenv('METADATA_SCAN_CACHE_TTL_SECONDS', '120'))
 _metadata_scan_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
 # /photos/filter's default sort order (rating/likes -> recency -> filename) never
 # depends on the request's minRating/minLikes/capture-range/location filter values
