@@ -59,4 +59,6 @@ exec gunicorn app:app \
     --max-requests-jitter "$MAX_REQUESTS_JITTER" \
     --timeout 600 \
     --graceful-timeout 60 \
-    --keep-alive 30
+    --keep-alive 30 \
+    --access-logfile - \
+    --access-logformat '%(t)s %(h)s "%(r)s" %(s)s "%(a)s"'
