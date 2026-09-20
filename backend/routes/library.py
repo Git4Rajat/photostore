@@ -308,15 +308,14 @@ def library_download_request():
 
 @library_bp.route('/api/library/download/status', methods=['GET'])
 def library_download_status():
-    _account_id, _library_id, error = app._require_library_context(require_auth=True)
+    _account_id, library_id, error = app._require_library_context(require_auth=True)
     if error:
         return error
     job_id = str(app.request.args.get('jobId', '') or '')
-    if not job_id or app.metadata_table_client is None:
+    if not job_id:
         return app.jsonify({'status': 'unknown'})
-    try:
-        row = app.metadata_table_client.get_entity(partition_key='jobs', row_key=app._job_row_key(job_id))
-    except Exception:
+    row = app._get_job_row(library_id, job_id)
+    if row is None:
         return app.jsonify({'status': 'unknown'})
     result = row.get('result')
     if isinstance(result, str):
@@ -502,11 +501,10 @@ def library_clean_status():
     if error:
         return error
     job_id = str(app.request.args.get('jobId', '') or '')
-    if not job_id or app.metadata_table_client is None:
+    if not job_id:
         return app.jsonify({'status': 'unknown'})
-    try:
-        row = app.metadata_table_client.get_entity(partition_key='jobs', row_key=app._job_row_key(job_id))
-    except Exception:
+    row = app._get_job_row(_library_id, job_id)
+    if row is None:
         stale_reason = app._reconcile_stale_library_cleanup(_library_id, job_id=job_id)
         if stale_reason:
             return app.jsonify({'status': 'failed', 'error': stale_reason})

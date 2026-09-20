@@ -30,7 +30,7 @@ class _FakeQueueMessage:
 @pytest.fixture(autouse=True)
 def metadata_table(monkeypatch):
     table = FakeTable()
-    monkeypatch.setattr(app, 'metadata_table_client', table)
+    monkeypatch.setattr(app, 'jobs_table_client', table)
     return table
 
 
@@ -54,7 +54,7 @@ def test_exceeding_max_retries_skips_dispatch_and_marks_job_failed(metadata_tabl
 
     assert outcome == 'done'
     assert dispatch_spy == []  # never reached the real pipeline
-    row = metadata_table.get_entity('jobs', app._job_row_key('ipwork:u1:f1'))
+    row = metadata_table.get_entity('u1', 'ipwork:u1:f1')
     assert row['status'] == 'failed'
     assert 'retries' in row['error'].lower()
 
@@ -104,7 +104,7 @@ def test_dispatch_exception_returns_error_not_done(metadata_table, monkeypatch):
     outcome = app._process_ipwork_message(message)
 
     assert outcome == 'error'
-    row = metadata_table.get_entity('jobs', app._job_row_key('ipwork:u1:f1'))
+    row = metadata_table.get_entity('u1', 'ipwork:u1:f1')
     assert row['status'] == 'failed'
     # The raw exception text is logged server-side, not stored on the job row
     # (that row's 'error' field is read back by /api/jobs/status).

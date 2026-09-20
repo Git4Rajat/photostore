@@ -6,6 +6,8 @@ as app.<name> throughout, matching the exact late-binding lookup semantics
 the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
+from concurrent.futures import ThreadPoolExecutor
+
 from flask import Blueprint
 
 import app
@@ -222,10 +224,22 @@ def get_person(person_id: str):
     except Exception:
         face_ids = []
 
-    faces = []
-    for fid in face_ids:
+    def _fetch_face(fid):
         try:
-            face = app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
+            return fid, app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
+        except Exception:
+            return fid, None
+
+    faces = []
+    # Independent point-reads, dominated by network I/O -- run them concurrently
+    # rather than one face at a time (same pattern as routes/photos.py's
+    # per-chunk metadata prefetch, via app.DELETE_IO_CONCURRENCY).
+    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
+        fetched = list(executor.map(_fetch_face, face_ids))
+    for fid, face in fetched:
+        if face is None:
+            continue
+        try:
             if app._face_is_rejected(face) or not app._face_is_owned_by_person(face, person_id):
                 continue
             faces.append({
@@ -597,15 +611,26 @@ def accept_suggested_faces(person_id: str):
     except Exception:
         return app.jsonify({'error': 'person not found'}), 404
 
+    cleaned_ids = [str(raw_face_id or '').strip() for raw_face_id in face_ids]
+    cleaned_ids = [fid for fid in cleaned_ids if fid]
+
+    def _fetch_face(fid):
+        try:
+            return fid, app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
+        except Exception:
+            return fid, None
+
+    # Prefetch the reads concurrently (independent point-reads, I/O-bound); the
+    # mutations below stay sequential since they touch shared per-person state
+    # (_remove_face_from_person/_add_face_to_person) and must not race.
+    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
+        fetched_faces = dict(executor.map(_fetch_face, cleaned_ids))
+
     accepted = []
     affected_files = set()
-    for raw_face_id in face_ids:
-        face_id = str(raw_face_id or '').strip()
-        if not face_id:
-            continue
-        try:
-            face = app.face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-        except Exception:
+    for face_id in cleaned_ids:
+        face = fetched_faces.get(face_id)
+        if face is None:
             continue
         old_person_id = str(face.get('personId') or '')
         if old_person_id and old_person_id != person_id:
@@ -822,8 +847,15 @@ def undo_merge(merge_id: str):
     except Exception:
         return app.jsonify({'error': 'merge not found'}), 404
 
+    blob_name = str(merge_entry.get('payloadBlobName') or '')
     try:
-        payload = app.json.loads(merge_entry.get('payload', '{}'))
+        if blob_name:
+            payload_bytes = app.download_file_from_blob(app.BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
+            payload = app.json.loads(payload_bytes)
+        else:
+            # Legacy rows written before payload moved to Blob Storage still
+            # carry the full snapshot inline.
+            payload = app.json.loads(merge_entry.get('payload', '{}'))
     except Exception:
         return app.jsonify({'error': 'invalid merge payload'}), 500
 
@@ -885,6 +917,8 @@ def undo_merge(merge_id: str):
         app.merge_table_client.delete_entity(partition_key=user_id, row_key=merge_id)
     except Exception:
         pass
+    if blob_name:
+        app._delete_blob_if_present(app.BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
 
     return app.jsonify({'success': True, 'mergeId': merge_id})
 

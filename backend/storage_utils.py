@@ -2231,7 +2231,7 @@ def detect_duplicates(user_id: str, file_hash: str, perceptual_hash: Optional[st
             # No hash index configured (e.g. older deploy) -- fall back to the
             # original partition scan so dedup still works, just not O(1).
             query = f"PartitionKey eq '{_escape_odata(user_id)}' and fileHash eq '{_escape_odata(file_hash)}'"
-            exact_matches = list(metadata_table_client.query_entities(query))
+            exact_matches = list(metadata_table_client.query_entities(query, select=['PartitionKey', 'RowKey']))
             if exact_matches:
                 matched_filename = str(exact_matches[0]['RowKey'])
 
@@ -2245,7 +2245,9 @@ def detect_duplicates(user_id: str, file_hash: str, perceptual_hash: Optional[st
         # Only perform perceptual hash matching if explicitly provided
         if perceptual_hash:
             query = f"PartitionKey eq '{user_id}'"
-            all_photos = list(metadata_table_client.query_entities(query))
+            all_photos = list(metadata_table_client.query_entities(
+                query, select=['PartitionKey', 'RowKey', 'perceptualHash'],
+            ))
             for photo in all_photos:
                 other_phash = photo.get('perceptualHash', '')
                 if other_phash and other_phash != perceptual_hash:

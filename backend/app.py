@@ -72,6 +72,7 @@ from storage_utils import (
     apply_client_processing_results_for_file,
     download_media_bytes,
     upload_file_to_blob,
+    download_file_from_blob,
     finalize_uploaded_file,
     get_media_properties,
     claim_processing_lease,
@@ -351,9 +352,21 @@ IMAGE_CONTAINER = os.getenv('IMAGE_CONTAINER', 'images')
 THUMBNAIL_CONTAINER = os.getenv('THUMBNAIL_CONTAINER', 'thumbnails')
 METADATA_TABLE = os.getenv('METADATA_TABLE', 'photometadata')
 ALBUMS_TABLE = os.getenv('ALBUMS_TABLE', 'photoalbums')
+# Public-share-link index: PartitionKey=publicToken, RowKey='owner' -> (userId,
+# albumId), so a public share view is an O(1) point read instead of an
+# unscoped `publicToken eq '...'` scan of every account's albums.
+ALBUM_TOKEN_INDEX_TABLE = os.getenv('ALBUM_TOKEN_INDEX_TABLE', 'photoalbumtokens')
 PEOPLE_TABLE = os.getenv('PEOPLE_TABLE', 'photopeople')
 FACE_TABLE = os.getenv('FACE_TABLE', 'photofaces')
 MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
+# Job status/progress rows: PartitionKey=userId (or libraryId for
+# library_clean/library_download, which any member of a shared library must
+# be able to check regardless of who started the job), RowKey=jobId. Used to
+# live as PartitionKey='jobs' inside METADATA_TABLE -- one shared partition
+# across every user, which forced every "is there an active job" check to
+# scan and Python-filter the whole thing (213k+ rows, 17-33s/call). See
+# _upsert_job_status.
+JOBS_TABLE = os.getenv('JOBS_TABLE', 'photojobs')
 # One row per user-triggered Workbench processing run (action, steps, scope,
 # filename count/list, timestamp) -- durable history, modeled on MERGE_TABLE.
 WORKBENCH_ACTIONS_TABLE = os.getenv('WORKBENCH_ACTIONS_TABLE', 'workbenchactions')
@@ -416,6 +429,11 @@ BLOB_COVER_CONTAINER = os.getenv('BLOB_COVER_CONTAINER', 'covers').strip()
 # the current run's parts per library (stale extra parts from a shrinking
 # export are swept by _cleanup_stale_library_export_parts).
 BLOB_EXPORTS_CONTAINER = os.getenv('BLOB_EXPORTS_CONTAINER', 'library-exports').strip()
+# Person-merge undo payloads (base + merged person snapshots, faceMap): these
+# can run large enough to threaten Table Storage's 64KB-per-property /
+# 1MB-per-entity caps, so they live here instead of inline on the
+# personmerges row -- see _write_merge_record.
+BLOB_MERGE_PAYLOADS_CONTAINER = os.getenv('BLOB_MERGE_PAYLOADS_CONTAINER', 'merge-payloads').strip()
 # Each export "part" ZIP is capped at roughly this many bytes (measured from
 # each photo's actual downloaded size as it's added) before it's closed and
 # uploaded and a new part is started. Keeps very large libraries from
@@ -858,6 +876,8 @@ albums_table_client = None
 face_table_client = None
 person_table_client = None
 merge_table_client = None
+jobs_table_client = None
+album_token_index_table_client = None
 workbench_actions_table_client = None
 image_names_table_client = None
 hash_index_table_client = None
@@ -1099,6 +1119,8 @@ def _init_storage_clients():
     global account_name, credential
     global metadata_table_client
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
+    global album_token_index_table_client
+    global jobs_table_client
     global workbench_actions_table_client
     global image_names_table_client
     global hash_index_table_client, filename_owners_table_client
@@ -1114,9 +1136,11 @@ def _init_storage_clients():
         tbl_svc = TableServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         metadata_table_client_local = tbl_svc.get_table_client(METADATA_TABLE)
         albums_table_client_local = tbl_svc.get_table_client(ALBUMS_TABLE)
+        album_token_index_table_client_local = tbl_svc.get_table_client(ALBUM_TOKEN_INDEX_TABLE)
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
+        jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
@@ -1169,9 +1193,11 @@ def _init_storage_clients():
         )
         metadata_table_client_local = tbl_svc.get_table_client(METADATA_TABLE)
         albums_table_client_local = tbl_svc.get_table_client(ALBUMS_TABLE)
+        album_token_index_table_client_local = tbl_svc.get_table_client(ALBUM_TOKEN_INDEX_TABLE)
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
+        jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
@@ -1189,11 +1215,13 @@ def _init_storage_clients():
     config_table_client = config_table_client_local
     blob_service_client = blob_service_client_local
     albums_table_client = albums_table_client_local
+    album_token_index_table_client = album_token_index_table_client_local
     # Wrap so every write (from anywhere in app.py or storage_utils.py) auto-invalidates
     # the people/faces scan cache -- see _InvalidatingTableClient.
     face_table_client = _InvalidatingTableClient(face_table_client_local, _invalidate_people_scan_cache)
     person_table_client = _InvalidatingTableClient(person_table_client_local, _invalidate_people_scan_cache)
     merge_table_client = merge_table_client_local
+    jobs_table_client = jobs_table_client_local
     workbench_actions_table_client = workbench_actions_table_client_local
     image_names_table_client = image_names_table_client_local
     hash_index_table_client = hash_index_table_client_local
@@ -1315,6 +1343,14 @@ def create_albums_table() -> None:
         pass
 
 
+def create_album_token_index_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=ALBUM_TOKEN_INDEX_TABLE)
+    except AzureError:
+        pass
+
+
 def create_face_table() -> None:
     try:
         svc = _ensure_table_service_client()
@@ -1335,6 +1371,14 @@ def create_merge_table() -> None:
     try:
         svc = _ensure_table_service_client()
         svc.create_table_if_not_exists(table_name=MERGE_TABLE)
+    except AzureError:
+        pass
+
+
+def create_jobs_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=JOBS_TABLE)
     except AzureError:
         pass
 
@@ -1374,7 +1418,7 @@ def create_filename_owners_table() -> None:
 def create_blob_containers() -> None:
     if blob_service_client is None:
         return
-    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER):
+    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER, BLOB_MERGE_PAYLOADS_CONTAINER):
         if not container_name:
             continue
         try:
@@ -2295,16 +2339,39 @@ def _is_stale_running_processing(entity: Dict, step: str) -> bool:
     return (datetime.now(timezone.utc) - started_at).total_seconds() >= PROCESSING_STUCK_SECONDS
 
 
+# Legacy RowKey shape for the old shared 'jobs' partition in METADATA_TABLE
+# (see _upsert_job_status's fallback-read note below). New rows in
+# JOBS_TABLE key by the raw job_id instead -- it only ever contains
+# `[prefix]:[id]:[hex]`, all valid Table Storage RowKey characters, so this
+# sanitize-through-secure_filename round-trip (which silently turned ':'
+# into '_') is no longer needed.
 def _job_row_key(job_id: str) -> str:
     return secure_filename(job_id) or str(uuid.uuid4())
 
 
+_LIBRARY_SCOPED_JOB_TYPES = ('library_clean', 'library_download')
+
+
+def _job_partition_key(user_id: str, job_type: str, fields: Dict) -> str:
+    """Jobs are partitioned by their natural scope so an "is there an active
+    job" check is a cheap single-partition query instead of a fleet-wide scan:
+    userId for personal jobs, libraryId for library_clean/library_download
+    since any member of a shared library must be able to check those
+    regardless of who started the job (see _active_library_cleanup_job)."""
+    if job_type in _LIBRARY_SCOPED_JOB_TYPES:
+        library_id = fields.get('libraryId')
+        if library_id:
+            return str(library_id)
+    return user_id
+
+
 def _upsert_job_status(job_id: str, user_id: str, job_type: str, status: str, **fields) -> None:
-    if metadata_table_client is None:
+    if jobs_table_client is None:
         return
+    partition_key = _job_partition_key(user_id, job_type, fields)
     entity = {
-        'PartitionKey': 'jobs',
-        'RowKey': _job_row_key(job_id),
+        'PartitionKey': partition_key,
+        'RowKey': job_id,
         'jobId': job_id,
         'userId': user_id,
         'jobType': job_type,
@@ -2315,9 +2382,44 @@ def _upsert_job_status(job_id: str, user_id: str, job_type: str, status: str, **
         if value is not None:
             entity[key] = json.dumps(value, separators=(',', ':')) if isinstance(value, (dict, list)) else value
     try:
-        metadata_table_client.upsert_entity(entity)
+        jobs_table_client.upsert_entity(entity)
     except Exception:
-        pass
+        return
+    if partition_key != user_id:
+        # jobs_status() (the notification-bell poller) only ever queries the
+        # caller's own userId partition. library_clean/library_download jobs
+        # are authoritatively keyed by libraryId instead (so any member of a
+        # shared library can see an in-progress cleanup, not just whoever
+        # started it) -- mirror the same row under the initiator's userId
+        # partition too, purely so their own bell/toast still sees it. Same
+        # hand-rolled-secondary-index shape as _store_hash_index/
+        # _store_filename_owner.
+        try:
+            jobs_table_client.upsert_entity({**entity, 'PartitionKey': user_id})
+        except Exception:
+            pass
+
+
+def _get_job_row(partition_key: str, job_id: str) -> Optional[Dict]:
+    """Point-read a job row by its scope (userId or libraryId) and jobId.
+
+    Falls back to the old shared 'jobs' partition in METADATA_TABLE if not
+    found in JOBS_TABLE, so a job that was already fully terminal (and thus
+    never wrote another update) at the moment JOBS_TABLE went live is still
+    findable for a bridging period. TODO(remove ~2 weeks after this ships):
+    every legitimate job will have cycled through the new table by then.
+    """
+    if jobs_table_client is not None:
+        try:
+            return jobs_table_client.get_entity(partition_key=partition_key, row_key=job_id)
+        except Exception:
+            pass
+    if metadata_table_client is not None:
+        try:
+            return metadata_table_client.get_entity(partition_key='jobs', row_key=_job_row_key(job_id))
+        except Exception:
+            pass
+    return None
 
 
 # How far back the /api/jobs/status endpoint looks for finished jobs. In-flight
@@ -2509,37 +2611,22 @@ CLUSTERING_ACTIVE_JOB_STALE_MINUTES = int(os.getenv('CLUSTERING_ACTIVE_JOB_STALE
 # heartbeat, _live_progress_heartbeat).
 CLUSTERING_JOB_HEARTBEAT_SECONDS = int(os.getenv('CLUSTERING_JOB_HEARTBEAT_SECONDS', '120'))
 
-# _has_active_clustering_job's query_entities("PartitionKey eq 'jobs'") is an
-# unfiltered scan of the SAME 'jobs' partition _active_library_cleanup_job
-# was found scanning on every upload request (213k+ rows and growing,
-# confirmed live to cost 17-33s/call -- see that fix's own comments). This
-# one is called far less often (gated behind _clustering_maintenance_due's
-# 30-minute cooldown, not every request) but hits the identical partition,
-# and that cooldown is a read-then-write race with no etag/CAS (see its own
-# docstring) -- every concurrent upload request in flight at the moment the
-# cooldown lapses can independently pay the full scan. Cached with a
-# constant key (not per-user): the query itself isn't scoped by user_id --
-# it fetches the whole partition and filters client-side -- so one scan
-# genuinely serves every user's check within the TTL window, the same way
-# _face_summary_scan_cache serves every caller of _load_user_face_summary_by_id.
-_JOBS_PARTITION_SCAN_CACHE_KEY = '__all_jobs__'
-_jobs_partition_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
-
-
+# _has_active_clustering_job used to run query_entities("PartitionKey eq
+# 'jobs'") -- an unfiltered scan of the SAME shared 'jobs' partition
+# _active_library_cleanup_job was found scanning on every upload request
+# (213k+ rows and growing, confirmed live to cost 17-33s/call -- see that
+# fix's own comments). Jobs now live in their own JOBS_TABLE partitioned by
+# userId (or libraryId for library_clean/library_download -- see
+# _job_partition_key), so this is a normal scoped partition query instead.
 def _has_active_clustering_job(user_id: str) -> Optional[str]:
-    if metadata_table_client is None:
+    if jobs_table_client is None:
         return None
     try:
-        rows = _jobs_partition_scan_cache.get(
-            _JOBS_PARTITION_SCAN_CACHE_KEY,
-            lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
-        )
+        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         return None
     stale_before = datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)
     for row in rows:
-        if str(row.get('userId') or '') != user_id:
-            continue
         # Job rows store the coarse category (see _upsert_job_status), so every
         # people_cluster/people_recluster/people_propagate job is written with
         # jobType='clustering'. Comparing against the fine-grained message types
@@ -2559,7 +2646,7 @@ def _has_active_clustering_job(user_id: str) -> Optional[str]:
     return None
 
 
-def _mark_clustering_job_rerun_requested(job_id: str) -> None:
+def _mark_clustering_job_rerun_requested(job_id: str, user_id: str) -> None:
     """Flag an in-flight clustering job so the worker fires exactly one
     follow-up job once it finishes, instead of the caller enqueueing its own.
 
@@ -2567,12 +2654,12 @@ def _mark_clustering_job_rerun_requested(job_id: str) -> None:
     upload finishing face detection) into a single clustering pass — and a
     single completion notification — rather than one job per photo.
     """
-    if metadata_table_client is None:
+    if jobs_table_client is None:
         return
     try:
-        metadata_table_client.upsert_entity({
-            'PartitionKey': 'jobs',
-            'RowKey': _job_row_key(job_id),
+        jobs_table_client.upsert_entity({
+            'PartitionKey': user_id,
+            'RowKey': job_id,
             'rerunRequested': True,
         })
     except Exception:
@@ -2714,7 +2801,7 @@ def _enqueue_clustering_job(
         existing_job_id = _has_active_clustering_job(user_id)
         if existing_job_id:
             if coalesce_on_conflict:
-                _mark_clustering_job_rerun_requested(existing_job_id)
+                _mark_clustering_job_rerun_requested(existing_job_id, user_id)
                 return {'status': 'coalesced', 'jobId': existing_job_id}
             return {'status': 'already_queued', 'jobId': existing_job_id}
     job_id = f"cluster:{user_id}:{uuid.uuid4().hex}"
@@ -4220,10 +4307,14 @@ def _remove_faces_for_filename(user_id: str, filename: str) -> None:
 
 
 def _remove_job_rows_for_filename(user_id: str, filename: str) -> int:
-    if metadata_table_client is None or not filename:
+    # Per-file jobs (preview, ipwork, clustering) are all userId-partitioned
+    # (see _job_partition_key) -- library-scoped job types (library_clean/
+    # library_download) never correlate to an individual filename, so scoping
+    # this to the user's own partition covers every realistic match.
+    if jobs_table_client is None or not filename:
         return 0
     try:
-        rows = list(metadata_table_client.query_entities("PartitionKey eq 'jobs'"))
+        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         rows = []
 
@@ -4239,16 +4330,15 @@ def _remove_job_rows_for_filename(user_id: str, filename: str) -> int:
         row_key = str(row.get('RowKey') or '')
         job_id = str(row.get('jobId') or '')
         row_filename = str(row.get('filename') or '')
-        row_user_id = str(row.get('userId') or '')
         correlation_id = str(row.get('correlationId') or '')
         if not (
-            (row_filename == filename and (not row_user_id or row_user_id == user_id))
-            or (filename == correlation_id and (not row_user_id or row_user_id == user_id))
+            row_filename == filename
+            or filename == correlation_id
             or any(token and (job_id.startswith(token) or row_key.startswith(token) or correlation_id.startswith(token)) for token in job_prefixes)
         ):
             continue
         try:
-            metadata_table_client.delete_entity(partition_key='jobs', row_key=row_key)
+            jobs_table_client.delete_entity(partition_key=user_id, row_key=row_key)
             removed += 1
         except Exception:
             pass
@@ -6693,6 +6783,32 @@ def _save_album_entity(entity: Dict) -> None:
     albums_table_client.upsert_entity(entity)
 
 
+def _store_album_token_index(token: str, user_id: str, album_id: str) -> None:
+    """Record token -> (userId, albumId) so a public share view is an O(1)
+    point read instead of an unscoped `publicToken eq '...'` scan of every
+    account's albums."""
+    if album_token_index_table_client is None or not token:
+        return
+    try:
+        album_token_index_table_client.upsert_entity({
+            'PartitionKey': token,
+            'RowKey': 'owner',
+            'userId': user_id,
+            'albumId': album_id,
+        })
+    except Exception:
+        pass
+
+
+def _delete_album_token_index(token: str) -> None:
+    if album_token_index_table_client is None or not token:
+        return
+    try:
+        album_token_index_table_client.delete_entity(partition_key=token, row_key='owner')
+    except Exception:
+        pass
+
+
 SMART_ALBUM_RULES = {
     'location': 'location',
     'by_location': 'location',
@@ -6895,6 +7011,23 @@ def _render_public_album_share_page(meta: Dict[str, str], redirect_url: str) -> 
 def _find_public_album_by_token(token: str) -> Optional[Dict]:
     if not albums_table_client or not token:
         return None
+    index_row = None
+    if album_token_index_table_client is not None:
+        try:
+            index_row = album_token_index_table_client.get_entity(partition_key=token, row_key='owner')
+        except Exception:
+            index_row = None
+    if index_row is not None:
+        entity = _load_album_entity(str(index_row.get('userId') or ''), str(index_row.get('albumId') or ''))
+        if entity is not None and str(entity.get('publicToken') or '') == token:
+            return entity
+        # Stale index row: the album was deleted, un-shared, or re-shared with a
+        # new token since this row was written. Self-heal instead of trusting it
+        # forever, then fall through to the scan below in case the token is
+        # actually valid but predates this index (pre-backfill).
+        _delete_album_token_index(token)
+    # Fallback: unscoped scan, for tokens created before this index existed and
+    # not yet covered by the backfill script.
     safe = _escape_odata(token)
     try:
         rows = list(albums_table_client.query_entities(f"publicToken eq '{safe}'"))
@@ -6902,7 +7035,9 @@ def _find_public_album_by_token(token: str) -> Optional[Dict]:
         rows = []
     if not rows:
         return None
-    return rows[0]
+    row = rows[0]
+    _store_album_token_index(token, str(row.get('PartitionKey') or ''), str(row.get('RowKey') or ''))
+    return row
 
 
 def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = None) -> Dict[str, str]:
@@ -7164,15 +7299,16 @@ def _reconcile_stale_library_cleanup(library_id: str, *, job_id: str = '', job_r
 def _active_library_cleanup_job(library_id: str) -> Optional[Dict]:
     """Return the active queued/running cleanup job row for a library, if any.
 
-    Matches both current rows (explicit ``libraryId``) and legacy rows by
-    ``jobId`` prefix to support libraries created before cleanup-state tracking
-    was added.
+    library_clean jobs are partitioned by libraryId (see _job_partition_key)
+    rather than the initiating user's userId, since any member of a shared
+    library must be able to check this regardless of who started the job --
+    so this is a scoped partition query, not a fleet-wide scan.
     """
-    if metadata_table_client is None or not library_id:
+    if jobs_table_client is None or not library_id:
         return None
     safe_library_id = str(library_id)
     try:
-        rows = list(metadata_table_client.query_entities("PartitionKey eq 'jobs'"))
+        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(safe_library_id)}'"))
     except Exception:
         return None
     for row in rows:
@@ -7180,10 +7316,7 @@ def _active_library_cleanup_job(library_id: str) -> Optional[Dict]:
             continue
         if str(row.get('status') or '').lower() not in {'queued', 'running'}:
             continue
-        row_library_id = str(row.get('libraryId') or '')
-        row_job_id = str(row.get('jobId') or '')
-        if row_library_id == safe_library_id or row_job_id.startswith(f'libclean:{safe_library_id}:'):
-            return row
+        return row
     return None
 
 
@@ -7199,14 +7332,13 @@ def _reconcile_in_progress_from_job_row(library_id: str, meta: Dict) -> bool:
     This closes the window where a worker's terminal write lost a race with a
     stale in-progress write and left uploads blocked until the 4h timeout.
     """
-    if library_store is None or metadata_table_client is None:
+    if library_store is None:
         return False
     job_id = str((meta or {}).get('lastCleanupJobId') or '')
     if not job_id:
         return False
-    try:
-        row = metadata_table_client.get_entity(partition_key='jobs', row_key=_job_row_key(job_id))
-    except Exception:
+    row = _get_job_row(library_id, job_id)
+    if row is None:
         return False
     status = str(row.get('status') or '').lower()
     if status == 'done':
@@ -7323,7 +7455,12 @@ def _execute_library_clean(library_id: str) -> Dict:
     "don't do full scans inline" rule."""
     pk = _escape_odata(library_id)
     try:
-        metadata_rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{pk}'")) if metadata_table_client else []
+        # _clean_one_photo below only reads RowKey/anonymousImageId per row --
+        # narrow select= avoids pulling every photo's full metadata (tags,
+        # embeddings, OCR text, etc.) just to delete it.
+        metadata_rows = list(metadata_table_client.query_entities(
+            f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey', 'anonymousImageId'],
+        )) if metadata_table_client else []
     except Exception:
         metadata_rows = []
 
@@ -7384,19 +7521,27 @@ def _execute_library_clean(library_id: str) -> Dict:
                    hash_index_table_client):
         if client is None:
             continue
+        # select=[keys only] (+payloadBlobName for merges): merge_table_client's
+        # partition can hold tens of thousands of face_membership_snapshot_chunk
+        # rows carrying a ~24KB `payload` blob each (see
+        # _create_people_repair_snapshot). Fetching full rows just to read
+        # PartitionKey/RowKey materializes all of that into memory at once and
+        # OOMs the worker (same bug class fixed for list_merges) -- adding the
+        # small payloadBlobName string doesn't reintroduce that risk.
+        select_fields = ['PartitionKey', 'RowKey']
+        if client is merge_table_client:
+            select_fields.append('payloadBlobName')
         try:
-            # select=[keys only]: merge_table_client's partition can hold tens of
-            # thousands of face_membership_snapshot_chunk rows carrying a ~24KB
-            # `payload` blob each (see _create_people_repair_snapshot). Fetching
-            # full rows just to read PartitionKey/RowKey materializes all of that
-            # into memory at once and OOMs the worker (same bug class fixed for
-            # list_merges).
-            rows_to_delete = list(client.query_entities(f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey']))
+            rows_to_delete = list(client.query_entities(f"PartitionKey eq '{pk}'", select=select_fields))
         except Exception as exc:
             app.logger.warning('Library clean skipped a table for %s: %s', library_id, exc)
             continue
 
         def _delete_row(row: Dict, client=client) -> None:
+            if client is merge_table_client:
+                blob_name = str(row.get('payloadBlobName') or '')
+                if blob_name:
+                    _delete_blob_if_present(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
             try:
                 client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
             except Exception:
@@ -7541,18 +7686,19 @@ def _execute_library_download(library_id: str, library_name: str, job_id: Option
     skipped_count = 0
     part_index = 0
     parts_summary: List[Dict] = []
-    if job_id and metadata_table_client is not None:
-        try:
-            prior_row = metadata_table_client.get_entity(partition_key='jobs', row_key=_job_row_key(job_id))
-            rows_processed = max(0, min(int(prior_row.get('exportRowsProcessed') or 0), photos_total))
-            written_count = int(prior_row.get('exportPhotosWritten') or 0)
-            skipped_count = int(prior_row.get('exportPhotosSkipped') or 0)
-            part_index = int(prior_row.get('exportPartsCompleted') or 0)
-            raw_summary = prior_row.get('exportPartsSummary')
-            if isinstance(raw_summary, str) and raw_summary:
-                parts_summary = json.loads(raw_summary)
-        except Exception:
-            rows_processed, written_count, skipped_count, part_index, parts_summary = 0, 0, 0, 0, []
+    if job_id:
+        prior_row = _get_job_row(library_id, job_id)
+        if prior_row is not None:
+            try:
+                rows_processed = max(0, min(int(prior_row.get('exportRowsProcessed') or 0), photos_total))
+                written_count = int(prior_row.get('exportPhotosWritten') or 0)
+                skipped_count = int(prior_row.get('exportPhotosSkipped') or 0)
+                part_index = int(prior_row.get('exportPartsCompleted') or 0)
+                raw_summary = prior_row.get('exportPartsSummary')
+                if isinstance(raw_summary, str) and raw_summary:
+                    parts_summary = json.loads(raw_summary)
+            except Exception:
+                rows_processed, written_count, skipped_count, part_index, parts_summary = 0, 0, 0, 0, []
 
     def _durable_checkpoint() -> None:
         # Only called right after a part's ZIP has actually been uploaded --
@@ -7737,26 +7883,19 @@ def _execute_library_download(library_id: str, library_name: str, job_id: Option
 
 def _has_active_library_download_job(library_id: str) -> Optional[str]:
     """Return the jobId of an in-flight 'library_download' job for this
-    library, if any -- de-dupes button-mash/multi-tab clicks. Reuses the
-    already-cached whole-'jobs'-partition scan (_jobs_partition_scan_cache)
-    rather than issuing a fresh query_entities("PartitionKey eq 'jobs'") --
-    see _has_active_clustering_job, whose identical scan was the target of
-    three recent fixes (fa03bc9, e1114b7, 4b325c4) for exactly this class of
-    unscoped, per-request 'jobs'-partition read."""
-    if metadata_table_client is None:
+    library, if any -- de-dupes button-mash/multi-tab clicks. library_download
+    jobs are partitioned by libraryId (see _job_partition_key), so this is a
+    scoped partition query instead of the fleet-wide 'jobs'-partition scan
+    this used to share with _has_active_clustering_job."""
+    if jobs_table_client is None:
         return None
     try:
-        rows = _jobs_partition_scan_cache.get(
-            _JOBS_PARTITION_SCAN_CACHE_KEY,
-            lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
-        )
+        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(library_id)}'"))
     except Exception:
         return None
     stale_before = datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)
     for row in rows:
         if str(row.get('jobType') or '') != 'library_download':
-            continue
-        if str(row.get('libraryId') or '') != library_id:
             continue
         if str(row.get('status') or '').lower() not in {'queued', 'running'}:
             continue
@@ -7796,11 +7935,6 @@ def _enqueue_library_download_job(library_id: str, actor_user_id: str, library_n
         _upsert_job_status(job_id, actor_user_id, 'library_download', 'failed', error='Failed to queue download job', libraryId=library_id)
         return {'status': 'failed', 'jobId': job_id}
     _upsert_job_status(job_id, actor_user_id, 'library_download', 'queued', libraryId=library_id)
-    # _has_active_library_download_job reads the same cached partition scan
-    # jobs_status() uses; without invalidating here, a second click within the
-    # cache TTL (the exact case this de-dupe exists for) would still see the
-    # pre-enqueue snapshot and queue a duplicate export job.
-    _jobs_partition_scan_cache.invalidate(_JOBS_PARTITION_SCAN_CACHE_KEY)
     return {'status': 'queued', 'jobId': job_id}
 
 
@@ -7932,24 +8066,18 @@ def _stream_cached_preview(filename: str, *, cache_control: str, blob_name: Opti
 
 def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
     """Called on every proxy_preview cache-miss (i.e. every first view of a
-    RAW/CR3 or other backend-preview-required file) -- unlike the
-    once-per-upload or once-per-delete call sites of this same 'jobs'
-    partition scan, this one is a hot, user-facing read path, so it reuses
-    _jobs_partition_scan_cache like _has_active_clustering_job and
-    _has_active_library_download_job do instead of re-scanning the whole
-    (213k+ row and growing) partition on every call."""
-    if metadata_table_client is None:
+    RAW/CR3 or other backend-preview-required file) -- a hot, user-facing read
+    path. media_preview jobs are partitioned by userId (see
+    _job_partition_key), so this is a scoped partition query instead of the
+    (213k+ row and growing) fleet-wide 'jobs'-partition scan this used to
+    share with _has_active_clustering_job."""
+    if jobs_table_client is None:
         return None
     try:
-        rows = _jobs_partition_scan_cache.get(
-            _JOBS_PARTITION_SCAN_CACHE_KEY,
-            lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
-        )
+        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         return None
     for row in rows:
-        if str(row.get('userId') or '') != user_id:
-            continue
         if str(row.get('jobType') or '') != PREVIEW_JOB_TYPE:
             continue
         if str(row.get('filename') or '') != filename:
@@ -8370,9 +8498,25 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
         except Exception:
             continue
 
+    merge_payload_blob_name = f'{user_id}/{merge_id}.json'
+
     def _write_merge_record(final_face_map, final_target_name):
         merged_names = [s['name'] for s in merged_snapshots if isinstance(s, dict) and s.get('name')]
+        payload_json = json.dumps({
+            'base': base_snapshot,
+            'merged': merged_snapshots,
+            'faceMap': final_face_map,
+        })
         try:
+            # Base+merged person snapshots can run large enough to threaten
+            # Table Storage's 64KB-per-property/1MB-per-entity caps -- store
+            # the payload in Blob Storage and keep only a reference on the row
+            # (called twice per merge -- safety-net then final -- overwriting
+            # the same blob each time is fine, it's keyed by merge_id).
+            upload_file_to_blob(
+                BLOB_MERGE_PAYLOADS_CONTAINER, merge_payload_blob_name,
+                payload_json.encode('utf-8'), 'application/json',
+            )
             merge_table_client.upsert_entity({
                 'PartitionKey': user_id,
                 'RowKey': merge_id,
@@ -8380,11 +8524,7 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
                 'mergedIds': json.dumps(merge_ids),
                 'targetName': final_target_name or '',
                 'mergedNames': json.dumps(merged_names),
-                'payload': json.dumps({
-                    'base': base_snapshot,
-                    'merged': merged_snapshots,
-                    'faceMap': final_face_map,
-                }),
+                'payloadBlobName': merge_payload_blob_name,
                 'createdAt': None,
             })
         except Exception:
@@ -9900,31 +10040,21 @@ def _extract_job_filename(base: str, user_id: str) -> str:
 
 
 def _batch_remove_job_rows(user_id: str, names_set: set) -> int:
-    """Delete stale job-status rows for any filename in ``names_set`` in a single
-    scan of the ``jobs`` partition (vs. one scan per file).
+    """Delete stale job-status rows for any filename in ``names_set`` in a
+    single scan of the user's own jobs partition (vs. one scan per file).
 
-    Reuses the cached whole-'jobs'-partition scan (_jobs_partition_scan_cache)
-    instead of issuing a fresh, unscoped query_entities("PartitionKey eq
-    'jobs'") -- see _has_active_clustering_job / _has_active_library_download_job,
-    whose identical scan was the target of repeated fixes (fa03bc9, e1114b7,
-    4b325c4) for this exact bug class. The 'jobs' partition has grown to
-    200k+ rows, so a direct scan here made every 100-file chunk of a bulk
-    delete pay a fresh multi-second full scan, which is what made large
-    deletes take minutes."""
-    if metadata_table_client is None or not names_set:
+    Per-file jobs are userId-partitioned (see _job_partition_key), so this is
+    a scoped partition query instead of the fleet-wide 200k+-row scan this
+    used to share with _has_active_clustering_job / library-scoped job types
+    never correlate to an individual filename anyway."""
+    if jobs_table_client is None or not names_set:
         return 0
     try:
-        rows = _jobs_partition_scan_cache.get(
-            _JOBS_PARTITION_SCAN_CACHE_KEY,
-            lambda: list(metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
-        )
+        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         return 0
     removed = 0
     for row in rows:
-        row_user_id = str(row.get('userId') or '')
-        if row_user_id and row_user_id != user_id:
-            continue
         row_key = str(row.get('RowKey') or '')
         job_id = str(row.get('jobId') or '')
         correlation_id = str(row.get('correlationId') or '')
@@ -9940,12 +10070,10 @@ def _batch_remove_job_rows(user_id: str, names_set: set) -> int:
         if not matches:
             continue
         try:
-            metadata_table_client.delete_entity(partition_key='jobs', row_key=row_key)
+            jobs_table_client.delete_entity(partition_key=user_id, row_key=row_key)
             removed += 1
         except Exception:
             pass
-    if removed:
-        _jobs_partition_scan_cache.invalidate(_JOBS_PARTITION_SCAN_CACHE_KEY)
     return removed
 
 
@@ -10128,11 +10256,10 @@ def _maybe_enqueue_coalesced_rerun(job_id: Optional[str], user_id: str) -> None:
     flagged (via _mark_clustering_job_rerun_requested) while it ran and, if
     so, fire exactly one follow-up job to pick up whatever queued up meanwhile.
     """
-    if not job_id or metadata_table_client is None:
+    if not job_id:
         return
-    try:
-        row = metadata_table_client.get_entity(partition_key='jobs', row_key=_job_row_key(job_id))
-    except Exception:
+    row = _get_job_row(user_id, job_id)
+    if row is None:
         return
     if not row.get('rerunRequested'):
         return
@@ -10539,9 +10666,19 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
             f'redelivered {dequeue_count} times without completing. '
             'Retry manually if this job is still wanted.'
         )
+        raw_library_id = str(payload.get('libraryId') or '') if isinstance(payload, dict) else ''
         if job_id and user_id:
             try:
-                _upsert_job_status(job_id, user_id, job_type or 'clustering', 'failed', error=reason)
+                # libraryId must be passed through for library_clean/
+                # library_download so this lands on the authoritative
+                # libraryId-partitioned row (see _job_partition_key), not just
+                # this user's mirror -- otherwise any other shared-library
+                # member's _active_library_cleanup_job check would keep
+                # seeing this job as still queued/running forever.
+                _upsert_job_status(
+                    job_id, user_id, job_type or 'clustering', 'failed', error=reason,
+                    libraryId=raw_library_id or None,
+                )
             except Exception:
                 pass
         if job_type == 'library_clean' and library_store is not None:
@@ -10551,7 +10688,7 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
             # uploads unblock immediately instead of waiting on
             # _reconcile_in_progress_from_job_row to notice on the next
             # upload attempt.
-            library_id = str(payload.get('libraryId') or user_id) if isinstance(payload, dict) else ''
+            library_id = raw_library_id or user_id
             if library_id:
                 try:
                     library_store.set_cleanup_failed(library_id, reason)
@@ -11260,7 +11397,7 @@ def _remove_file_quietly(path: str) -> None:
 
 
 # Guard other optional startup helpers to avoid import-time failures
-for _fn in ('create_blob_containers', 'create_metadata_table', 'create_albums_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
+for _fn in ('create_blob_containers', 'create_metadata_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
     if _fn in globals() and callable(globals().get(_fn)):
         try:
             globals().get(_fn)()

@@ -31,10 +31,9 @@ class _FakeJobsTable:
         self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
 
     def query_entities(self, filter_str):
-        # jobs_status() now fetches the whole 'jobs' partition once (via
-        # _jobs_partition_scan_cache) and filters by userId in Python --
-        # see that function's comment for why the old server-side "and
-        # userId eq X" filter still cost a full partition scan anyway.
+        # jobs_status() queries the caller's own userId partition directly --
+        # jobs are partitioned by scope (see _job_partition_key), so no
+        # client-side userId filter or cross-user cache is needed any more.
         m = re.match(r"PartitionKey eq '([^']*)'$", filter_str)
         assert m, f'unexpected filter: {filter_str}'
         pk = m.group(1)
@@ -44,20 +43,16 @@ class _FakeJobsTable:
 @pytest.fixture
 def jobs_table(monkeypatch):
     table = _FakeJobsTable()
-    monkeypatch.setattr(app, 'metadata_table_client', table)
+    monkeypatch.setattr(app, 'jobs_table_client', table)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    # Fresh cache per test -- _jobs_partition_scan_cache is a module-level
-    # singleton keyed by a constant, so without this, results from one test
-    # could leak into the next within the TTL window.
-    monkeypatch.setattr(app, '_jobs_partition_scan_cache', app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS))
     return table
 
 
 def _seed_job(table, job_id, job_type, status, *, age_minutes=0, user_id='owner'):
     updated_at = (datetime.now(timezone.utc) - timedelta(minutes=age_minutes)).isoformat()
     table.upsert_entity({
-        'PartitionKey': 'jobs',
-        'RowKey': app._job_row_key(job_id),
+        'PartitionKey': user_id,
+        'RowKey': job_id,
         'jobId': job_id,
         'userId': user_id,
         'jobType': job_type,
@@ -80,7 +75,7 @@ def test_stale_running_job_of_any_type_is_flushed_and_hidden_on_this_poll(jobs_t
     jobs = _poll()
 
     assert jobs == []
-    stored = jobs_table.rows[('jobs', app._job_row_key(job_id))]
+    stored = jobs_table.rows[('owner', job_id)]
     assert stored['status'] == 'failed'
     assert 'did not finish' in stored['error']
 
@@ -107,7 +102,7 @@ def test_recent_running_job_of_any_type_is_left_alone(jobs_table):
     assert len(jobs) == 1
     assert jobs[0]['jobId'] == job_id
     assert jobs[0]['status'] == 'running'
-    assert jobs_table.rows[('jobs', app._job_row_key(job_id))]['status'] == 'running'
+    assert jobs_table.rows[('owner', job_id)]['status'] == 'running'
 
 
 def test_another_users_stale_job_is_not_touched(jobs_table):
@@ -117,4 +112,4 @@ def test_another_users_stale_job_is_not_touched(jobs_table):
     jobs = _poll()
 
     assert jobs == []
-    assert jobs_table.rows[('jobs', app._job_row_key('ipwork:other:stale-3'))]['status'] == 'running'
+    assert jobs_table.rows[('other', 'ipwork:other:stale-3')]['status'] == 'running'

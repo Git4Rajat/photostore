@@ -24,7 +24,7 @@ from fakes import FakeTable
 @pytest.fixture
 def metadata_table(monkeypatch):
     table = FakeTable()
-    monkeypatch.setattr(app, 'metadata_table_client', table)
+    monkeypatch.setattr(app, 'jobs_table_client', table)
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
     monkeypatch.setattr(app, '_maybe_enqueue_coalesced_rerun', lambda job_id, user_id: None)
     return table
@@ -52,7 +52,7 @@ def test_slow_people_cluster_job_gets_heartbeated_before_it_finishes(monkeypatch
     thread.start()
 
     def _updated_at_write_count() -> int:
-        row = metadata_table.rows.get(('jobs', app._job_row_key(job_id)))
+        row = metadata_table.rows.get(('u1', job_id))
         return 0 if row is None else 1
 
     # Wait for the initial 'running' write, then give the heartbeat thread
@@ -61,13 +61,13 @@ def test_slow_people_cluster_job_gets_heartbeated_before_it_finishes(monkeypatch
         if _updated_at_write_count():
             break
         threading.Event().wait(0.01)
-    row_after_start = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+    row_after_start = metadata_table.get_entity('u1', job_id)
     assert row_after_start['status'] == 'running'
     first_updated_at = row_after_start['updatedAt']
 
     heartbeat_seen = False
     for _ in range(200):
-        row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+        row = metadata_table.get_entity('u1', job_id)
         if row['status'] == 'running' and row['updatedAt'] != first_updated_at:
             heartbeat_seen = True
             break
@@ -83,7 +83,7 @@ def test_slow_people_cluster_job_gets_heartbeated_before_it_finishes(monkeypatch
     thread.join(timeout=5)
     assert not thread.is_alive()
 
-    final_row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+    final_row = metadata_table.get_entity('u1', job_id)
     assert final_row['status'] == 'done'
 
 
@@ -97,13 +97,13 @@ def test_heartbeat_thread_stops_after_job_finishes(monkeypatch, metadata_table):
     job_id = 'cluster:u1:job2'
     app._handle_clustering_queue_payload({'trigger': 'upload_face_ready'}, job_id, 'u1', 'people_cluster')
 
-    row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+    row = metadata_table.get_entity('u1', job_id)
     assert row['status'] == 'done'
 
     # Give a leftover heartbeat thread, if any, a chance to fire and corrupt
     # the terminal status before asserting it stayed put.
     threading.Event().wait(0.2)
-    row_after_wait = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+    row_after_wait = metadata_table.get_entity('u1', job_id)
     assert row_after_wait['status'] == 'done'
 
 
@@ -141,17 +141,17 @@ def test_slow_library_clean_job_gets_heartbeated_before_it_finishes(monkeypatch,
     thread.start()
 
     for _ in range(100):
-        row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+        row = metadata_table.get_entity('u1', job_id)
         if row is not None:
             break
         threading.Event().wait(0.01)
-    row_after_start = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+    row_after_start = metadata_table.get_entity('u1', job_id)
     assert row_after_start['status'] == 'running'
     first_updated_at = row_after_start['updatedAt']
 
     heartbeat_seen = False
     for _ in range(200):
-        row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+        row = metadata_table.get_entity('u1', job_id)
         if row['status'] == 'running' and row['updatedAt'] != first_updated_at:
             heartbeat_seen = True
             break
@@ -167,5 +167,5 @@ def test_slow_library_clean_job_gets_heartbeated_before_it_finishes(monkeypatch,
     thread.join(timeout=5)
     assert not thread.is_alive()
 
-    final_row = metadata_table.get_entity('jobs', app._job_row_key(job_id))
+    final_row = metadata_table.get_entity('u1', job_id)
     assert final_row['status'] == 'done'

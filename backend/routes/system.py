@@ -65,7 +65,7 @@ def jobs_status():
         user_id, error = app._require_user_id()
         if error:
             return error
-        if app.metadata_table_client is None:
+        if app.jobs_table_client is None:
             return app.jsonify({'jobs': []})
         cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(minutes=app.JOB_STATUS_WINDOW_MINUTES)).isoformat()
         # A job of ANY type (clustering, ipwork, library_clean, preview, ...)
@@ -80,41 +80,36 @@ def jobs_status():
         # activity indicator never clears.
         stale_cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(minutes=app.CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
         try:
-            # Same 'jobs' partition _has_active_clustering_job scans (219k+
-            # rows and growing) -- userId isn't a key property, so Table
-            # Storage has no secondary index for it and "...and userId eq X"
-            # still costs a full partition scan server-side, paid on every
-            # poll of this endpoint. Reuse the same constant-key cache
-            # instead of re-scanning: one fetch of the whole partition genuinely
-            # serves every user's poll within the TTL window.
-            all_rows = app._jobs_partition_scan_cache.get(
-                app._JOBS_PARTITION_SCAN_CACHE_KEY,
-                lambda: list(app.metadata_table_client.query_entities("PartitionKey eq 'jobs'")),
-            )
-            rows = [row for row in all_rows if str(row.get('userId') or '') == user_id]
+            # Jobs are userId-partitioned (library_clean/library_download are
+            # mirrored into the initiator's userId partition too -- see
+            # _upsert_job_status), so this is a normal scoped partition query,
+            # not the fleet-wide 219k+-row scan this used to share with
+            # _has_active_clustering_job.
+            rows = list(app.jobs_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))
         except Exception:
             app.app.logger.exception('Failed to query job status rows for %s', user_id)
             return app.jsonify({'jobs': []})
         jobs = []
-        flushed_any_stale = False
         for row in rows:
             status = str(row.get('status') or '').lower()
             updated_at = str(row.get('updatedAt') or '')
             job_type = str(row.get('jobType') or '')
             if status in {'queued', 'running'} and updated_at and updated_at < stale_cutoff:
-                app._upsert_job_status(str(row.get('jobId') or ''), user_id, job_type, 'failed', error='Job did not finish (worker restarted or timed out)')
-                flushed_any_stale = True
+                # Passing libraryId through (when present) re-derives the same
+                # authoritative partition_key as the original write, so this
+                # updates the real (library_clean/library_download) row, not
+                # just this userId-partition mirror.
+                app._upsert_job_status(
+                    str(row.get('jobId') or ''), user_id, job_type, 'failed',
+                    error='Job did not finish (worker restarted or timed out)',
+                    libraryId=row.get('libraryId'),
+                )
                 continue
             # Keep in-flight jobs, plus terminal ones that finished recently.
             # updatedAt is a UTC isoformat string, so lexicographic comparison
             # against the cutoff is a valid recency test.
             if status in {'queued', 'running'} or updated_at >= cutoff:
                 jobs.append(app._humanize_job(row))
-        if flushed_any_stale:
-            # The write(s) above just happened in this same request/process --
-            # don't make the caller (or the next poller, in-process) wait out
-            # the full cache TTL to see its own just-written result.
-            app._jobs_partition_scan_cache.invalidate(app._JOBS_PARTITION_SCAN_CACHE_KEY)
         jobs.sort(key=lambda job: job.get('updatedAt') or '', reverse=True)
         return app.jsonify({'jobs': jobs[:50]})
     except Exception as exc:

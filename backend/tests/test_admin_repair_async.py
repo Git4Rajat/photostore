@@ -52,7 +52,7 @@ class _FakeQueue:
 def env(monkeypatch):
     table = _FakeTable()
     queue = _FakeQueue()
-    monkeypatch.setattr(app, 'metadata_table_client', table)
+    monkeypatch.setattr(app, 'jobs_table_client', table)
     monkeypatch.setattr(app, 'clustering_queue_client', queue)
     monkeypatch.setattr(app, 'face_table_client', object())
     monkeypatch.setattr(app, 'person_table_client', object())
@@ -131,7 +131,7 @@ def test_worker_dispatch_runs_the_real_handler_and_records_result(env, monkeypat
     app._handle_clustering_queue_payload(payload, job_id, 'owner', 'people_admin_repair')
 
     assert seen_kwargs == {'user_id': 'owner', 'dry_run': False}
-    row = table.get_entity('jobs', app._job_row_key(job_id))
+    row = table.get_entity('owner', job_id)
     assert row['status'] == 'done'
     assert json.loads(row['result']) == {'duplicateGroups': 3, 'deletedFaces': 5}
 
@@ -142,7 +142,7 @@ def test_worker_dispatch_unknown_action_fails_cleanly(env):
     payload = {'jobId': job_id, 'user_id': 'owner', 'type': 'people_admin_repair', 'action': 'not_a_real_action'}
     app._handle_clustering_queue_payload(payload, job_id, 'owner', 'people_admin_repair')
 
-    row = table.get_entity('jobs', app._job_row_key(job_id))
+    row = table.get_entity('owner', job_id)
     assert row['status'] == 'failed'
     assert 'unknown repair action' in row['error']
 
@@ -159,7 +159,7 @@ def test_worker_dispatch_handler_exception_is_caught_and_recorded_as_failed(env,
     payload = {'jobId': job_id, 'user_id': 'owner', 'type': 'people_admin_repair', 'action': 'suppress_suspicious', 'dryRun': True}
     app._handle_clustering_queue_payload(payload, job_id, 'owner', 'people_admin_repair')
 
-    row = table.get_entity('jobs', app._job_row_key(job_id))
+    row = table.get_entity('owner', job_id)
     assert row['status'] == 'failed'
 
 
@@ -202,7 +202,7 @@ def test_vector_index_rebuild_worker_handles_no_embeddings(env, monkeypatch):
     payload = {'jobId': job_id, 'user_id': 'owner', 'type': 'vector_index_rebuild'}
     app._handle_clustering_queue_payload(payload, job_id, 'owner', 'vector_index_rebuild')
 
-    row = table.get_entity('jobs', app._job_row_key(job_id))
+    row = table.get_entity('owner', job_id)
     assert row['status'] == 'done'
     result = json.loads(row['result'])
     assert result['status'] == 'empty'

@@ -85,14 +85,15 @@ class _FakeBlobServiceClient:
 @pytest.fixture
 def env(monkeypatch):
     table = _FakeTable()
+    jobs_table = _FakeTable()
     queue = _FakeQueue()
     blob_service = _FakeBlobServiceClient()
     monkeypatch.setattr(app, 'metadata_table_client', table)
+    monkeypatch.setattr(app, 'jobs_table_client', jobs_table)
     # library_download now runs on its own priority queue, not the general
     # clustering queue -- see LIBRARY_OPS_QUEUE_NAME.
     monkeypatch.setattr(app, 'library_ops_queue_client', queue)
     monkeypatch.setattr(app, 'blob_service_client', blob_service)
-    monkeypatch.setattr(app, '_jobs_partition_scan_cache', app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS))
 
     class _FakeLibraryStore:
         def get_library(self, library_id):
@@ -122,11 +123,11 @@ def env(monkeypatch):
         app, '_create_stable_read_sas_url',
         lambda container, name, download_filename=None: (f'https://fake.blob/{container}/{name}?sas=1', '2099-01-01T00:00:00+00:00'),
     )
-    return table, queue, uploaded
+    return table, jobs_table, queue, uploaded
 
 
 def test_execute_library_download_builds_zip_and_skips_deleted(env):
-    table, _queue, uploaded = env
+    table, _jobs_table, _queue, uploaded = env
     result = app._execute_library_download('lib1', 'My Library')
 
     assert result['photosIncluded'] == 2  # photo3 (deleted) is skipped
@@ -148,7 +149,7 @@ def test_execute_library_download_heartbeats_job_status(env, monkeypatch):
     force-flip a still-running export to 'failed' ("worker restarted or timed
     out") even though the worker is alive and still writing the ZIP. Verify
     the export refreshes the job row's status/updatedAt while it works."""
-    table, _queue, _uploaded = env
+    table, jobs_table, _queue, _uploaded = env
     for i in range(30):
         table.upsert_entity({'PartitionKey': 'lib1', 'RowKey': f'extra{i}.jpg', 'processing_state': 'done'})
 
@@ -166,7 +167,7 @@ def test_execute_library_download_heartbeats_job_status(env, monkeypatch):
 
     assert result['photosIncluded'] == 32  # 30 extras + photo1/photo2 (photo3 deleted)
     assert running_calls, 'expected at least one heartbeat write during the export'
-    row = table.get_entity('jobs', app._job_row_key('job1'))
+    row = jobs_table.get_entity('lib1', 'job1')
     assert row['status'] == 'running'
 
 
@@ -174,7 +175,7 @@ def test_execute_library_download_uses_stored_not_deflated_compression(env):
     """JPEG/HEIC/RAW are already entropy-coded -- DEFLATE just burns CPU for
     near-zero size reduction on this content, competing with the network-bound
     downloads for the same core. Verify parts are written uncompressed."""
-    _table, _queue, uploaded = env
+    _table, _jobs_table, _queue, uploaded = env
     app._execute_library_download('lib1', 'My Library')
     zf = zipfile.ZipFile(io.BytesIO(uploaded['blobs']['lib1/library-export-part-1.zip']))
     assert zf.infolist(), 'expected at least one file in the part'
@@ -187,7 +188,7 @@ def test_execute_library_download_downloads_concurrently(env, monkeypatch):
     strictly one-at-a-time is the main lever for real-world throughput.
     Verify concurrency actually happens by timing N artificially slow
     downloads against how long fully sequential processing would take."""
-    table, _queue, _uploaded = env
+    table, _jobs_table, _queue, _uploaded = env
     for i in range(16):
         table.upsert_entity({'PartitionKey': 'lib1', 'RowKey': f'extra{i}.jpg', 'processing_state': 'done'})
     # 18 candidates total (16 extras + photo1/photo2; photo3 stays deleted).
@@ -221,7 +222,7 @@ def test_execute_library_download_bounds_outstanding_downloads_with_a_slow_strag
     photo's bytes) can pile up in memory waiting for the straggler to clear.
     The fix (a sliding window of at most LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY
     outstanding futures) must keep that pile-up bounded."""
-    table, _queue, _uploaded = env
+    table, _jobs_table, _queue, _uploaded = env
     concurrency = 4
     monkeypatch.setattr(app, 'LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY', concurrency)
 
@@ -279,7 +280,7 @@ def test_execute_library_download_bounds_outstanding_downloads_with_a_slow_strag
 
 
 def test_execute_library_download_splits_into_size_capped_parts_and_cleans_up_stale_ones(env, monkeypatch):
-    table, _queue, _uploaded = env
+    table, _jobs_table, _queue, _uploaded = env
     for i in range(4):
         table.upsert_entity({'PartitionKey': 'lib1', 'RowKey': f'extra{i}.jpg', 'processing_state': 'done'})
     # 6 candidate photos total: extra0..3, photo1, photo2.
@@ -306,7 +307,7 @@ def test_execute_library_download_resumes_from_durable_checkpoint(env, monkeypat
     """Simulates a worker dying mid-export (of the same job_id) after 2 parts
     were durably uploaded, then the queue redelivering the same message. The
     remaining rows should be processed once, not re-downloaded from scratch."""
-    table, _queue, _uploaded = env
+    table, _jobs_table, _queue, _uploaded = env
     for i in range(4):
         table.upsert_entity({'PartitionKey': 'lib1', 'RowKey': f'extra{i}.jpg', 'processing_state': 'done'})
     # 6 candidates, sorted: extra0, extra1, extra2, extra3, photo1, photo2.
@@ -340,7 +341,7 @@ def test_execute_library_download_resumes_from_durable_checkpoint(env, monkeypat
 
 
 def test_request_route_enqueues_then_dedupes_on_second_call(env):
-    table, queue, _uploaded = env
+    table, _jobs_table, queue, _uploaded = env
 
     with app.app.test_request_context('/api/library/download/request', method='POST'):
         response = library_download_request()
@@ -360,7 +361,7 @@ def test_request_route_enqueues_then_dedupes_on_second_call(env):
 
 
 def test_worker_dispatch_and_status_route_end_to_end(env):
-    table, _queue, _uploaded = env
+    table, _jobs_table, _queue, _uploaded = env
     job_id = 'libdownload:lib1:abc123'
     payload = {'jobId': job_id, 'user_id': 'owner', 'libraryId': 'lib1', 'libraryName': 'My Library', 'type': 'library_download'}
 

@@ -329,11 +329,10 @@ def admin_job_status():
     if error:
         return error
     job_id = str(app.request.args.get('jobId', '') or '')
-    if not job_id or app.metadata_table_client is None:
+    if not job_id:
         return app.jsonify({'status': 'unknown'})
-    try:
-        row = app.metadata_table_client.get_entity(partition_key='jobs', row_key=app._job_row_key(job_id))
-    except Exception:
+    row = app._get_job_row(user_id, job_id)
+    if row is None:
         return app.jsonify({'status': 'unknown'})
     if str(row.get('userId') or '') != user_id:
         return app.jsonify({'status': 'unknown'})

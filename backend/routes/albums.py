@@ -33,9 +33,13 @@ def delete_multiple_albums_people():
     updated_files = []
 
     for album_id in album_ids:
+        existing = app._load_album_entity(user_id, str(album_id))
         try:
             app.albums_table_client.delete_entity(partition_key=user_id, row_key=str(album_id))
             deleted_albums.append(album_id)
+            old_token = str((existing or {}).get('publicToken') or '')
+            if old_token:
+                app._delete_album_token_index(old_token)
         except Exception as exc:
             app.app.logger.warning('Album delete failed for %s: %s', album_id, exc)
             album_errors.append({'albumId': album_id, 'error': 'delete failed'})
@@ -229,11 +233,15 @@ def delete_album(album_id: str):
         return error
     if not app._albums_table_available():
         return app.jsonify({'error': 'Albums not configured'}), 503
+    existing = app._load_album_entity(user_id, album_id)
     try:
         app.albums_table_client.delete_entity(partition_key=user_id, row_key=album_id)
     except Exception as exc:
         app.app.logger.exception('delete_album failed')
         return app.jsonify({'error': 'Internal server error'}), 500
+    old_token = str((existing or {}).get('publicToken') or '')
+    if old_token:
+        app._delete_album_token_index(old_token)
     return app.jsonify({'success': True})
 
 @albums_bp.route('/albums/autocreate', methods=['POST'])
@@ -322,11 +330,18 @@ def share_album(album_id: str):
     if access_code and not clear_access_code and len(access_code) < app.MIN_ALBUM_ACCESS_CODE_LENGTH:
         return app.jsonify({'error': f'Access code must be at least {app.MIN_ALBUM_ACCESS_CODE_LENGTH} characters.'}), 400
 
+    old_token = str(entity.get('publicToken') or '')
     entity['isPublic'] = enabled
     if enabled and not entity.get('publicToken'):
         entity['publicToken'] = str(app.uuid.uuid4())
     if not enabled:
         entity['publicToken'] = ''
+
+    if old_token and old_token != entity.get('publicToken'):
+        app._delete_album_token_index(old_token)
+    new_token = str(entity.get('publicToken') or '')
+    if new_token:
+        app._store_album_token_index(new_token, user_id, album_id)
 
     if expires_in_days > 0:
         expires = app.datetime.now(app.timezone.utc) + app.timedelta(days=expires_in_days)
@@ -355,10 +370,13 @@ def revoke_album_share(album_id: str):
     if not entity:
         return app.jsonify({'error': 'Album not found'}), 404
 
+    old_token = str(entity.get('publicToken') or '')
     entity['isPublic'] = False
     entity['publicToken'] = ''
     entity['publicExpiresAt'] = ''
     entity['accessCode'] = ''
     entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
     app._save_album_entity(entity)
+    if old_token:
+        app._delete_album_token_index(old_token)
     return app.jsonify({'album': app._album_entity_to_payload(entity)})

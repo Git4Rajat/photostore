@@ -76,7 +76,7 @@ class _FakeQueueServiceClient:
 @pytest.fixture(autouse=True)
 def metadata_table(monkeypatch):
     table = FakeTable()
-    monkeypatch.setattr(app, 'metadata_table_client', table)
+    monkeypatch.setattr(app, 'jobs_table_client', table)
     return table
 
 
@@ -117,7 +117,7 @@ def test_exceeding_max_retries_skips_dispatch_deletes_message_marks_failed(
 
     assert dispatch_spy == []  # never reached the real pipeline
     assert queue_client.delete_calls == ['m1']
-    row = metadata_table.get_entity('jobs', app._job_row_key('cluster:u1:job1'))
+    row = metadata_table.get_entity('u1', 'cluster:u1:job1')
     assert row['status'] == 'failed'
     assert 'retries' in row['error'].lower()
     assert row['jobType'] == 'people_cluster'
@@ -216,6 +216,6 @@ def test_library_clean_exceeding_its_own_ceiling_marks_library_failed(monkeypatc
 
     assert dispatch_spy == []
     assert library_ops_queue_client.delete_calls == ['m1']
-    row = metadata_table.get_entity('jobs', app._job_row_key('libclean:lib1:job1'))
+    row = metadata_table.get_entity('lib1', 'libclean:lib1:job1')
     assert row['status'] == 'failed'
     assert calls == [('lib1', row['error'])]
