@@ -657,6 +657,11 @@ const isRetriableUploadError = (err: unknown): boolean => {
     return code === 'ECONNABORTED' || code === 'ERR_NETWORK' || !navigator.onLine;
 };
 
+const isAbortUploadError = (err: unknown): boolean => {
+    const anyErr = err as any;
+    return anyErr?.name === 'AbortError';
+};
+
 const buildRequestedBrowserProcessingSteps = (actions?: BrowserProcessingAction[]): Set<string> | null => {
     if (!actions || actions.length === 0) {
         return null;
@@ -2691,12 +2696,37 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 throw new Error('No upload blocks were staged.');
             }
             options?.onFinalizeStarted?.();
-            await blockBlobClient.commitBlockList(finalBlockIds, {
-                abortSignal: options?.signal,
-                blobHTTPHeaders: {
-                    blobContentType: file.type || 'application/octet-stream',
-                },
-            });
+            try {
+                await blockBlobClient.commitBlockList(finalBlockIds, {
+                    abortSignal: options?.signal,
+                    blobHTTPHeaders: {
+                        blobContentType: file.type || 'application/octet-stream',
+                    },
+                });
+            } catch (commitErr) {
+                // abortSignal only tears down the client's view of the request --
+                // once Azure has received the commit, it finishes server-side
+                // regardless, so an AbortError here doesn't mean the commit
+                // actually failed. Treating it as a failure would mark this file
+                // non-'done', routing it into /upload/cancel's cleanup, which
+                // deletes any blob it can't prove was finalized -- deleting bytes
+                // that, per this check, just landed successfully. Verify with a
+                // signal-free getProperties() (Stop must not cancel this check)
+                // before deciding which way to go.
+                if (!isAbortUploadError(commitErr)) {
+                    throw commitErr;
+                }
+                let committedSize = -1;
+                try {
+                    const props = await blockBlobClient.getProperties();
+                    committedSize = props.contentLength ?? -1;
+                } catch {
+                    throw commitErr;
+                }
+                if (committedSize !== file.size) {
+                    throw commitErr;
+                }
+            }
             // The bytes are now durably committed to blob storage -- everything
             // left (register/dedup/queue this upload via /upload/finalize) is
             // backend bookkeeping, not data transfer, and measured at 20-90s+
