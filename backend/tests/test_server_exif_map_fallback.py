@@ -25,6 +25,12 @@ class _FakeMetadataTable:
     def upsert_entity(self, entity):
         self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
 
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        key = (entity['PartitionKey'], entity['RowKey'])
+        if key not in self.rows:
+            raise KeyError(key)
+        self.rows[key] = dict(entity)
+
     def get_entity(self, partition_key, row_key):
         key = (partition_key, row_key)
         if key not in self.rows:

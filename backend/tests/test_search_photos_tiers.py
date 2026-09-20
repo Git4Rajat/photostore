@@ -53,7 +53,7 @@ def test_semantic_score_still_computed_when_lexical_score_is_zero(monkeypatch):
     monkeypatch.setattr(app, 'lexical_search_score', lambda *a, **k: 0.0)
 
     score, lexical_score, _ = app._score_search_row(
-        {}, 'photo.jpg', _row(), {},
+        'u1', {}, 'photo.jpg', _row(), {},
         query_embedding=[1.0, 0.0],
         vector_scores={'photo.jpg': 0.9},
         current_embedding_version='v1',
@@ -71,7 +71,7 @@ def test_lexical_score_still_counts_when_semantic_score_is_zero(monkeypatch):
     monkeypatch.setattr(app, 'lexical_search_score', lambda *a, **k: 5.0)
 
     score, lexical_score, _ = app._score_search_row(
-        {}, 'photo.jpg', _row(), {},
+        'u1', {}, 'photo.jpg', _row(), {},
         query_embedding=[],  # no query embedding at all -> semantic_score stays 0.0
         vector_scores={},
         current_embedding_version='v1',
@@ -89,7 +89,7 @@ def test_person_and_location_bonuses_applied(monkeypatch):
     monkeypatch.setattr(app, 'lexical_search_score', lambda *a, **k: 0.0)
 
     score, _, _ = app._score_search_row(
-        {}, 'photo.jpg', _row(), {},
+        'u1', {}, 'photo.jpg', _row(), {},
         query_embedding=[], vector_scores={}, current_embedding_version='v1',
         semantic_threshold=0.16, matched_person_groups=[['p1'], ['p2']], matched_location_terms=['paris'],
     )

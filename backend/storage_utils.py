@@ -7,12 +7,15 @@ import os
 import uuid
 import base64
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import BinaryIO, Callable, Dict, List, Optional, Tuple, Union
+from typing import BinaryIO, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
+from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError, ResourceModifiedError
+from azure.data.tables import UpdateMode
 from azure.storage.blob import ContentSettings as BlobContentSettings
 from werkzeug.utils import secure_filename
 
@@ -52,6 +55,28 @@ CLIENT_PROCESSING_MAX_AI_TEXT_LENGTH = 2048
 # comparable by cosine similarity.
 PHOTO_EMBEDDING_MODEL_VERSION = 'clip-vit-base-patch32:openai:browser-v1'
 PHOTO_EMBEDDING_DIMENSION = 512
+
+# Narrow field set sufficient for gallery/timeline/filter display (rating,
+# tags, location, status badges, ...) -- deliberately excludes large fields
+# only search needs (ocrText, tagMetadata, weakTags, objects, faces,
+# processing_metadata) or that live in their own table now (photoEmbedding,
+# semanticEmbedding). Canonical definition lives here so both the raw-scan
+# fallback (app.py's _query_metadata_rows_for_user) and the "listing" search
+# index projection (_build_user_lexical_index_snapshot's sibling below) stay
+# in lockstep -- see PHOTO_LIST_SELECT_FIELDS's original comment in app.py for
+# the live-measured cost this was added to fix.
+PHOTO_LIST_SELECT_FIELDS = [
+    'PartitionKey', 'RowKey',
+    'size', 'lastModified', 'exifData', 'likedBy', 'processing_metadata',
+    'rating', 'likes', 'tags', 'rotation',
+    'latitude', 'longitude', 'address', 'locationCity', 'locationCountry',
+    'exifCount', 'faceCount', 'peopleIds',
+    'preview_status', 'thumbnail_status', 'exif_status', 'ocr_status',
+    'face_status', 'ai_vision_status', 'map_detection_status',
+    'processing_lease_owner', 'processing_lease_expires_at',
+    'anonymousImageId',
+    'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified',
+]
 SUSPICIOUS_FACE_CONFIDENCE = float(os.getenv('SUSPICIOUS_FACE_CONFIDENCE', '0.60'))
 FACE_MIN_STORE_CONFIDENCE = float(os.getenv('FACE_MIN_STORE_CONFIDENCE', '0.24'))
 FACE_LOW_CONFIDENCE_REJECT_BELOW = float(os.getenv('FACE_LOW_CONFIDENCE_REJECT_BELOW', '0.32'))
@@ -301,6 +326,8 @@ def configure_storage(
     image_names_table_client=None,
     hash_index_table_client=None,
     filename_owners_table_client=None,
+    embeddings_table_client=None,
+    search_index_dirty_table_client=None,
     queue_map_on_upload: bool = False,
     face_summary_lookup=None,
 ) -> None:
@@ -316,6 +343,8 @@ def configure_storage(
     _CTX['image_names_table_client'] = image_names_table_client
     _CTX['hash_index_table_client'] = hash_index_table_client
     _CTX['filename_owners_table_client'] = filename_owners_table_client
+    _CTX['embeddings_table_client'] = embeddings_table_client
+    _CTX['search_index_dirty_table_client'] = search_index_dirty_table_client
     _CTX['queue_map_on_upload'] = bool(queue_map_on_upload)
     # user_id -> {face_id: face_row_dict}, cached (PEOPLE_SCAN_CACHE_TTL_SECONDS,
     # invalidated on every face-table write via _InvalidatingTableClient) --
@@ -638,15 +667,23 @@ def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
         entity.update(updates or {})
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         try:
-            metadata_table_client.upsert_entity(entity)
+            # Conditional on the etag just read -- a concurrent writer (another
+            # processing step, a user edit, a lease race) between our get_entity
+            # above and this write now loses this attempt instead of silently
+            # clobbering it, and gets retried against a fresh read.
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             if metadata_updates_affect_search_indexes(updates):
-                touch_user_search_indexes_state(user_id)
+                touch_user_search_indexes_state(user_id, filenames=filename)
             return dict(entity)
         except ResourceModifiedError as exc:
             last_exc = exc
             import time
             time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
             continue
+        except ResourceNotFoundError as exc:
+            # The row was deleted between our read and this write -- nothing
+            # left to retry against.
+            raise RuntimeError(f'Photo was deleted during update: {user_id}/{filename}') from exc
     raise RuntimeError(f'Concurrent modification on {user_id}/{filename}') from last_exc
 
 
@@ -1185,6 +1222,40 @@ def _serialize_vector_index(snapshot: VectorIndexSnapshot) -> bytes:
     return buffer.getvalue()
 
 
+def _compute_photo_vector(
+    filename: str, row: Dict, embedding_row: Dict, photo_embeddings_compatible: bool,
+) -> Optional[np.ndarray]:
+    """Shared per-photo vector computation for both the full vector-index
+    build and the incremental merge below, so the two paths can never drift
+    apart on what counts as "this photo's embedding". Returns a normalized
+    unit vector, or None if no usable embedding could be found/computed."""
+    # Prefer the browser-computed CLIP image embedding (real visual signal) over
+    # a text embedding of the tag list, so search isn't purely a function of
+    # (possibly wrong) tags. Falls back to the tag-text embedding for photos
+    # that haven't been reprocessed with the image-embedding pipeline yet.
+    embedding: List[float] = []
+    if photo_embeddings_compatible and str(embedding_row.get('photoEmbeddingVersion') or '').strip() == PHOTO_EMBEDDING_MODEL_VERSION:
+        try:
+            candidate = json.loads(embedding_row.get('photoEmbedding', '[]') or '[]')
+        except Exception:
+            candidate = []
+        if isinstance(candidate, list) and len(candidate) == PHOTO_EMBEDDING_DIMENSION:
+            embedding = [float(v) for v in candidate if isinstance(v, (int, float))]
+    if not embedding:
+        embedding = vision_utils.encode_text_embedding(
+            build_semantic_text(filename, row),
+        )
+    if not embedding:
+        return None
+    vector = np.asarray(embedding, dtype=np.float32)
+    if vector.ndim != 1 or vector.size == 0:
+        return None
+    norm = float(np.linalg.norm(vector))
+    if norm <= 0:
+        return None
+    return (vector / norm).astype(np.float32, copy=False)
+
+
 def _build_user_vector_index_snapshot(user_id: str, source_version: str) -> Optional[VectorIndexSnapshot]:
     metadata_table_client = _CTX.get('metadata_table_client')
     if metadata_table_client is None:
@@ -1193,6 +1264,22 @@ def _build_user_vector_index_snapshot(user_id: str, source_version: str) -> Opti
         rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         rows = []
+
+    # Embeddings live in EMBEDDINGS_TABLE now (see _extract_and_store_embeddings),
+    # not on the photometadata row -- one extra partition-scoped scan of the
+    # (much smaller: 2 float-array columns vs. the full row) embeddings table,
+    # joined by filename below. Rows written before this table existed still
+    # carry their embedding inline, so the per-row fallback below covers those.
+    embeddings_table_client = _CTX.get('embeddings_table_client')
+    embeddings_by_filename: Dict[str, Dict] = {}
+    if embeddings_table_client is not None:
+        try:
+            embeddings_by_filename = {
+                str(row.get('RowKey') or ''): row
+                for row in embeddings_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
+            }
+        except Exception:
+            embeddings_by_filename = {}
 
     embedding_version = vision_utils.get_text_embedding_version()
     # Photo embeddings only share a vector space with query text embeddings when the
@@ -1205,32 +1292,12 @@ def _build_user_vector_index_snapshot(user_id: str, source_version: str) -> Opti
         filename = str(row.get('RowKey') or '').strip()
         if not filename:
             continue
-        # Prefer the browser-computed CLIP image embedding (real visual signal) over
-        # a text embedding of the tag list, so search isn't purely a function of
-        # (possibly wrong) tags. Falls back to the tag-text embedding for photos
-        # that haven't been reprocessed with the image-embedding pipeline yet.
-        embedding: List[float] = []
-        if photo_embeddings_compatible and str(row.get('photoEmbeddingVersion') or '').strip() == PHOTO_EMBEDDING_MODEL_VERSION:
-            try:
-                candidate = json.loads(row.get('photoEmbedding', '[]') or '[]')
-            except Exception:
-                candidate = []
-            if isinstance(candidate, list) and len(candidate) == PHOTO_EMBEDDING_DIMENSION:
-                embedding = [float(v) for v in candidate if isinstance(v, (int, float))]
-        if not embedding:
-            embedding = vision_utils.encode_text_embedding(
-                build_semantic_text(filename, row),
-            )
-        if not embedding:
-            continue
-        vector = np.asarray(embedding, dtype=np.float32)
-        if vector.ndim != 1 or vector.size == 0:
-            continue
-        norm = float(np.linalg.norm(vector))
-        if norm <= 0:
+        embedding_row = embeddings_by_filename.get(filename) or row
+        vector = _compute_photo_vector(filename, row, embedding_row, photo_embeddings_compatible)
+        if vector is None:
             continue
         row_keys.append(filename)
-        vectors.append((vector / norm).astype(np.float32, copy=False))
+        vectors.append(vector)
 
     if not row_keys:
         return VectorIndexSnapshot(
@@ -1253,12 +1320,85 @@ def _build_user_vector_index_snapshot(user_id: str, source_version: str) -> Opti
     )
 
 
-def refresh_user_vector_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[VectorIndexSnapshot]:
+def _merge_user_vector_index_snapshot(
+    user_id: str, existing: VectorIndexSnapshot, dirty_filenames: Set[str], source_version: str,
+) -> Optional[VectorIndexSnapshot]:
+    """Incremental counterpart to _build_user_vector_index_snapshot: instead of
+    re-scanning and re-embedding the whole partition, only re-fetch/re-embed
+    the filenames known to have changed (dirty_filenames) and merge them into
+    the existing snapshot. Point-reads are used instead of a partition scan
+    since the dirty set is expected to be small relative to the library."""
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return None
+    photo_embeddings_compatible = vision_utils.get_text_embedding_dimension() == PHOTO_EMBEDDING_DIMENSION
+    by_filename: Dict[str, np.ndarray] = dict(zip(existing.row_keys, existing.embeddings))
+
+    def _refresh_one(filename: str) -> Tuple[str, Optional[np.ndarray]]:
+        try:
+            row = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            return filename, None
+        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+            return filename, None
+        embedding_row = get_photo_embeddings(user_id, filename) or row
+        return filename, _compute_photo_vector(filename, row, embedding_row, photo_embeddings_compatible)
+
+    if dirty_filenames:
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty_filenames)))) as executor:
+            for filename, vector in executor.map(_refresh_one, dirty_filenames):
+                if vector is None:
+                    by_filename.pop(filename, None)
+                else:
+                    by_filename[filename] = vector
+
+    if not by_filename:
+        return VectorIndexSnapshot(
+            user_id=str(user_id),
+            source_version=source_version,
+            embedding_version=existing.embedding_version,
+            updated_at=source_version,
+            row_keys=[],
+            embeddings=np.zeros((0, 0), dtype=np.float32),
+        )
+    row_keys = list(by_filename.keys())
+    embeddings = np.vstack([by_filename[k] for k in row_keys]).astype(np.float32, copy=False)
+    return VectorIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        embedding_version=existing.embedding_version,
+        updated_at=source_version,
+        row_keys=row_keys,
+        embeddings=embeddings,
+    )
+
+
+def refresh_user_vector_index(
+    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
+) -> Optional[VectorIndexSnapshot]:
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
-    snapshot = _build_user_vector_index_snapshot(key, source_version)
+
+    snapshot = None
+    dirty_to_clear: Optional[Set[str]] = None
+    if not force_full:
+        existing = _load_vector_index_npz(key)
+        if existing is not None and existing.embedding_version == vision_utils.get_text_embedding_version():
+            dirty = _get_dirty_search_index_filenames(key, 'vector')
+            if dirty is not None:
+                snapshot = _merge_user_vector_index_snapshot(key, existing, dirty, source_version)
+                if snapshot is not None:
+                    dirty_to_clear = dirty
+    if snapshot is None:
+        snapshot = _build_user_vector_index_snapshot(key, source_version)
+        if snapshot is not None:
+            # A full rebuild reflects every currently-dirty filename too --
+            # clear the whole dirty set for this index kind so a later
+            # incremental merge doesn't needlessly re-fetch photos already
+            # correctly reflected in this fresh snapshot.
+            dirty_to_clear = _get_dirty_search_index_filenames(key, 'vector') or set()
     if snapshot is None:
         return None
     container_name = _vector_index_container_name()
@@ -1299,6 +1439,8 @@ def refresh_user_vector_index(user_id: str, *, source_version: Optional[str] = N
             'row_keys': snapshot.row_keys,
             'embeddings': snapshot.embeddings,
         }
+    if dirty_to_clear:
+        _clear_dirty_search_index_filenames(key, 'vector', dirty_to_clear)
     return snapshot
 
 
@@ -1726,6 +1868,173 @@ def invalidate_user_lexical_index_cache(user_id: str) -> None:
         _LEXICAL_INDEX_CACHE.pop(key, None)
 
 
+# --- "Listing" projection of the lexical index -------------------------------
+# A narrower blob (PHOTO_LIST_SELECT_FIELDS only -- no ocrText, tagMetadata,
+# weakTags, objects, faces, processing_metadata) for plain gallery/timeline
+# browsing, which never needs those heavier search-only fields. Written as a
+# side effect of refresh_user_lexical_index (same rows, same rebuild pass --
+# no extra Table Storage reads), so it's always in lockstep with the lexical
+# index rather than having its own independent dirty/rebuild cycle. Lives in
+# the same container, just a differently-named blob pair.
+_LISTING_INDEX_CACHE_LOCK = threading.RLock()
+_LISTING_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+
+
+def _listing_index_json_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-listing.json.gz'
+
+
+def _listing_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-listing.json'
+
+
+def _listing_index_blob_client(blob_name: str):
+    container_name = _lexical_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_listing_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _LISTING_INDEX_CACHE_LOCK:
+        _LISTING_INDEX_CACHE.pop(key, None)
+
+
+def _load_listing_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    blob_client = _listing_index_blob_client(_listing_index_json_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        rows = parsed.get('rows')
+        if not isinstance(rows, list):
+            return None
+        return LexicalIndexSnapshot(
+            user_id=str(user_id),
+            source_version=str(parsed.get('sourceVersion') or ''),
+            schema_version=str(parsed.get('schemaVersion') or ''),
+            updated_at=str(parsed.get('updatedAt') or ''),
+            rows=rows,
+        )
+    except Exception:
+        return None
+
+
+def _write_user_listing_index(user_id: str, lexical_snapshot: LexicalIndexSnapshot) -> None:
+    """Derive and upload the narrow listing projection from an already-built
+    lexical snapshot. Best-effort and non-fatal -- a failure here must never
+    block the (already-succeeded) lexical index write it piggybacks on;
+    get_user_listing_index falls back to the full lexical index if this blob
+    is missing or stale."""
+    container_name = _lexical_index_container_name()
+    if not container_name:
+        return
+    listing_rows = [
+        {k: v for k, v in row.items() if k in PHOTO_LIST_SELECT_FIELDS}
+        for row in lexical_snapshot.rows
+    ]
+    listing_snapshot = LexicalIndexSnapshot(
+        user_id=lexical_snapshot.user_id,
+        source_version=lexical_snapshot.source_version,
+        schema_version=lexical_snapshot.schema_version,
+        updated_at=lexical_snapshot.updated_at,
+        rows=listing_rows,
+    )
+    blob_client = _get_blob_client(container_name, _listing_index_json_blob_name(user_id))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                _serialize_lexical_index(listing_snapshot),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+            )
+        except Exception:
+            pass
+    manifest_client = _get_blob_client(container_name, _listing_index_manifest_blob_name(user_id))
+    if manifest_client is not None:
+        try:
+            manifest_client.upload_blob(
+                json.dumps({
+                    'userId': user_id,
+                    'sourceVersion': listing_snapshot.source_version,
+                    'schemaVersion': listing_snapshot.schema_version,
+                    'rowCount': len(listing_snapshot.rows),
+                    'updatedAt': listing_snapshot.updated_at,
+                }, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    with _LISTING_INDEX_CACHE_LOCK:
+        _LISTING_INDEX_CACHE[user_id] = {
+            'source_version': listing_snapshot.source_version,
+            'schema_version': listing_snapshot.schema_version,
+            'updated_at': listing_snapshot.updated_at,
+            'rows': listing_snapshot.rows,
+        }
+
+
+def get_user_listing_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
+    """Narrow gallery/timeline-listing projection of the lexical index (see
+    _write_user_listing_index). Never triggers its own rebuild -- it's purely
+    a byproduct of refresh_user_lexical_index -- so a stale/missing listing
+    blob just falls back to the full lexical index (which will itself
+    (re)build the listing blob as a side effect for next time)."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    with _LISTING_INDEX_CACHE_LOCK:
+        cached = _LISTING_INDEX_CACHE.get(key)
+    if cached and cached.get('schema_version') == _LEXICAL_INDEX_SCHEMA_VERSION:
+        manifest = _load_lexical_index_manifest(key)
+        if not bool(manifest.get('dirty')) and cached.get('source_version') == str(manifest.get('sourceVersion') or ''):
+            return cached
+
+    snapshot = _load_listing_index_blob(key)
+    if snapshot is not None and snapshot.schema_version == _LEXICAL_INDEX_SCHEMA_VERSION:
+        manifest = _load_lexical_index_manifest(key)
+        if not bool(manifest.get('dirty')) and snapshot.source_version == str(manifest.get('sourceVersion') or ''):
+            data = {
+                'source_version': snapshot.source_version,
+                'schema_version': snapshot.schema_version,
+                'updated_at': snapshot.updated_at,
+                'rows': snapshot.rows,
+            }
+            with _LISTING_INDEX_CACHE_LOCK:
+                _LISTING_INDEX_CACHE[key] = data
+            return data
+
+    if not allow_refresh:
+        return None
+    lexical = get_user_lexical_index(key, allow_refresh=True)
+    if lexical is None:
+        return None
+    # refresh_user_lexical_index already wrote/cached the listing blob as a
+    # side effect of the refresh get_user_lexical_index just triggered.
+    with _LISTING_INDEX_CACHE_LOCK:
+        cached = _LISTING_INDEX_CACHE.get(key)
+    if cached:
+        return cached
+    # Fell back to an already-fresh cached lexical snapshot that predates this
+    # feature (no listing blob ever written) -- derive it in-process once.
+    return {
+        'source_version': lexical.get('source_version'),
+        'schema_version': lexical.get('schema_version'),
+        'updated_at': lexical.get('updated_at'),
+        'rows': [
+            {k: v for k, v in row.items() if k in PHOTO_LIST_SELECT_FIELDS}
+            for row in (lexical.get('rows') or [])
+        ],
+    }
+
+
 def delete_user_lexical_index_data(user_id: str) -> None:
     """Delete a library's cached lexical-index blobs (data + manifest) and
     drop it from the in-memory cache. Best-effort: a missing blob is not an
@@ -1733,7 +2042,10 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     key = str(user_id or '').strip()
     if not key:
         return
-    for blob_name in (_lexical_index_json_blob_name(key), _lexical_index_manifest_blob_name(key)):
+    for blob_name in (
+        _lexical_index_json_blob_name(key), _lexical_index_manifest_blob_name(key),
+        _listing_index_json_blob_name(key), _listing_index_manifest_blob_name(key),
+    ):
         blob_client = _lexical_index_blob_client(blob_name)
         if blob_client is None:
             continue
@@ -1742,6 +2054,7 @@ def delete_user_lexical_index_data(user_id: str) -> None:
         except Exception:
             pass
     invalidate_user_lexical_index_cache(key)
+    invalidate_user_listing_index_cache(key)
 
 
 def touch_user_lexical_index_state(user_id: str) -> str:
@@ -1770,15 +2083,83 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     return source_version
 
 
-def touch_user_search_indexes_state(user_id: str, *, embedding_version: Optional[str] = None) -> None:
-    """Mark the vector, lexical, and tag-embedding indexes stale for user_id.
-    All three are dirtied by the exact same condition today
+_SEARCH_INDEX_KINDS = ('vector', 'lexical')
+
+
+def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
+    return f'{user_id}#{index_kind}'
+
+
+def _mark_search_index_dirty_filenames(user_id: str, filenames) -> None:
+    """Record filenames as dirty for the vector and lexical indexes'
+    incremental rebuilds (kept in separate partitions per index kind so one
+    index's rebuild consuming its dirty set doesn't blind the other to the
+    same changes -- they refresh on independent schedules). Best-effort: a
+    failed write here just means the next rebuild for this user falls back to
+    a full rescan (see _get_dirty_search_index_filenames), not wrong results."""
+    table = _CTX.get('search_index_dirty_table_client')
+    if table is None or not filenames:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    for filename in filenames:
+        filename = str(filename or '').strip()
+        if not filename:
+            continue
+        for kind in _SEARCH_INDEX_KINDS:
+            try:
+                table.upsert_entity({
+                    'PartitionKey': _search_index_dirty_partition_key(user_id, kind),
+                    'RowKey': filename,
+                    'dirtyAt': now,
+                })
+            except Exception:
+                pass
+
+
+def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional[Set[str]]:
+    """Filenames marked dirty for this user's index_kind since its last
+    successful rebuild, or None if the dirty table isn't usable (unconfigured,
+    or the query failed). Callers must treat None as "can't do an incremental
+    merge, fall back to a full rebuild" -- never as "nothing changed"."""
+    table = _CTX.get('search_index_dirty_table_client')
+    if table is None:
+        return None
+    partition_key = _search_index_dirty_partition_key(user_id, index_kind)
+    try:
+        rows = list(table.query_entities(f"PartitionKey eq '{_escape_odata(partition_key)}'"))
+    except Exception:
+        return None
+    return {str(row.get('RowKey') or '') for row in rows if row.get('RowKey')}
+
+
+def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames) -> None:
+    table = _CTX.get('search_index_dirty_table_client')
+    if table is None or not filenames:
+        return
+    partition_key = _search_index_dirty_partition_key(user_id, index_kind)
+    for filename in filenames:
+        try:
+            table.delete_entity(partition_key=partition_key, row_key=filename)
+        except Exception:
+            pass
+
+
+def touch_user_search_indexes_state(
+    user_id: str, *, embedding_version: Optional[str] = None, filenames=None,
+) -> None:
+    """Mark the vector, lexical, and tag-embedding indexes stale for user_id,
+    and (when filenames is given) record exactly which photos changed so the
+    next rebuild of each index can merge in just those instead of re-scanning
+    and re-embedding the user's entire library for a single-photo edit.
+    All three touch_*_state calls are dirtied by the exact same condition today
     (metadata_updates_affect_search_indexes) -- call this instead of either
-    touch_*_state function directly so the triggers can't drift apart
-    at a call site the way the old duplicated field lists already did."""
+    directly so the triggers can't drift apart at a call site the way the old
+    duplicated field lists already did."""
     touch_user_vector_index_state(user_id, embedding_version=embedding_version)
     touch_user_lexical_index_state(user_id)
     touch_user_tag_embedding_index_state(user_id)
+    if filenames:
+        _mark_search_index_dirty_filenames(user_id, filenames if isinstance(filenames, (list, set, tuple)) else [filenames])
 
 
 def _load_lexical_index_manifest(user_id: str) -> Dict[str, str]:
@@ -1862,12 +2243,71 @@ def _build_user_lexical_index_snapshot(user_id: str, source_version: str) -> Opt
     )
 
 
-def refresh_user_lexical_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
+def _merge_user_lexical_index_snapshot(
+    user_id: str, existing: LexicalIndexSnapshot, dirty_filenames: Set[str], source_version: str,
+) -> Optional[LexicalIndexSnapshot]:
+    """Incremental counterpart to _build_user_lexical_index_snapshot: only
+    re-fetch the filenames known to have changed (dirty_filenames) and merge
+    them into the existing snapshot's rows, instead of re-scanning the whole
+    partition. Point-reads instead of a partition scan since the dirty set is
+    expected to be small relative to the library."""
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return None
+    by_filename: Dict[str, Dict[str, object]] = {
+        str(row.get('RowKey') or ''): row for row in existing.rows if row.get('RowKey')
+    }
+
+    def _refresh_one(filename: str) -> Tuple[str, Optional[Dict[str, object]]]:
+        try:
+            row = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            return filename, None
+        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+            return filename, None
+        return filename, {k: v for k, v in dict(row).items() if k not in _LEXICAL_INDEX_EXCLUDED_FIELDS}
+
+    if dirty_filenames:
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty_filenames)))) as executor:
+            for filename, trimmed_row in executor.map(_refresh_one, dirty_filenames):
+                if trimmed_row is None:
+                    by_filename.pop(filename, None)
+                else:
+                    by_filename[filename] = trimmed_row
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_LEXICAL_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=list(by_filename.values()),
+    )
+
+
+def refresh_user_lexical_index(
+    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
+) -> Optional[LexicalIndexSnapshot]:
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
-    snapshot = _build_user_lexical_index_snapshot(key, source_version)
+
+    snapshot = None
+    dirty_to_clear: Optional[Set[str]] = None
+    if not force_full:
+        existing = _load_lexical_index_blob(key)
+        if existing is not None and existing.schema_version == _LEXICAL_INDEX_SCHEMA_VERSION:
+            dirty = _get_dirty_search_index_filenames(key, 'lexical')
+            if dirty is not None:
+                snapshot = _merge_user_lexical_index_snapshot(key, existing, dirty, source_version)
+                if snapshot is not None:
+                    dirty_to_clear = dirty
+    if snapshot is None:
+        snapshot = _build_user_lexical_index_snapshot(key, source_version)
+        if snapshot is not None:
+            # A full rebuild reflects every currently-dirty filename too -- see
+            # the identical comment in refresh_user_vector_index.
+            dirty_to_clear = _get_dirty_search_index_filenames(key, 'lexical') or set()
     if snapshot is None:
         return None
     container_name = _lexical_index_container_name()
@@ -1907,6 +2347,9 @@ def refresh_user_lexical_index(user_id: str, *, source_version: Optional[str] = 
             'updated_at': snapshot.updated_at,
             'rows': snapshot.rows,
         }
+    _write_user_listing_index(key, snapshot)
+    if dirty_to_clear:
+        _clear_dirty_search_index_filenames(key, 'lexical', dirty_to_clear)
     return snapshot
 
 
@@ -3632,14 +4075,22 @@ def _apply_client_processing_results(
 
     if status_updates:
         metadata.update(status_updates)
-    metadata_table_client.upsert_entity(metadata)
-    # A full eager refresh here would rescan and re-embed the user's whole
-    # library on every single photo (measured at ~20s for a ~6k-photo
-    # library) -- the same per-photo full-library-work bug already fixed
-    # once for clustering and once for the people/face scan cache. Just mark
-    # both search indexes stale; their lazy get_user_*_index paths rebuild
-    # once, on demand, the next time someone actually searches.
-    touch_user_search_indexes_state(user_id)
+    _extract_and_store_embeddings(user_id, filename, metadata)
+    # Conditional on the etag the caller's get_entity read -- unlike
+    # _update_metadata_fields/update_processing_status, this function derives
+    # `metadata` through ~100 lines of report/AI-vision merge logic before
+    # this one write, so a conflict here can't cheaply be retried by just
+    # re-reading and reapplying. Let it raise instead of silently clobbering a
+    # concurrent write (a user edit, another step) -- the caller
+    # (apply_client_processing_results_for_file) already unsticks the claimed
+    # steps and re-raises, and the queue's own redelivery/retry handles
+    # re-running this from a fresh read.
+    metadata_table_client.update_entity(metadata, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+    # An eager refresh here would rescan the user's whole library on every
+    # single photo. Just mark both search indexes stale for this one filename;
+    # their lazy get_user_*_index paths rebuild on demand, incrementally
+    # merging just the dirty filenames instead of re-embedding everything.
+    touch_user_search_indexes_state(user_id, filenames=filename)
 
 
 def _unstick_claimed_steps_still_running(
@@ -3924,22 +4375,39 @@ def _finalize_server_side_exif(user_id: str, filename: str, image_bytes: bytes, 
     immediately for formats the browser can't reliably self-report (video,
     RAW), instead of waiting on client-side processing."""
     metadata_table_client = _CTX['metadata_table_client']
-    entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    status_updates = _apply_server_exif_fallback(user_id, filename, entity, image_bytes, fallback_for=fallback_for)
-    for field, value in status_updates.items():
-        entity[field] = value
-    entity['exif_status'] = str(status_updates.get('exif_status') or 'no_data')
-    try:
-        _refresh_semantic_fields(filename, entity)
-    except Exception:
-        pass
-    entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-    metadata_table_client.upsert_entity(entity)
+    for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        status_updates = _apply_server_exif_fallback(user_id, filename, entity, image_bytes, fallback_for=fallback_for)
+        for field, value in status_updates.items():
+            entity[field] = value
+        entity['exif_status'] = str(status_updates.get('exif_status') or 'no_data')
+        try:
+            _refresh_semantic_fields(filename, entity)
+        except Exception:
+            pass
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        _extract_and_store_embeddings(user_id, filename, entity)
+        try:
+            # Conditional on the etag just read -- see _update_metadata_fields's
+            # identical comment. Unlike apply_client_processing_results_for_file,
+            # this function's whole derivation is cheap to redo from a fresh
+            # read (no network re-fetch -- image_bytes is already in hand), so
+            # a conflict is retried in place instead of raised.
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            break
+        except ResourceModifiedError:
+            import time
+            time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
+            continue
+        except ResourceNotFoundError:
+            return  # deleted between our read and this write -- nothing left to update
+    else:
+        return
     # Unlike apply_client_processing_results_for_file, this path writes location/
     # semantic fields directly and was the one caller that never marked the
     # cached search indexes stale -- a video's geocoded location silently never
     # became searchable until something unrelated dirtied the index.
-    touch_user_search_indexes_state(user_id)
+    touch_user_search_indexes_state(user_id, filenames=filename)
 
 
 PROCESSING_STEPS = (*BROWSER_PROCESSING_STEPS, 'verify')
@@ -3958,31 +4426,44 @@ def update_processing_status(
 ) -> None:
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
-        return
-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
-        return
+    for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            return
+        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+            return
 
-    status_field = f'{step}_status'
-    entity[status_field] = status
+        status_field = f'{step}_status'
+        entity[status_field] = status
 
-    processing = _safe_json_load(entity.get('processing_metadata'))
+        processing = _safe_json_load(entity.get('processing_metadata'))
 
-    if result is not None:
-        processing[step] = result
-    elif status == 'no_data':
-        processing[step] = None
+        if result is not None:
+            processing[step] = result
+        elif status == 'no_data':
+            processing[step] = None
 
-    if error:
-        entity['last_error'] = str(error)
-        if increment_retry:
-            entity['retry_count'] = int(entity.get('retry_count', 0) or 0) + 1
+        if error:
+            entity['last_error'] = str(error)
+            if increment_retry:
+                entity['retry_count'] = int(entity.get('retry_count', 0) or 0) + 1
 
-    entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
-    entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-    metadata_table_client.upsert_entity(entity)
+        entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        try:
+            # Conditional on the etag just read -- see _update_metadata_fields's
+            # identical comment. A concurrent writer (another ipwork step, a
+            # user edit) between the read and this write loses this attempt
+            # and retries against a fresh read instead of clobbering it.
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            return
+        except ResourceModifiedError:
+            import time
+            time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
+            continue
+        except ResourceNotFoundError:
+            return  # deleted between our read and this write -- nothing left to update
 
 
 def _processing_is_expired(entity: Dict) -> bool:
@@ -4013,46 +4494,66 @@ def claim_processing_lease(
     steps: Optional[List[str]] = None,
     mark_running: bool = True,
 ) -> Dict:
+    """Claim (or renew) the processing lease on a photo.
+
+    The ownership check and the write used to be two separate steps -- read,
+    decide, then a differently-retried _update_metadata_fields call that
+    blindly reapplied the same fields on conflict without re-checking
+    ownership. Two concurrent claims could both pass the check before either
+    wrote, and a losing retry would still stomp the winner's claim. Both the
+    check and the write now happen inside the same retry-on-conflict loop,
+    re-validated against a fresh read every attempt, so a losing racer's
+    retry correctly sees the winner's claim and raises instead of overwriting
+    it.
+    """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
-        raise PhotoNotFoundError('Photo not found.')
-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
-        raise PhotoNotFoundError('Photo has been deleted.')
-
-    lease_expired = _processing_is_expired(entity)
-    current_owner = str(entity.get('processing_lease_owner') or '').strip()
-    if current_owner and current_owner != owner_id and not lease_expired:
-        raise RuntimeError('Processing lease is already held by another client.')
-
-    if mark_running:
-        requested_steps = tuple(step for step in (steps or list(BROWSER_PROCESSING_STEPS)) if step in BROWSER_PROCESSING_STEPS)
-        for step in requested_steps:
-            field = f'{step}_status'
-            current_status = str(entity.get(field) or 'pending').strip().lower()
-            if current_status == 'running' and lease_expired:
-                current_status = 'pending'
-            if current_status not in {'done', 'no_data', 'deleted', 'skipped', 'unsupported'}:
-                entity[field] = 'running'
-
+    requested_steps = tuple(step for step in (steps or list(BROWSER_PROCESSING_STEPS)) if step in BROWSER_PROCESSING_STEPS)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(30, int(lease_seconds or CLIENT_PROCESSING_LEASE_SECONDS)))
-    updated = _update_metadata_fields(user_id, filename, {
-        'processing_lease_owner': owner_id,
-        'processing_lease': owner_id,
-        'processing_lease_expires_at': expires_at.isoformat(),
-        **({
-            f'{step}_status': 'running'
-            for step in (steps or list(BROWSER_PROCESSING_STEPS))
-            if mark_running and step in BROWSER_PROCESSING_STEPS and str(entity.get(f'{step}_status') or 'pending').strip().lower() not in {'done', 'no_data', 'deleted', 'skipped', 'unsupported'}
-        } if mark_running else {}),
-    })
+
+    for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            raise PhotoNotFoundError('Photo not found.')
+        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+            raise PhotoNotFoundError('Photo has been deleted.')
+
+        lease_expired = _processing_is_expired(entity)
+        current_owner = str(entity.get('processing_lease_owner') or '').strip()
+        if current_owner and current_owner != owner_id and not lease_expired:
+            raise RuntimeError('Processing lease is already held by another client.')
+
+        if mark_running:
+            for step in requested_steps:
+                field = f'{step}_status'
+                current_status = str(entity.get(field) or 'pending').strip().lower()
+                if current_status == 'running' and lease_expired:
+                    current_status = 'pending'
+                if current_status not in {'done', 'no_data', 'deleted', 'skipped', 'unsupported'}:
+                    entity[field] = 'running'
+
+        entity['processing_lease_owner'] = owner_id
+        entity['processing_lease'] = owner_id
+        entity['processing_lease_expires_at'] = expires_at.isoformat()
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        try:
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            break
+        except ResourceModifiedError:
+            import time
+            time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
+            continue
+        except ResourceNotFoundError as exc:
+            raise PhotoNotFoundError('Photo has been deleted.') from exc
+    else:
+        raise RuntimeError(f'Concurrent modification claiming lease on {user_id}/{filename}')
+
     return {
         'filename': filename,
         'ownerId': owner_id,
-        'leaseExpiresAt': updated.get('processing_lease_expires_at', ''),
-        'statuses': {f'{step}Status': updated.get(f'{step}_status', 'pending') for step in PROCESSING_STEPS},
+        'leaseExpiresAt': entity.get('processing_lease_expires_at', ''),
+        'statuses': {f'{step}Status': entity.get(f'{step}_status', 'pending') for step in PROCESSING_STEPS},
     }
 
 
@@ -4072,22 +4573,34 @@ def heartbeat_processing_lease(user_id: str, filename: str, owner_id: str, *, le
 
 
 def release_processing_lease(user_id: str, filename: str, owner_id: str) -> None:
+    """Ownership re-checked against a fresh read on every retry attempt (see
+    claim_processing_lease's docstring) -- otherwise a stale pre-check could
+    release a lease someone else has since (re)claimed."""
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
-        return
-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
-        return
-    current_owner = str(entity.get('processing_lease_owner') or entity.get('processing_lease') or '').strip()
-    if current_owner and current_owner != owner_id:
-        return
-    _update_metadata_fields(user_id, filename, {
-        'processing_lease_owner': '',
-        'processing_lease': '',
-        'processing_lease_expires_at': '',
-    })
+    for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            return
+        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+            return
+        current_owner = str(entity.get('processing_lease_owner') or entity.get('processing_lease') or '').strip()
+        if current_owner and current_owner != owner_id:
+            return
+        entity['processing_lease_owner'] = ''
+        entity['processing_lease'] = ''
+        entity['processing_lease_expires_at'] = ''
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        try:
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            return
+        except ResourceModifiedError:
+            import time
+            time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
+            continue
+        except ResourceNotFoundError:
+            return
 
 
 def refresh_metadata_entity(user_id: str, filename: str, updates: Dict) -> None:
@@ -4231,6 +4744,62 @@ def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) ->
     except Exception:
         # On error, fall back to original filename to avoid blocking uploads.
         return filename
+
+
+_EMBEDDING_FIELDS = ('photoEmbedding', 'photoEmbeddingVersion', 'semanticEmbedding', 'semanticEmbeddingVersion')
+
+
+def _extract_and_store_embeddings(user_id: str, filename: str, entity: Dict) -> None:
+    """Pop the embedding columns off ``entity`` (in place) and persist them to
+    EMBEDDINGS_TABLE instead, so they never land on the photometadata row.
+    Call this immediately before every metadata_table_client.upsert_entity(entity)
+    that might carry photoEmbedding/semanticEmbedding -- these are large JSON
+    float-array columns read only by the vector-index rebuild and a rare
+    cold-start fallback, never by gallery/lexical-search browsing, so keeping
+    them on the display row only bloats every full-row read for no benefit."""
+    embeddings_table_client = _CTX.get('embeddings_table_client')
+    values = {field: entity.pop(field, None) for field in _EMBEDDING_FIELDS}
+    if not any(v is not None for v in values.values()):
+        return
+    if embeddings_table_client is None:
+        # No embeddings table configured (e.g. older deploy) -- put the fields
+        # back rather than silently dropping real embedding data on the floor.
+        entity.update({k: v for k, v in values.items() if v is not None})
+        return
+    try:
+        embeddings_table_client.upsert_entity({
+            'PartitionKey': user_id,
+            'RowKey': filename,
+            **{k: v for k, v in values.items() if v is not None},
+        })
+    except Exception:
+        pass
+
+
+def delete_embeddings_entry(user_id: str, filename: str) -> None:
+    """Drop a deleted photo's row from EMBEDDINGS_TABLE. Mirrors
+    delete_hash_index_entry/delete_filename_owner_entry."""
+    embeddings_table_client = _CTX.get('embeddings_table_client')
+    if embeddings_table_client is None or not filename:
+        return
+    try:
+        embeddings_table_client.delete_entity(partition_key=user_id, row_key=filename)
+    except Exception:
+        pass
+
+
+def get_photo_embeddings(user_id: str, filename: str) -> Dict[str, object]:
+    """Point-read a single photo's embedding columns from EMBEDDINGS_TABLE.
+    Used by the vector-index rebuild and app.py's cold-start search fallback,
+    which used to read these straight off the photometadata row."""
+    embeddings_table_client = _CTX.get('embeddings_table_client')
+    if embeddings_table_client is None or not filename:
+        return {}
+    try:
+        entity = embeddings_table_client.get_entity(partition_key=user_id, row_key=filename)
+    except Exception:
+        return {}
+    return {field: entity.get(field) for field in _EMBEDDING_FIELDS}
 
 
 def _store_hash_index(user_id: str, file_hash: str, filename: str) -> None:

@@ -172,7 +172,7 @@ def test_vector_index_rebuild_route_enqueues_then_worker_populates_result(env, m
         embedding_version = 'adaface1'
         updated_at = '2026-09-16T00:00:00+00:00'
 
-    monkeypatch.setattr(app, 'refresh_user_vector_index', lambda user_id: _FakeSnapshot())
+    monkeypatch.setattr(app, 'refresh_user_vector_index', lambda user_id, **kwargs: _FakeSnapshot())
 
     with app.app.test_request_context(
         '/api/admin/vector-index/rebuild', method='POST',
@@ -196,7 +196,7 @@ def test_vector_index_rebuild_route_enqueues_then_worker_populates_result(env, m
 
 def test_vector_index_rebuild_worker_handles_no_embeddings(env, monkeypatch):
     table, queue = env
-    monkeypatch.setattr(app, 'refresh_user_vector_index', lambda user_id: None)
+    monkeypatch.setattr(app, 'refresh_user_vector_index', lambda user_id, **kwargs: None)
 
     job_id = 'cluster:owner:vecempty'
     payload = {'jobId': job_id, 'user_id': 'owner', 'type': 'vector_index_rebuild'}

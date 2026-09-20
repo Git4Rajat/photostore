@@ -649,7 +649,7 @@ def search_photos():
         # in full -- neither can veto the other.
         exif_data = app.parse_exif_data(row.get('exifData', '{}'))
         score, lexical_score, semantic_text = app._score_search_row(
-            tokens, filename, row, exif_data,
+            user_id, tokens, filename, row, exif_data,
             query_embedding=query_embedding,
             vector_scores=vector_scores,
             current_embedding_version=current_embedding_version,
@@ -900,6 +900,7 @@ def delete_multiple_photos():
             if file_hash:
                 app.delete_hash_index_entry(user_id, file_hash)
             app.delete_filename_owner_entry(user_id, safe_name)
+            app.delete_embeddings_entry(user_id, safe_name)
         elif not removed_any:
             return safe_name, 'not_found', ''
 
@@ -980,7 +981,7 @@ def delete_multiple_photos():
         # vector index dirty since the library's photo set changed.
         app._invalidate_metadata_scan_cache(user_id)
         try:
-            app.touch_user_search_indexes_state(user_id)
+            app.touch_user_search_indexes_state(user_id, filenames=deleted)
         except Exception:
             pass
 

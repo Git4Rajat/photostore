@@ -26,7 +26,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
 
 from azure.core import MatchConditions
-from azure.core.exceptions import AzureError, ResourceExistsError, ResourceModifiedError
+from azure.core.exceptions import AzureError, ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import (
@@ -70,6 +70,10 @@ from search_utils import (
 from storage_utils import (
     configure_storage,
     apply_client_processing_results_for_file,
+    get_photo_embeddings,
+    delete_embeddings_entry,
+    PHOTO_LIST_SELECT_FIELDS,
+    get_user_listing_index,
     download_media_bytes,
     upload_file_to_blob,
     download_file_from_blob,
@@ -351,6 +355,24 @@ STORAGE_CONNECTION_STRING = os.getenv('AZURE_STORAGE_CONNECTION_STRING') or os.g
 IMAGE_CONTAINER = os.getenv('IMAGE_CONTAINER', 'images')
 THUMBNAIL_CONTAINER = os.getenv('THUMBNAIL_CONTAINER', 'thumbnails')
 METADATA_TABLE = os.getenv('METADATA_TABLE', 'photometadata')
+# Per-photo embedding vectors: PartitionKey=user_id, RowKey=filename. Split out
+# of METADATA_TABLE because these are large JSON float-array columns read only
+# by the vector-index rebuild (and a rare cold-start fallback), never by
+# gallery/lexical-search browsing -- keeping them on the display row bloated
+# every full-row read/scan for no benefit to the reader. See storage_utils.py's
+# _extract_and_store_embeddings.
+EMBEDDINGS_TABLE = os.getenv('EMBEDDINGS_TABLE', 'photoembeddings')
+# Dirty-set tracking for incremental search-index rebuilds: PartitionKey=
+# f"{user_id}#vector" or f"{user_id}#lexical", RowKey=filename. The vector and
+# lexical indexes used to be rebuilt as an all-or-nothing full re-scan/re-embed
+# of the whole library on ANY single-photo edit (a rating change on 1 photo
+# re-embedded the other 35,999). Each edit now marks just its own filename
+# dirty in both partitions; a rebuild only re-fetches/re-embeds the dirty set
+# and merges it into the existing snapshot, clearing its own partition when
+# done -- kept separate per index kind so the vector rebuild consuming its
+# dirty set doesn't blind the lexical rebuild to the same changes (they run on
+# independent schedules). See touch_user_search_indexes_state.
+SEARCH_INDEX_DIRTY_TABLE = os.getenv('SEARCH_INDEX_DIRTY_TABLE', 'photosearchdirty')
 ALBUMS_TABLE = os.getenv('ALBUMS_TABLE', 'photoalbums')
 # Public-share-link index: PartitionKey=publicToken, RowKey='owner' -> (userId,
 # albumId), so a public share view is an O(1) point read instead of an
@@ -871,6 +893,8 @@ PHOTO_PROPS_BACKFILL_MAX_PER_REQUEST = int(os.getenv('PHOTO_PROPS_BACKFILL_MAX_P
 account_name = None
 credential = None
 metadata_table_client = None
+embeddings_table_client = None
+search_index_dirty_table_client = None
 blob_service_client = None
 albums_table_client = None
 face_table_client = None
@@ -1124,6 +1148,8 @@ def _init_storage_clients():
     global workbench_actions_table_client
     global image_names_table_client
     global hash_index_table_client, filename_owners_table_client
+    global embeddings_table_client
+    global search_index_dirty_table_client
     global config_table_client
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
@@ -1135,6 +1161,8 @@ def _init_storage_clients():
     if STORAGE_CONNECTION_STRING:
         tbl_svc = TableServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         metadata_table_client_local = tbl_svc.get_table_client(METADATA_TABLE)
+        embeddings_table_client_local = tbl_svc.get_table_client(EMBEDDINGS_TABLE)
+        search_index_dirty_table_client_local = tbl_svc.get_table_client(SEARCH_INDEX_DIRTY_TABLE)
         albums_table_client_local = tbl_svc.get_table_client(ALBUMS_TABLE)
         album_token_index_table_client_local = tbl_svc.get_table_client(ALBUM_TOKEN_INDEX_TABLE)
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
@@ -1192,6 +1220,8 @@ def _init_storage_clients():
             connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
         )
         metadata_table_client_local = tbl_svc.get_table_client(METADATA_TABLE)
+        embeddings_table_client_local = tbl_svc.get_table_client(EMBEDDINGS_TABLE)
+        search_index_dirty_table_client_local = tbl_svc.get_table_client(SEARCH_INDEX_DIRTY_TABLE)
         albums_table_client_local = tbl_svc.get_table_client(ALBUMS_TABLE)
         album_token_index_table_client_local = tbl_svc.get_table_client(ALBUM_TOKEN_INDEX_TABLE)
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
@@ -1212,6 +1242,8 @@ def _init_storage_clients():
 
     # assign to globals
     metadata_table_client = metadata_table_client_local
+    embeddings_table_client = embeddings_table_client_local
+    search_index_dirty_table_client = search_index_dirty_table_client_local
     config_table_client = config_table_client_local
     blob_service_client = blob_service_client_local
     albums_table_client = albums_table_client_local
@@ -1298,6 +1330,8 @@ def _init_storage_clients():
         image_names_table_client=image_names_table_client,
         hash_index_table_client=hash_index_table_client,
         filename_owners_table_client=filename_owners_table_client,
+        embeddings_table_client=embeddings_table_client,
+        search_index_dirty_table_client=search_index_dirty_table_client,
         queue_map_on_upload=(MAPS_QUEUE_ON_UPLOAD and not MAPS_ON_UPLOAD),
         # Lambda, not a direct reference: _load_user_face_summary_by_id is
         # defined later in this module than this call runs at import time --
@@ -1395,6 +1429,22 @@ def create_image_names_table() -> None:
     try:
         svc = _ensure_table_service_client()
         svc.create_table_if_not_exists(table_name=IMAGE_NAMES_TABLE)
+    except AzureError:
+        pass
+
+
+def create_embeddings_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=EMBEDDINGS_TABLE)
+    except AzureError:
+        pass
+
+
+def create_search_index_dirty_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=SEARCH_INDEX_DIRTY_TABLE)
     except AzureError:
         pass
 
@@ -2192,6 +2242,7 @@ def _parse_embedding(value) -> List[float]:
 
 
 def _semantic_embedding_for_row(
+    user_id: str,
     filename: str,
     metadata: Dict,
     current_version: str,
@@ -2201,18 +2252,25 @@ def _semantic_embedding_for_row(
     semantic_text = str(metadata.get('semanticText') or '').strip()
     if not semantic_text:
         semantic_text = build_semantic_text(filename, metadata)
+    # Embeddings live in EMBEDDINGS_TABLE now, not on the row (see
+    # _extract_and_store_embeddings) -- this cold-start fallback (vector index
+    # not yet built) only ever sees them on `metadata` for rows written before
+    # that table existed, so fall back to a point-read against the new table.
+    embedding_row = metadata if (metadata.get('photoEmbedding') or metadata.get('semanticEmbedding')) else (
+        get_photo_embeddings(user_id, filename) or metadata
+    )
     # A real image embedding (from the browser's CLIP encoder) is a much stronger
     # semantic signal than an embedding of the tag list, and doesn't inherit tag
     # mistakes. Use it whenever it shares the active embedding's vector space.
     if (
         vision_utils.get_text_embedding_dimension() == PHOTO_EMBEDDING_DIMENSION
-        and str(metadata.get('photoEmbeddingVersion') or '').strip() == PHOTO_EMBEDDING_MODEL_VERSION
+        and str(embedding_row.get('photoEmbeddingVersion') or '').strip() == PHOTO_EMBEDDING_MODEL_VERSION
     ):
-        photo_embedding = _parse_embedding(metadata.get('photoEmbedding', '[]'))
+        photo_embedding = _parse_embedding(embedding_row.get('photoEmbedding', '[]'))
         if len(photo_embedding) == PHOTO_EMBEDDING_DIMENSION:
             return photo_embedding, semantic_text
-    stored_version = str(metadata.get('semanticEmbeddingVersion') or '').strip()
-    stored_embedding = _parse_embedding(metadata.get('semanticEmbedding', '[]'))
+    stored_version = str(embedding_row.get('semanticEmbeddingVersion') or '').strip()
+    stored_embedding = _parse_embedding(embedding_row.get('semanticEmbedding', '[]'))
     if stored_embedding and stored_version == current_version:
         return stored_embedding, semantic_text
     if not allow_compute:
@@ -2575,11 +2633,16 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
         entity.update(updates or {})
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         try:
-            metadata_table_client.upsert_entity(entity)
+            # Conditional on the etag just read -- see _update_metadata_fields's
+            # identical comment in storage_utils.py.
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             _invalidate_metadata_scan_cache(user_id)
             if metadata_updates_affect_search_indexes(updates or {}):
-                touch_user_search_indexes_state(user_id)
+                touch_user_search_indexes_state(user_id, filenames=filename)
             return entity
+        except ResourceNotFoundError:
+            # Deleted between our read and this write -- nothing left to retry.
+            return None
         except Exception as exc:
             last_exc = exc
             time.sleep(0.05 * (2 ** attempt))
@@ -3096,19 +3159,9 @@ _photo_default_sort_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
 # rarer albums.smart_create/admin.backfill/uploads.corrupted purposes
 # genuinely need the wider field set, and sharing one cache/select between
 # them and the hot path would either re-bloat the hot path or silently drop
-# fields those purposes rely on.
-PHOTO_LIST_SELECT_FIELDS = [
-    'PartitionKey', 'RowKey',
-    'size', 'lastModified', 'exifData', 'likedBy', 'processing_metadata',
-    'rating', 'likes', 'tags', 'rotation',
-    'latitude', 'longitude', 'address', 'locationCity', 'locationCountry',
-    'exifCount', 'faceCount', 'peopleIds',
-    'preview_status', 'thumbnail_status', 'exif_status', 'ocr_status',
-    'face_status', 'ai_vision_status', 'map_detection_status',
-    'processing_lease_owner', 'processing_lease_expires_at',
-    'anonymousImageId',
-    'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified',
-]
+# fields those purposes rely on. PHOTO_LIST_SELECT_FIELDS itself now lives in
+# storage_utils.py so the "listing" search-index projection can share the
+# exact same field list (see get_user_listing_index).
 _metadata_list_scan_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
 _photo_list_default_sort_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
 
@@ -3148,29 +3201,32 @@ def _cached_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict
     """Narrow-column counterpart of _cached_metadata_rows_for_user -- see
     PHOTO_LIST_SELECT_FIELDS above for which purposes this is safe for.
 
-    Tries the same lazily-rebuilt, blob-persisted lexical index
-    /photos/search already relies on (get_user_lexical_index) before ever
-    falling back to a live Table scan. That index's rows are a superset of
-    PHOTO_LIST_SELECT_FIELDS (it excludes only the embedding columns), and
-    its staleness/rebuild state lives in a blob manifest rather than this
-    process's own memory -- so unlike _metadata_list_scan_cache below, it
-    stays correctly invalidated even when the write (upload/admin) and read
-    (backend/tools) paths run in different container-app processes after the
-    tools/upload/admin service split (see backend-cpu-optimization-2026-09
-    memory). This also removes the ~20s synchronous full-partition scan that
-    a cold _metadata_list_scan_cache used to force onto every first gallery
-    request after a replica restart -- observed live to be the trigger for a
-    ContainerBackOff crash loop under sustained upload traffic (2026-09-17).
-    Only a genuinely cold account (no index has ever been built) still pays
-    the live-scan cost here, matching search_photos's own fallback.
+    Tries the "listing" search-index projection (get_user_listing_index) --
+    the same PHOTO_LIST_SELECT_FIELDS columns, sourced from a small blob
+    derived alongside the full lexical index instead of a live Table scan.
+    Unlike the full lexical index (which /photos/search relies on and which
+    still carries ocrText/tagMetadata/weakTags/objects/faces for every row),
+    this blob never makes plain gallery/timeline browsing pay for search-only
+    fields it doesn't render. Its staleness/rebuild state lives in a blob
+    manifest rather than this process's own memory -- so unlike
+    _metadata_list_scan_cache below, it stays correctly invalidated even when
+    the write (upload/admin) and read (backend/tools) paths run in different
+    container-app processes after the tools/upload/admin service split (see
+    backend-cpu-optimization-2026-09 memory). This also removes the ~20s
+    synchronous full-partition scan that a cold _metadata_list_scan_cache used
+    to force onto every first gallery request after a replica restart --
+    observed live to be the trigger for a ContainerBackOff crash loop under
+    sustained upload traffic (2026-09-17). Only a genuinely cold account (no
+    index has ever been built) still pays the live-scan cost here, matching
+    search_photos's own fallback.
     """
     try:
-        lexical_index = get_user_lexical_index(user_id, allow_refresh=True)
+        listing_index = get_user_listing_index(user_id, allow_refresh=True)
     except Exception:
-        lexical_index = None
-        app.logger.exception('Lexical index lookup failed purpose=%s user=%s, falling back to full scan', purpose, user_id)
-    if lexical_index is not None:
-        return lexical_index.get('rows') or []
+        listing_index = None
+        app.logger.exception('Listing index lookup failed purpose=%s user=%s, falling back to full scan', purpose, user_id)
+    if listing_index is not None:
+        return listing_index.get('rows') or []
     return _metadata_list_scan_cache.get(
         user_id,
         lambda: _query_metadata_rows_for_user(user_id, select=list(PHOTO_LIST_SELECT_FIELDS), purpose=purpose),
@@ -7518,7 +7574,7 @@ def _execute_library_clean(library_id: str) -> Dict:
 
     for client in (metadata_table_client, face_table_client, person_table_client,
                    albums_table_client, merge_table_client, image_names_table_client,
-                   hash_index_table_client):
+                   hash_index_table_client, embeddings_table_client):
         if client is None:
             continue
         # select=[keys only] (+payloadBlobName for merges): merge_table_client's
@@ -9615,7 +9671,7 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> None:
     entity['processing_lease_expires_at'] = ''
     entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
     metadata_table_client.upsert_entity(entity)
-    touch_user_search_indexes_state(user_id)
+    touch_user_search_indexes_state(user_id, filenames=filename)
 
 
 def _delete_upload_temp_files_for_filename(filename: str, upload_id: str = '') -> Tuple[List[str], List[str]]:
@@ -9786,6 +9842,7 @@ def _row_passes_search_filters(
 
 
 def _score_search_row(
+    user_id: str,
     tokens: Dict[str, List[str]],
     filename: str,
     row: Dict,
@@ -9820,6 +9877,7 @@ def _score_search_row(
         semantic_score = vector_scores.get(filename, 0.0)
         if semantic_score <= 0 and not vector_scores:
             row_embedding, semantic_text = _semantic_embedding_for_row(
+                user_id,
                 filename,
                 row,
                 current_embedding_version,
@@ -10453,7 +10511,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         if job_id:
             _upsert_job_status(job_id, user_id, 'vector_index_rebuild', 'running')
         try:
-            snapshot = refresh_user_vector_index(user_id)
+            snapshot = refresh_user_vector_index(user_id, force_full=True)
             if snapshot is None:
                 result = {
                     'status': 'empty',
@@ -11397,7 +11455,7 @@ def _remove_file_quietly(path: str) -> None:
 
 
 # Guard other optional startup helpers to avoid import-time failures
-for _fn in ('create_blob_containers', 'create_metadata_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
+for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
     if _fn in globals() and callable(globals().get(_fn)):
         try:
             globals().get(_fn)()
