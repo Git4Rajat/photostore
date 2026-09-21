@@ -4127,6 +4127,16 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const observerRef = useRef<IntersectionObserver | null>(null);
     const loadMoreRef = useRef<HTMLDivElement | null>(null);
     const photoListRequestSeqRef = useRef<number>(0);
+    // Mirrors the pagination-observer's inputs so that observer can stay a
+    // single, stable instance across scrolling (see the effect below) instead
+    // of reading these off the closure directly.
+    const paginationStateRef = useRef({ hasMore: true, loadingMore: false, loading: false, error: null as string | null, offset: 0, sortBy: 'capture', searchQuery: '' });
+    const fetchPhotosRef = useRef<typeof fetchPhotos | null>(null);
+    // What to re-run when the user hits "retry" on a failed fetch — captured
+    // at failure time so a failed "load more" retries that same page instead
+    // of ErrorState's retry silently resetting to page 0 and discarding
+    // already-loaded photos.
+    const lastFailedFetchRef = useRef({ sort: 'capture', nextOffset: 0, append: false, queryText: '' });
     const hasBootstrappedFiltersRef = useRef<boolean>(false);
     const didInitialRevalidateRef = useRef<boolean>(false);
     const PAGE_SIZE = pageSizeForZoomLevel(24, galleryZoomLevel);
@@ -4233,12 +4243,19 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         const requestSeq = photoListRequestSeqRef.current + 1;
         photoListRequestSeqRef.current = requestSeq;
         const isInitialLoad = nextOffset === 0 && !append;
+        // Clear any previous error as soon as a new attempt starts (not just
+        // for initial loads) — otherwise a retried "load more" that succeeds
+        // would leave the old error banner stuck on screen forever.
+        setError(null);
         if (isInitialLoad) {
             setLoading(true);
-            setError(null);
             setHasMore(true);
             setServerTotalLoaded(false);
             setWarmingUp(false);
+            // A new initial load supersedes any in-flight "load more" request,
+            // whose own finally block will no-op once it sees a newer requestSeq
+            // — clear the flag here so it doesn't get stuck true forever.
+            setLoadingMore(false);
         } else {
             setLoadingMore(true);
         }
@@ -4333,8 +4350,16 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             }
             setWarmingUp(false);
             setError(getUserFacingFetchError(err));
-            // Prevent infinite-scroll from hammering the API when requests are failing.
-            setHasMore(false);
+            lastFailedFetchRef.current = { sort, nextOffset, append, queryText };
+            // A failed initial load has nothing to paginate from, so stop
+            // auto-retrying until the user changes a filter or hits retry. A
+            // failed "load more" leaves hasMore alone (the pagination
+            // observer already gates on `!error`, so it won't hammer the API)
+            // so retrying just re-fetches this same page instead of forcing
+            // the user back to page 0 and losing everything they'd scrolled.
+            if (isInitialLoad) {
+                setHasMore(false);
+            }
         } finally {
             if (requestSeq === photoListRequestSeqRef.current) {
                 if (isInitialLoad) {
@@ -4345,6 +4370,11 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             }
         }
     }, [sortBy, filters, searchQuery, buildCaptureQuery, galleryZoomLevel]);
+
+    useEffect(() => {
+        paginationStateRef.current = { hasMore, loadingMore, loading, error, offset, sortBy, searchQuery };
+    }, [hasMore, loadingMore, loading, error, offset, sortBy, searchQuery]);
+    useEffect(() => { fetchPhotosRef.current = fetchPhotos; }, [fetchPhotos]);
 
     // Deep link from another page ("view in library" on a photo tile) — an exact
     // point lookup rather than reusing the fuzzy/semantic search endpoint, so it
@@ -4676,9 +4706,26 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         // — the previous 0px default made every page boundary a visible
         // stall while the round trip ran. Same pattern as FaceClusters.tsx's
         // pagination observer.
+        //
+        // Deliberately a single stable instance for the component's life
+        // (empty deps below), reading current values from paginationStateRef/
+        // fetchPhotosRef instead of closing over hasMore/loadingMore/etc.
+        // directly. Those used to be effect dependencies, so the observer was
+        // torn down and recreated on every loadingMore/loading toggle — i.e.
+        // on every single page fetch. During a fast scroll the sentinel can
+        // still be inside the generous 1200px rootMargin when a freshly
+        // created observer immediately re-evaluates it, and disconnecting the
+        // old instance doesn't reliably cancel a callback the browser had
+        // already scheduled for it — so two overlapping observers could both
+        // fire for the same offset before either fetch advanced it. Confirmed
+        // live via forenkla2-qa telemetry: every page fetched exactly twice
+        // for the back half of a fast-scroll session, driving backend to its
+        // max replica count. A stable observer removes the recreate churn
+        // entirely.
         observerRef.current = new IntersectionObserver(entries => {
+            const { hasMore, loadingMore, loading, error, offset, sortBy, searchQuery } = paginationStateRef.current;
             if (entries[0].isIntersecting && hasMore && !loadingMore && !loading && !error) {
-                fetchPhotos(sortBy, offset, true, searchQuery);
+                fetchPhotosRef.current?.(sortBy, offset, true, searchQuery);
             }
         }, { threshold: 0.1, rootMargin: '1200px 0px' });
 
@@ -4691,7 +4738,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 observerRef.current.disconnect();
             }
         };
-    }, [hasMore, loadingMore, loading, error, fetchPhotos, sortBy, offset, searchQuery]);
+    }, []);
 
     useEffect(() => {
         if (!didInitialRevalidateRef.current) {
@@ -5395,9 +5442,12 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             )}
             {error && (
                 <ErrorState
-                    title="Couldn't load your photos"
+                    title={lastFailedFetchRef.current.append ? "Couldn't load more photos" : "Couldn't load your photos"}
                     message={error}
-                    onRetry={() => fetchPhotos(sortBy, 0, false, searchQuery)}
+                    onRetry={() => {
+                        const retry = lastFailedFetchRef.current;
+                        fetchPhotos(retry.sort, retry.nextOffset, retry.append, retry.queryText);
+                    }}
                 />
             )}
             {!loading && !error && searchNotice && <p className="status">{searchNotice}</p>}
@@ -5562,7 +5612,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             )}
 
             <div ref={loadMoreRef} className="load-more">
-                {hasMore && !loading && !loadingMore && (
+                {hasMore && !loading && !loadingMore && !error && (
                     <button
                         type="button"
                         onClick={() => fetchPhotos(sortBy, offset, true, searchQuery)}
