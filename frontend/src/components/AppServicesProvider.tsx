@@ -82,6 +82,15 @@ const JOB_POLL_MAX_MS = 20 * 60 * 1000;
 // gone quiet.
 const CLUSTER_FLUSH_QUIET_MS = 40000;
 
+// Same "steady trickle shouldn't look like starting/stopping" reasoning as
+// CLUSTER_FLUSH_QUIET_MS: ipwork runs one job row per photo, so a 'both'-mode
+// or 'backend'-mode batch has real gaps between individual job completions.
+// Debounce the "finished" transition on the standalone server-processing
+// notification (see ipworkProcessingNotificationIdRef) by this long before
+// declaring it done, so it doesn't flap started/finished/started across a
+// single upload's worth of per-photo jobs.
+const IPWORK_PROCESSING_FINALIZE_QUIET_MS = 40000;
+
 // A freshly-opened tab can fail the browser AI model load once even though
 // nothing is actually broken -- WASM/manifest fetches racing the rest of page
 // load, a momentary network blip. Retry a couple of times behind a visible
@@ -1137,6 +1146,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // ipworker still has photos left to process, more per-photo clustering
     // completions are likely still coming.
     const ipworkJobsInFlightRef = useRef<boolean>(false);
+    // Id of the standalone "server processing" bell notification, distinct from
+    // browserProcessingNotificationRef -- surfaces backend/ipworker activity on
+    // its own even when the browser is concurrently processing the same batch
+    // (processingMode 'both'), instead of folding it into the browser
+    // notification's text. There is no reliable total/remaining count for
+    // ipwork jobs (see ipworkActivityLabel's comment: /api/jobs/status caps at
+    // 50 rows), so this is presence-only -- started/finished, no progress bar.
+    const ipworkProcessingNotificationIdRef = useRef<string | null>(null);
+    // Pending debounced "finished" finalize for the above (see
+    // IPWORK_PROCESSING_FINALIZE_QUIET_MS).
+    const ipworkProcessingFinalizeTimerRef = useRef<number | null>(null);
 
     const flushClusterCompletions = useCallback(() => {
         if (clusterFlushTimerRef.current !== null) {
@@ -1265,7 +1285,35 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (changed) {
                 persistSeenJobIds(seen);
             }
-            ipworkJobsInFlightRef.current = inFlight.some((job) => job.kind === 'ipwork');
+            const ipworkInFlightNow = inFlight.some((job) => job.kind === 'ipwork');
+            if (ipworkInFlightNow) {
+                // Real activity -- cancel any debounced "finished" finalize so it
+                // doesn't fire out from under this notification (mirrors
+                // browserProcessingFinalizeTimerRef's handling above).
+                if (ipworkProcessingFinalizeTimerRef.current !== null) {
+                    window.clearTimeout(ipworkProcessingFinalizeTimerRef.current);
+                    ipworkProcessingFinalizeTimerRef.current = null;
+                }
+                if (!ipworkProcessingNotificationIdRef.current) {
+                    ipworkProcessingNotificationIdRef.current = addNotification(
+                        'Server processing started',
+                        'Photos are being processed on the server.',
+                    );
+                }
+            } else if (ipworkProcessingNotificationIdRef.current && ipworkProcessingFinalizeTimerRef.current === null) {
+                const notificationId = ipworkProcessingNotificationIdRef.current;
+                ipworkProcessingFinalizeTimerRef.current = window.setTimeout(() => {
+                    ipworkProcessingFinalizeTimerRef.current = null;
+                    updateNotification(notificationId, {
+                        title: 'Server processing finished',
+                        details: 'Server-side photo processing finished.',
+                    });
+                    if (ipworkProcessingNotificationIdRef.current === notificationId) {
+                        ipworkProcessingNotificationIdRef.current = null;
+                    }
+                }, IPWORK_PROCESSING_FINALIZE_QUIET_MS);
+            }
+            ipworkJobsInFlightRef.current = ipworkInFlightNow;
             // Publish the in-flight set so the People page + global pill can show
             // that clustering is running. Terminal jobs are excluded, so this
             // empties (hiding the indicator) on the poll that observes completion.
@@ -1281,7 +1329,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         } finally {
             jobPollInFlightRef.current = false;
         }
-    }, [addNotification, scheduleClusterFlush]);
+    }, [addNotification, updateNotification, scheduleClusterFlush]);
 
     const stopJobPolling = useCallback(() => {
         if (jobPollTimerRef.current !== null) {
@@ -1352,6 +1400,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 window.clearTimeout(browserProcessingFinalizeTimerRef.current);
                 browserProcessingFinalizeTimerRef.current = null;
             }
+            if (ipworkProcessingFinalizeTimerRef.current !== null) {
+                window.clearTimeout(ipworkProcessingFinalizeTimerRef.current);
+                ipworkProcessingFinalizeTimerRef.current = null;
+            }
         };
     }, [startJobPolling, stopJobPolling]);
 
@@ -1377,19 +1429,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         // This notification only ever tracks the browser's own claim-and-process
         // loop (see the processingMode/model-availability guards above it never
-        // starts under 'backend' mode), so it is always genuinely local work --
-        // but under 'both' mode the backend's ipworker is racing to claim and
-        // process the same photos server-side at the same time (whichever lands
-        // first wins), so say so instead of implying the browser is the only
-        // thing happening.
-        const mode = getRuntimeConfig().processingMode || 'browser';
-        const details = mode === 'both'
-            ? `Preparing ${pendingRemaining} photo${pendingRemaining === 1 ? '' : 's'} for processing in this browser (also queued on the server).`
-            : `Preparing ${pendingRemaining} photo${pendingRemaining === 1 ? '' : 's'} for processing in this browser.`;
+        // starts under 'backend' mode), so it is always genuinely local work.
+        // Under 'both' mode the backend's ipworker is racing to claim and process
+        // the same photos server-side at the same time (whichever lands first
+        // wins) -- that gets its own standalone notification driven off ipwork
+        // job presence (see ipworkProcessingNotificationIdRef in
+        // pollJobStatusesOnce) rather than a note folded into this one.
         const next: BrowserProcessingNotificationState = {
             id: addNotification(
                 'Processing photos started',
-                details,
+                `Preparing ${pendingRemaining} photo${pendingRemaining === 1 ? '' : 's'} for processing in this browser.`,
                 {
                     uploadedCount: 0,
                     totalCount: pendingRemaining,
