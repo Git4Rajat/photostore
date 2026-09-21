@@ -210,6 +210,11 @@ interface BrowserProcessingNotificationState {
     totalCount: number;
     processedCount: number;
     failedCount: number;
+    // Items that turned out to need no work this pass (e.g. already fully
+    // processed/duplicate by the time this batch ran). Counted as "done" for
+    // display purposes since totalCount already includes them but the normal
+    // processedCount/failedCount increments never fire for them.
+    skippedCount: number;
 }
 
 interface AppServicesContextValue {
@@ -597,7 +602,7 @@ export const browserProcessingActionSteps: Record<BrowserProcessingAction, strin
 // On-device AI steps that require the user to have loaded browser AI. Until then
 // only baseline steps (thumbnail, exif, map geocode) run; these stay pending so
 // they can be backfilled once the model is loaded.
-const BROWSER_AI_GATED_STEPS = new Set(['ocr', 'ai_vision', 'face']);
+export const BROWSER_AI_GATED_STEPS = new Set(['ocr', 'ai_vision', 'face']);
 const ALL_BROWSER_PROCESSING_STEPS = ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
 
 // Restrict the steps a processing pass may run to what the current model state allows.
@@ -1384,6 +1389,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             totalCount: pendingRemaining,
             processedCount: 0,
             failedCount: 0,
+            skippedCount: 0,
         };
         browserProcessingNotificationRef.current = next;
         return next;
@@ -1394,19 +1400,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         status?: string,
         title = 'Processing photos',
     ) => {
+        // Skipped (already-done) items required no work but still count against
+        // totalCount, so fold them into the displayed "processed" figure -- see
+        // BrowserProcessingNotificationState.skippedCount.
+        const displayProcessedCount = state.processedCount + state.skippedCount;
         updateNotification(state.id, {
             title,
             details: formatBrowserProcessingNotificationDetails(
-                state.processedCount,
+                displayProcessedCount,
                 state.totalCount,
                 state.failedCount,
                 status,
             ),
             progress: {
-                uploadedCount: state.processedCount,
+                uploadedCount: displayProcessedCount,
                 totalCount: state.totalCount,
                 failedCount: state.failedCount,
-                skippedDuplicateCount: 0,
+                skippedDuplicateCount: state.skippedCount,
             },
         });
     }, [updateNotification]);
@@ -2035,6 +2045,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (!options.force) {
                     const statuses = item?.statuses || {};
                     if (!hasRunnableBrowserStep(statuses, effectiveSteps) && requestedFilenames.length === 0) {
+                        // All requested steps are already terminal (duplicate/already
+                        // processed by the time this batch ran) -- nothing left to do,
+                        // so count it as done rather than leaving it stuck at 0/N.
+                        browserProcessingNotification.skippedCount += 1;
+                        syncBrowserProcessingNotification(browserProcessingNotification);
                         return;
                     }
                 }
@@ -2273,13 +2288,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 requestJobPoll();
             }
             const hasDeferredWork = browserProcessingDeferredRef.current.size > 0;
-            const hasObservedWork = browserProcessingNotification.processedCount > 0
-                || browserProcessingNotification.failedCount > 0
-                || hasDeferredWork;
+            const reconciledCount = browserProcessingNotification.processedCount
+                + browserProcessingNotification.failedCount
+                + browserProcessingNotification.skippedCount;
+            const hasObservedWork = reconciledCount > 0 || hasDeferredWork;
             const shouldKeepNotification = hasDeferredWork
                 || (isAutomaticPull
                     && hasObservedWork
-                    && browserProcessingNotification.processedCount + browserProcessingNotification.failedCount < browserProcessingNotification.totalCount);
+                    && reconciledCount < browserProcessingNotification.totalCount);
             if (shouldKeepNotification) {
                 syncBrowserProcessingNotification(
                     browserProcessingNotification,
@@ -2296,6 +2312,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 const notificationToFinalize = browserProcessingNotification;
                 browserProcessingFinalizeTimerRef.current = window.setTimeout(() => {
                     browserProcessingFinalizeTimerRef.current = null;
+                    // Some items can go quiet without ever being reconciled (lease lost
+                    // to another tab, no runnable step for the current model state,
+                    // etc.) -- clamp totalCount down to what was actually accounted for
+                    // so "finished" never renders a stuck/empty bar like "0/1". Any
+                    // truly still-pending work resurfaces via the next pending poll.
+                    const finalReconciledCount = notificationToFinalize.processedCount
+                        + notificationToFinalize.failedCount
+                        + notificationToFinalize.skippedCount;
+                    if (finalReconciledCount < notificationToFinalize.totalCount) {
+                        notificationToFinalize.totalCount = finalReconciledCount;
+                    }
                     syncBrowserProcessingNotification(
                         notificationToFinalize,
                         undefined,

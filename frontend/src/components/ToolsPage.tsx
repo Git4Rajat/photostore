@@ -25,7 +25,7 @@ import { getRuntimeConfig } from '../config/appConfig';
 import { requestJobPoll } from '../services/jobNotifications';
 import { plural } from '../utils/format';
 import { confirmDialog } from './shared/dialogs';
-import { useAppServices, browserProcessingActionSteps } from './AppServicesProvider';
+import { useAppServices, browserProcessingActionSteps, BROWSER_AI_GATED_STEPS } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
 import PhotoTile from './shared/PhotoTile';
 import { useThumbnailAccessResolver } from '../services/useThumbnailAccessResolver';
@@ -710,6 +710,21 @@ const ToolsPage: React.FC = () => {
         });
     };
 
+    const formatHistoryTimestamp = (value?: string) => {
+        if (!value) return '';
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) {
+            return value;
+        }
+        return parsed.toLocaleString(undefined, {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+        });
+    };
+
     const formatResolution = (resolution?: ToolPhotoMetadata['resolution']) => {
         const width = Number(resolution?.width || 0);
         const height = Number(resolution?.height || 0);
@@ -886,7 +901,13 @@ const ToolsPage: React.FC = () => {
         setMessage('');
         try {
             const processingMode = getRuntimeConfig().processingMode || 'browser';
-            if (actions.includes('vision') && processingMode !== 'backend' && browserAiModelState.status !== 'available') {
+            const steps = combinedStepsForActions(actions);
+            // OCR and Faces need the on-device AI model just as much as Vision does
+            // (see BROWSER_AI_GATED_STEPS) -- without this, running e.g. "OCR" alone
+            // never loads the model, so restrictStepsForModel() silently strips the
+            // 'ocr' step from every photo and the run is a no-op.
+            const needsBrowserAi = steps.some((step) => BROWSER_AI_GATED_STEPS.has(step));
+            if (needsBrowserAi && processingMode !== 'backend' && browserAiModelState.status !== 'available') {
                 const modelState = await loadBrowserAiModel();
                 if (modelState.status !== 'available') {
                     setMessage(`Browser AI is not available: ${modelState.detail || modelState.reason || modelState.status}.`);
@@ -894,7 +915,6 @@ const ToolsPage: React.FC = () => {
                 }
             }
             setMessage(`Running ${label} on ${plural(filenames.length, 'photo')}…`);
-            const steps = combinedStepsForActions(actions);
             // PROCESSING_MODE 'backend'/'both': startBrowserProcessing alone can no
             // longer (fully) do these steps -- it self-gates every step to a no-op
             // once processingMode !== 'browser' (see runBrowserProcessing in
@@ -2014,7 +2034,7 @@ const ToolsPage: React.FC = () => {
                                 <div className="people-merge-history-title">
                                     <span className="people-merge-chip">{(h.action && runningActionLabels[h.action as ToolAction]) || h.action}</span>
                                     <span className="people-merge-chip">{h.scope} · {plural(h.filenameCount || 0, 'photo')}</span>
-                                    <span className="people-merge-chip">{h.createdAt}</span>
+                                    <span className="people-merge-chip">{formatHistoryTimestamp(h.createdAt)}</span>
                                 </div>
                             </div>
                         </div>

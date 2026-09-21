@@ -99,7 +99,9 @@ export const NotificationBell: React.FC = () => {
                                                 <div
                                                     className="progress-bar"
                                                     style={{
-                                                        width: `${(notification.progress.uploadedCount / notification.progress.totalCount) * 100}%`,
+                                                        width: `${notification.progress.totalCount > 0
+                                                            ? (notification.progress.uploadedCount / notification.progress.totalCount) * 100
+                                                            : 100}%`,
                                                     }}
                                                 />
                                             </div>

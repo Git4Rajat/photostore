@@ -271,6 +271,20 @@ const FaceClusters: React.FC = () => {
         if (mergedLabels.length === 0) return `Merged into ${targetLabel}`;
         return `Merged ${mergedLabels.join(', ')} → ${targetLabel}`;
     };
+    const formatMergeTimestamp = (value?: string) => {
+        if (!value) return '';
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) {
+            return value;
+        }
+        return parsed.toLocaleString(undefined, {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+        });
+    };
 
     const selectedCount = useMemo(() => Object.values(selected).filter(Boolean).length, [selected]);
     const selectedPersonIds = useMemo(() => Object.keys(selected).filter(id => selected[id]), [selected]);
@@ -1404,7 +1418,7 @@ const FaceClusters: React.FC = () => {
                                     <div className="people-merge-history-main">
                                         <div className="people-merge-history-title">
                                             <span className="people-merge-chip">{formatMergeSummary(m)}</span>
-                                            <span className="people-merge-chip">{m.createdAt}</span>
+                                            <span className="people-merge-chip">{formatMergeTimestamp(m.createdAt)}</span>
                                         </div>
                                     </div>
                                     <div className="people-merge-history-actions">
