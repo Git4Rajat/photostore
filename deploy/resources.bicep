@@ -591,6 +591,12 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
             { name: 'SESSION_SECRET', secretRef: 'session-secret' }
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+            // 2026-09-21: public_bp (the /public/album/<token> share page)
+            // moved to the 'extras' role on 2026-09-17, but albums_bp here
+            // still builds the shared publicUrl -- without this, it defaulted
+            // to this app's OWN host, which 404s since backend no longer
+            // serves that route. See public-album-share-preview memory.
+            { name: 'EXTRAS_PUBLIC_BASE_URL', value: 'https://${extras.properties.configuration.ingress.fqdn}' }
           ])
         }
       ]

@@ -429,6 +429,12 @@ SESSION_SECRET = os.getenv('SESSION_SECRET', '') or secrets.token_hex(32)
 SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(30 * 24 * 3600)))
 # Base URL of the web app, used to build password-reset links in emails.
 PUBLIC_APP_BASE_URL = os.getenv('PUBLIC_APP_BASE_URL', '').strip() or SPA_BASE_URL
+# Base URL of the 'extras' role (public_bp lives there, not on 'backend' -- see
+# app.py's APP_ROLE registration block), used to build the /public/album/<token>
+# share link returned to the 'backend' role's own album endpoints. Falls back to
+# this process's own host for single-service deployments where APP_ROLE isn't
+# split and public_bp is registered locally.
+EXTRAS_PUBLIC_BASE_URL = os.getenv('EXTRAS_PUBLIC_BASE_URL', '').strip()
 # When false (the default), the unauthenticated `X-User-ID` header is never trusted as
 # an identity. It may only be used as a local development convenience by explicitly
 # opting in AND leaving auth un-enforced. Any enforced deployment ignores it entirely.
@@ -1726,10 +1732,14 @@ def _album_entity_to_payload(entity: Dict) -> Dict:
     is_expired = _album_is_expired(entity)
     public_url = ''
     if is_public and token and not is_expired:
-        # Points at this backend's own /public/album/<token> share page (not
-        # directly at the SPA) so link-preview bots see the album's real
-        # name/thumbnail; that page then redirects human visitors into the SPA.
-        public_url = f"{request.host_url.rstrip('/')}/public/album/{token}"
+        # Points at the share page's /public/album/<token> route (not directly
+        # at the SPA) so link-preview bots see the album's real name/thumbnail;
+        # that page then redirects human visitors into the SPA. That route
+        # lives on the 'extras' role, not this ('backend') role -- see
+        # EXTRAS_PUBLIC_BASE_URL -- so it must not be built from this
+        # process's own request.host_url.
+        base = EXTRAS_PUBLIC_BASE_URL or request.host_url.rstrip('/')
+        public_url = f"{base.rstrip('/')}/public/album/{token}"
     return {
         'id': entity.get('RowKey'),
         'name': entity.get('name', ''),
