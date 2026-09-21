@@ -4076,16 +4076,21 @@ def _apply_client_processing_results(
     if status_updates:
         metadata.update(status_updates)
     _extract_and_store_embeddings(user_id, filename, metadata)
-    # Conditional on the etag the caller's get_entity read -- unlike
-    # _update_metadata_fields/update_processing_status, this function derives
-    # `metadata` through ~100 lines of report/AI-vision merge logic before
-    # this one write, so a conflict here can't cheaply be retried by just
-    # re-reading and reapplying. Let it raise instead of silently clobbering a
-    # concurrent write (a user edit, another step) -- the caller
-    # (apply_client_processing_results_for_file) already unsticks the claimed
-    # steps and re-raises, and the queue's own redelivery/retry handles
-    # re-running this from a fresh read.
-    metadata_table_client.update_entity(metadata, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+    # Deliberately NOT a conditional/etag-checked write: mark_step_done/
+    # mark_step_no_data calls above (see their call sites throughout this
+    # function) each do their OWN immediate, independent upsert against this
+    # same row as they run -- by design, per _unstick_claimed_steps_still_running's
+    # docstring, so partial work survives a crash before this function
+    # reaches its own final write. Those intermediate writes bump the row's
+    # real etag every time, but `metadata`'s etag was captured once, back
+    # when apply_client_processing_results_for_file first read it -- making
+    # a conditional write here conflict with this function's OWN earlier
+    # writes on virtually every call, not just genuine concurrent-writer
+    # races (confirmed live 2026-09-21: every ipwork message failed with
+    # UpdateConditionNotSatisfied during an 8600-photo upload). This final
+    # write is intentionally a blind overwrite of the aggregate result,
+    # matching mark_step_done's own upsert semantics.
+    metadata_table_client.upsert_entity(metadata)
     # An eager refresh here would rescan the user's whole library on every
     # single photo. Just mark both search indexes stale for this one filename;
     # their lazy get_user_*_index paths rebuild on demand, incrementally
@@ -4375,34 +4380,35 @@ def _finalize_server_side_exif(user_id: str, filename: str, image_bytes: bytes, 
     immediately for formats the browser can't reliably self-report (video,
     RAW), instead of waiting on client-side processing."""
     metadata_table_client = _CTX['metadata_table_client']
-    for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+    try:
         entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-        status_updates = _apply_server_exif_fallback(user_id, filename, entity, image_bytes, fallback_for=fallback_for)
-        for field, value in status_updates.items():
-            entity[field] = value
-        entity['exif_status'] = str(status_updates.get('exif_status') or 'no_data')
-        try:
-            _refresh_semantic_fields(filename, entity)
-        except Exception:
-            pass
-        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-        _extract_and_store_embeddings(user_id, filename, entity)
-        try:
-            # Conditional on the etag just read -- see _update_metadata_fields's
-            # identical comment. Unlike apply_client_processing_results_for_file,
-            # this function's whole derivation is cheap to redo from a fresh
-            # read (no network re-fetch -- image_bytes is already in hand), so
-            # a conflict is retried in place instead of raised.
-            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
-            break
-        except ResourceModifiedError:
-            import time
-            time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
-            continue
-        except ResourceNotFoundError:
-            return  # deleted between our read and this write -- nothing left to update
-    else:
+    except ResourceNotFoundError:
         return
+    status_updates = _apply_server_exif_fallback(user_id, filename, entity, image_bytes, fallback_for=fallback_for)
+    for field, value in status_updates.items():
+        entity[field] = value
+    entity['exif_status'] = str(status_updates.get('exif_status') or 'no_data')
+    try:
+        _refresh_semantic_fields(filename, entity)
+    except Exception:
+        pass
+    entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+    _extract_and_store_embeddings(user_id, filename, entity)
+    # Deliberately NOT a conditional/etag-checked write -- _apply_server_exif_fallback
+    # above calls mark_step_done/mark_step_no_data for 'map_detection' on every
+    # code path, each of which does its OWN immediate upsert against this same
+    # row (by design, so partial work survives a crash -- see
+    # _unstick_claimed_steps_still_running's docstring). That write bumps the
+    # row's real etag out from under `entity`'s captured one, so a conditional
+    # write here would conflict with this function's OWN call to
+    # _apply_server_exif_fallback on every single invocation, and retrying by
+    # re-reading + re-calling _apply_server_exif_fallback again just re-triggers
+    # the same self-conflict on every attempt until retries are exhausted and
+    # the write is silently dropped entirely -- worse than the one-shot
+    # unconditional overwrite this always used to be (confirmed live 2026-09-21
+    # during an 8600-photo upload, same root cause as apply_client_processing_results_for_file's
+    # identical revert).
+    metadata_table_client.upsert_entity(entity)
     # Unlike apply_client_processing_results_for_file, this path writes location/
     # semantic fields directly and was the one caller that never marked the
     # cached search indexes stale -- a video's geocoded location silently never
