@@ -113,6 +113,25 @@ def test_finalize_writes_both_indexes(dedup_ctx):
     assert filename_owners.get_entity('vacation.jpg', 'lib-A')['fileHash'] == file_hash
 
 
+def test_finalize_marks_the_new_row_dirty_for_search_indexes(dedup_ctx, monkeypatch):
+    """A brand-new photo's row must be marked dirty for the lexical/vector/
+    listing indexes at creation time -- otherwise _merge_user_lexical_index_
+    snapshot's incremental rebuild (which only re-fetches already-dirty
+    filenames) never discovers it, and the photo stays invisible in
+    /api/photos until something UNRELATED later writes one of the
+    _VECTOR_INDEX_RELEVANT_FIELDS for it (e.g. face/AI processing finishing).
+    """
+    calls = []
+    monkeypatch.setattr(
+        storage_utils, 'touch_user_search_indexes_state',
+        lambda user_id, **kwargs: calls.append((user_id, kwargs.get('filenames'))),
+    )
+
+    storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='a' * 64)
+
+    assert ('lib-A', 'vacation.jpg') in calls
+
+
 def test_list_known_file_hashes_returns_this_librarys_index(dedup_ctx):
     """Backs the frontend's once-per-batch prefetch (GET /upload/known-hashes)
     that lets the browser skip re-uploading a known duplicate before spending

@@ -4335,6 +4335,18 @@ def finalize_uploaded_file(
     metadata['last_processing_update'] = datetime.now(timezone.utc).isoformat()
 
     metadata_table_client.upsert_entity(metadata)
+    # Mark the new row dirty for the search/listing indexes immediately --
+    # without this, a brand-new photo is invisible to /api/photos (and
+    # search) until something ELSE later writes one of the
+    # _VECTOR_INDEX_RELEVANT_FIELDS for it (e.g. face/AI processing
+    # finishing), since _merge_user_lexical_index_snapshot's incremental
+    # rebuild only re-fetches filenames already recorded as dirty -- it never
+    # discovers genuinely new rows on its own. If that downstream processing
+    # is delayed or backlogged, the photo simply never appears in the
+    # gallery. Same reasoning as the identical fix already applied to
+    # _finalize_server_side_exif below (found live 2026-09-21: a video's
+    # geocoded location never became searchable on its own either).
+    touch_user_search_indexes_state(user_id, filenames=final_filename)
     # Keep the O(1) dedup/collision indexes current for the next upload -- see
     # detect_duplicates() and _resolve_filename_for_upload().
     _store_hash_index(user_id, file_hash, final_filename)
