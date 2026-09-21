@@ -1375,10 +1375,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             current.totalCount = current.processedCount + current.failedCount + pendingRemaining;
             return current;
         }
+        // This notification only ever tracks the browser's own claim-and-process
+        // loop (see the processingMode/model-availability guards above it never
+        // starts under 'backend' mode), so it is always genuinely local work --
+        // but under 'both' mode the backend's ipworker is racing to claim and
+        // process the same photos server-side at the same time (whichever lands
+        // first wins), so say so instead of implying the browser is the only
+        // thing happening.
+        const mode = getRuntimeConfig().processingMode || 'browser';
+        const details = mode === 'both'
+            ? `Preparing ${pendingRemaining} photo${pendingRemaining === 1 ? '' : 's'} for processing in this browser (also queued on the server).`
+            : `Preparing ${pendingRemaining} photo${pendingRemaining === 1 ? '' : 's'} for processing in this browser.`;
         const next: BrowserProcessingNotificationState = {
             id: addNotification(
                 'Processing photos started',
-                `Preparing ${pendingRemaining} photo${pendingRemaining === 1 ? '' : 's'} for local processing.`,
+                details,
                 {
                     uploadedCount: 0,
                     totalCount: pendingRemaining,
@@ -1987,6 +1998,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // Explicit, user-initiated requests (isAutomaticPull false) still run
             // immediately regardless.
             if (isAutomaticPull && uploadingRef.current) {
+                return 0;
+            }
+            // Backend-only deployments never load browser AI (see the processingMode
+            // guard in loadBrowserAiModel), so browserAiModelStateRef should already
+            // never read 'available' here -- this check is a direct, explicit guard
+            // against automatically claiming/downloading photos for in-browser work
+            // in that mode, rather than relying solely on that indirect side effect.
+            if (isAutomaticPull && getRuntimeConfig().processingMode === 'backend') {
+                keepAliveRef.current?.stop();
                 return 0;
             }
             if (isAutomaticPull && browserAiModelStateRef.current.status !== 'available') {
