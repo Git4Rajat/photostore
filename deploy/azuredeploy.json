@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "328919103658101243"
+      "templateHash": "16639582821784776719"
     }
   },
   "parameters": {
@@ -96,6 +96,27 @@
       "defaultValue": "",
       "metadata": {
         "description": "Name of an existing Log Analytics workspace (in this resource group) to send Container Apps logs to. Leave blank (the one-click-deploy default) for no log destination -- opt in only where you have provisioned a workspace, since it is a separate billable resource."
+      }
+    },
+    "enableBlobLifecycleManagement": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Enable a blob lifecycle policy that auto-tiers full-resolution originals (\"images/\" container) and cached previews (\"thumbnails/preview/\") down to Cool then Cold as they go unviewed, to cut storage cost on libraries that mostly hold older, rarely-opened photos. Keyed off last-access time (not upload date), so a photo someone keeps revisiting stays Hot. Small thumbnails and album covers are deliberately excluded -- they are read on every gallery/album page load, so the per-operation cost of a cooler tier would outweigh the storage savings."
+      }
+    },
+    "blobCoolAfterDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "metadata": {
+        "description": "Days with no read access before an original/preview blob tiers Hot -> Cool."
+      }
+    },
+    "blobColdAfterDays": {
+      "type": "int",
+      "defaultValue": 90,
+      "metadata": {
+        "description": "Days with no read access before an original/preview blob tiers Cool -> Cold. Must be greater than blobCoolAfterDays."
       }
     }
   },
@@ -219,7 +240,8 @@
               "maxAgeInSeconds": 3600
             }
           ]
-        }
+        },
+        "lastAccessTimeTrackingPolicy": "[if(parameters('enableBlobLifecycleManagement'), createObject('enable', true(), 'name', 'AccessTimeTracking', 'trackingGranularityInDays', 1, 'blobType', createArray('blockBlob')), null())]"
       },
       "dependsOn": [
         "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
@@ -239,6 +261,72 @@
       },
       "dependsOn": [
         "[resourceId('Microsoft.Storage/storageAccounts/blobServices', variables('storageAccountName'), 'default')]"
+      ]
+    },
+    {
+      "condition": "[parameters('enableBlobLifecycleManagement')]",
+      "type": "Microsoft.Storage/storageAccounts/managementPolicies",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/{1}', variables('storageAccountName'), 'default')]",
+      "properties": {
+        "policy": {
+          "rules": [
+            {
+              "name": "ageOutOriginals",
+              "enabled": true,
+              "type": "Lifecycle",
+              "definition": {
+                "filters": {
+                  "blobTypes": [
+                    "blockBlob"
+                  ],
+                  "prefixMatch": [
+                    "images/"
+                  ]
+                },
+                "actions": {
+                  "baseBlob": {
+                    "tierToCool": {
+                      "daysAfterLastAccessTimeGreaterThan": "[parameters('blobCoolAfterDays')]"
+                    },
+                    "tierToCold": {
+                      "daysAfterLastAccessTimeGreaterThan": "[parameters('blobColdAfterDays')]"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "name": "ageOutPreviews",
+              "enabled": true,
+              "type": "Lifecycle",
+              "definition": {
+                "filters": {
+                  "blobTypes": [
+                    "blockBlob"
+                  ],
+                  "prefixMatch": [
+                    "thumbnails/preview/"
+                  ]
+                },
+                "actions": {
+                  "baseBlob": {
+                    "tierToCool": {
+                      "daysAfterLastAccessTimeGreaterThan": "[parameters('blobCoolAfterDays')]"
+                    },
+                    "tierToCold": {
+                      "daysAfterLastAccessTimeGreaterThan": "[parameters('blobColdAfterDays')]"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts/blobServices', variables('storageAccountName'), 'default')]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
       ]
     },
     {

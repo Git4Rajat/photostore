@@ -66,6 +66,15 @@ param sessionSecretParam string = '${newGuid()}${newGuid()}'
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps logs to. Leave blank (the one-click-deploy default) for no log destination -- opt in only where you have provisioned a workspace, since it is a separate billable resource.')
 param logAnalyticsWorkspaceName string = ''
 
+@description('Enable a blob lifecycle policy that auto-tiers full-resolution originals ("images/" container) and cached previews ("thumbnails/preview/") down to Cool then Cold as they go unviewed, to cut storage cost on libraries that mostly hold older, rarely-opened photos. Keyed off last-access time (not upload date), so a photo someone keeps revisiting stays Hot. Small thumbnails and album covers are deliberately excluded -- they are read on every gallery/album page load, so the per-operation cost of a cooler tier would outweigh the storage savings.')
+param enableBlobLifecycleManagement bool = true
+
+@description('Days with no read access before an original/preview blob tiers Hot -> Cool.')
+param blobCoolAfterDays int = 30
+
+@description('Days with no read access before an original/preview blob tiers Cool -> Cold. Must be greater than blobCoolAfterDays.')
+param blobColdAfterDays int = 90
+
 var suffix = uniqueString(resourceGroup().id)
 // Secret used to sign login sessions. High-entropy random value (two GUIDs,
 // ~244 bits) generated once at deploy time — NOT derived from uniqueString,
@@ -189,6 +198,15 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
         }
       ]
     }
+    // Powers the blob lifecycle policy below: without this, tierToCool/tierToCold
+    // can only key off last-modification time (effectively upload date), which
+    // would age out an original a user still opens regularly.
+    lastAccessTimeTrackingPolicy: enableBlobLifecycleManagement ? {
+      enable: true
+      name: 'AccessTimeTracking'
+      trackingGranularityInDays: 1
+      blobType: [ 'blockBlob' ]
+    } : null
   }
 }
 
@@ -201,6 +219,62 @@ resource containers 'Microsoft.Storage/storageAccounts/blobServices/containers@2
     }
   }
 ]
+
+// Originals and cached previews are large and mostly re-read only when someone
+// revisits an old photo; thumbnails/covers are small and hit on every
+// gallery/album render, so are deliberately left out of this policy (see
+// enableBlobLifecycleManagement's @description). Storage-account-wide `images/`
+// prefixMatch covers every account since blob names never repeat the container
+// name; `thumbnails/preview/` targets only the preview sub-prefix inside the
+// thumbnails container (storage_utils.py's `preview/<name>.jpg` blob naming),
+// leaving root-level thumbnail blobs in that same container untouched.
+resource blobLifecyclePolicy 'Microsoft.Storage/storageAccounts/managementPolicies@2023-05-01' = if (enableBlobLifecycleManagement) {
+  parent: storage
+  name: 'default'
+  properties: {
+    policy: {
+      rules: [
+        {
+          name: 'ageOutOriginals'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [ 'blockBlob' ]
+              prefixMatch: [ 'images/' ]
+            }
+            actions: {
+              baseBlob: {
+                tierToCool: { daysAfterLastAccessTimeGreaterThan: blobCoolAfterDays }
+                tierToCold: { daysAfterLastAccessTimeGreaterThan: blobColdAfterDays }
+              }
+            }
+          }
+        }
+        {
+          name: 'ageOutPreviews'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [ 'blockBlob' ]
+              prefixMatch: [ 'thumbnails/preview/' ]
+            }
+            actions: {
+              baseBlob: {
+                tierToCool: { daysAfterLastAccessTimeGreaterThan: blobCoolAfterDays }
+                tierToCold: { daysAfterLastAccessTimeGreaterThan: blobColdAfterDays }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    blobService
+  ]
+}
 
 // 2026-08-30: linked ad-hoc via `az containerapp env update
 // --logs-destination log-analytics` to debug the live 50GB/5827-file
