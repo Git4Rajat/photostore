@@ -7592,7 +7592,7 @@ def _execute_library_clean(library_id: str) -> Dict:
 
     for client in (metadata_table_client, face_table_client, person_table_client,
                    albums_table_client, merge_table_client, image_names_table_client,
-                   hash_index_table_client, embeddings_table_client):
+                   hash_index_table_client, embeddings_table_client, jobs_table_client):
         if client is None:
             continue
         # select=[keys only] (+payloadBlobName for merges): merge_table_client's
@@ -7605,11 +7605,21 @@ def _execute_library_clean(library_id: str) -> Dict:
         select_fields = ['PartitionKey', 'RowKey']
         if client is merge_table_client:
             select_fields.append('payloadBlobName')
+        elif client is jobs_table_client:
+            select_fields.append('jobType')
         try:
             rows_to_delete = list(client.query_entities(f"PartitionKey eq '{pk}'", select=select_fields))
         except Exception as exc:
             app.logger.warning('Library clean skipped a table for %s: %s', library_id, exc)
             continue
+
+        if client is jobs_table_client:
+            # Leave library_clean's own job-history rows alone -- this run's
+            # row is still 'running' until the caller writes 'done' after this
+            # function returns, and past library_clean rows are the audit
+            # trail for prior cleanups. Only ipwork/clustering job records are
+            # stale noise once their photos are gone.
+            rows_to_delete = [row for row in rows_to_delete if row.get('jobType') != 'library_clean']
 
         def _delete_row(row: Dict, client=client) -> None:
             if client is merge_table_client:

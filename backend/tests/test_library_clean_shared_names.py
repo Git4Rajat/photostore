@@ -47,6 +47,7 @@ def _no_op_side_tables(monkeypatch):
     for name in (
         'face_table_client', 'person_table_client', 'albums_table_client',
         'merge_table_client', 'image_names_table_client', 'hash_index_table_client',
+        'jobs_table_client',
     ):
         monkeypatch.setattr(app, name, None)
     monkeypatch.setattr(app, 'invalidate_image_names_cache', lambda library_id: None)
@@ -116,3 +117,26 @@ def test_shared_filename_survives_cleanup_while_owned_filename_is_deleted(
     # lib_b's row for the shared file is a different partition and must
     # survive untouched.
     assert ('lib_b', 'shared.jpg') in metadata_table.rows
+
+
+def test_stale_job_history_cleared_but_own_library_clean_rows_kept(monkeypatch, metadata_table):
+    # Leftover ipwork/clustering job-history rows for lib_a's now-deleted
+    # photos should be swept along with everything else. library_clean's own
+    # job rows (including this run's, still 'running' until the caller writes
+    # 'done' after this function returns) must survive -- they're the audit
+    # trail, not stale photo-processing noise.
+    jobs_table = FakeTable()
+    monkeypatch.setattr(app, 'jobs_table_client', jobs_table)
+    jobs_table.upsert_entity({'PartitionKey': 'lib_a', 'RowKey': 'ipwork:lib_a:1', 'jobType': 'ipwork'})
+    jobs_table.upsert_entity({'PartitionKey': 'lib_a', 'RowKey': 'cluster:lib_a:1', 'jobType': 'clustering'})
+    jobs_table.upsert_entity({'PartitionKey': 'lib_a', 'RowKey': 'libclean:lib_a:current', 'jobType': 'library_clean'})
+    jobs_table.upsert_entity({'PartitionKey': 'lib_b', 'RowKey': 'ipwork:lib_b:1', 'jobType': 'ipwork'})
+
+    app._execute_library_clean('lib_a')
+
+    assert ('lib_a', 'ipwork:lib_a:1') not in jobs_table.rows
+    assert ('lib_a', 'cluster:lib_a:1') not in jobs_table.rows
+    assert ('lib_a', 'libclean:lib_a:current') in jobs_table.rows
+    # A different library's job history is a different partition and must
+    # survive untouched.
+    assert ('lib_b', 'ipwork:lib_b:1') in jobs_table.rows
