@@ -2031,11 +2031,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // worker (see runDrainWorker below) more photos to stay warm across
             // before the batch drains and it has to fetch again.
             const pendingBatchSize = Math.max(concurrency, PENDING_PROCESSING_BATCH_SIZE);
-            // When browser AI isn't loaded, skip the automatic background pull: it
-            // would download pending images just to run baseline (thumbnail/EXIF/
-            // geocode) steps. Explicit, user-initiated requests still run so on-demand
-            // actions work regardless of model state; automatic backfill (including
-            // baseline steps) resumes once the model becomes available.
             // Defer the automatic background pull while an upload session is
             // actively transferring files: running CPU-heavy detection/embedding
             // work (WASM) concurrently with in-flight uploads was making the app
@@ -2058,10 +2053,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 keepAliveRef.current?.stop();
                 return 0;
             }
-            if (isAutomaticPull && browserAiModelStateRef.current.status !== 'available') {
-                keepAliveRef.current?.stop();
-                return 0;
-            }
+            // Note: automatic pulls used to also bail out entirely here whenever the
+            // AI model wasn't loaded/available, on the theory that it'd just download
+            // pending images to run baseline (thumbnail/EXIF/geocode) steps that don't
+            // need the model. But loadBrowserAiModel is only ever triggered by an
+            // explicit user click (never automatically), so a normal session that
+            // never touches that button left preview/exif/geocode stuck at 'pending'
+            // forever -- not just OCR/face/vision, which genuinely do need the model.
+            // restrictStepsForModel below already limits what a pass claims/runs to
+            // baseline-only steps while the model isn't available, so baseline work
+            // now proceeds unconditionally; AI-gated steps still wait for the model.
             const pendingResponse = requestedFilenames.length > 0
                 ? { pending: requestedItems.map((item) => ({ ...item, statuses: {} })) }
                 : await getUpload(`/upload/processing/pending?limit=${pendingBatchSize}`);
