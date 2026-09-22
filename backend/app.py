@@ -7114,6 +7114,13 @@ def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = Non
     # album visitors can't reach, which 404s and silently downgrades the lightbox to
     # the low-res thumbnail instead.
     preview_url = f'/public/photos/{token}/preview/{filename}' if not is_video_file(filename) else ''
+    # Same reasoning as preview_url above, for the lightbox's FR button: for
+    # RAW files it hardcodes a call to /api/photos/raw-full-preview/<filename>
+    # (an authenticated-only route) unless this field is present -- see
+    # getMainMediaPath/fetchFullResolution in PhotoViewer.tsx.
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+    is_raw = ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA
+    raw_full_preview_url = f'/public/photos/{token}/raw-full-preview/{filename}' if is_raw else ''
     # Direct SAS URLs point at storage, so they must name the physical blob (the
     # anonymous UUID for anonymized photos). The proxy fallbacks keep the original
     # filename since the public routes resolve the anonymous id internally.
@@ -7133,6 +7140,7 @@ def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = Non
         'url': image_url,
         'thumbnailUrl': thumbnail_url,
         'previewUrl': preview_url,
+        'rawFullPreviewUrl': raw_full_preview_url,
     }
 
 

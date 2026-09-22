@@ -99,6 +99,23 @@ if [ -n "$EXTRAS_API_BASE_URL" ] && [ "$EXTRAS_API_BASE_URL" != "$API_BASE_URL" 
   CONNECT_SRC="${CONNECT_SRC} ${EXTRAS_API_BASE_URL}"
 fi
 
+# img-src needs the same backend origins as connect-src: PublicAlbumPage's
+# unauthenticated <img> tags (useProtectedMedia=false, so no fetch+blob
+# indirection) point straight at proxy routes like
+# /public/photos/<token>/preview|thumbnail|image/<filename> on the 'extras'
+# role, not just Azure Blob Storage SAS URLs -- confirmed via a live browser
+# console capture showing "img-src" CSP violations on every extras-hosted
+# preview once the universal-preview-tier feature made previewUrl point at
+# extras instead of always resolving to a SAS URL. Built the same
+# only-if-different way as CONNECT_SRC above.
+IMG_SRC="'self' data: blob: https://*.blob.core.windows.net"
+if [ -n "$API_BASE_URL" ]; then
+  IMG_SRC="${IMG_SRC} ${API_BASE_URL}"
+fi
+if [ -n "$EXTRAS_API_BASE_URL" ] && [ "$EXTRAS_API_BASE_URL" != "$API_BASE_URL" ]; then
+  IMG_SRC="${IMG_SRC} ${EXTRAS_API_BASE_URL}"
+fi
+
 cat > /etc/nginx/csp.conf <<EOF
-add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://unpkg.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://*.blob.core.windows.net; media-src 'self' blob: https://*.blob.core.windows.net; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" always;
+add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://unpkg.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src ${IMG_SRC}; media-src 'self' blob: https://*.blob.core.windows.net; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" always;
 EOF

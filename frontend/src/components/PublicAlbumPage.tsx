@@ -25,6 +25,7 @@ interface PublicPhoto {
     url: string;
     thumbnailUrl?: string;
     previewUrl?: string;
+    rawFullPreviewUrl?: string;
     rotation?: number;
     thumbnailRotation?: number;
 }

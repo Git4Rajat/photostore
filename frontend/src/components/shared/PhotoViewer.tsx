@@ -10,6 +10,7 @@ export interface ViewerPhoto {
     url: string;
     thumbnailUrl?: string;
     previewUrl?: string;
+    rawFullPreviewUrl?: string;
     rotation?: number;
     thumbnailRotation?: number;
     exifSummary?: {
@@ -500,8 +501,12 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         // extract_raw_native_preview_bytes in image_utils.py for why this never
         // falls back to a full demosaic.
         const isRaw = getMediaKind(activePhoto.filename) === 'RAW';
+        // Public albums can't reach the authenticated backend route, so the
+        // server supplies a token-scoped equivalent on the photo itself (see
+        // rawFullPreviewUrl in _public_photo_urls, app.py) -- mirrors how
+        // previewUrl already overrides getMainMediaPath's hardcoded default.
         const originalPath = isRaw
-            ? `/api/photos/raw-full-preview/${encodeURIComponent(activePhoto.filename)}`
+            ? (activePhoto.rawFullPreviewUrl || `/api/photos/raw-full-preview/${encodeURIComponent(activePhoto.filename)}`)
             : (activePhoto.url || primaryMediaPath || activePhoto.thumbnailUrl || '');
         if (!originalPath) {
             return;

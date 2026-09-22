@@ -161,6 +161,78 @@ def test_share_preview_route_404s_for_filename_not_in_album(monkeypatch):
     assert resp.status_code == 404
 
 
+def test_public_photo_urls_sets_raw_full_preview_url_only_for_raw_files():
+    raw_urls = app._public_photo_urls('tok123', 'IMG_0001.CR3')
+    jpeg_urls = app._public_photo_urls('tok123', 'IMG_0002.jpg')
+
+    assert raw_urls['rawFullPreviewUrl'] == '/public/photos/tok123/raw-full-preview/IMG_0001.CR3'
+    assert jpeg_urls['rawFullPreviewUrl'] == ''
+
+
+def test_public_album_route_includes_raw_full_preview_url(monkeypatch):
+    entity = _entity(filenames='["IMG_0001.CR3", "IMG_0002.jpg"]')
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: entity)
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda owner_id, name: {})
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: (_ for _ in ()).throw(Exception('no SAS in tests')))
+
+    client = app.app.test_client()
+    resp = client.get('/public/albums/tok123')
+
+    assert resp.status_code == 200
+    photos = {p['filename']: p for p in resp.get_json()['photos']}
+    assert photos['IMG_0001.CR3']['rawFullPreviewUrl'] == '/public/photos/tok123/raw-full-preview/IMG_0001.CR3'
+    assert photos['IMG_0002.jpg']['rawFullPreviewUrl'] == ''
+
+
+def test_raw_full_preview_route_returns_native_preview_jpeg(monkeypatch):
+    entity = _entity(filenames='["IMG_0001.CR3"]')
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: entity)
+    monkeypatch.setattr(app, 'resolve_physical_blob_name', lambda owner_id, name, kind: 'blob-1')
+    monkeypatch.setattr(app, 'download_media_bytes', lambda kind, blob_name: b'raw-source-bytes')
+    monkeypatch.setattr(app, 'extract_raw_native_preview_bytes', lambda data, filename: b'native-preview-bytes')
+
+    client = app.app.test_client()
+    resp = client.get('/public/photos/tok123/raw-full-preview/IMG_0001.CR3')
+
+    assert resp.status_code == 200
+    assert resp.content_type == 'image/jpeg'
+    assert resp.get_data() == b'native-preview-bytes'
+
+
+def test_raw_full_preview_route_rejects_non_raw_filename(monkeypatch):
+    entity = _entity(filenames='["IMG_0002.jpg"]')
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: entity)
+
+    client = app.app.test_client()
+    resp = client.get('/public/photos/tok123/raw-full-preview/IMG_0002.jpg')
+
+    assert resp.status_code == 400
+
+
+def test_raw_full_preview_route_404s_for_locked_album(monkeypatch):
+    entity = _entity(filenames='["IMG_0001.CR3"]', accessCode='1234')
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: entity)
+
+    client = app.app.test_client()
+    resp = client.get('/public/photos/tok123/raw-full-preview/IMG_0001.CR3')
+
+    assert resp.status_code == 404
+
+
+def test_raw_full_preview_route_404s_when_no_native_preview_available(monkeypatch):
+    entity = _entity(filenames='["IMG_0001.CR3"]')
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: entity)
+    monkeypatch.setattr(app, 'resolve_physical_blob_name', lambda owner_id, name, kind: 'blob-1')
+    monkeypatch.setattr(app, 'download_media_bytes', lambda kind, blob_name: b'raw-source-bytes')
+    monkeypatch.setattr(app, 'extract_raw_native_preview_bytes', lambda data, filename: b'')
+
+    client = app.app.test_client()
+    resp = client.get('/public/photos/tok123/raw-full-preview/IMG_0001.CR3')
+
+    assert resp.status_code == 404
+    assert resp.get_json()['reason'] == 'raw_native_preview_unavailable'
+
+
 def test_public_url_in_album_payload_points_at_backend_share_page(monkeypatch):
     """_album_entity_to_payload feeds AlbumsPage's copy-to-clipboard link --
     it must point at this backend's own share page, not straight at the SPA,

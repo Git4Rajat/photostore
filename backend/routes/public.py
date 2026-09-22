@@ -66,6 +66,7 @@ def public_album(token: str):
             'url': urls['url'],
             'thumbnailUrl': urls['thumbnailUrl'],
             'previewUrl': urls.get('previewUrl') or '',
+            'rawFullPreviewUrl': urls.get('rawFullPreviewUrl') or '',
             'rotation': app._normalize_rotation((metadata or {}).get('rotation', 0)),
             'thumbnailRotation': app._thumbnail_rotation_from_metadata(metadata),
         })
@@ -257,6 +258,49 @@ def public_preview(token: str, filename: str):
             'reason': 'server_error',
             'detail': 'The server hit an error while building this preview.',
         }), 503
+
+@public_bp.route('/public/photos/<token>/raw-full-preview/<path:filename>', methods=['GET'])
+def public_raw_full_preview(token: str, filename: str):
+    """Public-album equivalent of proxy_raw_full_preview (routes/photos.py)
+    for the lightbox's FR ("full resolution") button on RAW photos. Without
+    this, the FR button always called the authenticated-only backend route,
+    which 401s for anonymous album visitors. Never falls back to a full
+    demosaic, same reasoning as the authenticated route.
+    """
+    entity = app._find_public_album_by_token(token)
+    if not entity or not app._coerce_bool(entity.get('isPublic', False)) or app._album_is_expired(entity):
+        return app.jsonify({'error': 'Not found'}), 404
+    if not app._album_grant_valid(entity, token):
+        return app.jsonify({'error': 'Not found'}), 404
+    safe_name = app._validate_media_filename(filename)
+    if not safe_name or safe_name not in app._album_filenames(entity):
+        return app.jsonify({'error': 'Not found'}), 404
+
+    ext = safe_name.rsplit('.', 1)[-1].lower() if '.' in safe_name else ''
+    if ext not in app.RAW_EXTENSIONS_RAWPY and ext not in app.RAW_EXTENSIONS_CINEMA:
+        return app.jsonify({'error': 'Not a RAW file'}), 400
+
+    try:
+        owner_id = str(entity.get('PartitionKey') or '')
+        blob_name_to_read = app.resolve_physical_blob_name(owner_id, safe_name, 'image') if owner_id else safe_name
+        image_bytes = app.download_media_bytes('image', blob_name_to_read)
+    except Exception as exc:
+        if app._is_missing_media_error(exc):
+            return app.jsonify({'error': 'File not found in storage'}), 404
+        app.app.logger.exception('Failed to read public RAW original for %s', safe_name)
+        return app.jsonify({'error': 'Failed to retrieve image'}), 503
+
+    preview_bytes = app.extract_raw_native_preview_bytes(image_bytes, safe_name)
+    if not preview_bytes:
+        return app.jsonify({
+            'error': 'No native preview available',
+            'reason': 'raw_native_preview_unavailable',
+            'detail': 'No higher-resolution preview is available for this RAW file — showing the standard preview.',
+        }), 404
+
+    resp = app.Response(preview_bytes, mimetype='image/jpeg')
+    resp.headers['Cache-Control'] = 'public, max-age=3600'
+    return resp
 
 @public_bp.route('/public/albums/<token>/download-check', methods=['GET'])
 def public_album_download_check(token: str):
