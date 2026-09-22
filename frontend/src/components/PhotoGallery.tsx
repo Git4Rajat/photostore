@@ -4741,6 +4741,26 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     }, []);
 
     useEffect(() => {
+        // IntersectionObserver only calls back on enter/exit transitions, not
+        // repeatedly while a target stays intersecting. With the stable
+        // single-instance observer above (needed to fix the double-fetch bug
+        // in the comment there), nothing else forces a re-check once the
+        // sentinel is already visible -- and with a 1200px rootMargin, one
+        // page of thumbnails often isn't tall enough to push the sentinel
+        // back outside that band. Net effect: the first load-more fires, but
+        // scrolling further does nothing, since the sentinel never re-enters
+        // (it never left). `offset` only advances after a fetch successfully
+        // appends photos (see setOffset in fetchPhotos above), so re-arming
+        // the observer here forces one fresh evaluation of wherever the
+        // sentinel actually is post-append, without recreating the observer
+        // instance itself (which is what caused the original double-fetch).
+        if (observerRef.current && loadMoreRef.current) {
+            observerRef.current.unobserve(loadMoreRef.current);
+            observerRef.current.observe(loadMoreRef.current);
+        }
+    }, [offset]);
+
+    useEffect(() => {
         if (!didInitialRevalidateRef.current) {
             didInitialRevalidateRef.current = true;
             // Always revalidate on mount, even when a cache is showing. Otherwise a
