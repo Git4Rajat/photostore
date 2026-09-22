@@ -523,6 +523,15 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // replicas, observed 30-115s response times). Raised to
             // 1vCPU/2Gi (Container Apps requires memory to scale with CPU in
             // lockstep -- 1.0 vCPU only pairs with 2Gi, not 1Gi).
+            //
+            // 2026-09-21: a same-day attempt to cut back to 0.5vCPU/1Gi
+            // (with maxReplicas also cut 5->2) was drafted but never shipped
+            // -- reverted after checking real forenkla-qa platform metrics
+            // (Azure Monitor CpuPercentage, no Log Analytics workspace is
+            // actually attached to any live env right now) showed CPU
+            // already spiking to 89% on THIS 1.0vCPU tier during the one day
+            // with real traffic. Cutting to 0.5vCPU would have reintroduced
+            // the exact 502/503 incident above on data, not just risk.
             cpu: json('1.0')
             memory: '2Gi'
           }
@@ -611,6 +620,10 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
         // finalize/client-processing got worse even as overall wall-clock
         // time improved. Only raises the ceiling under load -- minReplicas
         // stays 0, idle scale-to-zero is unaffected.
+        //
+        // 2026-09-21: a same-day cut to 2 (alongside the 0.5vCPU/1Gi draft
+        // above) was reverted before shipping, same reasoning as the
+        // cpu/memory comment above.
         maxReplicas: 5
         rules: [
           {
@@ -824,9 +837,18 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'extras'
           image: backendImage
+          // 2026-09-21: halved from 1.0vCPU/2Gi based on real forenkla-qa
+          // platform metrics (max 40% CPU / 13% memory over the one 3-day
+          // window with real activity). The library_export executor.map()
+          // OOM this app's biggest memory risk (people/library/public
+          // bundled here) was already fixed at the code level -- see
+          // library-export-threadpool-map-oom writeup -- so this isn't
+          // reverting into a still-open landmine the way worker's would be.
+          // Watch WorkingSetBytes/OOMKilled on a real library_export run;
+          // raise back to 1.0/2Gi if it recurs.
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            cpu: json('0.5')
+            memory: '1Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'extras' }
@@ -1035,11 +1057,25 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
           // (same incident/session as the backend cpu/memory fix above) --
           // unprojected full-table scans in worker job handlers (see the
           // library_clean OOM writeup) can pull large partitions into memory
-          // in one pass. Keep this in sync with live; don't let it drift back
-          // down to the old undersized default.
+          // in one pass.
+          //
+          // 2026-09-21: cpu halved to 1.0 based on real forenkla-qa platform
+          // metrics (max 59% of the 2.0vCPU allocation, i.e. ~1.18 cores
+          // peak, over the one 3-day window with real activity) -- accepted
+          // knowingly without re-testing the library_clean/full-DBSCAN burst
+          // path this app exists for, since worker is an async queue
+          // consumer, not a live HTTP path: CPU throttling here slows a
+          // background job, it doesn't 502 a user request the way backend
+          // throttling does. Memory kept at 2Gi (not reverted to the old
+          // 1Gi that caused the OOM crash-loop) specifically because that
+          // incident was memory-driven, not CPU-driven -- observed peak
+          // memory in the same window was only 14% of 4Gi (~560MB), so 2Gi
+          // still leaves real headroom. Watch WorkingSetBytes/OOMKilled next
+          // time a library_clean or large full-reclustering job runs; raise
+          // back to 2.0/4Gi if either recurs.
           resources: {
-            cpu: json('2.0')
-            memory: '4Gi'
+            cpu: json('1.0')
+            memory: '2Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'worker' }
@@ -1091,6 +1127,21 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
       scale: {
         minReplicas: 0
         maxReplicas: 1
+        // 2026-09-21: found via forenkla2-qa telemetry during a real 986-file
+        // upload -- the platform's effective cooldown between the last active
+        // trigger and scale-to-zero was only ~60s (confirmed live via
+        // ContainerAppSystemLogs_CL: 'Deactivated...from 1 to 0' followed by
+        // 'Scaled...from 0 to 1' exactly 60s later), not the ~300s a GET on
+        // the resource reports as a schema default. Under one continuous
+        // upload session, the clustering queue kept draining to empty for
+        // brief gaps between bursts, so the worker fully cold-started 5
+        // separate times in ~65 minutes instead of staying warm across the
+        // session. Set explicitly to 300s so a short lull no longer tears
+        // the replica down -- cost impact is negligible (a few extra idle
+        // minutes on a 1.0vCPU app); benefit is removing repeated
+        // process-restart/reconnect latency right when a user is watching
+        // clustering results land.
+        cooldownPeriod: 300
         rules: [
           {
             name: 'clustering-queue'
@@ -1235,7 +1286,18 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
               metadata: {
                 accountName: storageAccountName
                 queueName: 'photostore-ipwork'
-                queueLength: '1'
+                // 2026-09-21: raised 1->2 to match IPWORKER_CONCURRENCY=2 --
+                // a real 986-file forenkla2-qa upload showed KEDA scaling to
+                // all 4 replicas while average CPU never exceeded 35% (max
+                // 88%), meaning replicas were under-utilized even at the
+                // scale ceiling. Targeting one replica's actual concurrent
+                // capacity (2 messages) before adding another consolidates
+                // the same work onto fewer, better-utilized replicas instead
+                // of one replica per single queued message. Re-verify replica
+                // count/CPU on the next real upload; revert to '1' if backlog
+                // drain latency regresses under a much bigger burst than this
+                // one.
+                queueLength: '2'
                 // Default strategy ('all') counts messages that are dequeued
                 // but not yet deleted, not just genuinely unclaimed ones. In
                 // 'both' processing mode, a message ipworker lost the
