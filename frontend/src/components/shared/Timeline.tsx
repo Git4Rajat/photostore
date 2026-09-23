@@ -198,7 +198,13 @@ const panView = (view: TimelineViewState, deltaDays: number, totalSpanDays: numb
 // year, a full month, or a single day -- and that bucket becomes the range
 // pushed to the gallery's capture-date filter.
 const resolveSelectionRange = (day: number, level: ZoomLevel, originMs: number): [string, string] => {
-    const ms = originMs + Math.round(day) * MS_PER_DAY;
+    // Floor, not round: buckets are the half-open interval [startDay, endDay),
+    // the same range check the tooltip and highlighted bar use to resolve
+    // which bucket a pointer position belongs to. Rounding instead would snap
+    // any click on the right half of a bucket into the *next* bucket, so the
+    // committed capture-date filter would silently disagree with what the
+    // tooltip/highlight just showed the user they clicked.
+    const ms = originMs + Math.floor(day) * MS_PER_DAY;
     const dt = new Date(ms);
     const year = dt.getUTCFullYear();
     const month = dt.getUTCMonth(); // 0-based
