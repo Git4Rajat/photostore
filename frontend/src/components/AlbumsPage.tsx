@@ -151,6 +151,8 @@ const AlbumsPage: React.FC = () => {
     const [albums, setAlbums] = useState<Album[]>([]);
     const [albumsLoading, setAlbumsLoading] = useState<boolean>(false);
     const [activeAlbumId, setActiveAlbumId] = useState<string>('');
+    const activeAlbumIdRef = useRef(activeAlbumId);
+    activeAlbumIdRef.current = activeAlbumId;
     const [activeAlbumPhotos, setActiveAlbumPhotos] = useState<Photo[]>([]);
     const [activeAlbumVisibleCount, setActiveAlbumVisibleCount] = useState<number>(PAGE_SIZE);
     const [albumName, setAlbumName] = useState<string>('');
@@ -590,6 +592,10 @@ const AlbumsPage: React.FC = () => {
     }, [activeAlbumId, refreshActiveAlbum]);
 
     useEffect(() => {
+        setLastSharedUrl('');
+    }, [activeAlbumId]);
+
+    useEffect(() => {
         if (location.pathname !== '/albums') {
             return;
         }
@@ -928,10 +934,11 @@ const AlbumsPage: React.FC = () => {
             return;
         }
 
+        const requestedAlbumId = activeAlbumId;
         setError('');
         setStatus('');
         try {
-            const response = await post(`/albums/${activeAlbumId}/share`, {
+            const response = await post(`/albums/${requestedAlbumId}/share`, {
                 enabled: true,
                 expiresInDays,
                 accessCode: accessCodeInput,
@@ -939,10 +946,13 @@ const AlbumsPage: React.FC = () => {
             });
             const shared = response?.album as Album | undefined;
             if (shared) {
-                updateAlbumList(activeAlbumId, () => shared);
+                updateAlbumList(requestedAlbumId, () => shared);
             }
             const publicUrl = shared?.publicUrl || '';
-            setLastSharedUrl(publicUrl);
+            const stillActive = activeAlbumIdRef.current === requestedAlbumId;
+            if (stillActive) {
+                setLastSharedUrl(publicUrl);
+            }
 
             let copied = false;
             if (publicUrl && navigator?.clipboard?.writeText) {
@@ -952,6 +962,10 @@ const AlbumsPage: React.FC = () => {
                 } catch {
                     copied = false;
                 }
+            }
+
+            if (!stillActive) {
+                return;
             }
 
             if (!publicUrl) {
@@ -983,15 +997,18 @@ const AlbumsPage: React.FC = () => {
             return;
         }
 
+        const requestedAlbumId = activeAlbumId;
         setError('');
         setStatus('');
         try {
-            const response = await post(`/albums/${activeAlbumId}/revoke`, {});
+            const response = await post(`/albums/${requestedAlbumId}/revoke`, {});
             const updated = response?.album as Album | undefined;
             if (updated) {
-                updateAlbumList(activeAlbumId, () => updated);
+                updateAlbumList(requestedAlbumId, () => updated);
             }
-            setLastSharedUrl('');
+            if (activeAlbumIdRef.current === requestedAlbumId) {
+                setLastSharedUrl('');
+            }
             setStatus('Public link revoked.');
         } catch (err) {
             notifyApiError(err, { context: 'Failed to revoke public link.', retry: () => { void handleRevokeLink(); } });
@@ -1489,22 +1506,20 @@ const AlbumsPage: React.FC = () => {
                     {error && <p className="status error">{error}</p>}
                     {lastSharedUrl && (
                         <div className="albums-actions-row">
-                            <input id="last-shared-url" type="text" className="field" value={lastSharedUrl} readOnly />
                             <button
                                 type="button"
-                                className="btn btn-soft icon-btn"
+                                className="btn btn-soft"
                                 onClick={async () => {
                                     try {
                                         await navigator.clipboard.writeText(lastSharedUrl);
                                         setStatus('Public link copied.');
                                     } catch {
-                                        setError('Unable to copy automatically. You can copy the URL manually.');
+                                        setError('Unable to copy automatically. Try sharing again.');
                                     }
                                 }}
-                                aria-label="Copy link"
                             >
                                 <ClipboardIcon className="toolbar-icon" />
-                                <span className="sr-only">Copy link</span>
+                                Copy link
                             </button>
                         </div>
                     )}
