@@ -34,10 +34,15 @@ def delete_multiple_albums_people():
 
     for album_id in album_ids:
         existing = app._load_album_entity(user_id, str(album_id))
+        if not existing:
+            album_errors.append({'albumId': album_id, 'error': 'Not found'})
+            continue
         try:
-            app.albums_table_client.delete_entity(partition_key=user_id, row_key=str(album_id))
+            existing['deleted'] = True
+            existing['deletedAt'] = app.datetime.now(app.timezone.utc).isoformat()
+            old_token = str(existing.get('publicToken') or '')
+            app._save_album_entity(existing)
             deleted_albums.append(album_id)
-            old_token = str((existing or {}).get('publicToken') or '')
             if old_token:
                 app._delete_album_token_index(old_token)
         except Exception as exc:
@@ -94,7 +99,7 @@ def list_albums():
         rows = list(app.albums_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))
     except Exception:
         rows = []
-    albums = [app._album_entity_to_payload(row) for row in rows]
+    albums = [app._album_entity_to_payload(row) for row in rows if not app._coerce_bool(row.get('deleted'))]
     return app.jsonify({'albums': albums})
 
 @albums_bp.route('/albums', methods=['POST'])
@@ -135,7 +140,7 @@ def get_album(album_id: str):
     if not app._albums_table_available():
         return app.jsonify({'error': 'Albums not configured'}), 503
     entity = app._load_album_entity(user_id, album_id)
-    if not entity:
+    if not entity or app._coerce_bool(entity.get('deleted')):
         return app.jsonify({'error': 'Album not found'}), 404
     payload = app._album_entity_to_payload(entity)
     photos = app._load_photos_for_filenames(user_id, payload.get('filenames', []))
@@ -234,14 +239,69 @@ def delete_album(album_id: str):
     if not app._albums_table_available():
         return app.jsonify({'error': 'Albums not configured'}), 503
     existing = app._load_album_entity(user_id, album_id)
+    if not existing:
+        return app.jsonify({'error': 'Album not found'}), 404
     try:
-        app.albums_table_client.delete_entity(partition_key=user_id, row_key=album_id)
-    except Exception as exc:
+        old_token = str(existing.get('publicToken') or '')
+        existing['deleted'] = True
+        existing['deletedAt'] = app.datetime.now(app.timezone.utc).isoformat()
+        app._save_album_entity(existing)
+    except Exception:
         app.app.logger.exception('delete_album failed')
         return app.jsonify({'error': 'Internal server error'}), 500
-    old_token = str((existing or {}).get('publicToken') or '')
     if old_token:
         app._delete_album_token_index(old_token)
+    return app.jsonify({'success': True})
+
+@albums_bp.route('/albums/trash', methods=['GET'])
+@albums_bp.route('/api/albums/trash', methods=['GET'])
+def list_trashed_albums():
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._albums_table_available():
+        return app.jsonify({'error': 'Albums not configured'}), 503
+    try:
+        rows = list(app.albums_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))
+    except Exception:
+        rows = []
+    trashed = [row for row in rows if app._coerce_bool(row.get('deleted'))]
+    trashed.sort(key=lambda row: str(row.get('deletedAt') or ''), reverse=True)
+    albums = [app._album_entity_to_payload(row) for row in trashed]
+    return app.jsonify({'albums': albums, 'total': len(albums), 'retentionDays': app.TRASH_RETENTION_DAYS})
+
+@albums_bp.route('/albums/<album_id>/restore', methods=['POST'])
+@albums_bp.route('/api/albums/<album_id>/restore', methods=['POST'])
+def restore_album(album_id: str):
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._albums_table_available():
+        return app.jsonify({'error': 'Albums not configured'}), 503
+    entity = app._load_album_entity(user_id, album_id)
+    if not entity or not app._coerce_bool(entity.get('deleted')):
+        return app.jsonify({'error': 'Album not found in trash'}), 404
+    entity['deleted'] = False
+    entity['deletedAt'] = ''
+    entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
+    app._save_album_entity(entity)
+    return app.jsonify({'album': app._album_entity_to_payload(entity)})
+
+@albums_bp.route('/albums/<album_id>/purge', methods=['POST'])
+@albums_bp.route('/api/albums/<album_id>/purge', methods=['POST'])
+def purge_album(album_id: str):
+    """Delete forever -- only meaningful for an already-trashed album, but
+    doesn't strictly require it (same shape as /photos/trash/purge)."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._albums_table_available():
+        return app.jsonify({'error': 'Albums not configured'}), 503
+    existing = app._load_album_entity(user_id, album_id)
+    if not existing:
+        return app.jsonify({'error': 'Album not found'}), 404
+    if not app._hard_delete_album_now(user_id, album_id, existing=existing):
+        return app.jsonify({'error': 'Internal server error'}), 500
     return app.jsonify({'success': True})
 
 @albums_bp.route('/albums/autocreate', methods=['POST'])

@@ -499,7 +499,7 @@ def photos_processing_status():
     statuses: app.Dict[str, app.Dict] = {}
     for filename in filenames:
         entity = app._get_metadata_entity(user_id, filename)
-        if entity is None:
+        if entity is None or entity.get('processing_state') == 'deleted':
             continue
         statuses[filename] = {
             'preview': entity.get('preview_status'),
@@ -528,7 +528,7 @@ def lookup_photo(filename: str):
     if not safe_name:
         return app.jsonify({'error': 'Invalid filename'}), 400
     metadata = app._get_metadata_entity(user_id, safe_name)
-    if not metadata:
+    if not metadata or metadata.get('processing_state') == 'deleted':
         return app.jsonify({'error': 'Not found'}), 404
     pid_to_name, _ = app._load_people_name_index(user_id)
     return app.jsonify({'photo': app._build_photo_summary(user_id, safe_name, metadata, include_props=False, pid_to_name=pid_to_name)})
@@ -555,7 +555,7 @@ def lookup_photos_batch():
         if not safe_name:
             continue
         metadata = app._get_metadata_entity(user_id, safe_name)
-        if not metadata:
+        if not metadata or metadata.get('processing_state') == 'deleted':
             continue
         photos.append(app._build_photo_summary(user_id, safe_name, metadata, include_props=False, pid_to_name=pid_to_name))
     return app.jsonify({'photos': photos})
@@ -596,6 +596,17 @@ def search_photos():
         return app.jsonify({'error': 'Invalid paging parameters.'}), 400
 
     capture_start, capture_end = app._parse_capture_range_args()
+    # Bare year in the query text ("beach 2022") narrows to that calendar year,
+    # same as if the user had set the explicit date-range control -- only when
+    # they didn't already set one, so it never overrides a real choice. This is
+    # deliberately just a year: month/season/"last summer"-style parsing is a
+    # bigger, separate feature, not a one-line regex.
+    if capture_start is None and capture_end is None:
+        year_match = app.re.search(r'\b(19|20)\d{2}\b', query)
+        if year_match:
+            year = int(year_match.group(0))
+            capture_start = app.datetime(year, 1, 1, tzinfo=app.timezone.utc)
+            capture_end = app.datetime(year, 12, 31, tzinfo=app.timezone.utc)
 
     user_id, error = app._require_user_id()
     if error:
@@ -690,6 +701,16 @@ def search_photos():
     response_payload = {'photos': photos, 'total': total}
     if fallback_notice:
         response_payload['searchNotice'] = fallback_notice
+    # Surfaces why results matched (person/location chips in the UI) --
+    # already computed above for filtering/scoring, just wasn't returned.
+    if matched_person_groups:
+        matched_people = sorted({
+            pid_to_name[group[0]] for group in matched_person_groups if group and pid_to_name.get(group[0])
+        })
+        if matched_people:
+            response_payload['matchedPeople'] = matched_people
+    if matched_location_terms:
+        response_payload['matchedLocations'] = [app._smart_album_title(term) for term in matched_location_terms]
     return app.jsonify(response_payload)
 
 @photos_bp.route('/api/photos/search-index', methods=['GET'])
@@ -793,25 +814,16 @@ def photos_metadata():
 
     return app.jsonify(metadata)
 
-@photos_bp.route('/photos/delete', methods=['POST'])
-@photos_bp.route('/photos/delete/', methods=['POST'])
-@photos_bp.route('/api/photos/delete', methods=['POST'])
-@photos_bp.route('/api/photos/delete/', methods=['POST'])
-def delete_multiple_photos():
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-
+def _parse_filenames_request():
+    """Shared body parsing for the trash-family endpoints: {filenames: [...]}
+    -> (valid_names, errors) with each name run through _validate_media_filename
+    and de-duped, same contract delete_multiple_photos always used."""
     data = app.request.get_json(silent=True) or {}
     filenames = data.get('filenames', [])
     if not isinstance(filenames, list) or len(filenames) == 0:
-        return app.jsonify({'error': 'Invalid request'}), 400
-
-    deleted = []
-    errors = []
-
-    # Validate up front and resolve each requested name to its safe form once.
+        return [], ['Invalid request']
     valid_names = []
+    errors = []
     seen = set()
     for filename in filenames:
         safe_name = app._validate_media_filename(filename)
@@ -822,97 +834,53 @@ def delete_multiple_photos():
             continue
         seen.add(safe_name)
         valid_names.append(safe_name)
+    return valid_names, errors
 
+
+@photos_bp.route('/photos/delete', methods=['POST'])
+@photos_bp.route('/photos/delete/', methods=['POST'])
+@photos_bp.route('/api/photos/delete', methods=['POST'])
+@photos_bp.route('/api/photos/delete/', methods=['POST'])
+def delete_multiple_photos():
+    """Soft-delete: moves photos to trash (processing_state='deleted' +
+    deletedAt stamped) instead of removing them outright. Blob, faces, album
+    membership, and job rows are left untouched so restore is a pure flag
+    flip -- see app._mark_processing_deleted_for_file. The real, irreversible
+    delete now lives at /photos/trash/purge (and the retention sweep), both
+    backed by app._hard_delete_photos_now, which still does everything this
+    endpoint used to do directly."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    valid_names, errors = _parse_filenames_request()
+    deleted = []
     if not valid_names:
         return app.jsonify({'deleted': deleted, 'errors': errors, 'success': False})
 
     names_set = set(valid_names)
 
-    # --- Batch the expensive table/partition scans ONCE for the whole request.
-    # The previous implementation ran several full scans PER file, which made
-    # large deletions (hundreds of photos) take minutes. ---
-    # This chunk only ever needs metadata for the <=100 filenames it was sent,
-    # never the whole account -- a per-name point-read (get_entity) is an O(1)
-    # lookup, unlike the full-partition scan this replaced. That scan pulled
-    # every row of the user's ENTIRE library (every field, no select=) on
-    # every single chunk; on a 36k+-photo account this alone measured 60-80s
-    # per chunk (see the sibling narrow-column fix on the gallery-load path,
-    # METADATA_SCAN_CACHE_TTL_SECONDS's comment in app.py), which is what
-    # actually made bulk deletes crawl and eventually 503. A cache wouldn't
-    # have helped here either: each chunk's deletions invalidate it via
-    # _invalidate_metadata_scan_cache below, so the very next chunk would
-    # still miss and pay the full scan again.
-    # Each point-read is independent network I/O -- run them concurrently
-    # rather than one file at a time (up to ~100 per chunk sequentially was a
-    # meaningful chunk of the per-chunk wall time).
+    # Point-reads only (no partition scan) -- see _hard_delete_photos_now's
+    # sibling comment for why that mattered on large accounts.
     with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
         metadata_results = list(executor.map(lambda n: (n, app._get_metadata_entity(user_id, n)), valid_names))
     own_rows_by_name = {name: metadata for name, metadata in metadata_results if metadata is not None}
-
-    shared_names = app._shared_names_in_batch(names_set, user_id)
     temp_removed_names = app._batch_delete_upload_temp_files(names_set)
 
-    # Per-file point operations only (no scans): blob + metadata-row deletes.
-    # Each file's work (blob deletes, metadata delete, index cleanup) is
-    # independent of every other file's, and dominated by network I/O wait,
-    # so it runs concurrently across the chunk instead of one file at a time
-    # -- this loop was the single largest contributor to per-chunk wall time.
-    def _delete_one_file(safe_name: str) -> app.Tuple[str, str, str]:
-        """Returns (safe_name, outcome, detail) where outcome is one of
-        'deleted', 'not_found', 'error' (detail holds the error text)."""
-        metadata = own_rows_by_name.get(safe_name)
-        shared_with_other_user = safe_name in shared_names
-        file_errors = []
-        removed_any = safe_name in temp_removed_names
-
-        # Anonymized photos store their blobs under the anonymous UUID; resolve it
-        # from the metadata row we already loaded so the delete targets the real blob.
-        anonymous_id = str((metadata or {}).get('anonymousImageId') or '').strip()
-
-        if not shared_with_other_user:
-            physical_name = anonymous_id or safe_name
-            # Clear the original-filename blobs too when anonymized, in case a
-            # pre-anonymization copy ever lingered under the real name.
-            extra = [safe_name] if anonymous_id else None
-            blob_errors = app._delete_photo_blobs_if_present(physical_name, extra)
-            removed_any = True
-            file_errors.extend(blob_errors)
-            # Drop the name-mapping row so no anonymous_id -> original_filename
-            # record survives the photo (and the mapping table doesn't accrete
-            # dead rows). Skipped for shared content still referenced elsewhere.
-            if anonymous_id:
-                try:
-                    app.delete_image_name_mapping(user_id, anonymous_id)
-                except Exception:
-                    app.app.logger.debug('Failed to delete image-name mapping for %s', safe_name)
-
-        if metadata is not None:
-            try:
-                app.metadata_table_client.delete_entity(partition_key=user_id, row_key=safe_name)
-                removed_any = True
-            except Exception as exc:
-                app.app.logger.warning('Metadata delete failed for %s: %s', safe_name, exc)
-                file_errors.append('metadata: delete failed')
-            # Best-effort: drop this library's dedup/collision index rows too,
-            # so a deleted photo's hash/filename doesn't linger and confuse a
-            # later upload (detect_duplicates self-heals a stale hit anyway).
-            file_hash = str(metadata.get('fileHash') or '')
-            if file_hash:
-                app.delete_hash_index_entry(user_id, file_hash)
-            app.delete_filename_owner_entry(user_id, safe_name)
-            app.delete_embeddings_entry(user_id, safe_name)
-        elif not removed_any:
-            return safe_name, 'not_found', ''
-
-        if file_errors:
-            return safe_name, 'error', '; '.join(file_errors)
-        elif removed_any:
-            return safe_name, 'deleted', ''
-        else:
-            return safe_name, 'not_found', ''
+    def _soft_delete_one_file(safe_name: str) -> app.Tuple[str, str, str]:
+        """Returns (safe_name, outcome, detail); outcome one of 'deleted',
+        'not_found', 'error'. A photo with no metadata row yet (still
+        mid-upload) has nothing to trash -- clearing its temp file, same as
+        before, is as far as "delete" goes for it."""
+        if safe_name not in own_rows_by_name:
+            return (safe_name, 'deleted', '') if safe_name in temp_removed_names else (safe_name, 'not_found', '')
+        entity = app._mark_processing_deleted_for_file(user_id, safe_name)
+        if entity is None:
+            return safe_name, 'error', 'metadata: soft-delete failed'
+        return safe_name, 'deleted', ''
 
     with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
-        file_results = list(executor.map(_delete_one_file, valid_names))
+        file_results = list(executor.map(_soft_delete_one_file, valid_names))
 
     for safe_name, outcome, detail in file_results:
         if outcome == 'deleted':
@@ -922,69 +890,97 @@ def delete_multiple_photos():
         else:
             errors.append(f'{safe_name}: {detail}')
 
-    # Faces / people, jobs, and albums reconciliation — one scan each.
-    deleted_names_set = set(deleted)
-    try:
-        deleted_person_ids = app._batch_remove_faces_for_filenames(user_id, deleted_names_set)
-    except Exception as exc:
-        app.app.logger.warning('Batch face removal failed for %s: %s', user_id, exc)
-        deleted_person_ids = set()
-    try:
-        removed_jobs = app._batch_remove_job_rows(user_id, deleted_names_set)
-        if removed_jobs:
-            app.app.logger.info('Removed %s stale job row(s) for %s during batch delete', removed_jobs, user_id)
-    except Exception as exc:
-        app.app.logger.warning('Batch job cleanup failed for %s: %s', user_id, exc)
-    try:
-        app._batch_remove_filenames_from_albums(user_id, deleted_names_set)
-    except Exception as exc:
-        app.app.logger.warning('Batch album cleanup failed for %s: %s', user_id, exc)
-
-    # Strip references to any person that was emptied by this delete from the
-    # photos that survive (their peopleIds may still name a now-deleted person).
-    # Unlike the per-file lookups above, this genuinely needs the *whole*
-    # library -- a stale peopleIds reference can be on any surviving photo,
-    # not just one in this chunk -- so it can't be a point-read. Deleting a
-    # person's whole photo set makes deleted_person_ids non-empty on nearly
-    # every chunk in practice (not the rare case assumed originally), so this
-    # must be cheap: select= just the two columns this loop reads instead of
-    # the full-column cached scan, which measured 73s and loaded every photo's
-    # embeddings/tags/OCR text into memory for a 36k-row account -- the actual
-    # cause of a live OOM kill (exit 137) during a bulk delete.
-    if deleted_person_ids and app.metadata_table_client is not None:
-        try:
-            surviving_rows = app._query_metadata_rows_for_user(
-                user_id, select=['PartitionKey', 'RowKey', 'peopleIds'], purpose='photos.delete_person_cleanup',
-            )
-        except Exception:
-            surviving_rows = []
-        for row in surviving_rows:
-            name = str(row.get('RowKey') or '')
-            if name in deleted_names_set:
-                continue
-            try:
-                pids = app.json.loads(row.get('peopleIds', '[]') or '[]')
-            except Exception:
-                continue
-            next_pids = [pid for pid in pids if pid not in deleted_person_ids]
-            if len(next_pids) == len(pids):
-                continue
-            row['peopleIds'] = app.json.dumps(next_pids)
-            try:
-                app.metadata_table_client.upsert_entity(row)
-            except Exception:
-                pass
-
     if deleted:
-        # Deletions bypass _update_metadata_entity_fields; drop the scan cache so
-        # the next gallery load doesn't resurrect deleted photos, and mark the
-        # vector index dirty since the library's photo set changed.
         app._invalidate_metadata_scan_cache(user_id)
         try:
             app.touch_user_search_indexes_state(user_id, filenames=deleted)
         except Exception:
             pass
 
+    return app.jsonify({'deleted': deleted, 'errors': errors, 'success': len(deleted) > 0})
+
+
+@photos_bp.route('/photos/trash', methods=['GET'])
+@photos_bp.route('/api/photos/trash', methods=['GET'])
+def list_trashed_photos():
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    try:
+        offset = max(0, int(app.request.args.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        limit = max(1, min(200, int(app.request.args.get('limit', 50))))
+    except (TypeError, ValueError):
+        limit = 50
+
+    rows = app._query_metadata_rows_for_user(user_id, include_deleted=True, purpose='photos.list_trash')
+    trashed = [row for row in rows if row.get('processing_state') == 'deleted']
+    trashed.sort(key=lambda row: str(row.get('deletedAt') or ''), reverse=True)
+
+    retention_days = app.TRASH_RETENTION_DAYS
+    page = trashed[offset:offset + limit]
+    pid_to_name, _ = app._load_people_name_index(user_id)
+    photos = app._build_photo_summaries_page(
+        user_id,
+        [(str(row.get('RowKey') or ''), row) for row in page],
+        pid_to_name,
+    )
+    for photo, row in zip(photos, page):
+        deleted_at = str(row.get('deletedAt') or '')
+        photo['deletedAt'] = deleted_at
+        photo['purgeAt'] = app._compute_trash_purge_at(deleted_at, retention_days)
+
+    return app.jsonify({'photos': photos, 'total': len(trashed), 'offset': offset, 'limit': limit, 'retentionDays': retention_days})
+
+
+@photos_bp.route('/photos/trash/restore', methods=['POST'])
+@photos_bp.route('/api/photos/trash/restore', methods=['POST'])
+def restore_trashed_photos():
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    valid_names, errors = _parse_filenames_request()
+    restored = []
+    if not valid_names:
+        return app.jsonify({'restored': restored, 'errors': errors, 'success': False})
+
+    for safe_name in valid_names:
+        entity = app._restore_deleted_file(user_id, safe_name)
+        if entity is None:
+            errors.append(f'{safe_name}: Not found')
+        else:
+            restored.append(safe_name)
+
+    if restored:
+        app._invalidate_metadata_scan_cache(user_id)
+        try:
+            app.touch_user_search_indexes_state(user_id, filenames=restored)
+        except Exception:
+            pass
+
+    return app.jsonify({'restored': restored, 'errors': errors, 'success': len(restored) > 0})
+
+
+@photos_bp.route('/photos/trash/purge', methods=['POST'])
+@photos_bp.route('/api/photos/trash/purge', methods=['POST'])
+def purge_trashed_photos():
+    """Delete forever: only ever intended for filenames already sitting in
+    trash, but doesn't strictly require it -- same irreversible cascade the
+    old /photos/delete always ran."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    valid_names, errors = _parse_filenames_request()
+    if not valid_names:
+        return app.jsonify({'deleted': [], 'errors': errors, 'success': False})
+
+    deleted, hard_errors = app._hard_delete_photos_now(user_id, valid_names)
+    errors.extend(hard_errors)
     return app.jsonify({'deleted': deleted, 'errors': errors, 'success': len(deleted) > 0})
 
 @photos_bp.route('/photos/<filename>/rating', methods=['POST'])

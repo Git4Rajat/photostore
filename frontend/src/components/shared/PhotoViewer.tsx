@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, HeartIcon, InformationCircleIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, EllipsisHorizontalIcon, HeartIcon, InformationCircleIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { post, resolveApiUrl } from '../../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl } from '../../services/imageClient';
@@ -36,6 +36,13 @@ interface PhotoViewerProps {
     onRotationSave?: (filename: string, rotation: number) => Promise<void> | void;
     onRate?: (filename: string, rating: number) => Promise<void> | void;
     onToggleLike?: (filename: string) => Promise<void> | void;
+    // Host owns the confirm dialog + API call, same delegation as the above --
+    // this is just the trigger. Called unconditionally on click.
+    onDelete?: (filename: string) => void;
+    // Opens the host's existing PhotoActionSheet (add-to-album, download, etc.)
+    // targeted at just this one photo, instead of PhotoViewer building a
+    // second copy of that UI.
+    onOpenActions?: (filename: string) => void;
 }
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
@@ -205,7 +212,7 @@ const describePreviewFailure = (filename: string, rawMessage?: string | null): s
     return formatPreviewError(filename);
 };
 
-const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onIndexChange, useProtectedMedia = true, onRotationSave, onRate, onToggleLike }) => {
+const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onIndexChange, useProtectedMedia = true, onRotationSave, onRate, onToggleLike, onDelete, onOpenActions }) => {
     const [zoom, setZoom] = useState(1);
     const [pan, setPan] = useState({ x: 0, y: 0 });
     const [isPanning, setIsPanning] = useState(false);
@@ -1119,6 +1126,26 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                                     {rotationSaving ? <ArrowPathIcon className="toolbar-icon spin-icon" /> : <CheckIcon className="toolbar-icon" />}
                                 </button>
                             </>
+                        )}
+                        {onOpenActions && (
+                            <button
+                                type="button"
+                                className="photo-preview-icon"
+                                onClick={(e) => { e.stopPropagation(); if (activePhoto) onOpenActions(activePhoto.filename); }}
+                                aria-label="More photo actions"
+                            >
+                                <EllipsisHorizontalIcon className="toolbar-icon" />
+                            </button>
+                        )}
+                        {onDelete && (
+                            <button
+                                type="button"
+                                className="photo-preview-icon"
+                                onClick={(e) => { e.stopPropagation(); if (activePhoto) onDelete(activePhoto.filename); }}
+                                aria-label="Delete photo"
+                            >
+                                <TrashIcon className="toolbar-icon" />
+                            </button>
                         )}
                         <button type="button" className="photo-preview-icon" onClick={close} aria-label="Close">
                             <XMarkIcon className="toolbar-icon" />

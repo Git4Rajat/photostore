@@ -12,6 +12,7 @@ import {
     ExclamationTriangleIcon,
     InformationCircleIcon,
     KeyIcon,
+    MapIcon,
     MoonIcon,
     PhotoIcon,
     PlusIcon,
@@ -19,6 +20,7 @@ import {
     RocketLaunchIcon,
     ShareIcon,
     SunIcon,
+    TrashIcon,
     UserCircleIcon,
     UsersIcon,
     WrenchScrewdriverIcon,
@@ -48,10 +50,12 @@ const pageTitleFor = (pathname: string): string => {
     if (pathname === '/') return 'Gallery';
     if (pathname.startsWith('/albums')) return 'Albums';
     if (pathname.startsWith('/tools')) return 'Tools';
+    if (pathname.startsWith('/explore')) return 'Explore';
     if (pathname.startsWith('/people')) return 'People';
     if (pathname.startsWith('/library')) return 'Sharing';
     if (pathname.startsWith('/corrupted')) return 'Corrupted uploads';
     if (pathname.startsWith('/additional')) return 'Additional info';
+    if (pathname.startsWith('/trash')) return 'Recently Deleted';
     if (pathname === '/login') return 'Sign in';
     if (pathname === '/logout') return 'Sign out';
     if (pathname === '/reset-password') return 'Reset password';
@@ -66,14 +70,17 @@ const loadPhotoGalleryPage = () => import('./components/PhotoGallery');
 const loadAlbumsPage = () => import('./components/AlbumsPage');
 const loadToolsPage = () => import('./components/ToolsPage');
 const loadPeoplePage = () => import('./components/PeoplePage');
+const loadExplorePage = () => import('./components/ExplorePage');
 
 const LazyPhotoGallery = React.lazy(loadPhotoGalleryPage);
 const LazyAlbumsPage = React.lazy(loadAlbumsPage);
 const LazyToolsPage = React.lazy(loadToolsPage);
 const LazyPeoplePage = React.lazy(loadPeoplePage);
+const LazyExplorePage = React.lazy(loadExplorePage);
 const LazyPersonDetail = React.lazy(() => import('./components/PersonDetail'));
 const LazyAdditionalInfoPage = React.lazy(() => import('./components/AdditionalInfoPage'));
 const LazyCorruptedUploadsPage = React.lazy(() => import('./components/CorruptedUploadsPage'));
+const LazyRecentlyDeletedPage = React.lazy(() => import('./components/RecentlyDeletedPage'));
 const LazyPublicAlbumPage = React.lazy(() => import('./components/PublicAlbumPage'));
 const LazyLoginPage = React.lazy(() => import('./components/LoginPage'));
 const LazyLogoutPage = React.lazy(() => import('./components/LogoutPage'));
@@ -88,6 +95,7 @@ const PRIVATE_TAB_PRELOADERS = [
     loadAlbumsPage,
     loadToolsPage,
     loadPeoplePage,
+    loadExplorePage,
 ];
 
 let privateTabPreloadStarted = false;
@@ -127,6 +135,7 @@ interface NavItem {
 const PRIMARY_NAV_ITEMS: NavItem[] = [
     { to: '/', label: 'Gallery', end: true, Icon: PhotoIcon },
     { to: '/albums', label: 'Albums', Icon: RectangleStackIcon },
+    { to: '/explore', label: 'Explore', Icon: MapIcon },
     { to: '/tools', label: 'Tools', Icon: WrenchScrewdriverIcon },
     { to: '/people', label: 'People', Icon: UsersIcon },
     { to: '/library', label: 'Sharing', Icon: ShareIcon },
@@ -135,6 +144,7 @@ const PRIMARY_NAV_ITEMS: NavItem[] = [
 // Rarely-used utilities, kept out of the way (right of the tab-bar spacer on
 // desktop, a separate group in the drawer on mobile).
 const UTILITY_NAV_ITEMS: NavItem[] = [
+    { to: '/trash', label: 'Recently Deleted', Icon: TrashIcon },
     { to: '/corrupted', label: 'Corrupted', Icon: ExclamationTriangleIcon },
     { to: '/additional', label: 'Additional Info', Icon: InformationCircleIcon },
 ];
@@ -1011,7 +1021,12 @@ const AppContent: React.FC = () => {
                                 ),
                             },
                             { path: '/albums', element: renderProtectedLazyPage(<LazyAlbumsPage />, 'Loading albums…') },
+                            { path: '/explore', element: renderProtectedLazyPage(<LazyExplorePage />, 'Loading Explore…') },
                             { path: '/tools/*', element: renderProtectedLazyPage(<LazyToolsPage />, 'Loading tools…') },
+                            {
+                                path: '/trash',
+                                element: renderProtectedLazyPage(<LazyRecentlyDeletedPage />, 'Loading Recently Deleted…'),
+                            },
                             {
                                 path: '/corrupted',
                                 element: renderProtectedLazyPage(<LazyCorruptedUploadsPage />, 'Loading corrupted uploads…'),

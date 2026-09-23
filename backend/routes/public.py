@@ -60,6 +60,8 @@ def public_album(token: str):
     photos = []
     for name in filenames:
         metadata = app._get_metadata_entity(owner_id, name) if owner_id else {}
+        if (metadata or {}).get('processing_state') == 'deleted':
+            continue
         urls = app._public_photo_urls(token, name, blob_name=app._blob_name_from_metadata(metadata, name))
         photos.append({
             'filename': name,

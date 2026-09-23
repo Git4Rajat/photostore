@@ -549,6 +549,37 @@ const blobToDataUrl = (blob: Blob): Promise<string> => new Promise((resolve, rej
     reader.readAsDataURL(blob);
 });
 
+interface GallerySuggestion {
+    id: string;
+    type: 'unnamed_person' | 'on_this_day';
+    title: string;
+    subtitle: string;
+    actionLabel: string;
+    actionHref: string;
+}
+
+// Client-side "shown once" dismissal, same pattern as
+// MOBILE_SELECTION_TIP_STORAGE_KEY in AppServicesProvider.tsx -- no backend
+// state needed since re-computing the signal naturally stops resurfacing it
+// once resolved (e.g. once a person is named, they no longer match the
+// unnamed-person query at all).
+const SUGGESTION_DISMISSED_KEY_PREFIX = 'photostore.dismissedSuggestion.';
+const isSuggestionDismissed = (id: string): boolean => {
+    try {
+        return localStorage.getItem(SUGGESTION_DISMISSED_KEY_PREFIX + id) === '1';
+    } catch {
+        return false;
+    }
+};
+const dismissSuggestion = (id: string): void => {
+    try {
+        localStorage.setItem(SUGGESTION_DISMISSED_KEY_PREFIX + id, '1');
+    } catch {
+        // Storage unavailable (private browsing, quota) -- worst case the
+        // same suggestion shows again next session, not worth failing over.
+    }
+};
+
 // Only surface the "Deleting X/Y…" progress line for larger selections; small
 // deletes complete near-instantly and the line would just flash.
 const CHUNK_DELETE_FEEDBACK_MIN = 50;
@@ -4084,6 +4115,15 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [error, setError] = useState<string | null>(null);
     const [warmingUp, setWarmingUp] = useState<boolean>(false);
     const [searchNotice, setSearchNotice] = useState<string | null>(null);
+    // Why a search matched -- populated from /photos/search's response when
+    // the backend handled the query. The browser-AI local-search fallback
+    // (tryLocalSearch below) returns a plain {photos, total} with neither
+    // field, so these naturally clear to [] for that path rather than
+    // needing a special case.
+    const [matchedPeople, setMatchedPeople] = useState<string[]>([]);
+    const [matchedLocations, setMatchedLocations] = useState<string[]>([]);
+    const [savingSearchAsAlbum, setSavingSearchAsAlbum] = useState<boolean>(false);
+    const [suggestion, setSuggestion] = useState<GallerySuggestion | null>(null);
     // Default to capture-date order ("Captured") so the gallery opens on the most
     // recently *taken* photos. Upload date ("Recent") is a poor proxy for recency
     // in a bulk-imported library — every photo finalizes at roughly the same
@@ -4105,7 +4145,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [albumMenuOptions, setAlbumMenuOptions] = useState<AlbumSummary[] | null>(null);
     const [albumMenuLoading, setAlbumMenuLoading] = useState<boolean>(false);
     const [addingToAlbumId, setAddingToAlbumId] = useState<string | null>(null);
-    const [searchOpen, setSearchOpen] = useState<boolean>(false);
     const searchRef = useRef<HTMLDivElement | null>(null);
     const sortMenuRef = useRef<HTMLDivElement | null>(null);
     const filterMenuRef = useRef<HTMLDivElement | null>(null);
@@ -4341,8 +4380,12 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             setHasMore(list.length === PAGE_SIZE && nextOffset + list.length < response.total);
             if (trimmedQuery) {
                 setSearchNotice(typeof response.searchNotice === 'string' ? response.searchNotice : null);
+                setMatchedPeople(Array.isArray(response.matchedPeople) ? response.matchedPeople : []);
+                setMatchedLocations(Array.isArray(response.matchedLocations) ? response.matchedLocations : []);
             } else {
                 setSearchNotice(null);
+                setMatchedPeople([]);
+                setMatchedLocations([]);
             }
         } catch (err) {
             if (requestSeq !== photoListRequestSeqRef.current) {
@@ -4418,6 +4461,48 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         return () => {
             cancelled = true;
         };
+    }, [location.search]);
+
+    // Deep link from Explore ("tap a Place/Thing card") -- same shape as the
+    // focus= effect above, but seeds the search box instead of opening a
+    // single photo. Reimplements submitSearch's body (rather than calling it)
+    // because submitSearch is a useCallback closing over searchInput/sortBy;
+    // depending on it here would re-run this effect on every unrelated
+    // keystroke/sort change instead of only on real navigation.
+    useEffect(() => {
+        const params = new URLSearchParams(location.search);
+        const q = params.get('q');
+        if (!q) {
+            return;
+        }
+        setSearchInput(q);
+        setSearchQuery(q);
+        setOffset(0);
+        setHasMore(true);
+        fetchPhotos(sortBy, 0, false, q);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [location.search]);
+
+    // Deep link from a Nudge suggestion ("On this day, 2023 → View") --
+    // unlike q= above, this doesn't need to call fetchPhotos itself: the
+    // existing captureStartDate/captureEndDate watcher effect already
+    // refetches whenever those two state vars change, so this just has to
+    // seed them from the URL.
+    useEffect(() => {
+        const params = new URLSearchParams(location.search);
+        const start = params.get('captureStart');
+        const end = params.get('captureEnd');
+        const isValidDate = (value: string | null): value is string => Boolean(value && /^\d{4}-\d{2}-\d{2}$/.test(value));
+        if (!isValidDate(start) && !isValidDate(end)) {
+            return;
+        }
+        if (isValidDate(start)) {
+            setCaptureStartDate(start);
+        }
+        if (isValidDate(end)) {
+            setCaptureEndDate(end);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [location.search]);
 
     useEffect(() => {
@@ -4503,9 +4588,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         const deleteCount = selectedPhotos.size;
         const confirmDelete = await confirmDialog({
             title: 'Delete photos',
-            message: `Delete ${plural(deleteCount, 'photo')}? This will permanently remove them from the gallery and any albums.`,
+            message: `Move ${plural(deleteCount, 'photo')} to Recently Deleted? You can restore them for 30 days before they're gone for good.`,
             confirmLabel: 'Delete',
-            danger: true,
         });
         if (!confirmDelete) return;
 
@@ -4569,6 +4653,39 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         } finally {
             setDeleting(false);
             setDeleteProgress(null);
+        }
+    };
+
+    // Single-photo counterpart to handleDeletePhotos, for the PhotoViewer's
+    // delete button -- the photo being viewed isn't necessarily part of
+    // selectedPhotos, so this doesn't reuse that bulk flow's state.
+    const handleDeleteFromViewer = async (filename: string) => {
+        const confirmDelete = await confirmDialog({
+            title: 'Delete photo',
+            message: 'Move this photo to Recently Deleted? You can restore it for 30 days.',
+            confirmLabel: 'Delete',
+        });
+        if (!confirmDelete) return;
+
+        try {
+            const response = await post('/photos/delete', { filenames: [filename] });
+            const deletedOk = Array.isArray(response?.deleted) && response.deleted.includes(filename);
+            if (!deletedOk) {
+                setError('Failed to delete photo.');
+                return;
+            }
+            setPhotos(prev => prev.filter(p => p.filename !== filename));
+            releaseKnownHashesForFilenames?.([filename]);
+            addNotification('Photo deleted', `Moved ${getDisplayName(filename)} to Recently Deleted.`);
+
+            const remaining = filteredPhotos.length - 1;
+            if (remaining <= 0) {
+                closeLightbox();
+            } else if (lightboxIndex !== null && lightboxIndex >= remaining) {
+                setLightboxIndex(remaining - 1);
+            }
+        } catch (err) {
+            notifyApiError(err, { context: "Couldn't delete photo", retry: () => handleDeleteFromViewer(filename) });
         }
     };
 
@@ -4649,6 +4766,48 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             setAlbumMenuOptions(null);
         } catch (err) {
             setError(typeof err === 'string' ? err : 'Failed to create album from selection.');
+        }
+    };
+
+    // "Save as album" for the active search — same two-endpoint sequence as
+    // handleCreateAlbumFromSelected above (POST /albums then photos/add),
+    // just sourced from the current search result page instead of a manual
+    // selection. Only saves what's currently loaded (this page's results,
+    // not every match past pagination), same scope limit bulk-select already has.
+    const handleSaveSearchAsAlbum = async () => {
+        if (!searchQuery.trim() || filteredPhotos.length === 0) {
+            return;
+        }
+        const suggestedName = searchQuery.trim().replace(/\s+/g, ' ');
+        const input = await promptDialog({
+            title: 'Save search as album',
+            label: 'Album name',
+            defaultValue: suggestedName.slice(0, 80),
+            confirmLabel: 'Save',
+        });
+        if (input === null) {
+            return;
+        }
+        const albumName = input.trim();
+        if (!albumName) {
+            setError('Album name is required.');
+            return;
+        }
+
+        const filenames = filteredPhotos.map((photo) => photo.filename);
+        setSavingSearchAsAlbum(true);
+        try {
+            const createResponse = await post('/albums', { name: albumName });
+            const newAlbumId = String(createResponse?.album?.id || '');
+            if (!newAlbumId) {
+                throw new Error('Album was created but no album id was returned.');
+            }
+            await post(`/albums/${newAlbumId}/photos/add`, { filenames });
+            addNotification('Album created', `Saved "${albumName}" with ${plural(filenames.length, 'photo')}.`);
+        } catch (err) {
+            setError(typeof err === 'string' ? err : 'Failed to save search as an album.');
+        } finally {
+            setSavingSearchAsAlbum(false);
         }
     };
 
@@ -4814,7 +4973,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             setHasMore(true);
             fetchPhotos(sortBy, 0, false, '');
         }
-        setSearchOpen(false);
     }, [searchInput, searchQuery, fetchPhotos, sortBy]);
 
     const clearSearch = useCallback(() => {
@@ -4825,7 +4983,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             setHasMore(true);
             fetchPhotos(sortBy, 0, false, '');
         }
-        setSearchOpen(false);
     }, [searchQuery, fetchPhotos, sortBy]);
 
     useEffect(() => {
@@ -5123,61 +5280,44 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                     </p>
 
                     <div className="gallery-tool-cluster">
-                        {searchOpen ? (
-                            <div className="gallery-search-open" ref={searchRef}>
-                                <input
-                                    id="gallery-search"
-                                    type="text"
-                                    placeholder="Search by meaning…"
-                                    value={searchInput}
-                                    autoFocus
-                                    onChange={(e) => setSearchInput(e.target.value)}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Enter') {
-                                            submitSearch();
-                                        } else if (e.key === 'Escape') {
-                                            closeSearch();
-                                        }
-                                    }}
-                                    onBlur={closeSearch}
-                                    enterKeyHint="search"
-                                    className="field gallery-search-field"
-                                    aria-label="Search photos"
-                                    aria-busy={loading}
-                                />
-                                {loading ? (
-                                    <span className="gallery-search-clear gallery-search-spinner" aria-hidden="true">
-                                        <ArrowPathIcon className="toolbar-icon spin-icon" />
-                                    </span>
-                                ) : searchInput && (
-                                    <button
-                                        type="button"
-                                        className="gallery-search-clear"
-                                        onMouseDown={(e) => e.preventDefault()}
-                                        onClick={clearSearch}
-                                        aria-label="Clear search"
-                                    >
-                                        <XMarkIcon className="toolbar-icon" />
-                                    </button>
-                                )}
-                                {loading && <span className="sr-only" role="status">Searching…</span>}
-                            </div>
-                        ) : (
-                            <button
-                                type="button"
-                                onClick={() => setSearchOpen(true)}
-                                className={`btn icon-btn ${searchQuery ? 'btn-primary' : 'btn-soft'}`}
-                                aria-label="Search"
-                                title={loading && searchQuery ? 'Searching…' : searchQuery ? `Searching: ${searchQuery}` : 'Search'}
-                            >
-                                {loading && searchQuery ? (
-                                    <ArrowPathIcon className="toolbar-icon spin-icon" aria-hidden="true" />
-                                ) : (
-                                    <MagnifyingGlassIcon className="toolbar-icon" />
-                                )}
-                                <span className="sr-only">Search</span>
-                            </button>
-                        )}
+                        <div className="gallery-search-open gallery-search-persistent" ref={searchRef}>
+                            <MagnifyingGlassIcon className="gallery-search-icon toolbar-icon" aria-hidden="true" />
+                            <input
+                                id="gallery-search"
+                                type="text"
+                                placeholder="Ask your library — a name, a place, a year…"
+                                value={searchInput}
+                                onChange={(e) => setSearchInput(e.target.value)}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                        submitSearch();
+                                    } else if (e.key === 'Escape') {
+                                        closeSearch();
+                                    }
+                                }}
+                                onBlur={closeSearch}
+                                enterKeyHint="search"
+                                className="field gallery-search-field"
+                                aria-label="Search photos"
+                                aria-busy={loading}
+                            />
+                            {loading ? (
+                                <span className="gallery-search-clear gallery-search-spinner" aria-hidden="true">
+                                    <ArrowPathIcon className="toolbar-icon spin-icon" />
+                                </span>
+                            ) : searchInput && (
+                                <button
+                                    type="button"
+                                    className="gallery-search-clear"
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={clearSearch}
+                                    aria-label="Clear search"
+                                >
+                                    <XMarkIcon className="toolbar-icon" />
+                                </button>
+                            )}
+                            {loading && <span className="sr-only" role="status">Searching…</span>}
+                        </div>
 
                         <div className="gallery-menu-anchor" ref={sortMenuRef}>
                             <button
@@ -5471,6 +5611,31 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 />
             )}
             {!loading && !error && searchNotice && <p className="status">{searchNotice}</p>}
+            {!loading && !error && searchQuery && (matchedPeople.length > 0 || matchedLocations.length > 0 || filteredPhotos.length > 0) && (
+                <div className="gallery-search-meta-row">
+                    {(matchedPeople.length > 0 || matchedLocations.length > 0) && (
+                        <div className="tag-chips">
+                            {matchedPeople.map((name) => (
+                                <span key={`person-${name}`} className="tag-chip">{name}</span>
+                            ))}
+                            {matchedLocations.map((place) => (
+                                <span key={`place-${place}`} className="tag-chip">{place}</span>
+                            ))}
+                        </div>
+                    )}
+                    {filteredPhotos.length > 0 && (
+                        <button
+                            type="button"
+                            className="btn btn-soft"
+                            disabled={savingSearchAsAlbum}
+                            onClick={() => void handleSaveSearchAsAlbum()}
+                        >
+                            <PlusIcon className="toolbar-icon" aria-hidden="true" />
+                            {savingSearchAsAlbum ? 'Saving…' : 'Save as album'}
+                        </button>
+                    )}
+                </div>
+            )}
             {!loading && !error && filteredPhotos.length === 0 && photos.length > 0 && mediaFilter !== 'all' && (
                 <p className="empty">{mediaFilter === 'videos' ? 'No videos in the loaded results.' : 'No photos in the loaded results.'}</p>
             )}
@@ -5627,6 +5792,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         onRotationSave={handleSaveRotation}
                         onRate={handleRatePhoto}
                         onToggleLike={handleToggleLike}
+                        onDelete={handleDeleteFromViewer}
+                        onOpenActions={(filename) => setActionSheetTarget({ filenames: [filename] })}
                     />
                 </ErrorBoundary>
             )}

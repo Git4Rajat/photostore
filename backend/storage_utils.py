@@ -74,7 +74,7 @@ PHOTO_LIST_SELECT_FIELDS = [
     'preview_status', 'thumbnail_status', 'exif_status', 'ocr_status',
     'face_status', 'ai_vision_status', 'map_detection_status',
     'processing_lease_owner', 'processing_lease_expires_at',
-    'anonymousImageId',
+    'anonymousImageId', 'processing_state', 'deletedAt',
     'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified',
 ]
 SUSPICIOUS_FACE_CONFIDENCE = float(os.getenv('SUSPICIOUS_FACE_CONFIDENCE', '0.60'))
@@ -1292,6 +1292,8 @@ def _build_user_vector_index_snapshot(user_id: str, source_version: str) -> Opti
         filename = str(row.get('RowKey') or '').strip()
         if not filename:
             continue
+        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+            continue
         embedding_row = embeddings_by_filename.get(filename) or row
         vector = _compute_photo_vector(filename, row, embedding_row, photo_embeddings_compatible)
         if vector is None:
@@ -2231,6 +2233,8 @@ def _build_user_lexical_index_snapshot(user_id: str, source_version: str) -> Opt
     for row in rows:
         filename = str(row.get('RowKey') or '').strip()
         if not filename:
+            continue
+        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
             continue
         trimmed_rows.append({k: v for k, v in dict(row).items() if k not in _LEXICAL_INDEX_EXCLUDED_FIELDS})
 
@@ -4683,7 +4687,26 @@ def _claim_filename_owner(user_id: str, filename: str, file_hash: str) -> bool:
             existing = filename_owners_table_client.get_entity(partition_key=filename, row_key=user_id)
         except Exception:
             return True
-        return str(existing.get('fileHash') or '') == file_hash
+        if str(existing.get('fileHash') or '') == file_hash:
+            return True
+        # Different content claiming a name this same user already owns is
+        # normally a real collision (caller suffix-renames). But if what's
+        # sitting there is already in trash, its blob is about to be
+        # overwritten by this upload anyway -- let it reclaim the original
+        # name outright instead of getting silently renamed to "-<hex>".
+        metadata_table_client = _CTX.get('metadata_table_client')
+        if metadata_table_client is not None:
+            try:
+                existing_row = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+            except Exception:
+                existing_row = None
+            if existing_row is not None and existing_row.get('processing_state') == 'deleted':
+                try:
+                    filename_owners_table_client.upsert_entity({'PartitionKey': filename, 'RowKey': user_id, 'fileHash': file_hash})
+                except Exception:
+                    pass
+                return True
+        return False
     except Exception:
         return True
 

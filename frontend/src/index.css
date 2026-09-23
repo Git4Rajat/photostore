@@ -3451,6 +3451,30 @@ html[data-theme='light'] .notification-item.unread {
   padding-right: 30px;
 }
 
+/* Ask: the search box is now always visible (not a collapsed icon toggle),
+   so it gets a leading icon and a bit more room to read as the front door
+   it's meant to be, per the frontend:verify skill's note that .toolbar-icon
+   has no intrinsic size outside an .icon-btn context. */
+.gallery-search-persistent .gallery-search-field {
+  width: min(420px, 60vw);
+}
+
+.gallery-search-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.gallery-search-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+
 .gallery-search-clear {
   position: absolute;
   right: 6px;
@@ -6317,6 +6341,16 @@ video.photo-preview-media.is-loading {
   color: var(--muted);
   font-size: 0.82rem;
   margin-top: 2px;
+}
+
+.explore-section-title {
+  font-weight: 700;
+  font-size: 0.96rem;
+  margin: 1.5rem 0 0.75rem;
+}
+
+.explore-section-title:first-of-type {
+  margin-top: 0.5rem;
 }
 
 .tools-hero-actions .icon-btn,

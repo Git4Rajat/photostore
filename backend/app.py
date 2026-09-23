@@ -22,7 +22,7 @@ import unicodedata
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
 
 from azure.core import MatchConditions
@@ -481,6 +481,9 @@ LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY = int(os.getenv('LIBRARY_EXPORT_DOWNLOAD_CON
 # -- pure network I/O wait each time, same shape as the library-export
 # downloads above, so overlapping them is the same low-risk win.
 DELETE_IO_CONCURRENCY = int(os.getenv('DELETE_IO_CONCURRENCY', '16'))
+# How long a soft-deleted photo stays recoverable in trash before the
+# retention sweep (see _run_trash_purge_sweep) hard-deletes it for good.
+TRASH_RETENTION_DAYS = int(os.getenv('TRASH_RETENTION_DAYS', '30'))
 # The azure-core SDK's default requests-based transport caps its underlying
 # urllib3 connection pool at 10 per host. That's invisible under sequential
 # per-file calls, but DELETE_IO_CONCURRENCY (and any other concurrent callers
@@ -1740,7 +1743,8 @@ def _album_entity_to_payload(entity: Dict) -> Dict:
         # process's own request.host_url.
         base = EXTRAS_PUBLIC_BASE_URL or request.host_url.rstrip('/')
         public_url = f"{base.rstrip('/')}/public/album/{token}"
-    return {
+    deleted_at = str(entity.get('deletedAt') or '')
+    payload = {
         'id': entity.get('RowKey'),
         'name': entity.get('name', ''),
         'photoCount': len(filenames),
@@ -1751,6 +1755,10 @@ def _album_entity_to_payload(entity: Dict) -> Dict:
         'hasAccessCode': has_access_code,
         'isExpired': is_expired,
     }
+    if deleted_at:
+        payload['deletedAt'] = deleted_at
+        payload['purgeAt'] = _compute_trash_purge_at(deleted_at, TRASH_RETENTION_DAYS)
+    return payload
 
 
 def _location_from_metadata(metadata: Dict, exif_data: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -3236,7 +3244,13 @@ def _cached_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict
         listing_index = None
         app.logger.exception('Listing index lookup failed purpose=%s user=%s, falling back to full scan', purpose, user_id)
     if listing_index is not None:
-        return listing_index.get('rows') or []
+        # The listing-index blob isn't sourced through _query_metadata_rows_for_user,
+        # so it doesn't get that function's include_deleted=False filtering for
+        # free -- and nothing stamps it as dirty/rebuilds it when a photo is
+        # trashed, so a soft-deleted row can linger in it until the next
+        # natural rebuild. Filter defensively here rather than trust staleness
+        # timing.
+        return [row for row in (listing_index.get('rows') or []) if row.get('processing_state') != 'deleted']
     return _metadata_list_scan_cache.get(
         user_id,
         lambda: _query_metadata_rows_for_user(user_id, select=list(PHOTO_LIST_SELECT_FIELDS), purpose=purpose),
@@ -3255,14 +3269,25 @@ def _cached_sorted_metadata_list_rows_for_user(user_id: str, purpose: str) -> Li
     return _photo_list_default_sort_cache.get(user_id, _compute)
 
 
-def _query_metadata_rows_for_user(user_id: str, select: Optional[List[str]] = None, purpose: str = 'metadata') -> List[Dict]:
+def _query_metadata_rows_for_user(
+    user_id: str, select: Optional[List[str]] = None, purpose: str = 'metadata', include_deleted: bool = False,
+) -> List[Dict]:
+    """include_deleted=False (the default, and what every normal listing/search/
+    export path gets) drops trashed rows (processing_state == 'deleted') after
+    the fetch. This is a Python-side filter deliberately, not an OData 'and
+    processing_state ne ...' clause -- Table Storage's eq/ne comparisons
+    exclude entities missing the property entirely, which would have silently
+    dropped every pre-existing row from before this field existed. Pass
+    include_deleted=True only for trash listing and admin/repair tooling that
+    genuinely needs to see trashed rows too. If ``select`` is given, callers
+    that need include_deleted=True must include 'processing_state' in it."""
     if metadata_table_client is None:
         raise RuntimeError('Metadata table is not configured.')
 
     query = f"PartitionKey eq '{_escape_odata(user_id)}'"
     kwargs = {}
     if select:
-        kwargs['select'] = select
+        kwargs['select'] = select if include_deleted or 'processing_state' in select else [*select, 'processing_state']
     if PHOTO_TABLE_SCAN_PAGE_SIZE > 0:
         kwargs['results_per_page'] = PHOTO_TABLE_SCAN_PAGE_SIZE
 
@@ -3289,6 +3314,8 @@ def _query_metadata_rows_for_user(user_id: str, select: Optional[List[str]] = No
                 rows.append(dict(row))
                 if len(rows) > PHOTO_TABLE_SCAN_MAX_ROWS:
                     raise RuntimeError(f'Metadata scan exceeded {PHOTO_TABLE_SCAN_MAX_ROWS} rows.')
+        if not include_deleted:
+            rows = [row for row in rows if row.get('processing_state') != 'deleted']
         app.logger.info(
             'Metadata scan completed purpose=%s user=%s rows=%s elapsed_ms=%s',
             purpose,
@@ -6875,6 +6902,27 @@ def _delete_album_token_index(token: str) -> None:
         pass
 
 
+def _hard_delete_album_now(user_id: str, album_id: str, existing: Optional[Dict] = None) -> bool:
+    """Permanently removes an album row (and its public-share token index, if
+    any). Only the album grouping/name/share link is lost -- the photos
+    inside it are untouched (see _album_filenames' callers). Shared by the
+    explicit purge-forever endpoint and the retention sweep, mirroring
+    _hard_delete_photos_now's role for photo trash."""
+    if albums_table_client is None:
+        return False
+    if existing is None:
+        existing = _load_album_entity(user_id, album_id)
+    try:
+        albums_table_client.delete_entity(partition_key=user_id, row_key=album_id)
+    except Exception:
+        app.logger.warning('Album purge failed for %s/%s', user_id, album_id)
+        return False
+    old_token = str((existing or {}).get('publicToken') or '')
+    if old_token:
+        _delete_album_token_index(old_token)
+    return True
+
+
 SMART_ALBUM_RULES = {
     'location': 'location',
     'by_location': 'location',
@@ -6986,6 +7034,167 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
     else:
         candidates.sort(key=lambda item: (len(item['filenames']), item['latest'], item['name']), reverse=True)
     return candidates
+
+
+EXPLORE_MAX_GROUPS = 24
+
+
+def _explore_places_and_things(user_id: str) -> Dict[str, List[Dict]]:
+    """Groups a library into Places (by location) and Things (by tag/object)
+    for the Explore page. Sourced from the already-cached lexical index blob
+    (get_user_lexical_index) rather than a fresh table scan -- the scan cost
+    is already paid for by search, so this groupBy is just an in-process
+    iteration over rows already sitting in memory. Grouping/normalization
+    mirrors _smart_album_candidates's 'location' and 'tag-object' rules
+    exactly, so the same city spelled two ways or the same tag in different
+    case collapses into one group here too."""
+    lexical = get_user_lexical_index(user_id, allow_refresh=True)
+    rows = (lexical or {}).get('rows') or []
+    pid_to_name, _ = _load_people_name_index(user_id)
+
+    place_groups: Dict[str, Dict] = {}
+    thing_groups: Dict[str, Dict] = {}
+
+    for row in rows:
+        filename = row.get('RowKey')
+        if not filename:
+            continue
+
+        city = str(row.get('locationCity') or '').strip()
+        country = str(row.get('locationCountry') or '').strip()
+        address = str(row.get('address') or '').strip()
+        latitude = str(row.get('latitude') or '').strip()
+        longitude = str(row.get('longitude') or '').strip()
+        label = ', '.join(part for part in (city, country) if part) or address
+        if not label and latitude and longitude:
+            label = f'{latitude[:8]}, {longitude[:8]}'
+        place_key = _normalize_search_phrase(label)
+        if place_key:
+            group = place_groups.setdefault(place_key, {
+                'label': _smart_album_title(label), 'count': 0, 'row': row, 'filename': filename,
+                'latitude': latitude, 'longitude': longitude,
+            })
+            group['count'] += 1
+
+        terms = parse_tags(row.get('tags', '[]')) + parse_json_list(row.get('objects', '[]'))
+        for term in dict.fromkeys(terms):
+            term_key = _normalize_search_phrase(term)
+            if not term_key:
+                continue
+            group = thing_groups.setdefault(term_key, {
+                'label': _smart_album_title(term), 'count': 0, 'row': row, 'filename': filename,
+            })
+            group['count'] += 1
+
+    def _finalize(groups: Dict[str, Dict], include_coords: bool) -> List[Dict]:
+        items = sorted(groups.values(), key=lambda g: g['count'], reverse=True)[:EXPLORE_MAX_GROUPS]
+        results = []
+        for item in items:
+            photo = _build_photo_summary(
+                user_id, item['filename'], item['row'], include_props=False, pid_to_name=pid_to_name,
+            )
+            entry: Dict[str, object] = {'label': item['label'], 'count': item['count'], 'photo': photo}
+            if include_coords:
+                entry['latitude'] = item['latitude']
+                entry['longitude'] = item['longitude']
+            results.append(entry)
+        return results
+
+    return {'places': _finalize(place_groups, True), 'things': _finalize(thing_groups, False)}
+
+
+SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))
+
+
+def _compute_unnamed_person_suggestion(user_id: str) -> Optional[Dict]:
+    """Cheapest possible version of list_persons' Phase A pass
+    (routes/people.py:58-112) -- no per-page thumbnail minting, no
+    pagination, just enough to pick one candidate: the unnamed person with
+    the most active faces, above SUGGESTION_UNNAMED_FACE_THRESHOLD."""
+    try:
+        rows, face_by_id = _scan_person_and_face_rows(user_id)
+    except Exception:
+        return None
+    best_person_id = None
+    best_count = 0
+    for row in rows:
+        person_id = str(row.get('RowKey') or '')
+        if not person_id or _person_entity_is_named(row):
+            continue
+        try:
+            face_ids = json.loads(row.get('faceIds', '[]') or '[]')
+        except Exception:
+            face_ids = []
+        active_count = 0
+        for fid in face_ids:
+            face = face_by_id.get(str(fid))
+            if face is None:
+                continue
+            if _face_is_rejected(face) or not _face_is_owned_by_person(face, person_id):
+                continue
+            active_count += 1
+        if active_count > best_count:
+            best_count = active_count
+            best_person_id = person_id
+    if best_person_id is None or best_count < SUGGESTION_UNNAMED_FACE_THRESHOLD:
+        return None
+    return {
+        'id': f'unnamed_person:{best_person_id}',
+        'type': 'unnamed_person',
+        'title': f"{best_count} photos of someone you haven't named",
+        'subtitle': 'Name them so they show up in search and albums.',
+        'actionLabel': 'Name them',
+        'actionHref': f'/people/{best_person_id}',
+    }
+
+
+def _compute_on_this_day_suggestion(user_id: str) -> Optional[Dict]:
+    """No day-of-year index exists -- this is a plain filter over the same
+    already-cached listing used by /photos (_cached_metadata_list_rows_for_user),
+    reusing _metadata_capture_date (already used by _smart_album_candidates
+    and default sort ordering). Picks whichever past year has the most
+    matches for today's month/day."""
+    try:
+        rows = _cached_metadata_list_rows_for_user(user_id, purpose='suggestions.on_this_day')
+    except Exception:
+        return None
+    today = datetime.now(timezone.utc)
+    matches_by_year: Dict[int, int] = {}
+    for row in rows:
+        capture_dt = _metadata_capture_date(row)
+        if capture_dt == datetime.min.replace(tzinfo=timezone.utc):
+            continue
+        if capture_dt.month == today.month and capture_dt.day == today.day and capture_dt.year != today.year:
+            matches_by_year[capture_dt.year] = matches_by_year.get(capture_dt.year, 0) + 1
+    if not matches_by_year:
+        return None
+    best_year = max(matches_by_year, key=lambda y: matches_by_year[y])
+    count = matches_by_year[best_year]
+    date_str = f'{best_year:04d}-{today.month:02d}-{today.day:02d}'
+    return {
+        'id': f'on_this_day:{date_str}',
+        'type': 'on_this_day',
+        'title': f'On this day, {best_year}',
+        'subtitle': f"{count} photo{'s' if count != 1 else ''} from {best_year}",
+        'actionLabel': 'View',
+        'actionHref': f'/?captureStart={date_str}&captureEnd={date_str}',
+    }
+
+
+def _compute_suggestions(user_id: str) -> List[Dict]:
+    """Ordered by priority -- the frontend shows only the first one, per the
+    "at most one nudge per session" restraint. Trip/burst detection
+    deliberately isn't here yet -- no home-location or multi-day-windowing
+    concept exists anywhere in this codebase today, that's new algorithmic
+    work for a future pass, not a fit for this lightweight endpoint."""
+    suggestions = []
+    on_this_day = _compute_on_this_day_suggestion(user_id)
+    if on_this_day:
+        suggestions.append(on_this_day)
+    unnamed_person = _compute_unnamed_person_suggestion(user_id)
+    if unnamed_person:
+        suggestions.append(unnamed_person)
+    return suggestions
 
 
 def _public_album_share_meta(entity: Optional[Dict], token: str) -> Dict[str, str]:
@@ -7149,7 +7358,7 @@ def _load_photos_for_filenames(user_id: str, filenames: List[str]) -> List[Dict]
     photos = []
     for name in filenames:
         metadata = _get_metadata_entity(user_id, name)
-        if metadata is None:
+        if metadata is None or metadata.get('processing_state') == 'deleted':
             continue
         photos.append(_build_photo_summary(user_id, name, metadata, include_props=False, pid_to_name=pid_to_name))
     return photos
@@ -8609,7 +8818,7 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
                 'targetName': final_target_name or '',
                 'mergedNames': json.dumps(merged_names),
                 'payloadBlobName': merge_payload_blob_name,
-                'createdAt': None,
+                'createdAt': datetime.now(timezone.utc).isoformat(),
             })
         except Exception:
             pass
@@ -9514,6 +9723,83 @@ def _sweep_stale_processing_into_ipwork() -> Dict[str, int]:
     return stats
 
 
+def _deleted_at_past_cutoff(deleted_at: str, cutoff: datetime) -> bool:
+    if not deleted_at:
+        return False
+    try:
+        parsed = datetime.fromisoformat(deleted_at)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed <= cutoff
+
+
+def _run_trash_purge_sweep() -> Dict[str, int]:
+    """Hard-purges trashed photos AND trashed albums past TRASH_RETENTION_DAYS,
+    across every library. Same "enumerate library_store, point-select just
+    what's needed" shape as _sweep_stale_processing_into_ipwork above -- runs
+    from the same loop, under the same cluster-wide lock, so this reuses that
+    guarantee rather than needing its own. Albums are a per-library partition
+    query same as photos, but cheap -- album counts per user are nowhere near
+    photo-library scale."""
+    stats = {'libraries': 0, 'photosPurged': 0, 'albumsPurged': 0}
+    if library_store is None:
+        return stats
+    try:
+        library_ids = library_store.list_all_library_ids()
+    except Exception:
+        worker_logger.exception('trash sweep: failed to list libraries')
+        return stats
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=TRASH_RETENTION_DAYS)
+    for library_id in library_ids:
+        stats['libraries'] += 1
+
+        if metadata_table_client is not None:
+            try:
+                rows = _query_metadata_rows_for_user(
+                    library_id, select=['RowKey', 'processing_state', 'deletedAt'],
+                    purpose='trash_sweep', include_deleted=True,
+                )
+            except Exception:
+                worker_logger.warning('trash sweep: metadata scan failed for library %s', library_id, exc_info=True)
+                rows = []
+            purge_eligible = [
+                str(row.get('RowKey') or '').strip()
+                for row in rows
+                if row.get('processing_state') == 'deleted' and _deleted_at_past_cutoff(str(row.get('deletedAt') or ''), cutoff)
+            ]
+            purge_eligible = [f for f in purge_eligible if f]
+            if purge_eligible:
+                try:
+                    purged, errors = _hard_delete_photos_now(library_id, purge_eligible)
+                    stats['photosPurged'] += len(purged)
+                    if errors:
+                        worker_logger.warning('trash sweep: %d error(s) purging library %s: %s', len(errors), library_id, errors[:5])
+                except Exception:
+                    worker_logger.exception('trash sweep: photo purge failed for library %s', library_id)
+
+        if albums_table_client is not None:
+            try:
+                album_rows = list(albums_table_client.query_entities(f"PartitionKey eq '{_escape_odata(library_id)}'"))
+            except Exception:
+                worker_logger.warning('trash sweep: album scan failed for library %s', library_id, exc_info=True)
+                album_rows = []
+            for row in album_rows:
+                if not _coerce_bool(row.get('deleted')) or not _deleted_at_past_cutoff(str(row.get('deletedAt') or ''), cutoff):
+                    continue
+                album_id = str(row.get('RowKey') or '').strip()
+                if not album_id:
+                    continue
+                try:
+                    if _hard_delete_album_now(library_id, album_id, existing=row):
+                        stats['albumsPurged'] += 1
+                except Exception:
+                    worker_logger.exception('trash sweep: album purge failed for %s/%s', library_id, album_id)
+    return stats
+
+
 def _sweep_tag_embedding_indexes() -> Dict[str, int]:
     """Rebuild any library's tag-embedding index (see storage_utils.py's
     "Per-user tag-embedding index" section) that a tag-affecting write has
@@ -9573,6 +9859,12 @@ def _ipwork_sweep_loop() -> None:
                     worker_logger.info(
                         'tag-embedding sweep: %d/%d librar(y/ies) have a usable index',
                         tag_embedding_stats['indexesAvailable'], tag_embedding_stats['librariesChecked'],
+                    )
+                trash_stats = _run_trash_purge_sweep()
+                if trash_stats['photosPurged'] or trash_stats['albumsPurged']:
+                    worker_logger.info(
+                        'trash sweep: purged %d photo(s) and %d album(s) past the %d-day retention window across %d librar(y/ies)',
+                        trash_stats['photosPurged'], trash_stats['albumsPurged'], TRASH_RETENTION_DAYS, trash_stats['libraries'],
                     )
         except Exception:
             worker_logger.exception('ipwork sweep iteration failed')
@@ -9686,20 +9978,189 @@ def _delete_photo_blobs_if_present(blob_name: str, extra_blob_names: Optional[Li
     return errors
 
 
-def _mark_processing_deleted_for_file(user_id: str, filename: str) -> None:
+def _compute_trash_purge_at(deleted_at: str, retention_days: int = TRASH_RETENTION_DAYS) -> str:
+    """ISO timestamp of when a trashed photo becomes eligible for the
+    retention sweep, for the Recently Deleted UI's countdown."""
+    if not deleted_at:
+        return ''
+    try:
+        parsed = datetime.fromisoformat(deleted_at)
+    except ValueError:
+        return ''
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed + timedelta(days=retention_days)).isoformat()
+
+
+def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[Dict[str, Any]]:
+    """Soft-delete a photo row in place: flips it to the trash state every
+    read path already guards against (processing_state == 'deleted'), stamps
+    deletedAt for the retention sweep, and leaves the blob, faces, album
+    membership, and job rows untouched so restore has nothing to reconstruct.
+
+    Pure entity mutation -- callers doing this in bulk are expected to batch
+    touch_user_search_indexes_state/_invalidate_metadata_scan_cache once for
+    the whole request themselves, the same way the hard-delete route already
+    does, instead of paying for it per file.
+    """
     try:
         entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
     except Exception:
-        return
+        return None
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Snapshot the real per-step statuses before overwriting them, so restore
+    # can put them back exactly instead of forcing a wasteful full re-run of
+    # steps (thumbnail/OCR/etc.) whose output blobs are still sitting there.
+    pre_delete_statuses = {field: entity.get(field, 'pending') for field, _ in BROWSER_PROCESSING_STATUS_FIELDS}
+    entity['preDeleteStatuses'] = json.dumps(pre_delete_statuses, separators=(',', ':'))
     entity['processing_state'] = 'deleted'
-    for step in ('thumbnail', 'face', 'ai_vision', 'map_detection', 'verify'):
-        entity[f'{step}_status'] = 'deleted'
+    entity['deletedAt'] = now_iso
+    for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
+        entity[status_field] = 'deleted'
     entity['processing_lease_owner'] = ''
     entity['processing_lease'] = ''
     entity['processing_lease_expires_at'] = ''
+    entity['last_processing_update'] = now_iso
+    metadata_table_client.upsert_entity(entity)
+    return entity
+
+
+def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any]]:
+    """Undo _mark_processing_deleted_for_file: clears the trash flag and puts
+    each step's status back exactly as it was pre-delete (see the
+    preDeleteStatuses snapshot), so restore doesn't force a wasteful re-run of
+    steps whose output blobs are still sitting in storage untouched. Same
+    "pure mutation, caller batches index/cache touches" contract as the mark
+    function above."""
+    try:
+        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+    except Exception:
+        return None
+    if entity.get('processing_state') != 'deleted':
+        return entity
+    try:
+        pre_delete_statuses = json.loads(entity.get('preDeleteStatuses') or '{}')
+    except (TypeError, ValueError):
+        pre_delete_statuses = {}
+    entity['processing_state'] = 'active'
+    entity['deletedAt'] = ''
+    entity['preDeleteStatuses'] = ''
+    for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
+        entity[status_field] = pre_delete_statuses.get(status_field, 'pending')
     entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
     metadata_table_client.upsert_entity(entity)
-    touch_user_search_indexes_state(user_id, filenames=filename)
+    return entity
+
+
+def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[str], List[str]]:
+    """Permanently remove photos: blob + metadata row + dedup/collision index
+    rows, then the faces/people, job-row, and album-membership cascades.
+
+    This is the real, irreversible delete -- what /photos/delete used to do
+    directly for every request. It now only runs for photos that are already
+    sitting in trash: the explicit "delete forever" purge endpoint, and the
+    retention sweep. ``filenames`` should already be validated/deduped safe
+    names (see _validate_media_filename). Returns (deleted, errors).
+    """
+    deleted: List[str] = []
+    errors: List[str] = []
+    if not filenames:
+        return deleted, errors
+    names_set = set(filenames)
+
+    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+        metadata_results = list(executor.map(lambda n: (n, _get_metadata_entity(user_id, n)), filenames))
+    own_rows_by_name = {name: metadata for name, metadata in metadata_results if metadata is not None}
+
+    shared_names = _shared_names_in_batch(names_set, user_id)
+
+    def _hard_delete_one(safe_name: str) -> Tuple[str, str, str]:
+        metadata = own_rows_by_name.get(safe_name)
+        if metadata is None:
+            return safe_name, 'not_found', ''
+        file_errors: List[str] = []
+        anonymous_id = str((metadata or {}).get('anonymousImageId') or '').strip()
+        if safe_name not in shared_names:
+            physical_name = anonymous_id or safe_name
+            extra = [safe_name] if anonymous_id else None
+            file_errors.extend(_delete_photo_blobs_if_present(physical_name, extra))
+            if anonymous_id:
+                try:
+                    delete_image_name_mapping(user_id, anonymous_id)
+                except Exception:
+                    app.logger.debug('Failed to delete image-name mapping for %s', safe_name)
+        try:
+            metadata_table_client.delete_entity(partition_key=user_id, row_key=safe_name)
+        except Exception as exc:
+            app.logger.warning('Metadata delete failed for %s: %s', safe_name, exc)
+            file_errors.append('metadata: delete failed')
+        file_hash = str(metadata.get('fileHash') or '')
+        if file_hash:
+            delete_hash_index_entry(user_id, file_hash)
+        delete_filename_owner_entry(user_id, safe_name)
+        delete_embeddings_entry(user_id, safe_name)
+        if file_errors:
+            return safe_name, 'error', '; '.join(file_errors)
+        return safe_name, 'deleted', ''
+
+    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+        file_results = list(executor.map(_hard_delete_one, filenames))
+
+    for safe_name, outcome, detail in file_results:
+        if outcome == 'deleted':
+            deleted.append(safe_name)
+        elif outcome == 'not_found':
+            errors.append(f'{safe_name}: Not found')
+        else:
+            errors.append(f'{safe_name}: {detail}')
+
+    deleted_names_set = set(deleted)
+    try:
+        deleted_person_ids = _batch_remove_faces_for_filenames(user_id, deleted_names_set)
+    except Exception as exc:
+        app.logger.warning('Batch face removal failed for %s: %s', user_id, exc)
+        deleted_person_ids = set()
+    try:
+        _batch_remove_job_rows(user_id, deleted_names_set)
+    except Exception as exc:
+        app.logger.warning('Batch job cleanup failed for %s: %s', user_id, exc)
+    try:
+        _batch_remove_filenames_from_albums(user_id, deleted_names_set)
+    except Exception as exc:
+        app.logger.warning('Batch album cleanup failed for %s: %s', user_id, exc)
+
+    if deleted_person_ids and metadata_table_client is not None:
+        try:
+            surviving_rows = _query_metadata_rows_for_user(
+                user_id, select=['PartitionKey', 'RowKey', 'peopleIds'], purpose='photos.hard_delete_person_cleanup',
+            )
+        except Exception:
+            surviving_rows = []
+        for row in surviving_rows:
+            name = str(row.get('RowKey') or '')
+            if name in deleted_names_set:
+                continue
+            try:
+                pids = json.loads(row.get('peopleIds', '[]') or '[]')
+            except Exception:
+                continue
+            next_pids = [pid for pid in pids if pid not in deleted_person_ids]
+            if len(next_pids) == len(pids):
+                continue
+            row['peopleIds'] = json.dumps(next_pids)
+            try:
+                metadata_table_client.upsert_entity(row)
+            except Exception:
+                pass
+
+    if deleted:
+        _invalidate_metadata_scan_cache(user_id)
+        try:
+            touch_user_search_indexes_state(user_id, filenames=deleted)
+        except Exception:
+            pass
+
+    return deleted, errors
 
 
 def _delete_upload_temp_files_for_filename(filename: str, upload_id: str = '') -> Tuple[List[str], List[str]]:
@@ -10257,7 +10718,7 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
     try:
         user_meta_rows = list(metadata_table_client.query_entities(
             f"PartitionKey eq '{_escape_odata(user_id)}'",
-            select=['PartitionKey', 'RowKey', 'anonymousImageId', 'deleted'],
+            select=['PartitionKey', 'RowKey', 'anonymousImageId', 'processing_state'],
         ))
     except Exception as exc:
         app.logger.exception('Purge: failed to query metadata')
@@ -10267,8 +10728,11 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
     orphaned_filenames: set = set()
     for row in user_meta_rows:
         result['metadataRowsChecked'] += 1
-        if _coerce_bool(row.get('deleted')):
-            continue  # already soft-deleted, ignore
+        if row.get('processing_state') == 'deleted':
+            # Already in trash -- its blob is untouched and expected to still
+            # be present, so it's not orphaned, just not purge-eligible yet
+            # (the retention sweep owns that, once TRASH_RETENTION_DAYS is up).
+            continue
         filename = str(row.get('RowKey') or '')
         if not filename:
             continue
@@ -11513,6 +11977,8 @@ from routes.library import library_bp
 from routes.tools import tools_bp
 from routes.admin import admin_bp
 from routes.system import system_bp
+from routes.explore import explore_bp
+from routes.suggestions import suggestions_bp
 
 # 2026-09-15: service splits, following the modularity work above. Each
 # split group is registered on its own dedicated container app instead of
@@ -11561,5 +12027,5 @@ else:
     # Apps' default TCP probe doesn't need it, but losing a friendly
     # same-origin /health on backend specifically wasn't worth it for zero
     # real memory/CPU savings.
-    for _bp in (auth_bp, photos_bp, albums_bp, system_bp):
+    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp):
         app.register_blueprint(_bp)

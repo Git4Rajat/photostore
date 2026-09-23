@@ -294,6 +294,90 @@ const AlbumsPage: React.FC = () => {
         }
     };
 
+    // Rate/like never had a write path in this file before (only ever read
+    // photo.rating/photo.liked for display/filtering) -- added for the
+    // PhotoViewer's rate/like controls, mirroring PhotoGallery's endpoints and
+    // this file's own patchAll-3-arrays pattern from handleSaveRotation above.
+    const handleRatePhoto = async (filename: string, rating: number) => {
+        const previousRating = [...photos, ...(semanticPhotos || []), ...activeAlbumPhotos]
+            .find((photo) => photo.filename === filename)?.rating ?? 0;
+        const applyRating = (value: number) => (photo: Photo) => (
+            photo.filename === filename ? { ...photo, rating: value } : photo
+        );
+        const patchAll = (value: number) => {
+            setPhotos((prev) => prev.map(applyRating(value)));
+            setSemanticPhotos((prev) => (prev ? prev.map(applyRating(value)) : prev));
+            setActiveAlbumPhotos((prev) => prev.map(applyRating(value)));
+        };
+        patchAll(rating);
+        setStatus(`Rated ${filename} ${rating}/5.`);
+        try {
+            await post(`/photos/${encodeURIComponent(filename)}/rating`, { rating });
+        } catch (err) {
+            patchAll(previousRating);
+            setStatus(`Could not save rating for ${filename}.`);
+        }
+    };
+
+    const handleToggleLike = async (filename: string) => {
+        const previous = [...photos, ...(semanticPhotos || []), ...activeAlbumPhotos]
+            .find((photo) => photo.filename === filename);
+        const optimisticLiked = !(previous?.liked);
+        const optimisticLikes = Math.max(0, (previous?.likes ?? 0) + (optimisticLiked ? 1 : -1));
+        const applyLike = (liked: boolean, likes: number) => (photo: Photo) => (
+            photo.filename === filename ? { ...photo, liked, likes } : photo
+        );
+        const patchAll = (liked: boolean, likes: number) => {
+            setPhotos((prev) => prev.map(applyLike(liked, likes)));
+            setSemanticPhotos((prev) => (prev ? prev.map(applyLike(liked, likes)) : prev));
+            setActiveAlbumPhotos((prev) => prev.map(applyLike(liked, likes)));
+        };
+        patchAll(optimisticLiked, optimisticLikes);
+        try {
+            const response = await post(`/photos/${encodeURIComponent(filename)}/like`, {});
+            // Reconcile with the authoritative count (another member of a shared
+            // library may have liked the same photo) -- same reason PhotoGallery does this.
+            patchAll(response.liked, response.likes);
+        } catch (err) {
+            patchAll(previous?.liked ?? false, previous?.likes ?? 0);
+            setStatus(`Could not update like for ${filename}.`);
+        }
+    };
+
+    // Single-photo counterpart to handleDeleteSelected, for the PhotoViewer's
+    // delete button -- reuses removeDeletedPhotos so it stays in sync with
+    // photos/semanticPhotos/activeAlbumPhotos/selectedPhotos/album counts the
+    // exact same way the bulk flow does.
+    const handleDeleteFromViewer = async (filename: string) => {
+        const confirmed = await confirmDialog({
+            title: 'Delete photo',
+            message: 'Move this photo to Recently Deleted? You can restore it for 30 days.',
+            confirmLabel: 'Delete',
+        });
+        if (!confirmed) return;
+
+        try {
+            const response = await post('/photos/delete', { filenames: [filename] });
+            const deleted = Array.isArray(response?.deleted) ? (response.deleted as string[]) : [];
+            if (!deleted.includes(filename)) {
+                setError('Failed to delete photo.');
+                return;
+            }
+            removeDeletedPhotos(deleted);
+            releaseKnownHashesForFilenames(deleted);
+            setStatus('Photo deleted.');
+
+            const remaining = filteredPhotos.length - 1;
+            if (remaining <= 0) {
+                setViewerIndex(null);
+            } else if (viewerIndex !== null && viewerIndex >= remaining) {
+                setViewerIndex(remaining - 1);
+            }
+        } catch (err) {
+            notifyApiError(err, { context: "Couldn't delete photo", retry: () => handleDeleteFromViewer(filename) });
+        }
+    };
+
     const visiblePhotos = useMemo(() => {
         const semanticSource = semanticPhotos;
         if (!activeAlbumId) {
@@ -864,9 +948,8 @@ const AlbumsPage: React.FC = () => {
         const deleteCount = selectedPhotos.size;
         const confirmed = await confirmDialog({
             title: 'Delete photos',
-            message: `Delete ${plural(deleteCount, 'photo')} from the gallery? This will also remove them from all albums and cannot be undone.`,
+            message: `Move ${plural(deleteCount, 'photo')} to Recently Deleted? This removes them from the gallery and all albums, but you can restore them for 30 days.`,
             confirmLabel: 'Delete',
-            danger: true,
         });
         if (!confirmed) {
             return;
@@ -1634,6 +1717,10 @@ const AlbumsPage: React.FC = () => {
                             onIndexChange={setViewerIndex}
                             useProtectedMedia={true}
                             onRotationSave={handleSaveRotation}
+                            onRate={handleRatePhoto}
+                            onToggleLike={handleToggleLike}
+                            onDelete={handleDeleteFromViewer}
+                            onOpenActions={(filename) => setActionSheetTarget({ filenames: [filename] })}
                         />
                     )}
                 </section>
