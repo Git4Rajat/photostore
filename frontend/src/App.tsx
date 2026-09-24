@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { BrowserRouter as Router, Link, NavLink, Navigate, Routes, Route, useLocation } from 'react-router-dom';
+import type { Location } from 'react-router-dom';
 import {
     ArrowPathIcon,
     ArrowLeftOnRectangleIcon,
@@ -13,6 +14,7 @@ import {
     ExclamationTriangleIcon,
     InformationCircleIcon,
     KeyIcon,
+    MagnifyingGlassIcon,
     MapIcon,
     MoonIcon,
     PhotoIcon,
@@ -31,6 +33,8 @@ import { AppServicesProvider, useAppServices, getBrowserProcessingConcurrency, i
 import { ClusteringActivityIndicator, IpworkActivityIndicator, NotificationBell } from './components/AppServiceIndicators';
 import { TimelineMetadataProvider } from './components/TimelineMetadataProvider';
 import { LogoLockup } from './components/shared/Logo';
+import PhotoViewerRoute from './components/shared/PhotoViewerRoute';
+import { ViewerSessionProvider } from './components/shared/ViewerSessionContext';
 import { Loading } from './components/shared/Loading';
 import { BackendStatusBanner } from './components/shared/BackendStatusBanner';
 import { ErrorBoundary } from './components/shared/ErrorBoundary';
@@ -49,6 +53,7 @@ const APP_NAME = 'Keepsake';
 // tabs and bookmarks read "Gallery · Keepsake" instead of a bare "Keepsake".
 const pageTitleFor = (pathname: string): string => {
     if (pathname === '/') return 'Gallery';
+    if (pathname === '/ask') return 'Ask';
     if (pathname.startsWith('/albums')) return 'Albums';
     if (pathname.startsWith('/tools')) return 'Tools';
     if (pathname.startsWith('/explore')) return 'Explore';
@@ -136,11 +141,12 @@ interface NavItem {
 // Primary destinations, surfaced as the desktop tab bar and the top group of the
 // mobile navigation drawer.
 const PRIMARY_NAV_ITEMS: NavItem[] = [
+    { to: '/ask', label: 'Ask', Icon: MagnifyingGlassIcon },
     { to: '/', label: 'Gallery', end: true, Icon: PhotoIcon },
     { to: '/albums', label: 'Albums', Icon: RectangleStackIcon },
+    { to: '/people', label: 'People', Icon: UsersIcon },
     { to: '/explore', label: 'Explore', Icon: MapIcon },
     { to: '/tools', label: 'Tools', Icon: WrenchScrewdriverIcon },
-    { to: '/people', label: 'People', Icon: UsersIcon },
     { to: '/library', label: 'Sharing', Icon: ShareIcon },
 ];
 
@@ -665,7 +671,15 @@ const BackgroundTabWarningModal: React.FC<BackgroundTabWarningModalProps> = ({ o
 };
 
 const AppContent: React.FC = () => {
-    const location = useLocation();
+    // PhotoViewerRoute (mounted at /photo/:filename, see the second <Routes>
+    // below) pushes with `state: { background: <the location it opened
+    // from> }`. Rendering the main <Routes> against that frozen background
+    // location instead of the real one means Gallery/Albums never re-render
+    // or unmount while the viewer is open on top of them -- the standard
+    // React Router "modal route" pattern.
+    const rawLocation = useLocation();
+    const backgroundLocation = (rawLocation.state as { background?: Location } | null)?.background;
+    const location = backgroundLocation || rawLocation;
     const appServices = useAppServices();
     const authEnabled = isAuthEnabled();
     const isPublicAlbumRoute = location.pathname.startsWith('/public/album/');
@@ -1023,10 +1037,25 @@ const AppContent: React.FC = () => {
                 )}
 
                 <main className="ios-main reveal-up delay-1">
-                    <Routes>
+                    <Routes location={location}>
                         {[
                             {
                                 path: '/',
+                                element: renderProtectedLazyPage(
+                                    <LazyPhotoGallery
+                                        addNotification={appServices.addNotification}
+                                        registerUploadCompletionHandler={appServices.registerUploadCompletionHandler}
+                                        registerUploadErrorHandler={appServices.registerUploadErrorHandler}
+                                        releaseKnownHashesForFilenames={appServices.releaseKnownHashesForFilenames}
+                                    />,
+                                    'Loading library…',
+                                ),
+                            },
+                            {
+                                // Same surface as / (search isn't a separate results list -- it's
+                                // the gallery's own fetchPhotos), just its own nav destination/URL
+                                // with the search bar auto-focused on mount.
+                                path: '/ask',
                                 element: renderProtectedLazyPage(
                                     <LazyPhotoGallery
                                         addNotification={appServices.addNotification}
@@ -1134,6 +1163,15 @@ const AppContent: React.FC = () => {
                 />
             )}
 
+            {/* Matched against the real (non-background-overridden) location --
+                renders the full-viewport viewer overlay on top of whichever
+                page the main <Routes> above is still showing underneath. */}
+            {isSignedIntoPrivateArea && (
+                <Routes>
+                    <Route path="/photo/:filename" element={<PhotoViewerRoute />} />
+                </Routes>
+            )}
+
             {/* Styled confirm/prompt dialogs (replaces window.confirm/prompt). */}
             <DialogHost />
 
@@ -1151,7 +1189,9 @@ const App = () => (
     <AppServicesProvider>
         <TimelineMetadataProvider>
             <Router>
-                <AppContent />
+                <ViewerSessionProvider>
+                    <AppContent />
+                </ViewerSessionProvider>
             </Router>
         </TimelineMetadataProvider>
     </AppServicesProvider>

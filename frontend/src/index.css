@@ -4545,7 +4545,12 @@ html[data-theme='light'] .notification-item.unread {
   align-items: center;
   gap: 4px;
   margin-left: auto;
-  overflow-x: auto;
+  /* No overflow-x here: flex-wrap already keeps the row from overflowing by
+     wrapping instead of scrolling, and setting overflow-x forces
+     overflow-y to compute to auto too (per spec, whichever axis isn't
+     "visible" drags the other along) -- that silently clipped the
+     upward-opening .gallery-menu-upward popovers (Rate/Album) anchored
+     inside this row, since they render above this box's own edge. */
 }
 
 .selection-command-bar-actions .btn {
@@ -4964,6 +4969,22 @@ html[data-theme='light'] .notification-item.unread {
    floating control so it reads as glass over the photo, not a flat
    overlay.
    ================================================================= */
+
+/* PhotoViewerRoute's wrapper: the viewer is now a route rendered as a
+   sibling of Gallery/Albums (background-location pattern, see App.tsx),
+   not a same-page content swap, so it needs real fixed-full-viewport
+   positioning to sit on top of whichever page is still mounted underneath
+   instead of relying on being the only content in the document flow.
+   z-index 100 clears NavDrawer/AccountMenu (also 100, but never open at the
+   same time as the viewer) and stays below dialogs/toasts (9999+) so a
+   delete-confirm dialog opened from inside the viewer still shows on top. */
+.photo-viewer-route-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: #14130f;
+  overflow: hidden;
+}
 
 .photo-preview {
   position: relative;
@@ -7121,7 +7142,16 @@ video.photo-preview-media.is-loading {
 }
 
 .reveal-up {
-  animation: reveal-up var(--dur-slow) var(--ease-glass) both;
+  /* backwards, not both -- holds the pre-animation (opacity:0) state during
+     the delay so there's no flash-of-unstyled-content, but does NOT keep
+     filling forward once finished. With "both", Chrome keeps reporting the
+     settled transform as a resolved matrix (never the literal keyword
+     "none") for as long as the animation is still "filling", which
+     satisfies CSS's "has a transform" stacking-context/containing-block
+     rule forever -- silently hijacking any position:fixed descendant (e.g.
+     the selection command bar) into this ancestor's box, breaking its
+     dropdown menus site-wide. */
+  animation: reveal-up var(--dur-slow) var(--ease-glass) backwards;
 }
 
 .reveal-up.delay-1 {
@@ -7151,12 +7181,6 @@ video.photo-preview-media.is-loading {
   }
   to {
     opacity: 1;
-    /* Not translateY(0) -- animation-fill-mode:both keeps this "to" value
-       applied forever after the animation ends, and any transform other
-       than none (even a zero-displacement one) makes this element the
-       containing block for position:fixed descendants, silently breaking
-       any fixed-positioned bar/popover nested inside (e.g. the selection
-       command bar's dropdown menus rendered invisible behind page content). */
     transform: none;
   }
 }

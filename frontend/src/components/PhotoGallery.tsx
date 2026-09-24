@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, BellIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, MapPinIcon, PhotoIcon, PlusIcon, Squares2X2Icon, StarIcon, TrashIcon, UserCircleIcon, VideoCameraIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
@@ -55,6 +55,8 @@ export { idbPut, idbGet, idbDelete, dataUrlToBlob, readBlobArrayBuffer, sha256Ar
 import PhotoQuickActions, { WORKBENCH_URL_FILENAME_CAP, workbenchFilenameHref, workbenchFilenamesHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
+import { photoViewerPath } from './shared/PhotoViewerRoute';
+import { useViewerSession } from './shared/ViewerSessionContext';
 import SelectionCommandBar from './shared/SelectionCommandBar';
 import Timeline from './shared/Timeline';
 import { EmptyState } from './shared/EmptyState';
@@ -4053,6 +4055,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
 }) => {
     const location = useLocation();
     const navigate = useNavigate();
+    const { publishViewerSession } = useViewerSession();
     const cachedBoot = loadPhotoCache<Photo, FilterOptions>();
     const [photos, setPhotos] = useState<Photo[]>(cachedBoot?.photos || []);
     // filename -> batch-resolved access URL (see thumbnailAccessCache). '' means
@@ -4171,8 +4174,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const { summary: timelineSummary, status: timelineStatus } = useTimelineMetadata();
     const [downloading, setDownloading] = useState<boolean>(false);
     const [downloadProgress, setDownloadProgress] = useState<{ completed: number; total: number } | null>(null);
-    const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
-    const [returnHighlightFilename, setReturnHighlightFilename] = useState<string | null>(null);
     const [focusedFilename, setFocusedFilename] = useState<string | null>(null);
     const [focusedPhoto, setFocusedPhoto] = useState<Photo | null>(null);
     const [focusLoading, setFocusLoading] = useState<boolean>(false);
@@ -4504,6 +4505,20 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [location.search]);
 
+    // /ask is the same gallery+search surface as / (search isn't a separate
+    // results list -- see fetchPhotos above), just entered with the search
+    // bar already focused so it reads as its own destination per the mockup
+    // nav (Ask, Gallery, Albums, People, Explore) rather than a hidden
+    // feature of Gallery. Mount-only: re-focusing on every render would
+    // steal focus back after the user clicks elsewhere on the page.
+    useEffect(() => {
+        if (location.pathname !== '/ask') {
+            return;
+        }
+        document.getElementById('gallery-search')?.focus();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
     // Deep link from a Nudge suggestion ("On this day, 2023 → View") --
     // unlike q= above, this doesn't need to call fetchPhotos itself: the
     // existing captureStartDate/captureEndDate watcher effect already
@@ -4777,13 +4792,10 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             setPhotos(prev => prev.filter(p => p.filename !== filename));
             releaseKnownHashesForFilenames?.([filename]);
             addNotification('Photo deleted', `Moved ${getDisplayName(filename)} to Recently Deleted.`);
-
-            const remaining = filteredPhotos.length - 1;
-            if (remaining <= 0) {
-                closeLightbox();
-            } else if (lightboxIndex !== null && lightboxIndex >= remaining) {
-                setLightboxIndex(remaining - 1);
-            }
+            // If the viewer is open on this photo, PhotoViewerRoute notices it's
+            // no longer in the published session photo list (see filteredPhotos
+            // effect below) and returns to the gallery on its own -- no need to
+            // manage viewer index/close state here.
         } catch (err) {
             notifyApiError(err, { context: "Couldn't delete photo", retry: () => handleDeleteFromViewer(filename) });
         }
@@ -5254,37 +5266,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         return photos;
     }, [mediaFilter, photos]);
 
-    // The lightbox goes immersive: the app header/nav (and any upload
-    // banner) hide via the "lightbox-active" body class below, so the
-    // viewer's card is the only thing above the fold and its top edge
-    // touches the actual browser viewport top, not just the space below
-    // the app chrome. See the body.lightbox-active rules in index.css.
-    useEffect(() => () => {
-        document.body.classList.remove('lightbox-active');
-    }, []);
-
-    // The grid (and the tall spacer div that gives the page its scrollable
-    // height) unmounts while the lightbox is open, so the browser clamps
-    // whatever window scroll the user had in the grid into the shorter
-    // lightbox layout instead of aligning it to the viewer. With the app
-    // chrome above it now hidden (see the body class toggle above), the
-    // section's own top edge is where the viewer should sit -- measure and
-    // scroll to it rather than assuming 0, since layout/safe-area padding
-    // can still leave a small residual offset.
-    const preLightboxScrollYRef = useRef<number>(0);
-    // The index the lightbox was opened at, and the last non-null index it
-    // held (i.e. wherever in-lightbox prev/next/filmstrip navigation left
-    // it, since lightboxIndex itself goes to null on close). Compared on
-    // close to tell "closed on the same photo" (restore the saved scroll
-    // position) apart from "navigated to a different photo, possibly off
-    // in an unmounted/unrendered window row" (scroll to that photo instead).
-    const openedLightboxIndexRef = useRef<number | null>(null);
-    const lastLightboxIndexRef = useRef<number | null>(null);
-    if (lightboxIndex !== null) {
-        lastLightboxIndexRef.current = lightboxIndex;
-    }
-    const gallerySectionRef = useRef<HTMLElement | null>(null);
-
     const {
         containerRef: galleryWindowContainerRef,
         innerRef: galleryWindowInnerRef,
@@ -5293,85 +5274,52 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         visibleItems: visibleGalleryPhotos,
         startIndex: galleryWindowStartIndex,
         shouldAnimateEntrance: shouldAnimateGalleryTile,
-        scrollToIndex: scrollGalleryToIndex,
     } = useWindowedGrid({
         items: filteredPhotos,
         getKey: (photo: Photo) => photo.filename,
         layoutDeps: [galleryZoomLevel],
     });
-    // useWindowedGrid hands back freshly-created functions on every render,
-    // and filteredPhotos is a new array whenever photos/mediaFilter change --
-    // neither is safe to put in the effect's deps below without making it
-    // re-run (and re-jump/re-highlight) on renders that have nothing to do
-    // with the lightbox actually closing. Mirror the latest values into refs
-    // instead so the effect can still read current data but only *fires* on
-    // a real lightboxIndex transition.
-    const latestFilteredPhotosRef = useRef(filteredPhotos);
-    latestFilteredPhotosRef.current = filteredPhotos;
-    const scrollGalleryToIndexRef = useRef(scrollGalleryToIndex);
-    scrollGalleryToIndexRef.current = scrollGalleryToIndex;
-
-    useLayoutEffect(() => {
-        const isLightboxOpen = lightboxIndex !== null;
-        document.body.classList.toggle('lightbox-active', isLightboxOpen);
-        if (!isLightboxOpen) {
-            const closedAtIndex = lastLightboxIndexRef.current;
-            const openedAtIndex = openedLightboxIndexRef.current;
-            // Consume immediately: without this, an unrelated re-render while
-            // the lightbox stays closed would see the same non-null/differing
-            // refs and redo the jump+highlight (or, worse, the scroll
-            // restore) again.
-            openedLightboxIndexRef.current = null;
-            lastLightboxIndexRef.current = null;
-            if (closedAtIndex !== null && openedAtIndex !== null && closedAtIndex !== openedAtIndex) {
-                // Navigated to a different photo inside the lightbox (prev/next,
-                // filmstrip, keyboard) before closing -- land back in the grid on
-                // that photo's row instead of where the lightbox was opened from.
-                scrollGalleryToIndexRef.current(closedAtIndex);
-                const returnedToPhoto = latestFilteredPhotosRef.current[closedAtIndex];
-                setReturnHighlightFilename(returnedToPhoto ? returnedToPhoto.filename : null);
-            } else {
-                // The grid's own windowing state (metrics/visible range) was
-                // never touched while it sat unmounted behind the lightbox
-                // (its recompute bails out with no containerRef to measure),
-                // so it's still valid for this exact scroll position -- no
-                // recompute needed here, only for the jump-to-a-different-
-                // photo branch above, which lands somewhere that range never
-                // covered.
-                window.scrollTo(0, preLightboxScrollYRef.current);
-            }
-        } else if (gallerySectionRef.current) {
-            const sectionTop = gallerySectionRef.current.getBoundingClientRect().top + window.scrollY;
-            window.scrollTo(0, sectionTop);
-        }
-    }, [lightboxIndex]);
-
-    // Briefly highlight the tile the lightbox returned the user to, then
-    // clear it so it doesn't linger or re-trigger on unrelated re-renders.
-    useEffect(() => {
-        if (!returnHighlightFilename) {
-            return undefined;
-        }
-        const timer = window.setTimeout(() => setReturnHighlightFilename(null), 1800);
-        return () => window.clearTimeout(timer);
-    }, [returnHighlightFilename]);
-
     const totalPhotos = totalAvailable;
     const showingPhotos = filteredPhotos.length;
     const selectedCount = selectedPhotos.size;
     const hasCaptureFilter = captureStartDate.length > 0 || captureEndDate.length > 0;
-    const closeLightbox = useCallback(() => {
-        setLightboxIndex(null);
-    }, []);
 
-    const openLightboxAt = useCallback((index: number) => {
-        if (index < 0 || index >= filteredPhotos.length) {
+    // Opens the full-page viewer at /photo/:filename (PhotoViewerRoute,
+    // rendered via the background-location pattern in App.tsx) -- pushes one
+    // history entry carrying this page's own location as `state.background`
+    // so Back/Close return here. The grid never unmounts for this (it's
+    // rendered by a separate, un-navigated <Routes> underneath), so there's
+    // no scroll position to save/restore the way the old same-page lightbox
+    // swap needed.
+    const openPhotoViewerAt = useCallback((index: number) => {
+        const photo = filteredPhotos[index];
+        if (!photo) {
             return;
         }
-        preLightboxScrollYRef.current = window.scrollY;
-        openedLightboxIndexRef.current = index;
-        setLightboxIndex(index);
-    }, [filteredPhotos.length]);
+        navigate(photoViewerPath(photo.filename), { state: { background: location } });
+    }, [filteredPhotos, navigate, location]);
+
+    // PhotoViewerRoute is a route sibling, not a child, of this component
+    // (see the background-location pattern in App.tsx) -- it can't receive
+    // the current photo list or action handlers as props, so this publishes
+    // both to ViewerSessionContext instead. Re-runs on every render (the
+    // handlers below aren't memoized) rather than chasing exhaustive-deps
+    // here, since a stale closure publishing an outdated handler is worse
+    // than one extra context update. Deliberately no cleanup on this one --
+    // only unmounting clears the session (below) -- otherwise every
+    // re-render would briefly null it out first, and PhotoViewerRoute would
+    // see that null mid-session and bounce out.
+    useEffect(() => {
+        publishViewerSession({
+            photos: filteredPhotos,
+            onRotationSave: handleSaveRotation,
+            onRate: handleRatePhoto,
+            onToggleLike: handleToggleLike,
+            onDelete: handleDeleteFromViewer,
+            onOpenActions: (filename, initialScreen) => setActionSheetTarget({ filenames: [filename], initialScreen }),
+        });
+    });
+    useEffect(() => () => publishViewerSession(null), [publishViewerSession]);
 
     // Two-finger pinch on the grid steps the density level (see
     // GALLERY_ZOOM_SCALES). Modeled on Timeline.tsx's pinch-to-zoom-level
@@ -5436,8 +5384,8 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const sectionClass = hideDiscovery ? '' : 'gallery-wrap card-glass reveal-up delay-1 gallery-studio';
 
     return (
-        <section className={sectionClass} ref={gallerySectionRef}>
-            {!hideDiscovery && lightboxIndex === null && (
+        <section className={sectionClass}>
+            {!hideDiscovery && (
             <>
             <div className="gallery-controls-surface">
                 <div className="gallery-toolbar">
@@ -5869,7 +5817,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 />
             )}
 
-            {selectedCount > 0 && lightboxIndex === null && (
+            {selectedCount > 0 && (
                 <SelectionCommandBar count={selectedCount}>
                     <button type="button" className="btn btn-soft" onClick={handleSelectAll}>
                         {selectedPhotos.size === filteredPhotos.length
@@ -5987,8 +5935,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 </SelectionCommandBar>
             )}
 
-            {lightboxIndex === null ? (
-                <div ref={galleryWindowContainerRef} style={gallerySpacerStyle}>
+            <div ref={galleryWindowContainerRef} style={gallerySpacerStyle}>
                 <div
                     ref={galleryWindowInnerRef}
                     className="gallery-grid gallery-grid--zoomable"
@@ -6010,14 +5957,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                 selected={isSelected}
                                 animateEntrance={isNewTile}
                                 animationDelayMs={isNewTile ? (index % 8) * 36 : undefined}
-                                className={photo.filename === returnHighlightFilename ? 'tile-return-highlight' : undefined}
                                 title={photo.filename}
                                 showBody={false}
                                 useBatchedAccess
                                 resolvedAccessUrl={thumbAccessUrls.get(photo.filename)}
                                 onMediaClick={(e) => {
                                     e.stopPropagation();
-                                    openLightboxAt(index);
+                                    openPhotoViewerAt(index);
                                 }}
                                 onLongPress={() => handleTileLongPress(photo)}
                                 mediaOverlay={(
@@ -6082,36 +6028,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         );
                     })}
                 </div>
-                </div>
-            ) : (
-                <ErrorBoundary
-                    context="gallery-lightbox"
-                    fallback={(reset) => (
-                        <ErrorState
-                            title="Couldn't display this photo"
-                            message="Something went wrong opening the viewer."
-                            onRetry={() => {
-                                reset();
-                                closeLightbox();
-                            }}
-                            retryLabel="Back to gallery"
-                        />
-                    )}
-                >
-                    <PhotoViewer
-                        photos={filteredPhotos}
-                        index={lightboxIndex}
-                        onClose={closeLightbox}
-                        onIndexChange={setLightboxIndex}
-                        useProtectedMedia={true}
-                        onRotationSave={handleSaveRotation}
-                        onRate={handleRatePhoto}
-                        onToggleLike={handleToggleLike}
-                        onDelete={handleDeleteFromViewer}
-                        onOpenActions={(filename, initialScreen) => setActionSheetTarget({ filenames: [filename], initialScreen })}
-                    />
-                </ErrorBoundary>
-            )}
+            </div>
 
             <div ref={loadMoreRef} className="load-more">
                 {hasMore && !loading && !loadingMore && !error && (

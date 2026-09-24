@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
     ArrowPathIcon,
@@ -41,7 +41,8 @@ import { useWindowedGrid } from '../services/useWindowedGrid';
 import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { WORKBENCH_URL_FILENAME_CAP, libraryFocusHref, workbenchFilenameHref, workbenchFilenamesHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
-import PhotoViewer from './shared/PhotoViewer';
+import { photoViewerPath } from './shared/PhotoViewerRoute';
+import { useViewerSession } from './shared/ViewerSessionContext';
 import SelectionCommandBar from './shared/SelectionCommandBar';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import type { PhotoPersonLink } from '../types/uiTypes';
@@ -144,6 +145,7 @@ const extractApiErrorMessage = (err: unknown, fallback: string): string => {
 const AlbumsPage: React.FC = () => {
     const location = useLocation();
     const navigate = useNavigate();
+    const { publishViewerSession } = useViewerSession();
     const { releaseKnownHashesForFilenames } = useAppServices();
     const [photos, setPhotos] = useState<Photo[]>([]);
     const [photosLoading, setPhotosLoading] = useState<boolean>(false);
@@ -190,7 +192,6 @@ const AlbumsPage: React.FC = () => {
     const [totalAvailable, setTotalAvailable] = useState<number>(0);
     const [serverTotalLoaded, setServerTotalLoaded] = useState<boolean>(false);
     const [downloading, setDownloading] = useState<boolean>(false);
-    const [viewerIndex, setViewerIndex] = useState<number | null>(null);
     // filename -> batch-resolved access URL, shared with PhotoGallery/ToolsPage
     // via thumbnailAccessCache's module-level cache (see PhotoGallery.tsx).
     const { thumbAccessUrls, resolveAccessForBatch } = useThumbnailAccessResolver();
@@ -370,13 +371,9 @@ const AlbumsPage: React.FC = () => {
             removeDeletedPhotos(deleted);
             releaseKnownHashesForFilenames(deleted);
             setStatus('Photo deleted.');
-
-            const remaining = filteredPhotos.length - 1;
-            if (remaining <= 0) {
-                setViewerIndex(null);
-            } else if (viewerIndex !== null && viewerIndex >= remaining) {
-                setViewerIndex(remaining - 1);
-            }
+            // If the viewer is open on this photo, PhotoViewerRoute notices it's
+            // no longer in the published session photo list and returns to
+            // this page on its own -- no viewer index/close state to manage.
         } catch (err) {
             notifyApiError(err, { context: "Couldn't delete photo", retry: () => handleDeleteFromViewer(filename) });
         }
@@ -433,20 +430,6 @@ const AlbumsPage: React.FC = () => {
         });
     }, [visiblePhotos, searchQuery, filterLikedOnly, filterMinRating, semanticPhotos]);
 
-    // The grid (and the tall spacer div that gives the page its scrollable
-    // height) unmounts while the photo viewer is open, so the browser clamps
-    // window scroll to 0. Restore it on close -- unless in-viewer navigation
-    // (prev/next/filmstrip) left the user on a different photo than the one
-    // they opened, in which case scroll to and highlight that photo's row
-    // instead of the original position.
-    const preViewerScrollYRef = useRef<number>(0);
-    const openedViewerIndexRef = useRef<number | null>(null);
-    const lastViewerIndexRef = useRef<number | null>(null);
-    const [returnHighlightFilename, setReturnHighlightFilename] = useState<string | null>(null);
-    if (viewerIndex !== null) {
-        lastViewerIndexRef.current = viewerIndex;
-    }
-
     const {
         containerRef: albumsGridContainerRef,
         innerRef: albumsGridInnerRef,
@@ -454,57 +437,39 @@ const AlbumsPage: React.FC = () => {
         innerStyle: albumsInnerStyle,
         visibleItems: visibleAlbumPhotos,
         shouldAnimateEntrance: shouldAnimateAlbumTile,
-        scrollToIndex: scrollAlbumsToIndex,
     } = useWindowedGrid({
         items: filteredPhotos,
         getKey: (photo: Photo) => photo.filename,
     });
-    // useWindowedGrid hands back a freshly-created scrollToIndex on every
-    // render, and filteredPhotos is a new array whenever the underlying data
-    // changes -- neither is safe to put in the effect's deps below without
-    // making it re-run (and re-jump/re-highlight) on renders unrelated to
-    // the viewer actually closing. Mirror the latest values into refs so the
-    // effect can still read current data but only fires on a real
-    // viewerIndex transition.
-    const latestFilteredPhotosRef = useRef(filteredPhotos);
-    latestFilteredPhotosRef.current = filteredPhotos;
-    const scrollAlbumsToIndexRef = useRef(scrollAlbumsToIndex);
-    scrollAlbumsToIndexRef.current = scrollAlbumsToIndex;
 
-    useLayoutEffect(() => {
-        if (viewerIndex !== null) {
+    // Opens the full-page viewer at /photo/:filename (PhotoViewerRoute,
+    // rendered via the background-location pattern in App.tsx) -- pushes one
+    // history entry carrying this page's own location as `state.background`
+    // so Back/Close return here. The grid never unmounts for this, so
+    // there's no scroll position to save/restore.
+    const openPhotoViewerAt = useCallback((index: number) => {
+        const photo = filteredPhotos[index];
+        if (!photo) {
             return;
         }
-        const closedAtIndex = lastViewerIndexRef.current;
-        const openedAtIndex = openedViewerIndexRef.current;
-        // Consume immediately: without this, an unrelated re-render while the
-        // viewer stays closed would see the same non-null/differing refs and
-        // redo the jump+highlight (or the scroll restore) again.
-        openedViewerIndexRef.current = null;
-        lastViewerIndexRef.current = null;
-        if (closedAtIndex !== null && openedAtIndex !== null && closedAtIndex !== openedAtIndex) {
-            // Navigated to a different photo inside the viewer before closing
-            // -- land back in the grid on that photo's row instead of where
-            // the viewer was opened from.
-            scrollAlbumsToIndexRef.current(closedAtIndex);
-            const returnedToPhoto = latestFilteredPhotosRef.current[closedAtIndex];
-            setReturnHighlightFilename(returnedToPhoto ? returnedToPhoto.filename : null);
-            return;
-        }
-        // The grid's own windowing state (metrics/visible range) was never
-        // touched while it sat unmounted behind the viewer (its recompute
-        // bails out with no containerRef to measure), so it's still valid
-        // for this exact scroll position.
-        window.scrollTo(0, preViewerScrollYRef.current);
-    }, [viewerIndex]);
+        navigate(photoViewerPath(photo.filename), { state: { background: location } });
+    }, [filteredPhotos, navigate, location]);
 
+    // PhotoViewerRoute is a route sibling, not a child, of this component --
+    // publish the current photo list + action handlers to ViewerSessionContext
+    // instead of passing them as props. See the equivalent effect in
+    // PhotoGallery.tsx for why there's no cleanup on the publish effect.
     useEffect(() => {
-        if (!returnHighlightFilename) {
-            return undefined;
-        }
-        const timer = window.setTimeout(() => setReturnHighlightFilename(null), 1800);
-        return () => window.clearTimeout(timer);
-    }, [returnHighlightFilename]);
+        publishViewerSession({
+            photos: filteredPhotos,
+            onRotationSave: handleSaveRotation,
+            onRate: handleRatePhoto,
+            onToggleLike: handleToggleLike,
+            onDelete: handleDeleteFromViewer,
+            onOpenActions: (filename, initialScreen) => setActionSheetTarget({ filenames: [filename], initialScreen }),
+        });
+    });
+    useEffect(() => () => publishViewerSession(null), [publishViewerSession]);
 
     const publicAlbumCount = useMemo(
         () => albums.filter((album) => album.isPublic).length,
@@ -642,7 +607,7 @@ const AlbumsPage: React.FC = () => {
                 observerRef.current.disconnect();
             }
         };
-    }, [hasMore, photosLoading, loadingMore, error, offset, fetchPhotosPage, activeAlbumId, showAddFromGallery, activeAlbumVisibleCount, activeAlbumPhotos.length, searchQuery, viewerIndex]);
+    }, [hasMore, photosLoading, loadingMore, error, offset, fetchPhotosPage, activeAlbumId, showAddFromGallery, activeAlbumVisibleCount, activeAlbumPhotos.length, searchQuery]);
 
     const submitSearch = useCallback(() => {
         const nextQuery = searchInput.trim();
@@ -1779,8 +1744,7 @@ const AlbumsPage: React.FC = () => {
                         />
                     )}
 
-                    {viewerIndex === null ? (
-                        <>
+                    <>
                             <div ref={albumsGridContainerRef} style={albumsSpacerStyle}>
                             <div ref={albumsGridInnerRef} className="gallery-grid albums-photo-grid" style={albumsInnerStyle}>
                                 {visibleAlbumPhotos.map((photo) => {
@@ -1792,7 +1756,6 @@ const AlbumsPage: React.FC = () => {
                                             photo={photo}
                                             selected={isSelected}
                                             animateEntrance={shouldAnimateAlbumTile(photo.filename)}
-                                            className={photo.filename === returnHighlightFilename ? 'tile-return-highlight' : undefined}
                                             title={photo.filename}
                                             showBody={false}
                                             useBatchedAccess
@@ -1801,9 +1764,7 @@ const AlbumsPage: React.FC = () => {
                                                 e.stopPropagation();
                                                 e.preventDefault();
                                                 const clickedIndex = filteredPhotos.findIndex((item) => item.filename === photo.filename);
-                                                preViewerScrollYRef.current = window.scrollY;
-                                                openedViewerIndexRef.current = clickedIndex;
-                                                setViewerIndex(clickedIndex);
+                                                openPhotoViewerAt(clickedIndex);
                                             }}
                                             onLongPress={() => handleTileLongPress(photo)}
                                             mediaOverlay={(
@@ -1859,21 +1820,7 @@ const AlbumsPage: React.FC = () => {
                             )}
 
                             {loadingMore && (showAddFromGallery || !activeAlbumId) && <p className="status">Loading more photos…</p>}
-                        </>
-                    ) : (
-                        <PhotoViewer
-                            photos={filteredPhotos}
-                            index={viewerIndex}
-                            onClose={() => setViewerIndex(null)}
-                            onIndexChange={setViewerIndex}
-                            useProtectedMedia={true}
-                            onRotationSave={handleSaveRotation}
-                            onRate={handleRatePhoto}
-                            onToggleLike={handleToggleLike}
-                            onDelete={handleDeleteFromViewer}
-                            onOpenActions={(filename, initialScreen) => setActionSheetTarget({ filenames: [filename], initialScreen })}
-                        />
-                    )}
+                    </>
                 </section>
             </div>
 

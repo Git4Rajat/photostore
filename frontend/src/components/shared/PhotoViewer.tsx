@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, EllipsisHorizontalIcon, HeartIcon, InformationCircleIcon, RectangleStackIcon, ShareIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, EllipsisHorizontalIcon, HeartIcon, InformationCircleIcon, RectangleStackIcon, ShareIcon, TrashIcon } from '@heroicons/react/24/outline';
 import { post, resolveApiUrl } from '../../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl } from '../../services/imageClient';
@@ -1097,8 +1097,17 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         >
             <div className={`photo-preview-panel${controlsHidden ? ' controls-hidden' : ''}`}>
                 <div className={`photo-preview-top${activeIsVideo ? ' is-video' : ''}`}>
+                    <button type="button" className="photo-preview-back" onClick={close} aria-label="Back to gallery">
+                        <ChevronLeftIcon className="toolbar-icon" aria-hidden="true" />
+                        <span>Back</span>
+                    </button>
                     <div className="photo-preview-meta">
-                        <p className="photo-preview-title">{activePhoto.filename}</p>
+                        <p className="photo-preview-title">
+                            {activePhoto.filename}
+                            {activePhoto.exifSummary?.capturedAt && (
+                                <span className="photo-preview-date"> · {activePhoto.exifSummary.capturedAt}</span>
+                            )}
+                        </p>
                         <p className="photo-preview-counter">
                             {index !== null ? `${index + 1}/${photos.length}` : `0/${photos.length}`}
                             {getMediaKind(activePhoto.filename) === 'RAW' ? ' · RAW preview' : ''}
@@ -1174,9 +1183,6 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                                 <EllipsisHorizontalIcon className="toolbar-icon" />
                             </button>
                         )}
-                        <button type="button" className="photo-preview-icon" onClick={close} aria-label="Close">
-                            <XMarkIcon className="toolbar-icon" />
-                        </button>
                     </div>
                 </div>
                 <button type="button" className="photo-preview-nav previous" onClick={showPrevious} aria-label="Previous photo">
