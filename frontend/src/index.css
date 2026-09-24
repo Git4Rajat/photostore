@@ -5075,6 +5075,39 @@ html[data-theme='light'] .notification-item.unread {
   justify-content: flex-end;
 }
 
+/* Leading dismiss control (mockup: "‹ Back  filename · date") -- replaces
+   the old trailing X, since the viewer is a real page now (PhotoViewerRoute)
+   rather than a same-page overlay you'd only ever "close". */
+.photo-preview-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  border: none;
+  background: none;
+  padding: 6px 4px;
+  margin: 0;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85), 0 1px 14px rgba(0, 0, 0, 0.5);
+}
+
+.photo-preview-back:hover {
+  opacity: 0.85;
+}
+
+.photo-preview-back .toolbar-icon {
+  width: 18px;
+  height: 18px;
+}
+
+.photo-preview-date {
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.72);
+}
+
 .photo-preview-title,
 .photo-preview-counter {
   margin: 0;
