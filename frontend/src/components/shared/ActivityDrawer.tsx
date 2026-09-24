@@ -153,30 +153,32 @@ const ActivityDrawer: React.FC<ActivityDrawerProps> = ({ open, onClose }) => {
                     />
                 )}
                 {!loading && activity.length > 0 && (
-                    <div className="people-merge-history-list">
-                        {activity.map((item) => (
-                            <div key={item.id} className="people-merge-history-row">
-                                <div className="people-merge-history-main">
-                                    <div className="people-merge-history-title">
-                                        <span className="people-merge-chip">{item.label}</span>
-                                        {formatTimestamp(item.timestamp) && (
-                                            <span className="people-merge-chip">{formatTimestamp(item.timestamp)}</span>
-                                        )}
+                    <div className="tools-history-panel">
+                        <div className="people-merge-history-list">
+                            {activity.map((item) => (
+                                <div key={item.id} className="people-merge-history-row">
+                                    <div className="people-merge-history-main">
+                                        <div className="people-merge-history-title">
+                                            <span className="people-merge-chip">{item.label}</span>
+                                            {formatTimestamp(item.timestamp) && (
+                                                <span className="people-merge-chip">{formatTimestamp(item.timestamp)}</span>
+                                            )}
+                                        </div>
+                                    </div>
+                                    <div className="people-merge-history-actions">
+                                        <button
+                                            type="button"
+                                            className="btn btn-soft"
+                                            disabled={busyId === item.id}
+                                            onClick={() => void handleUndo(item)}
+                                        >
+                                            <ArrowUturnLeftIcon className="toolbar-icon" aria-hidden="true" />
+                                            {busyId === item.id ? 'Undoing…' : 'Undo'}
+                                        </button>
                                     </div>
                                 </div>
-                                <div className="people-merge-history-actions">
-                                    <button
-                                        type="button"
-                                        className="btn btn-soft"
-                                        disabled={busyId === item.id}
-                                        onClick={() => void handleUndo(item)}
-                                    >
-                                        <ArrowUturnLeftIcon className="toolbar-icon" aria-hidden="true" />
-                                        {busyId === item.id ? 'Undoing…' : 'Undo'}
-                                    </button>
-                                </div>
-                            </div>
-                        ))}
+                            ))}
+                        </div>
                     </div>
                 )}
 

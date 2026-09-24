@@ -5050,7 +5050,16 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     // Ask: live chip disambiguation while typing ("Li" -> Lisbon/Liam),
     // before the user even submits. Debounced -- this fires on every
     // keystroke otherwise.
+    const skipTypeaheadFetchRef = useRef(false);
     useEffect(() => {
+        if (skipTypeaheadFetchRef.current) {
+            // searchInput just changed because a suggestion was picked, not
+            // because the user typed -- don't re-fetch and immediately
+            // reopen the dropdown for the value the user just selected.
+            skipTypeaheadFetchRef.current = false;
+            setTypeaheadSuggestions([]);
+            return undefined;
+        }
         const trimmed = searchInput.trim();
         if (!trimmed) {
             setTypeaheadSuggestions([]);
@@ -5068,6 +5077,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     }, [searchInput]);
 
     const applyTypeaheadSuggestion = (item: TypeaheadSuggestion) => {
+        skipTypeaheadFetchRef.current = true;
         setSearchInput(item.label);
         setTypeaheadSuggestions([]);
         submitSearch(item.label);

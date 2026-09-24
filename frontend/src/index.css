@@ -3549,10 +3549,14 @@ html[data-theme='light'] .notification-item.unread {
 .gallery-search-meta-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   flex-wrap: wrap;
   gap: 8px;
   margin: 4px 0 8px;
+}
+
+.gallery-search-meta-row .btn {
+  margin-left: auto;
 }
 
 /* Ask: live chip disambiguation dropdown while typing, e.g. "Li" resolving
@@ -3649,7 +3653,7 @@ html[data-theme='light'] .notification-item.unread {
   display: inline-flex;
 }
 
-.gallery-suggestions-menu {
+.gallery-menu.gallery-suggestions-menu {
   min-width: 300px;
   max-width: min(380px, 90vw);
 }
@@ -3660,6 +3664,11 @@ html[data-theme='light'] .notification-item.unread {
   justify-content: space-between;
   gap: 10px;
   padding: 8px 4px;
+}
+
+.gallery-suggestion-copy {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .gallery-suggestion-row + .gallery-suggestion-row {
