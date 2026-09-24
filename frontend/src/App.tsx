@@ -1169,6 +1169,9 @@ const AppContent: React.FC = () => {
             {isSignedIntoPrivateArea && (
                 <Routes>
                     <Route path="/photo/:filename" element={<PhotoViewerRoute />} />
+                    {/* Matches every other real location so this <Routes> never warns
+                        "no routes matched" while the user is elsewhere in the app. */}
+                    <Route path="*" element={null} />
                 </Routes>
             )}
 

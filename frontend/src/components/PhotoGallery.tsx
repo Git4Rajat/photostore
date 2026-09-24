@@ -56,7 +56,7 @@ import PhotoQuickActions, { WORKBENCH_URL_FILENAME_CAP, workbenchFilenameHref, w
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
 import { photoViewerPath } from './shared/PhotoViewerRoute';
-import { useViewerSession } from './shared/ViewerSessionContext';
+import { usePublishViewerSession } from './shared/ViewerSessionContext';
 import SelectionCommandBar from './shared/SelectionCommandBar';
 import Timeline from './shared/Timeline';
 import { EmptyState } from './shared/EmptyState';
@@ -4055,7 +4055,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
 }) => {
     const location = useLocation();
     const navigate = useNavigate();
-    const { publishViewerSession } = useViewerSession();
+    const publishViewerSession = usePublishViewerSession();
     const cachedBoot = loadPhotoCache<Photo, FilterOptions>();
     const [photos, setPhotos] = useState<Photo[]>(cachedBoot?.photos || []);
     // filename -> batch-resolved access URL (see thumbnailAccessCache). '' means
@@ -4252,7 +4252,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         setPhotos(prev => prev.map(p => (p.filename === filename ? { ...p, ...patch } : p)));
     }, []);
 
-    const handleRatePhoto = async (filename: string, rating: number) => {
+    // useCallback (not a plain function) matters here beyond the usual
+    // perf reasons: these are published to ViewerSessionContext (see the
+    // effect below), keyed in that effect's dependency array. A fresh
+    // closure identity every render would make that effect re-run on every
+    // render, including the re-renders its own publish call cascades back
+    // down to this component -- an infinite loop.
+    const handleRatePhoto = useCallback(async (filename: string, rating: number) => {
         const previous = photos.find(p => p.filename === filename);
         patchPhoto(filename, { rating });
         addNotification('Rating updated', `${getDisplayName(filename)} rated ${rating}/5.`);
@@ -4262,9 +4268,9 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             patchPhoto(filename, { rating: previous?.rating ?? 0 });
             notifyApiError(err, { context: 'Couldn’t save rating.', retry: () => handleRatePhoto(filename, rating) });
         }
-    };
+    }, [photos, patchPhoto, addNotification]);
 
-    const handleSaveRotation = async (filename: string, rotation: number) => {
+    const handleSaveRotation = useCallback(async (filename: string, rotation: number) => {
         const previous = photos.find(p => p.filename === filename);
         patchPhoto(filename, { rotation });
         addNotification('Rotation saved', `${getDisplayName(filename)} rotated ${rotation}°.`);
@@ -4274,9 +4280,9 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             patchPhoto(filename, { rotation: previous?.rotation ?? 0 });
             notifyApiError(err, { context: 'Couldn’t save rotation.', retry: () => handleSaveRotation(filename, rotation) });
         }
-    };
+    }, [photos, patchPhoto, addNotification]);
 
-    const handleToggleLike = async (filename: string) => {
+    const handleToggleLike = useCallback(async (filename: string) => {
         const previous = photos.find(p => p.filename === filename);
         const optimisticLiked = !(previous?.liked);
         const optimisticLikes = Math.max(0, (previous?.likes ?? 0) + (optimisticLiked ? 1 : -1));
@@ -4294,7 +4300,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             patchPhoto(filename, { liked: previous?.liked ?? false, likes: previous?.likes ?? 0 });
             notifyApiError(err, { context: 'Couldn’t update like.', retry: () => handleToggleLike(filename) });
         }
-    };
+    }, [photos, patchPhoto, addNotification]);
 
     const fetchPhotos = useCallback(async (sort: string = sortBy, nextOffset = 0, append = false, queryText: string = searchQuery) => {
         const requestSeq = photoListRequestSeqRef.current + 1;
@@ -4774,7 +4780,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     // Single-photo counterpart to handleDeletePhotos, for the PhotoViewer's
     // delete button -- the photo being viewed isn't necessarily part of
     // selectedPhotos, so this doesn't reuse that bulk flow's state.
-    const handleDeleteFromViewer = async (filename: string) => {
+    const handleDeleteFromViewer = useCallback(async (filename: string) => {
         const confirmDelete = await confirmDialog({
             title: 'Delete photo',
             message: 'Move this photo to Recently Deleted? You can restore it for 30 days.',
@@ -4799,7 +4805,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         } catch (err) {
             notifyApiError(err, { context: "Couldn't delete photo", retry: () => handleDeleteFromViewer(filename) });
         }
-    };
+    }, [releaseKnownHashesForFilenames, addNotification]);
 
     const handleToggleAlbumMenu = async () => {
         setShowSortMenu(false);
@@ -5302,13 +5308,17 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     // PhotoViewerRoute is a route sibling, not a child, of this component
     // (see the background-location pattern in App.tsx) -- it can't receive
     // the current photo list or action handlers as props, so this publishes
-    // both to ViewerSessionContext instead. Re-runs on every render (the
-    // handlers below aren't memoized) rather than chasing exhaustive-deps
-    // here, since a stale closure publishing an outdated handler is worse
-    // than one extra context update. Deliberately no cleanup on this one --
-    // only unmounting clears the session (below) -- otherwise every
-    // re-render would briefly null it out first, and PhotoViewerRoute would
-    // see that null mid-session and bounce out.
+    // both to ViewerSessionContext instead. A real dependency array (not
+    // "run every render") matters here for more than the usual perf reason:
+    // publishing triggers a state update in ViewerSessionProvider, which --
+    // since it's an ancestor of this whole component -- cascades a re-render
+    // back down through here regardless of context subscriptions. Without
+    // memoized deps that re-render would look identical to a real change and
+    // re-trigger the effect, publishing again, forever. Deliberately no
+    // cleanup on this one -- only unmounting clears the session (below) --
+    // otherwise every legitimate re-publish would briefly null the session
+    // first, and PhotoViewerRoute would see that null mid-session and bounce
+    // out.
     useEffect(() => {
         publishViewerSession({
             photos: filteredPhotos,
@@ -5318,7 +5328,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             onDelete: handleDeleteFromViewer,
             onOpenActions: (filename, initialScreen) => setActionSheetTarget({ filenames: [filename], initialScreen }),
         });
-    });
+    }, [filteredPhotos, handleSaveRotation, handleRatePhoto, handleToggleLike, handleDeleteFromViewer, publishViewerSession]);
     useEffect(() => () => publishViewerSession(null), [publishViewerSession]);
 
     // Two-finger pinch on the grid steps the density level (see

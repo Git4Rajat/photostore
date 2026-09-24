@@ -42,7 +42,7 @@ import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { WORKBENCH_URL_FILENAME_CAP, libraryFocusHref, workbenchFilenameHref, workbenchFilenamesHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import { photoViewerPath } from './shared/PhotoViewerRoute';
-import { useViewerSession } from './shared/ViewerSessionContext';
+import { usePublishViewerSession } from './shared/ViewerSessionContext';
 import SelectionCommandBar from './shared/SelectionCommandBar';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import type { PhotoPersonLink } from '../types/uiTypes';
@@ -145,7 +145,7 @@ const extractApiErrorMessage = (err: unknown, fallback: string): string => {
 const AlbumsPage: React.FC = () => {
     const location = useLocation();
     const navigate = useNavigate();
-    const { publishViewerSession } = useViewerSession();
+    const publishViewerSession = usePublishViewerSession();
     const { releaseKnownHashesForFilenames } = useAppServices();
     const [photos, setPhotos] = useState<Photo[]>([]);
     const [photosLoading, setPhotosLoading] = useState<boolean>(false);
@@ -256,7 +256,7 @@ const AlbumsPage: React.FC = () => {
         }
     };
 
-    const removeDeletedPhotos = (filenames: string[]) => {
+    const removeDeletedPhotos = useCallback((filenames: string[]) => {
         const fileSet = new Set(filenames);
         setPhotos((prev) => prev.filter((photo) => !fileSet.has(photo.filename)));
         setSemanticPhotos((prev) => (prev ? prev.filter((photo) => !fileSet.has(photo.filename)) : prev));
@@ -275,9 +275,15 @@ const AlbumsPage: React.FC = () => {
                 photoCount: Math.max(0, (album.photoCount || 0) - removedCount),
             };
         }));
-    };
+    }, []);
 
-    const handleSaveRotation = async (filename: string, rotation: number) => {
+    // useCallback (not a plain function) matters here beyond the usual perf
+    // reasons for these four: they're published to ViewerSessionContext (see
+    // the effect below), keyed in that effect's dependency array. A fresh
+    // closure identity every render would make that effect re-run on every
+    // render, including the re-renders its own publish call cascades back
+    // down to this component -- an infinite loop.
+    const handleSaveRotation = useCallback(async (filename: string, rotation: number) => {
         // Optimistic: rotate in the UI immediately, roll back if the save fails.
         const previousRotation = [...photos, ...(semanticPhotos || []), ...activeAlbumPhotos]
             .find((photo) => photo.filename === filename)?.rotation ?? 0;
@@ -297,13 +303,13 @@ const AlbumsPage: React.FC = () => {
             patchAll(previousRotation);
             setStatus(`Could not save rotation for ${filename}.`);
         }
-    };
+    }, [photos, semanticPhotos, activeAlbumPhotos]);
 
     // Rate/like never had a write path in this file before (only ever read
     // photo.rating/photo.liked for display/filtering) -- added for the
     // PhotoViewer's rate/like controls, mirroring PhotoGallery's endpoints and
     // this file's own patchAll-3-arrays pattern from handleSaveRotation above.
-    const handleRatePhoto = async (filename: string, rating: number) => {
+    const handleRatePhoto = useCallback(async (filename: string, rating: number) => {
         const previousRating = [...photos, ...(semanticPhotos || []), ...activeAlbumPhotos]
             .find((photo) => photo.filename === filename)?.rating ?? 0;
         const applyRating = (value: number) => (photo: Photo) => (
@@ -322,9 +328,9 @@ const AlbumsPage: React.FC = () => {
             patchAll(previousRating);
             setStatus(`Could not save rating for ${filename}.`);
         }
-    };
+    }, [photos, semanticPhotos, activeAlbumPhotos]);
 
-    const handleToggleLike = async (filename: string) => {
+    const handleToggleLike = useCallback(async (filename: string) => {
         const previous = [...photos, ...(semanticPhotos || []), ...activeAlbumPhotos]
             .find((photo) => photo.filename === filename);
         const optimisticLiked = !(previous?.liked);
@@ -347,13 +353,13 @@ const AlbumsPage: React.FC = () => {
             patchAll(previous?.liked ?? false, previous?.likes ?? 0);
             setStatus(`Could not update like for ${filename}.`);
         }
-    };
+    }, [photos, semanticPhotos, activeAlbumPhotos]);
 
     // Single-photo counterpart to handleDeleteSelected, for the PhotoViewer's
     // delete button -- reuses removeDeletedPhotos so it stays in sync with
     // photos/semanticPhotos/activeAlbumPhotos/selectedPhotos/album counts the
     // exact same way the bulk flow does.
-    const handleDeleteFromViewer = async (filename: string) => {
+    const handleDeleteFromViewer = useCallback(async (filename: string) => {
         const confirmed = await confirmDialog({
             title: 'Delete photo',
             message: 'Move this photo to Recently Deleted? You can restore it for 30 days.',
@@ -377,7 +383,7 @@ const AlbumsPage: React.FC = () => {
         } catch (err) {
             notifyApiError(err, { context: "Couldn't delete photo", retry: () => handleDeleteFromViewer(filename) });
         }
-    };
+    }, [removeDeletedPhotos, releaseKnownHashesForFilenames]);
 
     const visiblePhotos = useMemo(() => {
         const semanticSource = semanticPhotos;
@@ -458,7 +464,8 @@ const AlbumsPage: React.FC = () => {
     // PhotoViewerRoute is a route sibling, not a child, of this component --
     // publish the current photo list + action handlers to ViewerSessionContext
     // instead of passing them as props. See the equivalent effect in
-    // PhotoGallery.tsx for why there's no cleanup on the publish effect.
+    // PhotoGallery.tsx for why a real dependency array (not "run every
+    // render") matters here -- without it, this loops.
     useEffect(() => {
         publishViewerSession({
             photos: filteredPhotos,
@@ -468,7 +475,7 @@ const AlbumsPage: React.FC = () => {
             onDelete: handleDeleteFromViewer,
             onOpenActions: (filename, initialScreen) => setActionSheetTarget({ filenames: [filename], initialScreen }),
         });
-    });
+    }, [filteredPhotos, handleSaveRotation, handleRatePhoto, handleToggleLike, handleDeleteFromViewer, publishViewerSession]);
     useEffect(() => () => publishViewerSession(null), [publishViewerSession]);
 
     const publicAlbumCount = useMemo(

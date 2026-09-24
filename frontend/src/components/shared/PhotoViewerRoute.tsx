@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect } from 'react';
+import React, { useCallback } from 'react';
 import { Navigate, useLocation, useNavigate, useParams } from 'react-router-dom';
 import PhotoViewer from './PhotoViewer';
 import { useViewerSession } from './ViewerSessionContext';
@@ -30,11 +30,6 @@ const PhotoViewerRoute: React.FC = () => {
     const { session } = useViewerSession();
     const background = (location.state as ViewerLocationState | null)?.background;
     const filename = params.filename ? decodeURIComponent(params.filename) : '';
-
-    useEffect(() => {
-        document.body.classList.add('lightbox-active');
-        return () => document.body.classList.remove('lightbox-active');
-    }, []);
 
     const handleClose = useCallback(() => {
         navigate(-1);

@@ -386,21 +386,6 @@ a {
     max(16px, env(safe-area-inset-left));
 }
 
-/* Immersive lightbox: PhotoGallery toggles this on <body> while the photo
-   viewer is open (see the useLayoutEffect around gallerySectionRef in
-   PhotoGallery.tsx) so the viewer's card is the only thing above the fold,
-   its top edge flush with the real browser viewport top instead of sitting
-   below the app header/nav. */
-body.lightbox-active .ios-shell {
-  padding-top: env(safe-area-inset-top);
-}
-
-body.lightbox-active .ios-header,
-body.lightbox-active .ios-tabs,
-body.lightbox-active .upload-approval-bar {
-  display: none;
-}
-
 .ios-backdrop {
   position: fixed;
   border-radius: var(--r-pill);
