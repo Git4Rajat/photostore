@@ -30,7 +30,7 @@ import {
 import { AppServicesProvider, useAppServices, getBrowserProcessingConcurrency, isBrowserProcessingTurboEnabled, setBrowserProcessingTurbo } from './components/AppServicesProvider';
 import { ClusteringActivityIndicator, IpworkActivityIndicator, NotificationBell } from './components/AppServiceIndicators';
 import { TimelineMetadataProvider } from './components/TimelineMetadataProvider';
-import { Logo } from './components/shared/Logo';
+import { LogoLockup } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
 import { BackendStatusBanner } from './components/shared/BackendStatusBanner';
 import ActivityDrawer from './components/shared/ActivityDrawer';
@@ -479,19 +479,26 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
     }, [open, close]);
 
     const showAuth = authEnabled && authReady && !isAuthRoute;
+    const initials = displayName
+        ? displayName.trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? '').join('')
+        : '';
 
     return (
         <div className="account-menu" ref={wrapRef}>
             <button
                 type="button"
-                className="btn btn-soft icon-btn account-menu-trigger"
+                className="account-menu-trigger"
                 aria-haspopup="menu"
                 aria-expanded={open}
                 onClick={() => setOpen((prev) => !prev)}
                 aria-label="Settings and account"
                 title="Settings and account"
             >
-                <EllipsisHorizontalIcon className="toolbar-icon" />
+                {initials ? (
+                    <span className="account-menu-trigger-avatar" aria-hidden="true">{initials}</span>
+                ) : (
+                    <UserCircleIcon className="account-menu-trigger-avatar-icon" aria-hidden="true" />
+                )}
                 <span className="sr-only">Settings and account</span>
             </button>
 
@@ -513,6 +520,18 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
                             <ArrowUturnLeftIcon className="account-menu-item-icon" aria-hidden="true" />
                             <span>Recent Activity</span>
                         </button>
+                        {UTILITY_NAV_ITEMS.map(({ to, label, end, Icon }) => (
+                            <NavLink
+                                key={to}
+                                to={to}
+                                end={end}
+                                onClick={close}
+                                className={({ isActive }) => `account-menu-item${isActive ? ' active' : ''}`}
+                            >
+                                <Icon className="account-menu-item-icon" aria-hidden="true" />
+                                <span>{label}</span>
+                            </NavLink>
+                        ))}
                     </div>
 
                     <div className="account-menu-section">
@@ -911,12 +930,19 @@ const AppContent: React.FC = () => {
                             <span className="sr-only">Open navigation menu</span>
                         </button>
                     )}
-                    <Logo size={40} className="ios-header-logo" />
-                    <div className="ios-header-title">
-                        <p className="ios-kicker">KEEPSAKE</p>
-                        <h1 className="ios-title">{libraryTitle}</h1>
-                        <p className="ios-subtitle">An elegant home for your memories.</p>
-                    </div>
+                    <LogoLockup size={30} className="ios-header-wordmark" />
+                    <nav className="ios-tabs" aria-label="Primary navigation">
+                        {PRIMARY_NAV_ITEMS.map(({ to, label, end }) => (
+                            <NavLink
+                                key={to}
+                                to={to}
+                                end={end}
+                                className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
+                            >
+                                {label}
+                            </NavLink>
+                        ))}
+                    </nav>
                     <div className="app-header-actions">
                         {isSignedIntoPrivateArea && (
                             <ErrorBoundary context="root-service-actions" fallback={null}>
@@ -936,32 +962,6 @@ const AppContent: React.FC = () => {
                         />
                     </div>
                 </header>
-                )}
-
-                {!isPublicAlbumRoute && (
-                <nav className="ios-tabs reveal-up delay-1" aria-label="Primary navigation">
-                    {PRIMARY_NAV_ITEMS.map(({ to, label, end }) => (
-                        <NavLink
-                            key={to}
-                            to={to}
-                            end={end}
-                            className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                        >
-                            {label}
-                        </NavLink>
-                    ))}
-                    <span className="ios-tab-spacer" aria-hidden="true" />
-                    {UTILITY_NAV_ITEMS.map(({ to, label, end }) => (
-                        <NavLink
-                            key={to}
-                            to={to}
-                            end={end}
-                            className={({ isActive }) => `ios-tab${isActive ? ' active' : ''}`}
-                        >
-                            {label}
-                        </NavLink>
-                    ))}
-                </nav>
                 )}
 
                 {!isPublicAlbumRoute && isSignedIntoPrivateArea && appServices.pendingUploadSummary && (

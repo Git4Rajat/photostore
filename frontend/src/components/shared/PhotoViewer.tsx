@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, EllipsisHorizontalIcon, HeartIcon, InformationCircleIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, EllipsisHorizontalIcon, HeartIcon, InformationCircleIcon, RectangleStackIcon, ShareIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { post, resolveApiUrl } from '../../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl } from '../../services/imageClient';
+import { showToast } from '../../services/toast';
 import { getMediaKind, isVideoFilename, requiresBackendPreview } from '../../utils/photoDisplay';
 
 export interface ViewerPhoto {
@@ -472,6 +473,41 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
             setMediaError(formatPreviewError(activePhoto.filename, 'Download failed.'));
         }
     }, [activePhoto, mainMediaPath, shouldProtect]);
+
+    // No per-photo share exists anywhere in the app today -- this is net new,
+    // matching the mockup's "Everything on this bottom bar is new" framing.
+    // Client-only: fetches the same path downloadCurrentPhoto uses, but as a
+    // real Blob (fetchProtectedBlobUrl/fetchPublicBlobUrl only hand back an
+    // already-created object URL, so it's re-fetched locally into a Blob) so
+    // it can be handed to the Web Share API. Falls back to a plain download
+    // when the Share API or file-sharing isn't available.
+    const shareCurrentPhoto = useCallback(async () => {
+        if (!activePhoto) {
+            return;
+        }
+        const sharePath = activePhoto.url || mainMediaPath || activePhoto.thumbnailUrl || '';
+        if (!sharePath) {
+            return;
+        }
+        try {
+            const objectUrl = shouldProtect
+                ? await fetchProtectedBlobUrl(sharePath)
+                : await fetchPublicBlobUrl(sharePath);
+            objectUrlsRef.current.push(objectUrl);
+            const blob = await (await fetch(objectUrl)).blob();
+            const file = new File([blob], activePhoto.filename, { type: blob.type || 'application/octet-stream' });
+            if (navigator.canShare?.({ files: [file] }) && navigator.share) {
+                await navigator.share({ files: [file], title: activePhoto.filename });
+                return;
+            }
+        } catch (err) {
+            if (err instanceof Error && err.name === 'AbortError') {
+                return;
+            }
+        }
+        showToast('Sharing isn’t supported on this device — downloading instead.');
+        void downloadCurrentPhoto();
+    }, [activePhoto, mainMediaPath, shouldProtect, downloadCurrentPhoto]);
 
     // Cancels an in-flight (or discards an already-fetched) full-resolution
     // original: aborts the fetch, revokes its object URL, and resets FR state
@@ -1137,16 +1173,6 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                                 <EllipsisHorizontalIcon className="toolbar-icon" />
                             </button>
                         )}
-                        {onDelete && (
-                            <button
-                                type="button"
-                                className="photo-preview-icon"
-                                onClick={(e) => { e.stopPropagation(); if (activePhoto) onDelete(activePhoto.filename); }}
-                                aria-label="Delete photo"
-                            >
-                                <TrashIcon className="toolbar-icon" />
-                            </button>
-                        )}
                         <button type="button" className="photo-preview-icon" onClick={close} aria-label="Close">
                             <XMarkIcon className="toolbar-icon" />
                         </button>
@@ -1255,38 +1281,6 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                     </button>
                     {showDetails && (
                         <div className="photo-preview-details" onClick={(event) => event.stopPropagation()}>
-                            {(onRate || onToggleLike) && (
-                                <div className="photo-preview-engage" onClick={(event) => event.stopPropagation()}>
-                                    {onRate && (
-                                        <div className="photo-preview-rate" role="group" aria-label="Rate photo">
-                                            {[1, 2, 3, 4, 5].map((star) => (
-                                                <button
-                                                    key={star}
-                                                    type="button"
-                                                    className={`photo-preview-star ${star <= Math.round(activePhoto.rating || 0) ? 'is-on' : ''}`}
-                                                    onClick={() => { void onRate(activePhoto.filename, star); }}
-                                                    aria-label={`Rate ${star} ${star === 1 ? 'star' : 'stars'}`}
-                                                    title={`Rate ${star}/5`}
-                                                >
-                                                    ★
-                                                </button>
-                                            ))}
-                                        </div>
-                                    )}
-                                    {onToggleLike && (
-                                        <button
-                                            type="button"
-                                            className={`photo-preview-like ${activePhoto.liked ? 'is-liked' : ''}`}
-                                            onClick={() => { void onToggleLike(activePhoto.filename); }}
-                                            aria-pressed={Boolean(activePhoto.liked)}
-                                            aria-label={activePhoto.liked ? 'Remove like' : 'Like photo'}
-                                        >
-                                            <HeartIcon className="toolbar-icon" />
-                                            <span>{activePhoto.likes || 0}</span>
-                                        </button>
-                                    )}
-                                </div>
-                            )}
                             <div>
                                 <span className="photo-preview-label">Kind</span>
                                 <span>{getMediaKind(activePhoto.filename)}</span>
@@ -1386,6 +1380,78 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                             </button>
                         );
                     })}
+                </div>
+                <div className="photo-preview-actionbar" role="toolbar" aria-label="Photo actions">
+                    {onRate && (
+                        <div className="photo-preview-rate" role="group" aria-label="Rate photo">
+                            {[1, 2, 3, 4, 5].map((star) => (
+                                <button
+                                    key={star}
+                                    type="button"
+                                    className={`photo-preview-star ${star <= Math.round(activePhoto.rating || 0) ? 'is-on' : ''}`}
+                                    onClick={() => { void onRate(activePhoto.filename, star); }}
+                                    aria-label={`Rate ${star} ${star === 1 ? 'star' : 'stars'}`}
+                                    title={`Rate ${star}/5`}
+                                >
+                                    ★
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                    {onToggleLike && (
+                        <button
+                            type="button"
+                            className={`photo-preview-like ${activePhoto.liked ? 'is-liked' : ''}`}
+                            onClick={() => { void onToggleLike(activePhoto.filename); }}
+                            aria-pressed={Boolean(activePhoto.liked)}
+                            aria-label={activePhoto.liked ? 'Remove like' : 'Like photo'}
+                        >
+                            <HeartIcon className="toolbar-icon" />
+                            <span>{activePhoto.likes || 0}</span>
+                        </button>
+                    )}
+                    {onOpenActions && (
+                        <button
+                            type="button"
+                            className="photo-preview-actionbar-item"
+                            onClick={() => onOpenActions(activePhoto.filename)}
+                            aria-label="Add to album"
+                        >
+                            <RectangleStackIcon className="toolbar-icon" />
+                            <span>Album</span>
+                        </button>
+                    )}
+                    <button
+                        type="button"
+                        className="photo-preview-actionbar-item"
+                        onClick={() => void shareCurrentPhoto()}
+                        aria-label="Share photo"
+                    >
+                        <ShareIcon className="toolbar-icon" />
+                        <span>Share</span>
+                    </button>
+                    {onDelete && (
+                        <button
+                            type="button"
+                            className="photo-preview-actionbar-item is-danger"
+                            onClick={() => onDelete(activePhoto.filename)}
+                            aria-label="Delete photo"
+                        >
+                            <TrashIcon className="toolbar-icon" />
+                            <span>Delete</span>
+                        </button>
+                    )}
+                    {onOpenActions && (
+                        <button
+                            type="button"
+                            className="photo-preview-actionbar-item"
+                            onClick={() => onOpenActions(activePhoto.filename)}
+                            aria-label="More photo actions"
+                        >
+                            <EllipsisHorizontalIcon className="toolbar-icon" />
+                            <span>More</span>
+                        </button>
+                    )}
                 </div>
             </div>
         </section>

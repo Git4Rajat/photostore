@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, BellIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, MapPinIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, UserCircleIcon, VideoCameraIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, BellIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, MapPinIcon, PhotoIcon, PlusIcon, Squares2X2Icon, StarIcon, TrashIcon, UserCircleIcon, VideoCameraIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
@@ -4127,7 +4127,9 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     // field, so these naturally clear to [] for that path rather than
     // needing a special case.
     const [matchedPeople, setMatchedPeople] = useState<string[]>([]);
+    const [matchedPeopleDetail, setMatchedPeopleDetail] = useState<{ personId: string; name: string; count: number }[]>([]);
     const [matchedLocations, setMatchedLocations] = useState<string[]>([]);
+    const [matchedYear, setMatchedYear] = useState<number | null>(null);
     const [savingSearchAsAlbum, setSavingSearchAsAlbum] = useState<boolean>(false);
     const [typeaheadSuggestions, setTypeaheadSuggestions] = useState<TypeaheadSuggestion[]>([]);
     // A bell dropdown (not a single inline card) can hold the whole ordered
@@ -4157,10 +4159,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [albumMenuOptions, setAlbumMenuOptions] = useState<AlbumSummary[] | null>(null);
     const [albumMenuLoading, setAlbumMenuLoading] = useState<boolean>(false);
     const [addingToAlbumId, setAddingToAlbumId] = useState<string | null>(null);
+    const [showRateMenu, setShowRateMenu] = useState<boolean>(false);
+    const [ratingSelected, setRatingSelected] = useState<boolean>(false);
     const searchRef = useRef<HTMLDivElement | null>(null);
     const sortMenuRef = useRef<HTMLDivElement | null>(null);
     const filterMenuRef = useRef<HTMLDivElement | null>(null);
     const albumMenuRef = useRef<HTMLDivElement | null>(null);
+    const rateMenuRef = useRef<HTMLDivElement | null>(null);
     const [captureStartDate, setCaptureStartDate] = useState<string>(cachedBoot?.captureStartDate || '');
     const [captureEndDate, setCaptureEndDate] = useState<string>(cachedBoot?.captureEndDate || '');
     const { summary: timelineSummary, status: timelineStatus } = useTimelineMetadata();
@@ -4393,11 +4398,15 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             if (trimmedQuery) {
                 setSearchNotice(typeof response.searchNotice === 'string' ? response.searchNotice : null);
                 setMatchedPeople(Array.isArray(response.matchedPeople) ? response.matchedPeople : []);
+                setMatchedPeopleDetail(Array.isArray(response.matchedPeopleDetail) ? response.matchedPeopleDetail : []);
                 setMatchedLocations(Array.isArray(response.matchedLocations) ? response.matchedLocations : []);
+                setMatchedYear(typeof response.matchedYear === 'number' ? response.matchedYear : null);
             } else {
                 setSearchNotice(null);
                 setMatchedPeople([]);
+                setMatchedPeopleDetail([]);
                 setMatchedLocations([]);
+                setMatchedYear(null);
             }
         } catch (err) {
             if (requestSeq !== photoListRequestSeqRef.current) {
@@ -4718,6 +4727,35 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         }
     };
 
+    // Bulk rate for the Select command bar's "Rate" action -- optimistic per-
+    // photo patch (same pattern as the single-photo handleRatePhoto), one
+    // request to /photos/rate-multiple rather than N single-photo calls.
+    const handleRateSelected = async (rating: number) => {
+        if (selectedPhotos.size === 0) return;
+        const targets = Array.from(selectedPhotos);
+        const previousRatings = new Map(targets.map((name) => [name, photos.find(p => p.filename === name)?.rating ?? 0]));
+        setShowRateMenu(false);
+        setRatingSelected(true);
+        targets.forEach((filename) => patchPhoto(filename, { rating }));
+        try {
+            const response = await post('/photos/rate-multiple', { filenames: targets, rating });
+            const rated = new Set<string>(Array.isArray(response?.rated) ? response.rated : []);
+            const failed = targets.filter((name) => !rated.has(name));
+            failed.forEach((filename) => patchPhoto(filename, { rating: previousRatings.get(filename) ?? 0 }));
+            if (rated.size > 0) {
+                addNotification('Rating updated', `Rated ${plural(rated.size, 'photo')} ${rating}/5.`);
+            }
+            if (failed.length > 0) {
+                setError(`Failed to rate ${plural(failed.length, 'photo')}.`);
+            }
+        } catch (err) {
+            targets.forEach((filename) => patchPhoto(filename, { rating: previousRatings.get(filename) ?? 0 }));
+            notifyApiError(err, { context: 'Couldn’t save ratings.', retry: () => handleRateSelected(rating) });
+        } finally {
+            setRatingSelected(false);
+        }
+    };
+
     // Single-photo counterpart to handleDeletePhotos, for the PhotoViewer's
     // delete button -- the photo being viewed isn't necessarily part of
     // selectedPhotos, so this doesn't reuse that bulk flow's state.
@@ -5025,6 +5063,17 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         fetchPhotos(sortBy, 0, false, nextQuery);
     }, [fetchPhotos, searchInput, sortBy]);
 
+    // Ask: dismissing a "person: Priya ✕" / "place: Lisbon ✕" / "year: 2022 ✕"
+    // clause chip strips that term out of the raw query text and re-submits --
+    // there's no structured query object to edit, the query is just a string
+    // the backend re-parses, so removing a clause is a text edit + re-search.
+    const removeSearchClause = useCallback((term: string) => {
+        const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const next = searchInput.replace(new RegExp(`\\b${escaped}\\b`, 'i'), '').replace(/\s+/g, ' ').trim();
+        setSearchInput(next);
+        submitSearch(next);
+    }, [searchInput, submitSearch]);
+
     // Leaving the box empty (never submitted, or cleared back out after a prior
     // search) should drop back to the unfiltered gallery rather than leaving a
     // stale query applied — covers click-away, tab-away (blur), and Escape.
@@ -5148,6 +5197,28 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             document.removeEventListener('keydown', handleKeyDown);
         };
     }, [showAlbumMenu]);
+
+    useEffect(() => {
+        if (!showRateMenu) {
+            return;
+        }
+        const handlePointerDown = (event: PointerEvent) => {
+            if (rateMenuRef.current && !rateMenuRef.current.contains(event.target as Node)) {
+                setShowRateMenu(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowRateMenu(false);
+            }
+        };
+        document.addEventListener('pointerdown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('pointerdown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [showRateMenu]);
 
     useEffect(() => {
         if (selectedPhotos.size === 0) {
@@ -5396,6 +5467,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                 </button>
                                 {showSuggestionsMenu && (
                                     <div className="gallery-menu gallery-suggestions-menu" role="menu" aria-label="Suggestions">
+                                        <div className="gallery-suggestions-menu-head">Suggestions</div>
                                         {suggestions.map((item) => (
                                             <div key={item.id} className="gallery-suggestion-row">
                                                 <div className="gallery-suggestion-copy">
@@ -5403,16 +5475,15 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                                     <p className="gallery-suggestion-subtitle">{item.subtitle}</p>
                                                 </div>
                                                 <div className="gallery-suggestion-row-actions">
-                                                    <button type="button" className="btn btn-primary" onClick={() => handleSuggestionAction(item)}>
+                                                    <button type="button" className="gallery-suggestion-link is-primary" onClick={() => handleSuggestionAction(item)}>
                                                         {item.actionLabel}
                                                     </button>
                                                     <button
                                                         type="button"
-                                                        className="btn btn-soft icon-btn"
+                                                        className="gallery-suggestion-link is-muted"
                                                         onClick={() => handleDismissSuggestion(item.id)}
-                                                        aria-label="Dismiss suggestion"
                                                     >
-                                                        <XMarkIcon className="toolbar-icon" />
+                                                        Not now
                                                     </button>
                                                 </div>
                                             </div>
@@ -5694,24 +5765,76 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             {!loading && !error && searchNotice && <p className="status">{searchNotice}</p>}
             {!loading && !error && searchQuery && (matchedPeople.length > 0 || matchedLocations.length > 0 || filteredPhotos.length > 0) && (
                 <div className="gallery-search-meta-row">
-                    {(matchedPeople.length > 0 || matchedLocations.length > 0) && (
+                    {(matchedPeople.length > 0 || matchedLocations.length > 0 || matchedYear) && (
                         <div className="tag-chips">
                             {matchedPeople.map((name) => (
-                                <span key={`person-${name}`} className="tag-chip">{name}</span>
+                                <button
+                                    key={`person-${name}`}
+                                    type="button"
+                                    className="tag-chip tag-chip-removable"
+                                    onClick={() => removeSearchClause(name)}
+                                >
+                                    <span className="tag-chip-clause">person:</span> {name}
+                                    <XMarkIcon className="tag-chip-remove" aria-hidden="true" />
+                                </button>
                             ))}
                             {matchedLocations.map((place) => (
-                                <span key={`place-${place}`} className="tag-chip">{place}</span>
+                                <button
+                                    key={`place-${place}`}
+                                    type="button"
+                                    className="tag-chip tag-chip-removable"
+                                    onClick={() => removeSearchClause(place)}
+                                >
+                                    <span className="tag-chip-clause">place:</span> {place}
+                                    <XMarkIcon className="tag-chip-remove" aria-hidden="true" />
+                                </button>
                             ))}
+                            {matchedYear && (
+                                <button
+                                    type="button"
+                                    className="tag-chip tag-chip-removable"
+                                    onClick={() => removeSearchClause(String(matchedYear))}
+                                >
+                                    <span className="tag-chip-clause">year:</span> {matchedYear}
+                                    <XMarkIcon className="tag-chip-remove" aria-hidden="true" />
+                                </button>
+                            )}
                         </div>
                     )}
-                    {matchedLocations.length > 0 && (
-                        <div className="gallery-map-snippet" aria-label="Places in these results">
-                            {matchedLocations.map((place) => (
-                                <span key={`pin-${place}`} className="gallery-map-snippet-pin">
-                                    <MapPinIcon className="toolbar-icon" aria-hidden="true" />
-                                    {place}
-                                </span>
-                            ))}
+                    {(matchedLocations.length > 0 || matchedPeopleDetail.length > 0) && (
+                        <div className="gallery-search-cards">
+                            {matchedLocations.length > 0 && (
+                                <div className="gallery-search-card">
+                                    <div className="gallery-search-card-label">Places</div>
+                                    <div className="gallery-map-snippet" aria-label="Places in these results">
+                                        {matchedLocations.map((place) => (
+                                            <span key={`pin-${place}`} className="gallery-map-snippet-pin">
+                                                <MapPinIcon className="toolbar-icon" aria-hidden="true" />
+                                                {place}
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                            {matchedPeopleDetail.length > 0 && (
+                                <div className="gallery-search-card">
+                                    <div className="gallery-search-card-label">People</div>
+                                    <div className="gallery-people-snippet" aria-label="People in these results">
+                                        {matchedPeopleDetail.map((person) => (
+                                            <span key={`person-count-${person.personId}`} className="gallery-people-snippet-item">
+                                                <span className="gallery-people-snippet-avatar" aria-hidden="true">
+                                                    {person.name.charAt(0).toUpperCase()}
+                                                </span>
+                                                <span>
+                                                    <strong>{person.name}</strong>
+                                                    {' · '}
+                                                    {person.count} {person.count === 1 ? 'photo' : 'photos'} together
+                                                </span>
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     )}
                     {filteredPhotos.length > 0 && (
@@ -5753,6 +5876,35 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                             ? `Deselect all (${filteredPhotos.length})`
                             : `Select all (${filteredPhotos.length})`}
                     </button>
+                    <div className="gallery-menu-anchor" ref={rateMenuRef}>
+                        <button
+                            type="button"
+                            onClick={() => setShowRateMenu((prev) => !prev)}
+                            disabled={ratingSelected}
+                            className={`btn icon-btn ${showRateMenu ? 'btn-primary' : 'btn-soft'}`}
+                            aria-label={`Rate ${selectedCount} selected`}
+                            aria-expanded={showRateMenu}
+                            title={`Rate ${selectedCount} selected`}
+                        >
+                            <StarIcon className="toolbar-icon" />
+                            <span>Rate</span>
+                        </button>
+                        {showRateMenu && (
+                            <div className="gallery-menu gallery-menu-upward gallery-rate-menu" role="menu" aria-label="Rate selected">
+                                {[1, 2, 3, 4, 5].map((star) => (
+                                    <button
+                                        key={star}
+                                        type="button"
+                                        className="gallery-rate-menu-star"
+                                        onClick={() => void handleRateSelected(star)}
+                                        aria-label={`Rate ${star} ${star === 1 ? 'star' : 'stars'}`}
+                                    >
+                                        ★
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </div>
                     <div className="gallery-menu-anchor" ref={albumMenuRef}>
                         <button
                             type="button"
@@ -5763,7 +5915,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                             title={`Add ${selectedCount} to album`}
                         >
                             <PlusIcon className="toolbar-icon" />
-                            <span className="sr-only">Add {selectedCount} to album</span>
+                            <span>Album</span>
                         </button>
                         {showAlbumMenu && (
                             <div className="gallery-menu gallery-menu-upward" role="menu" aria-label="Add to album">
@@ -5807,7 +5959,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                             title={`Open selected (${selectedCount}) in Workbench`}
                         >
                             <WrenchScrewdriverIcon className="toolbar-icon" />
-                            <span className="sr-only">Open selected ({selectedCount}) in Workbench</span>
+                            <span>Workbench</span>
                         </button>
                     )}
                     <button
@@ -5819,7 +5971,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         title={`Download selected (${selectedCount})`}
                     >
                         <ArrowDownTrayIcon className="toolbar-icon" />
-                        <span className="sr-only">Download selected ({selectedCount})</span>
+                        <span>Download</span>
                     </button>
                     <button
                         type="button"
@@ -5830,7 +5982,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         title={`Delete selected (${selectedCount})`}
                     >
                         <TrashIcon className="toolbar-icon" />
-                        <span className="sr-only">Delete selected ({selectedCount})</span>
+                        <span>Delete</span>
                     </button>
                 </SelectionCommandBar>
             )}

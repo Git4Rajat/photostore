@@ -7,6 +7,7 @@ import { EmptyState } from './EmptyState';
 import { Loading } from './Loading';
 import { notifyApiError } from '../../services/requestFeedback';
 import { showToast } from '../../services/toast';
+import { plural } from '../../utils/format';
 
 // Person-merge undo and album-restore are two independently-shipped
 // reversible-action mechanisms with different storage shapes underneath
@@ -30,29 +31,51 @@ const formatTimestamp = (value: string): string => {
     });
 };
 
+// Same formula as RecentlyDeletedPage.tsx's daysUntil().
+const daysUntil = (isoDate: string): number | null => {
+    if (!isoDate) return null;
+    const target = new Date(isoDate).getTime();
+    if (Number.isNaN(target)) return null;
+    return Math.max(0, Math.ceil((target - Date.now()) / (24 * 60 * 60 * 1000)));
+};
+
 interface ActivityDrawerProps {
     open: boolean;
     onClose: () => void;
 }
 
+interface TrashSummary {
+    total: number;
+    earliestPurgeAt: string | null;
+}
+
 const ActivityDrawer: React.FC<ActivityDrawerProps> = ({ open, onClose }) => {
     const [activity, setActivity] = useState<ActivityItem[]>([]);
+    const [trashSummary, setTrashSummary] = useState<TrashSummary | null>(null);
     const [loading, setLoading] = useState<boolean>(false);
     const [loaded, setLoaded] = useState<boolean>(false);
     const [busyId, setBusyId] = useState<string | null>(null);
+    const [restoringAll, setRestoringAll] = useState<boolean>(false);
 
-    // Two independent, already-working endpoints -- no new backend aggregator,
-    // just interleave by timestamp client-side (both lists are small: recent
-    // merges + recently-deleted albums, not photo-library scale).
+    // Three independent, already-working endpoints -- no new backend
+    // aggregator, just interleave by timestamp client-side (all three lists
+    // are small: recent merges + recently-deleted albums + one cheap
+    // trash-summary page, not photo-library scale).
     const load = useCallback(async () => {
         setLoading(true);
         try {
-            const [mergesResponse, albumsResponse] = await Promise.all([
+            const [mergesResponse, albumsResponse, trashResponse] = await Promise.all([
                 faceService.listMerges().catch(() => ({ merges: [] })),
                 get('/albums/trash').catch(() => ({ albums: [] })),
+                get('/photos/trash?limit=1').catch(() => null),
             ]);
             const merges = Array.isArray(mergesResponse?.merges) ? mergesResponse.merges : [];
             const albums = Array.isArray(albumsResponse?.albums) ? albumsResponse.albums : [];
+            if (trashResponse && typeof trashResponse.total === 'number' && trashResponse.total > 0) {
+                setTrashSummary({ total: trashResponse.total, earliestPurgeAt: trashResponse.earliestPurgeAt || null });
+            } else {
+                setTrashSummary(null);
+            }
 
             const mergeItems: ActivityItem[] = merges.map((m: any) => {
                 const mergedNames: string[] = Array.isArray(m?.mergedNames) ? m.mergedNames.filter(Boolean) : [];
@@ -118,6 +141,20 @@ const ActivityDrawer: React.FC<ActivityDrawerProps> = ({ open, onClose }) => {
         }
     };
 
+    const handleRestoreAll = async () => {
+        setRestoringAll(true);
+        try {
+            const response = await post('/photos/trash/restore-all', {});
+            const restoredCount = Array.isArray(response?.restored) ? response.restored.length : 0;
+            setTrashSummary(null);
+            showToast(restoredCount > 0 ? `Restored ${restoredCount === 1 ? '1 photo' : `${restoredCount} photos`}.` : 'Nothing to restore.');
+        } catch (err) {
+            notifyApiError(err, { context: "Couldn't restore those photos", retry: () => { void handleRestoreAll(); } });
+        } finally {
+            setRestoringAll(false);
+        }
+    };
+
     return (
         <div className={`activity-drawer${open ? ' open' : ''}`} aria-hidden={!open}>
             <button
@@ -153,32 +190,43 @@ const ActivityDrawer: React.FC<ActivityDrawerProps> = ({ open, onClose }) => {
                     />
                 )}
                 {!loading && activity.length > 0 && (
-                    <div className="tools-history-panel">
-                        <div className="people-merge-history-list">
-                            {activity.map((item) => (
-                                <div key={item.id} className="people-merge-history-row">
-                                    <div className="people-merge-history-main">
-                                        <div className="people-merge-history-title">
-                                            <span className="people-merge-chip">{item.label}</span>
-                                            {formatTimestamp(item.timestamp) && (
-                                                <span className="people-merge-chip">{formatTimestamp(item.timestamp)}</span>
-                                            )}
-                                        </div>
-                                    </div>
-                                    <div className="people-merge-history-actions">
-                                        <button
-                                            type="button"
-                                            className="btn btn-soft"
-                                            disabled={busyId === item.id}
-                                            onClick={() => void handleUndo(item)}
-                                        >
-                                            <ArrowUturnLeftIcon className="toolbar-icon" aria-hidden="true" />
-                                            {busyId === item.id ? 'Undoing…' : 'Undo'}
-                                        </button>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
+                    <div className="activity-list">
+                        {activity.map((item) => (
+                            <div key={item.id} className="activity-row">
+                                <span className="activity-row-label">{item.label}</span>
+                                {formatTimestamp(item.timestamp) && (
+                                    <span className="activity-row-when">{formatTimestamp(item.timestamp)}</span>
+                                )}
+                                <button
+                                    type="button"
+                                    className="activity-row-undo"
+                                    disabled={busyId === item.id}
+                                    onClick={() => void handleUndo(item)}
+                                >
+                                    {busyId === item.id ? 'Undoing…' : 'Undo'}
+                                </button>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {trashSummary && (
+                    <div className="activity-trash-strip">
+                        <span>
+                            Recently Deleted — {plural(trashSummary.total, 'photo')}
+                            {trashSummary.earliestPurgeAt && (() => {
+                                const days = daysUntil(trashSummary.earliestPurgeAt as string);
+                                return days !== null ? `, purges in ${plural(days, 'day')}` : '';
+                            })()}
+                        </span>
+                        <button
+                            type="button"
+                            className="activity-trash-strip-restore"
+                            disabled={restoringAll}
+                            onClick={() => void handleRestoreAll()}
+                        >
+                            {restoringAll ? 'Restoring…' : 'Restore all'}
+                        </button>
                     </div>
                 )}
 

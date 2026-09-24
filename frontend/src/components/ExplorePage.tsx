@@ -58,7 +58,11 @@ const ExplorePage: React.FC = () => {
         navigate(`/?q=${encodeURIComponent(label)}`);
     };
 
-    const renderGroup = (group: ExploreGroup) => (
+    // Overlay-card style (bg photo + bottom scrim + label/count baked over the
+    // image) for both Places and Things -- reuses PhotoTile's existing
+    // access-token/batched-thumbnail-resolution logic wholesale via its
+    // mediaOverlay slot rather than re-implementing image loading here.
+    const renderGroup = (group: ExploreGroup, variant: 'place' | 'thing') => (
         <PhotoTile
             key={group.label}
             photo={group.photo}
@@ -66,14 +70,33 @@ const ExplorePage: React.FC = () => {
             useBatchedAccess
             resolvedAccessUrl={thumbAccessUrls.get(group.photo.filename)}
             onCardClick={() => goToSearch(group.label)}
-            bodyContent={(
-                <>
-                    <p className="photo-kind">{group.label}</p>
-                    <p className="gallery-meta-dim">{plural(group.count, 'photo')}</p>
-                </>
+            showBody={false}
+            className={`explore-card explore-card-${variant}`}
+            mediaOverlay={(
+                <span className="explore-card-scrim">
+                    <span className="explore-card-label">{group.label}</span>
+                    <span className="explore-card-count">{plural(group.count, 'photo')}</span>
+                </span>
             )}
         />
     );
+
+    // Decorative (non-interactive, no map vendor) scatter of Places by their
+    // already-captured lat/long -- min/max-normalized across this user's own
+    // places into a bounded box, same spirit as the Ask search's decorative
+    // map-snippet. Net new backend work: zero, latitude/longitude were
+    // already returned by GET /explore and simply unused until now.
+    const geoPlaces = places
+        .map((place) => ({ place, lat: parseFloat(place.latitude || ''), lon: parseFloat(place.longitude || '') }))
+        .filter((entry) => Number.isFinite(entry.lat) && Number.isFinite(entry.lon));
+    const lats = geoPlaces.map((entry) => entry.lat);
+    const lons = geoPlaces.map((entry) => entry.lon);
+    const minLat = lats.length ? Math.min(...lats) : 0;
+    const maxLat = lats.length ? Math.max(...lats) : 0;
+    const minLon = lons.length ? Math.min(...lons) : 0;
+    const maxLon = lons.length ? Math.max(...lons) : 0;
+    const latRange = maxLat - minLat;
+    const lonRange = maxLon - minLon;
 
     const isEmpty = !loading && !error && places.length === 0 && things.length === 0;
 
@@ -102,11 +125,29 @@ const ExplorePage: React.FC = () => {
                 />
             )}
 
+            {!loading && !error && geoPlaces.length > 0 && (
+                <div className="explore-map" aria-hidden="true">
+                    {geoPlaces.map(({ place, lat, lon }) => (
+                        <span
+                            key={place.label}
+                            className="explore-map-pin"
+                            style={{
+                                left: `${lonRange ? ((lon - minLon) / lonRange) * 80 + 10 : 50}%`,
+                                top: `${latRange ? (1 - (lat - minLat) / latRange) * 80 + 10 : 50}%`,
+                            }}
+                            title={`${place.label} · ${place.count}`}
+                        >
+                            {place.count}
+                        </span>
+                    ))}
+                </div>
+            )}
+
             {!loading && !error && places.length > 0 && (
                 <>
                     <h3 className="explore-section-title">Places</h3>
-                    <div className="gallery-grid">
-                        {places.map(renderGroup)}
+                    <div className="explore-row">
+                        {places.map((group) => renderGroup(group, 'place'))}
                     </div>
                 </>
             )}
@@ -115,7 +156,7 @@ const ExplorePage: React.FC = () => {
                 <>
                     <h3 className="explore-section-title">Things</h3>
                     <div className="gallery-grid">
-                        {things.map(renderGroup)}
+                        {things.map((group) => renderGroup(group, 'thing'))}
                     </div>
                 </>
             )}

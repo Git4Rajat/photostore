@@ -1,33 +1,42 @@
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600&family=Manrope:wght@400;500;600;700&display=swap');
-
 /* =================================================================
-   DESIGN TOKENS — iOS 27 "Golden Gate" Liquid Glass
-   Built from Apple's Human Interface Guidelines material system and
-   the WWDC 2026 Liquid Glass refinements: a user-adjustable intensity
-   slider (Clear → Tinted), darkened element edges + brighter specular
-   highlights for depth/separation, uniform uncollapsing toolbars, and
-   stronger background dispersion for legibility. Respects Reduce
+   DESIGN TOKENS — "Light Table" (Keepsake UX Sketchbook palette)
+   Warm, editorial re-theme replacing the prior cool "Liquid Glass"
+   palette: warm cream/near-black surfaces, a muted slate-blue accent,
+   a grease-pencil orange reserved for badges/notification dots. The
+   frosted-glass blur mechanism (--lg-blur/--lg-surface*) is kept
+   structurally as-is, just retinted warm. Respects Reduce
    Transparency, Increase Contrast and Reduce Motion automatically.
    ================================================================= */
 
 :root {
   color-scheme: light dark;
 
-  /* ---- Brand surface (unchanged identity) ---- */
-  --bg-1: #f7f4ef;
-  --bg-2: #f3f1ec;
-  --bg-3: #f1eeea;
-  --bg-blob-1: rgba(10, 132, 255, 0.25);
-  --bg-blob-1-end: rgba(128, 183, 255, 0.02);
-  --bg-blob-2: rgba(56, 176, 255, 0.2);
-  --bg-blob-2-end: rgba(165, 235, 255, 0.02);
+  /* ---- Fonts: system stacks only, straight from the sketchbook -- no webfont load needed. ---- */
+  --font-label: 'SF Mono', Menlo, Consolas, 'Roboto Mono', monospace;
+  --font-display: Futura, 'Avenir Next Condensed', 'Century Gothic', 'Trebuchet MS', sans-serif;
+  --font-ui: -apple-system, 'SF Pro Text', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: var(--font-label);
 
-  --text: #1a1a1a;
-  --muted: #6a6a6a;
-  --accent: #1e6ae1;
-  --accent-soft: rgba(30, 106, 225, 0.12);
+  /* ---- Brand surface ---- */
+  --bg-1: #fbf9f5;
+  --bg-2: #f1ece1;
+  --bg-3: #ede6d8;
+  --bg-blob-1: rgba(193, 64, 31, 0.14);
+  --bg-blob-1-end: rgba(226, 100, 61, 0.02);
+  --bg-blob-2: rgba(47, 93, 130, 0.14);
+  --bg-blob-2-end: rgba(111, 163, 201, 0.02);
+
+  --text: #1e1c18;
+  --muted: #726c61;
+  --accent: #2f5d82;
+  --accent-soft: rgba(47, 93, 130, 0.12);
   --danger: #d24b5a;
   --success: #1a8c61;
+  /* Badges/notification dots only ("All new", "As built") -- kept
+     distinct from --danger, which stays reserved for destructive
+     actions. */
+  --grease: #c1401f;
+  --grease-soft: rgba(193, 64, 31, 0.1);
 
   /* ---- Liquid Glass intensity ----
      Mirrors Settings → Appearance → Liquid Glass. 0 = Clear
@@ -41,15 +50,15 @@
   --lg-blur: calc(16px + (var(--lg-intensity) * 14px));
   --lg-saturate: calc(1.35 + (var(--lg-intensity) * 0.45));
 
-  --lg-surface: rgba(255, 255, 255, calc(0.46 + (var(--lg-intensity) * 0.3)));
-  --lg-surface-strong: rgba(255, 255, 255, calc(0.7 + (var(--lg-intensity) * 0.22)));
-  --lg-surface-wash: rgba(255, 255, 255, calc(0.3 + (var(--lg-intensity) * 0.22)));
+  --lg-surface: rgba(251, 249, 245, calc(0.46 + (var(--lg-intensity) * 0.3)));
+  --lg-surface-strong: rgba(251, 249, 245, calc(0.7 + (var(--lg-intensity) * 0.22)));
+  --lg-surface-wash: rgba(251, 249, 245, calc(0.3 + (var(--lg-intensity) * 0.22)));
 
   /* Darkened edge: the iOS 27 fix for glass elements "disappearing"
      into busy backgrounds — a subtle dark rim plus a bright top
      specular line that reads as a beveled sheet of glass. */
-  --lg-edge: rgba(20, 20, 24, calc(0.07 + (var(--lg-intensity) * 0.07)));
-  --lg-edge-strong: rgba(16, 16, 20, calc(0.14 + (var(--lg-intensity) * 0.08)));
+  --lg-edge: rgba(32, 29, 24, calc(0.07 + (var(--lg-intensity) * 0.07)));
+  --lg-edge-strong: rgba(28, 25, 20, calc(0.14 + (var(--lg-intensity) * 0.08)));
   --lg-specular: rgba(255, 255, 255, 0.75);
   --lg-specular-soft: rgba(255, 255, 255, 0.4);
 
@@ -80,30 +89,32 @@
   --surface: var(--lg-surface);
   --surface-strong: var(--lg-surface-strong);
   --shadow-soft: var(--lg-shadow-resting);
-  --focus-ring: 0 0 0 3px rgba(30, 106, 225, 0.22);
+  --focus-ring: 0 0 0 3px rgba(47, 93, 130, 0.32);
 }
 
 /* ---- Dark appearance (System → Display → Dark) ---- */
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg-1: #0c0c0e;
-    --bg-2: #111114;
-    --bg-3: #08080a;
-    --bg-blob-1: rgba(10, 132, 255, 0.32);
-    --bg-blob-1-end: rgba(128, 183, 255, 0);
-    --bg-blob-2: rgba(56, 176, 255, 0.26);
-    --bg-blob-2-end: rgba(165, 235, 255, 0);
+    --bg-1: #17150f;
+    --bg-2: #201c15;
+    --bg-3: #0f0d09;
+    --bg-blob-1: rgba(226, 100, 61, 0.18);
+    --bg-blob-1-end: rgba(226, 100, 61, 0);
+    --bg-blob-2: rgba(111, 163, 201, 0.16);
+    --bg-blob-2-end: rgba(111, 163, 201, 0);
 
-    --text: #f4f4f6;
-    --muted: #9b9ba3;
-    --accent: #4da2ff;
-    --accent-soft: rgba(77, 162, 255, 0.2);
+    --text: #ede7da;
+    --muted: #9c9486;
+    --accent: #6fa3c9;
+    --accent-soft: rgba(111, 163, 201, 0.16);
     --danger: #ff6b7d;
     --success: #3ddc97;
+    --grease: #e2643d;
+    --grease-soft: rgba(226, 100, 61, 0.14);
 
-    --lg-surface: rgba(30, 30, 34, calc(0.5 + (var(--lg-intensity) * 0.3)));
-    --lg-surface-strong: rgba(36, 36, 41, calc(0.72 + (var(--lg-intensity) * 0.2)));
-    --lg-surface-wash: rgba(24, 24, 28, calc(0.4 + (var(--lg-intensity) * 0.24)));
+    --lg-surface: rgba(32, 28, 22, calc(0.5 + (var(--lg-intensity) * 0.3)));
+    --lg-surface-strong: rgba(38, 34, 27, calc(0.72 + (var(--lg-intensity) * 0.2)));
+    --lg-surface-wash: rgba(26, 23, 18, calc(0.4 + (var(--lg-intensity) * 0.24)));
 
     --lg-edge: rgba(0, 0, 0, calc(0.4 + (var(--lg-intensity) * 0.12)));
     --lg-edge-strong: rgba(0, 0, 0, calc(0.55 + (var(--lg-intensity) * 0.12)));
@@ -118,27 +129,29 @@
 html[data-theme='light'] {
   color-scheme: light;
 
-  --bg-1: #f7f4ef;
-  --bg-2: #f3f1ec;
-  --bg-3: #f1eeea;
-  --bg-blob-1: rgba(10, 132, 255, 0.25);
-  --bg-blob-1-end: rgba(128, 183, 255, 0.02);
-  --bg-blob-2: rgba(56, 176, 255, 0.2);
-  --bg-blob-2-end: rgba(165, 235, 255, 0.02);
+  --bg-1: #fbf9f5;
+  --bg-2: #f1ece1;
+  --bg-3: #ede6d8;
+  --bg-blob-1: rgba(193, 64, 31, 0.14);
+  --bg-blob-1-end: rgba(226, 100, 61, 0.02);
+  --bg-blob-2: rgba(47, 93, 130, 0.14);
+  --bg-blob-2-end: rgba(111, 163, 201, 0.02);
 
-  --text: #1a1a1a;
-  --muted: #6a6a6a;
-  --accent: #1e6ae1;
-  --accent-soft: rgba(30, 106, 225, 0.12);
+  --text: #1e1c18;
+  --muted: #726c61;
+  --accent: #2f5d82;
+  --accent-soft: rgba(47, 93, 130, 0.12);
   --danger: #d24b5a;
   --success: #1a8c61;
+  --grease: #c1401f;
+  --grease-soft: rgba(193, 64, 31, 0.1);
 
-  --lg-surface: rgba(255, 255, 255, calc(0.46 + (var(--lg-intensity) * 0.3)));
-  --lg-surface-strong: rgba(255, 255, 255, calc(0.7 + (var(--lg-intensity) * 0.22)));
-  --lg-surface-wash: rgba(255, 255, 255, calc(0.3 + (var(--lg-intensity) * 0.22)));
+  --lg-surface: rgba(251, 249, 245, calc(0.46 + (var(--lg-intensity) * 0.3)));
+  --lg-surface-strong: rgba(251, 249, 245, calc(0.7 + (var(--lg-intensity) * 0.22)));
+  --lg-surface-wash: rgba(251, 249, 245, calc(0.3 + (var(--lg-intensity) * 0.22)));
 
-  --lg-edge: rgba(20, 20, 24, calc(0.07 + (var(--lg-intensity) * 0.07)));
-  --lg-edge-strong: rgba(16, 16, 20, calc(0.14 + (var(--lg-intensity) * 0.08)));
+  --lg-edge: rgba(32, 29, 24, calc(0.07 + (var(--lg-intensity) * 0.07)));
+  --lg-edge-strong: rgba(28, 25, 20, calc(0.14 + (var(--lg-intensity) * 0.08)));
   --lg-specular: rgba(255, 255, 255, 0.75);
   --lg-specular-soft: rgba(255, 255, 255, 0.4);
 
@@ -150,24 +163,26 @@ html[data-theme='light'] {
 html[data-theme='dark'] {
   color-scheme: dark;
 
-  --bg-1: #0c0c0e;
-  --bg-2: #111114;
-  --bg-3: #08080a;
-  --bg-blob-1: rgba(10, 132, 255, 0.32);
-  --bg-blob-1-end: rgba(128, 183, 255, 0);
-  --bg-blob-2: rgba(56, 176, 255, 0.26);
-  --bg-blob-2-end: rgba(165, 235, 255, 0);
+  --bg-1: #17150f;
+  --bg-2: #201c15;
+  --bg-3: #0f0d09;
+  --bg-blob-1: rgba(226, 100, 61, 0.18);
+  --bg-blob-1-end: rgba(226, 100, 61, 0);
+  --bg-blob-2: rgba(111, 163, 201, 0.16);
+  --bg-blob-2-end: rgba(111, 163, 201, 0);
 
-  --text: #f4f4f6;
-  --muted: #9b9ba3;
-  --accent: #4da2ff;
-  --accent-soft: rgba(77, 162, 255, 0.2);
+  --text: #ede7da;
+  --muted: #9c9486;
+  --accent: #6fa3c9;
+  --accent-soft: rgba(111, 163, 201, 0.16);
   --danger: #ff6b7d;
   --success: #3ddc97;
+  --grease: #e2643d;
+  --grease-soft: rgba(226, 100, 61, 0.14);
 
-  --lg-surface: rgba(30, 30, 34, calc(0.5 + (var(--lg-intensity) * 0.3)));
-  --lg-surface-strong: rgba(36, 36, 41, calc(0.72 + (var(--lg-intensity) * 0.2)));
-  --lg-surface-wash: rgba(24, 24, 28, calc(0.4 + (var(--lg-intensity) * 0.24)));
+  --lg-surface: rgba(32, 28, 22, calc(0.5 + (var(--lg-intensity) * 0.3)));
+  --lg-surface-strong: rgba(38, 34, 27, calc(0.72 + (var(--lg-intensity) * 0.2)));
+  --lg-surface-wash: rgba(26, 23, 18, calc(0.4 + (var(--lg-intensity) * 0.24)));
 
   --lg-edge: rgba(0, 0, 0, calc(0.4 + (var(--lg-intensity) * 0.12)));
   --lg-edge-strong: rgba(0, 0, 0, calc(0.55 + (var(--lg-intensity) * 0.12)));
@@ -195,7 +210,7 @@ html[data-theme='dark'] {
   .sort-btn,
   .photo-card,
   .person-tile,
-  .ios-tabs,
+  .ios-header,
   .file-input {
     border-width: 1.5px;
   }
@@ -237,7 +252,7 @@ html[data-theme='dark'] {
   .file-input,
   .photo-card,
   .person-tile,
-  .ios-tabs,
+  .ios-header,
   .people-searchbar,
   .people-merge-input,
   .people-icon-btn,
@@ -282,6 +297,7 @@ html[data-theme='dark'] {
    radius; corner-shape lets the rendered geometry match the OS. ---- */
 @supports (corner-shape: squircle) {
   .card-glass,
+  .ios-header,
   .photo-card,
   .person-tile,
   .btn,
@@ -303,7 +319,6 @@ html[data-theme='dark'] {
     corner-shape: squircle;
   }
 
-  .ios-tab,
   .sort-btn,
   .people-icon-btn,
   .icon-btn,
@@ -350,7 +365,7 @@ textarea {
 
 body {
   color: var(--text);
-  font-family: "Manrope", "Noto Sans", sans-serif;
+  font-family: var(--font-ui);
   background:
     radial-gradient(900px 420px at 80% -10%, color-mix(in srgb, var(--accent) 14%, transparent), transparent),
     radial-gradient(720px 420px at -10% 20%, rgba(208, 220, 232, 0.4), transparent),
@@ -419,18 +434,34 @@ body.lightbox-active .upload-approval-bar {
   container-name: app;
 }
 
+/* Single topbar row: wordmark, inline text-link nav, then bell+avatar --
+   matches the mockup's .app-topbar (merges what used to be two stacked
+   elements, a hero title row and a separate pill-nav row, into one). */
 .ios-header {
-  padding: 4px 8px 18px;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  /* The header forms its own stacking context (the reveal-up animation leaves a
-     retained transform), so lift it above the sticky .ios-tabs (z-index: 30);
-     otherwise the notification pane, anchored inside the header, paints behind
-     the tabs. */
-  position: relative;
+  position: sticky;
+  top: max(8px, env(safe-area-inset-top));
   z-index: 40;
+  margin: 8px 8px 18px;
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-lg);
+  background: var(--lg-surface);
+  box-shadow: var(--lg-shadow-resting);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+}
+
+.ios-header-wordmark {
+  flex: 0 0 auto;
+}
+
+.ios-header-wordmark .logo-wordmark {
+  font-size: 17px;
+  font-family: var(--font-display);
+  font-weight: 700;
 }
 
 .auth-actions {
@@ -450,10 +481,11 @@ body.lightbox-active .upload-approval-bar {
 
 .app-header-actions {
   display: inline-flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 10px;
+  margin-left: auto;
 }
 
 .root-service-actions {
@@ -592,100 +624,42 @@ body.lightbox-active .upload-approval-bar {
   stroke-width: 2.1;
 }
 
-.ios-kicker {
-  margin: 0;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-  color: var(--muted);
-}
-
-.ios-title {
-  margin: 6px 0 2px;
-  font-size: clamp(1.9rem, 4.4vw, 3.2rem);
-  line-height: 1.02;
-  letter-spacing: -0.03em;
-  font-family: "Fraunces", "Manrope", sans-serif;
-}
-
-.ios-subtitle {
-  margin: 0;
-  color: var(--muted);
-  font-size: clamp(0.92rem, 1.6vw, 0.98rem);
-}
-
-/* ---- Tab bar → iOS 27 uniform toolbar.
-   The iOS 26 tab bar that collapsed into a single floating icon on
-   scroll was reversed in iOS 27: bars stay grouped and persistent,
-   and gain a solid backing layer ([data-condensed]) the moment
-   content scrolls beneath them instead of disappearing. Toggle
-   data-condensed="true" from scroll-position state in the app shell. */
+/* ---- Primary nav: plain text links with an underline-on-active state,
+   inline in the single topbar row (mockup's .app-nav), not a separate
+   pill bar. ---- */
 .ios-tabs {
-  position: sticky;
-  top: max(10px, env(safe-area-inset-top));
-  z-index: 30;
   display: flex;
-  width: auto;
-  gap: 6px;
-  margin: 0 8px 18px;
-  padding: 6px;
-  background: var(--lg-surface);
-  border: 1px solid var(--lg-edge);
-  border-radius: var(--r-lg);
-  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
-  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
-  box-shadow: var(--lg-shadow-resting);
-  transition: background-color var(--dur-base) var(--ease-glass), box-shadow var(--dur-base) var(--ease-glass);
-}
-
-.ios-tabs[data-condensed="true"] {
-  background: var(--lg-surface-strong);
-  box-shadow: var(--lg-shadow-raised);
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .ios-tab {
   text-decoration: none;
   color: var(--muted);
   font-size: 14px;
-  font-weight: 650;
-  border-radius: var(--r-md);
-  padding: 7px 16px;
+  font-weight: 600;
+  padding: 6px 4px;
   min-height: var(--tap-min);
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  text-align: center;
-  transition: color var(--dur-quick) ease, background-color var(--dur-quick) ease, transform var(--dur-quick) ease;
+  border-bottom: 2px solid transparent;
+  transition: color var(--dur-quick) ease, border-color var(--dur-quick) ease;
 }
 
 .ios-tab:hover {
   color: var(--text);
-  background: var(--lg-surface-strong);
-}
-
-.ios-tab:active {
-  transform: scale(0.97);
 }
 
 .ios-tab.active {
   color: var(--text);
-  background: var(--lg-surface-strong);
-  box-shadow: var(--lg-shadow-resting);
-}
-
-.ios-tab-spacer {
-  flex: 1;
+  border-bottom-color: var(--accent);
 }
 
 .ios-main {
   display: grid;
   gap: 18px;
-}
-
-/* ---- Header title block + hamburger (mobile nav trigger) ---- */
-.ios-header-title {
-  flex: 1;
-  min-width: 0;
 }
 
 /* Only surfaced on narrow screens, where the tab bar collapses into the
@@ -737,10 +711,39 @@ body.lightbox-active .upload-approval-bar {
   z-index: 50;
 }
 
+/* Avatar-circle trigger (initials, or a generic icon when signed out)
+   replacing the old ellipsis-icon overflow button -- matches the
+   mockup's topbar avatar. */
 .account-menu-trigger {
   min-width: var(--tap-min);
   min-height: var(--tap-min);
-  padding: 9px 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.account-menu-trigger-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  font-family: var(--font-label);
+}
+
+.account-menu-trigger-avatar-icon {
+  width: 30px;
+  height: 30px;
+  color: var(--muted);
 }
 
 .account-menu-pane {
@@ -811,6 +814,7 @@ body.lightbox-active .upload-approval-bar {
   font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
+  font-family: var(--font-label);
   color: var(--muted);
 }
 
@@ -834,6 +838,10 @@ body.lightbox-active .upload-approval-bar {
 
 .account-menu-item:hover {
   background: var(--lg-surface);
+}
+
+.account-menu-item.active {
+  color: var(--accent);
 }
 
 .account-menu-item:focus-visible {
@@ -1073,6 +1081,83 @@ body.lightbox-active .upload-approval-bar {
   text-decoration: underline;
 }
 
+/* Undo: plain description + right-aligned muted timestamp + Undo button --
+   no chip styling (the previous look reused the person-merge history chip
+   pattern for both fields, giving them no visual hierarchy). */
+.activity-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.activity-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  font-size: 0.86rem;
+}
+
+.activity-row:first-child {
+  border-top: none;
+}
+
+.activity-row-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.activity-row-when {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.activity-row-undo {
+  flex: 0 0 auto;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.activity-row-undo:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Real data (GET /photos/trash's earliestPurgeAt), not a fabricated
+   "You"/"Auto" or "Expired" state -- see keepsake-ux-vision-roadmap memory
+   for why those two mockup details were deliberately not built. */
+.activity-trash-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.activity-trash-strip-restore {
+  margin-left: auto;
+  flex: 0 0 auto;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.activity-trash-strip-restore:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .app-menu-head {
   display: flex;
   align-items: flex-start;
@@ -1094,7 +1179,7 @@ body.lightbox-active .upload-approval-bar {
   font-size: 1.35rem;
   line-height: 1.1;
   letter-spacing: -0.02em;
-  font-family: "Fraunces", "Manrope", sans-serif;
+  font-family: var(--font-display);
   color: var(--text);
 }
 
@@ -1109,6 +1194,7 @@ body.lightbox-active .upload-approval-bar {
   font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
+  font-family: var(--font-label);
   color: var(--muted);
 }
 
@@ -1280,6 +1366,7 @@ body.lightbox-active .upload-approval-bar {
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+  font-family: var(--font-label);
   color: var(--muted);
 }
 
@@ -1326,7 +1413,7 @@ body.lightbox-active .upload-approval-bar {
   margin: 8px 0 6px;
   font-size: clamp(1.4rem, 3vw, 2rem);
   letter-spacing: -0.02em;
-  font-family: "Fraunces", "Manrope", sans-serif;
+  font-family: var(--font-display);
 }
 
 .additional-subtitle {
@@ -1449,6 +1536,7 @@ body.lightbox-active .upload-approval-bar {
   font-size: 0.8rem;
   letter-spacing: 0.24em;
   text-transform: uppercase;
+  font-family: var(--font-label);
   color: var(--muted);
 }
 
@@ -1911,6 +1999,7 @@ body.lightbox-active .upload-approval-bar {
   margin: 0;
   font-size: 11px;
   text-transform: uppercase;
+  font-family: var(--font-label);
   letter-spacing: 0.12em;
   color: var(--muted);
 }
@@ -2685,6 +2774,7 @@ body.lightbox-active .upload-approval-bar {
   font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  font-family: var(--font-label);
   color: var(--muted);
 }
 
@@ -3414,6 +3504,7 @@ html[data-theme='light'] .notification-item.unread {
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+  font-family: var(--font-label);
   color: var(--muted);
 }
 
@@ -3485,6 +3576,8 @@ html[data-theme='light'] .notification-item.unread {
   margin: 0;
   font-size: clamp(1.2rem, 2.6vw, 1.5rem);
   letter-spacing: -0.01em;
+  font-family: var(--font-display);
+  font-weight: 700;
 }
 
 .page-topline .gallery-meta-line {
@@ -3548,15 +3641,75 @@ html[data-theme='light'] .notification-item.unread {
 
 .gallery-search-meta-row {
   display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  flex-wrap: wrap;
-  gap: 8px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
   margin: 4px 0 8px;
 }
 
-.gallery-search-meta-row .btn {
-  margin-left: auto;
+.gallery-search-meta-row > .tag-chips {
+  align-self: stretch;
+}
+
+/* Ask: clause chips are dismissible buttons (labeled "person:"/"place:"/
+   "year:") that strip that term from the query and re-search, not inert
+   pills. */
+.tag-chip-removable {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.tag-chip-clause {
+  opacity: 0.75;
+  font-weight: 500;
+}
+
+.tag-chip-remove {
+  width: 10px;
+  height: 10px;
+  margin-left: 2px;
+}
+
+/* Ask: the Places/People result-context panels sit in a bordered, labeled
+   2-column card grid (the mockup's 3rd "Photos" panel is deliberately
+   skipped -- the real result grid already renders directly below this row,
+   a mini duplicate of it would just be redundant). */
+.gallery-search-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(200px, 1fr));
+  gap: 10px;
+  align-self: stretch;
+}
+
+@media (max-width: 640px) {
+  .gallery-search-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+.gallery-search-card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 10px 12px;
+  background: var(--lg-surface-wash);
+}
+
+.gallery-search-card-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-family: var(--font-label);
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.gallery-search-card .gallery-map-snippet {
+  border: none;
+  padding: 0;
+  background: none;
 }
 
 /* Ask: live chip disambiguation dropdown while typing, e.g. "Li" resolving
@@ -3610,6 +3763,7 @@ html[data-theme='light'] .notification-item.unread {
   font-size: 11px;
   color: var(--muted);
   text-transform: uppercase;
+  font-family: var(--font-label);
   letter-spacing: 0.06em;
 }
 
@@ -3646,6 +3800,40 @@ html[data-theme='light'] .notification-item.unread {
   color: var(--accent);
 }
 
+/* Ask: the People counterpart to the map snippet -- who matched and how
+   many shared photos, not just a bare name chip. */
+.gallery-people-snippet {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.gallery-people-snippet-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px 5px 5px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: var(--lg-surface-wash);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.gallery-people-snippet-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+
 /* Nudge: bell + dropdown (not an inline card) -- can hold the whole ordered
    suggestion list without crowding the primary content area. */
 .gallery-suggestions-bell {
@@ -3656,6 +3844,18 @@ html[data-theme='light'] .notification-item.unread {
 .gallery-menu.gallery-suggestions-menu {
   min-width: 300px;
   max-width: min(380px, 90vw);
+}
+
+.gallery-suggestions-menu-head {
+  font-family: var(--font-label);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 2px 4px 6px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 2px;
 }
 
 .gallery-suggestion-row {
@@ -3690,8 +3890,28 @@ html[data-theme='light'] .notification-item.unread {
 .gallery-suggestion-row-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 12px;
   flex: 0 0 auto;
+}
+
+/* Plain inline text-link actions (not filled buttons / an icon-only
+   dismiss) -- matches the mockup's "Create album   Not now" pairing. */
+.gallery-suggestion-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.gallery-suggestion-link.is-primary {
+  color: var(--accent);
+}
+
+.gallery-suggestion-link.is-muted {
+  color: var(--muted);
+  font-weight: 500;
 }
 
 .gallery-search-clear {
@@ -3748,6 +3968,7 @@ html[data-theme='light'] .notification-item.unread {
   border-radius: var(--r-lg);
   border: 1px solid var(--lg-edge);
   background: var(--lg-surface-strong);
+  color: var(--text);
   box-shadow: var(--lg-shadow-floating);
   backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
   -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
@@ -3759,6 +3980,7 @@ html[data-theme='light'] .notification-item.unread {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  font-family: var(--font-label);
   color: var(--muted);
 }
 
@@ -4066,17 +4288,8 @@ html[data-theme='light'] .notification-item.unread {
   max-width: 280px;
 }
 
-/* ---- Preview: interactive rating + like ---- */
-.photo-preview-engage {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding-bottom: 8px;
-  margin-bottom: 4px;
-  border-bottom: 1px solid var(--lg-edge);
-}
-
+/* ---- Preview: interactive rating + like (now in .photo-preview-actionbar,
+   the persistent bottom bar, not the details card) ---- */
 .photo-preview-rate {
   display: inline-flex;
   gap: 2px;
@@ -4106,7 +4319,6 @@ html[data-theme='light'] .notification-item.unread {
   align-items: center;
   gap: 6px;
   flex: 0 0 auto;
-  margin-left: auto;
   padding: 5px 12px;
   border-radius: 999px;
   border: 1px solid var(--lg-edge);
@@ -4201,6 +4413,15 @@ html[data-theme='light'] .notification-item.unread {
   font-size: 13px;
   font-weight: 650;
   transition: transform var(--dur-quick) ease, background-color var(--dur-quick) ease, border-color var(--dur-quick) ease, box-shadow var(--dur-base) ease;
+}
+
+/* Heroicons ship no intrinsic size -- without this, a .toolbar-icon inside
+   a plain (non-.icon-btn) button has no width/height and renders at the
+   browser's oversized replaced-element default. */
+.btn .toolbar-icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
 }
 
 .sort-btn:focus-visible,
@@ -4343,23 +4564,25 @@ html[data-theme='light'] .notification-item.unread {
    .selection-bar above on Gallery/Albums/Recently Deleted, so "select
    something, act on it" is the same floating-pill gesture everywhere
    instead of three separate placements. */
+/* Full-width, edge-to-edge -- not a floating centered pill -- matching the
+   mockup's Select frame. Inverts relative to the current theme (dark bar in
+   light mode, light bar in dark mode), same as the mockup's own
+   `background: var(--app-ink); color: var(--app-bg)`, rather than being
+   hardcoded dark like the photo viewer (which really is always-dark). */
 .selection-command-bar {
   position: fixed;
-  left: 50%;
-  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-  transform: translateX(-50%);
+  left: 0;
+  right: 0;
+  bottom: 0;
   z-index: 30;
   display: flex;
   align-items: center;
-  gap: 14px;
-  max-width: min(680px, calc(100vw - 24px));
-  padding: 10px 16px;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--lg-edge);
-  background: var(--lg-surface-strong);
-  box-shadow: var(--lg-shadow-floating);
-  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
-  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  gap: 10px;
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid color-mix(in srgb, var(--bg-1) 15%, transparent);
+  background: var(--text);
+  color: var(--bg-1);
+  box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.25);
 }
 
 .selection-command-bar-count {
@@ -4367,14 +4590,31 @@ html[data-theme='light'] .notification-item.unread {
   font-weight: 600;
   white-space: nowrap;
   flex: 0 0 auto;
+  color: var(--bg-1);
 }
 
 .selection-command-bar-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  margin-left: auto;
   overflow-x: auto;
+}
+
+.selection-command-bar-actions .btn {
+  background: transparent;
+  border: none;
+  color: color-mix(in srgb, var(--bg-1) 85%, transparent);
+  font-weight: 600;
+}
+
+.selection-command-bar-actions .btn:hover {
+  background: color-mix(in srgb, var(--bg-1) 12%, transparent);
+}
+
+.selection-command-bar-actions .btn-danger {
+  color: var(--danger);
 }
 
 /* A menu nested in the bottom bar (e.g. Gallery's "Add to album") has to
@@ -4383,6 +4623,30 @@ html[data-theme='light'] .notification-item.unread {
 .gallery-menu-upward {
   top: auto;
   bottom: calc(100% + 8px);
+}
+
+/* Bulk-rate popover: a single row of 5 stars instead of the default
+   vertical menu-item list. */
+.gallery-rate-menu {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+.gallery-rate-menu-star {
+  border: 0;
+  background: none;
+  padding: 2px;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.gallery-rate-menu-star:hover {
+  color: #e2b33f;
 }
 
 .gallery-grid {
@@ -4788,7 +5052,7 @@ html[data-theme='light'] .notification-item.unread {
      the whole panel. */
   height: calc(100vh - 48px);
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto auto;
+  grid-template-rows: minmax(0, 1fr) auto auto auto;
   box-sizing: border-box;
   padding: 20px;
   border-radius: var(--r-xl);
@@ -5090,6 +5354,53 @@ video.photo-preview-media.is-loading {
   touch-action: pan-x;
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
+}
+
+/* Persistent, always-visible, full-width bottom action bar -- "the viewer
+   finally has hands" (rate/like/album/share/delete/more), genuinely
+   always-dark regardless of page theme (unlike the theme-inverted Select
+   command bar), matching the mockup's hardcoded-dark .viewer chrome. Breaks
+   out of the panel's own 20px padding so it reads edge-to-edge. */
+.photo-preview-actionbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px));
+  margin: 0 -20px -20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(10, 12, 16, 0.97);
+  color: #fff;
+}
+
+.photo-preview-actionbar-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-height: var(--tap-min);
+  padding: 8px 12px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.photo-preview-actionbar-item:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.photo-preview-actionbar-item.is-danger {
+  color: #ff8a8a;
+}
+
+.photo-preview-actionbar-item .toolbar-icon {
+  width: 18px;
+  height: 18px;
 }
 
 .photo-preview-thumb {
@@ -6007,6 +6318,7 @@ video.photo-preview-media.is-loading {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  font-family: var(--font-label);
 }
 
 .tools-control-row {
@@ -6336,6 +6648,7 @@ video.photo-preview-media.is-loading {
   font-size: 0.75rem;
   font-weight: 600;
   text-transform: uppercase;
+  font-family: var(--font-label);
   letter-spacing: 0.05em;
   color: var(--muted);
   margin: 0;
@@ -6610,12 +6923,89 @@ video.photo-preview-media.is-loading {
 
 .explore-section-title {
   font-weight: 700;
-  font-size: 0.96rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: var(--font-label);
+  color: var(--muted);
   margin: 1.5rem 0 0.75rem;
 }
 
 .explore-section-title:first-of-type {
   margin-top: 0.5rem;
+}
+
+/* Explore: decorative (non-interactive, no map vendor) scatter of Places by
+   their captured lat/long, normalized into this bounded box. */
+.explore-map {
+  position: relative;
+  height: 190px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line);
+  margin-bottom: 0.5rem;
+  overflow: hidden;
+  background:
+    repeating-linear-gradient(45deg, var(--lg-surface) 0, var(--lg-surface) 10px, transparent 10px, transparent 20px),
+    var(--lg-surface-wash);
+}
+
+.explore-map-pin {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2rem;
+  height: 2rem;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  box-shadow: 0 0 0 5px var(--accent-soft);
+}
+
+.explore-row {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.explore-card {
+  flex: 0 0 auto;
+}
+
+.explore-card-place {
+  width: 160px;
+}
+
+.explore-card-place .photo-media {
+  height: 96px;
+}
+
+/* Bottom scrim: label + count baked over the image, matching the mockup's
+   place/thing cards, instead of plain text below the thumbnail. */
+.explore-card-scrim {
+  position: absolute;
+  inset: auto 0 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.68), rgba(0, 0, 0, 0));
+  color: #fff;
+}
+
+.explore-card-label {
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.explore-card-count {
+  font-size: 0.7rem;
+  opacity: 0.85;
 }
 
 .tools-hero-actions .icon-btn,
@@ -6891,26 +7281,18 @@ video.photo-preview-media.is-loading {
     padding: max(24px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) max(30px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
   }
 
-  /* Slim, single-row header: hamburger + truncated title + compact actions.
-     The tab bar is replaced by the slide-in drawer at this width. */
+  /* Slim, single-row header: hamburger + wordmark + compact actions.
+     The inline nav is replaced by the slide-in drawer at this width. */
   .ios-header {
     flex-direction: row;
     align-items: center;
     gap: 10px;
-    padding: 2px 2px 12px;
+    margin: 8px 2px 18px;
+    padding: 8px 10px;
   }
 
   .ios-menu-toggle {
     display: inline-flex;
-  }
-
-  .ios-kicker,
-  .ios-subtitle {
-    display: none;
-  }
-
-  .ios-title {
-    display: none;
   }
 
   .app-header-actions {
@@ -7034,6 +7416,15 @@ video.photo-preview-media.is-loading {
     height: calc(100vh - 24px);
     padding: 14px;
     border-radius: var(--r-lg);
+  }
+
+  .photo-preview-actionbar {
+    margin: 0 -14px -14px;
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .photo-preview-actionbar-item span {
+    display: none;
   }
 
   .photo-preview-top {
@@ -7429,6 +7820,7 @@ video.photo-preview-media.is-loading {
   display: inline-block;
   font-size: 0.7rem;
   text-transform: uppercase;
+  font-family: var(--font-label);
   letter-spacing: 0.04em;
   opacity: 0.65;
   margin-left: 0.35rem;

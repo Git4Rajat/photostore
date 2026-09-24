@@ -601,12 +601,13 @@ def search_photos():
     # they didn't already set one, so it never overrides a real choice. This is
     # deliberately just a year: month/season/"last summer"-style parsing is a
     # bigger, separate feature, not a one-line regex.
+    matched_year = None
     if capture_start is None and capture_end is None:
         year_match = app.re.search(r'\b(19|20)\d{2}\b', query)
         if year_match:
-            year = int(year_match.group(0))
-            capture_start = app.datetime(year, 1, 1, tzinfo=app.timezone.utc)
-            capture_end = app.datetime(year, 12, 31, tzinfo=app.timezone.utc)
+            matched_year = int(year_match.group(0))
+            capture_start = app.datetime(matched_year, 1, 1, tzinfo=app.timezone.utc)
+            capture_end = app.datetime(matched_year, 12, 31, tzinfo=app.timezone.utc)
 
     user_id, error = app._require_user_id()
     if error:
@@ -709,8 +710,34 @@ def search_photos():
         })
         if matched_people:
             response_payload['matchedPeople'] = matched_people
+        # Per-person match counts for the Ask results' People panel -- counted
+        # over the full ranked/scored set (pre-pagination), not just the
+        # current page, so the count reflects the whole result set.
+        people_detail = []
+        for group in matched_person_groups:
+            if not group:
+                continue
+            person_id = group[0]
+            name = pid_to_name.get(person_id)
+            if not name:
+                continue
+            group_ids = set(group)
+            count = 0
+            for _, _, row in scored:
+                try:
+                    row_people_ids = set(app.json.loads(row.get('peopleIds', '[]') or '[]'))
+                except Exception:
+                    row_people_ids = set()
+                if row_people_ids & group_ids:
+                    count += 1
+            people_detail.append({'personId': person_id, 'name': name, 'count': count})
+        if people_detail:
+            people_detail.sort(key=lambda item: item['count'], reverse=True)
+            response_payload['matchedPeopleDetail'] = people_detail
     if matched_location_terms:
         response_payload['matchedLocations'] = [app._smart_album_title(term) for term in matched_location_terms]
+    if matched_year:
+        response_payload['matchedYear'] = matched_year
     return app.jsonify(response_payload)
 
 @photos_bp.route('/api/photos/search-index', methods=['GET'])
@@ -933,7 +960,16 @@ def list_trashed_photos():
         photo['deletedAt'] = deleted_at
         photo['purgeAt'] = app._compute_trash_purge_at(deleted_at, retention_days)
 
-    return app.jsonify({'photos': photos, 'total': len(trashed), 'offset': offset, 'limit': limit, 'retentionDays': retention_days})
+    response_payload = {'photos': photos, 'total': len(trashed), 'offset': offset, 'limit': limit, 'retentionDays': retention_days}
+    if trashed:
+        # `trashed` is already sorted by deletedAt descending (most recent
+        # first), so the oldest deletion -- the one closest to purging -- is
+        # the last row. Free to compute: the full list is already in memory
+        # for `total` above, no extra scan for the Activity drawer's summary
+        # strip ("Recently Deleted -- N photos, purges in M days").
+        response_payload['earliestPurgeAt'] = app._compute_trash_purge_at(str(trashed[-1].get('deletedAt') or ''), retention_days)
+
+    return app.jsonify(response_payload)
 
 
 @photos_bp.route('/photos/trash/restore', methods=['POST'])
@@ -949,6 +985,40 @@ def restore_trashed_photos():
         return app.jsonify({'restored': restored, 'errors': errors, 'success': False})
 
     for safe_name in valid_names:
+        entity = app._restore_deleted_file(user_id, safe_name)
+        if entity is None:
+            errors.append(f'{safe_name}: Not found')
+        else:
+            restored.append(safe_name)
+
+    if restored:
+        app._invalidate_metadata_scan_cache(user_id)
+        try:
+            app.touch_user_search_indexes_state(user_id, filenames=restored)
+        except Exception:
+            pass
+
+    return app.jsonify({'restored': restored, 'errors': errors, 'success': len(restored) > 0})
+
+
+@photos_bp.route('/photos/trash/restore-all', methods=['POST'])
+@photos_bp.route('/api/photos/trash/restore-all', methods=['POST'])
+def restore_all_trashed_photos():
+    """The Activity drawer's "Restore all" strip action -- every currently-
+    trashed photo, without the caller needing to already know filenames
+    (unlike /photos/trash/restore, which the RecentlyDeletedPage selection
+    flow uses)."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    rows = app._query_metadata_rows_for_user(user_id, include_deleted=True, purpose='photos.restore_all_trash')
+    trashed_names = [str(row.get('RowKey') or '') for row in rows if row.get('processing_state') == 'deleted']
+    trashed_names = [name for name in trashed_names if name]
+
+    restored = []
+    errors: app.List[str] = []
+    for safe_name in trashed_names:
         entity = app._restore_deleted_file(user_id, safe_name)
         if entity is None:
             errors.append(f'{safe_name}: Not found')
@@ -1009,6 +1079,46 @@ def set_photo_rating(filename: str):
     except Exception as e:
         app.app.logger.exception('set_photo_rating failed')
         return app.jsonify({'error': 'Internal server error'}), 500
+
+@photos_bp.route('/photos/rate-multiple', methods=['POST'])
+@photos_bp.route('/photos/rate-multiple/', methods=['POST'])
+@photos_bp.route('/api/photos/rate-multiple', methods=['POST'])
+@photos_bp.route('/api/photos/rate-multiple/', methods=['POST'])
+def rate_multiple_photos():
+    """Bulk rating for the Select command bar's "Rate" action -- same
+    {filenames: [...]} body shape as /photos/delete, plus a single shared
+    rating applied to every valid photo."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    data = app.request.get_json(silent=True) or {}
+    rating = data.get('rating', 0)
+    if not isinstance(rating, int) or rating < 0 or rating > 5:
+        return app.jsonify({'error': 'Rating must be between 0 and 5'}), 400
+
+    valid_names, errors = _parse_filenames_request()
+    rated = []
+    if not valid_names:
+        return app.jsonify({'rated': rated, 'errors': errors, 'success': False})
+
+    def _rate_one(safe_name: str) -> app.Tuple[str, bool]:
+        metadata = app._get_metadata_entity(user_id, safe_name)
+        if not metadata:
+            return safe_name, False
+        app._update_metadata_entity_fields(user_id, safe_name, {'rating': rating})
+        return safe_name, True
+
+    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
+        results = list(executor.map(_rate_one, valid_names))
+
+    for safe_name, ok in results:
+        if ok:
+            rated.append(safe_name)
+        else:
+            errors.append(f'{safe_name}: Not found')
+
+    return app.jsonify({'rated': rated, 'rating': rating, 'errors': errors, 'success': len(rated) > 0})
 
 @photos_bp.route('/photos/<filename>/like', methods=['POST'])
 @photos_bp.route('/photos/<filename>/like/', methods=['POST'])
