@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, BellIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, MapPinIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, BellIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, MapPinIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, UserCircleIcon, VideoCameraIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
@@ -5463,7 +5463,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                             {item.type === 'place' ? (
                                                 <MapPinIcon className="toolbar-icon" aria-hidden="true" />
                                             ) : (
-                                                <UserCircleIconPlaceholder />
+                                                <UserCircleIcon className="toolbar-icon" aria-hidden="true" />
                                             )}
                                             <span>{item.label}</span>
                                             <span className="gallery-search-typeahead-type">{item.type === 'place' ? 'place' : 'person'}</span>
@@ -5691,6 +5691,16 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                             ))}
                             {matchedLocations.map((place) => (
                                 <span key={`place-${place}`} className="tag-chip">{place}</span>
+                            ))}
+                        </div>
+                    )}
+                    {matchedLocations.length > 0 && (
+                        <div className="gallery-map-snippet" aria-label="Places in these results">
+                            {matchedLocations.map((place) => (
+                                <span key={`pin-${place}`} className="gallery-map-snippet-pin">
+                                    <MapPinIcon className="toolbar-icon" aria-hidden="true" />
+                                    {place}
+                                </span>
                             ))}
                         </div>
                     )}
