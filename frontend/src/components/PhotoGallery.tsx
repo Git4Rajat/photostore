@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, AdjustmentsHorizontalIcon, BellIcon, CalendarDaysIcon, CheckIcon, ChevronDownIcon, ClockIcon, FunnelIcon, MagnifyingGlassIcon, MapPinIcon, PhotoIcon, PlusIcon, Squares2X2Icon, TrashIcon, VideoCameraIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { HeartIcon as HeartSolidIcon, StarIcon as StarSolidIcon } from '@heroicons/react/24/solid';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { get, post } from '../services/apiClient';
@@ -55,6 +55,7 @@ export { idbPut, idbGet, idbDelete, dataUrlToBlob, readBlobArrayBuffer, sha256Ar
 import PhotoQuickActions, { WORKBENCH_URL_FILENAME_CAP, workbenchFilenameHref, workbenchFilenamesHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
+import SelectionCommandBar from './shared/SelectionCommandBar';
 import Timeline from './shared/Timeline';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
@@ -556,6 +557,11 @@ interface GallerySuggestion {
     subtitle: string;
     actionLabel: string;
     actionHref: string;
+}
+
+interface TypeaheadSuggestion {
+    type: 'person' | 'place';
+    label: string;
 }
 
 // Client-side "shown once" dismissal, same pattern as
@@ -4123,7 +4129,13 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [matchedPeople, setMatchedPeople] = useState<string[]>([]);
     const [matchedLocations, setMatchedLocations] = useState<string[]>([]);
     const [savingSearchAsAlbum, setSavingSearchAsAlbum] = useState<boolean>(false);
-    const [suggestion, setSuggestion] = useState<GallerySuggestion | null>(null);
+    const [typeaheadSuggestions, setTypeaheadSuggestions] = useState<TypeaheadSuggestion[]>([]);
+    // A bell dropdown (not a single inline card) can hold the whole ordered
+    // list without the clutter problem an inline card had -- no "show only
+    // the first" cap needed here.
+    const [suggestions, setSuggestions] = useState<GallerySuggestion[]>([]);
+    const [showSuggestionsMenu, setShowSuggestionsMenu] = useState<boolean>(false);
+    const suggestionsMenuRef = useRef<HTMLDivElement | null>(null);
     // Default to capture-date order ("Captured") so the gallery opens on the most
     // recently *taken* photos. Upload date ("Recent") is a poor proxy for recency
     // in a bulk-imported library — every photo finalizes at roughly the same
@@ -4504,6 +4516,56 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [location.search]);
+
+    // Nudge: fetched once per page load (not polled like job-status
+    // notifications -- these signals change at most daily). The bell
+    // dropdown can hold the whole ordered list at once.
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const response = await get('/api/suggestions');
+                if (cancelled) return;
+                const list: GallerySuggestion[] = Array.isArray(response?.suggestions) ? response.suggestions : [];
+                setSuggestions(list.filter((item) => item?.id && !isSuggestionDismissed(item.id)));
+            } catch {
+                // Best-effort, ambient feature -- no error UI for a failed fetch.
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
+
+    useEffect(() => {
+        if (!showSuggestionsMenu) {
+            return undefined;
+        }
+        const handlePointerDown = (event: PointerEvent) => {
+            if (suggestionsMenuRef.current && !suggestionsMenuRef.current.contains(event.target as Node)) {
+                setShowSuggestionsMenu(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowSuggestionsMenu(false);
+            }
+        };
+        document.addEventListener('pointerdown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('pointerdown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [showSuggestionsMenu]);
+
+    const handleDismissSuggestion = (id: string) => {
+        dismissSuggestion(id);
+        setSuggestions((prev) => prev.filter((item) => item.id !== id));
+    };
+
+    const handleSuggestionAction = (item: GallerySuggestion) => {
+        setShowSuggestionsMenu(false);
+        navigate(item.actionHref);
+    };
 
     useEffect(() => {
         if (!registerUploadCompletionHandler) {
@@ -4985,6 +5047,32 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         }
     }, [searchQuery, fetchPhotos, sortBy]);
 
+    // Ask: live chip disambiguation while typing ("Li" -> Lisbon/Liam),
+    // before the user even submits. Debounced -- this fires on every
+    // keystroke otherwise.
+    useEffect(() => {
+        const trimmed = searchInput.trim();
+        if (!trimmed) {
+            setTypeaheadSuggestions([]);
+            return undefined;
+        }
+        const timeoutId = window.setTimeout(() => {
+            get(`/api/search/suggest?q=${encodeURIComponent(trimmed)}`)
+                .then((response) => {
+                    const list: TypeaheadSuggestion[] = Array.isArray(response?.suggestions) ? response.suggestions : [];
+                    setTypeaheadSuggestions(list);
+                })
+                .catch(() => setTypeaheadSuggestions([]));
+        }, 200);
+        return () => window.clearTimeout(timeoutId);
+    }, [searchInput]);
+
+    const applyTypeaheadSuggestion = (item: TypeaheadSuggestion) => {
+        setSearchInput(item.label);
+        setTypeaheadSuggestions([]);
+        submitSearch(item.label);
+    };
+
     useEffect(() => {
         if (!showSortMenu) {
             return;
@@ -5280,6 +5368,49 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                     </p>
 
                     <div className="gallery-tool-cluster">
+                        {suggestions.length > 0 && (
+                            <div className="gallery-menu-anchor" ref={suggestionsMenuRef}>
+                                <button
+                                    type="button"
+                                    className={`btn icon-btn ${showSuggestionsMenu ? 'btn-primary' : 'btn-soft'}`}
+                                    onClick={() => setShowSuggestionsMenu((prev) => !prev)}
+                                    aria-label={`Suggestions (${suggestions.length})`}
+                                    aria-expanded={showSuggestionsMenu}
+                                    title="Suggestions"
+                                >
+                                    <span className="gallery-suggestions-bell">
+                                        <BellIcon className="toolbar-icon" />
+                                        <span className="notification-badge">{suggestions.length}</span>
+                                    </span>
+                                    <span className="sr-only">Suggestions ({suggestions.length})</span>
+                                </button>
+                                {showSuggestionsMenu && (
+                                    <div className="gallery-menu gallery-suggestions-menu" role="menu" aria-label="Suggestions">
+                                        {suggestions.map((item) => (
+                                            <div key={item.id} className="gallery-suggestion-row">
+                                                <div className="gallery-suggestion-copy">
+                                                    <p className="gallery-suggestion-title">{item.title}</p>
+                                                    <p className="gallery-suggestion-subtitle">{item.subtitle}</p>
+                                                </div>
+                                                <div className="gallery-suggestion-row-actions">
+                                                    <button type="button" className="btn btn-primary" onClick={() => handleSuggestionAction(item)}>
+                                                        {item.actionLabel}
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="btn btn-soft icon-btn"
+                                                        onClick={() => handleDismissSuggestion(item.id)}
+                                                        aria-label="Dismiss suggestion"
+                                                    >
+                                                        <XMarkIcon className="toolbar-icon" />
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        )}
                         <div className="gallery-search-open gallery-search-persistent" ref={searchRef}>
                             <MagnifyingGlassIcon className="gallery-search-icon toolbar-icon" aria-hidden="true" />
                             <input
@@ -5290,8 +5421,10 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                 onChange={(e) => setSearchInput(e.target.value)}
                                 onKeyDown={(e) => {
                                     if (e.key === 'Enter') {
+                                        setTypeaheadSuggestions([]);
                                         submitSearch();
                                     } else if (e.key === 'Escape') {
+                                        setTypeaheadSuggestions([]);
                                         closeSearch();
                                     }
                                 }}
@@ -5317,6 +5450,27 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                 </button>
                             )}
                             {loading && <span className="sr-only" role="status">Searching…</span>}
+                            {typeaheadSuggestions.length > 0 && (
+                                <div className="gallery-search-typeahead" role="listbox" aria-label="Search suggestions">
+                                    {typeaheadSuggestions.map((item) => (
+                                        <button
+                                            type="button"
+                                            key={`${item.type}-${item.label}`}
+                                            className="gallery-search-typeahead-chip"
+                                            onMouseDown={(e) => e.preventDefault()}
+                                            onClick={() => applyTypeaheadSuggestion(item)}
+                                        >
+                                            {item.type === 'place' ? (
+                                                <MapPinIcon className="toolbar-icon" aria-hidden="true" />
+                                            ) : (
+                                                <UserCircleIconPlaceholder />
+                                            )}
+                                            <span>{item.label}</span>
+                                            <span className="gallery-search-typeahead-type">{item.type === 'place' ? 'place' : 'person'}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
                         </div>
 
                         <div className="gallery-menu-anchor" ref={sortMenuRef}>
@@ -5444,89 +5598,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                             <span className="sr-only">Refresh</span>
                         </button>
 
-                        {selectedCount > 0 && (
-                            <>
-                                <div className="gallery-menu-anchor" ref={albumMenuRef}>
-                                    <button
-                                        type="button"
-                                        onClick={() => void handleToggleAlbumMenu()}
-                                        className={`btn icon-btn ${showAlbumMenu ? 'btn-primary' : 'btn-soft'}`}
-                                        aria-label={`Add ${selectedCount} to album`}
-                                        aria-expanded={showAlbumMenu}
-                                        title={`Add ${selectedCount} to album`}
-                                    >
-                                        <PlusIcon className="toolbar-icon" />
-                                        <span className="sr-only">Add {selectedCount} to album</span>
-                                    </button>
-                                    {showAlbumMenu && (
-                                        <div className="gallery-menu" role="menu" aria-label="Add to album">
-                                            <button
-                                                type="button"
-                                                className="btn btn-soft gallery-menu-action"
-                                                onClick={() => void handleCreateAlbumFromSelected()}
-                                            >
-                                                <PlusIcon className="toolbar-icon" aria-hidden="true" />
-                                                <span>Create new album</span>
-                                            </button>
-                                            <div className="gallery-menu-divider" />
-                                            <p className="gallery-menu-label">Add to existing album</p>
-                                            <div className="gallery-menu-album-list">
-                                                {albumMenuLoading && <p className="gallery-menu-empty">Loading…</p>}
-                                                {!albumMenuLoading && albumMenuOptions && albumMenuOptions.length === 0 && (
-                                                    <p className="gallery-menu-empty">No albums yet.</p>
-                                                )}
-                                                {!albumMenuLoading && albumMenuOptions && albumMenuOptions.map((album) => (
-                                                    <button
-                                                        key={album.id}
-                                                        type="button"
-                                                        className="btn btn-soft gallery-menu-action"
-                                                        disabled={addingToAlbumId !== null}
-                                                        onClick={() => void handleAddSelectedToAlbum(album)}
-                                                    >
-                                                        <span>{album.name}</span>
-                                                        <span className="gallery-menu-action-meta">{album.photoCount}</span>
-                                                    </button>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
-                                {selectedCount > 1 && (
-                                    <button
-                                        type="button"
-                                        onClick={handleOpenSelectedInWorkbench}
-                                        className="btn btn-soft icon-btn"
-                                        aria-label={`Open selected (${selectedCount}) in Workbench`}
-                                        title={`Open selected (${selectedCount}) in Workbench`}
-                                    >
-                                        <WrenchScrewdriverIcon className="toolbar-icon" />
-                                        <span className="sr-only">Open selected ({selectedCount}) in Workbench</span>
-                                    </button>
-                                )}
-                                <button
-                                    type="button"
-                                    onClick={handleDownloadSelected}
-                                    disabled={downloading}
-                                    className="btn btn-soft icon-btn"
-                                    aria-label={`Download selected (${selectedCount})`}
-                                    title={`Download selected (${selectedCount})`}
-                                >
-                                    <ArrowDownTrayIcon className="toolbar-icon" />
-                                    <span className="sr-only">Download selected ({selectedCount})</span>
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={handleDeletePhotos}
-                                    disabled={deleting}
-                                    className="btn btn-danger icon-btn"
-                                    aria-label={`Delete selected (${selectedCount})`}
-                                    title={`Delete selected (${selectedCount})`}
-                                >
-                                    <TrashIcon className="toolbar-icon" />
-                                    <span className="sr-only">Delete selected ({selectedCount})</span>
-                                </button>
-                            </>
-                        )}
                     </div>
                 </div>
             </div>
@@ -5656,20 +5727,92 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             )}
 
             {selectedCount > 0 && lightboxIndex === null && (
-                <div className="selection-bar">
-                    <div className="selection-bar-actions">
-                        <span className="selection-count">{selectedCount} selected</span>
+                <SelectionCommandBar count={selectedCount}>
+                    <button type="button" className="btn btn-soft" onClick={handleSelectAll}>
+                        {selectedPhotos.size === filteredPhotos.length
+                            ? `Deselect all (${filteredPhotos.length})`
+                            : `Select all (${filteredPhotos.length})`}
+                    </button>
+                    <div className="gallery-menu-anchor" ref={albumMenuRef}>
                         <button
                             type="button"
-                            className="btn btn-soft selection-select-all"
-                            onClick={handleSelectAll}
+                            onClick={() => void handleToggleAlbumMenu()}
+                            className={`btn icon-btn ${showAlbumMenu ? 'btn-primary' : 'btn-soft'}`}
+                            aria-label={`Add ${selectedCount} to album`}
+                            aria-expanded={showAlbumMenu}
+                            title={`Add ${selectedCount} to album`}
                         >
-                            {selectedPhotos.size === filteredPhotos.length
-                                ? `Deselect all (${filteredPhotos.length})`
-                                : `Select all (${filteredPhotos.length})`}
+                            <PlusIcon className="toolbar-icon" />
+                            <span className="sr-only">Add {selectedCount} to album</span>
                         </button>
+                        {showAlbumMenu && (
+                            <div className="gallery-menu gallery-menu-upward" role="menu" aria-label="Add to album">
+                                <button
+                                    type="button"
+                                    className="btn btn-soft gallery-menu-action"
+                                    onClick={() => void handleCreateAlbumFromSelected()}
+                                >
+                                    <PlusIcon className="toolbar-icon" aria-hidden="true" />
+                                    <span>Create new album</span>
+                                </button>
+                                <div className="gallery-menu-divider" />
+                                <p className="gallery-menu-label">Add to existing album</p>
+                                <div className="gallery-menu-album-list">
+                                    {albumMenuLoading && <p className="gallery-menu-empty">Loading…</p>}
+                                    {!albumMenuLoading && albumMenuOptions && albumMenuOptions.length === 0 && (
+                                        <p className="gallery-menu-empty">No albums yet.</p>
+                                    )}
+                                    {!albumMenuLoading && albumMenuOptions && albumMenuOptions.map((album) => (
+                                        <button
+                                            key={album.id}
+                                            type="button"
+                                            className="btn btn-soft gallery-menu-action"
+                                            disabled={addingToAlbumId !== null}
+                                            onClick={() => void handleAddSelectedToAlbum(album)}
+                                        >
+                                            <span>{album.name}</span>
+                                            <span className="gallery-menu-action-meta">{album.photoCount}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
                     </div>
-                </div>
+                    {selectedCount > 1 && (
+                        <button
+                            type="button"
+                            onClick={handleOpenSelectedInWorkbench}
+                            className="btn btn-soft icon-btn"
+                            aria-label={`Open selected (${selectedCount}) in Workbench`}
+                            title={`Open selected (${selectedCount}) in Workbench`}
+                        >
+                            <WrenchScrewdriverIcon className="toolbar-icon" />
+                            <span className="sr-only">Open selected ({selectedCount}) in Workbench</span>
+                        </button>
+                    )}
+                    <button
+                        type="button"
+                        onClick={handleDownloadSelected}
+                        disabled={downloading}
+                        className="btn btn-soft icon-btn"
+                        aria-label={`Download selected (${selectedCount})`}
+                        title={`Download selected (${selectedCount})`}
+                    >
+                        <ArrowDownTrayIcon className="toolbar-icon" />
+                        <span className="sr-only">Download selected ({selectedCount})</span>
+                    </button>
+                    <button
+                        type="button"
+                        onClick={handleDeletePhotos}
+                        disabled={deleting}
+                        className="btn btn-danger icon-btn"
+                        aria-label={`Delete selected (${selectedCount})`}
+                        title={`Delete selected (${selectedCount})`}
+                    >
+                        <TrashIcon className="toolbar-icon" />
+                        <span className="sr-only">Delete selected ({selectedCount})</span>
+                    </button>
+                </SelectionCommandBar>
             )}
 
             {lightboxIndex === null ? (

@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { TrashIcon, CheckIcon, ArrowUturnLeftIcon } from '@heroicons/react/24/outline';
 import { get, post } from '../services/apiClient';
-import faceService from '../services/faceService';
 import PhotoTile from './shared/PhotoTile';
+import SelectionCommandBar from './shared/SelectionCommandBar';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
@@ -20,32 +20,11 @@ interface TrashedPhoto extends Photo {
     purgeAt: string;
 }
 
-// Person-merge undo and album-restore are two independently-shipped
-// reversible-action mechanisms with different storage shapes underneath
-// (blob-snapshotted merge table vs. a plain flag on the album row) --
-// unifying them at the storage layer wasn't worth it, so this normalizes
-// both into one shape just for this list instead.
-interface ActivityItem {
-    id: string;
-    kind: 'album' | 'merge';
-    label: string;
-    timestamp: string;
-}
-
 const daysUntil = (isoDate: string): number | null => {
     if (!isoDate) return null;
     const target = new Date(isoDate).getTime();
     if (Number.isNaN(target)) return null;
     return Math.max(0, Math.ceil((target - Date.now()) / (24 * 60 * 60 * 1000)));
-};
-
-const formatTimestamp = (value: string): string => {
-    if (!value) return '';
-    const parsed = new Date(value);
-    if (Number.isNaN(parsed.getTime())) return '';
-    return parsed.toLocaleString(undefined, {
-        year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-    });
 };
 
 const RecentlyDeletedPage: React.FC = () => {
@@ -56,10 +35,6 @@ const RecentlyDeletedPage: React.FC = () => {
     const [selected, setSelected] = useState<Set<string>>(new Set());
     const [busy, setBusy] = useState<'restore' | 'purge' | null>(null);
     const { thumbAccessUrls, resolveAccessForBatch } = useThumbnailAccessResolver();
-
-    const [activity, setActivity] = useState<ActivityItem[]>([]);
-    const [activityLoading, setActivityLoading] = useState<boolean>(true);
-    const [activityBusyId, setActivityBusyId] = useState<string | null>(null);
 
     const load = useCallback(async () => {
         setLoading(true);
@@ -77,69 +52,11 @@ const RecentlyDeletedPage: React.FC = () => {
         }
     }, [resolveAccessForBatch]);
 
-    // Two independent, already-working endpoints -- no new backend aggregator,
-    // just interleave by timestamp client-side (both lists are small: recent
-    // merges + recently-deleted albums, not photo-library scale).
-    const loadActivity = useCallback(async () => {
-        setActivityLoading(true);
-        try {
-            const [mergesResponse, albumsResponse] = await Promise.all([
-                faceService.listMerges().catch(() => ({ merges: [] })),
-                get('/albums/trash').catch(() => ({ albums: [] })),
-            ]);
-            const merges = Array.isArray(mergesResponse?.merges) ? mergesResponse.merges : [];
-            const albums = Array.isArray(albumsResponse?.albums) ? albumsResponse.albums : [];
-
-            const mergeItems: ActivityItem[] = merges.map((m: any) => {
-                const mergedNames: string[] = Array.isArray(m?.mergedNames) ? m.mergedNames.filter(Boolean) : [];
-                const targetName = m?.targetName || 'Unknown';
-                const label = mergedNames.length > 0
-                    ? `Merged ${mergedNames.join(', ')} → ${targetName}`
-                    : `Merged into ${targetName}`;
-                return { id: String(m?.mergeId || ''), kind: 'merge' as const, label, timestamp: String(m?.createdAt || '') };
-            }).filter((item) => item.id);
-
-            const albumItems: ActivityItem[] = albums.map((a: any): ActivityItem => ({
-                id: String(a?.id || ''),
-                kind: 'album' as const,
-                label: `Album deleted: ${a?.name || 'Untitled album'}`,
-                timestamp: String(a?.deletedAt || ''),
-            })).filter((item: ActivityItem) => item.id);
-
-            const combined: ActivityItem[] = [...mergeItems, ...albumItems].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
-            setActivity(combined);
-        } catch {
-            // Best-effort secondary section -- the photo-trash grid above is the
-            // page's primary content and already has its own error handling.
-            setActivity([]);
-        } finally {
-            setActivityLoading(false);
-        }
-    }, []);
-
     useEffect(() => {
         void load();
-        void loadActivity();
-    }, [load, loadActivity]);
+    }, [load]);
 
     useBackendRecoveryRetry(error, load);
-
-    const handleUndoActivity = async (item: ActivityItem) => {
-        setActivityBusyId(item.id);
-        try {
-            if (item.kind === 'merge') {
-                await faceService.undoMerge(item.id);
-            } else {
-                await post(`/albums/${item.id}/restore`, {});
-            }
-            setActivity((prev) => prev.filter((i) => i.id !== item.id));
-            showToast(item.kind === 'merge' ? 'Merge undone.' : 'Album restored.');
-        } catch (err) {
-            notifyApiError(err, { context: "Couldn't undo that action", retry: () => { void handleUndoActivity(item); } });
-        } finally {
-            setActivityBusyId(null);
-        }
-    };
 
     const toggleSelect = (filename: string) => {
         setSelected((prev) => {
@@ -227,38 +144,35 @@ const RecentlyDeletedPage: React.FC = () => {
                     onRetry={error.retriable ? () => { void load(); } : undefined}
                 />
             )}
-            {!loading && !error && !activityLoading && photos.length === 0 && activity.length === 0 && (
+            {!loading && !error && photos.length === 0 && (
                 <EmptyState
                     icon={<TrashIcon />}
                     title="Nothing here"
-                    message="Photos and albums you delete, and merges you undo, stay here for a while before they're gone for good."
+                    message="Photos you delete stay here for 30 days before they're gone for good."
                 />
             )}
 
             {selected.size > 0 && (
-                <div className="selection-bar">
-                    <div className="selection-bar-actions">
-                        <span className="selection-count">{plural(selected.size, 'photo')} selected</span>
-                        <button
-                            type="button"
-                            className="btn btn-soft"
-                            disabled={busy !== null}
-                            onClick={() => void handleRestore()}
-                        >
-                            <ArrowUturnLeftIcon className="toolbar-icon" aria-hidden="true" />
-                            {busy === 'restore' ? 'Restoring…' : 'Restore'}
-                        </button>
-                        <button
-                            type="button"
-                            className="btn btn-danger"
-                            disabled={busy !== null}
-                            onClick={() => void handlePurge()}
-                        >
-                            <TrashIcon className="toolbar-icon" aria-hidden="true" />
-                            {busy === 'purge' ? 'Deleting…' : 'Delete forever'}
-                        </button>
-                    </div>
-                </div>
+                <SelectionCommandBar count={selected.size} countLabel={`${plural(selected.size, 'photo')} selected`}>
+                    <button
+                        type="button"
+                        className="btn btn-soft"
+                        disabled={busy !== null}
+                        onClick={() => void handleRestore()}
+                    >
+                        <ArrowUturnLeftIcon className="toolbar-icon" aria-hidden="true" />
+                        {busy === 'restore' ? 'Restoring…' : 'Restore'}
+                    </button>
+                    <button
+                        type="button"
+                        className="btn btn-danger"
+                        disabled={busy !== null}
+                        onClick={() => void handlePurge()}
+                    >
+                        <TrashIcon className="toolbar-icon" aria-hidden="true" />
+                        {busy === 'purge' ? 'Deleting…' : 'Delete forever'}
+                    </button>
+                </SelectionCommandBar>
             )}
 
             {!loading && !error && photos.length > 0 && (
@@ -300,37 +214,6 @@ const RecentlyDeletedPage: React.FC = () => {
                         );
                     })}
                 </div>
-            )}
-
-            {!activityLoading && activity.length > 0 && (
-                <>
-                    <h3 className="explore-section-title">Other activity</h3>
-                    <div className="people-merge-history-list">
-                        {activity.map((item) => (
-                            <div key={item.id} className="people-merge-history-row">
-                                <div className="people-merge-history-main">
-                                    <div className="people-merge-history-title">
-                                        <span className="people-merge-chip">{item.label}</span>
-                                        {formatTimestamp(item.timestamp) && (
-                                            <span className="people-merge-chip">{formatTimestamp(item.timestamp)}</span>
-                                        )}
-                                    </div>
-                                </div>
-                                <div className="people-merge-history-actions">
-                                    <button
-                                        type="button"
-                                        className="btn btn-soft"
-                                        disabled={activityBusyId === item.id}
-                                        onClick={() => void handleUndoActivity(item)}
-                                    >
-                                        <ArrowUturnLeftIcon className="toolbar-icon" aria-hidden="true" />
-                                        {activityBusyId === item.id ? 'Undoing…' : 'Undo'}
-                                    </button>
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-                </>
             )}
         </section>
     );

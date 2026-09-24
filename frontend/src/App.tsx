@@ -4,6 +4,7 @@ import {
     ArrowPathIcon,
     ArrowLeftOnRectangleIcon,
     ArrowRightOnRectangleIcon,
+    ArrowUturnLeftIcon,
     Bars3Icon,
     ChevronDownIcon,
     ComputerDesktopIcon,
@@ -32,6 +33,7 @@ import { TimelineMetadataProvider } from './components/TimelineMetadataProvider'
 import { Logo } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
 import { BackendStatusBanner } from './components/shared/BackendStatusBanner';
+import ActivityDrawer from './components/shared/ActivityDrawer';
 import { ErrorBoundary } from './components/shared/ErrorBoundary';
 import NotFoundPage from './components/NotFoundPage';
 import { DialogHost } from './components/shared/dialogs';
@@ -432,6 +434,7 @@ interface AccountMenuProps {
     displayName: string;
     onSignIn: () => void;
     onSignOut: () => void;
+    onOpenActivity: () => void;
 }
 
 // Consolidates appearance + account controls behind a single overflow button so
@@ -445,6 +448,7 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
     displayName,
     onSignIn,
     onSignOut,
+    onOpenActivity,
 }) => {
     const [open, setOpen] = useState<boolean>(false);
     const [turbo, setTurbo] = useState<boolean>(() => isBrowserProcessingTurboEnabled());
@@ -499,6 +503,17 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
                             <span className="account-menu-user">{displayName}</span>
                         </div>
                     )}
+
+                    <div className="account-menu-section">
+                        <button
+                            type="button"
+                            className="account-menu-item"
+                            onClick={() => { close(); onOpenActivity(); }}
+                        >
+                            <ArrowUturnLeftIcon className="account-menu-item-icon" aria-hidden="true" />
+                            <span>Recent Activity</span>
+                        </button>
+                    </div>
 
                     <div className="account-menu-section">
                         <p className="account-menu-label">Appearance</p>
@@ -642,6 +657,7 @@ const AppContent: React.FC = () => {
     const [libraryTitle, setLibraryTitle] = useState<string>('Library');
     const [themePreference, setThemePreference] = useState<ThemePreference>(getStoredThemePreference);
     const [menuOpen, setMenuOpen] = useState<boolean>(false);
+    const [activityDrawerOpen, setActivityDrawerOpen] = useState<boolean>(false);
     const [showBackgroundTabWarning, setShowBackgroundTabWarning] = useState<boolean>(false);
     const hasShownBackgroundWarningRef = useRef<boolean>(false);
     const isPrivateArea = !isPublicAlbumRoute && !isAuthRoute;
@@ -916,6 +932,7 @@ const AppContent: React.FC = () => {
                             displayName={displayName}
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
+                            onOpenActivity={() => setActivityDrawerOpen(true)}
                         />
                     </div>
                 </header>
@@ -1110,6 +1127,12 @@ const AppContent: React.FC = () => {
                     open={menuOpen}
                     onClose={() => setMenuOpen(false)}
                     libraryTitle={libraryTitle}
+                />
+            )}
+            {isSignedIntoPrivateArea && (
+                <ActivityDrawer
+                    open={activityDrawerOpen}
+                    onClose={() => setActivityDrawerOpen(false)}
                 />
             )}
 

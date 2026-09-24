@@ -42,6 +42,7 @@ import { useDragSelect } from '../services/useDragSelect';
 import PhotoQuickActions, { WORKBENCH_URL_FILENAME_CAP, libraryFocusHref, workbenchFilenameHref, workbenchFilenamesHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
+import SelectionCommandBar from './shared/SelectionCommandBar';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
 import type { PhotoPersonLink } from '../types/uiTypes';
 import { classifyApiError, type ApiError } from '../services/apiError';
@@ -1528,34 +1529,6 @@ const AlbumsPage: React.FC = () => {
                                             </button>
                                         )}
 
-                                        {selectedCount > 0 && (
-                                            <button type="button" className="btn btn-soft gallery-menu-action" onClick={() => { void handleDownloadSelected(); setShowActionsMenu(false); }} disabled={downloading}>
-                                                <ArrowDownTrayIcon className="toolbar-icon" />
-                                                Download selected ({selectedCount})
-                                            </button>
-                                        )}
-
-                                        {selectedCount > 1 && (
-                                            <button type="button" className="btn btn-soft gallery-menu-action" onClick={() => { handleOpenSelectedInWorkbench(); setShowActionsMenu(false); }}>
-                                                <WrenchScrewdriverIcon className="toolbar-icon" />
-                                                Open selected in Workbench ({selectedCount})
-                                            </button>
-                                        )}
-
-                                        {activeAlbumId && !showAddFromGallery && selectedCount > 0 && (
-                                            <button type="button" className="btn btn-soft gallery-menu-action" onClick={() => { void handleRemoveSelected(); setShowActionsMenu(false); }}>
-                                                <MinusCircleIcon className="toolbar-icon" />
-                                                Remove from album ({selectedCount})
-                                            </button>
-                                        )}
-
-                                        {selectedCount > 0 && (
-                                            <button type="button" className="btn btn-danger gallery-menu-action" onClick={() => { void handleDeleteSelected(); setShowActionsMenu(false); }}>
-                                                <TrashIcon className="toolbar-icon" />
-                                                Delete selected ({selectedCount})
-                                            </button>
-                                        )}
-
                                         {activeAlbumId && (
                                             <>
                                                 <div className="gallery-menu-divider" />
@@ -1584,6 +1557,56 @@ const AlbumsPage: React.FC = () => {
                             </div>
                         </div>
                     </div>
+
+                    {selectedCount > 0 && (
+                        <SelectionCommandBar count={selectedCount}>
+                            <button
+                                type="button"
+                                className="btn btn-soft icon-btn"
+                                onClick={() => void handleDownloadSelected()}
+                                disabled={downloading}
+                                aria-label={`Download selected (${selectedCount})`}
+                                title={`Download selected (${selectedCount})`}
+                            >
+                                <ArrowDownTrayIcon className="toolbar-icon" />
+                                <span className="sr-only">Download selected ({selectedCount})</span>
+                            </button>
+                            {selectedCount > 1 && (
+                                <button
+                                    type="button"
+                                    className="btn btn-soft icon-btn"
+                                    onClick={handleOpenSelectedInWorkbench}
+                                    aria-label={`Open selected (${selectedCount}) in Workbench`}
+                                    title={`Open selected (${selectedCount}) in Workbench`}
+                                >
+                                    <WrenchScrewdriverIcon className="toolbar-icon" />
+                                    <span className="sr-only">Open selected ({selectedCount}) in Workbench</span>
+                                </button>
+                            )}
+                            {activeAlbumId && !showAddFromGallery && (
+                                <button
+                                    type="button"
+                                    className="btn btn-soft icon-btn"
+                                    onClick={() => void handleRemoveSelected()}
+                                    aria-label={`Remove ${selectedCount} from album`}
+                                    title={`Remove ${selectedCount} from album`}
+                                >
+                                    <MinusCircleIcon className="toolbar-icon" />
+                                    <span className="sr-only">Remove {selectedCount} from album</span>
+                                </button>
+                            )}
+                            <button
+                                type="button"
+                                className="btn btn-danger icon-btn"
+                                onClick={() => void handleDeleteSelected()}
+                                aria-label={`Delete selected (${selectedCount})`}
+                                title={`Delete selected (${selectedCount})`}
+                            >
+                                <TrashIcon className="toolbar-icon" />
+                                <span className="sr-only">Delete selected ({selectedCount})</span>
+                            </button>
+                        </SelectionCommandBar>
+                    )}
 
                     {status && <p className="status success">{status}</p>}
                     {error && <p className="status error">{error}</p>}

@@ -7181,6 +7181,48 @@ def _compute_on_this_day_suggestion(user_id: str) -> Optional[Dict]:
     }
 
 
+def _search_typeahead_suggestions(user_id: str, partial: str, limit: int = 5) -> List[Dict]:
+    """Live chip disambiguation while typing in Ask -- prefix match (not the
+    full whole-word logic /photos/search uses) against known person names and
+    location terms, so "Li" resolves toward "Lisbon"/"Liam" before the user
+    even hits enter. Location terms are sourced from the already-cached
+    listing (_cached_metadata_list_rows_for_user), not a fresh scan, so this
+    stays cheap on every keystroke."""
+    partial_norm = _normalize_search_phrase(partial)
+    if not partial_norm:
+        return []
+    results: List[Dict] = []
+    seen_labels = set()
+
+    pid_to_name, _ = _load_people_name_index(user_id)
+    for name in sorted(set(pid_to_name.values())):
+        if len(results) >= limit:
+            return results
+        if name in seen_labels:
+            continue
+        if _normalize_search_phrase(name).startswith(partial_norm):
+            results.append({'type': 'person', 'label': name})
+            seen_labels.add(name)
+
+    if len(results) < limit:
+        try:
+            rows = _cached_metadata_list_rows_for_user(user_id, purpose='search.typeahead')
+        except Exception:
+            rows = []
+        for term in _known_location_terms(rows):
+            if len(results) >= limit:
+                break
+            if len(term) < 3 or not term.startswith(partial_norm):
+                continue
+            display = _smart_album_title(term)
+            if display in seen_labels:
+                continue
+            results.append({'type': 'place', 'label': display})
+            seen_labels.add(display)
+
+    return results
+
+
 def _compute_suggestions(user_id: str) -> List[Dict]:
     """Ordered by priority -- the frontend shows only the first one, per the
     "at most one nudge per session" restraint. Trip/burst detection

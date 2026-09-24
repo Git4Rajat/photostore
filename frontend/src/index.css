@@ -993,6 +993,86 @@ body.lightbox-active .upload-approval-bar {
   transform: translateX(0);
 }
 
+/* Activity drawer -- same slide-in-with-backdrop mechanics as the nav
+   drawer above, mirrored to slide in from the right so it reads as a
+   distinct, secondary panel rather than the primary navigation. */
+.activity-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.activity-drawer.open {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.activity-drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  background: rgba(12, 15, 24, 0.44);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity var(--dur-base) var(--ease-glass);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+
+.activity-drawer.open .activity-drawer-backdrop {
+  opacity: 1;
+}
+
+.activity-drawer-panel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: min(360px, 88vw);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding:
+    max(20px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom))
+    16px;
+  background: var(--lg-surface-strong);
+  border-left: 1px solid var(--lg-edge);
+  box-shadow: var(--lg-shadow-floating);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  transform: translateX(100%);
+  transition: transform var(--dur-base) var(--ease-glass);
+  overflow-y: auto;
+}
+
+.activity-drawer.open .activity-drawer-panel {
+  transform: translateX(0);
+}
+
+.activity-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.activity-drawer-footer-link {
+  margin-top: auto;
+  padding-top: 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.activity-drawer-footer-link:hover {
+  text-decoration: underline;
+}
+
 .app-menu-head {
   display: flex;
   align-items: flex-start;
@@ -3475,6 +3555,49 @@ html[data-theme='light'] .notification-item.unread {
   margin: 4px 0 8px;
 }
 
+/* Nudge: bell + dropdown (not an inline card) -- can hold the whole ordered
+   suggestion list without crowding the primary content area. */
+.gallery-suggestions-bell {
+  position: relative;
+  display: inline-flex;
+}
+
+.gallery-suggestions-menu {
+  min-width: 300px;
+  max-width: min(380px, 90vw);
+}
+
+.gallery-suggestion-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 4px;
+}
+
+.gallery-suggestion-row + .gallery-suggestion-row {
+  border-top: 1px solid var(--line);
+}
+
+.gallery-suggestion-title {
+  margin: 0;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.gallery-suggestion-subtitle {
+  margin: 2px 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.gallery-suggestion-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
 .gallery-search-clear {
   position: absolute;
   right: 6px;
@@ -4118,6 +4241,52 @@ html[data-theme='light'] .notification-item.unread {
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+}
+
+/* Shared floating bottom bar (SelectionCommandBar) -- replaces the inline
+   .selection-bar above on Gallery/Albums/Recently Deleted, so "select
+   something, act on it" is the same floating-pill gesture everywhere
+   instead of three separate placements. */
+.selection-command-bar {
+  position: fixed;
+  left: 50%;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: min(680px, calc(100vw - 24px));
+  padding: 10px 16px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--lg-edge);
+  background: var(--lg-surface-strong);
+  box-shadow: var(--lg-shadow-floating);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+}
+
+.selection-command-bar-count {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.selection-command-bar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+}
+
+/* A menu nested in the bottom bar (e.g. Gallery's "Add to album") has to
+   open upward -- .gallery-menu's default top:100% would push it below the
+   viewport from a bottom-fixed trigger. */
+.gallery-menu-upward {
+  top: auto;
+  bottom: calc(100% + 8px);
 }
 
 .gallery-grid {
