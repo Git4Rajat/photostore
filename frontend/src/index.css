@@ -1001,71 +1001,17 @@ body.lightbox-active .upload-approval-bar {
   transform: translateX(0);
 }
 
-/* Activity drawer -- same slide-in-with-backdrop mechanics as the nav
-   drawer above, mirrored to slide in from the right so it reads as a
-   distinct, secondary panel rather than the primary navigation. */
-.activity-drawer {
-  position: fixed;
-  inset: 0;
-  z-index: 100;
-  visibility: hidden;
-  pointer-events: none;
-}
-
-.activity-drawer.open {
-  visibility: visible;
-  pointer-events: auto;
-}
-
-.activity-drawer-backdrop {
-  position: absolute;
-  inset: 0;
-  border: 0;
-  padding: 0;
-  background: rgba(12, 15, 24, 0.44);
-  opacity: 0;
-  cursor: pointer;
-  transition: opacity var(--dur-base) var(--ease-glass);
-  -webkit-backdrop-filter: blur(2px);
-  backdrop-filter: blur(2px);
-}
-
-.activity-drawer.open .activity-drawer-backdrop {
-  opacity: 1;
-}
-
-.activity-drawer-panel {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  right: 0;
-  width: min(360px, 88vw);
+/* Activity page -- mockup's ACTIVITY.PANEL frame is labeled "account menu"
+   (its entry point) rather than a 1440x900 full-screen dimension like Ask/
+   Viewer/Explore, and renders as a right-aligned card within the page body
+   rather than edge-to-edge -- matched here via max-width + margin-left:auto
+   instead of stretching the list full-width. */
+.activity-page-panel {
+  max-width: 520px;
+  margin-left: auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding:
-    max(20px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom))
-    16px;
-  background: var(--lg-surface-strong);
-  border-left: 1px solid var(--lg-edge);
-  box-shadow: var(--lg-shadow-floating);
-  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
-  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
-  transform: translateX(100%);
-  transition: transform var(--dur-base) var(--ease-glass);
-  overflow-y: auto;
-}
-
-.activity-drawer.open .activity-drawer-panel {
-  transform: translateX(0);
-}
-
-.activity-drawer-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 10px;
 }
 
 .activity-drawer-footer-link {
@@ -7205,7 +7151,13 @@ video.photo-preview-media.is-loading {
   }
   to {
     opacity: 1;
-    transform: translateY(0);
+    /* Not translateY(0) -- animation-fill-mode:both keeps this "to" value
+       applied forever after the animation ends, and any transform other
+       than none (even a zero-displacement one) makes this element the
+       containing block for position:fixed descendants, silently breaking
+       any fixed-positioned bar/popover nested inside (e.g. the selection
+       command bar's dropdown menus rendered invisible behind page content). */
+    transform: none;
   }
 }
 

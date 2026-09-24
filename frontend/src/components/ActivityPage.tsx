@@ -1,20 +1,21 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ArrowUturnLeftIcon, XMarkIcon } from '@heroicons/react/24/outline';
-import { get, post } from '../../services/apiClient';
-import faceService from '../../services/faceService';
-import { EmptyState } from './EmptyState';
-import { Loading } from './Loading';
-import { notifyApiError } from '../../services/requestFeedback';
-import { showToast } from '../../services/toast';
-import { plural } from '../../utils/format';
+import { ArrowUturnLeftIcon } from '@heroicons/react/24/outline';
+import { get, post } from '../services/apiClient';
+import faceService from '../services/faceService';
+import { EmptyState } from './shared/EmptyState';
+import { Loading } from './shared/Loading';
+import { notifyApiError } from '../services/requestFeedback';
+import { showToast } from '../services/toast';
+import { plural } from '../utils/format';
 
 // Person-merge undo and album-restore are two independently-shipped
 // reversible-action mechanisms with different storage shapes underneath
 // (blob-snapshotted merge table vs. a plain flag on the album row) --
 // unifying them at the storage layer wasn't worth it, so this normalizes
-// both into one shape just for this list. Moved here from
-// RecentlyDeletedPage.tsx, which now stays photos-only.
+// both into one shape just for this list. Formerly a slide-in drawer
+// (ActivityDrawer); moved to a real page so it has its own URL like the
+// rest of the mockup's full-page frames.
 interface ActivityItem {
     id: string;
     kind: 'album' | 'merge';
@@ -39,21 +40,15 @@ const daysUntil = (isoDate: string): number | null => {
     return Math.max(0, Math.ceil((target - Date.now()) / (24 * 60 * 60 * 1000)));
 };
 
-interface ActivityDrawerProps {
-    open: boolean;
-    onClose: () => void;
-}
-
 interface TrashSummary {
     total: number;
     earliestPurgeAt: string | null;
 }
 
-const ActivityDrawer: React.FC<ActivityDrawerProps> = ({ open, onClose }) => {
+const ActivityPage: React.FC = () => {
     const [activity, setActivity] = useState<ActivityItem[]>([]);
     const [trashSummary, setTrashSummary] = useState<TrashSummary | null>(null);
-    const [loading, setLoading] = useState<boolean>(false);
-    const [loaded, setLoaded] = useState<boolean>(false);
+    const [loading, setLoading] = useState<boolean>(true);
     const [busyId, setBusyId] = useState<string | null>(null);
     const [restoringAll, setRestoringAll] = useState<boolean>(false);
 
@@ -99,30 +94,12 @@ const ActivityDrawer: React.FC<ActivityDrawerProps> = ({ open, onClose }) => {
             setActivity([]);
         } finally {
             setLoading(false);
-            setLoaded(true);
         }
     }, []);
 
-    // Fetch lazily -- only once the drawer is actually opened, not on every
-    // page load regardless of whether the user ever looks at it.
     useEffect(() => {
-        if (open && !loaded) {
-            void load();
-        }
-    }, [open, loaded, load]);
-
-    useEffect(() => {
-        if (!open || typeof document === 'undefined') {
-            return undefined;
-        }
-        const handleKeyDown = (event: KeyboardEvent) => {
-            if (event.key === 'Escape') {
-                onClose();
-            }
-        };
-        document.addEventListener('keydown', handleKeyDown);
-        return () => document.removeEventListener('keydown', handleKeyDown);
-    }, [open, onClose]);
+        void load();
+    }, [load]);
 
     const handleUndo = async (item: ActivityItem) => {
         setBusyId(item.id);
@@ -156,31 +133,12 @@ const ActivityDrawer: React.FC<ActivityDrawerProps> = ({ open, onClose }) => {
     };
 
     return (
-        <div className={`activity-drawer${open ? ' open' : ''}`} aria-hidden={!open}>
-            <button
-                type="button"
-                className="activity-drawer-backdrop"
-                aria-label="Close recent activity"
-                tabIndex={open ? 0 : -1}
-                onClick={onClose}
-            />
-            <aside className="activity-drawer-panel" aria-label="Recent activity">
-                <div className="activity-drawer-head">
-                    <div>
-                        <p className="app-menu-kicker">KEEPSAKE</p>
-                        <p className="app-menu-title">Recent Activity</p>
-                    </div>
-                    <button
-                        type="button"
-                        className="btn btn-soft icon-btn"
-                        onClick={onClose}
-                        aria-label="Close recent activity"
-                    >
-                        <XMarkIcon className="toolbar-icon" />
-                        <span className="sr-only">Close recent activity</span>
-                    </button>
-                </div>
+        <section className="card-glass gallery-wrap">
+            <header className="page-topline">
+                <h2 className="page-topline-title">Recent Activity</h2>
+            </header>
 
+            <div className="activity-page-panel">
                 {loading && <Loading label="Loading activity…" fullPage={false} />}
                 {!loading && activity.length === 0 && (
                     <EmptyState
@@ -230,12 +188,12 @@ const ActivityDrawer: React.FC<ActivityDrawerProps> = ({ open, onClose }) => {
                     </div>
                 )}
 
-                <Link to="/trash" className="activity-drawer-footer-link" onClick={onClose}>
+                <Link to="/trash" className="activity-drawer-footer-link">
                     View Recently Deleted photos →
                 </Link>
-            </aside>
-        </div>
+            </div>
+        </section>
     );
 };
 
-export default ActivityDrawer;
+export default ActivityPage;

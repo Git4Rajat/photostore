@@ -33,6 +33,10 @@ interface PhotoActionSheetProps {
     people?: PhotoPersonLink[];
     showLibraryLink?: boolean;
     showWorkbenchLink?: boolean;
+    // Opens straight to the album picker instead of the top-level menu --
+    // lets a dedicated "Album" trigger (as opposed to a generic "More")
+    // skip the extra tap.
+    initialScreen?: 'menu' | 'chooseAlbum';
     // Bulk-only: host provides these since they already carry page-specific
     // optimistic-UI/state handling (e.g. removing deleted tiles).
     onDownload?: () => void;
@@ -55,6 +59,7 @@ const PhotoActionSheet: React.FC<PhotoActionSheetProps> = ({
     people = [],
     showLibraryLink = true,
     showWorkbenchLink = true,
+    initialScreen = 'menu',
     onDownload,
     onDelete,
     onAlbumsChanged,
@@ -67,9 +72,14 @@ const PhotoActionSheet: React.FC<PhotoActionSheetProps> = ({
 
     useEffect(() => {
         if (open) {
-            setScreen('menu');
+            if (initialScreen === 'chooseAlbum') {
+                void goToChooseAlbum();
+            } else {
+                setScreen('menu');
+            }
         }
-    }, [open]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [open, initialScreen]);
 
     if (!open || filenames.length === 0) {
         return null;

@@ -4178,7 +4178,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     const [focusLoading, setFocusLoading] = useState<boolean>(false);
     const [focusError, setFocusError] = useState<string | null>(null);
     const [focusLightboxOpen, setFocusLightboxOpen] = useState<boolean>(false);
-    const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
+    const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people']; initialScreen?: 'menu' | 'chooseAlbum' } | null>(null);
 
     const observerRef = useRef<IntersectionObserver | null>(null);
     const loadMoreRef = useRef<HTMLDivElement | null>(null);
@@ -6108,7 +6108,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                         onRate={handleRatePhoto}
                         onToggleLike={handleToggleLike}
                         onDelete={handleDeleteFromViewer}
-                        onOpenActions={(filename) => setActionSheetTarget({ filenames: [filename] })}
+                        onOpenActions={(filename, initialScreen) => setActionSheetTarget({ filenames: [filename], initialScreen })}
                     />
                 </ErrorBoundary>
             )}
@@ -6133,6 +6133,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                 onClose={() => setActionSheetTarget(null)}
                 filenames={actionSheetTarget?.filenames || []}
                 people={actionSheetTarget?.people}
+                initialScreen={actionSheetTarget?.initialScreen}
                 showLibraryLink={false}
                 onDownload={actionSheetTarget && actionSheetTarget.filenames.length > 1 ? handleDownloadSelected : undefined}
                 onDelete={actionSheetTarget && actionSheetTarget.filenames.length > 1 ? handleDeletePhotos : undefined}

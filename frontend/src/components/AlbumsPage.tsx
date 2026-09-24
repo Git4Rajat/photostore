@@ -159,7 +159,10 @@ const AlbumsPage: React.FC = () => {
     const [albumName, setAlbumName] = useState<string>('');
     const [addAlbumOpen, setAddAlbumOpen] = useState<boolean>(false);
     const { selected: selectedPhotos, setSelected: setSelectedPhotos } = useMultiSelect();
-    const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
+    const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people']; initialScreen?: 'menu' | 'chooseAlbum' } | null>(null);
+    const [showBarAlbumMenu, setShowBarAlbumMenu] = useState<boolean>(false);
+    const [addingToAlbumId, setAddingToAlbumId] = useState<string | null>(null);
+    const barAlbumMenuRef = useRef<HTMLDivElement | null>(null);
     const { selected: selectedAlbumIds, setSelected: setSelectedAlbumIds } = useMultiSelect();
     const [showAddFromGallery, setShowAddFromGallery] = useState<boolean>(false);
     const [searchInput, setSearchInput] = useState<string>('');
@@ -713,6 +716,28 @@ const AlbumsPage: React.FC = () => {
     }, [showActionsMenu]);
 
     useEffect(() => {
+        if (!showBarAlbumMenu) {
+            return;
+        }
+        const handlePointerDown = (event: PointerEvent) => {
+            if (barAlbumMenuRef.current && !barAlbumMenuRef.current.contains(event.target as Node)) {
+                setShowBarAlbumMenu(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowBarAlbumMenu(false);
+            }
+        };
+        document.addEventListener('pointerdown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('pointerdown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [showBarAlbumMenu]);
+
+    useEffect(() => {
         if (!showFilterMenu) {
             return;
         }
@@ -904,6 +929,68 @@ const AlbumsPage: React.FC = () => {
             syncAlbumFilenames(filenames, 'add');
             setStatus('');
             notifyApiError(err, { context: 'Failed to remove photos from album.' });
+        }
+    };
+
+    const handleAddSelectedToAlbum = async (album: Album) => {
+        if (selectedPhotos.size === 0) {
+            return;
+        }
+        const filenames = Array.from(selectedPhotos);
+        setAddingToAlbumId(album.id);
+        try {
+            await post(`/albums/${album.id}/photos/add`, { filenames });
+            showToast(`Added ${plural(filenames.length, 'photo')} to "${album.name}".`);
+            setAlbums((prev) => prev.map((a) => (a.id === album.id ? { ...a, photoCount: a.photoCount + filenames.length } : a)));
+            setSelectedPhotos(new Set());
+            setShowBarAlbumMenu(false);
+        } catch (err) {
+            notifyApiError(err, { context: 'Failed to add photos to album.' });
+        } finally {
+            setAddingToAlbumId(null);
+        }
+    };
+
+    const handleCreateAlbumFromSelectionBar = async () => {
+        if (selectedPhotos.size === 0) {
+            return;
+        }
+        setShowBarAlbumMenu(false);
+        const input = await promptDialog({
+            title: 'Create album',
+            label: 'Album name',
+            defaultValue: `Album ${new Date().toLocaleDateString()}`,
+            confirmLabel: 'Create',
+        });
+        if (input === null) {
+            return;
+        }
+        const newAlbumName = input.trim();
+        if (!newAlbumName) {
+            setError('Album name is required.');
+            return;
+        }
+        const filenames = Array.from(selectedPhotos);
+        try {
+            const createResponse = await post('/albums', { name: newAlbumName });
+            const newAlbumId = String(createResponse?.album?.id || '');
+            if (!newAlbumId) {
+                throw new Error('Album was created but no album id was returned.');
+            }
+            await post(`/albums/${newAlbumId}/photos/add`, { filenames });
+            showToast(`Created "${newAlbumName}" with ${plural(filenames.length, 'photo')}.`);
+            setAlbums((prev) => [...prev, { id: newAlbumId, name: newAlbumName, photoCount: filenames.length }]);
+            setSelectedPhotos(new Set());
+        } catch (err) {
+            notifyApiError(err, { context: 'Failed to create album from selection.' });
+        }
+    };
+
+    const handleSelectAllVisible = () => {
+        if (filteredPhotos.length > 0 && selectedPhotos.size === filteredPhotos.length) {
+            setSelectedPhotos(new Set());
+        } else {
+            setSelectedPhotos(new Set(filteredPhotos.map((photo) => photo.filename)));
         }
     };
 
@@ -1510,13 +1597,7 @@ const AlbumsPage: React.FC = () => {
                                         <button
                                             type="button"
                                             className="btn btn-soft gallery-menu-action"
-                                            onClick={() => {
-                                                if (filteredPhotos.length > 0 && selectedPhotos.size === filteredPhotos.length) {
-                                                    setSelectedPhotos(new Set());
-                                                } else {
-                                                    setSelectedPhotos(new Set(filteredPhotos.map((photo) => photo.filename)));
-                                                }
-                                            }}
+                                            onClick={handleSelectAllVisible}
                                         >
                                             <CheckIcon className="toolbar-icon" />
                                             {filteredPhotos.length > 0 && selectedPhotos.size === filteredPhotos.length ? 'Deselect visible' : 'Select visible'}
@@ -1560,17 +1641,53 @@ const AlbumsPage: React.FC = () => {
 
                     {selectedCount > 0 && (
                         <SelectionCommandBar count={selectedCount}>
-                            <button
-                                type="button"
-                                className="btn btn-soft icon-btn"
-                                onClick={() => void handleDownloadSelected()}
-                                disabled={downloading}
-                                aria-label={`Download selected (${selectedCount})`}
-                                title={`Download selected (${selectedCount})`}
-                            >
-                                <ArrowDownTrayIcon className="toolbar-icon" />
-                                <span className="sr-only">Download selected ({selectedCount})</span>
+                            <button type="button" className="btn btn-soft" onClick={handleSelectAllVisible}>
+                                {filteredPhotos.length > 0 && selectedPhotos.size === filteredPhotos.length
+                                    ? `Deselect all (${filteredPhotos.length})`
+                                    : `Select all (${filteredPhotos.length})`}
                             </button>
+                            <div className="gallery-menu-anchor" ref={barAlbumMenuRef}>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowBarAlbumMenu((prev) => !prev)}
+                                    className={`btn icon-btn ${showBarAlbumMenu ? 'btn-primary' : 'btn-soft'}`}
+                                    aria-label={`Add ${selectedCount} to album`}
+                                    aria-expanded={showBarAlbumMenu}
+                                    title={`Add ${selectedCount} to album`}
+                                >
+                                    <PlusIcon className="toolbar-icon" />
+                                    <span>Album</span>
+                                </button>
+                                {showBarAlbumMenu && (
+                                    <div className="gallery-menu gallery-menu-upward" role="menu" aria-label="Add to album">
+                                        <button
+                                            type="button"
+                                            className="btn btn-soft gallery-menu-action"
+                                            onClick={() => void handleCreateAlbumFromSelectionBar()}
+                                        >
+                                            <PlusIcon className="toolbar-icon" aria-hidden="true" />
+                                            <span>Create new album</span>
+                                        </button>
+                                        <div className="gallery-menu-divider" />
+                                        <p className="gallery-menu-label">Add to existing album</p>
+                                        <div className="gallery-menu-album-list">
+                                            {albums.length === 0 && <p className="gallery-menu-empty">No albums yet.</p>}
+                                            {albums.map((album) => (
+                                                <button
+                                                    key={album.id}
+                                                    type="button"
+                                                    className="btn btn-soft gallery-menu-action"
+                                                    disabled={addingToAlbumId !== null}
+                                                    onClick={() => void handleAddSelectedToAlbum(album)}
+                                                >
+                                                    <span>{album.name}</span>
+                                                    <span className="gallery-menu-action-meta">{album.photoCount}</span>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
                             {selectedCount > 1 && (
                                 <button
                                     type="button"
@@ -1580,7 +1697,7 @@ const AlbumsPage: React.FC = () => {
                                     title={`Open selected (${selectedCount}) in Workbench`}
                                 >
                                     <WrenchScrewdriverIcon className="toolbar-icon" />
-                                    <span className="sr-only">Open selected ({selectedCount}) in Workbench</span>
+                                    <span>Workbench</span>
                                 </button>
                             )}
                             {activeAlbumId && !showAddFromGallery && (
@@ -1592,9 +1709,20 @@ const AlbumsPage: React.FC = () => {
                                     title={`Remove ${selectedCount} from album`}
                                 >
                                     <MinusCircleIcon className="toolbar-icon" />
-                                    <span className="sr-only">Remove {selectedCount} from album</span>
+                                    <span>Remove</span>
                                 </button>
                             )}
+                            <button
+                                type="button"
+                                className="btn btn-soft icon-btn"
+                                onClick={() => void handleDownloadSelected()}
+                                disabled={downloading}
+                                aria-label={`Download selected (${selectedCount})`}
+                                title={`Download selected (${selectedCount})`}
+                            >
+                                <ArrowDownTrayIcon className="toolbar-icon" />
+                                <span>Download</span>
+                            </button>
                             <button
                                 type="button"
                                 className="btn btn-danger icon-btn"
@@ -1603,7 +1731,7 @@ const AlbumsPage: React.FC = () => {
                                 title={`Delete selected (${selectedCount})`}
                             >
                                 <TrashIcon className="toolbar-icon" />
-                                <span className="sr-only">Delete selected ({selectedCount})</span>
+                                <span>Delete</span>
                             </button>
                         </SelectionCommandBar>
                     )}
@@ -1743,7 +1871,7 @@ const AlbumsPage: React.FC = () => {
                             onRate={handleRatePhoto}
                             onToggleLike={handleToggleLike}
                             onDelete={handleDeleteFromViewer}
-                            onOpenActions={(filename) => setActionSheetTarget({ filenames: [filename] })}
+                            onOpenActions={(filename, initialScreen) => setActionSheetTarget({ filenames: [filename], initialScreen })}
                         />
                     )}
                 </section>
@@ -1754,6 +1882,7 @@ const AlbumsPage: React.FC = () => {
                 onClose={() => setActionSheetTarget(null)}
                 filenames={actionSheetTarget?.filenames || []}
                 people={actionSheetTarget?.people}
+                initialScreen={actionSheetTarget?.initialScreen}
                 onDownload={actionSheetTarget && actionSheetTarget.filenames.length > 1 ? handleDownloadSelected : undefined}
                 onDelete={actionSheetTarget && actionSheetTarget.filenames.length > 1 ? handleDeleteSelected : undefined}
                 onAlbumsChanged={loadAlbums}

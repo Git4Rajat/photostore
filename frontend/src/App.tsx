@@ -33,7 +33,6 @@ import { TimelineMetadataProvider } from './components/TimelineMetadataProvider'
 import { LogoLockup } from './components/shared/Logo';
 import { Loading } from './components/shared/Loading';
 import { BackendStatusBanner } from './components/shared/BackendStatusBanner';
-import ActivityDrawer from './components/shared/ActivityDrawer';
 import { ErrorBoundary } from './components/shared/ErrorBoundary';
 import NotFoundPage from './components/NotFoundPage';
 import { DialogHost } from './components/shared/dialogs';
@@ -58,6 +57,7 @@ const pageTitleFor = (pathname: string): string => {
     if (pathname.startsWith('/corrupted')) return 'Corrupted uploads';
     if (pathname.startsWith('/additional')) return 'Additional info';
     if (pathname.startsWith('/trash')) return 'Recently Deleted';
+    if (pathname.startsWith('/activity')) return 'Recent Activity';
     if (pathname === '/login') return 'Sign in';
     if (pathname === '/logout') return 'Sign out';
     if (pathname === '/reset-password') return 'Reset password';
@@ -83,6 +83,7 @@ const LazyPersonDetail = React.lazy(() => import('./components/PersonDetail'));
 const LazyAdditionalInfoPage = React.lazy(() => import('./components/AdditionalInfoPage'));
 const LazyCorruptedUploadsPage = React.lazy(() => import('./components/CorruptedUploadsPage'));
 const LazyRecentlyDeletedPage = React.lazy(() => import('./components/RecentlyDeletedPage'));
+const LazyActivityPage = React.lazy(() => import('./components/ActivityPage'));
 const LazyPublicAlbumPage = React.lazy(() => import('./components/PublicAlbumPage'));
 const LazyLoginPage = React.lazy(() => import('./components/LoginPage'));
 const LazyLogoutPage = React.lazy(() => import('./components/LogoutPage'));
@@ -434,7 +435,6 @@ interface AccountMenuProps {
     displayName: string;
     onSignIn: () => void;
     onSignOut: () => void;
-    onOpenActivity: () => void;
 }
 
 // Consolidates appearance + account controls behind a single overflow button so
@@ -448,7 +448,6 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
     displayName,
     onSignIn,
     onSignOut,
-    onOpenActivity,
 }) => {
     const [open, setOpen] = useState<boolean>(false);
     const [turbo, setTurbo] = useState<boolean>(() => isBrowserProcessingTurboEnabled());
@@ -512,14 +511,14 @@ const AccountMenu: React.FC<AccountMenuProps> = ({
                     )}
 
                     <div className="account-menu-section">
-                        <button
-                            type="button"
-                            className="account-menu-item"
-                            onClick={() => { close(); onOpenActivity(); }}
+                        <NavLink
+                            to="/activity"
+                            onClick={close}
+                            className={({ isActive }) => `account-menu-item${isActive ? ' active' : ''}`}
                         >
                             <ArrowUturnLeftIcon className="account-menu-item-icon" aria-hidden="true" />
                             <span>Recent Activity</span>
-                        </button>
+                        </NavLink>
                         {UTILITY_NAV_ITEMS.map(({ to, label, end, Icon }) => (
                             <NavLink
                                 key={to}
@@ -676,7 +675,6 @@ const AppContent: React.FC = () => {
     const [libraryTitle, setLibraryTitle] = useState<string>('Library');
     const [themePreference, setThemePreference] = useState<ThemePreference>(getStoredThemePreference);
     const [menuOpen, setMenuOpen] = useState<boolean>(false);
-    const [activityDrawerOpen, setActivityDrawerOpen] = useState<boolean>(false);
     const [showBackgroundTabWarning, setShowBackgroundTabWarning] = useState<boolean>(false);
     const hasShownBackgroundWarningRef = useRef<boolean>(false);
     const isPrivateArea = !isPublicAlbumRoute && !isAuthRoute;
@@ -780,6 +778,8 @@ const AppContent: React.FC = () => {
     // Show background tab warning when tab goes to background (one-time, unless dismissed forever).
     // Only relevant to the signed-in app, which is the only place AI processing runs -- public
     // album viewers and visitors on auth pages never trigger it, so skip the listener there too.
+    // Also only relevant while in-browser processing is actually running -- there's nothing to
+    // slow down otherwise, so don't warn.
     useEffect(() => {
         if (!isPrivateArea || typeof document === 'undefined' || typeof localStorage === 'undefined') {
             return undefined;
@@ -792,8 +792,9 @@ const AppContent: React.FC = () => {
         }
 
         const handleVisibilityChange = () => {
-            // Only show warning once per session and only when tab goes to background
-            if (document.hidden && !hasShownBackgroundWarningRef.current) {
+            // Only show warning once per session, only when tab goes to background, and only
+            // if in-browser processing is actually active.
+            if (document.hidden && !hasShownBackgroundWarningRef.current && appServices.browserProcessingActive) {
                 hasShownBackgroundWarningRef.current = true;
                 setShowBackgroundTabWarning(true);
             }
@@ -803,7 +804,7 @@ const AppContent: React.FC = () => {
         return () => {
             document.removeEventListener('visibilitychange', handleVisibilityChange);
         };
-    }, [isPrivateArea]);
+    }, [isPrivateArea, appServices.browserProcessingActive]);
 
     const handleCloseBackgroundWarning = useCallback(() => {
         setShowBackgroundTabWarning(false);
@@ -958,7 +959,6 @@ const AppContent: React.FC = () => {
                             displayName={displayName}
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
-                            onOpenActivity={() => setActivityDrawerOpen(true)}
                         />
                     </div>
                 </header>
@@ -1045,6 +1045,10 @@ const AppContent: React.FC = () => {
                                 element: renderProtectedLazyPage(<LazyRecentlyDeletedPage />, 'Loading Recently Deleted…'),
                             },
                             {
+                                path: '/activity',
+                                element: renderProtectedLazyPage(<LazyActivityPage />, 'Loading activity…'),
+                            },
+                            {
                                 path: '/corrupted',
                                 element: renderProtectedLazyPage(<LazyCorruptedUploadsPage />, 'Loading corrupted uploads…'),
                             },
@@ -1127,12 +1131,6 @@ const AppContent: React.FC = () => {
                     open={menuOpen}
                     onClose={() => setMenuOpen(false)}
                     libraryTitle={libraryTitle}
-                />
-            )}
-            {isSignedIntoPrivateArea && (
-                <ActivityDrawer
-                    open={activityDrawerOpen}
-                    onClose={() => setActivityDrawerOpen(false)}
                 />
             )}
 

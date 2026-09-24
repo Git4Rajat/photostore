@@ -42,8 +42,9 @@ interface PhotoViewerProps {
     onDelete?: (filename: string) => void;
     // Opens the host's existing PhotoActionSheet (add-to-album, download, etc.)
     // targeted at just this one photo, instead of PhotoViewer building a
-    // second copy of that UI.
-    onOpenActions?: (filename: string) => void;
+    // second copy of that UI. initialScreen lets a dedicated "Album" trigger
+    // skip straight to the album picker instead of the top-level menu.
+    onOpenActions?: (filename: string, initialScreen?: 'menu' | 'chooseAlbum') => void;
 }
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
@@ -1414,7 +1415,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                         <button
                             type="button"
                             className="photo-preview-actionbar-item"
-                            onClick={() => onOpenActions(activePhoto.filename)}
+                            onClick={() => onOpenActions(activePhoto.filename, 'chooseAlbum')}
                             aria-label="Add to album"
                         >
                             <RectangleStackIcon className="toolbar-icon" />
