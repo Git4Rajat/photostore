@@ -16,9 +16,9 @@ export type PageId =
     | 'trash';
 
 export interface Photo {
-    id: string;
+    id: string; // equals `filename` for real photos — the backend's stable key
     filename: string;
-    swatch: SwatchKey;
+    swatch: SwatchKey; // deterministic placeholder shown behind/while the image loads
     dateLabel: string;
     year: number;
     rating: number; // 0–5
@@ -26,33 +26,47 @@ export interface Photo {
     placeId: string | null;
     personIds: string[];
     tags: string[];
-}
-
-export interface ShareSettings {
-    isPublic: boolean;
-    expiry: string;
-    code: string;
+    // Real-image fields (absent in legacy seed data; present once wired to the
+    // backend). `thumbnailUrl` is the raw value from the listing response — a
+    // direct SAS http URL for most photos, or a backend-relative path for
+    // formats that need a scoped access token (HEIC/CR3/video). PhotoGrid /
+    // PhotoViewer resolve these to a loadable src via services/imageClient +
+    // components/shared/PhotoTile helpers.
+    thumbnailUrl?: string;
+    rotation?: number;
+    thumbnailRotation?: number;
+    likes?: number;
+    captureDate?: string | null;
 }
 
 export interface Album {
     id: string;
     name: string;
-    coverPhotoId: string | null;
-    photoIds: string[];
-    share: ShareSettings;
+    photoCount: number;
+    isPublic?: boolean;
+    publicUrl?: string;
+    publicExpiresAt?: string;
+    hasAccessCode?: boolean;
+    isExpired?: boolean;
 }
 
 export interface Person {
     id: string;
     name: string | null; // null => unnamed cluster
-    swatch: SwatchKey;
-    photoIds: string[];
+    swatch: SwatchKey; // placeholder tint when no cover thumbnail is available
+    photoIds: string[]; // legacy seed field; empty for server-backed people
+    coverThumbnailUrl?: string; // representative face thumbnail (SAS or backend path)
+    faceCount?: number;
 }
 
 export interface Place {
     id: string;
     name: string;
     swatch: SwatchKey;
+    count?: number;
+    coverThumbnailUrl?: string;
+    latitude?: string;
+    longitude?: string;
 }
 
 export interface ThingTag {
@@ -60,16 +74,7 @@ export interface ThingTag {
     name: string;
     count: number;
     swatch: SwatchKey;
-}
-
-export interface Member {
-    id: string;
-    name: string;
-    sub: string;
-    initials: string;
-    color: string;
-    role: 'owner' | 'view' | 'contribute';
-    pending?: boolean;
+    coverThumbnailUrl?: string;
 }
 
 export interface ActivityItem {
@@ -98,6 +103,8 @@ export interface RouteParams {
     query?: string;
     placeId?: string;
     tag?: string;
+    // Comma-separated filenames deep-linked into the Tools "Workbench" view.
+    filenames?: string;
 }
 
 export interface Route {

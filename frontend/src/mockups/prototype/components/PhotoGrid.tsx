@@ -2,6 +2,7 @@ import React from 'react';
 import { CheckCircleIcon, HeartIcon } from '@heroicons/react/24/solid';
 import { StarIcon } from '@heroicons/react/24/solid';
 import { useStore } from '../store';
+import { usePhotoThumbnails } from '../media';
 import type { Photo } from '../types';
 
 /**
@@ -9,47 +10,26 @@ import type { Photo } from '../types';
  * checkbox toggles selection (which surfaces the command bar). Rating and like
  * state show as small overlays.
  */
-export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement> }> = ({ photos, emptyHint }) => {
+export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean }> = ({ photos, emptyHint, extendable }) => {
     const { selection, toggleSelect, selectMany, openViewer } = useStore();
+    const thumbs = usePhotoThumbnails(photos);
     const [lastSelected, setLastSelected] = React.useState<number | null>(null);
-    const [dragStart, setDragStart] = React.useState<number | null>(null);
-    const [touchDragStart, setTouchDragStart] = React.useState<number | null>(null);
+    // Drag origin is a ref, not state: mouseenter fires as the pointer moves and
+    // must read the current origin synchronously. Reading it from state raced the
+    // setState re-render, so a fast sweep saw a stale `null` and selected nothing.
+    const dragStartRef = React.useRef<number | null>(null);
+    const draggedRef = React.useRef(false);
     const gridRef = React.useRef<HTMLDivElement>(null);
-
-    const getTileIndex = (target: Element): number | null => {
-        const tile = (target as Element).closest('.pt-tile');
-        if (!tile || !gridRef.current) return null;
-        const tiles = Array.from(gridRef.current.querySelectorAll('.pt-tile'));
-        return tiles.indexOf(tile);
-    };
-
-    const getTileAtPoint = (x: number, y: number): number | null => {
-        if (!gridRef.current) return null;
-        const element = document.elementFromPoint(x, y);
-        return getTileIndex(element as Element);
-    };
-
-    const handleTouchStart = (e: React.TouchEvent) => {
-        if (e.touches.length === 0) return;
-        const touch = e.touches[0];
-        const index = getTileAtPoint(touch.clientX, touch.clientY);
-        if (index !== null) setTouchDragStart(index);
-    };
-
-    const handleTouchMove = (e: React.TouchEvent) => {
-        if (touchDragStart === null || e.touches.length === 0) return;
-        const touch = e.touches[0];
-        const index = getTileAtPoint(touch.clientX, touch.clientY);
-        if (index !== null) {
-            const start = Math.min(touchDragStart, index);
-            const end = Math.max(touchDragStart, index);
-            const rangeIds = ids.slice(start, end + 1);
-            selectMany(Array.from(new Set([...selection, ...rangeIds])));
+    // Long-press on touch devices enters/toggles selection without opening the
+    // viewer; a short tap still opens it. `longPressedRef` suppresses the click
+    // that fires right after a long-press so the viewer doesn't pop open.
+    const longPressTimer = React.useRef<number | null>(null);
+    const longPressedRef = React.useRef(false);
+    const clearLongPress = () => {
+        if (longPressTimer.current !== null) {
+            window.clearTimeout(longPressTimer.current);
+            longPressTimer.current = null;
         }
-    };
-
-    const handleTouchEnd = () => {
-        setTouchDragStart(null);
     };
 
     if (!photos.length) {
@@ -72,20 +52,25 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
     };
 
     const handleMouseDown = (i: number) => {
-        setDragStart(i);
+        dragStartRef.current = i;
+        draggedRef.current = false;
     };
 
     const handleMouseEnter = (i: number) => {
-        if (dragStart !== null) {
-            const start = Math.min(dragStart, i);
-            const end = Math.max(dragStart, i);
-            const rangeIds = ids.slice(start, end + 1);
-            selectMany(Array.from(new Set([...selection, ...rangeIds])));
-        }
+        const origin = dragStartRef.current;
+        if (origin === null || origin === i) return;
+        draggedRef.current = true;
+        const start = Math.min(origin, i);
+        const end = Math.max(origin, i);
+        // Recompute the whole origin..current range each move (merged with the
+        // pre-drag selection), so it's robust to the closure's `selection` being
+        // a render behind. lastSelected anchors a later shift-click.
+        selectMany(Array.from(new Set([...selection, ...ids.slice(start, end + 1)])));
+        setLastSelected(i);
     };
 
     const handleMouseUp = () => {
-        setDragStart(null);
+        dragStartRef.current = null;
     };
 
     return (
@@ -94,9 +79,6 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
             ref={gridRef}
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
-            onTouchStart={handleTouchStart}
-            onTouchMove={handleTouchMove}
-            onTouchEnd={handleTouchEnd}
         >
             {photos.map((photo, i) => {
                 const selected = selection.includes(photo.id);
@@ -107,16 +89,45 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                         role="button"
                         tabIndex={0}
                         data-photo-id={photo.id}
-                        onClick={() => openViewer(ids, i)}
+                        onClick={() => {
+                            // Suppress the click that follows a long-press or a
+                            // drag-select so it doesn't also open the viewer.
+                            if (longPressedRef.current || draggedRef.current) {
+                                longPressedRef.current = false;
+                                draggedRef.current = false;
+                                return;
+                            }
+                            openViewer(ids, i, { extendable });
+                        }}
                         onKeyDown={(e) => {
                             if (e.key === 'Enter' || e.key === ' ') {
                                 e.preventDefault();
-                                openViewer(ids, i);
+                                openViewer(ids, i, { extendable });
                             }
                         }}
                         onMouseDown={() => handleMouseDown(i)}
                         onMouseEnter={() => handleMouseEnter(i)}
+                        onTouchStart={() => {
+                            longPressedRef.current = false;
+                            clearLongPress();
+                            longPressTimer.current = window.setTimeout(() => {
+                                longPressedRef.current = true;
+                                toggleSelect(ids[i]);
+                                setLastSelected(i);
+                            }, 400);
+                        }}
+                        onTouchMove={clearLongPress}
+                        onTouchEnd={clearLongPress}
                     >
+                        {thumbs[photo.filename] && (
+                            <img
+                                className="pt-tile-img"
+                                src={thumbs[photo.filename]}
+                                alt={photo.filename}
+                                loading="lazy"
+                                draggable={false}
+                            />
+                        )}
                         <button
                             type="button"
                             className={`pt-tile-check${selected ? ' on' : ''}`}

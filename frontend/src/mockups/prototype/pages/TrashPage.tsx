@@ -1,11 +1,17 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { ArrowUturnLeftIcon, TrashIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
-import { Swatch } from '../components/bits';
+import { usePhotoThumbnails } from '../media';
 
 /** Recently Deleted — restore individually or all, or purge for good. */
 export const TrashPage: React.FC = () => {
-    const { trash, restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, navigate } = useStore();
+    const { trash, trashLoading, reloadTrash, restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, navigate } = useStore();
+    const thumbs = usePhotoThumbnails(trash.map((t) => t.photo));
+
+    useEffect(() => {
+        reloadTrash();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     return (
         <div>
@@ -25,7 +31,7 @@ export const TrashPage: React.FC = () => {
             {trash.length === 0 ? (
                 <div className="empty-state">
                     <span className="empty-state-icon"><TrashIcon /></span>
-                    <p className="empty-state-title">Nothing in Recently Deleted</p>
+                    <p className="empty-state-title">{trashLoading ? 'Loading…' : 'Nothing in Recently Deleted'}</p>
                     <p className="empty-state-message">Deleted photos rest here for 30 days before they’re gone for good.</p>
                     <div className="empty-state-action">
                         <button type="button" className="btn" onClick={() => navigate('gallery')}>Back to Gallery</button>
@@ -35,6 +41,9 @@ export const TrashPage: React.FC = () => {
                 <div className="pt-grid">
                     {trash.map((t) => (
                         <div key={t.photo.id} className={`pt-tile pt-trash-tile mock-swatch ${t.photo.swatch}`}>
+                            {thumbs[t.photo.filename] && (
+                                <img className="pt-tile-img" src={thumbs[t.photo.filename]} alt={t.photo.filename} loading="lazy" draggable={false} />
+                            )}
                             <div className="pt-trash-actions">
                                 <button type="button" title="Restore" aria-label="Restore" onClick={() => restorePhotos([t.photo.id])}><ArrowUturnLeftIcon /></button>
                                 <button type="button" title="Delete forever" aria-label="Delete forever" onClick={() => purgePhoto(t.photo.id)}><TrashIcon /></button>

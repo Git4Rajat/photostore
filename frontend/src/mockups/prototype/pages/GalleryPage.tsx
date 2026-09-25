@@ -1,18 +1,64 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { ArrowUpTrayIcon, PhotoIcon, UserPlusIcon } from '@heroicons/react/24/outline';
-import { useStore } from '../store';
-import { useSimulatedUpload } from '../../useSimulatedUpload';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowUpTrayIcon, MagnifyingGlassMinusIcon, MagnifyingGlassPlusIcon, PhotoIcon, UserPlusIcon } from '@heroicons/react/24/outline';
+import { useStore, isVideoFilename } from '../store';
+import type { MediaFilter } from '../store';
+import { useAppServices } from '../../../components/AppServicesProvider';
 import PhotoGrid from '../components/PhotoGrid';
+import TimelineRail from '../components/TimelineRail';
+
+const TILE_MIN = 120;
+const TILE_STEP = 30;
+const TILE_RANGE = { min: 72, max: 260 };
+const clampTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(TILE_RANGE.min, n));
+
+const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
+    { value: 'all', label: 'All' },
+    { value: 'photo', label: 'Photos' },
+    { value: 'video', label: 'Videos' },
+];
 
 /** Gallery — the populated grid + drag-and-drop upload + the empty first-run state. */
 export const GalleryPage: React.FC = () => {
-    const { photos, addPhotos, navigate, uploadRequest, selectMany, clearSelection, selection, toast } = useStore();
-    const { state, start, cancel, reset } = useSimulatedUpload();
+    const {
+        photos, navigate, selectMany, clearSelection, selection, photosLoading, hasMorePhotos,
+        loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
+    } = useStore();
+    const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
     const [dragging, setDragging] = useState(false);
+    const [tileMin, setTileMin] = useState(TILE_MIN);
     const depth = useRef(0);
-    const pending = useRef(0);
-    const firstReq = useRef(uploadRequest);
     const gridRef = useRef<HTMLDivElement>(null);
+    const sentinelRef = useRef<HTMLDivElement>(null);
+    const pinchRef = useRef<{ dist: number; tile: number } | null>(null);
+
+    const touchDistance = (t: React.TouchList) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const onTouchStart = (e: React.TouchEvent) => {
+        if (e.touches.length === 2) pinchRef.current = { dist: touchDistance(e.touches), tile: tileMin };
+    };
+    const onTouchMove = (e: React.TouchEvent) => {
+        if (e.touches.length === 2 && pinchRef.current) {
+            const ratio = touchDistance(e.touches) / pinchRef.current.dist;
+            // Pinch out (ratio > 1) => bigger tiles; pinch in => smaller.
+            setTileMin(clampTile(Math.round(pinchRef.current.tile * ratio)));
+        }
+    };
+    const onTouchEnd = (e: React.TouchEvent) => {
+        if (e.touches.length < 2) pinchRef.current = null;
+    };
+
+    // Refresh the grid whenever an upload session finishes so new photos appear.
+    useEffect(() => registerUploadCompletionHandler(() => { reloadPhotos(); }), [registerUploadCompletionHandler, reloadPhotos]);
+
+    // Infinite scroll: load the next page when the bottom sentinel scrolls into view.
+    useEffect(() => {
+        const node = sentinelRef.current;
+        if (!node || !hasMorePhotos) return undefined;
+        const observer = new IntersectionObserver((entries) => {
+            if (entries.some((e) => e.isIntersecting)) loadMorePhotos();
+        }, { rootMargin: '600px' });
+        observer.observe(node);
+        return () => observer.disconnect();
+    }, [hasMorePhotos, loadMorePhotos, photos.length]);
 
     const selectVisible = () => {
         if (!gridRef.current) return;
@@ -30,38 +76,41 @@ export const GalleryPage: React.FC = () => {
         if (visible.length > 0) selectMany(visible);
     };
 
-    const begin = (count: number) => {
-        pending.current = count;
-        reset();
-        start(count, 0.02);
-    };
-
-    // Topbar / empty-state upload button routes through the store's request signal.
-    useEffect(() => {
-        if (uploadRequest !== firstReq.current) begin(512);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [uploadRequest]);
-
-    // When a run completes, the photos land in the grid.
-    useEffect(() => {
-        if (state.complete && pending.current > 0) {
-            const added = addPhotos(pending.current - state.failedCount);
-            toast(`Added ${added.length} photo${added.length > 1 ? 's' : ''}`);
-            pending.current = 0;
-        }
-    }, [state.complete, state.failedCount, addPhotos, toast]);
-
     const onDrop = (e: React.DragEvent) => {
         e.preventDefault();
         depth.current = 0;
         setDragging(false);
-        const n = e.dataTransfer?.files?.length || 24;
-        begin(n);
+        const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/') || f.type.startsWith('video/') || /\.(heic|heif|cr2|cr3|arw|nef|dng|raf)$/i.test(f.name));
+        if (files.length) void startUpload(files);
     };
 
-    const pct = state.total ? Math.round((state.done / state.total) * 100) : 0;
+    // Live upload progress from the active upload notification.
+    const progress = notifications.map((n) => n.progress).find((p) => p && p.totalCount > 0);
+    const pct = progress && progress.totalCount ? Math.round((progress.uploadedCount / progress.totalCount) * 100) : 0;
+    const showFailed = !uploading && (pendingUploadSummary?.failedCount ?? 0) > 0;
 
-    if (photos.length === 0 && !state.running) {
+    // Client-side photo/video split over the loaded page(s). Media type isn't a
+    // server filter here, so this narrows what's already fetched by extension.
+    const visiblePhotos = useMemo(() => {
+        if (mediaFilter === 'all') return photos;
+        return photos.filter((p) => (mediaFilter === 'video' ? isVideoFilename(p.filename) : !isVideoFilename(p.filename)));
+    }, [photos, mediaFilter]);
+
+    const countLabel = totalPhotos !== null
+        ? `${totalPhotos.toLocaleString()} photo${totalPhotos === 1 ? '' : 's'}`
+        : `${photos.length}${hasMorePhotos ? '+' : ''} photos`;
+
+    if (photos.length === 0 && photosLoading) {
+        return (
+            <div className="pt-arrive">
+                <div className="empty-state">
+                    <p className="empty-state-message">Loading your photos…</p>
+                </div>
+            </div>
+        );
+    }
+
+    if (photos.length === 0 && !uploading) {
         return (
             <div className="pt-arrive">
                 <div className="empty-state">
@@ -71,7 +120,7 @@ export const GalleryPage: React.FC = () => {
                         Upload your first photos and Keepsake starts sorting faces, places and moments as they come in.
                     </p>
                     <div className="empty-state-action pt-arrive-actions">
-                        <button type="button" className="btn mock-cta" onClick={() => begin(120)}>
+                        <button type="button" className="btn mock-cta" onClick={requestUpload}>
                             <ArrowUpTrayIcon className="toolbar-icon" /> Upload photos
                         </button>
                         <button type="button" className="btn" onClick={() => navigate('sharing')}>
@@ -88,9 +137,24 @@ export const GalleryPage: React.FC = () => {
             <div className="pt-toolbar">
                 <div>
                     <h1 className="pt-page-title">Gallery</h1>
-                    <p className="pt-page-sub">{photos.length} photos</p>
+                    <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
                 </div>
                 <div className="pt-toolbar-actions">
+                    <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
+                        {MEDIA_FILTERS.map((f) => (
+                            <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} onClick={() => setMediaFilter(f.value)}>
+                                {f.label}
+                            </button>
+                        ))}
+                    </div>
+                    <div className="pt-zoom" role="group" aria-label="Thumbnail size">
+                        <button type="button" className="btn" aria-label="Smaller thumbnails" disabled={tileMin <= TILE_RANGE.min} onClick={() => setTileMin((n) => clampTile(n - TILE_STEP))}>
+                            <MagnifyingGlassMinusIcon className="toolbar-icon" />
+                        </button>
+                        <button type="button" className="btn" aria-label="Larger thumbnails" disabled={tileMin >= TILE_RANGE.max} onClick={() => setTileMin((n) => clampTile(n + TILE_STEP))}>
+                            <MagnifyingGlassPlusIcon className="toolbar-icon" />
+                        </button>
+                    </div>
                     {selection.length === 0 ? (
                         <button type="button" className="btn" onClick={selectVisible}>
                             Select visible
@@ -103,21 +167,24 @@ export const GalleryPage: React.FC = () => {
                 </div>
             </div>
 
-            {(state.running || (state.complete && state.failedCount > 0)) && (
-                <div className={`upload-dock${state.complete ? ' is-done' : ''}`}>
-                    {state.running ? (
+            {timeline && (
+                <TimelineRail timeline={timeline} captureRange={captureRange} onSelect={setCaptureRange} />
+            )}
+
+            {(uploading || showFailed) && (
+                <div className={`upload-dock${!uploading ? ' is-done' : ''}`}>
+                    {uploading ? (
                         <>
-                            <span className="count">Uploading {state.done} / {state.total}</span>
+                            <span className="count">{progress ? `Uploading ${progress.uploadedCount} / ${progress.totalCount}` : 'Uploading…'}</span>
                             <span className="track"><span className="fill" style={{ width: `${pct}%` }} /></span>
-                            <span className="rate">{state.mbps.toFixed(1)} MB/s</span>
-                            <button type="button" className="btn" onClick={() => { cancel(); pending.current = 0; }}>Cancel</button>
+                            {progress?.mbPerSecond ? <span className="rate">{progress.mbPerSecond.toFixed(1)} MB/s</span> : null}
+                            <button type="button" className="btn" onClick={stopActiveUpload}>Stop</button>
                         </>
                     ) : (
                         <>
-                            <span className="done-label">Uploaded {state.total - state.failedCount} of {state.total}</span>
+                            <span className="done-label">Upload finished</span>
                             <span className="track"><span className="fill" style={{ width: '100%' }} /></span>
-                            <span className="failed">{state.failedCount} failed</span>
-                            <button type="button" className="btn" onClick={reset}>Dismiss</button>
+                            <span className="failed">{pendingUploadSummary?.failedCount} failed</span>
                         </>
                     )}
                 </div>
@@ -126,12 +193,21 @@ export const GalleryPage: React.FC = () => {
             <div
                 className={`pt-drop-surface${dragging ? ' dragging' : ''}`}
                 ref={gridRef}
+                style={{ ['--pt-tile-min' as string]: `${tileMin}px` } as React.CSSProperties}
                 onDragEnter={(e) => { e.preventDefault(); depth.current += 1; setDragging(true); }}
                 onDragOver={(e) => e.preventDefault()}
                 onDragLeave={(e) => { e.preventDefault(); depth.current = Math.max(0, depth.current - 1); if (!depth.current) setDragging(false); }}
                 onDrop={onDrop}
+                onTouchStart={onTouchStart}
+                onTouchMove={onTouchMove}
+                onTouchEnd={onTouchEnd}
             >
-                <PhotoGrid photos={photos} gridRef={gridRef} />
+                <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable />
+                {mediaFilter !== 'all' && visiblePhotos.length === 0 && (
+                    <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
+                )}
+                <div ref={sentinelRef} className="pt-scroll-sentinel" aria-hidden="true" />
+                {photosLoading && photos.length > 0 && <p className="pt-grid-empty">Loading more…</p>}
                 <div className="pt-drop-overlay">
                     <span className="drop-icon"><ArrowUpTrayIcon /></span>
                     <b>Drop to add to Keepsake</b>

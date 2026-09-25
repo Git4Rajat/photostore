@@ -244,6 +244,9 @@ interface AppServicesContextValue {
     pendingUploadFailedFiles: PersistedUploadFile[];
     queuedUploadFileCount: number;
     requestUpload: () => void;
+    // Directly upload a set of files (e.g. drag-and-drop), bypassing the native
+    // picker that requestUpload opens.
+    startUpload: (filesToUpload: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => Promise<void>;
     resumeAllPendingUploads: () => Promise<void>;
     stopActiveUpload: () => void;
     retryPersistedUploadSession: () => Promise<void>;
@@ -4547,6 +4550,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         pendingUploadFailedFiles,
         queuedUploadFileCount,
         requestUpload,
+        startUpload,
         resumeAllPendingUploads,
         stopActiveUpload,
         retryPersistedUploadSession,
@@ -4579,6 +4583,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         pendingUploadFailedFiles,
         queuedUploadFileCount,
         requestUpload,
+        startUpload,
         resumeAllPendingUploads,
         stopActiveUpload,
         retryPersistedUploadSession,

@@ -1,6 +1,5 @@
 import React from 'react';
 import {
-    ArrowUpTrayIcon,
     EllipsisVerticalIcon,
     PlusIcon,
     StarIcon,
@@ -13,10 +12,11 @@ import { useStore } from '../store';
 
 /**
  * Compact floating menu for multi-selection. Delete button always visible,
- * other actions (rate/album/share) in options menu.
+ * other actions (rate/album/workbench) in the options menu. Sharing is
+ * intentionally album-only, so there's no per-photo/selection share here.
  */
 export const CommandBar: React.FC = () => {
-    const { selection, ratePhotos, deletePhotos, toast } = useStore();
+    const { selection, ratePhotos, deletePhotos, navigate, toast } = useStore();
     if (!selection.length) return null;
 
     return (
@@ -66,11 +66,7 @@ export const CommandBar: React.FC = () => {
                             )}
                         />
 
-                        <button type="button" className="pt-fm-item" onClick={() => { toast(`Shared ${selection.length}`); close(); }}>
-                            <ArrowUpTrayIcon /> Share
-                        </button>
-
-                        <button type="button" className="pt-fm-item" onClick={() => { toast(`Opened in Workbench`); close(); }}>
+                        <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
                             <WrenchScrewdriverIcon /> Workbench
                         </button>
                     </div>
