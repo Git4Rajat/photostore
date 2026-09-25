@@ -1,4 +1,4 @@
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 
 const MOVE_THRESHOLD_PX = 6;
 
@@ -28,6 +28,17 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
     const draggingRef = useRef(false);
     const targetStateRef = useRef(false);
     const visitedRef = useRef<Set<string>>(new Set());
+
+    // Cancel drag selection if the user scrolls, since scroll changes which
+    // tiles are under the pointer coordinates.
+    useEffect(() => {
+        const handleScroll = () => {
+            originRef.current = null;
+            draggingRef.current = false;
+        };
+        window.addEventListener('scroll', handleScroll, { capture: true });
+        return () => window.removeEventListener('scroll', handleScroll, { capture: true });
+    }, []);
 
     const tileIdAt = (x: number, y: number): string | undefined => {
         const el = document.elementFromPoint(x, y);

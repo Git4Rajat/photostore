@@ -109,6 +109,8 @@ export const PhotoViewer: React.FC = () => {
         });
     }, [photo, toast]);
 
+    const photoRef = useRef<HTMLDivElement>(null);
+
     useEffect(() => {
         if (!viewer) return undefined;
         const onKey = (e: KeyboardEvent) => {
@@ -121,6 +123,18 @@ export const PhotoViewer: React.FC = () => {
         document.addEventListener('keydown', onKey);
         return () => document.removeEventListener('keydown', onKey);
     }, [viewer, closeViewer, viewerStep, zoomBy]);
+
+    useEffect(() => {
+        const el = photoRef.current;
+        if (!el) return undefined;
+        const onWheel = (e: WheelEvent) => {
+            if (!e.ctrlKey && !e.metaKey) return;
+            e.preventDefault();
+            zoomBy(e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP);
+        };
+        el.addEventListener('wheel', onWheel, { passive: false });
+        return () => el.removeEventListener('wheel', onWheel);
+    }, [zoomBy]);
 
     if (!viewer) return null;
     if (!photo) return null;
@@ -167,9 +181,9 @@ export const PhotoViewer: React.FC = () => {
                         <ChevronLeftIcon />
                     </button>
                     <div
+                        ref={photoRef}
                         className="pt-viewer-photo"
                         onDoubleClick={() => (zoomed ? resetZoom() : zoomBy(ZOOM_STEP * 2))}
-                        onWheel={(e) => { if (e.ctrlKey || e.metaKey) { e.preventDefault(); zoomBy(e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP); } }}
                         onMouseDown={(e) => { if (zoomed) panRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y }; }}
                         onMouseMove={(e) => {
                             const p = panRef.current;
