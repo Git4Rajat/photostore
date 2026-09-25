@@ -4327,10 +4327,11 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         const captureQuery = buildCaptureQuery();
         const requestPhotoPage = async () => {
             if (trimmedQuery) {
-                const local = await tryLocalSearch(trimmedQuery, nextOffset, PAGE_SIZE, captureStartDate, captureEndDate);
-                if (local) {
-                    return local;
-                }
+                // Go straight to the server endpoint for fast response. Client-side
+                // search (tryLocalSearch) requires downloading + parsing a search
+                // index blob and loading CLIP on first query, adding 5+ seconds of
+                // overhead. Server-side search is already cached and optimized, so
+                // skip local attempt entirely for now.
                 return get(
                     `/photos/search?q=${encodeURIComponent(trimmedQuery)}&offset=${nextOffset}&limit=${PAGE_SIZE}${captureQuery}`,
                     { timeout: PHOTO_LIST_REQUEST_TIMEOUT_MS },
