@@ -5132,8 +5132,14 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             setTypeaheadSuggestions([]);
             return undefined;
         }
+        // Only the fragment currently being typed -- the trailing run of
+        // non-space characters -- should be prefix-matched against known
+        // names/places. The suggest endpoint does a whole-string startsWith,
+        // so sending the full box (e.g. "priya at the beach, 2022 li") would
+        // never match anything once earlier clauses are already present.
+        const lastToken = trimmed.slice(trimmed.search(/\S+$/));
         const timeoutId = window.setTimeout(() => {
-            get(`/api/search/suggest?q=${encodeURIComponent(trimmed)}`)
+            get(`/api/search/suggest?q=${encodeURIComponent(lastToken)}`)
                 .then((response) => {
                     const list: TypeaheadSuggestion[] = Array.isArray(response?.suggestions) ? response.suggestions : [];
                     setTypeaheadSuggestions(list);
@@ -5145,9 +5151,17 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
 
     const applyTypeaheadSuggestion = (item: TypeaheadSuggestion) => {
         skipTypeaheadFetchRef.current = true;
-        setSearchInput(item.label);
+        // Replace only the trailing fragment that produced this suggestion,
+        // keeping any earlier clauses already typed (e.g.
+        // "priya at the beach, 2022 li" + "Lisbon" -> "...2022 Lisbon", not
+        // just "Lisbon").
+        const trimmed = searchInput.trim();
+        const lastTokenStart = trimmed.search(/\S+$/);
+        const prefix = lastTokenStart > 0 ? trimmed.slice(0, lastTokenStart) : '';
+        const nextValue = `${prefix}${item.label}`;
+        setSearchInput(nextValue);
         setTypeaheadSuggestions([]);
-        submitSearch(item.label);
+        submitSearch(nextValue);
     };
 
     useEffect(() => {

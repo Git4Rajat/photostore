@@ -1,0 +1,763 @@
+/* =================================================================
+   MOCKUPS-ONLY styling — Roll 02 UX frames (Cover / Invite / Drop /
+   Arrive). Standalone dev harness, NOT shipped with the app. Loaded
+   only by /mockups.html via src/mockups/main.tsx, after index.css so
+   it can lean on the real design tokens (--bg-1, --accent, --grease,
+   --lg-surface*, --r-*, the three font stacks) while adding classes
+   that don't exist in the app yet. Every colour here references a real
+   token so light/dark parity comes for free.
+   ================================================================= */
+
+/* ---- Harness chrome (the light-table around the mock, never shipped) ---- */
+.mock-root {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 28px 20px 80px;
+}
+.mock-masthead {
+  margin-bottom: 20px;
+}
+.mock-eyebrow {
+  font-family: var(--font-label);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--grease);
+}
+.mock-masthead h1 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(1.5rem, 3.4vw, 2.1rem);
+  margin: 0.3rem 0 0.5rem;
+  color: var(--text);
+}
+.mock-masthead p {
+  max-width: 70ch;
+  color: var(--muted);
+  line-height: 1.55;
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.mock-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-md);
+  background: var(--lg-surface-wash);
+}
+.mock-control-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mock-control-label {
+  font-family: var(--font-label);
+  font-size: 0.66rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mock-seg {
+  display: inline-flex;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-pill);
+  overflow: hidden;
+}
+.mock-seg button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.mock-seg button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.mock-filmstrip {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 14px 0 4px;
+  margin: 8px 0 18px;
+  border-top: 1px dashed var(--lg-edge);
+  border-bottom: 1px dashed var(--lg-edge);
+}
+.mock-tab {
+  appearance: none;
+  flex: 0 0 auto;
+  text-align: left;
+  font-family: var(--font-label);
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+  cursor: pointer;
+  background: transparent;
+}
+.mock-tab:hover {
+  color: var(--text);
+  border-color: var(--muted);
+}
+.mock-tab.active {
+  color: var(--text);
+  border-color: var(--grease);
+  background: var(--grease-soft);
+}
+.mock-tab span {
+  display: block;
+  font-family: var(--font-ui);
+  font-size: 0.74rem;
+  text-transform: none;
+  letter-spacing: 0;
+  margin-top: 2px;
+  color: inherit;
+}
+
+/* the "loupe" mount: a phone frame in mobile mode, full-bleed in desktop */
+.mock-stage {
+  display: flex;
+  justify-content: center;
+  position: absolute;
+  top: 50px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  overflow: auto;
+}
+.mock-viewport {
+  width: 100%;
+  height: 100%;
+  container-type: inline-size;
+  border: none;
+  border-radius: 0;
+  overflow: hidden;
+  background: var(--bg-1);
+}
+.mock-viewport.is-mobile {
+  width: 402px;
+  max-width: 100%;
+  border-radius: 34px;
+  padding: 8px;
+  background: var(--bg-3);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+}
+.mock-viewport.is-mobile .mock-app {
+  border-radius: 26px;
+  height: 760px;
+  max-height: 76vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.mock-app {
+  background: var(--bg-1);
+  min-height: 540px;
+}
+/* Reproduce the app's warm blob backdrop so the glass topbar reads right. */
+.mock-app::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(60% 50% at 15% 0%, var(--bg-blob-1), var(--bg-blob-1-end) 70%),
+    radial-gradient(60% 50% at 100% 20%, var(--bg-blob-2), var(--bg-blob-2-end) 70%);
+}
+.mock-app > * { position: relative; z-index: 1; }
+
+.mock-body {
+  padding: clamp(12px, 3vw, 20px);
+}
+
+/* Trim the sticky header's outer margins so it sits flush inside the mount. */
+.mock-app .ios-header {
+  margin: 8px;
+}
+
+/* The desktop nav collapses to a single hamburger on a narrow viewport,
+   same as the real app. Reproduce a mobile tab bar for the phone view. */
+.mock-tabbar {
+  display: none;
+}
+
+@container (max-width: 620px) {
+  .mock-app .ios-tabs { display: none; }
+  .mock-app { padding-bottom: 60px; } /* space for fixed tabbar */
+  .mock-tabbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-around;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 40;
+    padding: 8px 4px calc(8px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--lg-edge);
+    background: var(--lg-surface-strong);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+    font-size: 0.66rem;
+    color: var(--muted);
+  }
+  .mock-tabbar .on { color: var(--accent); font-weight: 700; }
+}
+
+/* the account-menu avatar in the mock topbar */
+.mock-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+.mock-bell {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--lg-edge);
+  background: var(--lg-surface-wash);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+.mock-bell .dot {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--grease);
+}
+.mock-bell svg { width: 17px; height: 17px; }
+
+/* The real base .btn sets no display/gap, so an icon+text button renders with
+   the SVG jammed against the label. Give mock buttons the intended inline-flex
+   layout (shipping these buttons would add the same). Scoped to .mock-app so it
+   never leaks into the harness chrome. */
+.mock-app .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+/* shared: primary CTA in the *intended* warm accent (the real .btn-primary
+   still ships a leftover iOS-blue gradient — one of the flagged fixes). */
+.btn.mock-cta {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+.btn.mock-cta:hover { background: color-mix(in srgb, var(--accent) 88%, black); }
+
+.mock-section-label {
+  font-family: var(--font-label);
+  font-size: 0.66rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 4px 0 10px;
+}
+
+/* placeholder photo swatches (stand in for real thumbnails) */
+.mock-swatch { background: linear-gradient(135deg, #7a8b6f, #b7c39a); }
+.mock-swatch.s2 { background: linear-gradient(135deg, #3f5a73, #8fb4c9); }
+.mock-swatch.s3 { background: linear-gradient(135deg, #a3673f, #d9b088); }
+.mock-swatch.s4 { background: linear-gradient(135deg, #5c4b6b, #a68fc0); }
+.mock-swatch.s5 { background: linear-gradient(135deg, #6f7a4a, #c3cf8f); }
+.mock-swatch.s6 { background: linear-gradient(135deg, #7a4a4f, #c98f92); }
+.mock-swatch.s7 { background: linear-gradient(135deg, #2e5f5a, #7fb3ac); }
+.mock-swatch.s8 { background: linear-gradient(135deg, #8a7a3f, #d6c079); }
+
+/* grease-pencil callout marks, matching the sketchbook */
+.mock-note-list { margin-top: 16px; display: grid; gap: 8px; }
+.mock-note {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 0.9rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.mock-note b { color: var(--text); }
+.mock-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--grease);
+  color: #fff;
+  font-family: var(--font-label);
+  font-size: 0.62rem;
+  font-weight: 700;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+/* =========================== FRAME 09 — Albums ===================== */
+.albm-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 16px;
+}
+@container (max-width: 620px) {
+  .albm-layout { grid-template-columns: 1fr; }
+}
+.albm-sidebar { padding: 12px; }
+.albm-rowbtn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  color: var(--text);
+}
+.albm-rowbtn + .albm-rowbtn { margin-top: 2px; }
+.albm-rowbtn:hover { background: var(--lg-surface-wash); }
+.albm-rowbtn.active { background: var(--accent-soft); }
+.albm-cover {
+  width: 52px;
+  height: 52px;
+  border-radius: var(--r-xs);
+  flex: 0 0 auto;
+  object-fit: cover;
+}
+.albm-meta { display: flex; flex-direction: column; min-width: 0; }
+.albm-meta b { font-size: 0.9rem; font-weight: 650; }
+.albm-meta span { font-size: 0.76rem; color: var(--muted); }
+
+.albm-detail { padding: 16px; }
+.albm-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.albm-detail-title {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0;
+}
+.albm-detail-sub { font-size: 0.8rem; color: var(--muted); margin: 2px 0 0; }
+
+/* the share sheet that replaces the two prompt() dialogs */
+.share-sheet {
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-md);
+  background: var(--lg-surface-wash);
+  padding: 4px 14px;
+  margin-bottom: 16px;
+}
+.share-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--lg-edge);
+}
+.share-row:last-child { border-bottom: none; }
+.share-row .lbl { display: flex; flex-direction: column; min-width: 0; }
+.share-row .lbl b { font-size: 0.88rem; font-weight: 600; }
+.share-row .lbl span { font-size: 0.76rem; color: var(--muted); }
+.share-url {
+  font-family: var(--font-label);
+  font-size: 0.78rem;
+  background: var(--bg-2);
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-xs);
+  padding: 8px 10px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.share-code {
+  font-family: var(--font-label);
+  font-size: 1.05rem;
+  letter-spacing: 0.24em;
+  color: var(--text);
+}
+
+/* toggle switch */
+.mock-switch {
+  appearance: none;
+  position: relative;
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--lg-edge-strong);
+  border: 0;
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: background var(--dur-quick) ease;
+}
+.mock-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: left var(--dur-quick) ease;
+}
+.mock-switch[aria-checked='true'] { background: var(--accent); }
+.mock-switch[aria-checked='true']::after { left: 20px; }
+
+.albm-photo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+}
+.albm-photo-grid .cell { aspect-ratio: 1; border-radius: var(--r-xs); }
+
+/* =========================== FRAME 10 — Sharing =================== */
+.lib-card { padding: 16px; margin-bottom: 14px; }
+.lib-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.member-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 4px;
+  border-bottom: 1px solid var(--lg-edge);
+}
+.member-row:last-child { border-bottom: none; }
+.member-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #fff;
+}
+.member-row.pending .member-avatar {
+  background: transparent !important;
+  border: 1.5px dashed var(--muted);
+  color: var(--muted);
+}
+.member-meta { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.member-meta b { font-size: 0.9rem; font-weight: 600; }
+.member-meta span { font-size: 0.76rem; color: var(--muted); }
+.member-badge {
+  font-family: var(--font-label);
+  font-size: 0.6rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--lg-edge);
+  color: var(--muted);
+}
+.member-badge.owner { color: var(--accent); border-color: var(--accent); }
+.member-row .link {
+  color: var(--accent);
+  font-weight: 650;
+  font-size: 0.8rem;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  padding: 4px 6px;
+}
+.member-row .link.muted { color: var(--muted); font-weight: 500; }
+
+.invite-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+.invite-bar .field { flex: 1; width: auto; min-width: 180px; }
+
+/* =========================== FRAME 11 — Upload =================== */
+.upload-dock {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-md);
+  background: var(--lg-surface-strong);
+  font-size: 0.82rem;
+  flex-wrap: wrap;
+}
+.upload-dock .count { font-weight: 700; color: var(--text); white-space: nowrap; }
+.upload-dock .track {
+  flex: 1;
+  min-width: 120px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--lg-edge);
+  overflow: hidden;
+}
+/* display:block so the inline-by-default <span> actually takes width/height */
+.upload-dock .fill { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+.upload-dock .rate { color: var(--muted); font-variant-numeric: tabular-nums; }
+.upload-dock .failed { color: var(--grease); font-weight: 650; }
+.upload-dock .details {
+  margin-left: auto;
+  color: var(--accent);
+  font-weight: 650;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.drop-surface { position: relative; }
+.drop-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  gap: 6px;
+  transition: opacity var(--dur-base) ease, filter var(--dur-base) ease;
+}
+.drop-grid .cell { aspect-ratio: 1; border-radius: var(--r-xs); }
+.drop-surface.dragging .drop-grid { opacity: 0.35; filter: blur(1px); }
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-align: center;
+  border: 2px dashed var(--accent);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--accent-soft) 100%, transparent);
+  color: var(--accent);
+  font-weight: 650;
+}
+.drop-surface.dragging .drop-overlay { display: flex; }
+.drop-overlay .drop-icon {
+  width: 46px; height: 46px;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+}
+.drop-overlay .drop-icon svg { width: 24px; height: 24px; }
+.drop-overlay .sub { font-weight: 400; font-size: 0.82rem; color: var(--muted); }
+.drop-hint {
+  margin-top: 12px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-align: center;
+}
+.drop-hint button {
+  border: 0; background: none; color: var(--accent);
+  font: inherit; font-weight: 650; cursor: pointer;
+}
+
+/* generic inline text link/button used across the prototypes */
+.mock-link {
+    color: var(--accent);
+    font-weight: 650;
+    font-size: 0.82rem;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    padding: 4px 6px;
+}
+.mock-link.muted { color: var(--muted); font-weight: 500; }
+.mock-link:disabled { color: var(--muted); opacity: 0.6; cursor: default; }
+
+/* ---- Frame 09 additions: create album + inline rename ---- */
+.albm-newbtn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    margin-top: 8px;
+    padding: 10px;
+    border: 1px dashed var(--lg-edge);
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+.albm-newbtn:hover { color: var(--text); border-color: var(--muted); }
+.albm-newbtn svg { width: 16px; height: 16px; }
+.albm-title-input {
+    font-family: var(--font-display);
+    font-size: 1.25rem;
+    font-weight: 700;
+    width: min(320px, 60vw);
+}
+
+/* ---- Frame 10 additions: per-member role select ---- */
+.member-role {
+    width: auto;
+    min-width: 0;
+    padding: 6px 8px;
+    font-size: 0.78rem;
+}
+.member-flash {
+    font-size: 0.78rem;
+    color: var(--success);
+    font-weight: 650;
+    padding: 4px 6px;
+}
+
+/* ---- Frame 11 additions: done state + retry list + controls ---- */
+.upload-dock.is-done .fill { background: var(--success); }
+.upload-dock .done-label { color: var(--text); font-weight: 700; white-space: nowrap; }
+.upload-retry {
+    margin: 0 0 14px;
+    border: 1px solid var(--lg-edge);
+    border-radius: var(--r-md);
+    overflow: hidden;
+    background: var(--lg-surface-wash);
+}
+.upload-retry .head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--lg-edge);
+    font-family: var(--font-label);
+    font-size: 0.66rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+.upload-retry .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--lg-edge);
+    font-size: 0.84rem;
+}
+.upload-retry .row:last-child { border-bottom: none; }
+.upload-retry .row .name { flex: 1; font-family: var(--font-label); font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-retry .row .why { color: var(--grease); font-size: 0.74rem; white-space: nowrap; }
+.drop-controls { display: flex; gap: 8px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+
+/* =========================== FRAME 12 — Arrive =================== */
+.arrive-uploading { text-align: center; padding: 40px 16px 28px; }
+.arrive-uploading .k {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 52px;
+    height: 52px;
+    border-radius: 16px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    margin-bottom: 12px;
+}
+.arrive-uploading .k svg { width: 26px; height: 26px; }
+.arrive-uploading h3 { font-family: var(--font-display); font-size: 1.05rem; margin: 0 0 4px; }
+.arrive-uploading .count { color: var(--muted); font-size: 0.85rem; }
+.arrive-uploading .track {
+    max-width: 300px;
+    margin: 16px auto 0;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--lg-edge);
+    overflow: hidden;
+}
+.arrive-uploading .fill { display: block; height: 100%; background: var(--accent); transition: width 0.14s linear; }
+.arrive-gallery {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+    gap: 6px;
+}
+.arrive-gallery .cell { aspect-ratio: 1; border-radius: var(--r-xs); }
+.arrive-ready-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+.arrive-ready-head h3 { font-family: var(--font-display); font-size: 1.15rem; margin: 0; }
+.arrive-ready-head p { margin: 2px 0 0; font-size: 0.82rem; color: var(--muted); }
+
+/* =========================== FRAME 12 — Arrive (original) ======== */
+.arrive-wrap { max-width: 620px; margin: 0 auto; padding-top: 12px; }
+.arrive-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.arrive-preview {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 24px;
+}
+@container (max-width: 620px) {
+  .arrive-preview { grid-template-columns: 1fr; }
+}
+.arrive-preview .card-glass {
+  padding: 16px;
+  text-align: center;
+}
+.arrive-preview .card-glass .k {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px; height: 38px;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.arrive-preview .card-glass .k svg { width: 20px; height: 20px; }
+.arrive-preview .card-glass b { display: block; font-size: 0.9rem; margin-bottom: 3px; }
+.arrive-preview .card-glass span { font-size: 0.8rem; color: var(--muted); }
