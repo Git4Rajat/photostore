@@ -1,4 +1,4 @@
-import type { Album, Member, Person, Photo, Place, Suggestion, ThingTag } from './types';
+import type { Person, Photo, Place, Suggestion, ThingTag } from './types';
 import type { SwatchKey } from './types';
 
 // Seed data for the prototype. Generated once at module load so it stays
@@ -74,43 +74,6 @@ for (const person of PEOPLE) {
         person.photoIds = PHOTOS.slice(0, 6).map((p) => p.id);
     }
 }
-
-export const ALBUMS: Album[] = [
-    {
-        id: 'algarve',
-        name: 'Algarve, 2022',
-        coverPhotoId: 'p2',
-        photoIds: PHOTOS.slice(0, 12).map((p) => p.id),
-        share: { isPublic: true, expiry: '7', code: '4F2A' },
-    },
-    {
-        id: 'reunion',
-        name: 'Family Reunion',
-        coverPhotoId: 'p6',
-        photoIds: PHOTOS.slice(6, 20).map((p) => p.id),
-        share: { isPublic: false, expiry: '7', code: '9K3P' },
-    },
-    {
-        id: 'dog',
-        name: 'Dog: the sequel',
-        coverPhotoId: 'p3',
-        photoIds: PHOTOS.slice(12, 22).map((p) => p.id),
-        share: { isPublic: false, expiry: '30', code: 'B7QX' },
-    },
-    {
-        id: 'screens',
-        name: 'Screenshots I keep',
-        coverPhotoId: 'p1',
-        photoIds: PHOTOS.slice(20, 28).map((p) => p.id),
-        share: { isPublic: false, expiry: '7', code: 'M2W6' },
-    },
-];
-
-export const MEMBERS: Member[] = [
-    { id: 'me', name: 'Rajat Verma', sub: 'rajat@example.com', initials: 'RV', color: 'linear-gradient(135deg,#3f5a73,#6fa3c9)', role: 'owner' },
-    { id: 'priya', name: 'Priya S.', sub: 'Member · joined Sep 12', initials: 'PS', color: 'linear-gradient(135deg,#7a4a4f,#c98f92)', role: 'contribute' },
-    { id: 'rohan', name: 'rohan@example.com', sub: 'Invited 2 days ago', initials: '?', color: '', role: 'view', pending: true },
-];
 
 export const SUGGESTIONS: Suggestion[] = [
     { id: 'trip', text: 'Trip to Lisbon · Mar 14–16 · 42 photos', action: 'Create album', target: { page: 'explore' } },

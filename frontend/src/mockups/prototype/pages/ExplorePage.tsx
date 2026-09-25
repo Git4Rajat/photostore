@@ -1,11 +1,15 @@
 import React from 'react';
 import { useStore } from '../store';
+import { useProtectedBlobUrls } from '../../../services/imageClient';
 
 /** Explore — browse by place and by thing, built from data already captured. */
 export const ExplorePage: React.FC = () => {
-    const { places, things, photos, navigate } = useStore();
+    const { places, things, exploreLoading, navigate } = useStore();
+    const covers = useProtectedBlobUrls(
+        [...places, ...things].map((g) => g.coverThumbnailUrl).filter((u): u is string => Boolean(u)),
+    );
 
-    const placeCount = (placeId: string) => photos.filter((p) => p.placeId === placeId).length;
+    const coverFor = (url?: string) => (url ? covers[url] : undefined);
 
     return (
         <div>
@@ -16,29 +20,47 @@ export const ExplorePage: React.FC = () => {
                 </div>
             </div>
 
-            <div className="pt-bigmap" aria-hidden="true">
-                <span className="pt-cluster" style={{ top: '38%', left: '28%' }}>{placeCount('lisbon')}</span>
-                <span className="pt-cluster" style={{ top: '60%', left: '58%' }}>{placeCount('goa')}</span>
-                <span className="pt-cluster" style={{ top: '26%', left: '72%' }}>{placeCount('tokyo')}</span>
-            </div>
+            {exploreLoading && places.length === 0 && things.length === 0 && (
+                <p className="pt-grid-empty">Finding places and things…</p>
+            )}
 
-            <div className="pt-menu-label">Places</div>
-            <div className="pt-place-row">
-                {places.map((pl) => (
-                    <button key={pl.id} type="button" className={`pt-place-card mock-swatch ${pl.swatch}`} onClick={() => navigate('ask', { query: pl.name })}>
-                        <span>{pl.name} · {placeCount(pl.id)}</span>
-                    </button>
-                ))}
-            </div>
+            {places.length > 0 && (
+                <>
+                    <div className="pt-menu-label">Places</div>
+                    <div className="pt-place-row">
+                        {places.map((pl) => {
+                            const src = coverFor(pl.coverThumbnailUrl);
+                            return (
+                                <button key={pl.id} type="button" className={`pt-place-card mock-swatch ${pl.swatch}`} onClick={() => navigate('ask', { query: pl.name })}>
+                                    {src && <img className="pt-explore-cover" src={src} alt={pl.name} />}
+                                    <span>{pl.name} · {pl.count ?? 0}</span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                </>
+            )}
 
-            <div className="pt-menu-label" style={{ marginTop: 18 }}>Things</div>
-            <div className="pt-things-grid">
-                {things.map((t) => (
-                    <button key={t.id} type="button" className={`pt-thing-card mock-swatch ${t.swatch}`} onClick={() => navigate('ask', { query: t.name })}>
-                        <span>{t.name} · {t.count}</span>
-                    </button>
-                ))}
-            </div>
+            {things.length > 0 && (
+                <>
+                    <div className="pt-menu-label" style={{ marginTop: 18 }}>Things</div>
+                    <div className="pt-things-grid">
+                        {things.map((t) => {
+                            const src = coverFor(t.coverThumbnailUrl);
+                            return (
+                                <button key={t.id} type="button" className={`pt-thing-card mock-swatch ${t.swatch}`} onClick={() => navigate('ask', { query: t.name })}>
+                                    {src && <img className="pt-explore-cover" src={src} alt={t.name} />}
+                                    <span>{t.name} · {t.count}</span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                </>
+            )}
+
+            {!exploreLoading && places.length === 0 && things.length === 0 && (
+                <p className="pt-grid-empty">Once your photos have locations and tags, they’ll show up here grouped by place and subject.</p>
+            )}
         </div>
     );
 };

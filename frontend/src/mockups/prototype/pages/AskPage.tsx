@@ -1,58 +1,90 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { MagnifyingGlassIcon, PlusIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
+import { get } from '../../../services/apiClient';
+import type { Photo as BackendPhoto } from '../../../types/uiTypes';
+import type { Photo } from '../types';
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+const mapResult = (b: BackendPhoto): Photo => {
+    const iso = b.captureDate || b.uploadDate || null;
+    const d = iso ? new Date(iso) : null;
+    const valid = d && !Number.isNaN(d.getTime()) ? d : null;
+    return {
+        id: b.filename,
+        filename: b.filename,
+        swatch: 's1',
+        dateLabel: valid ? `${MONTHS[valid.getMonth()]} ${valid.getDate()}, ${valid.getFullYear()}` : '',
+        year: valid ? valid.getFullYear() : 0,
+        rating: b.rating ?? 0,
+        liked: Boolean(b.liked),
+        likes: b.likes,
+        placeId: null,
+        personIds: (b.people ?? []).map((p) => p.personId),
+        tags: b.tags ?? [],
+        thumbnailUrl: b.thumbnailUrl,
+        rotation: b.rotation,
+        thumbnailRotation: b.thumbnailRotation,
+        captureDate: iso,
+    };
+};
 
 /**
- * Ask — one search box fused across people / places / tags / year. Results
- * update as you type, matched people & places surface as cards, live typeahead
- * disambiguates the trailing term, and a search can be saved as an album.
+ * Ask — one search box fused across people / places / things / years. Results
+ * come from the backend search index (GET /photos/search); matched people and
+ * places surface as cards, live typeahead disambiguates the trailing term, and
+ * a search can be saved as an album.
  */
 export const AskPage: React.FC = () => {
-    const { photos, people, places, route, createAlbum, addPhotosToAlbum, navigate, toast } = useStore();
+    const { people, places, route, createAlbum, addPhotosToAlbum, navigate } = useStore();
     const [query, setQuery] = useState(route.params.query ?? '');
+    const [results, setResults] = useState<Photo[]>([]);
+    const [searching, setSearching] = useState(false);
+    const seqRef = useRef(0);
 
     useEffect(() => {
         if (route.params.query !== undefined) setQuery(route.params.query);
     }, [route.params.query]);
 
+    // Debounced server search.
+    useEffect(() => {
+        const trimmed = query.trim();
+        if (!trimmed) {
+            setResults([]);
+            setSearching(false);
+            return;
+        }
+        const seq = ++seqRef.current;
+        setSearching(true);
+        const handle = window.setTimeout(async () => {
+            try {
+                const res = await get<{ photos?: BackendPhoto[] }>(`/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=200`);
+                if (seq !== seqRef.current) return;
+                setResults(Array.isArray(res?.photos) ? res.photos.map(mapResult) : []);
+            } catch {
+                if (seq === seqRef.current) setResults([]);
+            } finally {
+                if (seq === seqRef.current) setSearching(false);
+            }
+        }, 300);
+        return () => window.clearTimeout(handle);
+    }, [query]);
+
     const tokens = useMemo(() => query.toLowerCase().split(/\s+/).filter(Boolean), [query]);
-
-    const matchesToken = (photo: (typeof photos)[number], token: string): boolean => {
-        if (photo.filename.toLowerCase().includes(token)) return true;
-        if (String(photo.year) === token) return true;
-        if (photo.tags.some((t) => t.includes(token))) return true;
-        const place = places.find((pl) => pl.id === photo.placeId);
-        if (place && place.name.toLowerCase().includes(token)) return true;
-        const names = photo.personIds.map((id) => people.find((pp) => pp.id === id)?.name?.toLowerCase() ?? '');
-        return names.some((n) => n && n.includes(token));
-    };
-
-    // Only tokens that match at least one facet constrain the results.
-    const activeTokens = useMemo(
-        () => tokens.filter((tk) => photos.some((p) => matchesToken(p, tk)) || people.some((pp) => pp.name?.toLowerCase().includes(tk)) || places.some((pl) => pl.name.toLowerCase().includes(tk))),
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-        [tokens, photos, people, places],
-    );
-
-    const results = useMemo(() => {
-        if (!activeTokens.length) return [];
-        return photos.filter((p) => activeTokens.every((tk) => matchesToken(p, tk)));
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeTokens, photos]);
+    const lastToken = tokens.length ? tokens[tokens.length - 1] : '';
 
     const matchedPeople = useMemo(
-        () => people.filter((pp) => pp.name && activeTokens.some((tk) => pp.name!.toLowerCase().includes(tk))),
-        [people, activeTokens],
+        () => people.filter((pp) => pp.name && tokens.some((tk) => pp.name!.toLowerCase().includes(tk))),
+        [people, tokens],
     );
     const matchedPlaces = useMemo(
-        () => places.filter((pl) => activeTokens.some((tk) => pl.name.toLowerCase().includes(tk))),
-        [places, activeTokens],
+        () => places.filter((pl) => tokens.some((tk) => pl.name.toLowerCase().includes(tk))),
+        [places, tokens],
     );
 
-    // Typeahead for the trailing term.
-    const lastToken = tokens.length ? tokens[tokens.length - 1] : '';
     const suggestions = useMemo(() => {
         if (!lastToken) return [];
         const pool = [
@@ -68,10 +100,15 @@ export const AskPage: React.FC = () => {
     };
 
     const saveAsAlbum = () => {
-        const id = createAlbum(query.trim() || 'Saved search');
-        addPhotosToAlbum(id, results.map((r) => r.id));
-        navigate('albums', { albumId: id });
+        void (async () => {
+            const id = await createAlbum(query.trim() || 'Saved search');
+            if (!id) return;
+            addPhotosToAlbum(id, results.map((r) => r.id));
+            navigate('albums', { albumId: id });
+        })();
     };
+
+    const hasQuery = query.trim().length > 0;
 
     return (
         <div>
@@ -106,7 +143,7 @@ export const AskPage: React.FC = () => {
                 </div>
             )}
 
-            {activeTokens.length === 0 ? (
+            {!hasQuery ? (
                 <p className="pt-grid-empty">Start typing to search across everything at once.</p>
             ) : (
                 <>
@@ -115,19 +152,19 @@ export const AskPage: React.FC = () => {
                             {matchedPeople.map((p) => (
                                 <div key={p.id} className="card-glass pt-match-card" onClick={() => navigate('person', { personId: p.id })} role="button" tabIndex={0}>
                                     <Swatch swatch={p.swatch} className="pt-match-face" />
-                                    <div><b>{p.name}</b><span>{p.photoIds.length} photos</span></div>
+                                    <div><b>{p.name}</b><span>{p.faceCount ?? 0} photos</span></div>
                                 </div>
                             ))}
                             {matchedPlaces.map((pl) => (
-                                <div key={pl.id} className="card-glass pt-match-card">
+                                <div key={pl.id} className="card-glass pt-match-card" onClick={() => navigate('ask', { query: pl.name })} role="button" tabIndex={0}>
                                     <Swatch swatch={pl.swatch} className="pt-match-face" />
                                     <div><b>{pl.name}</b><span>place</span></div>
                                 </div>
                             ))}
                         </div>
                     )}
-                    <div className="pt-menu-label">{results.length} result{results.length === 1 ? '' : 's'}</div>
-                    <PhotoGrid photos={results} emptyHint="No photos match that search." />
+                    <div className="pt-menu-label">{searching ? 'Searching…' : `${results.length} result${results.length === 1 ? '' : 's'}`}</div>
+                    <PhotoGrid photos={results} emptyHint={searching ? 'Searching…' : 'No photos match that search.'} />
                 </>
             )}
         </div>

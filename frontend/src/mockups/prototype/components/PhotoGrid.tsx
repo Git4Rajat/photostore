@@ -2,6 +2,7 @@ import React from 'react';
 import { CheckCircleIcon, HeartIcon } from '@heroicons/react/24/solid';
 import { StarIcon } from '@heroicons/react/24/solid';
 import { useStore } from '../store';
+import { usePhotoThumbnails } from '../media';
 import type { Photo } from '../types';
 
 /**
@@ -11,46 +12,10 @@ import type { Photo } from '../types';
  */
 export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement> }> = ({ photos, emptyHint }) => {
     const { selection, toggleSelect, selectMany, openViewer } = useStore();
+    const thumbs = usePhotoThumbnails(photos);
     const [lastSelected, setLastSelected] = React.useState<number | null>(null);
     const [dragStart, setDragStart] = React.useState<number | null>(null);
-    const [touchDragStart, setTouchDragStart] = React.useState<number | null>(null);
     const gridRef = React.useRef<HTMLDivElement>(null);
-
-    const getTileIndex = (target: Element): number | null => {
-        const tile = (target as Element).closest('.pt-tile');
-        if (!tile || !gridRef.current) return null;
-        const tiles = Array.from(gridRef.current.querySelectorAll('.pt-tile'));
-        return tiles.indexOf(tile);
-    };
-
-    const getTileAtPoint = (x: number, y: number): number | null => {
-        if (!gridRef.current) return null;
-        const element = document.elementFromPoint(x, y);
-        return getTileIndex(element as Element);
-    };
-
-    const handleTouchStart = (e: React.TouchEvent) => {
-        if (e.touches.length === 0) return;
-        const touch = e.touches[0];
-        const index = getTileAtPoint(touch.clientX, touch.clientY);
-        if (index !== null) setTouchDragStart(index);
-    };
-
-    const handleTouchMove = (e: React.TouchEvent) => {
-        if (touchDragStart === null || e.touches.length === 0) return;
-        const touch = e.touches[0];
-        const index = getTileAtPoint(touch.clientX, touch.clientY);
-        if (index !== null) {
-            const start = Math.min(touchDragStart, index);
-            const end = Math.max(touchDragStart, index);
-            const rangeIds = ids.slice(start, end + 1);
-            selectMany(Array.from(new Set([...selection, ...rangeIds])));
-        }
-    };
-
-    const handleTouchEnd = () => {
-        setTouchDragStart(null);
-    };
 
     if (!photos.length) {
         return <p className="pt-grid-empty">{emptyHint ?? 'Nothing here yet.'}</p>;
@@ -94,9 +59,6 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
             ref={gridRef}
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
-            onTouchStart={handleTouchStart}
-            onTouchMove={handleTouchMove}
-            onTouchEnd={handleTouchEnd}
         >
             {photos.map((photo, i) => {
                 const selected = selection.includes(photo.id);
@@ -117,6 +79,15 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                         onMouseDown={() => handleMouseDown(i)}
                         onMouseEnter={() => handleMouseEnter(i)}
                     >
+                        {thumbs[photo.filename] && (
+                            <img
+                                className="pt-tile-img"
+                                src={thumbs[photo.filename]}
+                                alt={photo.filename}
+                                loading="lazy"
+                                draggable={false}
+                            />
+                        )}
                         <button
                             type="button"
                             className={`pt-tile-check${selected ? ' on' : ''}`}

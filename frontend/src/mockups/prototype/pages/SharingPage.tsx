@@ -1,87 +1,119 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { PaperAirplaneIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
 import { Avatar } from '../components/bits';
-import type { Member } from '../types';
+import * as library from '../../../services/libraryClient';
+import { getRuntimeConfig } from '../../../config/appConfig';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** Sharing — family library members, invites, roles, and library settings. */
+const initialsFor = (value: string): string => {
+    const parts = value.replace(/@.*/, '').split(/[\s._-]+/).filter(Boolean);
+    const letters = parts.length >= 2 ? parts[0][0] + parts[1][0] : value.slice(0, 2);
+    return (letters || '?').toUpperCase();
+};
+
+/** Sharing — shared-library members, pending invites, and library settings. */
 export const SharingPage: React.FC = () => {
-    const { members, invite, cancelInvite, resendInvite, removeMember, setMemberRole, toast } = useStore();
+    const {
+        members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
+        reloadMembers, invite, revokeInvite, removeMember, renameLibrary, toast,
+    } = useStore();
     const [email, setEmail] = useState('');
-    const [role, setRole] = useState<Member['role']>('contribute');
-    const [exportRunning, setExportRunning] = useState(true);
+    const [targetType, setTargetType] = useState<'join' | 'fresh'>('join');
     const valid = EMAIL_RE.test(email.trim());
+    const memberCount = members.length;
+    const atCapacity = memberCount + pendingInvites.filter((p) => p.targetType === 'join').length >= maxMembers;
+
+    useEffect(() => {
+        reloadMembers();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const send = () => {
+        if (!valid || atCapacity) return;
+        invite(email.trim(), targetType);
+        setEmail('');
+    };
+
+    const cleanLibrary = () => {
+        if (!window.confirm('Start library cleanup? This removes ALL photos and videos. You’ll get an emailed link to confirm before anything is deleted.')) return;
+        const passwordMode = (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
+        const password = passwordMode ? (window.prompt('Re-enter your password to continue:') ?? undefined) : undefined;
+        if (passwordMode && !password) return;
+        void library.requestLibraryClean(password)
+            .then((res) => toast(res.sentTo?.length ? `Confirmation link sent to ${res.sentTo.join(', ')}` : 'Cleanup confirmation requested'))
+            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t start cleanup'));
+    };
+
+    const removeLibrary = () => {
+        if (!window.confirm('Delete this entire library and all its photos? This cannot be undone.')) return;
+        if (!window.confirm('Are you absolutely sure? All photos in this library will be permanently deleted.')) return;
+        void library.deleteLibrary()
+            .then(() => { toast('Library deleted'); window.location.reload(); })
+            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t delete library'));
+    };
 
     return (
         <div>
             <div className="pt-toolbar">
                 <div>
                     <h1 className="pt-page-title">Sharing</h1>
-                    <p className="pt-page-sub">Home Library · {members.length} {members.length === 1 ? 'person' : 'people'}</p>
+                    <p className="pt-page-sub">{libraryName || 'Library'} · {memberCount} of {maxMembers} {memberCount === 1 ? 'member' : 'members'}</p>
                 </div>
             </div>
 
             <div className="card-glass lib-card">
+                {membersLoading && members.length === 0 && <div className="member-row"><span className="member-meta"><b>Loading members…</b></span></div>}
                 {members.map((m) => (
-                    <div key={m.id} className={`member-row${m.pending ? ' pending' : ''}`}>
-                        <Avatar initials={m.initials} color={m.color || undefined} />
-                        <span className="member-meta"><b>{m.name}</b><span>{m.sub}</span></span>
-                        {m.role === 'owner' && <span className="member-badge owner">Owner</span>}
-                        {m.pending ? (
-                            <>
-                                <button type="button" className="mock-link" onClick={() => resendInvite(m.id)}>Resend</button>
-                                <button type="button" className="mock-link muted" onClick={() => cancelInvite(m.id)}>Cancel</button>
-                            </>
-                        ) : m.role !== 'owner' ? (
-                            <>
-                                <select className="field member-role" value={m.role} onChange={(e) => setMemberRole(m.id, e.target.value as Member['role'])} aria-label={`Role for ${m.name}`}>
-                                    <option value="view">Can view</option>
-                                    <option value="contribute">Can view &amp; add</option>
-                                </select>
-                                <button type="button" className="mock-link muted" onClick={() => removeMember(m.id)}>Remove</button>
-                            </>
-                        ) : null}
+                    <div key={m.userId} className="member-row">
+                        <Avatar initials={initialsFor(m.email || m.userId)} />
+                        <span className="member-meta"><b>{m.email || m.userId}</b><span>{m.isSelf ? 'You' : 'Member'}</span></span>
+                        {m.isOwner && <span className="member-badge owner">Owner</span>}
+                        {isOwner && !m.isOwner && !m.isSelf && (
+                            <button type="button" className="mock-link muted" onClick={() => removeMember(m.userId)}>Remove</button>
+                        )}
                     </div>
                 ))}
 
-                <div className="invite-bar">
-                    <input className="field" type="email" placeholder="Invite by email" value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && valid) { invite(email.trim(), role); setEmail(''); } }} />
-                    <select className="field field-select" value={role} onChange={(e) => setRole(e.target.value as Member['role'])} aria-label="Permission level">
-                        <option value="view">Can view</option>
-                        <option value="contribute">Can view &amp; add</option>
-                    </select>
-                    <button type="button" className="btn mock-cta" disabled={!valid} onClick={() => { invite(email.trim(), role); setEmail(''); }}>
-                        <PaperAirplaneIcon className="toolbar-icon" /> Send invite
-                    </button>
-                </div>
+                {pendingInvites.map((p) => (
+                    <div key={p.inviteId} className="member-row pending">
+                        <Avatar initials="?" />
+                        <span className="member-meta"><b>{p.email}</b><span>Invited · {p.targetType === 'fresh' ? 'new library' : 'join'}</span></span>
+                        {isOwner && <button type="button" className="mock-link muted" onClick={() => revokeInvite(p.inviteId)}>Revoke</button>}
+                    </div>
+                ))}
+
+                {isOwner ? (
+                    <div className="invite-bar">
+                        <input className="field" type="email" placeholder="Invite by email" value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') send(); }} disabled={atCapacity} />
+                        <select className="field field-select" value={targetType} onChange={(e) => setTargetType(e.target.value as 'join' | 'fresh')} aria-label="Invite type">
+                            <option value="join">Join this library</option>
+                            <option value="fresh">Start their own library</option>
+                        </select>
+                        <button type="button" className="btn mock-cta" disabled={!valid || atCapacity} onClick={send}>
+                            <PaperAirplaneIcon className="toolbar-icon" /> Send invite
+                        </button>
+                    </div>
+                ) : (
+                    <p className="pt-page-sub" style={{ padding: '8px 4px' }}>Only the library owner can invite or remove members.</p>
+                )}
+                {atCapacity && isOwner && <p className="pt-page-sub" style={{ padding: '0 4px' }}>This library is at its member limit.</p>}
             </div>
 
-            <div className="card-glass lib-card">
-                <div className="pt-menu-label">Library settings</div>
-                <div className={`upload-dock${exportRunning ? '' : ' is-done'}`}>
-                    {exportRunning ? (
-                        <>
-                            <span className="count">Exporting 3.2 / 9.4 GB</span>
-                            <span className="track"><span className="fill" style={{ width: '34%' }} /></span>
-                            <span className="rate">18.6 MB/s</span>
-                            <button type="button" className="btn" onClick={() => setExportRunning(false)}>Cancel</button>
-                        </>
-                    ) : (
-                        <>
-                            <span className="done-label">Export canceled</span>
-                            <span className="track"><span className="fill" style={{ width: '34%' }} /></span>
-                            <button type="button" className="btn" onClick={() => setExportRunning(true)}>Restart</button>
-                        </>
-                    )}
+            {isOwner && (
+                <div className="card-glass lib-card">
+                    <div className="pt-menu-label">Library settings</div>
+                    <div className="pt-danger-row">
+                        <button type="button" className="btn" onClick={() => {
+                            const next = window.prompt('Rename library', libraryName);
+                            if (next && next.trim()) renameLibrary(next.trim());
+                        }}>Rename library</button>
+                        <button type="button" className="btn" onClick={cleanLibrary}>Clean library</button>
+                        <button type="button" className="btn btn-danger" onClick={removeLibrary}>Delete library</button>
+                    </div>
                 </div>
-                <div className="pt-danger-row">
-                    <button type="button" className="btn" onClick={() => toast('Rename library')}>Rename library</button>
-                    <button type="button" className="btn" onClick={() => toast('Clean library scheduled')}>Clean library</button>
-                    <button type="button" className="btn btn-danger" onClick={() => toast('Delete library — needs confirmation')}>Delete library</button>
-                </div>
-            </div>
+            )}
         </div>
     );
 };
