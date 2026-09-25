@@ -1836,6 +1836,11 @@ def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
             # No thumbnail blob exists yet; the proxy route falls through to the
             # server-side RAW/HEIC preview converter, which a direct blob URL can't.
             return make_proxy_url(filename, 'thumbnail')
+        # For regular photos without a thumbnail yet, fall back to preview if available.
+        # This is especially important for deleted photos where users need to see what
+        # they're restoring or permanently deleting.
+        if str((metadata or {}).get('preview_status') or '').strip().lower() == 'done':
+            return make_proxy_url(filename, 'preview')
         return ''
     return make_media_url(filename, 'thumbnail', blob_name=_blob_name_from_metadata(metadata, filename))
 
