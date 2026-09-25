@@ -381,6 +381,7 @@ a {
   min-height: 100vh;
   position: relative;
   overflow-x: hidden;
+  overflow-y: auto;
   padding:
     max(38px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(44px, env(safe-area-inset-bottom))
     max(16px, env(safe-area-inset-left));
@@ -4031,6 +4032,12 @@ html[data-theme='light'] .notification-item.unread {
      entirely, so the browser must not also interpret the gesture as a page
      scroll starting here. */
   touch-action: none;
+  /* Without these, iOS Safari's native callout/selection UI can fire on a
+     held touch and cancels the in-flight pointer gesture (pointercancel),
+     silently aborting drag-select before it starts. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .photo-card:hover .tile-select,
@@ -4243,6 +4250,13 @@ html[data-theme='light'] .notification-item.unread {
 
 .photo-preview-star.is-on {
   color: #ffcf4a;
+}
+
+@media (max-width: 720px) {
+  .photo-preview-star {
+    font-size: 16px;
+    padding: 1px;
+  }
 }
 
 .photo-preview-like {
@@ -5259,8 +5273,10 @@ video.photo-preview-media.is-loading {
   inset: 50% auto auto 50%;
   transform: translate(-50%, -50%);
   z-index: 1;
-  display: inline-flex;
+  display: flex;
+  flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 10px;
   padding: 10px 14px;
   border: 1px solid rgba(255, 255, 255, 0.2);

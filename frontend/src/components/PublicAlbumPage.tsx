@@ -288,7 +288,7 @@ const PublicAlbumPage: React.FC = () => {
         const queue = photos
             .slice(0, PREVIEW_PREFETCH_COUNT)
             .filter((photo) => !isVideoFilename(photo.filename))
-            .map((photo) => getMainMediaPath(photo))
+            .map((photo) => getMainMediaPath(photo, true))
             .filter((path): path is string => Boolean(path));
 
         const prefetchOne = (path: string) => new Promise<void>((resolve) => {

@@ -67,12 +67,18 @@ const thumbnailDisplayRotation = (photo?: ViewerPhoto | null) => (
 // PublicAlbumPage's initial-screen preview prefetch) resolve the exact same
 // path the viewer itself will request -- otherwise a mismatched path warms
 // the wrong URL and the later <img src> is still a cold fetch.
-export const getMainMediaPath = (photo?: ViewerPhoto | null) => {
+export const getMainMediaPath = (photo?: ViewerPhoto | null, isPublic: boolean = false) => {
     if (!photo) {
         return '';
     }
     if (photo.previewUrl) {
         return photo.previewUrl;
+    }
+    // For public albums, never use authenticated API endpoints -- previewUrl
+    // should always be populated by the backend, but fall back to the direct URL
+    // if it isn't rather than returning a 404.
+    if (isPublic) {
+        return photo.url || photo.thumbnailUrl || '';
     }
     // The shrunk preview is the default lightbox image for every non-video
     // photo now, not just RAW/HEIC/JXL -- see access-batch's 'preview' kind
@@ -268,7 +274,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
 
     const activePhoto = index !== null ? photos[index] : null;
     const activeIsVideo = Boolean(activePhoto && isVideoFilename(activePhoto.filename));
-    const primaryMediaPath = getMainMediaPath(activePhoto);
+    const primaryMediaPath = getMainMediaPath(activePhoto, !useProtectedMedia);
     const mainMediaPath = mediaPathOverride || primaryMediaPath;
     const shouldProtect = useProtectedMedia && isAuthEnabled();
     const savedRotation = normalizeRotation(activePhoto?.rotation);
@@ -369,7 +375,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         previewPreloadIndexes.forEach((photoIndex) => {
             const neighbor = photos[photoIndex];
             if (neighbor && !isVideoFilename(neighbor.filename || '')) {
-                pushTarget(getMainMediaPath(neighbor), neighbor.filename);
+                pushTarget(getMainMediaPath(neighbor, !shouldProtect), neighbor.filename);
             }
         });
 
@@ -836,7 +842,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                 ...(activeIsVideo ? [] : [mainMediaPath]),
                 ...previewPreloadIndexes
                     .filter((photoIndex) => !isVideoFilename(photos[photoIndex]?.filename || ''))
-                    .map((photoIndex) => getMainMediaPath(photos[photoIndex])),
+                    .map((photoIndex) => getMainMediaPath(photos[photoIndex], !shouldProtect)),
             ];
         const paths = [
             ...mainPreloadPaths,
