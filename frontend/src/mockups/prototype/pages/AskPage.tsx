@@ -49,8 +49,14 @@ export const AskPage: React.FC = () => {
         if (route.params.query !== undefined) setQuery(route.params.query);
     }, [route.params.query]);
 
-    // Debounced server search.
     useEffect(() => {
+        if (!query.trim()) {
+            setResults([]);
+            setSearching(false);
+        }
+    }, [query]);
+
+    const runSearch = () => {
         const trimmed = query.trim();
         if (!trimmed) {
             setResults([]);
@@ -59,7 +65,7 @@ export const AskPage: React.FC = () => {
         }
         const seq = ++seqRef.current;
         setSearching(true);
-        const handle = window.setTimeout(async () => {
+        void (async () => {
             try {
                 const res = await get<{ photos?: BackendPhoto[] }>(`/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=200`);
                 if (seq !== seqRef.current) return;
@@ -69,9 +75,13 @@ export const AskPage: React.FC = () => {
             } finally {
                 if (seq === seqRef.current) setSearching(false);
             }
-        }, 300);
-        return () => window.clearTimeout(handle);
-    }, [query]);
+        })();
+    };
+
+    useEffect(() => {
+        if (route.params.query !== undefined && route.params.query.trim()) runSearch();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [route.params.query]);
 
     const tokens = useMemo(() => query.toLowerCase().split(/\s+/).filter(Boolean), [query]);
     const lastToken = tokens.length ? tokens[tokens.length - 1] : '';
@@ -127,6 +137,9 @@ export const AskPage: React.FC = () => {
                     placeholder="Search people, places, things, years…"
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                        if (e.key === 'Enter') runSearch();
+                    }}
                 />
                 {results.length > 0 && (
                     <button type="button" className="btn mock-cta" onClick={saveAsAlbum}><PlusIcon className="toolbar-icon" /> Save as album</button>

@@ -3,6 +3,7 @@ import { CheckCircleIcon, HeartIcon } from '@heroicons/react/24/solid';
 import { StarIcon } from '@heroicons/react/24/solid';
 import { useStore } from '../store';
 import { usePhotoThumbnails } from '../media';
+import { useDragSelect } from '../../../services/useDragSelect';
 import type { Photo } from '../types';
 
 /**
@@ -31,6 +32,28 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
             longPressTimer.current = null;
         }
     };
+
+    // Mirrors `selection` synchronously so a touch drag-select gesture (which
+    // fires several setSelected calls before React commits a re-render) always
+    // reads the up-to-date set instead of a stale closure -- same hazard the
+    // mouse sweep above works around with dragStartRef.
+    const selectionRef = React.useRef<string[]>(selection);
+    React.useEffect(() => {
+        selectionRef.current = selection;
+    }, [selection]);
+
+    // Press-and-drag multi-select anchored to each tile's checkbox, for touch --
+    // the mouse sweep above (mousedown + mouseenter) has no touch equivalent.
+    const touchDragSelect = useDragSelect({
+        isSelected: (id) => selectionRef.current.includes(id),
+        setSelected: (id, isOn) => {
+            const cur = selectionRef.current;
+            if (cur.includes(id) === isOn) return;
+            const next = isOn ? [...cur, id] : cur.filter((x) => x !== id);
+            selectionRef.current = next;
+            selectMany(next);
+        },
+    });
 
     if (!photos.length) {
         return <p className="pt-grid-empty">{emptyHint ?? 'Nothing here yet.'}</p>;
@@ -89,6 +112,7 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                         role="button"
                         tabIndex={0}
                         data-photo-id={photo.id}
+                        data-tile-id={photo.id}
                         onClick={() => {
                             // Suppress the click that follows a long-press or a
                             // drag-select so it doesn't also open the viewer.
@@ -134,6 +158,12 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                             aria-label={selected ? 'Deselect' : 'Select'}
                             aria-pressed={selected}
                             onClick={(e) => handleCheckClick(e, i)}
+                            // The tile's own onTouchStart (below) starts a
+                            // long-press timer on any touch, including this
+                            // button; stop it here so pressing the checkbox
+                            // to start a drag doesn't also toggle via long-press.
+                            onTouchStart={(e) => e.stopPropagation()}
+                            {...touchDragSelect}
                         >
                             <CheckCircleIcon />
                         </button>

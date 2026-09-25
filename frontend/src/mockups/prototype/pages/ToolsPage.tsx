@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
+import { InformationCircleIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
-import PhotoGrid from '../components/PhotoGrid';
+import WorkbenchGrid from '../components/WorkbenchGrid';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import type { BrowserProcessingAction } from '../../../components/AppServicesProvider';
 import { getTools, postTools, postAdmin } from '../../../services/apiClient';
@@ -29,7 +30,7 @@ interface HistoryEntry { action?: string; steps?: string[]; scope?: string; file
 
 /** Tools — live pipeline health + a bulk re-run row + recovery/history. */
 export const ToolsPage: React.FC = () => {
-    const { toast, route, photosByIds } = useStore();
+    const { toast, route, photos } = useStore();
     const {
         activeJobs, clusteringActive, clusteringStatusLabel, ipworkActive, ipworkStatusLabel,
         startBrowserProcessing, browserProcessingActive, browserAiModelState, loadBrowserAiModel,
@@ -39,14 +40,26 @@ export const ToolsPage: React.FC = () => {
     const [tab, setTab] = useState(workbenchFilenames.length ? 'Workbench' : 'Overview');
     const [steps, setSteps] = useState<string[]>(['OCR', 'Faces']);
     const [wbSteps, setWbSteps] = useState<string[]>(['OCR', 'Faces']);
+    const [wbSelection, setWbSelection] = useState<string[]>(workbenchFilenames);
     const [history, setHistory] = useState<HistoryEntry[]>([]);
     const [busy, setBusy] = useState(false);
 
-    // Resolve deep-linked filenames to photo objects for the Workbench grid,
-    // falling back to a minimal record for any not currently loaded.
-    const workbenchPhotos: Photo[] = workbenchFilenames.map((filename) => (
-        photosByIds([filename])[0] ?? { id: filename, filename, swatch: 's1', dateLabel: '', year: 0, rating: 0, liked: false, placeId: null, personIds: [], tags: [] }
-    ));
+    // A deep link ("Open in Workbench" from the gallery) pre-selects those
+    // photos, but any photo in the loaded library can be searched for and
+    // selected here too.
+    useEffect(() => {
+        if (workbenchFilenames.length) setWbSelection(workbenchFilenames);
+    }, [route.params.filenames]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const toggleWbSelect = (id: string) =>
+        setWbSelection((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+    // Any deep-linked filename not present in the loaded library yet still
+    // needs a minimal record so it can render as a tile.
+    const missingDeepLinked: Photo[] = workbenchFilenames
+        .filter((filename) => !photos.some((p) => p.id === filename))
+        .map((filename) => ({ id: filename, filename, swatch: 's1', dateLabel: '', year: 0, rating: 0, liked: false, placeId: null, personIds: [], tags: [] }));
+    const workbenchLibrary: Photo[] = [...missingDeepLinked, ...photos];
 
     const loadHistory = async () => {
         try {
@@ -90,14 +103,14 @@ export const ToolsPage: React.FC = () => {
 
     const runWorkbench = async () => {
         const actions = wbSteps.map((s) => STEP_ACTIONS[s]).filter(Boolean);
-        if (!actions.length || !workbenchFilenames.length) return;
+        if (!actions.length || !wbSelection.length) return;
         ensureModelForActions(actions);
         try {
-            const queued = await startBrowserProcessing({ actions, filenames: workbenchFilenames, force: true });
-            recordAction(wbSteps, 'selected', workbenchFilenames);
+            const queued = await startBrowserProcessing({ actions, filenames: wbSelection, force: true });
+            recordAction(wbSteps, 'selected', wbSelection);
             toast(queued > 0
                 ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${wbSteps.join(', ')}`
-                : `Queued ${workbenchFilenames.length} photo${workbenchFilenames.length === 1 ? '' : 's'} · ${wbSteps.join(', ')}`);
+                : `Queued ${wbSelection.length} photo${wbSelection.length === 1 ? '' : 's'} · ${wbSteps.join(', ')}`);
         } catch {
             toast('Couldn’t start processing');
         }
@@ -199,22 +212,24 @@ export const ToolsPage: React.FC = () => {
 
             {tab === 'Workbench' && (
                 <>
-                    {workbenchFilenames.length === 0 ? (
-                        <p className="pt-grid-empty">Select photos in the gallery, then choose “Workbench” to re-run processing on just those photos.</p>
-                    ) : (
-                        <>
-                            <div className="pt-menu-label">{workbenchFilenames.length} photo{workbenchFilenames.length === 1 ? '' : 's'} in this workbench</div>
-                            <PhotoGrid photos={workbenchPhotos} />
-                            <div className="pt-step-row">
-                                {Object.keys(STEP_ACTIONS).map((name) => (
-                                    <button key={name} type="button" className={`pt-step${wbSteps.includes(name) ? ' on' : ''}`} onClick={() => toggleWbStep(name)}>{name}</button>
-                                ))}
-                                <button type="button" className="pt-step run" onClick={() => void runWorkbench()} disabled={!wbSteps.length || browserProcessingActive}>
-                                    Run on these ({wbSteps.length})
-                                </button>
-                            </div>
-                        </>
-                    )}
+                    <div className="pt-menu-label">
+                        Search or sort your library, tick the photos you want, then force a re-run of any step —
+                        each tile shows how all 7 steps did and an <InformationCircleIcon className="pt-inline-icon" /> for its EXIF + tags.
+                    </div>
+                    <WorkbenchGrid
+                        photos={workbenchLibrary}
+                        selection={wbSelection}
+                        onToggleSelect={toggleWbSelect}
+                        onSelectMany={setWbSelection}
+                    />
+                    <div className="pt-step-row wb-force">
+                        {Object.keys(STEP_ACTIONS).map((name) => (
+                            <button key={name} type="button" className={`pt-step${wbSteps.includes(name) ? ' on' : ''}`} onClick={() => toggleWbStep(name)}>{name}</button>
+                        ))}
+                        <button type="button" className="pt-step run" onClick={() => void runWorkbench()} disabled={!wbSteps.length || !wbSelection.length || browserProcessingActive}>
+                            Force re-run ({wbSelection.length} selected)
+                        </button>
+                    </div>
                 </>
             )}
 

@@ -88,7 +88,7 @@ export const PhotoViewer: React.FC = () => {
         return () => { active = false; };
     }, [showInfo, photo, meta]);
 
-    const mainSrc = useMainMedia(photo, fullRes);
+    const { url: mainSrc, loading: fullResLoading, progress: fullResProgress } = useMainMedia(photo, fullRes);
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
     const resetZoom = useCallback(() => { setZoom(1); setPan({ x: 0, y: 0 }); }, []);
@@ -233,10 +233,28 @@ export const PhotoViewer: React.FC = () => {
                                 className={fullRes ? 'on' : undefined}
                                 onClick={() => setFullRes((v) => !v)}
                                 aria-pressed={fullRes}
-                                aria-label="Full resolution"
-                                title={fullRes ? 'Showing full resolution' : 'Load full resolution'}
+                                aria-label={fullResLoading ? `Loading full resolution, ${fullResProgress}%` : 'Full resolution'}
+                                title={fullRes ? (fullResLoading ? `Loading full resolution (${fullResProgress}%)` : 'Showing full resolution') : 'Load full resolution'}
                             >
-                                <ArrowsPointingOutIcon /> <span className="pt-viewer-fr">FR</span>
+                                {fullResLoading ? (
+                                    <span className="pt-viewer-fr-loading">
+                                        <svg viewBox="0 0 36 36" className="pt-viewer-fr-ring" aria-hidden="true">
+                                            <circle cx="18" cy="18" r="16" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                                            <circle
+                                                cx="18" cy="18" r="16" fill="none"
+                                                stroke="currentColor" strokeWidth="3" strokeLinecap="round"
+                                                strokeDasharray={100.53}
+                                                strokeDashoffset={100.53 * (1 - fullResProgress / 100)}
+                                                transform="rotate(-90 18 18)"
+                                            />
+                                        </svg>
+                                        <span className="pt-viewer-fr-percent">{fullResProgress}%</span>
+                                    </span>
+                                ) : (
+                                    <>
+                                        <ArrowsPointingOutIcon /> <span className="pt-viewer-fr">FR</span>
+                                    </>
+                                )}
                             </button>
                         </>
                     )}

@@ -234,6 +234,7 @@ interface Store {
     renameAlbum: (id: string, name: string) => void;
     addPhotosToAlbum: (albumId: string, ids: string[]) => void;
     deleteAlbum: (id: string) => void;
+    deleteAlbums: (ids: string[]) => void;
     shareAlbum: (id: string, opts: { expiresInDays: number; accessCode?: string }) => Promise<void>;
     revokeAlbum: (id: string) => Promise<void>;
 
@@ -719,6 +720,19 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             });
     }, [albums, toast]);
 
+    const deleteAlbums = useCallback((ids: string[]) => {
+        if (!ids.length) return;
+        const idSet = new Set(ids);
+        const removed = albums.filter((a) => idSet.has(a.id));
+        setAlbums((prev) => prev.filter((a) => !idSet.has(a.id)));
+        void post('/albums/delete-multiple', { albumIds: ids })
+            .then(() => toast(`Deleted ${removed.length} album${removed.length === 1 ? '' : 's'}`))
+            .catch(() => {
+                if (removed.length) setAlbums((prev) => [...prev, ...removed]);
+                toast('Couldn’t delete albums');
+            });
+    }, [albums, toast]);
+
     const shareAlbum = useCallback(async (id: string, opts: { expiresInDays: number; accessCode?: string }) => {
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/share`, {
@@ -920,6 +934,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             renameAlbum,
             addPhotosToAlbum,
             deleteAlbum,
+            deleteAlbums,
             shareAlbum,
             revokeAlbum,
             peopleLoading,
@@ -947,7 +962,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             clearSelection, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,
-            createAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, shareAlbum, revokeAlbum,
+            createAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, reloadPeople, openPerson, personPhotosById, personPhotosLoading,
             renamePerson, mergePeople, reloadMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,

@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeftIcon, ArrowPathIcon, ClipboardDocumentIcon, PlusIcon, ShareIcon } from '@heroicons/react/24/outline';
+import { ArrowLeftIcon, ArrowPathIcon, CheckIcon, ClipboardDocumentIcon, PlusIcon, ShareIcon, TrashIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
+import { confirmDialog } from '../../../components/shared/dialogs';
 
 const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
     { value: '1', label: 'In 1 day', days: 1 },
@@ -16,9 +17,11 @@ const randomCode = () => Math.random().toString(16).slice(2, 6).toUpperCase();
 export const AlbumsPage: React.FC = () => {
     const {
         albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, albumPhotosLoading,
-        createAlbum, renameAlbum, deleteAlbum, shareAlbum, revokeAlbum, toast,
+        createAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
     } = useStore();
     const [showMobileDetail, setShowMobileDetail] = useState(false);
+    const [selectMode, setSelectMode] = useState(false);
+    const [selectedAlbumIds, setSelectedAlbumIds] = useState<string[]>([]);
     const selectedId = route.params.albumId ?? albums[0]?.id;
     const album = albums.find((a) => a.id === selectedId) ?? albums[0];
     const [renaming, setRenaming] = useState(false);
@@ -34,6 +37,30 @@ export const AlbumsPage: React.FC = () => {
         if (album?.id) void openAlbum(album.id);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [album?.id]);
+
+    const toggleAlbumSelect = (id: string) => {
+        setSelectedAlbumIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+    };
+
+    const exitSelectMode = () => {
+        setSelectMode(false);
+        setSelectedAlbumIds([]);
+    };
+
+    const bulkDelete = async () => {
+        const count = selectedAlbumIds.length;
+        if (!count) return;
+        const confirmed = await confirmDialog({
+            title: `Delete ${count} album${count === 1 ? '' : 's'}?`,
+            message: 'The photos inside stay in your library — only the album is removed.',
+            confirmLabel: 'Delete',
+            danger: true,
+        });
+        if (!confirmed) return;
+        deleteAlbums(selectedAlbumIds);
+        navigate('albums', {});
+        exitSelectMode();
+    };
 
     const handleCreate = async (thenRename = false) => {
         const id = await createAlbum('New album');
@@ -88,27 +115,57 @@ export const AlbumsPage: React.FC = () => {
 
     const albumList = (
         <>
-            <div className="pt-menu-label">Your albums</div>
-            {albums.map((a) => (
-                <button
-                    key={a.id}
-                    type="button"
-                    className={`pt-album-row${a.id === album.id ? ' active' : ''}`}
-                    onClick={() => {
-                        navigate('albums', { albumId: a.id });
-                        setShowMobileDetail(true);
-                    }}
-                >
-                    <span className="pt-album-row-cover empty" />
-                    <span className="pt-album-row-meta">
-                        <b>{a.name}</b>
-                        <span>{a.photoCount} photos</span>
-                    </span>
+            <div className="pt-album-list-head">
+                <div className="pt-menu-label" style={{ margin: 0 }}>Your albums</div>
+                {albums.length > 0 && (
+                    <button type="button" className="pt-linkish" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}>
+                        {selectMode ? 'Cancel' : 'Select'}
+                    </button>
+                )}
+            </div>
+            {albums.map((a) => {
+                const checked = selectedAlbumIds.includes(a.id);
+                return (
+                    <button
+                        key={a.id}
+                        type="button"
+                        className={`pt-album-row${a.id === album.id && !selectMode ? ' active' : ''}`}
+                        onClick={() => {
+                            if (selectMode) {
+                                toggleAlbumSelect(a.id);
+                                return;
+                            }
+                            navigate('albums', { albumId: a.id });
+                            setShowMobileDetail(true);
+                        }}
+                    >
+                        {selectMode && (
+                            <span className={`pt-album-row-check${checked ? ' on' : ''}`} aria-hidden="true">
+                                <CheckIcon />
+                            </span>
+                        )}
+                        <span className="pt-album-row-cover empty" />
+                        <span className="pt-album-row-meta">
+                            <b>{a.name}</b>
+                            <span>{a.photoCount} photos</span>
+                        </span>
+                    </button>
+                );
+            })}
+            {selectMode ? (
+                selectedAlbumIds.length > 0 && (
+                    <div className="pt-album-select-bar">
+                        <span>{selectedAlbumIds.length} selected</span>
+                        <button type="button" className="btn btn-danger" onClick={() => void bulkDelete()}>
+                            <TrashIcon className="toolbar-icon" /> Delete
+                        </button>
+                    </div>
+                )
+            ) : (
+                <button type="button" className="albm-newbtn" onClick={() => void handleCreate(true)}>
+                    <PlusIcon /> New album
                 </button>
-            ))}
-            <button type="button" className="albm-newbtn" onClick={() => void handleCreate(true)}>
-                <PlusIcon /> New album
-            </button>
+            )}
         </>
     );
 

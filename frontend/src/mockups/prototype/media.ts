@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { get, post, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
-import { fetchProtectedBlobUrl } from '../../services/imageClient';
+import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress } from '../../services/imageClient';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
 import type { Photo } from './types';
@@ -99,18 +99,33 @@ const accessUrl = async (kind: 'preview' | 'image' | 'thumbnail', filename: stri
  * of a blank stage. `fullRes` flips the order to fetch the original first — used
  * by the viewer's "Full res" button.
  */
-export function useMainMedia(photo?: Photo | null, fullRes = false): string | undefined {
+export interface MainMediaState {
+    url: string | undefined;
+    /** True while a `fullRes` fetch is in flight (drives the FR button's loading ring). */
+    loading: boolean;
+    /** 0-100 download progress for the in-flight `fullRes` fetch. */
+    progress: number;
+}
+
+export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaState {
     const [url, setUrl] = useState<string | undefined>(undefined);
+    const [loading, setLoading] = useState(false);
+    const [progress, setProgress] = useState(0);
     const filename = photo?.filename;
 
     useEffect(() => {
         if (!filename) {
             setUrl(undefined);
+            setLoading(false);
+            setProgress(0);
             return;
         }
         let active = true;
         let created: string | undefined;
         setUrl(undefined);
+        setProgress(0);
+        setLoading(fullRes);
+        const controller = new AbortController();
         void (async () => {
             try {
                 const order: Array<'preview' | 'image' | 'thumbnail'> = fullRes
@@ -127,28 +142,43 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): string | un
                 if (!target) {
                     return;
                 }
-                const blobUrl = await fetchProtectedBlobUrl(target);
+                const blobUrl = fullRes
+                    ? await fetchProtectedBlobUrlWithProgress(target, {
+                          signal: controller.signal,
+                          onProgress: (loadedBytes, totalBytes) => {
+                              if (active) {
+                                  setProgress(totalBytes > 0 ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100)) : 0);
+                              }
+                          },
+                      })
+                    : await fetchProtectedBlobUrl(target);
                 if (!active) {
                     URL.revokeObjectURL(blobUrl);
                     return;
                 }
                 created = blobUrl;
+                setProgress(100);
                 setUrl(blobUrl);
             } catch {
                 if (active) {
                     setUrl(undefined);
                 }
+            } finally {
+                if (active) {
+                    setLoading(false);
+                }
             }
         })();
         return () => {
             active = false;
+            controller.abort();
             if (created) {
                 URL.revokeObjectURL(created);
             }
         };
     }, [filename, fullRes]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    return url;
+    return { url, loading, progress };
 }
 
 // Shape of GET /api/photos/<filename>/metadata, trimmed to the fields the

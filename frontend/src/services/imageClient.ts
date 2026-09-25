@@ -34,6 +34,58 @@ export const fetchProtectedBlobUrl = async (path: string): Promise<string> => {
   return URL.createObjectURL(blob);
 };
 
+// Same as fetchProtectedBlobUrl but streams the response so download progress
+// can drive a UI indicator (e.g. the viewer's full-resolution loading ring),
+// and accepts an AbortSignal so a navigation away can cancel the fetch.
+export const fetchProtectedBlobUrlWithProgress = async (
+  path: string,
+  options: { signal?: AbortSignal; onProgress?: (loadedBytes: number, totalBytes: number) => void } = {},
+): Promise<string> => {
+  const url = resolveApiUrl(path);
+  const headers: Record<string, string> = {};
+  const isSignedStorageUrl = /^https?:\/\//i.test(path);
+  if (!isSignedStorageUrl && isAuthEnabled()) {
+    const token = await getAccessToken();
+    if (!token) {
+      throw new Error('Authentication required for protected image fetch');
+    }
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const response = await fetch(url, {
+    headers,
+    mode: 'cors',
+    credentials: 'omit',
+    signal: options.signal,
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(body || `Failed to fetch protected image: ${response.status}`);
+  }
+
+  const totalBytes = Number(response.headers.get('Content-Length') || 0);
+  if (!response.body || !options.onProgress) {
+    const blob = await response.blob();
+    return URL.createObjectURL(blob);
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loadedBytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      loadedBytes += value.byteLength;
+      options.onProgress(loadedBytes, totalBytes);
+    }
+  }
+  const blob = new Blob(chunks as BlobPart[], { type: response.headers.get('Content-Type') || 'application/octet-stream' });
+  return URL.createObjectURL(blob);
+};
+
 export const useProtectedBlobUrls = (paths: string[], maxConcurrent = DEFAULT_MAX_PROTECTED_IMAGE_REQUESTS) => {
   const [urls, setUrls] = useState<Record<string, string>>({});
   const urlsRef = useRef<Record<string, string>>({});
