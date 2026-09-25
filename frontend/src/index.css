@@ -5168,9 +5168,23 @@ html[data-theme='light'] .notification-item.unread {
   border-color: rgba(120, 200, 255, 0.55);
 }
 
+.photo-preview-fr-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
 .photo-preview-fr-ring {
   width: 22px;
   height: 22px;
+}
+
+.photo-preview-fr-percent {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
 }
 
 .photo-preview-icon.is-dirty {

@@ -1137,21 +1137,24 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                                 title={fullResError || undefined}
                             >
                                 {fullResLoading ? (
-                                    <svg viewBox="0 0 36 36" className="photo-preview-fr-ring" aria-hidden="true">
-                                        <circle cx="18" cy="18" r="16" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
-                                        <circle
-                                            cx="18"
-                                            cy="18"
-                                            r="16"
-                                            fill="none"
-                                            stroke="currentColor"
-                                            strokeWidth="3"
-                                            strokeLinecap="round"
-                                            strokeDasharray={100.53}
-                                            strokeDashoffset={100.53 * (1 - fullResProgress / 100)}
-                                            transform="rotate(-90 18 18)"
-                                        />
-                                    </svg>
+                                    <div className="photo-preview-fr-loading">
+                                        <svg viewBox="0 0 36 36" className="photo-preview-fr-ring" aria-hidden="true">
+                                            <circle cx="18" cy="18" r="16" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                                            <circle
+                                                cx="18"
+                                                cy="18"
+                                                r="16"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                strokeWidth="3"
+                                                strokeLinecap="round"
+                                                strokeDasharray={100.53}
+                                                strokeDashoffset={100.53 * (1 - fullResProgress / 100)}
+                                                transform="rotate(-90 18 18)"
+                                            />
+                                        </svg>
+                                        <span className="photo-preview-fr-percent">{fullResProgress}%</span>
+                                    </div>
                                 ) : (
                                     <span className="photo-preview-fr-label">FR</span>
                                 )}
