@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { get, resolveApiUrl } from '../../services/apiClient';
+import { get, post, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl } from '../../services/imageClient';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
@@ -80,12 +80,26 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
     return out;
 }
 
+// Mint a scoped access URL for one of the photo's media tiers. Returns '' when
+// that tier isn't available yet (e.g. a preview that hasn't been generated).
+const accessUrl = async (kind: 'preview' | 'image' | 'thumbnail', filename: string): Promise<string> => {
+    try {
+        const res = await get(`/api/photos/access/${kind}/${encodeURIComponent(filename)}`);
+        return res && typeof res.url === 'string' ? res.url : '';
+    } catch {
+        return '';
+    }
+};
+
 /**
- * Resolves the full-size (preview) image for the viewer to an object URL,
- * revoking it on change/unmount. Prefers a scoped preview; falls back to a
- * direct thumbnail SAS when a preview isn't available for the file.
+ * Resolves the viewer image for a photo to an object URL, revoking it on
+ * change/unmount. In preview mode it prefers the shrunk preview tier and falls
+ * back through the full image and finally a scoped thumbnail, so formats whose
+ * preview blob isn't ready yet (HEIC/CR3/video) still show *something* instead
+ * of a blank stage. `fullRes` flips the order to fetch the original first — used
+ * by the viewer's "Full res" button.
  */
-export function useMainMedia(photo?: Photo | null): string | undefined {
+export function useMainMedia(photo?: Photo | null, fullRes = false): string | undefined {
     const [url, setUrl] = useState<string | undefined>(undefined);
     const filename = photo?.filename;
 
@@ -99,14 +113,13 @@ export function useMainMedia(photo?: Photo | null): string | undefined {
         setUrl(undefined);
         void (async () => {
             try {
+                const order: Array<'preview' | 'image' | 'thumbnail'> = fullRes
+                    ? ['image', 'preview', 'thumbnail']
+                    : ['preview', 'image', 'thumbnail'];
                 let target = '';
-                try {
-                    const res = await get(`/api/photos/access/preview/${encodeURIComponent(filename)}`);
-                    if (res && typeof res.url === 'string') {
-                        target = res.url;
-                    }
-                } catch {
-                    // no preview available — fall back to a direct thumbnail below
+                for (const kind of order) {
+                    target = await accessUrl(kind, filename);
+                    if (target) break;
                 }
                 if (!target && photo?.thumbnailUrl && isHttpUrl(photo.thumbnailUrl)) {
                     target = photo.thumbnailUrl;
@@ -133,9 +146,40 @@ export function useMainMedia(photo?: Photo | null): string | undefined {
                 URL.revokeObjectURL(created);
             }
         };
-    }, [filename]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [filename, fullRes]); // eslint-disable-line react-hooks/exhaustive-deps
 
     return url;
+}
+
+// Shape of GET /api/photos/<filename>/metadata, trimmed to the fields the
+// viewer's info panel renders.
+export interface PhotoMetadata {
+    exifSummary?: {
+        camera?: string; lens?: string; fNumber?: string; exposureTime?: string;
+        iso?: string; focalLength?: string; capturedAt?: string;
+    };
+    resolution?: { width?: number; height?: number };
+    location?: { city?: string; country?: string; address?: string; latitude?: string; longitude?: string };
+    tags?: string[];
+    objects?: string[];
+    ocrText?: string;
+    caption?: string;
+    uploadDate?: string;
+}
+
+/** Fetches the full metadata record for a single photo (info panel only). */
+export async function fetchPhotoMetadata(filename: string): Promise<PhotoMetadata | null> {
+    try {
+        return await get<PhotoMetadata>(`/api/photos/${encodeURIComponent(filename)}/metadata`);
+    } catch {
+        return null;
+    }
+}
+
+/** Persists a new rotation (normalized to 0/90/180/270) for a photo. */
+export async function setPhotoRotation(filename: string, rotation: number): Promise<void> {
+    const normalized = ((rotation % 360) + 360) % 360;
+    await post(`/api/photos/${encodeURIComponent(filename)}/rotation`, { rotation: normalized });
 }
 
 // Resolves the best downloadable/shareable URL for a photo: the full-size

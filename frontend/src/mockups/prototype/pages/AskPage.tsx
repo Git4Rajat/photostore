@@ -164,7 +164,7 @@ export const AskPage: React.FC = () => {
                         </div>
                     )}
                     <div className="pt-menu-label">{searching ? 'Searching…' : `${results.length} result${results.length === 1 ? '' : 's'}`}</div>
-                    <PhotoGrid photos={results} emptyHint={searching ? 'Searching…' : 'No photos match that search.'} />
+                    <PhotoGrid photos={results} emptyHint={searching ? '' : 'No photos match that search.'} />
                 </>
             )}
         </div>

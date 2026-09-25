@@ -25,6 +25,9 @@ export const AlbumsPage: React.FC = () => {
     const [draft, setDraft] = useState('');
     const [copied, setCopied] = useState(false);
     const [expiry, setExpiry] = useState('7');
+    // The backend never returns an album's access code back (it's a stored
+    // secret), so remember codes we generate this session to show the owner.
+    const [codes, setCodes] = useState<Record<string, string>>({});
 
     // Fetch the active album's photos whenever the selection changes.
     useEffect(() => {
@@ -190,8 +193,19 @@ export const AlbumsPage: React.FC = () => {
                                             </div>
                                         )}
                                         <div className="share-row">
-                                            <span className="lbl"><b>Access code</b><span>{album.hasAccessCode ? 'Link is protected by a code' : 'Add a code to protect the link'}</span></span>
-                                            <button type="button" className="btn" onClick={() => { const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7; void shareAlbum(album.id, { expiresInDays: days, accessCode: randomCode() }); toast('New access code set'); }}>
+                                            <span className="lbl">
+                                                <b>Access code</b>
+                                                {codes[album.id]
+                                                    ? <span>Share this code with viewers: <code className="pt-access-code">{codes[album.id]}</code></span>
+                                                    : <span>{album.hasAccessCode ? 'Protected — generate a new code to reveal one' : 'Add a code to protect the link'}</span>}
+                                            </span>
+                                            <button type="button" className="btn" onClick={() => {
+                                                const code = randomCode();
+                                                const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
+                                                void shareAlbum(album.id, { expiresInDays: days, accessCode: code });
+                                                setCodes((prev) => ({ ...prev, [album.id]: code }));
+                                                toast(`New access code: ${code}`);
+                                            }}>
                                                 <ArrowPathIcon className="toolbar-icon" /> New code
                                             </button>
                                         </div>

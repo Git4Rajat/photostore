@@ -1,17 +1,28 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUpTrayIcon, MagnifyingGlassMinusIcon, MagnifyingGlassPlusIcon, PhotoIcon, UserPlusIcon } from '@heroicons/react/24/outline';
-import { useStore } from '../store';
+import { useStore, isVideoFilename } from '../store';
+import type { MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import PhotoGrid from '../components/PhotoGrid';
+import TimelineRail from '../components/TimelineRail';
 
 const TILE_MIN = 120;
 const TILE_STEP = 30;
 const TILE_RANGE = { min: 72, max: 260 };
 const clampTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(TILE_RANGE.min, n));
 
+const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
+    { value: 'all', label: 'All' },
+    { value: 'photo', label: 'Photos' },
+    { value: 'video', label: 'Videos' },
+];
+
 /** Gallery — the populated grid + drag-and-drop upload + the empty first-run state. */
 export const GalleryPage: React.FC = () => {
-    const { photos, navigate, selectMany, clearSelection, selection, photosLoading, hasMorePhotos, loadMorePhotos, reloadPhotos } = useStore();
+    const {
+        photos, navigate, selectMany, clearSelection, selection, photosLoading, hasMorePhotos,
+        loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
+    } = useStore();
     const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
     const [dragging, setDragging] = useState(false);
     const [tileMin, setTileMin] = useState(TILE_MIN);
@@ -78,6 +89,17 @@ export const GalleryPage: React.FC = () => {
     const pct = progress && progress.totalCount ? Math.round((progress.uploadedCount / progress.totalCount) * 100) : 0;
     const showFailed = !uploading && (pendingUploadSummary?.failedCount ?? 0) > 0;
 
+    // Client-side photo/video split over the loaded page(s). Media type isn't a
+    // server filter here, so this narrows what's already fetched by extension.
+    const visiblePhotos = useMemo(() => {
+        if (mediaFilter === 'all') return photos;
+        return photos.filter((p) => (mediaFilter === 'video' ? isVideoFilename(p.filename) : !isVideoFilename(p.filename)));
+    }, [photos, mediaFilter]);
+
+    const countLabel = totalPhotos !== null
+        ? `${totalPhotos.toLocaleString()} photo${totalPhotos === 1 ? '' : 's'}`
+        : `${photos.length}${hasMorePhotos ? '+' : ''} photos`;
+
     if (photos.length === 0 && photosLoading) {
         return (
             <div className="pt-arrive">
@@ -115,9 +137,16 @@ export const GalleryPage: React.FC = () => {
             <div className="pt-toolbar">
                 <div>
                     <h1 className="pt-page-title">Gallery</h1>
-                    <p className="pt-page-sub">{photos.length}{hasMorePhotos ? '+' : ''} photos</p>
+                    <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
                 </div>
                 <div className="pt-toolbar-actions">
+                    <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
+                        {MEDIA_FILTERS.map((f) => (
+                            <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} onClick={() => setMediaFilter(f.value)}>
+                                {f.label}
+                            </button>
+                        ))}
+                    </div>
                     <div className="pt-zoom" role="group" aria-label="Thumbnail size">
                         <button type="button" className="btn" aria-label="Smaller thumbnails" disabled={tileMin <= TILE_RANGE.min} onClick={() => setTileMin((n) => clampTile(n - TILE_STEP))}>
                             <MagnifyingGlassMinusIcon className="toolbar-icon" />
@@ -137,6 +166,10 @@ export const GalleryPage: React.FC = () => {
                     )}
                 </div>
             </div>
+
+            {timeline && (
+                <TimelineRail timeline={timeline} captureRange={captureRange} onSelect={setCaptureRange} />
+            )}
 
             {(uploading || showFailed) && (
                 <div className={`upload-dock${!uploading ? ' is-done' : ''}`}>
@@ -169,7 +202,10 @@ export const GalleryPage: React.FC = () => {
                 onTouchMove={onTouchMove}
                 onTouchEnd={onTouchEnd}
             >
-                <PhotoGrid photos={photos} gridRef={gridRef} />
+                <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable />
+                {mediaFilter !== 'all' && visiblePhotos.length === 0 && (
+                    <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
+                )}
                 <div ref={sentinelRef} className="pt-scroll-sentinel" aria-hidden="true" />
                 {photosLoading && photos.length > 0 && <p className="pt-grid-empty">Loading more…</p>}
                 <div className="pt-drop-overlay">

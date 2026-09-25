@@ -4,6 +4,7 @@ import { useStore } from '../store';
 import { Avatar } from '../components/bits';
 import * as library from '../../../services/libraryClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
+import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -36,22 +37,41 @@ export const SharingPage: React.FC = () => {
         setEmail('');
     };
 
-    const cleanLibrary = () => {
-        if (!window.confirm('Start library cleanup? This removes ALL photos and videos. You’ll get an emailed link to confirm before anything is deleted.')) return;
+    const renameLibraryPrompt = async () => {
+        const next = await promptDialog({
+            title: 'Rename library',
+            label: 'Library name',
+            defaultValue: libraryName,
+            placeholder: 'e.g. Family photos',
+            confirmLabel: 'Rename',
+        });
+        if (next && next.trim()) renameLibrary(next.trim());
+    };
+
+    const cleanLibrary = async () => {
+        const confirmed = await confirmDialog({
+            title: 'Clean library?',
+            message: 'This removes ALL photos and videos from this library. You’ll get an emailed link to confirm before anything is actually deleted.',
+            confirmLabel: 'Continue',
+            danger: true,
+        });
+        if (!confirmed) return;
         const passwordMode = (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
-        const password = passwordMode ? (window.prompt('Re-enter your password to continue:') ?? undefined) : undefined;
-        if (passwordMode && !password) return;
+        let password: string | undefined;
+        if (passwordMode) {
+            const entered = await promptDialog({
+                title: 'Confirm it’s you',
+                message: 'Re-enter your password to start the cleanup.',
+                label: 'Password',
+                type: 'password',
+                confirmLabel: 'Confirm',
+            });
+            if (!entered) return;
+            password = entered;
+        }
         void library.requestLibraryClean(password)
             .then((res) => toast(res.sentTo?.length ? `Confirmation link sent to ${res.sentTo.join(', ')}` : 'Cleanup confirmation requested'))
             .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t start cleanup'));
-    };
-
-    const removeLibrary = () => {
-        if (!window.confirm('Delete this entire library and all its photos? This cannot be undone.')) return;
-        if (!window.confirm('Are you absolutely sure? All photos in this library will be permanently deleted.')) return;
-        void library.deleteLibrary()
-            .then(() => { toast('Library deleted'); window.location.reload(); })
-            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t delete library'));
     };
 
     return (
@@ -105,12 +125,8 @@ export const SharingPage: React.FC = () => {
                 <div className="card-glass lib-card">
                     <div className="pt-menu-label">Library settings</div>
                     <div className="pt-danger-row">
-                        <button type="button" className="btn" onClick={() => {
-                            const next = window.prompt('Rename library', libraryName);
-                            if (next && next.trim()) renameLibrary(next.trim());
-                        }}>Rename library</button>
-                        <button type="button" className="btn" onClick={cleanLibrary}>Clean library</button>
-                        <button type="button" className="btn btn-danger" onClick={removeLibrary}>Delete library</button>
+                        <button type="button" className="btn" onClick={() => void renameLibraryPrompt()}>Rename library</button>
+                        <button type="button" className="btn" onClick={() => void cleanLibrary()}>Clean library</button>
                     </div>
                 </div>
             )}

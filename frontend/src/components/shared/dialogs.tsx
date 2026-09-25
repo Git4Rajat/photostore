@@ -23,6 +23,9 @@ export interface PromptOptions {
     placeholder?: string;
     confirmLabel?: string;
     cancelLabel?: string;
+    // Masks the input for secrets (e.g. re-entering a password to confirm a
+    // destructive action). Defaults to a normal text field.
+    type?: 'text' | 'password';
 }
 
 type DialogRequest =
@@ -131,7 +134,7 @@ export const DialogHost: React.FC = () => {
                             id="dialog-input"
                             ref={inputRef}
                             className="field"
-                            type="text"
+                            type={opts.type === 'password' ? 'password' : 'text'}
                             value={inputValue}
                             placeholder={opts.placeholder}
                             onChange={(event) => setInputValue(event.target.value)}

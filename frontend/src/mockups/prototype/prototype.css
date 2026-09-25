@@ -7,8 +7,9 @@
    ================================================================= */
 
 .pt-shell { height: 100vh; width: 100vw; margin: 0; padding: 0; overflow: hidden; }
-.pt-devbar { position: absolute; top: 0; left: 0; right: 0; z-index: 70; background: var(--bg-1); border-bottom: 1px solid var(--lg-edge); padding-bottom: 2px; }
-.pt-devbar-brand { font-family: var(--font-label); font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--grease); margin-right: auto; }
+/* The dev toolbar was removed, so the stage fills from the very top instead of
+   clearing a 50px bar (see mockups.css .mock-stage). */
+.pt-shell .mock-stage { top: 0; }
 
 /* mockups.css sets `.mock-app > * { z-index: 1 }` (old harness), which flattens
    the sticky header down to the body's level and lets page content paint over
@@ -92,6 +93,20 @@
 .pt-toolbar-actions { display: flex; gap: 8px; align-items: center; }
 .pt-zoom { display: inline-flex; gap: 4px; }
 .pt-zoom .btn { padding: 6px 8px; }
+.pt-media-filter { flex: 0 0 auto; }
+
+/* ---- gallery timeline scrubber (year -> month -> day) ---- */
+.pt-timeline-wrap { margin-bottom: 12px; }
+.pt-timeline-crumbs { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 0.78rem; color: var(--muted); }
+.pt-timeline-crumbs button { background: none; border: 0; color: var(--muted); font: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer; padding: 2px 4px; border-radius: 5px; }
+.pt-timeline-crumbs button:hover { color: var(--text); }
+.pt-timeline-crumbs button.on { color: var(--accent); }
+.pt-timeline { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; -webkit-overflow-scrolling: touch; }
+.pt-timeline-chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--lg-edge); background: var(--lg-surface-wash); border-radius: var(--r-pill); padding: 5px 12px; font: inherit; font-size: 0.8rem; font-weight: 600; color: var(--text); cursor: pointer; }
+.pt-timeline-chip:hover { border-color: var(--accent); }
+.pt-timeline-chip.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.pt-timeline-count { font-size: 0.66rem; font-weight: 700; color: var(--muted); }
+.pt-timeline-chip.on .pt-timeline-count { color: var(--accent); }
 .pt-suggest-empty { color: var(--muted); padding: 10px 6px; font-size: 0.84rem; }
 @media (max-width: 620px) {
   .pt-toolbar { flex-direction: column; align-items: flex-start; }
@@ -106,6 +121,10 @@
 .pt-tile-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; -webkit-user-drag: none; user-select: none; }
 .pt-tile-check { position: absolute; top: 6px; left: 6px; width: 22px; height: 22px; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; padding: 0; opacity: 0; transition: opacity 0.12s ease; }
 .pt-tile:hover .pt-tile-check, .pt-tile-check.on { opacity: 1; }
+/* Touch devices have no hover, so surface the selection affordance directly. */
+@media (hover: none) and (pointer: coarse) {
+  .pt-tile-check { opacity: 0.85; }
+}
 .pt-tile-check svg { width: 22px; height: 22px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
 .pt-tile-check.on { color: var(--accent); }
 .pt-tile-badges { position: absolute; bottom: 6px; right: 6px; display: flex; gap: 4px; align-items: center; }
@@ -182,22 +201,42 @@
 .pt-merge { padding: 16px; margin-top: 16px; }
 .pt-merge-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 
-/* ---- explore ---- */
-.pt-bigmap { height: 190px; border-radius: var(--r-md); background: repeating-linear-gradient(45deg, var(--bg-2), var(--bg-2) 10px, var(--bg-1) 10px, var(--bg-1) 20px); position: relative; margin-bottom: 16px; }
-.pt-cluster { position: absolute; display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; background: var(--grease); color: #fff; font-family: var(--font-label); font-size: 0.8rem; font-weight: 700; box-shadow: 0 0 0 6px var(--grease-soft); }
-.pt-place-row { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
-.pt-place-card { flex: 0 0 auto; width: 150px; height: 90px; border-radius: var(--r-sm); border: 0; cursor: pointer; position: relative; display: flex; align-items: flex-end; padding: 8px; color: #fff; font-weight: 600; font-size: 0.82rem; }
-.pt-place-card { overflow: hidden; }
-.pt-place-card span { position: relative; z-index: 1; background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 6px; }
-.pt-things-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
-.pt-thing-card { position: relative; overflow: hidden; aspect-ratio: 1.3; border-radius: var(--r-sm); border: 0; cursor: pointer; display: flex; align-items: flex-end; padding: 8px; color: #fff; font-weight: 600; font-size: 0.78rem; }
-.pt-thing-card span { position: relative; z-index: 1; background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 6px; }
+/* ---- explore: netflix-style horizontal shelves ---- */
+.pt-shelf { margin-bottom: 22px; }
+.pt-shelf-title { font-family: var(--font-display); font-size: 1.05rem; font-weight: 700; margin: 0 0 10px; }
+.pt-shelf-row { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 6px; scroll-snap-type: x proximity; -webkit-overflow-scrolling: touch; }
+.pt-shelf-row > * { scroll-snap-align: start; }
+.pt-shelf-card { flex: 0 0 auto; border: 0; cursor: pointer; position: relative; overflow: hidden; background: var(--lg-surface-wash); color: var(--text); font: inherit; }
+/* Person: portrait card with a round face and a caption underneath. */
+.pt-shelf-card.person { width: 120px; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px 8px; border-radius: var(--r-md); background: var(--lg-surface-wash); }
+.pt-shelf-card.person:hover { background: var(--lg-surface-strong); }
+.pt-shelf-face { width: 80px; height: 80px; border-radius: 50%; object-fit: cover; flex: 0 0 auto; }
+.pt-shelf-card-name { font-size: 0.86rem; font-weight: 650; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-shelf-card-sub { font-size: 0.72rem; color: var(--muted); }
+/* Wide: landscape tile for places / things / albums, with an overlaid label. */
+.pt-shelf-card.wide { width: 190px; height: 112px; border-radius: var(--r-sm); display: flex; align-items: flex-end; padding: 8px; color: #fff; font-weight: 600; font-size: 0.82rem; }
+.pt-shelf-card.album { background: linear-gradient(135deg, var(--accent-soft), var(--lg-surface-strong)); color: var(--text); }
+.pt-shelf-overlay { position: relative; z-index: 1; background: rgba(0,0,0,0.42); padding: 2px 8px; border-radius: 6px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-shelf-card.album .pt-shelf-overlay { background: rgba(127,127,127,0.18); }
+/* Photo: square thumbnail. */
+.pt-shelf-card.photo { width: 112px; height: 112px; border-radius: var(--r-sm); }
 .pt-explore-cover { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+@media (max-width: 620px) {
+  .pt-shelf-card.wide { width: 150px; height: 92px; }
+  .pt-shelf-card.photo { width: 92px; height: 92px; }
+  .pt-shelf-card.person { width: 104px; }
+}
 
 /* ---- ask ---- */
 .pt-ask-box { display: flex; align-items: center; gap: 10px; border: 1px solid var(--lg-edge); border-radius: var(--r-lg); background: var(--lg-surface-strong); padding: 12px 16px; margin-bottom: 12px; }
 .pt-ask-box svg { width: 20px; height: 20px; color: var(--muted); flex: 0 0 auto; }
 .pt-ask-input { flex: 1; border: 0; background: none; font: inherit; font-size: 1rem; color: var(--text); outline: none; min-width: 0; }
+/* Keep the "Save as album" CTA a single, vertically-centred, non-shrinking pill
+   so its icon + label don't wrap or drift out of line on narrow screens. */
+.pt-ask-box .btn { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+@media (max-width: 420px) {
+  .pt-ask-box .btn .toolbar-icon { margin: 0; }
+}
 .pt-suggest-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .pt-chip { border: 1px solid var(--lg-edge); background: var(--lg-surface-wash); border-radius: var(--r-pill); padding: 6px 12px; font-size: 0.8rem; color: var(--text); cursor: pointer; }
 .pt-chip:hover { border-color: var(--accent); color: var(--accent); }
@@ -209,6 +248,7 @@
 
 /* ---- sharing extras ---- */
 .pt-danger-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.pt-access-code { font-family: var(--font-label, monospace); font-weight: 700; letter-spacing: 0.12em; background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 5px; }
 
 /* ---- tools ---- */
 .pt-subnav { display: flex; gap: 16px; border-bottom: 1px solid var(--lg-edge); margin-bottom: 16px; overflow-x: auto; }
@@ -264,7 +304,35 @@
 .pt-viewer-back svg { width: 18px; height: 18px; }
 .pt-viewer-title { font-size: 0.9rem; color: #cfc8ba; }
 .pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: #9c9486; font-family: var(--font-label); }
+.pt-viewer-stage-wrap { flex: 1; position: relative; display: flex; min-height: 0; }
 .pt-viewer-stage { flex: 1; display: flex; align-items: center; gap: 12px; padding: 0 18px; min-height: 0; }
+.pt-viewer-loading { color: #9c9486; font-size: 0.9rem; }
+/* Floating image controls (zoom / rotate / full-res) over the stage. */
+.pt-viewer-tools { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); padding: 4px 8px; backdrop-filter: blur(8px); z-index: 2; }
+.pt-viewer-tools button { display: inline-grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 50%; background: none; color: #ece6d9; cursor: pointer; }
+.pt-viewer-tools button:hover:not(:disabled) { background: rgba(255,255,255,0.14); }
+.pt-viewer-tools button:disabled { opacity: 0.35; cursor: default; }
+.pt-viewer-tools button.on { color: var(--accent); background: rgba(255,255,255,0.14); }
+.pt-viewer-tools button svg { width: 18px; height: 18px; }
+.pt-viewer-tools .pt-viewer-fr { font-size: 0.6rem; font-weight: 700; margin-left: 1px; }
+.pt-viewer-tools button:has(.pt-viewer-fr) { width: auto; padding: 0 8px; gap: 3px; }
+.pt-viewer-zoom-label { font-size: 0.72rem; color: #cfc8ba; font-family: var(--font-label); min-width: 40px; text-align: center; }
+.pt-viewer-tools-sep { width: 1px; height: 20px; background: rgba(255,255,255,0.15); margin: 0 2px; }
+/* Info panel: right rail on desktop, bottom sheet on phones. */
+.pt-viewer-info { position: absolute; top: 0; right: 0; bottom: 0; width: min(340px, 82vw); overflow-y: auto; padding: 16px; border-radius: 0; z-index: 3; color: var(--text); }
+.pt-viewer-info-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.pt-viewer-info-head h3 { margin: 0; font-size: 1rem; }
+.pt-viewer-info-head button { background: none; border: 0; color: var(--muted); font-size: 1.4rem; line-height: 1; cursor: pointer; }
+.pt-viewer-info-empty { color: var(--muted); font-size: 0.86rem; }
+.pt-viewer-info-list { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; font-size: 0.82rem; }
+.pt-viewer-info-list dt { color: var(--muted); font-weight: 600; }
+.pt-viewer-info-list dd { margin: 0; word-break: break-word; }
+.pt-viewer-info-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.pt-viewer-info-tags .pt-chip { padding: 2px 8px; font-size: 0.72rem; }
+.pt-viewer-info-ocr { white-space: pre-wrap; color: var(--muted); font-size: 0.78rem; max-height: 140px; overflow-y: auto; }
+@media (max-width: 620px) {
+  .pt-viewer-info { top: auto; width: 100%; max-height: 60%; border-top: 1px solid var(--lg-edge); }
+}
 .pt-viewer-nav { width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.1); border: 0; color: #fff; cursor: pointer; flex: 0 0 auto; display: grid; place-items: center; }
 .pt-viewer-nav:disabled { opacity: 0.3; cursor: default; }
 .pt-viewer-nav svg { width: 22px; height: 22px; }

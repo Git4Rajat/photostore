@@ -3,24 +3,38 @@ import { useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import type { BrowserProcessingAction } from '../../../components/AppServicesProvider';
-import { getTools, postAdmin } from '../../../services/apiClient';
+import { getTools, postTools, postAdmin } from '../../../services/apiClient';
+import { getRuntimeConfig } from '../../../config/appConfig';
 import type { Photo } from '../types';
 
 const TABS = ['Overview', 'Workbench', 'Recovery', 'History'];
 
-// Prototype step labels -> the browser-processing actions AppServicesProvider runs.
+// Prototype step labels -> the browser-processing actions AppServicesProvider
+// runs. Order here is the pipeline order the buttons render in.
 const STEP_ACTIONS: Record<string, BrowserProcessingAction> = {
+    Preview: 'preview',
     Thumbnails: 'thumbnails',
+    EXIF: 'exif',
     OCR: 'ocr',
+    Vision: 'vision',
+    Geo: 'map',
     Faces: 'faces',
 };
 
-interface HistoryEntry { action?: string; scope?: string; filenameCount?: number; createdAt?: string; }
+// Steps that need the on-device AI model; selecting one triggers a model load so
+// the run isn't silently stuck at 'pending' waiting for a model that never loads.
+const AI_STEPS = new Set<BrowserProcessingAction>(['ocr', 'vision', 'faces']);
+
+interface HistoryEntry { action?: string; steps?: string[]; scope?: string; filenameCount?: number; createdAt?: string; }
 
 /** Tools — live pipeline health + a bulk re-run row + recovery/history. */
 export const ToolsPage: React.FC = () => {
     const { toast, route, photosByIds } = useStore();
-    const { activeJobs, clusteringActive, clusteringStatusLabel, ipworkActive, ipworkStatusLabel, startBrowserProcessing, browserProcessingActive } = useAppServices();
+    const {
+        activeJobs, clusteringActive, clusteringStatusLabel, ipworkActive, ipworkStatusLabel,
+        startBrowserProcessing, browserProcessingActive, browserAiModelState, loadBrowserAiModel,
+    } = useAppServices();
+    const backendMode = getRuntimeConfig().processingMode === 'backend';
     const workbenchFilenames = (route.params.filenames ?? '').split(',').map((f) => f.trim()).filter(Boolean);
     const [tab, setTab] = useState(workbenchFilenames.length ? 'Workbench' : 'Overview');
     const [steps, setSteps] = useState<string[]>(['OCR', 'Faces']);
@@ -34,16 +48,18 @@ export const ToolsPage: React.FC = () => {
         photosByIds([filename])[0] ?? { id: filename, filename, swatch: 's1', dateLabel: '', year: 0, rating: 0, liked: false, placeId: null, personIds: [], tags: [] }
     ));
 
+    const loadHistory = async () => {
+        try {
+            const res = await getTools<{ actions?: HistoryEntry[] }>('/api/tools/workbench/actions');
+            setHistory(Array.isArray(res?.actions) ? res.actions : []);
+        } catch {
+            setHistory([]);
+        }
+    };
+
     useEffect(() => {
         if (tab !== 'History') return;
-        void (async () => {
-            try {
-                const res = await getTools<{ actions?: HistoryEntry[]; history?: HistoryEntry[] }>('/tools/history');
-                setHistory(res?.actions ?? res?.history ?? []);
-            } catch {
-                setHistory([]);
-            }
-        })();
+        void loadHistory();
     }, [tab]);
 
     const toggleStep = (name: string) =>
@@ -51,12 +67,37 @@ export const ToolsPage: React.FC = () => {
     const toggleWbStep = (name: string) =>
         setWbSteps((prev) => (prev.includes(name) ? prev.filter((s) => s !== name) : [...prev, name]));
 
+    // Log a history row so History reflects the run even for purely in-browser
+    // processing (which otherwise never touches the backend). Best-effort.
+    const recordAction = (stepNames: string[], scope: 'selected' | 'library', filenames?: string[]) => {
+        void postTools('/api/tools/workbench/actions', {
+            action: 'reprocess',
+            steps: stepNames,
+            scope,
+            filenameCount: filenames?.length ?? 0,
+            filenames: filenames ?? [],
+            force: true,
+        }).catch(() => { /* logging must never block the run */ });
+    };
+
+    // Kick a model load when the run needs AI steps but the model isn't ready,
+    // so ocr/vision/faces don't sit at 'pending' forever waiting for a click.
+    const ensureModelForActions = (actions: BrowserProcessingAction[]) => {
+        if (backendMode) return;
+        if (!actions.some((a) => AI_STEPS.has(a))) return;
+        if (browserAiModelState.status !== 'available') void loadBrowserAiModel();
+    };
+
     const runWorkbench = async () => {
         const actions = wbSteps.map((s) => STEP_ACTIONS[s]).filter(Boolean);
         if (!actions.length || !workbenchFilenames.length) return;
+        ensureModelForActions(actions);
         try {
             const queued = await startBrowserProcessing({ actions, filenames: workbenchFilenames, force: true });
-            toast(`Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${wbSteps.join(', ')}`);
+            recordAction(wbSteps, 'selected', workbenchFilenames);
+            toast(queued > 0
+                ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${wbSteps.join(', ')}`
+                : `Queued ${workbenchFilenames.length} photo${workbenchFilenames.length === 1 ? '' : 's'} · ${wbSteps.join(', ')}`);
         } catch {
             toast('Couldn’t start processing');
         }
@@ -65,9 +106,17 @@ export const ToolsPage: React.FC = () => {
     const runSelected = async () => {
         const actions = steps.map((s) => STEP_ACTIONS[s]).filter(Boolean);
         if (!actions.length) return;
+        if (backendMode) {
+            toast('This deployment processes on the server — use Recovery → Backfill to re-run the whole library.');
+            return;
+        }
+        ensureModelForActions(actions);
         try {
             const queued = await startBrowserProcessing({ actions, force: true });
-            toast(`Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${steps.join(', ')}`);
+            recordAction(steps, 'library');
+            toast(queued > 0
+                ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${steps.join(', ')}`
+                : `Started ${steps.join(', ')} — pulling pending photos…`);
         } catch {
             toast('Couldn’t start processing');
         }
@@ -196,8 +245,9 @@ export const ToolsPage: React.FC = () => {
                     ) : (
                         history.map((h, i) => (
                             <div key={i} className="pt-history-row">
-                                {h.action ?? 'Action'} · {h.scope ?? 'library'}
-                                {typeof h.filenameCount === 'number' ? ` · ${h.filenameCount} photos` : ''}
+                                {(h.action ?? 'Action')} · {h.scope ?? 'library'}
+                                {Array.isArray(h.steps) && h.steps.length ? ` · ${h.steps.join(', ')}` : ''}
+                                {typeof h.filenameCount === 'number' && h.filenameCount > 0 ? ` · ${h.filenameCount} photos` : ''}
                                 {h.createdAt ? ` · ${new Date(h.createdAt).toLocaleString()}` : ''}
                             </div>
                         ))

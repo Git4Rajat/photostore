@@ -1,6 +1,5 @@
 import React from 'react';
 import {
-    ArrowUpTrayIcon,
     EllipsisVerticalIcon,
     PlusIcon,
     StarIcon,
@@ -10,23 +9,15 @@ import {
 import { Menu, Stars } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
 import { useStore } from '../store';
-import { sharePhotos } from '../media';
 
 /**
  * Compact floating menu for multi-selection. Delete button always visible,
- * other actions (rate/album/share) in options menu.
+ * other actions (rate/album/workbench) in the options menu. Sharing is
+ * intentionally album-only, so there's no per-photo/selection share here.
  */
 export const CommandBar: React.FC = () => {
-    const { selection, ratePhotos, deletePhotos, photosByIds, navigate, toast } = useStore();
+    const { selection, ratePhotos, deletePhotos, navigate, toast } = useStore();
     if (!selection.length) return null;
-
-    const shareSelection = () => {
-        void (async () => {
-            const outcome = await sharePhotos(photosByIds(selection));
-            if (outcome === 'downloaded') toast('Sharing isn’t supported here — downloaded instead');
-            else if (outcome === 'unsupported') toast(selection.length > 1 ? 'Sharing multiple photos isn’t supported here' : 'Couldn’t share');
-        })();
-    };
 
     return (
         <div className="pt-floating-menu" role="toolbar" aria-label="Selection actions">
@@ -74,10 +65,6 @@ export const CommandBar: React.FC = () => {
                                 </button>
                             )}
                         />
-
-                        <button type="button" className="pt-fm-item" onClick={() => { shareSelection(); close(); }}>
-                            <ArrowUpTrayIcon /> Share
-                        </button>
 
                         <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
                             <WrenchScrewdriverIcon /> Workbench

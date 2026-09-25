@@ -1,15 +1,19 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { MemoryRouter } from 'react-router-dom';
-import { BellIcon, PlusIcon } from '@heroicons/react/24/outline';
+import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
+import { PlusIcon } from '@heroicons/react/24/outline';
 import { LogoLockup } from '../../components/shared/Logo';
 import Loading from '../../components/shared/Loading';
 import { AppServicesProvider, useAppServices } from '../../components/AppServicesProvider';
+import { NotificationBell } from '../../components/AppServiceIndicators';
+import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
 import { StoreProvider, useStore } from './store';
 import { Menu } from './components/bits';
 import CommandBar from './components/CommandBar';
 import PhotoViewer from './components/PhotoViewer';
 import Toasts from './components/Toasts';
+
+const LazyPublicAlbumPage = React.lazy(() => import('../../components/PublicAlbumPage'));
 import GalleryPage from './pages/GalleryPage';
 import AlbumsPage from './pages/AlbumsPage';
 import { PeoplePage, PersonDetailPage } from './pages/PeoplePages';
@@ -36,8 +40,14 @@ const accountInitials = (name: string, email: string): string => {
     return letters.toUpperCase();
 };
 
-type Device = 'desktop' | 'mobile';
 type Theme = 'light' | 'dark' | 'system';
+
+// A share link (…/public/album/<token>) is a public, no-auth destination. The
+// prototype's own store-based navigation ignores the URL path, so without this
+// the SPA would fall through to the gallery/login. Detect the path up front and
+// hand it to the real PublicAlbumPage under a router that supplies :token.
+const isPublicAlbumPath = (): boolean =>
+    typeof window !== 'undefined' && window.location.pathname.startsWith('/public/album/');
 
 const NAV: { id: PageId; label: string }[] = [
     { id: 'ask', label: 'Ask' },
@@ -80,11 +90,9 @@ const Page: React.FC = () => {
 };
 
 const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: () => void }> = ({ theme, onTheme, onSignOut }) => {
-    const { route, navigate, suggestions, toast } = useStore();
+    const { route, navigate, toast } = useStore();
     const { requestUpload } = useAppServices();
     const active = activeNavFor(route.page);
-    const [dismissedSuggestions, setDismissedSuggestions] = useState<string[]>([]);
-    const visibleSuggestions = suggestions.filter((s) => !dismissedSuggestions.includes(s.id));
     const account = getActiveAccount();
     const accountName = account?.name || account?.username || 'Signed in';
     const accountEmail = account?.username || '';
@@ -107,32 +115,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                     <PlusIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span>
                 </button>
 
-                <Menu
-                    align="right"
-                    renderTrigger={(toggle) => (
-                        <button type="button" className="mock-bell" onClick={toggle} aria-label="Suggestions">
-                            <BellIcon />
-                            {visibleSuggestions.length > 0 && <span className="dot" />}
-                        </button>
-                    )}
-                >
-                    {(close) => (
-                        <div className="pt-bell-menu">
-                            <div className="pt-menu-label">Suggestions</div>
-                            {visibleSuggestions.length === 0 ? (
-                                <p className="pt-suggest-empty">You’re all caught up.</p>
-                            ) : visibleSuggestions.map((s) => (
-                                <div key={s.id} className="pt-suggest-card">
-                                    <p>{s.text}</p>
-                                    <div className="pt-suggest-actions">
-                                        <button type="button" className="pt-linkish strong" onClick={() => { if (s.target) navigate(s.target.page, s.target.params); toast(s.action); close(); }}>{s.action}</button>
-                                        <button type="button" className="pt-linkish muted" onClick={() => setDismissedSuggestions((prev) => [...prev, s.id])}>Not now</button>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </Menu>
+                <NotificationBell />
 
                 <Menu
                     align="right"
@@ -180,33 +163,13 @@ const MobileTabbar: React.FC = () => {
 };
 
 const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
-    const [device, setDevice] = useState<Device>('desktop');
     const [theme, setTheme] = useState<Theme>('system');
     useEffect(() => applyTheme(theme), [theme]);
 
     return (
         <div className="pt-shell">
-            <div className="mock-controls pt-devbar">
-                <span className="pt-devbar-brand">Keepsake — prototype</span>
-                <div className="mock-control-group">
-                    <span className="mock-control-label">Device</span>
-                    <div className="mock-seg" role="group" aria-label="Device">
-                        <button type="button" className={device === 'desktop' ? 'active' : undefined} onClick={() => setDevice('desktop')}>Desktop</button>
-                        <button type="button" className={device === 'mobile' ? 'active' : undefined} onClick={() => setDevice('mobile')}>Mobile</button>
-                    </div>
-                </div>
-                <div className="mock-control-group">
-                    <span className="mock-control-label">Theme</span>
-                    <div className="mock-seg" role="group" aria-label="Theme">
-                        {(['light', 'dark', 'system'] as Theme[]).map((t) => (
-                            <button key={t} type="button" className={theme === t ? 'active' : undefined} onClick={() => setTheme(t)}>{t[0].toUpperCase() + t.slice(1)}</button>
-                        ))}
-                    </div>
-                </div>
-            </div>
-
             <div className="mock-stage">
-                <div className={`mock-viewport${device === 'mobile' ? ' is-mobile' : ''}`}>
+                <div className="mock-viewport">
                     <div className="mock-app">
                         <Topbar theme={theme} onTheme={setTheme} onSignOut={onSignOut} />
                         <div className="mock-body pt-body">
@@ -220,6 +183,7 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
             <CommandBar />
             <PhotoViewer />
             <Toasts />
+            <DialogHost />
         </div>
     );
 };
@@ -253,6 +217,19 @@ const PrototypeApp: React.FC = () => {
         await signOut();
         await refreshAuthState();
     }, [refreshAuthState]);
+
+    // Public share links render the real album page regardless of auth state.
+    if (isPublicAlbumPath()) {
+        return (
+            <BrowserRouter>
+                <React.Suspense fallback={<Loading label="Loading album…" />}>
+                    <Routes>
+                        <Route path="/public/album/:token" element={<LazyPublicAlbumPage />} />
+                    </Routes>
+                </React.Suspense>
+            </BrowserRouter>
+        );
+    }
 
     if (!authReady) {
         return <Loading label="Loading Keepsake…" />;

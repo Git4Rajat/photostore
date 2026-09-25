@@ -128,7 +128,34 @@ const facesToPhotos = (faces: PersonFace[]): Photo[] => {
 interface ViewerState {
     ids: string[];
     index: number;
+    // When true, the viewer is backed by the gallery's infinite list: its ids
+    // grow as more pages load, and nearing the end triggers a fetch. Viewers
+    // opened from a fully-loaded set (albums, a person, search) leave this off.
+    extendable?: boolean;
 }
+
+export type MediaFilter = 'all' | 'photo' | 'video';
+
+export interface CaptureRange {
+    // Inclusive ISO date bounds (yyyy-mm-dd) passed to /photos as
+    // captureStart/captureEnd; either end may be omitted for an open range.
+    start?: string;
+    end?: string;
+    label: string;
+}
+
+// Shape of GET /photos/timeline (see backend build_timeline_summary): a nested
+// year -> month -> day count tree the gallery's timeline rail is built from.
+export interface TimelineSummary {
+    years: Record<string, { count: number; months: Record<string, { count: number; days: Record<string, number> }> }>;
+    firstDate: string | null;
+    lastDate: string | null;
+    undatedCount: number;
+    totalCount: number;
+}
+
+const VIDEO_EXT_RE = /\.(mp4|mov|m4v|webm|avi|mkv|3gp|hevc)$/i;
+export const isVideoFilename = (filename: string): boolean => VIDEO_EXT_RE.test(filename);
 
 interface Store {
     route: Route;
@@ -153,8 +180,16 @@ interface Store {
     // photo loading (server-paged)
     photosLoading: boolean;
     hasMorePhotos: boolean;
+    totalPhotos: number | null;
     loadMorePhotos: () => void;
     reloadPhotos: () => void;
+
+    // gallery filters / timeline
+    mediaFilter: MediaFilter;
+    setMediaFilter: (filter: MediaFilter) => void;
+    captureRange: CaptureRange | null;
+    setCaptureRange: (range: CaptureRange | null) => void;
+    timeline: TimelineSummary | null;
 
     // explore (places / things from /explore)
     exploreLoading: boolean;
@@ -175,7 +210,7 @@ interface Store {
     clearSelection: () => void;
 
     // viewer
-    openViewer: (ids: string[], index: number) => void;
+    openViewer: (ids: string[], index: number, opts?: { extendable?: boolean }) => void;
     closeViewer: () => void;
     viewerStep: (delta: number) => void;
 
@@ -233,6 +268,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [photos, setPhotos] = useState<Photo[]>([]);
     const [photosLoading, setPhotosLoading] = useState<boolean>(true);
     const [hasMorePhotos, setHasMorePhotos] = useState<boolean>(true);
+    const [totalPhotos, setTotalPhotos] = useState<number | null>(null);
+    const [mediaFilter, setMediaFilterState] = useState<MediaFilter>('all');
+    const [captureRange, setCaptureRangeState] = useState<CaptureRange | null>(null);
+    const [timeline, setTimeline] = useState<TimelineSummary | null>(null);
+    const captureRangeRef = useRef<CaptureRange | null>(null);
     const photoOffsetRef = useRef(0);
     const photoLoadingRef = useRef(false);
     const photoHasMoreRef = useRef(true);
@@ -281,14 +321,17 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         photoLoadingRef.current = true;
         setPhotosLoading(true);
         const offset = reset ? 0 : photoOffsetRef.current;
+        const range = captureRangeRef.current;
+        const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
         try {
-            const res = await get<{ photos?: BackendPhoto[] }>(
-                `/photos?sort=capture&offset=${offset}&limit=${PAGE_SIZE}`,
+            const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
+                `/photos?sort=capture&offset=${offset}&limit=${PAGE_SIZE}${rangeQuery}`,
             );
             const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
             photoOffsetRef.current = offset + list.length;
             photoHasMoreRef.current = list.length === PAGE_SIZE;
             setHasMorePhotos(photoHasMoreRef.current);
+            if (typeof res?.total === 'number') setTotalPhotos(res.total);
             setPhotos((prev) => (reset ? list : [...prev, ...list]));
         } catch {
             photoHasMoreRef.current = false;
@@ -309,6 +352,58 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         photoHasMoreRef.current = true;
         void fetchPhotos(true);
     }, [fetchPhotos]);
+
+    // Timeline summary (year/month/day counts) drives the gallery's date rail.
+    const fetchTimeline = useCallback(async () => {
+        try {
+            const res = await get<TimelineSummary>('/photos/timeline');
+            if (res && typeof res === 'object' && res.years) setTimeline(res);
+        } catch {
+            // timeline rail simply stays hidden on failure
+        }
+    }, []);
+
+    useEffect(() => {
+        void fetchTimeline();
+    }, [fetchTimeline]);
+
+    // Narrow the gallery to a capture-date window (from the timeline rail) and
+    // re-fetch from the top. Passing null clears the window back to the full set.
+    const setCaptureRange = useCallback((range: CaptureRange | null) => {
+        captureRangeRef.current = range;
+        setCaptureRangeState(range);
+        photoOffsetRef.current = 0;
+        photoHasMoreRef.current = true;
+        void fetchPhotos(true);
+    }, [fetchPhotos]);
+
+    const setMediaFilter = useCallback((filter: MediaFilter) => setMediaFilterState(filter), []);
+
+    // The id sequence a gallery-backed viewer slides through: the loaded photos
+    // in the current media filter. It grows as more pages load.
+    const galleryViewerIds = useMemo(() => {
+        const list = mediaFilter === 'all'
+            ? photos
+            : photos.filter((p) => (mediaFilter === 'video' ? isVideoFilename(p.filename) : !isVideoFilename(p.filename)));
+        return list.map((p) => p.id);
+    }, [photos, mediaFilter]);
+
+    // Keep an open gallery-backed viewer in sync as newly-loaded photos arrive,
+    // so the user can keep sliding past what was loaded when they opened it.
+    useEffect(() => {
+        setViewer((prev) => {
+            if (!prev || !prev.extendable || prev.ids.length === galleryViewerIds.length) return prev;
+            return { ...prev, ids: galleryViewerIds };
+        });
+    }, [galleryViewerIds]);
+
+    // Prefetch the next page once the viewer nears the end of the loaded ids.
+    useEffect(() => {
+        if (!viewer?.extendable) return;
+        if (viewer.index >= viewer.ids.length - 3 && photoHasMoreRef.current && !photoLoadingRef.current) {
+            void fetchPhotos(false);
+        }
+    }, [viewer?.extendable, viewer?.index, viewer?.ids.length, fetchPhotos]);
 
     const dismissToast = useCallback((id: string) => {
         setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -344,7 +439,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const selectMany = useCallback((ids: string[]) => setSelection(ids), []);
     const clearSelection = useCallback(() => setSelection([]), []);
 
-    const openViewer = useCallback((ids: string[], index: number) => setViewer({ ids, index }), []);
+    const openViewer = useCallback((ids: string[], index: number, opts?: { extendable?: boolean }) => (
+        setViewer({ ids, index, extendable: opts?.extendable })
+    ), []);
     const closeViewer = useCallback(() => setViewer(null), []);
     const viewerStep = useCallback((delta: number) => {
         setViewer((prev) => {
@@ -785,8 +882,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             toasts,
             photosLoading,
             hasMorePhotos,
+            totalPhotos,
             loadMorePhotos,
             reloadPhotos,
+            mediaFilter,
+            setMediaFilter,
+            captureRange,
+            setCaptureRange,
+            timeline,
             exploreLoading,
             reloadExplore,
             photoById,
@@ -837,7 +940,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [
             route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
             placesState, thingsState, trash, trashLoading, selection, viewer, toasts,
-            photosLoading, hasMorePhotos, loadMorePhotos, reloadPhotos, exploreLoading, reloadExplore,
+            photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
+            mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
+            exploreLoading, reloadExplore,
             photoById, photosByIds, albumById, personById, navigate, toggleSelect, selectMany,
             clearSelection, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
