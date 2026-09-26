@@ -225,6 +225,7 @@ interface Store {
     // photo mutations
     ratePhotos: (ids: string[], rating: number) => void;
     toggleLike: (id: string) => void;
+    applyPhotoRotation: (filename: string, rotation: number) => void;
     deletePhotos: (ids: string[]) => void;
     restorePhotos: (ids: string[]) => void;
     restoreAllTrash: () => void;
@@ -531,6 +532,32 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         },
         [photos, toast],
     );
+
+    // Persist a manual rotation into every client-side photo collection so the
+    // gallery grid, an already-open viewer, and any later reopen of the photo
+    // all reflect it. The backend doesn't bake manual rotation into the served
+    // preview/thumbnail (only EXIF orientation), so the absolute `rotation`
+    // value stored here is what the viewer/grid apply as a CSS transform.
+    const applyPhotoRotation = useCallback((filename: string, rotation: number) => {
+        const norm = ((rotation % 360) + 360) % 360;
+        const patch = (p: Photo): Photo => (p.id === filename && p.rotation !== norm ? { ...p, rotation: norm } : p);
+        setPhotos((prev) => prev.map(patch));
+        setAlbumPhotos((prev) => {
+            const next: Record<string, Photo[]> = {};
+            for (const [id, list] of Object.entries(prev)) next[id] = list.map(patch);
+            return next;
+        });
+        setPersonPhotos((prev) => {
+            const next: Record<string, Photo[]> = {};
+            for (const [id, list] of Object.entries(prev)) next[id] = list.map(patch);
+            return next;
+        });
+        setExtraPhotos((prev) => {
+            const existing = prev[filename];
+            if (!existing || existing.rotation === norm) return prev;
+            return { ...prev, [filename]: { ...existing, rotation: norm } };
+        });
+    }, []);
 
     const removeFromEverywhere = useCallback((ids: string[]) => {
         const set = new Set(ids);
@@ -1078,6 +1105,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             viewerStep,
             ratePhotos,
             toggleLike,
+            applyPhotoRotation,
             deletePhotos,
             restorePhotos,
             restoreAllTrash,
@@ -1125,7 +1153,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
-            clearSelection, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, deletePhotos,
+            clearSelection, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,

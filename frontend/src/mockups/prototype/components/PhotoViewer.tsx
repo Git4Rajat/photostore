@@ -31,7 +31,7 @@ const dash = (value?: string | number): string => {
 /** Full-screen photo viewer with a persistent action bar, prev/next, keyboard,
  *  rotate + zoom controls, an EXIF/location info panel, and on-demand full-res. */
 export const PhotoViewer: React.FC = () => {
-    const { viewer, photos, photoById, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, deletePhotos, navigate, toast, route, registerPhotos } = useStore();
+    const { viewer, photoById, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos, navigate, toast, route, registerPhotos } = useStore();
 
     const live = useMemo(
         () => (viewer ? viewer.ids.map((id) => photoById(id)).filter((p) => Boolean(p)) : []),
@@ -50,13 +50,21 @@ export const PhotoViewer: React.FC = () => {
     const index = viewer ? Math.min(viewer.index, Math.max(0, live.length - 1)) : 0;
     const photo = viewer && live.length ? live[index] : null;
 
-    // Per-photo view state. `rotation` is the *absolute* orientation we persist;
-    // the preview the server serves is already corrected to the stored rotation,
-    // so we only ever apply the delta since mount as a CSS transform (baseRef) —
-    // otherwise a stored rotation would double-rotate on screen.
+    // `rotation` is the photo's *absolute* manual orientation (0/90/180/270).
+    // The server bakes only EXIF orientation into the preview it serves, never
+    // this manual rotation (confirmed: nothing in the backend reads the
+    // `rotation` field when generating thumbnails/previews), so we apply the
+    // full value as a CSS transform on top of the already-upright preview —
+    // matching how PhotoTile renders it in the grid. It's seeded from the
+    // stored rotation on each photo and persisted back through the store.
     const [rotation, setRotation] = useState(0);
-    const baseRef = useRef(0);
     const [zoom, setZoom] = useState(1);
+    // Mirrors `zoom` for the imperative pinch/gesture listeners below, so they
+    // can read the current zoom as a pinch baseline without listing `zoom` as
+    // an effect dependency -- re-running those effects mid-gesture detaches and
+    // reattaches the listeners, dropping events partway through a pinch.
+    const zoomRef = useRef(1);
+    useEffect(() => { zoomRef.current = zoom; }, [zoom]);
     const [pan, setPan] = useState({ x: 0, y: 0 });
     const [fullRes, setFullRes] = useState(false);
     const [showInfo, setShowInfo] = useState(false);
@@ -66,34 +74,43 @@ export const PhotoViewer: React.FC = () => {
     // but the save request is deliberately deferred -- it fires once the user
     // navigates away from this photo (prev/next) or closes the viewer, not on
     // every click, via this effect's cleanup below.
-    const pendingRotationRef = useRef<{ filename: string; rotation: number } | null>(null);
+    const pendingRotationRef = useRef<{ filename: string; rotation: number; previous: number } | null>(null);
     const flushPendingRotation = useCallback(() => {
         const pending = pendingRotationRef.current;
         if (!pending) return;
         pendingRotationRef.current = null;
-        void setPhotoRotation(pending.filename, pending.rotation).catch(() => toast('Couldn’t save rotation'));
-    }, [toast]);
+        // Persist to the store immediately (optimistic) so the grid and any
+        // reopen reflect the new orientation, then write it through to the
+        // backend. On failure, revert the store to the saved-before value.
+        applyPhotoRotation(pending.filename, pending.rotation);
+        void setPhotoRotation(pending.filename, pending.rotation).catch(() => {
+            applyPhotoRotation(pending.filename, pending.previous);
+            toast('Couldn’t save rotation');
+        });
+    }, [toast, applyPhotoRotation]);
 
     // Reset transient view state whenever the active photo changes, flushing
     // any pending rotation for the photo being left (see flushPendingRotation).
+    // Keyed on photo?.id only, deliberately not photo.rotation: persisting a
+    // new rotation writes it back to the store (applyPhotoRotation), and we
+    // must NOT let that re-run this reset and clobber the user's just-applied
+    // in-session rotation.
     useEffect(() => {
-        const base = photo?.rotation ? ((photo.rotation % 360) + 360) % 360 : 0;
-        baseRef.current = base;
-        setRotation(base);
+        setRotation(photo?.rotation ? ((photo.rotation % 360) + 360) % 360 : 0);
         setZoom(1);
         setPan({ x: 0, y: 0 });
         setFullRes(false);
         setShowInfo(false);
         setMeta(null);
         return () => flushPendingRotation();
-    }, [photo?.id, flushPendingRotation]);
+    }, [photo?.id, flushPendingRotation]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Flush pending rotation when the viewer closes (if the component returns null early).
-    useEffect(() => {
-        return () => flushPendingRotation();
-    }, [flushPendingRotation]);
+    // Also flush on unmount (the viewer stays mounted but renders null when
+    // closed, so this covers a hard teardown; the photo-change cleanup above
+    // covers close-via-Back, which flips photo?.id to undefined).
+    useEffect(() => () => flushPendingRotation(), [flushPendingRotation]);
 
-    const displayRotation = ((rotation - baseRef.current) % 360 + 360) % 360;
+    const displayRotation = ((rotation % 360) + 360) % 360;
 
     // Fetch metadata lazily the first time the info panel is opened for a photo.
     useEffect(() => {
@@ -117,9 +134,10 @@ export const PhotoViewer: React.FC = () => {
 
     const rotate = useCallback((delta: number) => {
         if (!photo) return;
+        const previous = photo.rotation ? ((photo.rotation % 360) + 360) % 360 : 0;
         setRotation((r) => {
             const next = ((r + delta) % 360 + 360) % 360;
-            pendingRotationRef.current = { filename: photo.filename, rotation: next };
+            pendingRotationRef.current = { filename: photo.filename, rotation: next, previous };
             return next;
         });
     }, [photo]);
@@ -149,7 +167,11 @@ export const PhotoViewer: React.FC = () => {
         };
         el.addEventListener('wheel', onWheel, { passive: false });
         return () => el.removeEventListener('wheel', onWheel);
-    }, [zoomBy]);
+        // photo?.id gates re-attachment: the viewer renders null while closed,
+        // so photoRef.current is null on the initial mount and only becomes the
+        // real element once a photo opens -- without re-running here, the
+        // listener would never attach and pinch/scroll-zoom silently no-ops.
+    }, [zoomBy, photo?.id]);
 
     // Two-finger trackpad pinch on desktop: Chrome/Firefox report it as a
     // ctrl/cmd+wheel event (handled above); Safari instead fires its
@@ -160,7 +182,7 @@ export const PhotoViewer: React.FC = () => {
         if (!el) return undefined;
         const onGestureStart = (e: Event) => {
             e.preventDefault();
-            gestureStartZoomRef.current = zoom;
+            gestureStartZoomRef.current = zoomRef.current;
         };
         const onGestureChange = (e: Event) => {
             e.preventDefault();
@@ -176,21 +198,27 @@ export const PhotoViewer: React.FC = () => {
             el.removeEventListener('gesturechange', onGestureChange);
             el.removeEventListener('gestureend', onGestureEnd);
         };
-    }, [zoom]);
+    }, [photo?.id]);
 
-    // iOS Safari two-finger pinch via touch events (gesturestart etc. don't fire there).
+    // iOS Safari two-finger pinch via touch events -- its gesture* events are
+    // unreliable inside a position:fixed overlay, so drive zoom from raw touch
+    // points. touch-action:none on .pt-viewer-photo (see CSS) stops the browser
+    // from claiming the gesture for its own page-zoom; passive:false lets us
+    // preventDefault so the pinch scales the photo instead of the page.
     const touchPinchRef = useRef<{ dist: number; zoom: number } | null>(null);
     useEffect(() => {
         const el = photoRef.current;
         if (!el) return undefined;
-        const touchDist = (t: TouchList) => t.length === 2 ? Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) : 0;
+        const touchDist = (t: TouchList) => t.length >= 2 ? Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) : 0;
         const onTouchStart = (e: TouchEvent) => {
             if (e.touches.length === 2) {
-                touchPinchRef.current = { dist: touchDist(e.touches), zoom };
+                e.preventDefault();
+                touchPinchRef.current = { dist: touchDist(e.touches) || 1, zoom: zoomRef.current };
             }
         };
         const onTouchMove = (e: TouchEvent) => {
-            if (e.touches.length === 2 && touchPinchRef.current) {
+            if (e.touches.length >= 2 && touchPinchRef.current) {
+                e.preventDefault();
                 const ratio = touchDist(e.touches) / touchPinchRef.current.dist;
                 setZoom(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +(touchPinchRef.current.zoom * ratio).toFixed(2))));
             }
@@ -198,15 +226,17 @@ export const PhotoViewer: React.FC = () => {
         const onTouchEnd = (e: TouchEvent) => {
             if (e.touches.length < 2) touchPinchRef.current = null;
         };
-        el.addEventListener('touchstart', onTouchStart);
-        el.addEventListener('touchmove', onTouchMove);
+        el.addEventListener('touchstart', onTouchStart, { passive: false });
+        el.addEventListener('touchmove', onTouchMove, { passive: false });
         el.addEventListener('touchend', onTouchEnd);
+        el.addEventListener('touchcancel', onTouchEnd);
         return () => {
             el.removeEventListener('touchstart', onTouchStart);
             el.removeEventListener('touchmove', onTouchMove);
             el.removeEventListener('touchend', onTouchEnd);
+            el.removeEventListener('touchcancel', onTouchEnd);
         };
-    }, [zoom]);
+    }, [photo?.id]);
 
     if (!viewer) return null;
     if (!photo) return null;
@@ -407,27 +437,14 @@ export const PhotoViewer: React.FC = () => {
                                         type="button"
                                         onClick={() => {
                                             close();
-                                            // navigate() always clears the open viewer (so a
-                                            // stale one never lingers over an unrelated page),
-                                            // so reopen it right after via a microtask -- registerPhotos
-                                            // first in case this photo isn't in Gallery's own loaded
-                                            // page yet (same fix as Ask's search-result preview).
-                                            // Prefer reopening at this photo's real position in
-                                            // the gallery's own id sequence (with prev/next and
-                                            // further paging still working), not an isolated
-                                            // single-photo viewer -- otherwise the photo "opens"
-                                            // but never actually appears inside the gallery grid.
-                                            const galleryIds = photos.map((p) => p.id);
-                                            const galleryIndex = galleryIds.indexOf(photo.id);
+                                            // Hand the photo off to the Gallery via a route
+                                            // param and let it open the viewer inside its own
+                                            // (paged, swipeable) sequence once loaded -- see
+                                            // GalleryPage's photo-param effect. registerPhotos
+                                            // first so the viewer can still resolve this photo
+                                            // even if it's on a gallery page not yet fetched.
                                             registerPhotos([photo]);
-                                            navigate('gallery');
-                                            Promise.resolve().then(() => {
-                                                if (galleryIndex >= 0) {
-                                                    openViewer(galleryIds, galleryIndex, { extendable: true });
-                                                } else {
-                                                    openViewer([photo.id], 0);
-                                                }
-                                            });
+                                            navigate('gallery', { photo: photo.id });
                                         }}
                                     >
                                         Show in Gallery

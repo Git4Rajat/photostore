@@ -225,12 +225,16 @@
 .pt-person-count { font-size: 0.76rem; color: var(--muted); }
 .pt-back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; margin-bottom: 8px; }
 .pt-back svg { width: 18px; height: 18px; }
+/* Person-detail header: the name-row and the Find-more/Delete actions share a
+   single vertically-centred line (the photo count moved out to .pt-person-count
+   below, so it no longer pushes the name row up out of line with the buttons). */
+.pt-person-toolbar { align-items: center; }
 .pt-person-head { display: flex; align-items: center; gap: 14px; flex: 1; min-width: 0; }
-.pt-person-head-face { width: 64px; height: 64px; border-radius: 50%; flex: 0 0 auto; object-fit: cover; }
-.pt-person-head > div { display: flex; flex-direction: column; flex: 1; min-width: 0; }
-.pt-person-name-row { display: flex; gap: 8px; align-items: center; min-width: 0; }
-.pt-person-name-row .field { flex: 0 1 220px; min-width: 0; }
+.pt-person-head-face { width: 48px; height: 48px; border-radius: 50%; flex: 0 0 auto; object-fit: cover; }
+.pt-person-name-row { display: flex; gap: 8px; align-items: center; min-width: 0; flex: 1; }
+.pt-person-name-row .field { flex: 0 1 240px; min-width: 0; }
 .pt-person-name-row .btn { flex: 0 0 auto; white-space: nowrap; padding: 8px 12px; }
+.pt-person-count { margin: 6px 0 16px 62px; }
 .pt-merge { padding: 16px; margin-top: 16px; }
 .pt-merge-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 
@@ -438,7 +442,7 @@
 .pt-viewer-nav { width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.1); border: 0; color: #fff; cursor: pointer; flex: 0 0 auto; display: grid; place-items: center; }
 .pt-viewer-nav:disabled { opacity: 0.3; cursor: default; }
 .pt-viewer-nav svg { width: 22px; height: 22px; }
-.pt-viewer-photo { flex: 1; height: min(70vh, 100%); border-radius: var(--r-md); position: relative; overflow: hidden; }
+.pt-viewer-photo { flex: 1; height: min(70vh, 100%); border-radius: var(--r-md); position: relative; overflow: hidden; touch-action: none; }
 .pt-viewer-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
 .pt-viewer-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px calc(12px + env(safe-area-inset-bottom)); background: rgba(0,0,0,0.32); flex-wrap: nowrap; position: relative; }
 .pt-vb-group { display: flex; align-items: center; gap: 6px; min-width: 0; }

@@ -1856,7 +1856,22 @@ def _blob_name_from_metadata(metadata: Optional[Dict], filename: str) -> str:
 
 def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
     """Return a thumbnail URL when a real thumbnail or backend preview can be served."""
-    if str((metadata or {}).get('thumbnail_status') or '').strip().lower() != 'done':
+    meta = metadata or {}
+    thumbnail_status = str(meta.get('thumbnail_status') or '').strip().lower()
+    # Soft-delete stamps every browser-processing status (thumbnail_status
+    # included) to 'deleted' via _mark_processing_deleted_for_file, even though
+    # the thumbnail/preview blobs are left fully intact for the retention
+    # window. Recover the real pre-delete thumbnail status from the snapshot so
+    # the Recently Deleted grid serves the actual thumbnail that's still
+    # sitting in blob storage instead of the empty-URL placeholder the
+    # overwritten 'deleted' status would otherwise produce.
+    if str(meta.get('processing_state') or '').strip().lower() == 'deleted' and thumbnail_status == 'deleted':
+        try:
+            pre_delete = json.loads(meta.get('preDeleteStatuses') or '{}')
+        except (TypeError, ValueError):
+            pre_delete = {}
+        thumbnail_status = str((pre_delete or {}).get('thumbnail_status') or '').strip().lower()
+    if thumbnail_status != 'done':
         if _filename_requires_backend_preview(filename):
             # No thumbnail blob exists yet; the proxy route falls through to the
             # server-side RAW/HEIC preview converter, which a direct blob URL can't.
@@ -1864,7 +1879,7 @@ def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
         # For regular photos without a thumbnail yet, fall back to preview if available.
         # This is especially important for deleted photos where users need to see what
         # they're restoring or permanently deleting.
-        if str((metadata or {}).get('preview_status') or '').strip().lower() == 'done':
+        if str(meta.get('preview_status') or '').strip().lower() == 'done':
             return make_proxy_url(filename, 'preview')
         return ''
     return make_media_url(filename, 'thumbnail', blob_name=_blob_name_from_metadata(metadata, filename))

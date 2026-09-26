@@ -128,6 +128,10 @@ export interface RouteParams {
     tag?: string;
     // Comma-separated filenames deep-linked into the Tools "Workbench" view.
     filenames?: string;
+    // A single photo id/filename the Gallery should open in the viewer on
+    // arrival — used by the viewer's "Show in Gallery" action so the photo
+    // opens inside the gallery's own (paged, swipeable) sequence.
+    photo?: string;
 }
 
 export interface Route {

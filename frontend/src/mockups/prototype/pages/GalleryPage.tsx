@@ -22,6 +22,7 @@ export const GalleryPage: React.FC = () => {
     const {
         photos, navigate, selectMany, clearSelection, selection, photosLoading, hasMorePhotos,
         loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
+        route, openViewer,
     } = useStore();
     const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
     const [dragging, setDragging] = useState(false);
@@ -106,6 +107,29 @@ export const GalleryPage: React.FC = () => {
         if (mediaFilter === 'all') return photos;
         return photos.filter((p) => (mediaFilter === 'video' ? isVideoFilename(p.filename) : !isVideoFilename(p.filename)));
     }, [photos, mediaFilter]);
+
+    // Open the viewer at a photo handed off via ?photo= (the PhotoViewer's
+    // "Show in Gallery" action). Opens it inside the gallery's own id sequence
+    // so prev/next and further paging keep working. If the photo isn't on a
+    // loaded page yet, page forward until it appears; once every page is loaded
+    // and it's still missing (e.g. a search-only result), fall back to opening
+    // it on its own -- the viewer already had it registered before navigating.
+    const openedPhotoParamRef = useRef<string | null>(null);
+    useEffect(() => {
+        const target = route.params.photo;
+        if (!target) { openedPhotoParamRef.current = null; return; }
+        if (openedPhotoParamRef.current === target) return;
+        const idx = visiblePhotos.findIndex((p) => p.id === target);
+        if (idx >= 0) {
+            openedPhotoParamRef.current = target;
+            openViewer(visiblePhotos.map((p) => p.id), idx, { extendable: true });
+        } else if (hasMorePhotos && !photosLoading) {
+            loadMorePhotos();
+        } else if (!hasMorePhotos) {
+            openedPhotoParamRef.current = target;
+            openViewer([target], 0);
+        }
+    }, [route.params.photo, visiblePhotos, hasMorePhotos, photosLoading, loadMorePhotos, openViewer]);
 
     const countLabel = totalPhotos !== null
         ? `${totalPhotos.toLocaleString()} photo${totalPhotos === 1 ? '' : 's'}`

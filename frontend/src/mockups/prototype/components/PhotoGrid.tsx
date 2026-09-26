@@ -6,6 +6,18 @@ import { usePhotoThumbnails } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
 import type { Photo } from '../types';
 
+// The served thumbnail bakes in only the client's auto-orientation
+// (thumbnailRotation); the user's manual rotate action lives in `rotation` and
+// is applied on top as a CSS transform -- mirrors PhotoTile's remainingRotation
+// so the grid tile matches what the viewer shows. The 0.74 down-scale on
+// quarter-turns keeps a rotated landscape thumbnail from overflowing its square.
+const normRot = (value?: number) => { const r = Number(value || 0) % 360; return r < 0 ? r + 360 : r; };
+const tileRotationStyle = (photo: Photo): React.CSSProperties | undefined => {
+    const remaining = normRot(normRot(photo.rotation) - normRot(photo.thumbnailRotation));
+    if (!remaining) return undefined;
+    return { transform: `rotate(${remaining}deg) scale(${remaining % 180 === 0 ? 1 : 0.74})` };
+};
+
 /**
  * Selection-aware photo grid. Clicking a tile opens the viewer; the corner
  * checkbox toggles selection (which surfaces the command bar). Rating and like
@@ -160,6 +172,7 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                                 alt={photo.filename}
                                 loading="lazy"
                                 draggable={false}
+                                style={tileRotationStyle(photo)}
                             />
                         )}
                         <button

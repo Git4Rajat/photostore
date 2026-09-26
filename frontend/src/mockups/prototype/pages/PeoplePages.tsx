@@ -166,23 +166,20 @@ export const PersonDetailPage: React.FC = () => {
     return (
         <div>
             <button type="button" className="pt-back" onClick={() => navigate('people')}><ArrowLeftIcon /> People</button>
-            <div className="pt-toolbar">
+            <div className="pt-toolbar pt-person-toolbar">
                 <div className="pt-person-head">
                     {coverSrc
                         ? <img className="pt-person-head-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} />
                         : <Swatch swatch={person.swatch} className="pt-person-head-face" />}
-                    <div>
-                        <div className="pt-person-name-row">
-                            <input
-                                className="field"
-                                value={draft}
-                                placeholder="Add a name"
-                                onChange={(e) => setDraft(e.target.value)}
-                                onKeyDown={(e) => { if (e.key === 'Enter' && draft.trim()) { renamePerson(person.id, draft.trim()); toast('Name saved'); } }}
-                            />
-                            <button type="button" className="btn mock-cta" disabled={!draft.trim()} onClick={() => { renamePerson(person.id, draft.trim()); toast('Name saved'); }}>Save</button>
-                        </div>
-                        <p className="pt-page-sub">{photos?.length ?? person.faceCount ?? 0} photos</p>
+                    <div className="pt-person-name-row">
+                        <input
+                            className="field"
+                            value={draft}
+                            placeholder="Add a name"
+                            onChange={(e) => setDraft(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' && draft.trim()) { renamePerson(person.id, draft.trim()); toast('Name saved'); } }}
+                        />
+                        <button type="button" className="btn mock-cta" disabled={!draft.trim()} onClick={() => { renamePerson(person.id, draft.trim()); toast('Name saved'); }}>Save</button>
                     </div>
                 </div>
                 <div className="pt-toolbar-actions">
@@ -190,6 +187,7 @@ export const PersonDetailPage: React.FC = () => {
                     <button type="button" className="btn btn-danger" onClick={() => void handleDeletePerson()}><TrashIcon className="toolbar-icon" /> Delete</button>
                 </div>
             </div>
+            <p className="pt-page-sub pt-person-count">{photos?.length ?? person.faceCount ?? 0} photos</p>
 
             {photos === undefined && personPhotosLoading ? (
                 <p className="pt-grid-empty">Loading photos…</p>
