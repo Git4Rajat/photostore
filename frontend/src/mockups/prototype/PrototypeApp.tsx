@@ -14,6 +14,7 @@ import PhotoViewer from './components/PhotoViewer';
 import Toasts from './components/Toasts';
 
 const LazyPublicAlbumPage = React.lazy(() => import('../../components/PublicAlbumPage'));
+const LazyAcceptInvitePage = React.lazy(() => import('../../components/AcceptInvitePage'));
 import GalleryPage from './pages/GalleryPage';
 import AlbumsPage from './pages/AlbumsPage';
 import { PeoplePage, PersonDetailPage } from './pages/PeoplePages';
@@ -49,6 +50,12 @@ type Theme = 'light' | 'dark' | 'system';
 // hand it to the real PublicAlbumPage under a router that supplies :token.
 const isPublicAlbumPath = (): boolean =>
     typeof window !== 'undefined' && window.location.pathname.startsWith('/public/album/');
+
+// Same problem for an invite link (…/accept-invite?token=…): it must work for a
+// brand-new invitee with no account yet, and the token query string has to
+// survive, which the MemoryRouter used for the signed-out gate below discards.
+const isAcceptInvitePath = (): boolean =>
+    typeof window !== 'undefined' && window.location.pathname === '/accept-invite';
 
 const NAV: { id: PageId; label: string }[] = [
     { id: 'ask', label: 'Ask' },
@@ -229,6 +236,21 @@ const PrototypeApp: React.FC = () => {
                 <React.Suspense fallback={<Loading label="Loading album…" />}>
                     <Routes>
                         <Route path="/public/album/:token" element={<LazyPublicAlbumPage />} />
+                    </Routes>
+                </React.Suspense>
+            </BrowserRouter>
+        );
+    }
+
+    // Invite links render the real accept-invite page regardless of auth
+    // state, so a brand-new invitee sees the signup (set-password) form
+    // instead of falling into the generic login page.
+    if (isAcceptInvitePath()) {
+        return (
+            <BrowserRouter>
+                <React.Suspense fallback={<Loading label="Loading invitation…" />}>
+                    <Routes>
+                        <Route path="/accept-invite" element={<LazyAcceptInvitePage />} />
                     </Routes>
                 </React.Suspense>
             </BrowserRouter>

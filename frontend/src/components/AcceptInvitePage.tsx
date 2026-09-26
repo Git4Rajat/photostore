@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
 import * as library from '../services/libraryClient';
 import { LogoLockup } from './shared/Logo';
 
@@ -131,7 +131,15 @@ const AcceptInvitePage: React.FC = () => {
                     >
                         {pending ? 'Accepting…' : 'Accept invitation'}
                     </button>
-                    <Link className="btn btn-link auth-page-link" to="/login">Back to sign in</Link>
+                    {/* Hard navigation: this page can render under a router that
+                        only knows the /accept-invite route (see PrototypeApp). */}
+                    <button
+                        type="button"
+                        className="btn btn-link auth-page-link"
+                        onClick={() => { window.location.href = '/login'; }}
+                    >
+                        Back to sign in
+                    </button>
                 </form>
             )}
         </section>
