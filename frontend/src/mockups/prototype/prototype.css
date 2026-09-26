@@ -309,6 +309,27 @@
 .pt-history-row { padding: 12px 0; border-bottom: 1px solid var(--lg-edge); font-size: 0.84rem; }
 .pt-history-row:last-child { border-bottom: 0; }
 
+.pt-album-trash-header { margin-top: 24px; }
+.pt-album-trash-title { font-size: 1.1rem; }
+.pt-album-trash-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pt-album-trash-label { flex: 1 1 auto; min-width: 0; }
+.pt-album-trash-actions { flex: 0 0 auto; display: flex; gap: 14px; }
+.pt-album-trash-purge { color: var(--danger, #d24b5a); }
+
+.qchip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--lg-edge); background: var(--lg-surface-wash); border-radius: var(--r-pill); padding: 4px 10px; font-size: 0.8rem; color: var(--text); }
+.qchip.warn { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+
+.pt-history-row-with-action { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pt-history-reselect { flex: 0 0 auto; width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--lg-edge); background: transparent; color: var(--text); cursor: pointer; display: grid; place-items: center; }
+.pt-history-reselect:hover { background: var(--lg-surface-wash); }
+.pt-history-reselect:disabled { opacity: 0.5; cursor: default; }
+.pt-history-reselect svg { width: 16px; height: 16px; }
+
+.pt-diagnostic-card { gap: 12px; }
+.pt-diagnostic-card .pt-toolbar { width: 100%; }
+.pt-diagnostic-recommendation { font-weight: 650; }
+.pt-diagnostic-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+
 /* ---- trash ---- */
 .pt-trash-tile { cursor: default; }
 .pt-trash-actions { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 10px; opacity: 0; transition: opacity 0.12s ease; background: rgba(0,0,0,0.35); }

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useLocation } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import {
     ArrowPathIcon,
     ArrowsPointingOutIcon,
@@ -20,7 +20,7 @@ import {
     UsersIcon,
     XMarkIcon,
 } from '@heroicons/react/24/outline';
-import { get, post, getTools, postTools, getUpload, getAdmin, postAdmin } from '../services/apiClient';
+import { get, post, getTools, postTools, getUpload, getAdmin, postAdmin, getExtras } from '../services/apiClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import { requestJobPoll } from '../services/jobNotifications';
 import { plural } from '../utils/format';
@@ -31,10 +31,10 @@ import PhotoTile from './shared/PhotoTile';
 import { useThumbnailAccessResolver } from '../services/useThumbnailAccessResolver';
 import { useWindowedGrid } from '../services/useWindowedGrid';
 import { useDragSelect } from '../services/useDragSelect';
-import PhotoQuickActions, { libraryFocusHref } from './shared/PhotoQuickActions';
+import PhotoQuickActions, { libraryFocusHref, workbenchFilenamesHref } from './shared/PhotoQuickActions';
 import PhotoActionSheet from './shared/PhotoActionSheet';
 import PhotoViewer from './shared/PhotoViewer';
-import type { PhotoPersonLink, WorkbenchHistoryEntry } from '../types/uiTypes';
+import type { PhotoPersonLink, WorkbenchHistoryEntry, PeopleDiagnostic } from '../types/uiTypes';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { classifyApiError, type ApiError } from '../services/apiError';
@@ -122,7 +122,7 @@ type QueueStatus = {
 };
 
 type QueueStatusResponse = QueueStatus & { generatedAt?: string };
-type ToolsPageKey = 'overview' | 'queue-status' | 'browser-workbench' | 'recovery' | 'history';
+type ToolsPageKey = 'overview' | 'queue-status' | 'browser-workbench' | 'recovery' | 'history' | 'diagnostics';
 
 const processingStateLabels: Record<ProcessingFilterState, string> = {
     all: 'All',
@@ -224,6 +224,7 @@ const toolsSubnavItems: Array<{ key: ToolsPageKey; to: string; label: string; no
     { key: 'queue-status', to: '/tools/queue-status', label: 'Queue status', note: 'Live pipeline counters' },
     { key: 'recovery', to: '/tools/recovery', label: 'Recovery', note: 'Snapshot-backed repairs' },
     { key: 'history', to: '/tools/history', label: 'History', note: 'Recent workbench runs' },
+    { key: 'diagnostics', to: '/tools/diagnostics', label: 'Diagnostics', note: "Why aren't faces clustering?" },
 ];
 
 const getProcessingStatus = (photo: Photo, step: ChipStepKey) => {
@@ -276,6 +277,9 @@ const getToolsPageKey = (pathname: string): ToolsPageKey => {
     if (pathname.startsWith('/tools/history')) {
         return 'history';
     }
+    if (pathname.startsWith('/tools/diagnostics')) {
+        return 'diagnostics';
+    }
     return 'overview';
 };
 
@@ -284,6 +288,7 @@ const PAGE_SIZE = 50;
 const ToolsPage: React.FC = () => {
     const { browserAiModelState, loadBrowserAiModel, startBrowserProcessing } = useAppServices();
     const location = useLocation();
+    const navigate = useNavigate();
     const [photos, setPhotos] = useState<Photo[]>([]);
     const [photosTotal, setPhotosTotal] = useState<number>(0);
     const [photosOffset, setPhotosOffset] = useState<number>(0);
@@ -319,6 +324,10 @@ const ToolsPage: React.FC = () => {
     const focusTargetRef = useRef<HTMLDivElement | null>(null);
     const [actionSheetTarget, setActionSheetTarget] = useState<{ filenames: string[]; people?: Photo['people'] } | null>(null);
     const [history, setHistory] = useState<WorkbenchHistoryEntry[]>([]);
+    const [reselectingId, setReselectingId] = useState<string | null>(null);
+    const [diagnostic, setDiagnostic] = useState<PeopleDiagnostic | null>(null);
+    const [diagnosticLoading, setDiagnosticLoading] = useState<boolean>(false);
+    const [diagnosticError, setDiagnosticError] = useState<string>('');
     // filename -> batch-resolved access URL, shared with PhotoGallery/AlbumsPage
     // via thumbnailAccessCache's module-level cache (see PhotoGallery.tsx).
     const { thumbAccessUrls, resolveAccessForBatch } = useThumbnailAccessResolver();
@@ -328,6 +337,7 @@ const ToolsPage: React.FC = () => {
     const isBrowserWorkbenchPage = activeToolsPage === 'browser-workbench';
     const isRecoveryPage = activeToolsPage === 'recovery';
     const isHistoryPage = activeToolsPage === 'history';
+    const isDiagnosticsPage = activeToolsPage === 'diagnostics';
 
     const loadPhotos = async (queryText: string = '') => {
         setLoading(true);
@@ -465,6 +475,37 @@ const ToolsPage: React.FC = () => {
         }
     };
 
+    const handleReselectHistoryAction = async (actionId?: string) => {
+        if (!actionId) return;
+        setReselectingId(actionId);
+        try {
+            const response = await getTools(`/api/tools/workbench/actions/${actionId}`);
+            const filenames: string[] = Array.isArray(response?.filenames) ? response.filenames : [];
+            if (filenames.length === 0) {
+                setMessage("Those photos aren't available anymore.");
+                return;
+            }
+            navigate(workbenchFilenamesHref(filenames));
+        } catch (err) {
+            setMessage(`Couldn't reselect those photos: ${String(err)}`);
+        } finally {
+            setReselectingId(null);
+        }
+    };
+
+    const refreshPeopleDiagnostic = async () => {
+        setDiagnosticLoading(true);
+        setDiagnosticError('');
+        try {
+            const response = await getExtras('/api/people/diagnostic');
+            setDiagnostic(response as PeopleDiagnostic);
+        } catch (err) {
+            setDiagnosticError(String(err));
+        } finally {
+            setDiagnosticLoading(false);
+        }
+    };
+
     useEffect(() => {
         void loadQueueStatus();
         if (isOverviewPage || isBrowserWorkbenchPage) {
@@ -472,6 +513,9 @@ const ToolsPage: React.FC = () => {
         }
         if (isBrowserWorkbenchPage || isHistoryPage) {
             void refreshWorkbenchHistory();
+        }
+        if (isDiagnosticsPage) {
+            void refreshPeopleDiagnostic();
         }
     }, [activeToolsPage]);
 
@@ -2037,9 +2081,74 @@ const ToolsPage: React.FC = () => {
                                     <span className="people-merge-chip">{formatHistoryTimestamp(h.createdAt)}</span>
                                 </div>
                             </div>
+                            <div className="people-merge-history-actions">
+                                <button
+                                    type="button"
+                                    className="people-icon-btn"
+                                    disabled={reselectingId === h.actionId}
+                                    onClick={() => void handleReselectHistoryAction(h.actionId)}
+                                    aria-label="Reselect these photos"
+                                    title="Reselect these photos"
+                                >
+                                    <ArrowsPointingOutIcon />
+                                </button>
+                            </div>
                         </div>
                     ))}
                 </div>
+            )}
+        </div>
+    );
+
+    const renderDiagnosticsPage = () => (
+        <div className="tools-panel tools-diagnostics-panel">
+            <div className="tools-panel-header">
+                <div>
+                    <h2 className="tools-panel-title">Diagnostics</h2>
+                    <p className="tools-panel-meta">Why aren't faces clustering into people?</p>
+                </div>
+                <button
+                    type="button"
+                    className="btn btn-soft icon-btn"
+                    onClick={() => void refreshPeopleDiagnostic()}
+                    disabled={diagnosticLoading}
+                    aria-label="Refresh diagnostics"
+                    title="Refresh diagnostics"
+                >
+                    <ArrowPathIcon className="toolbar-icon" />
+                    <span className="sr-only">Refresh diagnostics</span>
+                </button>
+            </div>
+            {diagnosticLoading && <Loading label="Running diagnostics…" fullPage={false} />}
+            {!diagnosticLoading && diagnosticError && <p className="status error">{diagnosticError}</p>}
+            {!diagnosticLoading && !diagnosticError && diagnostic && (
+                <>
+                    {diagnostic.recommendation && (
+                        <p className="tools-diagnostic-recommendation">{diagnostic.recommendation}</p>
+                    )}
+                    <div className="tools-diagnostic-grid">
+                        <span className="people-merge-chip">Total faces · {diagnostic.totalFaces}</span>
+                        <span className="people-merge-chip">Accepted for clustering · {diagnostic.acceptedForClustering}</span>
+                        <span className="people-merge-chip">Unassigned · {diagnostic.unassignedFaces}</span>
+                        <span className="people-merge-chip">Confirmed · {diagnostic.confirmedFaces}</span>
+                        <span className="people-merge-chip">Rejected · {diagnostic.rejectedFaces}</span>
+                        <span className="people-merge-chip">Suspicious · {diagnostic.suspiciousFaces}</span>
+                        <span className="people-merge-chip">Stale embedding version · {diagnostic.staleEmbeddingVersionFaces}</span>
+                        <span className="people-merge-chip">No embedding · {diagnostic.noEmbeddingFaces}</span>
+                        <span className="people-merge-chip">Total people · {diagnostic.totalPeople}</span>
+                    </div>
+                    <div className="tools-diagnostic-grid">
+                        <span className="people-merge-chip">
+                            Clustering queue · {diagnostic.clusteringConfiguration.clusteringQueueAvailable ? 'available' : 'unavailable'}
+                        </span>
+                        <span className="people-merge-chip">
+                            Browser-only processing · {diagnostic.clusteringConfiguration.browserOnlyProcessing ? 'yes' : 'no'}
+                        </span>
+                        <span className="people-merge-chip">
+                            Active clustering job · {diagnostic.clusteringConfiguration.activeClusteringJob ? 'yes' : 'no'}
+                        </span>
+                    </div>
+                </>
             )}
         </div>
     );
@@ -2053,6 +2162,7 @@ const ToolsPage: React.FC = () => {
             {isBrowserWorkbenchPage && renderBrowserWorkbenchPage()}
             {isRecoveryPage && renderRecoveryPage()}
             {isHistoryPage && renderHistoryPage()}
+            {isDiagnosticsPage && renderDiagnosticsPage()}
 
             <PhotoActionSheet
                 open={!!actionSheetTarget}

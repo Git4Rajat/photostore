@@ -1061,6 +1061,22 @@ a {
   cursor: default;
 }
 
+.activity-row-purge {
+  flex: 0 0 auto;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--danger);
+  font-weight: 700;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.activity-row-purge:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 /* Real data (GET /photos/trash's earliestPurgeAt), not a fabricated
    "You"/"Auto" or "Expired" state -- see keepsake-ux-vision-roadmap memory
    for why those two mockup details were deliberately not built. */
@@ -2717,7 +2733,8 @@ a {
 }
 
 .face-clusters .people-merge-chip,
-.tools-history-panel .people-merge-chip {
+.tools-history-panel .people-merge-chip,
+.tools-diagnostics-panel .people-merge-chip {
   padding: 4px 8px;
   border-radius: var(--r-pill);
   background: var(--accent-soft);
@@ -2725,7 +2742,8 @@ a {
   font-size: 0.78rem;
 }
 
-.face-clusters .people-merge-history-actions {
+.face-clusters .people-merge-history-actions,
+.tools-history-panel .people-merge-history-actions {
   display: flex;
   align-items: center;
 }
@@ -6934,6 +6952,20 @@ video.photo-preview-media.is-loading {
   color: var(--muted);
   font-size: 0.82rem;
   margin-top: 2px;
+}
+
+.tools-diagnostic-recommendation {
+  margin: 4px 0 14px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tools-diagnostic-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
 }
 
 .explore-section-title {

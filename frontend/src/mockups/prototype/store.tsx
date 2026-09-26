@@ -19,6 +19,7 @@ import type {
     ThingTag,
     Toast,
     TrashItem,
+    AlbumTrashItem,
 } from './types';
 
 // ---- backend <-> prototype photo mapping -------------------------------------
@@ -173,6 +174,8 @@ interface Store {
     suggestions: Suggestion[];
     trash: TrashItem[];
     trashLoading: boolean;
+    albumTrash: AlbumTrashItem[];
+    albumTrashLoading: boolean;
     selection: string[];
     viewer: ViewerState | null;
     toasts: Toast[];
@@ -223,6 +226,9 @@ interface Store {
     purgePhoto: (id: string) => void;
     purgeAllTrash: () => void;
     reloadTrash: () => void;
+    reloadAlbumTrash: () => void;
+    restoreAlbum: (id: string) => void;
+    purgeAlbum: (id: string) => void;
 
     // albums (server-backed)
     albumsLoading: boolean;
@@ -296,6 +302,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [membersLoading, setMembersLoading] = useState<boolean>(true);
     const [trash, setTrash] = useState<TrashItem[]>([]);
     const [trashLoading, setTrashLoading] = useState<boolean>(false);
+    const [albumTrash, setAlbumTrash] = useState<AlbumTrashItem[]>([]);
+    const [albumTrashLoading, setAlbumTrashLoading] = useState<boolean>(false);
     const [selection, setSelection] = useState<string[]>([]);
     const [viewer, setViewer] = useState<ViewerState | null>(null);
     const [toasts, setToasts] = useState<Toast[]>([]);
@@ -606,6 +614,46 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             });
     }, [trash, toast]);
 
+    const reloadAlbumTrash = useCallback(async () => {
+        setAlbumTrashLoading(true);
+        try {
+            const res = await get<{ albums?: Album[] }>('/albums/trash');
+            const now = Date.now();
+            const items: AlbumTrashItem[] = Array.isArray(res?.albums)
+                ? res.albums.map((album) => {
+                    const days = album.purgeAt ? Math.max(0, Math.ceil((new Date(album.purgeAt).getTime() - now) / 86400000)) : 30;
+                    return { album, purgesInDays: days };
+                })
+                : [];
+            setAlbumTrash(items);
+        } catch {
+            // keep the current list on failure
+        } finally {
+            setAlbumTrashLoading(false);
+        }
+    }, []);
+
+    const restoreAlbum = useCallback((id: string) => {
+        const snapshot = albumTrash;
+        const restored = snapshot.find((t) => t.album.id === id);
+        setAlbumTrash((prev) => prev.filter((t) => t.album.id !== id));
+        if (restored) setAlbums((prev) => [restored.album, ...prev]);
+        void post(`/albums/${encodeURIComponent(id)}/restore`, {}).catch(() => {
+            setAlbumTrash(snapshot);
+            if (restored) setAlbums((prev) => prev.filter((a) => a.id !== id));
+            toast('Couldn’t restore album');
+        });
+    }, [albumTrash, toast]);
+
+    const purgeAlbum = useCallback((id: string) => {
+        const snapshot = albumTrash;
+        setAlbumTrash((prev) => prev.filter((t) => t.album.id !== id));
+        void post(`/albums/${encodeURIComponent(id)}/purge`, {}).catch(() => {
+            setAlbumTrash(snapshot);
+            toast('Couldn’t permanently delete album');
+        });
+    }, [albumTrash, toast]);
+
     const fetchAlbums = useCallback(async () => {
         setAlbumsLoading(true);
         try {
@@ -891,6 +939,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             suggestions: SUGGESTIONS,
             trash,
             trashLoading,
+            albumTrash,
+            albumTrashLoading,
             selection,
             viewer,
             toasts,
@@ -925,6 +975,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             purgePhoto,
             purgeAllTrash,
             reloadTrash,
+            reloadAlbumTrash,
+            restoreAlbum,
+            purgeAlbum,
             albumsLoading,
             reloadAlbums,
             openAlbum,
@@ -954,13 +1007,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }),
         [
             route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
-            placesState, thingsState, trash, trashLoading, selection, viewer, toasts,
+            placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, viewer, toasts,
             photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
             mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore,
             photoById, photosByIds, albumById, personById, navigate, toggleSelect, selectMany,
             clearSelection, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
+            reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,
             createAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, reloadPeople, openPerson, personPhotosById, personPhotosLoading,

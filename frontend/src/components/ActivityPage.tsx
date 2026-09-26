@@ -5,6 +5,7 @@ import { get, post } from '../services/apiClient';
 import faceService from '../services/faceService';
 import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
+import { confirmDialog } from './shared/dialogs';
 import { notifyApiError } from '../services/requestFeedback';
 import { showToast } from '../services/toast';
 import { plural } from '../utils/format';
@@ -118,6 +119,27 @@ const ActivityPage: React.FC = () => {
         }
     };
 
+    const handlePurgeAlbum = async (item: ActivityItem) => {
+        const confirmed = await confirmDialog({
+            title: 'Delete forever',
+            message: `Permanently delete "${item.label.replace(/^Album deleted: /, '')}"? This cannot be undone.`,
+            confirmLabel: 'Delete forever',
+            danger: true,
+        });
+        if (!confirmed) return;
+
+        setBusyId(item.id);
+        try {
+            await post(`/albums/${item.id}/purge`, {});
+            setActivity((prev) => prev.filter((i) => i.id !== item.id));
+            showToast('Album permanently deleted.');
+        } catch (err) {
+            notifyApiError(err, { context: "Couldn't permanently delete that album", retry: () => { void handlePurgeAlbum(item); } });
+        } finally {
+            setBusyId(null);
+        }
+    };
+
     const handleRestoreAll = async () => {
         setRestoringAll(true);
         try {
@@ -163,6 +185,16 @@ const ActivityPage: React.FC = () => {
                                 >
                                     {busyId === item.id ? 'Undoing…' : 'Undo'}
                                 </button>
+                                {item.kind === 'album' && (
+                                    <button
+                                        type="button"
+                                        className="activity-row-purge"
+                                        disabled={busyId === item.id}
+                                        onClick={() => void handlePurgeAlbum(item)}
+                                    >
+                                        Delete forever
+                                    </button>
+                                )}
                             </div>
                         ))}
                     </div>

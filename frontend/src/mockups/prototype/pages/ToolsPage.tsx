@@ -1,14 +1,14 @@
 import React, { useEffect, useState } from 'react';
-import { InformationCircleIcon } from '@heroicons/react/24/outline';
+import { ArrowsPointingOutIcon, InformationCircleIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
 import WorkbenchGrid from '../components/WorkbenchGrid';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import type { BrowserProcessingAction } from '../../../components/AppServicesProvider';
-import { getTools, postTools, postAdmin } from '../../../services/apiClient';
+import { getTools, postTools, postAdmin, getExtras } from '../../../services/apiClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import type { Photo } from '../types';
 
-const TABS = ['Overview', 'Workbench', 'Recovery', 'History'];
+const TABS = ['Overview', 'Workbench', 'Recovery', 'History', 'Diagnostics'];
 
 // Prototype step labels -> the browser-processing actions AppServicesProvider
 // runs. Order here is the pipeline order the buttons render in.
@@ -26,11 +26,29 @@ const STEP_ACTIONS: Record<string, BrowserProcessingAction> = {
 // the run isn't silently stuck at 'pending' waiting for a model that never loads.
 const AI_STEPS = new Set<BrowserProcessingAction>(['ocr', 'vision', 'faces']);
 
-interface HistoryEntry { action?: string; steps?: string[]; scope?: string; filenameCount?: number; createdAt?: string; }
+interface HistoryEntry { actionId?: string; action?: string; steps?: string[]; scope?: string; filenameCount?: number; createdAt?: string; }
+
+interface PeopleDiagnostic {
+    totalFaces: number;
+    acceptedForClustering: number;
+    rejectedFaces: number;
+    suspiciousFaces: number;
+    staleEmbeddingVersionFaces: number;
+    noEmbeddingFaces: number;
+    unassignedFaces: number;
+    confirmedFaces: number;
+    totalPeople: number;
+    clusteringConfiguration: {
+        browserOnlyProcessing: boolean;
+        clusteringQueueAvailable: boolean;
+        activeClusteringJob?: boolean;
+    };
+    recommendation?: string;
+}
 
 /** Tools — live pipeline health + a bulk re-run row + recovery/history. */
 export const ToolsPage: React.FC = () => {
-    const { toast, route, photos } = useStore();
+    const { toast, route, photos, navigate } = useStore();
     const {
         activeJobs, clusteringActive, clusteringStatusLabel, ipworkActive, ipworkStatusLabel,
         startBrowserProcessing, browserProcessingActive, browserAiModelState, loadBrowserAiModel,
@@ -43,13 +61,54 @@ export const ToolsPage: React.FC = () => {
     const [wbSelection, setWbSelection] = useState<string[]>(workbenchFilenames);
     const [history, setHistory] = useState<HistoryEntry[]>([]);
     const [busy, setBusy] = useState(false);
+    const [reselectingId, setReselectingId] = useState<string | null>(null);
+    const [diagnostic, setDiagnostic] = useState<PeopleDiagnostic | null>(null);
+    const [diagnosticLoading, setDiagnosticLoading] = useState(false);
 
     // A deep link ("Open in Workbench" from the gallery) pre-selects those
     // photos, but any photo in the loaded library can be searched for and
     // selected here too.
     useEffect(() => {
-        if (workbenchFilenames.length) setWbSelection(workbenchFilenames);
+        if (workbenchFilenames.length) {
+            setWbSelection(workbenchFilenames);
+            setTab('Workbench');
+        }
     }, [route.params.filenames]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const reselectHistoryAction = async (actionId?: string) => {
+        if (!actionId) return;
+        setReselectingId(actionId);
+        try {
+            const res = await getTools<{ filenames?: string[] }>(`/api/tools/workbench/actions/${actionId}`);
+            const filenames = Array.isArray(res?.filenames) ? res.filenames : [];
+            if (!filenames.length) {
+                toast("Those photos aren't available anymore");
+                return;
+            }
+            navigate('tools', { filenames: filenames.join(',') });
+        } catch {
+            toast('Couldn’t reselect those photos');
+        } finally {
+            setReselectingId(null);
+        }
+    };
+
+    const loadDiagnostic = async () => {
+        setDiagnosticLoading(true);
+        try {
+            const res = await getExtras<PeopleDiagnostic>('/api/people/diagnostic');
+            setDiagnostic(res ?? null);
+        } catch {
+            setDiagnostic(null);
+        } finally {
+            setDiagnosticLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        if (tab !== 'Diagnostics') return;
+        void loadDiagnostic();
+    }, [tab]);
 
     const toggleWbSelect = (id: string) =>
         setWbSelection((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
@@ -259,14 +318,64 @@ export const ToolsPage: React.FC = () => {
                         <div className="pt-history-row">No recent actions.</div>
                     ) : (
                         history.map((h, i) => (
-                            <div key={i} className="pt-history-row">
-                                {(h.action ?? 'Action')} · {h.scope ?? 'library'}
-                                {Array.isArray(h.steps) && h.steps.length ? ` · ${h.steps.join(', ')}` : ''}
-                                {typeof h.filenameCount === 'number' && h.filenameCount > 0 ? ` · ${h.filenameCount} photos` : ''}
-                                {h.createdAt ? ` · ${new Date(h.createdAt).toLocaleString()}` : ''}
+                            <div key={h.actionId ?? i} className="pt-history-row pt-history-row-with-action">
+                                <span>
+                                    {(h.action ?? 'Action')} · {h.scope ?? 'library'}
+                                    {Array.isArray(h.steps) && h.steps.length ? ` · ${h.steps.join(', ')}` : ''}
+                                    {typeof h.filenameCount === 'number' && h.filenameCount > 0 ? ` · ${h.filenameCount} photos` : ''}
+                                    {h.createdAt ? ` · ${new Date(h.createdAt).toLocaleString()}` : ''}
+                                </span>
+                                {h.actionId && (
+                                    <button
+                                        type="button"
+                                        className="pt-history-reselect"
+                                        title="Reselect these photos"
+                                        aria-label="Reselect these photos"
+                                        disabled={reselectingId === h.actionId}
+                                        onClick={() => void reselectHistoryAction(h.actionId)}
+                                    >
+                                        <ArrowsPointingOutIcon />
+                                    </button>
+                                )}
                             </div>
                         ))
                     )}
+                </div>
+            )}
+
+            {tab === 'Diagnostics' && (
+                <div className="pt-recovery">
+                    <div className="card-glass pt-recover-card pt-diagnostic-card">
+                        <div className="pt-toolbar">
+                            <strong>Why aren't faces clustering into people?</strong>
+                            <button type="button" className="btn" disabled={diagnosticLoading} onClick={() => void loadDiagnostic()}>
+                                {diagnosticLoading ? 'Refreshing…' : 'Refresh'}
+                            </button>
+                        </div>
+                        {diagnosticLoading && !diagnostic && <span>Running diagnostics…</span>}
+                        {!diagnosticLoading && !diagnostic && <span>Couldn’t load diagnostics.</span>}
+                        {diagnostic && (
+                            <>
+                                {diagnostic.recommendation && <span className="pt-diagnostic-recommendation">{diagnostic.recommendation}</span>}
+                                <div className="pt-diagnostic-chips">
+                                    <span className="qchip">Total faces · {diagnostic.totalFaces}</span>
+                                    <span className="qchip">Accepted · {diagnostic.acceptedForClustering}</span>
+                                    <span className="qchip">Unassigned · {diagnostic.unassignedFaces}</span>
+                                    <span className="qchip">Confirmed · {diagnostic.confirmedFaces}</span>
+                                    <span className="qchip">Rejected · {diagnostic.rejectedFaces}</span>
+                                    <span className="qchip">Suspicious · {diagnostic.suspiciousFaces}</span>
+                                    <span className="qchip">Stale embedding · {diagnostic.staleEmbeddingVersionFaces}</span>
+                                    <span className="qchip">No embedding · {diagnostic.noEmbeddingFaces}</span>
+                                    <span className="qchip">Total people · {diagnostic.totalPeople}</span>
+                                </div>
+                                <div className="pt-diagnostic-chips">
+                                    <span className="qchip">Clustering queue · {diagnostic.clusteringConfiguration.clusteringQueueAvailable ? 'available' : 'unavailable'}</span>
+                                    <span className="qchip">Browser-only processing · {diagnostic.clusteringConfiguration.browserOnlyProcessing ? 'yes' : 'no'}</span>
+                                    <span className="qchip">Active clustering job · {diagnostic.clusteringConfiguration.activeClusteringJob ? 'yes' : 'no'}</span>
+                                </div>
+                            </>
+                        )}
+                    </div>
                 </div>
             )}
         </div>

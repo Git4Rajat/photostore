@@ -5,11 +5,16 @@ import { usePhotoThumbnails } from '../media';
 
 /** Recently Deleted — restore individually or all, or purge for good. */
 export const TrashPage: React.FC = () => {
-    const { trash, trashLoading, reloadTrash, restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, navigate } = useStore();
+    const {
+        trash, trashLoading, reloadTrash, restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash,
+        albumTrash, albumTrashLoading, reloadAlbumTrash, restoreAlbum, purgeAlbum,
+        navigate,
+    } = useStore();
     const thumbs = usePhotoThumbnails(trash.map((t) => t.photo));
 
     useEffect(() => {
         reloadTrash();
+        reloadAlbumTrash();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
@@ -52,6 +57,29 @@ export const TrashPage: React.FC = () => {
                         </div>
                     ))}
                 </div>
+            )}
+
+            {(albumTrash.length > 0 || albumTrashLoading) && (
+                <>
+                    <div className="pt-toolbar pt-album-trash-header">
+                        <h2 className="pt-page-title pt-album-trash-title">Deleted albums</h2>
+                    </div>
+                    <div className="card-glass pt-history">
+                        {albumTrashLoading && albumTrash.length === 0 ? (
+                            <div className="pt-history-row">Loading…</div>
+                        ) : (
+                            albumTrash.map((t) => (
+                                <div key={t.album.id} className="pt-history-row pt-album-trash-row">
+                                    <span className="pt-album-trash-label">{t.album.name || 'Untitled album'} · purges in {t.purgesInDays}d</span>
+                                    <span className="pt-album-trash-actions">
+                                        <button type="button" className="btn-link" onClick={() => restoreAlbum(t.album.id)}>Restore</button>
+                                        <button type="button" className="btn-link pt-album-trash-purge" onClick={() => purgeAlbum(t.album.id)}>Delete forever</button>
+                                    </span>
+                                </div>
+                            ))
+                        )}
+                    </div>
+                </>
             )}
         </div>
     );

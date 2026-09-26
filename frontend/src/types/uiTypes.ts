@@ -61,3 +61,25 @@ export interface WorkbenchHistoryEntry {
     force?: boolean;
     createdAt?: string;
 }
+
+export interface PeopleDiagnostic {
+    totalFaces: number;
+    acceptedForClustering: number;
+    rejectedFaces: number;
+    suspiciousFaces: number;
+    lowConfidenceFaces: number;
+    staleEmbeddingVersionFaces: number;
+    noEmbeddingFaces: number;
+    unassignedFaces: number;
+    confirmedFaces: number;
+    totalPeople: number;
+    clusteringConfiguration: {
+        browserOnlyProcessing: boolean;
+        clusteringQueueAvailable: boolean;
+        activeClusteringJob?: boolean;
+        allowedEmbeddingVersions?: string[];
+        clusteringEps?: number;
+        clusteringPreset?: string;
+    };
+    recommendation?: string;
+}

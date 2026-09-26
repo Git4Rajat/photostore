@@ -48,6 +48,8 @@ export interface Album {
     publicExpiresAt?: string;
     hasAccessCode?: boolean;
     isExpired?: boolean;
+    deletedAt?: string;
+    purgeAt?: string;
 }
 
 export interface Person {
@@ -94,6 +96,11 @@ export interface Suggestion {
 
 export interface TrashItem {
     photo: Photo;
+    purgesInDays: number;
+}
+
+export interface AlbumTrashItem {
+    album: Album;
     purgesInDays: number;
 }
 
