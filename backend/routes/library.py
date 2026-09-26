@@ -196,6 +196,10 @@ def library_invite_accept():
     app.library_store.audit(library_id, actor=account_id, action='invite-accepted', target=email)
 
     active_library = library_id if target_type == 'join' else account_id
+    # Persist it, not just this session's token -- otherwise the very next
+    # plain login (no invite link involved) mints a fresh token defaulting
+    # back to the account's own library, silently undoing the join.
+    app.library_store.set_current_library(account_id, active_library)
     token_out = app._issue_session_for(account_id, library_id=active_library, email=email, mode=app.AUTH_MODE)
     return app.jsonify({
         'status': 'accepted',
@@ -214,6 +218,7 @@ def library_switch():
     target = str(data.get('libraryId', '') or '').strip()
     if not target or not app.library_store.is_member(account_id, target):
         return app.jsonify({'error': 'You are not a member of that library.'}), 403
+    app.library_store.set_current_library(account_id, target)
     email = str((app.library_store.get_user(account_id) or {}).get('email') or '')
     token = app._issue_session_for(account_id, library_id=target, email=email, mode=app.AUTH_MODE)
     return app.jsonify({'token': token, 'activeLibraryId': target, 'expiresIn': app.SESSION_TTL_SECONDS})
@@ -265,6 +270,7 @@ def library_leave():
     app.library_store.remove_membership(account_id, target_library)
     app.library_store.audit(target_library, actor=account_id, action='leave', target=account_id)
     # Drop the caller back into their own library.
+    app.library_store.set_current_library(account_id, account_id)
     email = str((app.library_store.get_user(account_id) or {}).get('email') or '')
     token = app._issue_session_for(account_id, library_id=account_id, email=email, mode=app.AUTH_MODE)
     return app.jsonify({'status': 'ok', 'token': token, 'activeLibraryId': account_id})

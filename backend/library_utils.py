@@ -292,6 +292,32 @@ class LibraryStore:
         entity['PartitionKey'] = _USER_PK
         self.users.upsert_entity(entity)
 
+    def get_current_library(self, user_id: str) -> str:
+        """The library a fresh sign-in should land the account in.
+
+        Falls back to the account's own library if none was ever recorded, or
+        if the recorded one is stale (the account left/was removed from it
+        since) -- otherwise a removed member's next plain login would 403 on
+        every request instead of quietly landing back in their own library.
+        """
+        account = self.get_user(user_id)
+        stored = str((account or {}).get('currentLibraryId') or '').strip()
+        if stored and stored != user_id and not self.is_member(user_id, stored):
+            stored = ''
+        return stored or str(user_id)
+
+    def set_current_library(self, user_id: str, library_id: str) -> None:
+        """Record the library a fresh sign-in should land the account in next
+        time, so accepting an invite / switching libraries survives logout
+        (session tokens alone don't: a plain re-login mints a brand new one)."""
+        entity = self.get_user(user_id)
+        if not entity:
+            return
+        entity['currentLibraryId'] = str(library_id or user_id)
+        entity['RowKey'] = str(user_id)
+        entity['PartitionKey'] = _USER_PK
+        self.users.upsert_entity(entity)
+
     def delete_user(self, user_id: str) -> None:
         """Delete an account row and its email lookup (account deletion)."""
         account = self.get_user(user_id)

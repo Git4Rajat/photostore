@@ -46,7 +46,8 @@ def auth_login():
     app.password_auth.record_login_success(app.config_table_client, throttle_row)
     uid = str(account.get('RowKey'))
     email = str(account.get('email') or email_in)
-    token = app._issue_session_for(uid, email=email, mode='password')
+    library_id = app.library_store.get_current_library(uid) if app.library_store else uid
+    token = app._issue_session_for(uid, library_id=library_id, email=email, mode='password')
     return app.jsonify({'token': token, 'email': email, 'expiresIn': app.SESSION_TTL_SECONDS})
 
 @auth_bp.route('/auth/exchange', methods=['POST'])
@@ -74,7 +75,8 @@ def auth_exchange():
         return app.jsonify({'error': 'Token does not contain a usable user identifier claim.'}), 401
     email = str(payload.get('preferred_username') or payload.get('email') or payload.get('upn') or '').strip()
     app._ensure_account_bootstrapped(user_id, email=email)
-    token = app._issue_session_for(user_id, email=email, mode='entra')
+    library_id = app.library_store.get_current_library(user_id) if app.library_store else user_id
+    token = app._issue_session_for(user_id, library_id=library_id, email=email, mode='entra')
     return app.jsonify({'token': token, 'email': email, 'expiresIn': app.SESSION_TTL_SECONDS})
 
 @auth_bp.route('/auth/change-password', methods=['POST'])
@@ -83,7 +85,7 @@ def auth_change_password():
     guard = app._password_mode_guard()
     if guard:
         return guard
-    account_id, _library_id, error = app._require_library_context(require_auth=True)
+    account_id, library_id, error = app._require_library_context(require_auth=True)
     if error:
         return error
     data = app.request.get_json(silent=True) or {}
@@ -97,9 +99,10 @@ def auth_change_password():
         return app.jsonify({'error': 'Current password is incorrect.'}), 401
     app.library_store.set_user_password(account_id, app.password_auth.hash_password(new_password))
     # Session-kill: invalidate every outstanding token, then hand this session a
-    # fresh one so the user who just changed their password stays signed in here.
+    # fresh one so the user who just changed their password stays signed in here,
+    # in the same library they were in (not reset to their own).
     app.library_store.bump_token_version(account_id)
-    token = app._issue_session_for(account_id, email=str(account.get('email') or ''), mode='password')
+    token = app._issue_session_for(account_id, library_id=library_id, email=str(account.get('email') or ''), mode='password')
     return app.jsonify({'status': 'ok', 'token': token, 'expiresIn': app.SESSION_TTL_SECONDS})
 
 @auth_bp.route('/auth/forgot', methods=['POST'])
