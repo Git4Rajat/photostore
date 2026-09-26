@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
 import * as library from '../services/libraryClient';
 import { LogoLockup } from './shared/Logo';
 
@@ -76,7 +76,15 @@ const ConfirmLibraryCleanPage: React.FC = () => {
                     <button type="button" className="btn btn-soft danger" disabled={pending} onClick={handleConfirm}>
                         {pending ? 'Confirming…' : 'Confirm cleanup'}
                     </button>
-                    <Link className="btn btn-link auth-page-link" to="/login">Back to sign in</Link>
+                    {/* Hard navigation: this page can render under a router that
+                        only knows the /confirm-library-clean route (see PrototypeApp). */}
+                    <button
+                        type="button"
+                        className="btn btn-link auth-page-link"
+                        onClick={() => { window.location.href = '/login'; }}
+                    >
+                        Back to sign in
+                    </button>
                 </div>
             ) : outcome === 'awaiting_more_approvals' ? (
                 <p className="status success">

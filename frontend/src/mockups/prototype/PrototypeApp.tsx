@@ -15,6 +15,8 @@ import Toasts from './components/Toasts';
 
 const LazyPublicAlbumPage = React.lazy(() => import('../../components/PublicAlbumPage'));
 const LazyAcceptInvitePage = React.lazy(() => import('../../components/AcceptInvitePage'));
+const LazyResetPasswordPage = React.lazy(() => import('../../components/ResetPasswordPage'));
+const LazyConfirmLibraryCleanPage = React.lazy(() => import('../../components/ConfirmLibraryCleanPage'));
 import GalleryPage from './pages/GalleryPage';
 import AlbumsPage from './pages/AlbumsPage';
 import { PeoplePage, PersonDetailPage } from './pages/PeoplePages';
@@ -56,6 +58,14 @@ const isPublicAlbumPath = (): boolean =>
 // survive, which the MemoryRouter used for the signed-out gate below discards.
 const isAcceptInvitePath = (): boolean =>
     typeof window !== 'undefined' && window.location.pathname === '/accept-invite';
+
+// Same problem for a password-reset link (…/reset-password?token=…).
+const isResetPasswordPath = (): boolean =>
+    typeof window !== 'undefined' && window.location.pathname === '/reset-password';
+
+// Same problem for a library-clean confirmation link (…/confirm-library-clean?token=…).
+const isConfirmLibraryCleanPath = (): boolean =>
+    typeof window !== 'undefined' && window.location.pathname === '/confirm-library-clean';
 
 const NAV: { id: PageId; label: string }[] = [
     { id: 'ask', label: 'Ask' },
@@ -251,6 +261,33 @@ const PrototypeApp: React.FC = () => {
                 <React.Suspense fallback={<Loading label="Loading invitation…" />}>
                     <Routes>
                         <Route path="/accept-invite" element={<LazyAcceptInvitePage />} />
+                    </Routes>
+                </React.Suspense>
+            </BrowserRouter>
+        );
+    }
+
+    // Password-reset links render the real reset page regardless of auth state.
+    if (isResetPasswordPath()) {
+        return (
+            <BrowserRouter>
+                <React.Suspense fallback={<Loading label="Loading…" />}>
+                    <Routes>
+                        <Route path="/reset-password" element={<LazyResetPasswordPage />} />
+                    </Routes>
+                </React.Suspense>
+            </BrowserRouter>
+        );
+    }
+
+    // Library-clean confirmation links render the real confirm page regardless
+    // of auth state (it shows its own sign-in-required message if needed).
+    if (isConfirmLibraryCleanPath()) {
+        return (
+            <BrowserRouter>
+                <React.Suspense fallback={<Loading label="Loading…" />}>
+                    <Routes>
+                        <Route path="/confirm-library-clean" element={<LazyConfirmLibraryCleanPage />} />
                     </Routes>
                 </React.Suspense>
             </BrowserRouter>

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
 import * as passwordAuth from '../services/passwordAuthClient';
 import { LogoLockup } from './shared/Logo';
 
@@ -13,7 +13,9 @@ const ResetPasswordPage: React.FC = () => {
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
     const [done, setDone] = useState(false);
-    const navigate = useNavigate();
+    // Hard navigation: this page can render under a router that only knows
+    // the /reset-password route (see PrototypeApp).
+    const goToSignIn = () => { window.location.href = '/login'; };
 
     const handleSubmit = async (event: React.FormEvent) => {
         event.preventDefault();
@@ -47,7 +49,7 @@ const ResetPasswordPage: React.FC = () => {
             ) : done ? (
                 <>
                     <p className="status success">Your password has been reset. You can now sign in.</p>
-                    <button type="button" className="btn btn-primary" onClick={() => navigate('/login')}>
+                    <button type="button" className="btn btn-primary" onClick={goToSignIn}>
                         Go to sign in
                     </button>
                 </>
@@ -75,7 +77,7 @@ const ResetPasswordPage: React.FC = () => {
                     <button type="submit" className="btn btn-primary" disabled={pending || !newPassword || !confirm}>
                         {pending ? 'Resetting…' : 'Reset password'}
                     </button>
-                    <Link className="btn btn-link auth-page-link" to="/login">Back to sign in</Link>
+                    <button type="button" className="btn btn-link auth-page-link" onClick={goToSignIn}>Back to sign in</button>
                 </form>
             )}
         </section>
