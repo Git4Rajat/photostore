@@ -259,6 +259,8 @@ interface Store {
     renamePerson: (id: string, name: string) => void;
     mergePeople: (sourceId: string, targetId: string) => void;
     mergePeopleBatch: (targetId: string, sourceIds: string[]) => void;
+    deletePerson: (id: string) => void;
+    deletePeopleBatch: (ids: string[]) => void;
 
     // members / sharing (server-backed shared libraries)
     reloadMembers: () => void;
@@ -949,6 +951,33 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [people, fetchPeople, toast],
     );
 
+    // Deletes a person cluster entirely (their faces become unassigned, not
+    // deleted) -- distinct from mergePeople/mergePeopleBatch, which fold one
+    // cluster's faces into another rather than dropping them.
+    const deletePerson = useCallback((id: string) => {
+        const removed = people.find((p) => p.id === id);
+        setPeople((prev) => prev.filter((p) => p.id !== id));
+        void faceService.deletePersons([id])
+            .then(() => toast('Person deleted'))
+            .catch(() => {
+                if (removed) setPeople((prev) => [...prev, removed]);
+                toast('Couldn’t delete person');
+            });
+    }, [people, toast]);
+
+    const deletePeopleBatch = useCallback((ids: string[]) => {
+        if (!ids.length) return;
+        const idSet = new Set(ids);
+        const removed = people.filter((p) => idSet.has(p.id));
+        setPeople((prev) => prev.filter((p) => !idSet.has(p.id)));
+        void faceService.deletePersons(ids)
+            .then(() => toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`))
+            .catch(() => {
+                if (removed.length) setPeople((prev) => [...prev, ...removed]);
+                toast('Couldn’t delete people');
+            });
+    }, [people, toast]);
+
     const fetchMembers = useCallback(async () => {
         setMembersLoading(true);
         try {
@@ -1079,6 +1108,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             renamePerson,
             mergePeople,
             mergePeopleBatch,
+            deletePerson,
+            deletePeopleBatch,
             reloadMembers,
             invite,
             revokeInvite,
@@ -1100,7 +1131,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, reloadPeople, openPerson, personPhotosById, personPhotosLoading,
-            renamePerson, mergePeople, mergePeopleBatch, reloadMembers, invite, revokeInvite,
+            renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],
     );

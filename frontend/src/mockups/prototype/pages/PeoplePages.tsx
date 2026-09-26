@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeftIcon, CheckIcon, SparklesIcon } from '@heroicons/react/24/outline';
+import { ArrowLeftIcon, CheckIcon, SparklesIcon, TrashIcon, UserGroupIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
+import { confirmDialog } from '../../../components/shared/dialogs';
 import type { Person } from '../types';
 
 // The merge target when several selected clusters are merged at once: prefer
@@ -16,7 +17,7 @@ const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.n
  *  "Select" mode lets several clusters be picked and merged into one in a
  *  single action, instead of the one-at-a-time merge on the detail page. */
 export const PeoplePage: React.FC = () => {
-    const { people, peopleLoading, navigate, mergePeopleBatch } = useStore();
+    const { people, peopleLoading, navigate, mergePeopleBatch, deletePeopleBatch } = useStore();
     const covers = useProtectedBlobUrls(people.map((p) => p.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
     const [selectMode, setSelectMode] = useState(false);
     const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -36,6 +37,20 @@ export const PeoplePage: React.FC = () => {
         const target = pickMergeTarget(selected);
         const sourceIds = selected.filter((p) => p.id !== target.id).map((p) => p.id);
         mergePeopleBatch(target.id, sourceIds);
+        exitSelectMode();
+    };
+
+    const handleDelete = async () => {
+        const count = selectedIds.length;
+        if (!count) return;
+        const confirmed = await confirmDialog({
+            title: `Delete ${count} ${count === 1 ? 'person' : 'people'}?`,
+            message: 'Their faces become unassigned — the photos themselves are untouched.',
+            confirmLabel: 'Delete',
+            danger: true,
+        });
+        if (!confirmed) return;
+        deletePeopleBatch(selectedIds);
         exitSelectMode();
     };
 
@@ -84,11 +99,21 @@ export const PeoplePage: React.FC = () => {
                 })}
             </div>
             {selectMode && selectedIds.length > 0 && (
-                <div className="pt-album-select-bar">
-                    <span>{selectedIds.length} selected</span>
-                    <button type="button" className="btn mock-cta" disabled={selectedIds.length < 2} onClick={handleMerge}>
-                        Merge into one
+                <div className="pt-floating-menu" role="toolbar" aria-label="People selection actions">
+                    <div className="pt-fm-badge">{selectedIds.length}</div>
+                    <button
+                        type="button"
+                        className="pt-fm-delete"
+                        onClick={() => void handleDelete()}
+                        aria-label={`Delete ${selectedIds.length} ${selectedIds.length > 1 ? 'people' : 'person'}`}
+                    >
+                        <TrashIcon />
                     </button>
+                    {selectedIds.length > 1 && (
+                        <button type="button" className="pt-fm-more" onClick={handleMerge} aria-label="Merge selected people">
+                            <UserGroupIcon />
+                        </button>
+                    )}
                 </div>
             )}
         </div>
@@ -97,7 +122,7 @@ export const PeoplePage: React.FC = () => {
 
 /** Person detail — rename / name, browse their photos, and merge in another cluster. */
 export const PersonDetailPage: React.FC = () => {
-    const { route, people, personById, openPerson, personPhotosById, personPhotosLoading, navigate, renamePerson, mergePeople, reloadPeople, toast } = useStore();
+    const { route, people, personById, openPerson, personPhotosById, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, toast } = useStore();
     const personId = route.params.personId;
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
@@ -126,6 +151,18 @@ export const PersonDetailPage: React.FC = () => {
     const photos = personPhotosById(person.id);
     const coverSrc = person.coverThumbnailUrl ? headCover[person.coverThumbnailUrl] : undefined;
 
+    const handleDeletePerson = async () => {
+        const confirmed = await confirmDialog({
+            title: `Delete ${person.name ?? 'this person'}?`,
+            message: 'Their faces become unassigned — the photos themselves are untouched.',
+            confirmLabel: 'Delete',
+            danger: true,
+        });
+        if (!confirmed) return;
+        deletePerson(person.id);
+        navigate('people');
+    };
+
     return (
         <div>
             <button type="button" className="pt-back" onClick={() => navigate('people')}><ArrowLeftIcon /> People</button>
@@ -148,7 +185,10 @@ export const PersonDetailPage: React.FC = () => {
                         <p className="pt-page-sub">{photos?.length ?? person.faceCount ?? 0} photos</p>
                     </div>
                 </div>
-                <button type="button" className="btn" onClick={() => { toast('Scanning for more faces…'); reloadPeople(); }}><SparklesIcon className="toolbar-icon" /> Find more faces</button>
+                <div className="pt-toolbar-actions">
+                    <button type="button" className="btn" onClick={() => { toast('Scanning for more faces…'); reloadPeople(); }}><SparklesIcon className="toolbar-icon" /> Find more faces</button>
+                    <button type="button" className="btn btn-danger" onClick={() => void handleDeletePerson()}><TrashIcon className="toolbar-icon" /> Delete</button>
+                </div>
             </div>
 
             {photos === undefined && personPhotosLoading ? (

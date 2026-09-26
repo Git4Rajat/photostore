@@ -1723,7 +1723,30 @@ def _album_access_code_gate(entity: Dict, token: str, provided: str):
     return jsonify({'codeRequired': True, 'retryAfterSeconds': 0}), 401
 
 
-def _album_entity_to_payload(entity: Dict) -> Dict:
+def _album_cover_thumbnail_url(user_id: str, filenames: List[str]) -> str:
+    """Picks the album's cover: the highest-rated (then most-liked) photo it
+    contains, so an album with any curated favorites shows one instead of a
+    blank placeholder. Reuses the same rating/likes-sorted, per-user cached
+    scan _cached_sorted_metadata_rows_for_user already maintains for
+    /photos/filter's pagination -- filtering that cached list to this album's
+    filenames costs no extra table reads."""
+    if not filenames:
+        return ''
+    name_set = set(filenames)
+    try:
+        rows = _cached_sorted_metadata_rows_for_user(user_id, purpose='albums.cover')
+    except Exception:
+        return ''
+    for row in rows:
+        name = row.get('RowKey')
+        if name in name_set:
+            url = _thumbnail_url_from_metadata(row, name)
+            if url:
+                return url
+    return ''
+
+
+def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = None) -> Dict:
     filenames = []
     try:
         filenames = json.loads(entity.get('filenames', '[]') or '[]')
@@ -1758,6 +1781,8 @@ def _album_entity_to_payload(entity: Dict) -> Dict:
     if deleted_at:
         payload['deletedAt'] = deleted_at
         payload['purgeAt'] = _compute_trash_purge_at(deleted_at, TRASH_RETENTION_DAYS)
+    if cover_thumbnail_url is not None:
+        payload['coverThumbnailUrl'] = cover_thumbnail_url
     return payload
 
 

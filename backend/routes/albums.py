@@ -99,7 +99,12 @@ def list_albums():
         rows = list(app.albums_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))
     except Exception:
         rows = []
-    albums = [app._album_entity_to_payload(row) for row in rows if not app._coerce_bool(row.get('deleted'))]
+    albums = []
+    for row in rows:
+        if app._coerce_bool(row.get('deleted')):
+            continue
+        cover = app._album_cover_thumbnail_url(user_id, app._album_filenames(row))
+        albums.append(app._album_entity_to_payload(row, cover_thumbnail_url=cover))
     return app.jsonify({'albums': albums})
 
 @albums_bp.route('/albums', methods=['POST'])
@@ -142,7 +147,9 @@ def get_album(album_id: str):
     entity = app._load_album_entity(user_id, album_id)
     if not entity or app._coerce_bool(entity.get('deleted')):
         return app.jsonify({'error': 'Album not found'}), 404
-    payload = app._album_entity_to_payload(entity)
+    filenames = app._album_filenames(entity)
+    cover = app._album_cover_thumbnail_url(user_id, filenames)
+    payload = app._album_entity_to_payload(entity, cover_thumbnail_url=cover)
     photos = app._load_photos_for_filenames(user_id, payload.get('filenames', []))
     return app.jsonify({'album': payload, 'photos': photos})
 

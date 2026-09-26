@@ -7,6 +7,7 @@ import { useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
 import { Menu } from '../components/bits';
 import { confirmDialog } from '../../../components/shared/dialogs';
+import { useProtectedBlobUrls } from '../../../services/imageClient';
 
 const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
     { value: '1', label: 'In 1 day', days: 1 },
@@ -41,6 +42,7 @@ export const AlbumsPage: React.FC = () => {
     const [draft, setDraft] = useState('');
     const [copied, setCopied] = useState(false);
     const [expiry, setExpiry] = useState('7');
+    const covers = useProtectedBlobUrls(albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
     // The backend never returns an album's access code back (it's a stored
     // secret), so remember codes we generate this session to show the owner.
     const [codes, setCodes] = useState<Record<string, string>>({});
@@ -143,7 +145,13 @@ export const AlbumsPage: React.FC = () => {
 
     const activePhotos = albumPhotosById(album.id);
 
-    const albumList = (
+    // Split into the scrollable row list and a footer that stays outside the
+    // scrolling container -- the sidebar/mobile list wrappers clip overflow
+    // (so a long album list scrolls independently of the page), which also
+    // clipped the Smart Album popover whenever it rendered inside that same
+    // scrolling box, making it appear to silently vanish/render behind the
+    // list instead of over it.
+    const albumListRows = (
         <>
             <div className="pt-album-list-head">
                 <div className="pt-menu-label" style={{ margin: 0 }}>Your albums</div>
@@ -174,7 +182,11 @@ export const AlbumsPage: React.FC = () => {
                                 <CheckIcon />
                             </span>
                         )}
-                        <span className="pt-album-row-cover empty" />
+                        {a.coverThumbnailUrl && covers[a.coverThumbnailUrl] ? (
+                            <img className="pt-album-row-cover" src={covers[a.coverThumbnailUrl]} alt="" />
+                        ) : (
+                            <span className="pt-album-row-cover empty" />
+                        )}
                         <span className="pt-album-row-meta">
                             <b>{a.name}</b>
                             <span>{a.photoCount} photos</span>
@@ -182,51 +194,52 @@ export const AlbumsPage: React.FC = () => {
                     </button>
                 );
             })}
-            {selectMode ? (
-                selectedAlbumIds.length > 0 && (
-                    <div className="pt-album-select-bar">
-                        <span>{selectedAlbumIds.length} selected</span>
-                        <button type="button" className="btn btn-danger" onClick={() => void bulkDelete()}>
-                            <TrashIcon className="toolbar-icon" /> Delete
-                        </button>
-                    </div>
-                )
-            ) : (
-                <div className="pt-albums-new-row">
-                    <button type="button" className="albm-newbtn" onClick={() => void handleCreate(true)}>
-                        <PlusIcon /> New album
+            {selectMode && selectedAlbumIds.length > 0 && (
+                <div className="pt-album-select-bar">
+                    <span>{selectedAlbumIds.length} selected</span>
+                    <button type="button" className="btn btn-danger" onClick={() => void bulkDelete()}>
+                        <TrashIcon className="toolbar-icon" /> Delete
                     </button>
-                    <Menu
-                        renderTrigger={(toggle) => (
-                            <button type="button" className="albm-newbtn" onClick={toggle} disabled={smartCreatingRule !== null}>
-                                <SparklesIcon /> {smartCreatingRule ? 'Creating…' : 'Smart album'}
-                            </button>
-                        )}
-                    >
-                        {(close) => (
-                            <div className="pt-more-menu pt-smart-album-menu">
-                                {SMART_ALBUM_RULES.map(({ id, label, description, Icon }) => (
-                                    <button key={id} type="button" onClick={() => void handleSmartCreate(id, close)} disabled={smartCreatingRule !== null}>
-                                        <Icon className="toolbar-icon" />
-                                        <span>
-                                            <b>{label}</b>
-                                            <small>{description}</small>
-                                        </span>
-                                    </button>
-                                ))}
-                            </div>
-                        )}
-                    </Menu>
                 </div>
             )}
         </>
+    );
+
+    const albumListFooter = !selectMode && (
+        <div className="pt-albums-new-row">
+            <button type="button" className="albm-newbtn" onClick={() => void handleCreate(true)}>
+                <PlusIcon /> New album
+            </button>
+            <Menu
+                renderTrigger={(toggle) => (
+                    <button type="button" className="albm-newbtn" onClick={toggle} disabled={smartCreatingRule !== null}>
+                        <SparklesIcon /> {smartCreatingRule ? 'Creating…' : 'Smart album'}
+                    </button>
+                )}
+            >
+                {(close) => (
+                    <div className="pt-more-menu pt-smart-album-menu">
+                        {SMART_ALBUM_RULES.map(({ id, label, description, Icon }) => (
+                            <button key={id} type="button" onClick={() => void handleSmartCreate(id, close)} disabled={smartCreatingRule !== null}>
+                                <Icon className="toolbar-icon" />
+                                <span>
+                                    <b>{label}</b>
+                                    <small>{description}</small>
+                                </span>
+                            </button>
+                        ))}
+                    </div>
+                )}
+            </Menu>
+        </div>
     );
 
     return (
         <div className="pt-albums-wrapper">
             {/* Mobile list view */}
             <div className={`pt-albums-mobile-list${showMobileDetail ? ' hidden' : ''}`}>
-                {albumList}
+                <div className="pt-album-list-scroll">{albumListRows}</div>
+                {albumListFooter}
             </div>
 
             {/* Desktop sidebar + mobile detail view */}
@@ -243,7 +256,8 @@ export const AlbumsPage: React.FC = () => {
                 )}
                 <div className={`pt-albums${showMobileDetail ? ' show-detail' : ''}`}>
                     <aside className="pt-album-sidebar">
-                        {albumList}
+                        <div className="pt-album-list-scroll">{albumListRows}</div>
+                        {albumListFooter}
                     </aside>
 
                     <section className="pt-album-detail">
@@ -274,55 +288,42 @@ export const AlbumsPage: React.FC = () => {
                             </button>
                         </div>
 
-                        <div className="pt-share-section">
-                            <div className="pt-menu-label">Sharing</div>
-                            <div className="share-sheet">
-                                <div className="share-row">
-                                    <span className="lbl"><b>Public link</b><span>Anyone with the link can view</span></span>
-                                    <button
-                                        type="button"
-                                        role="switch"
-                                        aria-checked={Boolean(album.isPublic)}
-                                        aria-label="Public link"
-                                        className="mock-switch"
-                                        onClick={togglePublic}
-                                    />
+                        {album.isPublic && (
+                            <div className="pt-share-section">
+                                <div className="pt-menu-label">Sharing</div>
+                                <div className="share-sheet">
+                                    <div className="share-row">
+                                        <span className="lbl"><b>Link expires</b>{album.publicExpiresAt && <span>{new Date(album.publicExpiresAt).toLocaleDateString()}</span>}</span>
+                                        <select className="field field-select" value={expiry} onChange={(e) => changeExpiry(e.target.value)}>
+                                            {EXPIRY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                        </select>
+                                    </div>
+                                    {url && (
+                                        <div className="share-row">
+                                            <span className="share-url">{url}</span>
+                                            <button type="button" className="btn" onClick={copy}><ClipboardDocumentIcon className="toolbar-icon" />{copied ? 'Copied' : 'Copy'}</button>
+                                        </div>
+                                    )}
+                                    <div className="share-row">
+                                        <span className="lbl">
+                                            <b>Access code</b>
+                                            {codes[album.id]
+                                                ? <span>Share this code with viewers: <code className="pt-access-code">{codes[album.id]}</code></span>
+                                                : <span>{album.hasAccessCode ? 'Protected — generate a new code to reveal one' : 'Add a code to protect the link'}</span>}
+                                        </span>
+                                        <button type="button" className="btn" onClick={() => {
+                                            const code = randomCode();
+                                            const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
+                                            void shareAlbum(album.id, { expiresInDays: days, accessCode: code });
+                                            setCodes((prev) => ({ ...prev, [album.id]: code }));
+                                            toast(`New access code: ${code}`);
+                                        }}>
+                                            <ArrowPathIcon className="toolbar-icon" /> New code
+                                        </button>
+                                    </div>
                                 </div>
-                                {album.isPublic && (
-                                    <>
-                                        <div className="share-row">
-                                            <span className="lbl"><b>Link expires</b>{album.publicExpiresAt && <span>{new Date(album.publicExpiresAt).toLocaleDateString()}</span>}</span>
-                                            <select className="field field-select" value={expiry} onChange={(e) => changeExpiry(e.target.value)}>
-                                                {EXPIRY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                                            </select>
-                                        </div>
-                                        {url && (
-                                            <div className="share-row">
-                                                <span className="share-url">{url}</span>
-                                                <button type="button" className="btn" onClick={copy}><ClipboardDocumentIcon className="toolbar-icon" />{copied ? 'Copied' : 'Copy'}</button>
-                                            </div>
-                                        )}
-                                        <div className="share-row">
-                                            <span className="lbl">
-                                                <b>Access code</b>
-                                                {codes[album.id]
-                                                    ? <span>Share this code with viewers: <code className="pt-access-code">{codes[album.id]}</code></span>
-                                                    : <span>{album.hasAccessCode ? 'Protected — generate a new code to reveal one' : 'Add a code to protect the link'}</span>}
-                                            </span>
-                                            <button type="button" className="btn" onClick={() => {
-                                                const code = randomCode();
-                                                const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
-                                                void shareAlbum(album.id, { expiresInDays: days, accessCode: code });
-                                                setCodes((prev) => ({ ...prev, [album.id]: code }));
-                                                toast(`New access code: ${code}`);
-                                            }}>
-                                                <ArrowPathIcon className="toolbar-icon" /> New code
-                                            </button>
-                                        </div>
-                                    </>
-                                )}
                             </div>
-                        </div>
+                        )}
 
                         <div className="pt-album-photos-head">
                             <div className="pt-menu-label" style={{ margin: 0 }}>Photos</div>

@@ -12,7 +12,6 @@ import {
     Square2StackIcon,
     SparklesIcon,
     UserIcon,
-    XCircleIcon,
 } from '@heroicons/react/24/outline';
 import { usePhotoThumbnails, fetchPhotoMetadata } from '../media';
 import type { PhotoMetadata } from '../media';
@@ -32,7 +31,7 @@ const STEP_ICONS: Record<WorkbenchStep, React.ComponentType<React.SVGProps<SVGSV
     Faces: UserIcon,
 };
 
-type StepStatus = 'done' | 'pending' | 'failed';
+type StepStatus = 'done' | 'pending' | 'no-data' | 'failed';
 
 // Maps a WorkbenchStep to its field on Photo['processing'] -- mirrors
 // ChipStepKey/processingServiceLabels in the (now-dead) legacy ToolsPage.tsx,
@@ -49,14 +48,21 @@ const STEP_FIELDS: Record<WorkbenchStep, keyof NonNullable<Photo['processing']>>
     Faces: 'face',
 };
 
-const DONE_STATUSES = new Set(['done', 'skipped', 'unsupported']);
-const FAILED_STATUSES = new Set(['failed', 'timeout', 'no_data']);
+// Mirrors getProcessingStatus's good/pending/warning/bad buckets from the
+// (now-dead) legacy ToolsPage.tsx: done -> green, ran-but-found-nothing ->
+// yellow, failed -> red, not-yet-run -> gray. Distinct from FAILED_STATUSES
+// below -- 'no_data' means the step *ran successfully* and found nothing,
+// not that it errored.
+const DONE_STATUSES = new Set(['done']);
+const NO_DATA_STATUSES = new Set(['no_data', 'skipped', 'unsupported']);
+const FAILED_STATUSES = new Set(['failed', 'timeout']);
 
 const statusFor = (photo: Photo, step: WorkbenchStep): StepStatus => {
     const raw = photo.processing?.[STEP_FIELDS[step]];
     // `face` is sometimes a {status} object rather than a bare string.
     const value = String((raw && typeof raw === 'object' ? raw.status : raw) || '').toLowerCase();
     if (DONE_STATUSES.has(value)) return 'done';
+    if (NO_DATA_STATUSES.has(value)) return 'no-data';
     if (FAILED_STATUSES.has(value)) return 'failed';
     return 'pending';
 };
@@ -95,7 +101,7 @@ const WorkbenchTile: React.FC<{
                 <div className="wb-tile-steps" aria-hidden="true">
                     {WORKBENCH_STEPS.map((step) => {
                         const status = statusFor(photo, step);
-                        const Icon = status === 'failed' ? XCircleIcon : STEP_ICONS[step];
+                        const Icon = STEP_ICONS[step];
                         return <Icon key={step} className={`wb-step-icon ${status}`} title={`${step}: ${status}`} />;
                     })}
                 </div>

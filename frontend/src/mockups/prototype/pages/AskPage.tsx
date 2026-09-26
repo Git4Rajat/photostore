@@ -3,7 +3,9 @@ import { MagnifyingGlassIcon, PlusIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
-import { get } from '../../../services/apiClient';
+import { get, post } from '../../../services/apiClient';
+import { getLocalSearchIndex } from '../../../services/localSearchIndex';
+import { runLocalSearch } from '../../../services/localLexicalSearch';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 import type { Photo } from '../types';
 
@@ -32,11 +34,35 @@ const mapResult = (b: BackendPhoto): Photo => {
     };
 };
 
+// Falls back to the browser's own locally-cached lexical search index (the
+// same one the legacy gallery search used) when the backend's /photos/search
+// endpoint is unavailable or errors -- a browser-only-processing deployment
+// may not maintain a working server-side index at all, in which case Ask
+// searching "doesn't work at all" without this. Lexical-only (no semantic/CLIP
+// tier): that's a bonus layer the legacy fallback also treated as optional.
+// Returns null to mean "no local fallback available" (caller keeps zero
+// results), distinct from a real empty result set ([]).
+const tryLocalSearch = async (queryText: string): Promise<Photo[] | null> => {
+    try {
+        const index = await getLocalSearchIndex();
+        if (!index) return null;
+        const { filenames, total } = runLocalSearch(index.rows, index.peopleNameIndex, queryText, 0, 200, null, null);
+        if (total === 0) return null;
+        if (filenames.length === 0) return [];
+        const response = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames });
+        const byFilename = new Map((response?.photos ?? []).map((p) => [p.filename, p]));
+        return filenames.map((f) => byFilename.get(f)).filter((p): p is BackendPhoto => Boolean(p)).map(mapResult);
+    } catch {
+        return null;
+    }
+};
+
 /**
  * Ask — one search box fused across people / places / things / years. Results
- * come from the backend search index (GET /photos/search); matched people and
- * places surface as cards, live typeahead disambiguates the trailing term, and
- * a search can be saved as an album.
+ * come from the backend search index (GET /photos/search), falling back to a
+ * local in-browser index (tryLocalSearch) if that endpoint errors out. Matched
+ * people and places surface as cards, live typeahead disambiguates the
+ * trailing term, and a search can be saved as an album.
  */
 export const AskPage: React.FC = () => {
     const { people, places, route, createAlbum, addPhotosToAlbum, registerPhotos, navigate } = useStore();
@@ -86,7 +112,9 @@ export const AskPage: React.FC = () => {
                 if (seq !== seqRef.current) return;
                 setResults(Array.isArray(res?.photos) ? res.photos.map(mapResult) : []);
             } catch {
-                if (seq === seqRef.current) setResults([]);
+                if (seq !== seqRef.current) return;
+                const local = await tryLocalSearch(trimmed);
+                if (seq === seqRef.current) setResults(local ?? []);
             } finally {
                 if (seq === seqRef.current) setSearching(false);
             }

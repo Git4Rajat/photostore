@@ -32,7 +32,12 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
     const originRef = useRef<{ x: number; y: number } | null>(null);
     const draggingRef = useRef(false);
     const targetStateRef = useRef(false);
-    const visitedRef = useRef<Set<string>>(new Set());
+    // Snapshot of every tile's id (in rendered/DOM order) and which of them
+    // were already selected, taken once at gesture start -- see applyRange.
+    const orderedIdsRef = useRef<string[]>([]);
+    const originIndexRef = useRef<number | null>(null);
+    const preDragSelectedRef = useRef<Set<string>>(new Set());
+    const appliedRef = useRef<Set<string>>(new Set());
     const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
     const autoScrollFrameRef = useRef<number | null>(null);
     // Guards the scroll-cancel handler below against the auto-scroll loop's
@@ -70,13 +75,46 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
         return tile?.dataset.tileId;
     };
 
-    const applyAt = (x: number, y: number) => {
-        const id = tileIdAt(x, y);
-        if (!id || visitedRef.current.has(id)) {
+    // Recomputes the whole origin..current range each move (rather than just
+    // marking each newly-crossed tile "visited" and never revisiting it), and
+    // reconciles it against the *previous* applied range -- a tile that falls
+    // out of range as the gesture reverses back toward its origin is restored
+    // to its pre-drag state instead of staying stuck at whatever it was set to
+    // on the way out. Mirrors the equivalent mouse-drag fix in PhotoGrid.tsx.
+    const applyRange = (currentId: string) => {
+        const ids = orderedIdsRef.current;
+        const origin = originIndexRef.current;
+        if (origin === null) {
             return;
         }
-        visitedRef.current.add(id);
-        setSelected(id, targetStateRef.current);
+        const currentIndex = ids.indexOf(currentId);
+        if (currentIndex === -1) {
+            return;
+        }
+        const start = Math.min(origin, currentIndex);
+        const end = Math.max(origin, currentIndex);
+        const rangeIds = new Set(ids.slice(start, end + 1));
+        appliedRef.current.forEach((id) => {
+            if (!rangeIds.has(id)) {
+                const shouldBe = preDragSelectedRef.current.has(id);
+                if (isSelected(id) !== shouldBe) {
+                    setSelected(id, shouldBe);
+                }
+            }
+        });
+        rangeIds.forEach((id) => {
+            if (isSelected(id) !== targetStateRef.current) {
+                setSelected(id, targetStateRef.current);
+            }
+        });
+        appliedRef.current = rangeIds;
+    };
+
+    const applyAt = (x: number, y: number) => {
+        const id = tileIdAt(x, y);
+        if (id) {
+            applyRange(id);
+        }
     };
 
     const stopAutoScroll = () => {
@@ -140,7 +178,13 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
         originRef.current = { x: event.clientX, y: event.clientY };
         draggingRef.current = false;
         targetStateRef.current = !isSelected(id);
-        visitedRef.current = new Set();
+        const ids = Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]'))
+            .map((el) => el.dataset.tileId)
+            .filter((tileId): tileId is string => Boolean(tileId));
+        orderedIdsRef.current = ids;
+        originIndexRef.current = ids.indexOf(id);
+        preDragSelectedRef.current = new Set(ids.filter((tileId) => isSelected(tileId)));
+        appliedRef.current = new Set();
         (event.currentTarget as Element).setPointerCapture(event.pointerId);
     };
 

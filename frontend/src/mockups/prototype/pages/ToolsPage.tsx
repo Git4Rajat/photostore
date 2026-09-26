@@ -6,6 +6,7 @@ import { useAppServices } from '../../../components/AppServicesProvider';
 import type { BrowserProcessingAction } from '../../../components/AppServicesProvider';
 import { getTools, postTools, postAdmin, getExtras } from '../../../services/apiClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
+import { confirmDialog } from '../../../components/shared/dialogs';
 import type { Photo } from '../types';
 
 const TABS = ['Overview', 'Workbench', 'Recovery', 'History', 'Diagnostics'];
@@ -195,6 +196,13 @@ export const ToolsPage: React.FC = () => {
     };
 
     const runAdmin = async (label: string, path: string, body: Record<string, unknown>) => {
+        const confirmed = await confirmDialog({
+            title: `${label}?`,
+            message: 'This is a protected admin repair action that runs across your whole library. It may take a while and can’t be cancelled once started.',
+            confirmLabel: 'Run',
+            danger: label.toLowerCase().includes('purge'),
+        });
+        if (!confirmed) return;
         setBusy(true);
         try {
             await postAdmin(path, body);
@@ -298,17 +306,42 @@ export const ToolsPage: React.FC = () => {
                     <div className="card-glass pt-recover-card">
                         <strong>Backfill all photos</strong>
                         <span>Re-run the full pipeline — thumbnails, EXIF, OCR, AI vision, faces.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Backfill', '/api/admin/backfill/photos', { repair: true })}>Run backfill</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Backfill', '/api/admin/backfill/photos', { repair: true, confirm: 'BACKFILL_ALL_PHOTOS' })}>Run backfill</button>
+                    </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Rebuild vector index</strong>
+                        <span>Recompute the semantic search embedding index from current photo data.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Vector index rebuild', '/api/admin/vector-index/rebuild', { repair: true, confirm: 'REBUILD_VECTOR_INDEX' })}>Rebuild</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Deduplicate faces</strong>
                         <span>Find and remove duplicate face rows across your library.</span>
-                        <button type="button" className="btn mock-cta" disabled={busy} onClick={() => void runAdmin('Face dedupe', '/api/admin/people/dedupe', { apply: true })}>Apply</button>
+                        <button type="button" className="btn mock-cta" disabled={busy} onClick={() => void runAdmin('Face dedupe', '/api/admin/people/dedupe-faces', { repair: true, confirm: 'DEDUPE_FACES' })}>Apply</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Rebuild people index</strong>
-                        <span>Recompute the people clustering index from current face data.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('People index rebuild', '/api/admin/people/rebuild', {})}>Rebuild</button>
+                        <span>Recompute the photo→person mapping index. Use this if people are not appearing on their photos.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('People index rebuild', '/api/admin/people/rebuild-photo-people-index', { repair: true, confirm: 'REBUILD_PEOPLE_INDEX' })}>Rebuild</button>
+                    </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Repair stale memberships</strong>
+                        <span>Fix people-cluster membership rows left inconsistent by an interrupted merge or split.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Repair stale memberships', '/api/admin/people/repair-stale-memberships', { repair: true, confirm: 'REPAIR_STALE_MEMBERSHIPS' })}>Repair</button>
+                    </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Unblock low-confidence faces</strong>
+                        <span>Re-admit faces previously held back by the suspicious-face confidence gate.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Unblock low-confidence faces', '/api/admin/people/unblock-low-confidence-faces', { repair: true, confirm: 'UNBLOCK_LOW_CONFIDENCE_FACES' })}>Unblock</button>
+                    </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Suppress suspicious faces</strong>
+                        <span>Hide faces flagged as likely false detections from clustering and people counts.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Suppress suspicious faces', '/api/admin/people/suppress-suspicious-faces', { repair: true, confirm: 'SUPPRESS_SUSPICIOUS_FACES' })}>Suppress</button>
+                    </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Purge orphaned photo data</strong>
+                        <span>Remove leftover rows/blobs for photos that no longer exist in the library.</span>
+                        <button type="button" className="btn btn-danger" disabled={busy} onClick={() => void runAdmin('Purge orphaned photo data', '/api/admin/photos/purge-orphaned-data', { repair: true, confirm: 'PURGE_ORPHANED_PHOTO_DATA' })}>Purge</button>
                     </div>
                 </div>
             )}

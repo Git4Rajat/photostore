@@ -158,18 +158,24 @@
 
 /* ---- albums ---- */
 .pt-albums-wrapper { display: contents; }
-.pt-albums-mobile-list { display: none; padding: 12px; overflow-y: auto; }
+.pt-albums-mobile-list { display: none; flex-direction: column; padding: 12px; min-height: 0; }
 .pt-albums-mobile-list.hidden { display: none; }
 .pt-albums-desktop-sidebar { display: contents; }
+/* Scrolls independently so a long album list doesn't also scroll the page --
+   split out from the sidebar/mobile-list wrapper itself (which no longer sets
+   overflow) so the "New album / Smart album" footer's popover isn't clipped
+   by an ancestor's overflow, which made it appear to render behind the list. */
+.pt-album-list-scroll { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
 
 @media (max-width: 620px) {
-  .pt-albums-mobile-list { display: block; }
+  .pt-albums-mobile-list { display: flex; max-height: 100%; }
   .pt-albums-mobile-list.hidden { display: none !important; }
   .pt-albums-desktop-sidebar { display: contents; }
 }
 
 .pt-albums { display: grid; grid-template-columns: 280px 1fr; gap: 12px; }
-.pt-album-sidebar { padding: 8px; align-self: start; position: sticky; top: 0; max-height: 85vh; overflow-y: auto; border-radius: var(--r-md); }
+.pt-album-sidebar { padding: 8px; align-self: start; position: sticky; top: 0; max-height: 85vh; display: flex; flex-direction: column; min-height: 0; border-radius: var(--r-md); }
+.pt-album-sidebar .pt-album-list-scroll { max-height: none; }
 /* Capped + independently scrollable to match the sidebar, so the sidebar's
    own scrollbar (20-30 albums) and the page's outer scroll never both show
    at once for one Albums view -- each pane scrolls itself, the page doesn't. */
@@ -193,7 +199,7 @@
 .pt-album-row { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 8px; border: 0; border-radius: var(--r-sm); background: transparent; cursor: pointer; font: inherit; color: var(--text); }
 .pt-album-row:hover { background: var(--lg-surface-wash); }
 .pt-album-row.active { background: var(--accent-soft); }
-.pt-album-row-cover { width: 48px; height: 48px; border-radius: var(--r-xs); flex: 0 0 auto; }
+.pt-album-row-cover { width: 48px; height: 48px; border-radius: var(--r-xs); flex: 0 0 auto; object-fit: cover; }
 .pt-album-row-cover.empty { background: var(--lg-edge); }
 .pt-album-row-meta { display: flex; flex-direction: column; min-width: 0; }
 .pt-album-row-meta b { font-size: 0.88rem; }
@@ -223,7 +229,7 @@
 .pt-person-head-face { width: 64px; height: 64px; border-radius: 50%; flex: 0 0 auto; object-fit: cover; }
 .pt-person-head > div { display: flex; flex-direction: column; flex: 1; min-width: 0; }
 .pt-person-name-row { display: flex; gap: 8px; align-items: center; min-width: 0; }
-.pt-person-name-row .field { flex: 1; min-width: 0; }
+.pt-person-name-row .field { flex: 0 1 220px; min-width: 0; }
 .pt-person-name-row .btn { flex: 0 0 auto; white-space: nowrap; padding: 8px 12px; }
 .pt-merge { padding: 16px; margin-top: 16px; }
 .pt-merge-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
@@ -310,6 +316,7 @@
 .wb-step-icon { width: 15px; height: 15px; flex: 0 0 auto; color: var(--lg-edge); }
 .wb-step-icon.done { color: #34c759; }
 .wb-step-icon.pending { color: var(--muted); opacity: 0.6; }
+.wb-step-icon.no-data { color: #ffd60a; }
 .wb-step-icon.failed { color: #ff453a; }
 .wb-info-panel { position: absolute; top: 32px; right: 6px; left: 6px; z-index: 5; background: var(--bg-1); border: 1px solid var(--lg-edge); border-radius: var(--r-sm); padding: 10px 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.28); }
 .wb-info-title { font-weight: 700; font-size: 0.78rem; margin-bottom: 6px; word-break: break-all; }
@@ -375,6 +382,19 @@
 .pt-fm-item svg { width: 16px; height: 16px; }
 .pt-floating-menu .pt-menu-panel { top: auto; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); }
 .pt-viewer-bar .pt-menu-panel { top: auto; bottom: calc(100% + 10px); }
+@media (max-width: 620px) {
+  /* A right-aligned menu panel positions itself relative to its own (small,
+     icon-sized) trigger button, not the viewport -- on a narrow screen a
+     trigger anywhere left of center leaves less than the panel's 220px
+     min-width to its left, pushing it past the screen edge. Clamp it back
+     onto the viewport instead of letting it overflow either edge. */
+  .pt-viewer-bar .pt-menu-panel.right {
+    right: auto;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100vw - 24px);
+  }
+}
 
 /* ---- photo viewer (fixed, full-window) ---- */
 .pt-viewer { position: fixed; inset: 0; z-index: 80; background: #0e0d0b; color: #ece6d9; display: flex; flex-direction: column; }

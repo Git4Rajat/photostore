@@ -57,6 +57,8 @@ export interface Album {
     id: string;
     name: string;
     photoCount: number;
+    /** Auto-picked cover: the album's highest-rated/most-liked photo, if any. */
+    coverThumbnailUrl?: string;
     isPublic?: boolean;
     publicUrl?: string;
     publicExpiresAt?: string;

@@ -49,6 +49,17 @@ export const GalleryPage: React.FC = () => {
     // Refresh the grid whenever an upload session finishes so new photos appear.
     useEffect(() => registerUploadCompletionHandler(() => { reloadPhotos(); }), [registerUploadCompletionHandler, reloadPhotos]);
 
+    // Deleting every currently-loaded photo (e.g. "Select visible" + delete)
+    // can empty `photos` while more pages still exist further down -- without
+    // this, that state rendered the same "library is empty" first-run screen
+    // as an actually-empty library, and only a full page refresh re-fetched
+    // the next page. Pull it in automatically instead.
+    useEffect(() => {
+        if (photos.length === 0 && hasMorePhotos && !photosLoading) {
+            loadMorePhotos();
+        }
+    }, [photos.length, hasMorePhotos, photosLoading, loadMorePhotos]);
+
     // Infinite scroll: load the next page when the bottom sentinel scrolls into view.
     useEffect(() => {
         const node = sentinelRef.current;
@@ -100,7 +111,7 @@ export const GalleryPage: React.FC = () => {
         ? `${totalPhotos.toLocaleString()} photo${totalPhotos === 1 ? '' : 's'}`
         : `${photos.length}${hasMorePhotos ? '+' : ''} photos`;
 
-    if (photos.length === 0 && photosLoading) {
+    if (photos.length === 0 && (photosLoading || hasMorePhotos)) {
         return (
             <div className="pt-arrive">
                 <div className="empty-state">
