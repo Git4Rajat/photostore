@@ -86,7 +86,12 @@ export const PhotoViewer: React.FC = () => {
         setShowInfo(false);
         setMeta(null);
         return () => flushPendingRotation();
-    }, [photo?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [photo?.id, flushPendingRotation]);
+
+    // Flush pending rotation when the viewer closes (if the component returns null early).
+    useEffect(() => {
+        return () => flushPendingRotation();
+    }, [flushPendingRotation]);
 
     const displayRotation = ((rotation - baseRef.current) % 360 + 360) % 360;
 
@@ -170,6 +175,36 @@ export const PhotoViewer: React.FC = () => {
             el.removeEventListener('gesturestart', onGestureStart);
             el.removeEventListener('gesturechange', onGestureChange);
             el.removeEventListener('gestureend', onGestureEnd);
+        };
+    }, [zoom]);
+
+    // iOS Safari two-finger pinch via touch events (gesturestart etc. don't fire there).
+    const touchPinchRef = useRef<{ dist: number; zoom: number } | null>(null);
+    useEffect(() => {
+        const el = photoRef.current;
+        if (!el) return undefined;
+        const touchDist = (t: TouchList) => t.length === 2 ? Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) : 0;
+        const onTouchStart = (e: TouchEvent) => {
+            if (e.touches.length === 2) {
+                touchPinchRef.current = { dist: touchDist(e.touches), zoom };
+            }
+        };
+        const onTouchMove = (e: TouchEvent) => {
+            if (e.touches.length === 2 && touchPinchRef.current) {
+                const ratio = touchDist(e.touches) / touchPinchRef.current.dist;
+                setZoom(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +(touchPinchRef.current.zoom * ratio).toFixed(2))));
+            }
+        };
+        const onTouchEnd = (e: TouchEvent) => {
+            if (e.touches.length < 2) touchPinchRef.current = null;
+        };
+        el.addEventListener('touchstart', onTouchStart);
+        el.addEventListener('touchmove', onTouchMove);
+        el.addEventListener('touchend', onTouchEnd);
+        return () => {
+            el.removeEventListener('touchstart', onTouchStart);
+            el.removeEventListener('touchmove', onTouchMove);
+            el.removeEventListener('touchend', onTouchEnd);
         };
     }, [zoom]);
 
@@ -374,8 +409,8 @@ export const PhotoViewer: React.FC = () => {
                                             close();
                                             // navigate() always clears the open viewer (so a
                                             // stale one never lingers over an unrelated page),
-                                            // so reopen it right after -- registerPhotos first
-                                            // in case this photo isn't in Gallery's own loaded
+                                            // so reopen it right after via a microtask -- registerPhotos
+                                            // first in case this photo isn't in Gallery's own loaded
                                             // page yet (same fix as Ask's search-result preview).
                                             // Prefer reopening at this photo's real position in
                                             // the gallery's own id sequence (with prev/next and
@@ -386,11 +421,13 @@ export const PhotoViewer: React.FC = () => {
                                             const galleryIndex = galleryIds.indexOf(photo.id);
                                             registerPhotos([photo]);
                                             navigate('gallery');
-                                            if (galleryIndex >= 0) {
-                                                openViewer(galleryIds, galleryIndex, { extendable: true });
-                                            } else {
-                                                openViewer([photo.id], 0);
-                                            }
+                                            Promise.resolve().then(() => {
+                                                if (galleryIndex >= 0) {
+                                                    openViewer(galleryIds, galleryIndex, { extendable: true });
+                                                } else {
+                                                    openViewer([photo.id], 0);
+                                                }
+                                            });
                                         }}
                                     >
                                         Show in Gallery

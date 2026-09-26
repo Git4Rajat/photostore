@@ -440,7 +440,7 @@
 .pt-viewer-nav svg { width: 22px; height: 22px; }
 .pt-viewer-photo { flex: 1; height: min(70vh, 100%); border-radius: var(--r-md); position: relative; overflow: hidden; }
 .pt-viewer-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
-.pt-viewer-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px calc(12px + env(safe-area-inset-bottom)); background: rgba(0,0,0,0.32); flex-wrap: nowrap; }
+.pt-viewer-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px calc(12px + env(safe-area-inset-bottom)); background: rgba(0,0,0,0.32); flex-wrap: nowrap; position: relative; }
 .pt-vb-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .pt-vb-group.left { flex: 1 1 0; justify-content: flex-start; }
 .pt-vb-group.center { flex: 0 0 auto; justify-content: center; }
