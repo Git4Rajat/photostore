@@ -22,7 +22,7 @@ export const ExplorePage: React.FC = () => {
 
     // Resolve every group cover in one batched pass (people/place/thing thumbs).
     const covers = useProtectedBlobUrls(
-        [...people.map((p) => p.coverThumbnailUrl), ...places.map((p) => p.coverThumbnailUrl), ...things.map((t) => t.coverThumbnailUrl)]
+        [...people.map((p) => p.coverThumbnailUrl), ...places.map((p) => p.coverThumbnailUrl), ...things.map((t) => t.coverThumbnailUrl), ...albums.map((a) => a.coverThumbnailUrl)]
             .filter((u): u is string => Boolean(u)),
     );
     const coverFor = (url?: string) => (url ? covers[url] : undefined);
@@ -89,6 +89,7 @@ export const ExplorePage: React.FC = () => {
                 <Shelf title="Albums">
                     {albums.map((a) => (
                         <button key={a.id} type="button" className="pt-shelf-card wide album" onClick={() => navigate('albums', { albumId: a.id })}>
+                            {coverFor(a.coverThumbnailUrl) && <img className="pt-explore-cover" src={coverFor(a.coverThumbnailUrl)} alt={a.name} />}
                             <span className="pt-shelf-overlay">{a.name} · {a.photoCount}</span>
                         </button>
                     ))}

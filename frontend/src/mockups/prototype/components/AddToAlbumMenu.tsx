@@ -2,6 +2,7 @@ import React from 'react';
 import { PlusIcon } from '@heroicons/react/24/outline';
 import { Menu } from './bits';
 import { useStore } from '../store';
+import { useProtectedBlobUrls } from '../../../services/imageClient';
 
 /**
  * "Add to album" popover — lists existing albums (with covers) and a create
@@ -13,6 +14,9 @@ export const AddToAlbumMenu: React.FC<{
     align?: 'left' | 'right';
 }> = ({ photoIds, renderTrigger, align = 'left' }) => {
     const { albums, addPhotosToAlbum, createAlbum } = useStore();
+    const covers = useProtectedBlobUrls(
+        albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)),
+    );
 
     return (
         <Menu renderTrigger={renderTrigger} align={align}>
@@ -29,7 +33,11 @@ export const AddToAlbumMenu: React.FC<{
                                 close();
                             }}
                         >
-                            <span className="pt-album-menu-cover empty" />
+                            {a.coverThumbnailUrl && covers[a.coverThumbnailUrl] ? (
+                                <img className="pt-album-menu-cover" src={covers[a.coverThumbnailUrl]} alt="" />
+                            ) : (
+                                <span className="pt-album-menu-cover empty" />
+                            )}
                             <span className="pt-album-menu-name">{a.name}</span>
                             <span className="pt-album-menu-count">{a.photoCount}</span>
                         </button>

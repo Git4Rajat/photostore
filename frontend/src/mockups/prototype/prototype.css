@@ -70,7 +70,7 @@
 .pt-album-menu { min-width: 260px; }
 .pt-album-menu-row { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: none; border: 0; padding: 8px; border-radius: var(--r-xs); cursor: pointer; font: inherit; color: var(--text); }
 .pt-album-menu-row:hover { background: var(--lg-surface-wash); }
-.pt-album-menu-cover { width: 32px; height: 32px; border-radius: 6px; flex: 0 0 auto; }
+.pt-album-menu-cover { width: 32px; height: 32px; border-radius: 6px; flex: 0 0 auto; object-fit: cover; }
 .pt-album-menu-cover.empty { background: var(--lg-edge); }
 .pt-album-menu-name { flex: 1; font-size: 0.86rem; }
 .pt-album-menu-count { font-size: 0.74rem; color: var(--muted); }

@@ -4,8 +4,7 @@ import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { get, post } from '../../../services/apiClient';
-import { getLocalSearchIndex } from '../../../services/localSearchIndex';
-import { runLocalSearch } from '../../../services/localLexicalSearch';
+import { runLocalSemanticSearch } from '../../../services/localSemanticSearch';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 import type { Photo } from '../types';
 
@@ -34,41 +33,42 @@ const mapResult = (b: BackendPhoto): Photo => {
     };
 };
 
-// Falls back to the browser's own locally-cached lexical search index (the
-// same one the legacy gallery search used) when the backend's /photos/search
-// endpoint is unavailable or errors -- a browser-only-processing deployment
-// may not maintain a working server-side index at all, in which case Ask
-// searching "doesn't work at all" without this. Lexical-only (no semantic/CLIP
-// tier): that's a bonus layer the legacy fallback also treated as optional.
-// Returns null to mean "no local fallback available" (caller keeps zero
-// results), distinct from a real empty result set ([]).
-const tryLocalSearch = async (queryText: string): Promise<Photo[] | null> => {
-    try {
-        const index = await getLocalSearchIndex();
-        if (!index) return null;
-        const { filenames, total } = runLocalSearch(index.rows, index.peopleNameIndex, queryText, 0, 200, null, null);
-        if (total === 0) return null;
-        if (filenames.length === 0) return [];
-        const response = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames });
-        const byFilename = new Map((response?.photos ?? []).map((p) => [p.filename, p]));
-        return filenames.map((f) => byFilename.get(f)).filter((p): p is BackendPhoto => Boolean(p)).map(mapResult);
-    } catch {
-        return null;
-    }
+const SEARCH_PAGE_LIMIT = 200;
+
+// The local search scores filenames; turn them back into full photo records
+// (thumbnails, ratings, dates, ...) via a point-lookup, preserving the local
+// score order for whatever resolves (lookup-batch can drop a filename it can't
+// resolve, e.g. one deleted between scoring and lookup).
+const resolvePhotos = async (filenames: string[]): Promise<Photo[]> => {
+    if (filenames.length === 0) return [];
+    const response = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames });
+    const byFilename = new Map((response?.photos ?? []).map((p) => [p.filename, p]));
+    return filenames
+        .map((f) => byFilename.get(f))
+        .filter((p): p is BackendPhoto => Boolean(p))
+        .map(mapResult);
 };
 
 /**
  * Ask — one search box fused across people / places / things / years. Results
- * come from the backend search index (GET /photos/search), falling back to a
- * local in-browser index (tryLocalSearch) if that endpoint errors out. Matched
- * people and places surface as cards, live typeahead disambiguates the
- * trailing term, and a search can be saved as an album.
+ * come from the full client-side search the legacy gallery built (lexical +
+ * semantic CLIP tier over a locally-cached index; see localSemanticSearch.ts),
+ * which avoids the slow server-side /photos/search full-scan for the common
+ * case. When the local index isn't available (e.g. never built server-side, or
+ * a brand-new library) it falls back to that server endpoint and tells the user
+ * the search is running on the server and will take longer. Matched people and
+ * places surface as cards, live typeahead disambiguates the trailing term, and
+ * a search can be saved as an album.
  */
 export const AskPage: React.FC = () => {
     const { people, places, route, createAlbum, addPhotosToAlbum, registerPhotos, navigate } = useStore();
     const [query, setQuery] = useState(route.params.query ?? '');
     const [results, setResults] = useState<Photo[]>([]);
     const [searching, setSearching] = useState(false);
+    // True once a search has been routed to the slower server endpoint (the
+    // local index couldn't answer it) -- surfaced in the UI so the user knows
+    // why this particular search is taking longer.
+    const [usingBackend, setUsingBackend] = useState(false);
     const seqRef = useRef(0);
 
     // Search results aren't part of the gallery's paginated photo list, so the
@@ -88,6 +88,7 @@ export const AskPage: React.FC = () => {
             seqRef.current += 1;
             setResults([]);
             setSearching(false);
+            setUsingBackend(false);
         }
     }, [query]);
 
@@ -103,18 +104,46 @@ export const AskPage: React.FC = () => {
         if (!trimmed) {
             setResults([]);
             setSearching(false);
+            setUsingBackend(false);
             return;
         }
         setSearching(true);
+        setUsingBackend(false);
         void (async () => {
+            // Primary path: the full client-side search (lexical + semantic
+            // CLIP tier) over the locally-cached index. Returns null when the
+            // local index can't answer -- either it isn't available yet or it
+            // scored nothing, both of which fall through to the server below.
+            let local: Awaited<ReturnType<typeof runLocalSemanticSearch>>;
             try {
-                const res = await get<{ photos?: BackendPhoto[] }>(`/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=200`);
+                local = await runLocalSemanticSearch(trimmed, 0, SEARCH_PAGE_LIMIT, null, null);
+            } catch {
+                local = null;
+            }
+            if (seq !== seqRef.current) return;
+
+            if (local) {
+                try {
+                    const photos = await resolvePhotos(local.filenames);
+                    if (seq !== seqRef.current) return;
+                    setResults(photos);
+                } catch {
+                    if (seq === seqRef.current) setResults([]);
+                } finally {
+                    if (seq === seqRef.current) setSearching(false);
+                }
+                return;
+            }
+
+            // Fallback: the slower server-side full-scan search. Flag it so the
+            // UI can tell the user this search is running on the server.
+            setUsingBackend(true);
+            try {
+                const res = await get<{ photos?: BackendPhoto[] }>(`/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=${SEARCH_PAGE_LIMIT}`);
                 if (seq !== seqRef.current) return;
                 setResults(Array.isArray(res?.photos) ? res.photos.map(mapResult) : []);
             } catch {
-                if (seq !== seqRef.current) return;
-                const local = await tryLocalSearch(trimmed);
-                if (seq === seqRef.current) setResults(local ?? []);
+                if (seq === seqRef.current) setResults([]);
             } finally {
                 if (seq === seqRef.current) setSearching(false);
             }
@@ -230,7 +259,14 @@ export const AskPage: React.FC = () => {
                             ))}
                         </div>
                     )}
-                    <div className="pt-menu-label">{searching ? 'Searching…' : `${results.length} result${results.length === 1 ? '' : 's'}`}</div>
+                    <div className="pt-menu-label">
+                        {searching
+                            ? (usingBackend ? 'Searching on the server (this can take longer)…' : 'Searching…')
+                            : `${results.length} result${results.length === 1 ? '' : 's'}`}
+                    </div>
+                    {usingBackend && !searching && (
+                        <p className="pt-page-sub">Searched on the server — the fast on-device index wasn’t available for this query.</p>
+                    )}
                     <PhotoGrid photos={results} emptyHint={searching ? '' : 'No photos match that search.'} />
                 </>
             )}

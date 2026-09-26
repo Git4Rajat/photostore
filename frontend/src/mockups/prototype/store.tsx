@@ -520,18 +520,37 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .catch(() => { /* viewer will show its own empty/loading state */ });
     }, [photos, openViewer, registerPhotos]);
 
+    const fetchAlbums = useCallback(async () => {
+        setAlbumsLoading(true);
+        try {
+            const res = await get<{ albums?: Album[] }>('/albums');
+            setAlbums(Array.isArray(res?.albums) ? res.albums : []);
+        } catch {
+            // leave the current list in place on transient failures
+        } finally {
+            setAlbumsLoading(false);
+        }
+    }, []);
+
+    const reloadAlbums = useCallback(() => { void fetchAlbums(); }, [fetchAlbums]);
+
+    // Rating/liking a photo can change which photo is an album's auto-picked
+    // cover (backend picks the highest-rated/most-liked photo in the album),
+    // so reload albums after either succeeds to pick up any new cover.
     const ratePhotos = useCallback(
         (ids: string[], rating: number) => {
             if (!ids.length) return;
             const set = new Set(ids);
             const prevRatings = new Map(photos.filter((p) => set.has(p.id)).map((p) => [p.id, p.rating]));
             setPhotos((prev) => prev.map((p) => (set.has(p.id) ? { ...p, rating } : p)));
-            void post('/photos/rate-multiple', { filenames: ids, rating }).catch(() => {
-                setPhotos((prev) => prev.map((p) => (prevRatings.has(p.id) ? { ...p, rating: prevRatings.get(p.id)! } : p)));
-                toast('Couldn’t save rating');
-            });
+            void post('/photos/rate-multiple', { filenames: ids, rating })
+                .then(() => reloadAlbums())
+                .catch(() => {
+                    setPhotos((prev) => prev.map((p) => (prevRatings.has(p.id) ? { ...p, rating: prevRatings.get(p.id)! } : p)));
+                    toast('Couldn’t save rating');
+                });
         },
-        [photos, toast],
+        [photos, toast, reloadAlbums],
     );
 
     const toggleLike = useCallback(
@@ -546,6 +565,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     setPhotos((prev) => prev.map((p) => (p.id === id
                         ? { ...p, liked: res.liked ?? nextLiked, likes: res.likes ?? optimisticLikes }
                         : p)));
+                    reloadAlbums();
                 })
                 .catch(() => {
                     setPhotos((prev) => prev.map((p) => (p.id === id
@@ -554,7 +574,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     toast('Couldn’t update like');
                 });
         },
-        [photos, toast],
+        [photos, toast, reloadAlbums],
     );
 
     // Persist a manual rotation into every client-side photo collection so the
@@ -740,23 +760,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         });
     }, [albumTrash, toast]);
 
-    const fetchAlbums = useCallback(async () => {
-        setAlbumsLoading(true);
-        try {
-            const res = await get<{ albums?: Album[] }>('/albums');
-            setAlbums(Array.isArray(res?.albums) ? res.albums : []);
-        } catch {
-            // leave the current list in place on transient failures
-        } finally {
-            setAlbumsLoading(false);
-        }
-    }, []);
-
     useEffect(() => {
         void fetchAlbums();
     }, [fetchAlbums]);
-
-    const reloadAlbums = useCallback(() => { void fetchAlbums(); }, [fetchAlbums]);
 
     const fetchExplore = useCallback(async () => {
         setExploreLoading(true);

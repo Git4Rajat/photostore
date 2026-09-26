@@ -61,6 +61,7 @@ export const ToolsPage: React.FC = () => {
     const [wbSteps, setWbSteps] = useState<string[]>(['OCR', 'Faces']);
     const [wbSelection, setWbSelection] = useState<string[]>(workbenchFilenames);
     const [history, setHistory] = useState<HistoryEntry[]>([]);
+    const [historyLoading, setHistoryLoading] = useState(false);
     const [busy, setBusy] = useState(false);
     const [reselectingId, setReselectingId] = useState<string | null>(null);
     const [diagnostic, setDiagnostic] = useState<PeopleDiagnostic | null>(null);
@@ -122,11 +123,14 @@ export const ToolsPage: React.FC = () => {
     const workbenchLibrary: Photo[] = [...missingDeepLinked, ...photos];
 
     const loadHistory = async () => {
+        setHistoryLoading(true);
         try {
             const res = await getTools<{ actions?: HistoryEntry[] }>('/api/tools/workbench/actions');
             setHistory(Array.isArray(res?.actions) ? res.actions : []);
         } catch {
             setHistory([]);
+        } finally {
+            setHistoryLoading(false);
         }
     };
 
@@ -348,7 +352,9 @@ export const ToolsPage: React.FC = () => {
 
             {tab === 'History' && (
                 <div className="card-glass pt-history">
-                    {history.length === 0 ? (
+                    {historyLoading ? (
+                        <div className="pt-history-row">Loading history…</div>
+                    ) : history.length === 0 ? (
                         <div className="pt-history-row">No recent actions.</div>
                     ) : (
                         history.map((h, i) => (
