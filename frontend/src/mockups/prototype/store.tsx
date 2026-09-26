@@ -58,6 +58,7 @@ const mapPhoto = (b: BackendPhoto): Photo => {
         rotation: b.rotation,
         thumbnailRotation: b.thumbnailRotation,
         captureDate: iso,
+        processing: b.processing,
     };
 };
 
@@ -203,6 +204,10 @@ interface Store {
     photosByIds: (ids: string[]) => Photo[];
     albumById: (id: string) => Album | undefined;
     personById: (id: string) => Person | undefined;
+    // Merges photos from a source outside the paginated gallery list (e.g.
+    // /photos/search results) into the shared lookup so the viewer can find
+    // them by id. See photoIndex below.
+    registerPhotos: (list: Photo[]) => void;
 
     // navigation
     navigate: (page: PageId, params?: RouteParams) => void;
@@ -237,6 +242,7 @@ interface Store {
     albumPhotosById: (id: string) => Photo[] | undefined;
     albumPhotosLoading: boolean;
     createAlbum: (name?: string) => Promise<string>;
+    autoCreateAlbum: (rule: string) => Promise<{ albumId: string; count: number; message?: string }>;
     renameAlbum: (id: string, name: string) => void;
     addPhotosToAlbum: (albumId: string, ids: string[]) => void;
     deleteAlbum: (id: string) => void;
@@ -252,6 +258,7 @@ interface Store {
     personPhotosLoading: boolean;
     renamePerson: (id: string, name: string) => void;
     mergePeople: (sourceId: string, targetId: string) => void;
+    mergePeopleBatch: (targetId: string, sourceIds: string[]) => void;
 
     // members / sharing (server-backed shared libraries)
     reloadMembers: () => void;
@@ -309,11 +316,37 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [toasts, setToasts] = useState<Toast[]>([]);
     const toastTimers = useRef<Record<string, number>>({});
 
+    // Photos fetched outside the paginated gallery list (currently: Ask's
+    // /photos/search results) -- merged into photoIndex below so the viewer
+    // can resolve them by id. Without this, opening a search result whose
+    // photo isn't among the ~100 most-recent gallery photos found nothing,
+    // and the viewer's resync effect immediately closed itself.
+    const [extraPhotos, setExtraPhotos] = useState<Record<string, Photo>>({});
+    const registerPhotos = useCallback((list: Photo[]) => {
+        if (!list.length) return;
+        setExtraPhotos((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const p of list) {
+                if (next[p.id] !== p) {
+                    next[p.id] = p;
+                    changed = true;
+                }
+            }
+            return changed ? next : prev;
+        });
+    }, []);
+
     const photoIndex = useMemo(() => {
         const m = new Map<string, Photo>();
+        for (const p of Object.values(extraPhotos)) m.set(p.id, p);
+        for (const list of Object.values(albumPhotos)) for (const p of list) m.set(p.id, p);
+        for (const list of Object.values(personPhotos)) for (const p of list) m.set(p.id, p);
+        // The paginated gallery list is the freshest/most authoritative source
+        // (rating/like edits land here first), so it's merged last and wins.
         for (const p of photos) m.set(p.id, p);
         return m;
-    }, [photos]);
+    }, [photos, albumPhotos, personPhotos, extraPhotos]);
 
     const photoById = useCallback((id: string) => photoIndex.get(id), [photoIndex]);
     const photosByIds = useCallback(
@@ -727,6 +760,28 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [toast],
     );
 
+    // Smart albums: server picks the matching photos by `rule` (location,
+    // recent-upload, person, event-window, tag-object -- see SMART_ALBUM_RULES
+    // in AlbumsPage.tsx) and creates/returns the album in one call.
+    const autoCreateAlbum = useCallback(
+        async (rule: string): Promise<{ albumId: string; count: number; message?: string }> => {
+            try {
+                const res = await post<{ album?: Album; count?: number; message?: string }>('/albums/autocreate', { rule });
+                const created = res?.album;
+                const count = Number(res?.count || 0);
+                if (count > 0 && created) {
+                    setAlbums((prev) => (prev.some((a) => a.id === created.id) ? prev : [created, ...prev]));
+                    return { albumId: created.id, count };
+                }
+                return { albumId: '', count: 0, message: res?.message };
+            } catch {
+                toast('Couldn’t create smart album');
+                return { albumId: '', count: 0 };
+            }
+        },
+        [toast],
+    );
+
     const renameAlbum = useCallback((id: string, name: string) => {
         const trimmed = name.trim();
         if (!trimmed) return;
@@ -870,6 +925,30 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [people, fetchPeople, toast],
     );
 
+    // Multi-select merge from the People grid: several source clusters into
+    // one target in a single request (the backend's merge endpoint already
+    // accepts multiple mergeIds -- no separate "batch" call needed for a
+    // single target).
+    const mergePeopleBatch = useCallback(
+        (targetId: string, sourceIds: string[]) => {
+            const ids = sourceIds.filter((id) => id !== targetId);
+            if (!ids.length) return;
+            const removedSet = new Set(ids);
+            const removed = people.filter((p) => removedSet.has(p.id));
+            setPeople((prev) => prev.filter((p) => !removedSet.has(p.id)));
+            void faceService.mergePersons(targetId, ids)
+                .then(() => {
+                    toast(`Merged ${ids.length + 1} people`);
+                    void fetchPeople();
+                })
+                .catch(() => {
+                    if (removed.length) setPeople((prev) => [...prev, ...removed]);
+                    toast('Couldn’t merge people');
+                });
+        },
+        [people, fetchPeople, toast],
+    );
+
     const fetchMembers = useCallback(async () => {
         setMembersLoading(true);
         try {
@@ -960,6 +1039,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             photosByIds,
             albumById,
             personById,
+            registerPhotos,
             navigate,
             toggleSelect,
             selectMany,
@@ -984,6 +1064,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             albumPhotosById,
             albumPhotosLoading,
             createAlbum,
+            autoCreateAlbum,
             renameAlbum,
             addPhotosToAlbum,
             deleteAlbum,
@@ -997,6 +1078,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             personPhotosLoading,
             renamePerson,
             mergePeople,
+            mergePeopleBatch,
             reloadMembers,
             invite,
             revokeInvite,
@@ -1011,14 +1093,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
             mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore,
-            photoById, photosByIds, albumById, personById, navigate, toggleSelect, selectMany,
+            photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
             clearSelection, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,
-            createAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
+            createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, reloadPeople, openPerson, personPhotosById, personPhotosLoading,
-            renamePerson, mergePeople, reloadMembers, invite, revokeInvite,
+            renamePerson, mergePeople, mergePeopleBatch, reloadMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],
     );

@@ -87,6 +87,14 @@
 .pt-star { background: none; border: 0; padding: 0; cursor: pointer; color: #e2b33f; display: inline-grid; place-items: center; }
 .pt-star:disabled, .pt-star.static { cursor: default; }
 .pt-star svg { width: 100%; height: 100%; }
+/* Compact single-star, partial-fill rating indicator -- hidden by default;
+   only swapped in for the full 5-star row on narrow lightbox viewports (see
+   the .pt-viewer-bar override below), where 5 separate buttons crowd into
+   the neighboring Like button. */
+.pt-star-compact { display: none; position: relative; background: none; border: 0; padding: 0; cursor: pointer; }
+.pt-star-compact:disabled, .pt-star-compact.static { cursor: default; }
+.pt-star-compact-bg, .pt-star-compact-fg { position: absolute; inset: 0; width: 100%; height: 100%; color: #e2b33f; }
+.pt-star-compact-fg { clip-path: inset(0 calc(100% - var(--pt-star-fill, 0%)) 0 0); }
 
 /* ---- toolbar / page headers ---- */
 .pt-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; min-width: 0; }
@@ -162,13 +170,22 @@
 
 .pt-albums { display: grid; grid-template-columns: 280px 1fr; gap: 12px; }
 .pt-album-sidebar { padding: 8px; align-self: start; position: sticky; top: 0; max-height: 85vh; overflow-y: auto; border-radius: var(--r-md); }
-.pt-album-detail { padding: 12px; min-width: 0; }
+/* Capped + independently scrollable to match the sidebar, so the sidebar's
+   own scrollbar (20-30 albums) and the page's outer scroll never both show
+   at once for one Albums view -- each pane scrolls itself, the page doesn't. */
+.pt-album-detail { padding: 12px; min-width: 0; max-height: 85vh; overflow-y: auto; }
 
 @media (max-width: 620px) {
   .pt-albums { grid-template-columns: 1fr; gap: 8px; }
   .pt-albums.show-detail .pt-album-sidebar { display: none; }
   .pt-album-sidebar { position: static; max-height: none; display: none; }
-  .pt-album-detail { padding: 8px; }
+  /* Mirror image of the mobile list/sidebar toggle above: the detail pane
+     only showed when show-detail was set on the *sidebar*, never gated
+     itself, so it rendered stacked directly below the full album list
+     instead of replacing it -- on a 20-30 album library, "the album" was
+     always there, just scrolled past the whole list first. */
+  .pt-album-detail { display: none; }
+  .pt-albums.show-detail .pt-album-detail { display: block; padding: 8px; max-height: none; overflow-y: visible; }
   .pt-share-section { max-height: none; overflow: visible; }
   .pt-album-detail-head .btn span { display: none; }
   .pt-body { overflow-y: auto; }
@@ -192,8 +209,10 @@
 
 /* ---- people ---- */
 .pt-people-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
-.pt-person-card { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 14px; border: 1px solid var(--lg-edge); border-radius: var(--r-md); background: var(--lg-surface-wash); cursor: pointer; font: inherit; color: var(--text); }
+.pt-person-card { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 14px; border: 1px solid var(--lg-edge); border-radius: var(--r-md); background: var(--lg-surface-wash); cursor: pointer; font: inherit; color: var(--text); }
 .pt-person-card:hover { border-color: var(--muted); }
+.pt-person-card.selected { border-color: var(--accent); background: var(--accent-soft); }
+.pt-person-check { position: absolute; top: 8px; right: 8px; }
 .pt-person-face { width: 84px; height: 84px; border-radius: 50%; object-fit: cover; }
 .pt-person-name { font-weight: 650; font-size: 0.92rem; }
 .pt-person-name.unnamed { color: var(--accent); }
@@ -366,7 +385,7 @@
 .pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: #9c9486; font-family: var(--font-label); }
 .pt-viewer-stage-wrap { flex: 1; position: relative; display: flex; min-height: 0; }
 .pt-viewer-stage { flex: 1; display: flex; align-items: center; gap: 12px; padding: 0 18px; min-height: 0; }
-.pt-viewer-loading { color: #9c9486; font-size: 0.9rem; }
+.pt-viewer-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #9c9486; font-size: 0.9rem; }
 /* Floating image controls (zoom / rotate / full-res) over the stage. */
 .pt-viewer-tools { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); padding: 4px 8px; backdrop-filter: blur(8px); z-index: 2; }
 .pt-viewer-tools button { display: inline-grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 50%; background: none; color: #ece6d9; cursor: pointer; }
@@ -417,9 +436,22 @@
 @media (max-width: 520px) {
   .pt-vb-btn span { display: none; }
   .pt-vb-group { gap: 2px; }
+  /* 5 separate star buttons crowd into the Like button at this width --
+     collapse to one partial-fill star instead. */
+  .pt-viewer-bar .pt-stars-full { display: none; }
+  .pt-viewer-bar .pt-star-compact { display: inline-grid; place-items: center; }
 }
 .pt-more-menu button { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: var(--r-xs); font: inherit; font-size: 0.86rem; color: var(--text); cursor: pointer; }
 .pt-more-menu button:hover { background: var(--lg-surface-wash); }
+.pt-more-menu button:disabled { opacity: 0.5; cursor: default; }
+
+.pt-albums-new-row { display: flex; gap: 8px; margin-top: 8px; }
+.pt-albums-new-row .albm-newbtn { width: auto; flex: 1; margin-top: 0; }
+.pt-smart-album-menu { min-width: 220px; }
+.pt-smart-album-menu button { display: flex; align-items: center; gap: 10px; }
+.pt-smart-album-menu button svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--muted); }
+.pt-smart-album-menu button span { display: flex; flex-direction: column; gap: 1px; }
+.pt-smart-album-menu button small { color: var(--muted); font-size: 0.74rem; font-weight: 400; }
 
 /* ---- toasts (mobile-safe) ---- */
 .pt-toasts { position: fixed; left: 16px; right: 16px; bottom: 100px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }

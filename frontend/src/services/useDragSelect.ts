@@ -1,6 +1,11 @@
 import { useEffect, useRef } from 'react';
 
 const MOVE_THRESHOLD_PX = 6;
+// Start auto-scrolling once the pointer gets this close to the scroll
+// container's top/bottom edge, so a drag-select can reach photos below the
+// fold without the user lifting their finger to scroll manually first.
+const AUTO_SCROLL_EDGE_PX = 72;
+const AUTO_SCROLL_MAX_SPEED_PX = 18;
 
 export interface DragSelectHandlers {
     onPointerDown: (event: React.PointerEvent) => void;
@@ -28,16 +33,35 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
     const draggingRef = useRef(false);
     const targetStateRef = useRef(false);
     const visitedRef = useRef<Set<string>>(new Set());
+    const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
+    const autoScrollFrameRef = useRef<number | null>(null);
+    // Guards the scroll-cancel handler below against the auto-scroll loop's
+    // own scrollBy() calls -- container.scrollBy() fires a non-bubbling
+    // 'scroll' event that the capture-phase window listener still observes,
+    // and without this it would cancel the very drag that's auto-scrolling.
+    const isAutoScrollingRef = useRef(false);
 
     // Cancel drag selection if the user scrolls, since scroll changes which
     // tiles are under the pointer coordinates.
     useEffect(() => {
         const handleScroll = () => {
+            if (isAutoScrollingRef.current) {
+                return;
+            }
             originRef.current = null;
             draggingRef.current = false;
+            if (autoScrollFrameRef.current !== null) {
+                cancelAnimationFrame(autoScrollFrameRef.current);
+                autoScrollFrameRef.current = null;
+            }
         };
         window.addEventListener('scroll', handleScroll, { capture: true });
-        return () => window.removeEventListener('scroll', handleScroll, { capture: true });
+        return () => {
+            window.removeEventListener('scroll', handleScroll, { capture: true });
+            if (autoScrollFrameRef.current !== null) {
+                cancelAnimationFrame(autoScrollFrameRef.current);
+            }
+        };
     }, []);
 
     const tileIdAt = (x: number, y: number): string | undefined => {
@@ -53,6 +77,59 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
         }
         visitedRef.current.add(id);
         setSelected(id, targetStateRef.current);
+    };
+
+    const stopAutoScroll = () => {
+        if (autoScrollFrameRef.current !== null) {
+            cancelAnimationFrame(autoScrollFrameRef.current);
+            autoScrollFrameRef.current = null;
+        }
+    };
+
+    // .pt-body is the app's one page-content scroll container (see
+    // PrototypeApp.tsx's Shell) -- every grid this hook is wired into lives
+    // inside it, so there's no need to thread a container ref through props.
+    const scrollContainer = (): HTMLElement | null => document.querySelector<HTMLElement>('.pt-body');
+
+    const autoScrollTick = () => {
+        // Cleared here, one full frame after it was last set to true by a
+        // scrollBy() below -- not synchronously right after that call, since
+        // the 'scroll' event it triggers fires asynchronously (the next
+        // frame), and clearing the flag immediately closed the guard window
+        // before that event arrived, so the very first auto-scroll frame
+        // always self-cancelled the drag.
+        isAutoScrollingRef.current = false;
+        autoScrollFrameRef.current = null;
+        if (!draggingRef.current || !lastPointerRef.current) {
+            return;
+        }
+        const container = scrollContainer();
+        const pointer = lastPointerRef.current;
+        if (container) {
+            const rect = container.getBoundingClientRect();
+            let delta = 0;
+            if (pointer.y < rect.top + AUTO_SCROLL_EDGE_PX) {
+                const intensity = Math.min(1, (rect.top + AUTO_SCROLL_EDGE_PX - pointer.y) / AUTO_SCROLL_EDGE_PX);
+                delta = -Math.ceil(AUTO_SCROLL_MAX_SPEED_PX * intensity);
+            } else if (pointer.y > rect.bottom - AUTO_SCROLL_EDGE_PX) {
+                const intensity = Math.min(1, (pointer.y - (rect.bottom - AUTO_SCROLL_EDGE_PX)) / AUTO_SCROLL_EDGE_PX);
+                delta = Math.ceil(AUTO_SCROLL_MAX_SPEED_PX * intensity);
+            }
+            if (delta !== 0) {
+                isAutoScrollingRef.current = true;
+                container.scrollBy({ top: delta });
+                // The pointer didn't move, but the content under it just did --
+                // resample so tiles scrolled into place still get painted.
+                applyAt(pointer.x, pointer.y);
+            }
+        }
+        autoScrollFrameRef.current = requestAnimationFrame(autoScrollTick);
+    };
+
+    const startAutoScrollLoop = () => {
+        if (autoScrollFrameRef.current === null) {
+            autoScrollFrameRef.current = requestAnimationFrame(autoScrollTick);
+        }
     };
 
     const onPointerDown = (event: React.PointerEvent) => {
@@ -71,6 +148,7 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
         if (!originRef.current) {
             return;
         }
+        lastPointerRef.current = { x: event.clientX, y: event.clientY };
         if (!draggingRef.current) {
             const dx = event.clientX - originRef.current.x;
             const dy = event.clientY - originRef.current.y;
@@ -81,6 +159,7 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
             // Confirmed drag rather than a tap -- paint the tile the gesture
             // started on too, since its own click/onChange won't fire now.
             applyAt(originRef.current.x, originRef.current.y);
+            startAutoScrollLoop();
         }
         applyAt(event.clientX, event.clientY);
     };
@@ -92,11 +171,13 @@ export const useDragSelect = ({ isSelected, setSelected }: UseDragSelectOptions)
             event.preventDefault();
         }
         originRef.current = null;
+        stopAutoScroll();
     };
 
     const onPointerCancel = () => {
         originRef.current = null;
         draggingRef.current = false;
+        stopAutoScroll();
     };
 
     // Capture phase, same element as onPointerDown -- runs before that

@@ -22,6 +22,7 @@ import AskPage from './pages/AskPage';
 import SharingPage from './pages/SharingPage';
 import ToolsPage from './pages/ToolsPage';
 import TrashPage from './pages/TrashPage';
+import AdditionalInfoPage from '../../components/AdditionalInfoPage';
 import type { PageId } from './types';
 
 const LazyLoginPage = React.lazy(() => import('../../components/LoginPage'));
@@ -71,7 +72,9 @@ const applyTheme = (theme: Theme) => {
     }
 };
 
-const activeNavFor = (page: PageId): PageId | '' => (page === 'person' ? 'people' : page === 'trash' ? '' : page);
+const activeNavFor = (page: PageId): PageId | '' => (
+    page === 'person' ? 'people' : (page === 'trash' || page === 'additional') ? '' : page
+);
 
 const Page: React.FC = () => {
     const { route } = useStore();
@@ -85,6 +88,7 @@ const Page: React.FC = () => {
         case 'sharing': return <SharingPage />;
         case 'tools': return <ToolsPage />;
         case 'trash': return <TrashPage />;
+        case 'additional': return <AdditionalInfoPage />;
         default: return <GalleryPage />;
     }
 };
@@ -128,7 +132,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                             <div className="pt-account-head"><b>{accountName}</b>{accountEmail && <span>{accountEmail}</span>}</div>
                             <button type="button" onClick={() => { navigate('trash'); close(); }}>Recently Deleted</button>
                             <button type="button" onClick={() => { toast('Corrupted uploads: all clear'); close(); }}>Corrupted uploads</button>
-                            <button type="button" onClick={() => { toast('Additional info'); close(); }}>Additional info</button>
+                            <button type="button" onClick={() => { navigate('additional'); close(); }}>Additional info</button>
                             <div className="pt-account-sep" />
                             <div className="pt-account-theme">
                                 <span>Theme</span>

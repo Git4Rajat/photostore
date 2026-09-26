@@ -4,6 +4,7 @@ import { isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress } from '../../services/imageClient';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
+import { isRawFilename } from '../../utils/photoDisplay';
 import type { Photo } from './types';
 
 // Image resolution for the prototype's tiles and viewer. Deliberately thin:
@@ -128,7 +129,12 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaSt
         const controller = new AbortController();
         void (async () => {
             try {
-                const order: Array<'preview' | 'image' | 'thumbnail'> = fullRes
+                // 'image' is a SAS URL to the original blob -- for RAW files
+                // (CR3/NEF/ARW/DNG/...) that's the undecoded raw file itself,
+                // which no browser can render as an <img>. Full-res mode still
+                // has to prefer the (already browser-viewable) preview render
+                // for those, or toggling "FR" just shows a broken image.
+                const order: Array<'preview' | 'image' | 'thumbnail'> = fullRes && !isRawFilename(filename)
                     ? ['image', 'preview', 'thumbnail']
                     : ['preview', 'image', 'thumbnail'];
                 let target = '';

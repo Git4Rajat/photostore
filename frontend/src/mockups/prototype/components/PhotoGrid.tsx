@@ -20,6 +20,14 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
     // setState re-render, so a fast sweep saw a stale `null` and selected nothing.
     const dragStartRef = React.useRef<number | null>(null);
     const draggedRef = React.useRef(false);
+    // Selection as it was *before this drag gesture started*. Each mouseenter
+    // merges this frozen snapshot with the current origin..pointer range --
+    // not the live `selection`, which would only ever grow: reversing the
+    // drag back toward the origin recomputes a smaller range, and merging
+    // against the live (already-grown) selection kept every tile the sweep
+    // had passed over, so dragging back over already-selected tiles could
+    // never deselect them.
+    const preDragSelectionRef = React.useRef<string[]>([]);
     const gridRef = React.useRef<HTMLDivElement>(null);
     // Long-press on touch devices enters/toggles selection without opening the
     // viewer; a short tap still opens it. `longPressedRef` suppresses the click
@@ -77,6 +85,7 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
     const handleMouseDown = (i: number) => {
         dragStartRef.current = i;
         draggedRef.current = false;
+        preDragSelectionRef.current = selection;
     };
 
     const handleMouseEnter = (i: number) => {
@@ -85,10 +94,11 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
         draggedRef.current = true;
         const start = Math.min(origin, i);
         const end = Math.max(origin, i);
-        // Recompute the whole origin..current range each move (merged with the
-        // pre-drag selection), so it's robust to the closure's `selection` being
-        // a render behind. lastSelected anchors a later shift-click.
-        selectMany(Array.from(new Set([...selection, ...ids.slice(start, end + 1)])));
+        // Recompute the whole origin..current range each move, merged with the
+        // pre-drag snapshot (not the live selection) so shrinking the range
+        // back toward the origin actually drops the tiles it no longer covers.
+        // lastSelected anchors a later shift-click.
+        selectMany(Array.from(new Set([...preDragSelectionRef.current, ...ids.slice(start, end + 1)])));
         setLastSelected(i);
     };
 

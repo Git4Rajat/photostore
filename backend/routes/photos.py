@@ -122,17 +122,33 @@ def photo_access_url_batch():
     except Exception:
         metadata_map = {}
 
-    urls: app.Dict[str, str] = {}
-    expires_at = ''
+    safe_names = []
     for raw_name in filenames:
         safe_name = app._validate_media_filename(str(raw_name or ''))
-        if not safe_name:
-            continue
-        # Fall back to a direct lookup only for a cache miss (e.g. uploaded
-        # in the last few seconds, before the scan cache refreshed) so a
-        # brand-new photo's thumbnail still resolves instead of silently
-        # dropping from the response.
-        metadata = metadata_map.get(safe_name) or app._get_metadata_entity(user_id, safe_name)
+        if safe_name:
+            safe_names.append(safe_name)
+
+    # _cached_metadata_list_rows_for_user deliberately excludes trashed rows
+    # (processing_state == 'deleted'), so every filename on the Recently
+    # Deleted page misses the cache here -- not just brand-new uploads. A
+    # serial per-filename _get_metadata_entity fallback turned that page's
+    # batch (up to 200 filenames) into 200 sequential Table Storage round
+    # trips, slow enough that the whole request could fail and leave every
+    # tile showing the empty-thumbnail placeholder. Fan the misses out
+    # concurrently instead, same bounded-concurrency pattern the delete
+    # endpoint above already uses for per-file Table Storage I/O.
+    misses = [name for name in safe_names if name not in metadata_map]
+    if misses:
+        with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
+            fetched = executor.map(lambda name: (name, app._get_metadata_entity(user_id, name)), misses)
+        for name, entity in fetched:
+            if entity:
+                metadata_map[name] = entity
+
+    urls: app.Dict[str, str] = {}
+    expires_at = ''
+    for safe_name in safe_names:
+        metadata = metadata_map.get(safe_name)
         if not metadata:
             continue
         container = app._photo_access_container(kind)

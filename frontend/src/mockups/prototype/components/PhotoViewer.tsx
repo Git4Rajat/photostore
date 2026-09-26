@@ -4,7 +4,6 @@ import {
     ArrowLeftIcon,
     ArrowUturnLeftIcon,
     ArrowUturnRightIcon,
-    ArrowsPointingOutIcon,
     ChevronLeftIcon,
     ChevronRightIcon,
     EllipsisHorizontalIcon,
@@ -34,7 +33,7 @@ const dash = (value?: string | number): string => {
 /** Full-screen photo viewer with a persistent action bar, prev/next, keyboard,
  *  rotate + zoom controls, an EXIF/location info panel, and on-demand full-res. */
 export const PhotoViewer: React.FC = () => {
-    const { viewer, photoById, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, deletePhotos, navigate, toast } = useStore();
+    const { viewer, photoById, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, deletePhotos, navigate, toast, route, registerPhotos } = useStore();
 
     const live = useMemo(
         () => (viewer ? viewer.ids.map((id) => photoById(id)).filter((p) => Boolean(p)) : []),
@@ -251,9 +250,7 @@ export const PhotoViewer: React.FC = () => {
                                         <span className="pt-viewer-fr-percent">{fullResProgress}%</span>
                                     </span>
                                 ) : (
-                                    <>
-                                        <ArrowsPointingOutIcon /> <span className="pt-viewer-fr">FR</span>
-                                    </>
+                                    <span className="pt-viewer-fr">FR</span>
                                 )}
                             </button>
                         </>
@@ -342,6 +339,24 @@ export const PhotoViewer: React.FC = () => {
                                 <button type="button" onClick={() => { setShowInfo(true); close(); }}>Photo info</button>
                                 <button type="button" onClick={() => { close(); void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed')); }}>Download</button>
                                 <button type="button" onClick={() => { close(); navigate('tools', { filenames: photo.filename }); }}>Open in Workbench</button>
+                                {route.page !== 'gallery' && (
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            close();
+                                            // navigate() always clears the open viewer (so a
+                                            // stale one never lingers over an unrelated page),
+                                            // so reopen it right after -- registerPhotos first
+                                            // in case this photo isn't in Gallery's own loaded
+                                            // page yet (same fix as Ask's search-result preview).
+                                            registerPhotos([photo]);
+                                            navigate('gallery');
+                                            openViewer([photo.id], 0);
+                                        }}
+                                    >
+                                        Show in Gallery
+                                    </button>
+                                )}
                             </div>
                         )}
                     </Menu>

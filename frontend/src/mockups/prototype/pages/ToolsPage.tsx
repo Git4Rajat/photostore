@@ -141,9 +141,9 @@ export const ToolsPage: React.FC = () => {
 
     // Log a history row so History reflects the run even for purely in-browser
     // processing (which otherwise never touches the backend). Best-effort.
-    const recordAction = (stepNames: string[], scope: 'selected' | 'library', filenames?: string[]) => {
+    const recordAction = (stepNames: string[], scope: 'selected' | 'library', filenames?: string[], action = 'reprocess') => {
         void postTools('/api/tools/workbench/actions', {
-            action: 'reprocess',
+            action,
             steps: stepNames,
             scope,
             filenameCount: filenames?.length ?? 0,
@@ -198,6 +198,7 @@ export const ToolsPage: React.FC = () => {
         setBusy(true);
         try {
             await postAdmin(path, body);
+            recordAction([], 'library', undefined, label);
             toast(`${label} started`);
         } catch {
             toast(`Couldn’t start ${label.toLowerCase()}`);

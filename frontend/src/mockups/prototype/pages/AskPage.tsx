@@ -39,31 +39,46 @@ const mapResult = (b: BackendPhoto): Photo => {
  * a search can be saved as an album.
  */
 export const AskPage: React.FC = () => {
-    const { people, places, route, createAlbum, addPhotosToAlbum, navigate } = useStore();
+    const { people, places, route, createAlbum, addPhotosToAlbum, registerPhotos, navigate } = useStore();
     const [query, setQuery] = useState(route.params.query ?? '');
     const [results, setResults] = useState<Photo[]>([]);
     const [searching, setSearching] = useState(false);
     const seqRef = useRef(0);
 
+    // Search results aren't part of the gallery's paginated photo list, so the
+    // viewer can't resolve them by id unless they're registered here too --
+    // otherwise clicking a result flashes the viewer open and immediately
+    // closed (its resync effect finds no matching photo). See registerPhotos.
     useEffect(() => {
-        if (route.params.query !== undefined) setQuery(route.params.query);
-    }, [route.params.query]);
+        registerPhotos(results);
+    }, [results, registerPhotos]);
 
+    // Clear reactively as the user backspaces the box to empty (not just on
+    // Enter/route navigation) -- bumps seqRef too, so an in-flight request
+    // for whatever was just cleared can't land afterward and repopulate
+    // results the user already watched disappear.
     useEffect(() => {
         if (!query.trim()) {
+            seqRef.current += 1;
             setResults([]);
             setSearching(false);
         }
     }, [query]);
 
-    const runSearch = () => {
-        const trimmed = query.trim();
+    const runSearch = (queryOverride?: string) => {
+        const trimmed = (queryOverride ?? query).trim();
+        // Bump the sequence even on a no-op/empty search so a response for a
+        // *previous* in-flight request (e.g. one just superseded by the user
+        // clearing the box) can never land after the guard below already
+        // decided this search doesn't need one -- otherwise a late response
+        // could repopulate results/re-toggle "Searching…" after the UI had
+        // already moved on.
+        const seq = ++seqRef.current;
         if (!trimmed) {
             setResults([]);
             setSearching(false);
             return;
         }
-        const seq = ++seqRef.current;
         setSearching(true);
         void (async () => {
             try {
@@ -78,8 +93,19 @@ export const AskPage: React.FC = () => {
         })();
     };
 
+    // Single effect drives both the input box and the actual search off the
+    // same incoming route param, passing it straight to runSearch instead of
+    // relying on `query` state -- two separate effects both keyed on
+    // route.params.query (one calling setQuery, the other calling runSearch)
+    // raced: the search effect ran first and read `query` from *before*
+    // setQuery's update had committed, so e.g. clicking a place chip updated
+    // the input box to the new place name but actually searched the
+    // previous text.
     useEffect(() => {
-        if (route.params.query !== undefined && route.params.query.trim()) runSearch();
+        const incoming = route.params.query;
+        if (incoming === undefined) return;
+        setQuery(incoming);
+        runSearch(incoming);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [route.params.query]);
 

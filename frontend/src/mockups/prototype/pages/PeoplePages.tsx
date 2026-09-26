@@ -1,14 +1,43 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeftIcon, SparklesIcon } from '@heroicons/react/24/outline';
+import { ArrowLeftIcon, CheckIcon, SparklesIcon } from '@heroicons/react/24/outline';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
+import type { Person } from '../types';
 
-/** People — a grid of face clusters; unnamed ones are flagged for naming. */
+// The merge target when several selected clusters are merged at once: prefer
+// a named person (merging *into* a name is the common case -- folding
+// unnamed duplicate clusters into someone already identified), falling back
+// to selection order if none are named.
+const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.name) ?? selected[0];
+
+/** People — a grid of face clusters; unnamed ones are flagged for naming.
+ *  "Select" mode lets several clusters be picked and merged into one in a
+ *  single action, instead of the one-at-a-time merge on the detail page. */
 export const PeoplePage: React.FC = () => {
-    const { people, peopleLoading, navigate } = useStore();
+    const { people, peopleLoading, navigate, mergePeopleBatch } = useStore();
     const covers = useProtectedBlobUrls(people.map((p) => p.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
+    const [selectMode, setSelectMode] = useState(false);
+    const [selectedIds, setSelectedIds] = useState<string[]>([]);
+
+    const exitSelectMode = () => {
+        setSelectMode(false);
+        setSelectedIds([]);
+    };
+
+    const toggleSelect = (id: string) => {
+        setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+    };
+
+    const handleMerge = () => {
+        const selected = people.filter((p) => selectedIds.includes(p.id));
+        if (selected.length < 2) return;
+        const target = pickMergeTarget(selected);
+        const sourceIds = selected.filter((p) => p.id !== target.id).map((p) => p.id);
+        mergePeopleBatch(target.id, sourceIds);
+        exitSelectMode();
+    };
 
     if (peopleLoading && people.length === 0) {
         return (
@@ -23,12 +52,28 @@ export const PeoplePage: React.FC = () => {
                     <h1 className="pt-page-title">People</h1>
                     <p className="pt-page-sub">{people.length} people · {people.filter((p) => !p.name).length} to name</p>
                 </div>
+                {people.length > 1 && (
+                    <button type="button" className="pt-linkish" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}>
+                        {selectMode ? 'Cancel' : 'Select'}
+                    </button>
+                )}
             </div>
             <div className="pt-people-grid">
                 {people.map((person) => {
                     const coverSrc = person.coverThumbnailUrl ? covers[person.coverThumbnailUrl] : undefined;
+                    const checked = selectedIds.includes(person.id);
                     return (
-                        <button key={person.id} type="button" className="pt-person-card" onClick={() => navigate('person', { personId: person.id })}>
+                        <button
+                            key={person.id}
+                            type="button"
+                            className={`pt-person-card${checked ? ' selected' : ''}`}
+                            onClick={() => (selectMode ? toggleSelect(person.id) : navigate('person', { personId: person.id }))}
+                        >
+                            {selectMode && (
+                                <span className={`pt-album-row-check pt-person-check${checked ? ' on' : ''}`} aria-hidden="true">
+                                    <CheckIcon />
+                                </span>
+                            )}
                             {coverSrc
                                 ? <img className="pt-person-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} />
                                 : <Swatch swatch={person.swatch} className="pt-person-face" />}
@@ -38,6 +83,14 @@ export const PeoplePage: React.FC = () => {
                     );
                 })}
             </div>
+            {selectMode && selectedIds.length > 0 && (
+                <div className="pt-album-select-bar">
+                    <span>{selectedIds.length} selected</span>
+                    <button type="button" className="btn mock-cta" disabled={selectedIds.length < 2} onClick={handleMerge}>
+                        Merge into one
+                    </button>
+                </div>
+            )}
         </div>
     );
 };

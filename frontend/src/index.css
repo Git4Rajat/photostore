@@ -350,6 +350,11 @@ body,
   margin: 0;
   padding: 0;
   min-height: 100%;
+  /* The app shell (.pt-shell) owns a fixed 100vh box with its own internal
+     scroll containers (.mock-body per page, plus component-level ones like
+     .pt-album-sidebar/.pt-album-detail) -- scrolling should only ever happen
+     inside those, never on the outer document itself. */
+  overflow: hidden;
 }
 
 * {

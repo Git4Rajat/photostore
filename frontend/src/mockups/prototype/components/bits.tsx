@@ -24,7 +24,14 @@ export const Avatar: React.FC<{ initials: string; color?: string; size?: number;
     </span>
 );
 
-/** Interactive 5-star rating. Clicking the current rating again clears it. */
+/** Interactive 5-star rating. Clicking the current rating again clears it.
+ *
+ * Renders both the full 5-star row and a compact single partial-fill star --
+ * CSS (see `.pt-stars-compact`/`.pt-stars-full`) swaps which one is visible
+ * below the width where 5 separate star buttons crowd into a neighboring
+ * button (e.g. the lightbox action bar's Like button on mobile). The compact
+ * star cycles the rating up by one per tap (wrapping past 5 back to 0),
+ * mirroring the full row's "tap current value again to clear" behavior. */
 export const Stars: React.FC<{ value: number; onRate?: (n: number) => void; size?: number }> = ({
     value,
     onRate,
@@ -33,29 +40,45 @@ export const Stars: React.FC<{ value: number; onRate?: (n: number) => void; size
     const [hover, setHover] = useState<number>(0);
     const shown = hover || value;
     return (
-        <span className="pt-stars" onMouseLeave={() => setHover(0)}>
-            {[1, 2, 3, 4, 5].map((n) => {
-                const Filled = n <= shown;
-                const Icon = Filled ? StarSolid : StarOutline;
-                return (
-                    <button
-                        key={n}
-                        type="button"
-                        className={`pt-star${onRate ? '' : ' static'}`}
-                        aria-label={`${n} star${n > 1 ? 's' : ''}`}
-                        onMouseEnter={() => onRate && setHover(n)}
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            onRate?.(value === n ? 0 : n);
-                        }}
-                        disabled={!onRate}
-                        style={{ width: size, height: size }}
-                    >
-                        <Icon />
-                    </button>
-                );
-            })}
-        </span>
+        <>
+            <span className="pt-stars pt-stars-full" onMouseLeave={() => setHover(0)}>
+                {[1, 2, 3, 4, 5].map((n) => {
+                    const Filled = n <= shown;
+                    const Icon = Filled ? StarSolid : StarOutline;
+                    return (
+                        <button
+                            key={n}
+                            type="button"
+                            className={`pt-star${onRate ? '' : ' static'}`}
+                            aria-label={`${n} star${n > 1 ? 's' : ''}`}
+                            onMouseEnter={() => onRate && setHover(n)}
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onRate?.(value === n ? 0 : n);
+                            }}
+                            disabled={!onRate}
+                            style={{ width: size, height: size }}
+                        >
+                            <Icon />
+                        </button>
+                    );
+                })}
+            </span>
+            <button
+                type="button"
+                className={`pt-star-compact${onRate ? '' : ' static'}`}
+                aria-label={`Rating: ${value} of 5 stars`}
+                onClick={(e) => {
+                    e.stopPropagation();
+                    onRate?.(value >= 5 ? 0 : value + 1);
+                }}
+                disabled={!onRate}
+                style={{ width: size, height: size, '--pt-star-fill': `${Math.max(0, Math.min(5, value)) / 5 * 100}%` } as React.CSSProperties}
+            >
+                <StarOutline className="pt-star-compact-bg" />
+                <StarSolid className="pt-star-compact-fg" />
+            </button>
+        </>
     );
 };
 

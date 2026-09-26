@@ -1,7 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeftIcon, ArrowPathIcon, CheckIcon, ClipboardDocumentIcon, PlusIcon, ShareIcon, TrashIcon } from '@heroicons/react/24/outline';
+import {
+    ArrowLeftIcon, ArrowPathIcon, CalendarDaysIcon, CheckIcon, ClipboardDocumentIcon, ClockIcon,
+    MapPinIcon, PlusIcon, ShareIcon, SparklesIcon, TagIcon, TrashIcon, UserGroupIcon,
+} from '@heroicons/react/24/outline';
 import { useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
+import { Menu } from '../components/bits';
 import { confirmDialog } from '../../../components/shared/dialogs';
 
 const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
@@ -11,17 +15,26 @@ const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
     { value: 'never', label: 'Never', days: 0 },
 ];
 
+const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string; Icon: React.ComponentType<React.SVGProps<SVGSVGElement>> }> = [
+    { id: 'location', label: 'By location', description: 'Places across the library', Icon: MapPinIcon },
+    { id: 'recent-upload', label: 'By recent upload', description: 'Latest upload window', Icon: ClockIcon },
+    { id: 'person', label: 'By person', description: 'Matched people clusters', Icon: UserGroupIcon },
+    { id: 'event-window', label: 'By event/time', description: 'Capture date window', Icon: CalendarDaysIcon },
+    { id: 'tag-object', label: 'By tag/object', description: 'AI tags and detected objects', Icon: TagIcon },
+];
+
 const randomCode = () => Math.random().toString(16).slice(2, 6).toUpperCase();
 
 /** Albums — list first on mobile, detail view on larger screens. */
 export const AlbumsPage: React.FC = () => {
     const {
         albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, albumPhotosLoading,
-        createAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
+        createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
     } = useStore();
     const [showMobileDetail, setShowMobileDetail] = useState(false);
     const [selectMode, setSelectMode] = useState(false);
     const [selectedAlbumIds, setSelectedAlbumIds] = useState<string[]>([]);
+    const [smartCreatingRule, setSmartCreatingRule] = useState<string | null>(null);
     const selectedId = route.params.albumId ?? albums[0]?.id;
     const album = albums.find((a) => a.id === selectedId) ?? albums[0];
     const [renaming, setRenaming] = useState(false);
@@ -70,6 +83,23 @@ export const AlbumsPage: React.FC = () => {
         if (thenRename) {
             setDraft('New album');
             setRenaming(true);
+        }
+    };
+
+    const handleSmartCreate = async (rule: string, closeMenu: () => void) => {
+        closeMenu();
+        setSmartCreatingRule(rule);
+        try {
+            const { albumId, count, message } = await autoCreateAlbum(rule);
+            if (albumId) {
+                navigate('albums', { albumId });
+                setShowMobileDetail(true);
+                toast(`Created smart album with ${count} photo${count === 1 ? '' : 's'}`);
+            } else {
+                toast(message || 'No matching photos found for that rule.');
+            }
+        } finally {
+            setSmartCreatingRule(null);
         }
     };
 
@@ -162,9 +192,32 @@ export const AlbumsPage: React.FC = () => {
                     </div>
                 )
             ) : (
-                <button type="button" className="albm-newbtn" onClick={() => void handleCreate(true)}>
-                    <PlusIcon /> New album
-                </button>
+                <div className="pt-albums-new-row">
+                    <button type="button" className="albm-newbtn" onClick={() => void handleCreate(true)}>
+                        <PlusIcon /> New album
+                    </button>
+                    <Menu
+                        renderTrigger={(toggle) => (
+                            <button type="button" className="albm-newbtn" onClick={toggle} disabled={smartCreatingRule !== null}>
+                                <SparklesIcon /> {smartCreatingRule ? 'Creating…' : 'Smart album'}
+                            </button>
+                        )}
+                    >
+                        {(close) => (
+                            <div className="pt-more-menu pt-smart-album-menu">
+                                {SMART_ALBUM_RULES.map(({ id, label, description, Icon }) => (
+                                    <button key={id} type="button" onClick={() => void handleSmartCreate(id, close)} disabled={smartCreatingRule !== null}>
+                                        <Icon className="toolbar-icon" />
+                                        <span>
+                                            <b>{label}</b>
+                                            <small>{description}</small>
+                                        </span>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </Menu>
+                </div>
             )}
         </>
     );

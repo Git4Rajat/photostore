@@ -13,7 +13,8 @@ export type PageId =
     | 'explore'
     | 'sharing'
     | 'tools'
-    | 'trash';
+    | 'trash'
+    | 'additional';
 
 export interface Photo {
     id: string; // equals `filename` for real photos — the backend's stable key
@@ -37,6 +38,19 @@ export interface Photo {
     thumbnailRotation?: number;
     likes?: number;
     captureDate?: string | null;
+    /** Per-step server processing status (mirrors the backend's raw status
+     * strings -- 'done'/'pending'/'queued'/'running'/'failed'/'skipped'/
+     * 'no_data'/'timeout'/'unsupported' -- or a {status} object for face).
+     * Absent for legacy seed data. Drives the Workbench tile's step icons. */
+    processing?: {
+        preview?: string | null;
+        thumbnail?: string | null;
+        exif?: string | null;
+        ocr?: string | null;
+        face?: string | { status?: string } | null;
+        aiVision?: string | null;
+        mapDetection?: string | null;
+    };
 }
 
 export interface Album {
