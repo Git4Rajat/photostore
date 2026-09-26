@@ -90,6 +90,7 @@ def _send_message(client, message: dict, *, to_address: str) -> None:
     status = raw_status.lower()
 
     if status in {'succeeded', 'success', 'delivered'}:
+        logger.info('Email accepted for %s (status=%s, messageId=%s)', to_address, raw_status or 'unknown', message_id)
         return
     if status in {'queued', 'outfordelivery', 'scheduled', 'started', 'running', 'inprogress'}:
         logger.warning('Email accepted but not yet terminal for %s (status=%s, messageId=%s)', to_address, raw_status or 'unknown', message_id)
