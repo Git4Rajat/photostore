@@ -143,6 +143,11 @@ export const PhotoViewer: React.FC = () => {
     }, [photo]);
 
     const photoRef = useRef<HTMLDivElement>(null);
+    // Zoom listeners (wheel/gesture/touch) bind here, to the whole media area,
+    // not just the image element -- a real pinch or ctrl+scroll rarely lands
+    // exactly on the photo, and when it lands on the surrounding stage the
+    // browser was zooming the *page* instead (reported "page zooms instead").
+    const stageWrapRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         if (!viewer) return undefined;
@@ -158,7 +163,7 @@ export const PhotoViewer: React.FC = () => {
     }, [viewer, closeViewer, viewerStep, zoomBy]);
 
     useEffect(() => {
-        const el = photoRef.current;
+        const el = stageWrapRef.current;
         if (!el) return undefined;
         const onWheel = (e: WheelEvent) => {
             if (!e.ctrlKey && !e.metaKey) return;
@@ -168,9 +173,9 @@ export const PhotoViewer: React.FC = () => {
         el.addEventListener('wheel', onWheel, { passive: false });
         return () => el.removeEventListener('wheel', onWheel);
         // photo?.id gates re-attachment: the viewer renders null while closed,
-        // so photoRef.current is null on the initial mount and only becomes the
-        // real element once a photo opens -- without re-running here, the
-        // listener would never attach and pinch/scroll-zoom silently no-ops.
+        // so the ref is null on the initial mount and only becomes the real
+        // element once a photo opens -- without re-running here, the listener
+        // would never attach and pinch/scroll-zoom silently no-ops.
     }, [zoomBy, photo?.id]);
 
     // Two-finger trackpad pinch on desktop: Chrome/Firefox report it as a
@@ -178,7 +183,7 @@ export const PhotoViewer: React.FC = () => {
     // non-standard gesture* events, which never carry a ctrlKey wheel at all.
     const gestureStartZoomRef = useRef(1);
     useEffect(() => {
-        const el = photoRef.current;
+        const el = stageWrapRef.current;
         if (!el) return undefined;
         const onGestureStart = (e: Event) => {
             e.preventDefault();
@@ -207,7 +212,7 @@ export const PhotoViewer: React.FC = () => {
     // preventDefault so the pinch scales the photo instead of the page.
     const touchPinchRef = useRef<{ dist: number; zoom: number } | null>(null);
     useEffect(() => {
-        const el = photoRef.current;
+        const el = stageWrapRef.current;
         if (!el) return undefined;
         const touchDist = (t: TouchList) => t.length >= 2 ? Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) : 0;
         const onTouchStart = (e: TouchEvent) => {
@@ -260,7 +265,7 @@ export const PhotoViewer: React.FC = () => {
                 <span className="pt-viewer-pos">{index + 1} / {live.length}</span>
             </div>
 
-            <div className="pt-viewer-stage-wrap">
+            <div className="pt-viewer-stage-wrap" ref={stageWrapRef}>
                 <div
                     className="pt-viewer-stage"
                     onTouchStart={(e) => { if (e.touches.length === 1 && !zoomed) swipeRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY }; }}

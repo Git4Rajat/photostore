@@ -221,6 +221,9 @@ interface Store {
     openViewer: (ids: string[], index: number, opts?: { extendable?: boolean }) => void;
     closeViewer: () => void;
     viewerStep: (delta: number) => void;
+    // Open a single photo in the viewer within the gallery sequence, resolving
+    // it by exact filename lookup when it isn't on a loaded gallery page yet.
+    focusPhoto: (filename: string) => void;
 
     // photo mutations
     ratePhotos: (ids: string[], rating: number) => void;
@@ -495,6 +498,27 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             return { ...prev, index };
         });
     }, []);
+
+    // "Show in Gallery": open one photo in the viewer, reliably, wherever it
+    // lives in the library. If it's already on a loaded gallery page, open it
+    // in that (swipeable, extendable) sequence; otherwise resolve it by exact
+    // filename via /photos/lookup -- an exact point lookup that always finds
+    // the photo, unlike scrolling/paging forward until it happens to load
+    // (which never terminates for a photo thousands of items deep). The looked
+    // -up photo is registered so the viewer can render it as a standalone item.
+    const focusPhoto = useCallback((filename: string) => {
+        const loadedIndex = photos.findIndex((p) => p.id === filename);
+        if (loadedIndex >= 0) {
+            openViewer(photos.map((p) => p.id), loadedIndex, { extendable: true });
+            return;
+        }
+        openViewer([filename], 0);
+        void get<{ photo?: BackendPhoto }>(`/photos/lookup/${encodeURIComponent(filename)}`)
+            .then((res) => {
+                if (res?.photo) registerPhotos([mapPhoto(res.photo)]);
+            })
+            .catch(() => { /* viewer will show its own empty/loading state */ });
+    }, [photos, openViewer, registerPhotos]);
 
     const ratePhotos = useCallback(
         (ids: string[], rating: number) => {
@@ -1103,6 +1127,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             openViewer,
             closeViewer,
             viewerStep,
+            focusPhoto,
             ratePhotos,
             toggleLike,
             applyPhotoRotation,
@@ -1153,7 +1178,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
-            clearSelection, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
+            clearSelection, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,

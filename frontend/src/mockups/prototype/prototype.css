@@ -407,7 +407,11 @@
 .pt-viewer-back svg { width: 18px; height: 18px; }
 .pt-viewer-title { font-size: 0.9rem; color: #cfc8ba; }
 .pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: #9c9486; font-family: var(--font-label); }
-.pt-viewer-stage-wrap { flex: 1; position: relative; display: flex; min-height: 0; }
+/* touch-action: none stops the browser from turning a two-finger pinch here
+   into a whole-page zoom; the pinch is handled in JS to zoom the photo instead.
+   The info panel re-enables panning so it can still scroll (see below). */
+.pt-viewer-stage-wrap { flex: 1; position: relative; display: flex; min-height: 0; touch-action: none; }
+.pt-viewer-info { touch-action: pan-y; }
 .pt-viewer-stage { flex: 1; display: flex; align-items: center; gap: 12px; padding: 0 18px; min-height: 0; }
 .pt-viewer-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #9c9486; font-size: 0.9rem; }
 /* Floating image controls (zoom / rotate / full-res) over the stage. */
