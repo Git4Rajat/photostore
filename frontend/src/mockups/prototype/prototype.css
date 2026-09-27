@@ -20,12 +20,13 @@
    chrome while keeping the underline-on-active treatment. */
 .ios-tabs .ios-tab { appearance: none; -webkit-appearance: none; background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
 .ios-tabs .ios-tab.active { border-bottom-color: var(--accent); }
-.mock-tabbar button { appearance: none; -webkit-appearance: none; background: none; border: 0; color: inherit; font: inherit; font-size: 0.66rem; cursor: pointer; padding: 4px 6px; }
+.mock-tabbar button { appearance: none; -webkit-appearance: none; background: none; border: 0; color: inherit; font: inherit; font-size: 0.66rem; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; flex: 1; min-width: 44px; min-height: 44px; padding: 4px 6px; }
 .mock-tabbar button.on { color: var(--accent); font-weight: 700; }
+.mock-tabbar-icon { width: 22px; height: 22px; flex: 0 0 auto; }
 
-.pt-wordmark-btn { background: none; border: 0; padding: 0; cursor: pointer; }
+.pt-wordmark-btn { background: none; border: 0; padding: 0; cursor: pointer; display: inline-flex; align-items: center; min-height: 44px; }
 .pt-upload-btn { white-space: nowrap; }
-.pt-avatar-btn { border: 0; cursor: pointer; }
+.pt-avatar-btn { border: 0; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: 0; }
 
 /* ---- popover menus ---- */
 .pt-menu-anchor { position: relative; display: inline-flex; }
@@ -103,7 +104,7 @@
 .pt-page-sub { margin: 2px 0 0; color: var(--muted); font-size: 0.85rem; }
 .pt-toolbar-actions { display: flex; gap: 8px; align-items: center; }
 .pt-zoom { display: inline-flex; gap: 4px; }
-.pt-zoom .btn { padding: 6px 8px; }
+.pt-zoom .btn { padding: 6px 8px; min-width: 44px; min-height: 44px; }
 .pt-media-filter { flex: 0 0 auto; }
 
 /* ---- gallery timeline scrubber (year -> month -> day) ---- */
@@ -130,7 +131,10 @@
 .pt-tile { position: relative; aspect-ratio: 1; border-radius: var(--r-sm); cursor: pointer; overflow: hidden; -webkit-touch-callout: none; -webkit-user-select: none; }
 .pt-tile.selected { outline: 3px solid var(--accent); outline-offset: -3px; }
 .pt-tile-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; -webkit-user-drag: none; user-select: none; }
-.pt-tile-check { position: absolute; top: 6px; left: 6px; width: 22px; height: 22px; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; padding: 0; opacity: 0; transition: opacity 0.12s ease; touch-action: none; }
+/* 44x44 tap target flush with the tile's corner (the tile clips overflow, so
+   the hit area can't extend past it) with the 22px glyph inset via padding
+   to sit where it visually sat before. */
+.pt-tile-check { position: absolute; top: 0; left: 0; width: 44px; height: 44px; box-sizing: border-box; display: flex; align-items: flex-start; justify-content: flex-start; padding: 6px; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; opacity: 0; transition: opacity 0.12s ease; touch-action: none; }
 .pt-tile:hover .pt-tile-check, .pt-tile-check.on { opacity: 1; }
 /* Touch devices have no hover, so surface the selection affordance directly. */
 @media (hover: none) and (pointer: coarse) {
@@ -496,7 +500,7 @@
 @container (max-width: 620px) {
     .pt-albums { grid-template-columns: 1fr; }
     .pt-upload-label { display: none; }
-    .pt-upload-btn { padding: 9px 11px; }
+    .pt-upload-btn { padding: 9px 11px; min-width: 44px; }
     .pt-viewer-title { display: none; }
     .pt-toolbar { align-items: flex-start; }
 }

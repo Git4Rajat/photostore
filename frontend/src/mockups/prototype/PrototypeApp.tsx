@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
-import { PlusIcon } from '@heroicons/react/24/outline';
+import { PlusIcon, MagnifyingGlassIcon, PhotoIcon, RectangleStackIcon, UserGroupIcon, SparklesIcon } from '@heroicons/react/24/outline';
+import { MagnifyingGlassIcon as MagnifyingGlassIconSolid, PhotoIcon as PhotoIconSolid, RectangleStackIcon as RectangleStackIconSolid, UserGroupIcon as UserGroupIconSolid, SparklesIcon as SparklesIconSolid } from '@heroicons/react/24/solid';
 import { LogoLockup } from '../../components/shared/Logo';
 import Loading from '../../components/shared/Loading';
 import { AppServicesProvider, useAppServices } from '../../components/AppServicesProvider';
@@ -77,6 +78,14 @@ const NAV: { id: PageId; label: string }[] = [
     { id: 'sharing', label: 'Sharing' },
 ];
 const MOBILE_NAV = NAV.slice(0, 5);
+
+const MOBILE_NAV_ICONS: Record<string, [React.ElementType, React.ElementType]> = {
+    ask: [MagnifyingGlassIcon, MagnifyingGlassIconSolid],
+    gallery: [PhotoIcon, PhotoIconSolid],
+    albums: [RectangleStackIcon, RectangleStackIconSolid],
+    people: [UserGroupIcon, UserGroupIconSolid],
+    explore: [SparklesIcon, SparklesIconSolid],
+};
 
 const applyTheme = (theme: Theme) => {
     const root = document.documentElement;
@@ -174,11 +183,17 @@ const MobileTabbar: React.FC = () => {
     const active = activeNavFor(route.page);
     return (
         <nav className="mock-tabbar" aria-label="Primary navigation (mobile)">
-            {MOBILE_NAV.map((item) => (
-                <button key={item.id} type="button" className={item.id === active ? 'on' : undefined} onClick={() => navigate(item.id)}>
-                    {item.label}
-                </button>
-            ))}
+            {MOBILE_NAV.map((item) => {
+                const isActive = item.id === active;
+                const [Outline, Solid] = MOBILE_NAV_ICONS[item.id];
+                const Icon = isActive ? Solid : Outline;
+                return (
+                    <button key={item.id} type="button" className={isActive ? 'on' : undefined} onClick={() => navigate(item.id)}>
+                        <Icon className="mock-tabbar-icon" aria-hidden="true" />
+                        <span>{item.label}</span>
+                    </button>
+                );
+            })}
         </nav>
     );
 };
