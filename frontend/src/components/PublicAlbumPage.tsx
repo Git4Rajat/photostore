@@ -81,6 +81,27 @@ const parsePublicAlbumError = (err: unknown): Record<string, unknown> => {
     return {};
 };
 
+// Writes a plain status message into a popup window opened for the bulk
+// download (see handleDownload below). It has no app bundle/styles of its
+// own -- it's either about:blank or, once form.submit() navigates it, the
+// download response -- so this is deliberately a tiny self-contained document.
+const writeToPopup = (popup: Window | null, heading: string, detail: string): void => {
+    if (!popup) {
+        return;
+    }
+    popup.document.open();
+    popup.document.write(
+        '<!doctype html><html><head><title>Keepsake download</title>'
+        + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        + '<style>body{display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;'
+        + 'font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#333;background:#fafafa;'
+        + 'text-align:center;padding:24px;box-sizing:border-box}'
+        + 'p{margin:4px 0}p:first-child{font-weight:600}</style></head>'
+        + `<body><div><p>${heading}</p><p>${detail}</p></div></body></html>`,
+    );
+    popup.document.close();
+};
+
 const PublicAlbumPage: React.FC = () => {
     const { token } = useParams();
     const [loading, setLoading] = useState<boolean>(true);
@@ -362,6 +383,14 @@ const PublicAlbumPage: React.FC = () => {
         // spawn a new one.
         const popupName = `public-album-download-${Date.now()}`;
         const popup = window.open('', popupName);
+        // The tab is otherwise blank white until download-check resolves and the
+        // form navigates it -- on a cold-started backend that can take several
+        // seconds, and a blank tab with no indication anything is happening
+        // reads as broken (and, on failure, silently closing a tab the user
+        // just watched open is its own confusing signal). Write a holding
+        // message immediately, and an explicit one on failure instead of
+        // closing it -- a real download success simply navigates over this.
+        writeToPopup(popup, 'Preparing your download…', 'This tab will update automatically.');
 
         setDownloading(true);
         try {
@@ -371,7 +400,7 @@ const PublicAlbumPage: React.FC = () => {
             // backend is already known offline, skip straight to feedback instead of
             // waiting out another full cold-start retry cycle just to rediscover it.
             if (getBackendStatusSnapshot().status === 'offline') {
-                popup?.close();
+                writeToPopup(popup, "Can't reach the server right now.", 'Close this tab and try again once the album has reloaded.');
                 showToast("Can't reach the server right now — try again once it's back.", {
                     variant: 'error',
                     action: { label: 'Retry', onClick: () => { void handleDownload(); } },
@@ -391,7 +420,7 @@ const PublicAlbumPage: React.FC = () => {
             form.target = popupName;
             form.submit();
         } catch (err) {
-            popup?.close();
+            writeToPopup(popup, "Couldn't start the download.", 'Close this tab and try again from the album.');
             notifyApiError(err, { context: "Couldn't start the download", retry: () => { void handleDownload(); } });
         } finally {
             setDownloading(false);
