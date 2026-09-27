@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowDownTrayIcon, CheckIcon, LockOpenIcon, PhotoIcon } from '@heroicons/react/24/outline';
+import { ArrowDownTrayIcon, CheckIcon, LockClosedIcon, PhotoIcon } from '@heroicons/react/24/outline';
 import { useParams } from 'react-router-dom';
 // public_bp moved to the dedicated `extras` container app (2026-09-17, see
 // app.py's APP_ROLE=extras split) -- aliased so every call site below stays
@@ -164,9 +164,16 @@ const PublicAlbumPage: React.FC = () => {
             setLoadError(null);
             setRetryAfterSeconds(null);
             try {
+                // withCredentials: this endpoint Set-Cookies a signed "grant" for
+                // code-protected albums so the (cookie-only, cross-origin) preview/
+                // image/thumbnail proxy routes can verify the code was already
+                // cleared -- <img src> can't carry the code itself. Without
+                // credentials on this call the browser never stores that cookie
+                // cross-origin, so every media request 404s and the lightbox
+                // silently falls back to the thumbnail for every photo.
                 const response = code.trim()
-                    ? await post(`/public/albums/${encodeURIComponent(token)}`, { accessCode: code.trim() })
-                    : await get(`/public/albums/${encodeURIComponent(token)}`);
+                    ? await post(`/public/albums/${encodeURIComponent(token)}`, { accessCode: code.trim() }, { withCredentials: true })
+                    : await get(`/public/albums/${encodeURIComponent(token)}`, { withCredentials: true });
 
                 if (!response || !response.album) {
                     setError('This public album link is invalid or no longer available.');
@@ -345,6 +352,17 @@ const PublicAlbumPage: React.FC = () => {
             return;
         }
 
+        // Open the destination tab synchronously, before any await below --
+        // once an `await` breaks the call stack, Chrome/Safari no longer treat
+        // a subsequent form.submit(target=_blank) as a direct result of this
+        // click, and silently block the new tab as an unrequested popup (no
+        // error, no toast: to the user the button just "does nothing").
+        // Submitting the form at target=popupName later reuses this
+        // already-open, already-user-activated window instead of trying to
+        // spawn a new one.
+        const popupName = `public-album-download-${Date.now()}`;
+        const popup = window.open('', popupName);
+
         setDownloading(true);
         try {
             // form.submit() below gives no programmatic success/failure signal (it
@@ -353,6 +371,7 @@ const PublicAlbumPage: React.FC = () => {
             // backend is already known offline, skip straight to feedback instead of
             // waiting out another full cold-start retry cycle just to rediscover it.
             if (getBackendStatusSnapshot().status === 'offline') {
+                popup?.close();
                 showToast("Can't reach the server right now — try again once it's back.", {
                     variant: 'error',
                     action: { label: 'Retry', onClick: () => { void handleDownload(); } },
@@ -362,14 +381,17 @@ const PublicAlbumPage: React.FC = () => {
             await get(`/public/albums/${encodeURIComponent(token)}/download-check`);
             const form = downloadFormRef.current;
             if (!form) {
+                popup?.close();
                 return;
             }
             const filenamesInput = form.querySelector<HTMLInputElement>('input[name="filenames"]');
             if (filenamesInput) {
                 filenamesInput.value = selectedCount > 0 ? JSON.stringify(files.map((photo) => photo.filename)) : '';
             }
+            form.target = popupName;
             form.submit();
         } catch (err) {
+            popup?.close();
             notifyApiError(err, { context: "Couldn't start the download", retry: () => { void handleDownload(); } });
         } finally {
             setDownloading(false);
@@ -442,7 +464,6 @@ const PublicAlbumPage: React.FC = () => {
                 ref={downloadFormRef}
                 action={downloadActionUrl}
                 method="post"
-                target="_blank"
                 style={{ display: 'none' }}
             >
                 <input type="hidden" name="filenames" defaultValue="" />
@@ -485,7 +506,7 @@ const PublicAlbumPage: React.FC = () => {
                         }}
                         aria-label="Unlock"
                     >
-                        <LockOpenIcon className="toolbar-icon" />
+                        <LockClosedIcon className="toolbar-icon" />
                         <span className="sr-only">Unlock</span>
                     </button>
                 </div>

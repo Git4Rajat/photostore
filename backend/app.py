@@ -7459,6 +7459,13 @@ def add_cors_headers(response):
         if _origin_is_allowed(origin):
             response.headers['Access-Control-Allow-Origin'] = origin
             response.headers['Vary'] = 'Origin'
+            # Required for the browser to honor a credentialed (withCredentials)
+            # cross-origin request -- e.g. the public-album access-code POST,
+            # which needs its Set-Cookie grant actually stored so the (also
+            # cross-origin) <img src> preview/image/thumbnail routes can read
+            # it back. Safe to pair with credentials here specifically because
+            # the origin is echoed only after _origin_is_allowed, never '*'.
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Upload-Id, X-Filename, Content-Range'
     _apply_security_headers(response)
@@ -7491,6 +7498,7 @@ def handle_preflight():
             if _origin_is_allowed(origin):
                 resp.headers['Access-Control-Allow-Origin'] = origin
                 resp.headers['Vary'] = 'Origin'
+                resp.headers['Access-Control-Allow-Credentials'] = 'true'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
         resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Upload-Id, X-Filename, Content-Range'
         # Without this, the browser re-preflights every method+headers

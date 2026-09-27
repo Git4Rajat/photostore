@@ -5,6 +5,7 @@ import {
     StarIcon,
     TrashIcon,
     WrenchScrewdriverIcon,
+    XMarkIcon,
 } from '@heroicons/react/24/outline';
 import { Menu, Stars } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
@@ -14,13 +15,25 @@ import { useStore } from '../store';
  * Compact floating menu for multi-selection. Delete button always visible,
  * other actions (rate/album/workbench) in the options menu. Sharing is
  * intentionally album-only, so there's no per-photo/selection share here.
+ * Also carries its own "clear selection" close button -- the toolbar's Clear
+ * button scrolls out of view with the page, so this is the only always-reachable
+ * way to cancel a selection once the user has scrolled away from the top.
  */
 export const CommandBar: React.FC = () => {
-    const { selection, ratePhotos, deletePhotos, navigate, toast } = useStore();
+    const { selection, ratePhotos, deletePhotos, navigate, toast, clearSelection } = useStore();
     if (!selection.length) return null;
 
     return (
         <div className="pt-floating-menu" role="toolbar" aria-label="Selection actions">
+            <button
+                type="button"
+                className="pt-fm-close"
+                onClick={clearSelection}
+                aria-label="Clear selection"
+            >
+                <XMarkIcon />
+            </button>
+
             <div className="pt-fm-badge">{selection.length}</div>
 
             <button

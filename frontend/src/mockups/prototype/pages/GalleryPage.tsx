@@ -11,6 +11,20 @@ const TILE_STEP = 30;
 const TILE_RANGE = { min: 72, max: 260 };
 const clampTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(TILE_RANGE.min, n));
 
+// Persisted across sessions so returning to the Gallery doesn't reset the
+// thumbnail size the user picked (pinch or the +/- toolbar buttons) back to
+// the default every time.
+const TILE_SIZE_KEY = 'photostore.galleryTileSize';
+const loadStoredTileSize = (): number => {
+    try {
+        const raw = window.localStorage.getItem(TILE_SIZE_KEY);
+        const parsed = raw ? Number(raw) : NaN;
+        return Number.isFinite(parsed) ? clampTile(parsed) : TILE_MIN;
+    } catch {
+        return TILE_MIN;
+    }
+};
+
 const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
     { value: 'photo', label: 'Photos' },
@@ -26,7 +40,15 @@ export const GalleryPage: React.FC = () => {
     } = useStore();
     const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
     const [dragging, setDragging] = useState(false);
-    const [tileMin, setTileMin] = useState(TILE_MIN);
+    const [tileMin, setTileMin] = useState(loadStoredTileSize);
+
+    useEffect(() => {
+        try {
+            window.localStorage.setItem(TILE_SIZE_KEY, String(tileMin));
+        } catch {
+            // ignore storage failures (private browsing, quota, ...)
+        }
+    }, [tileMin]);
     const depth = useRef(0);
     const gridRef = useRef<HTMLDivElement>(null);
     const sentinelRef = useRef<HTMLDivElement>(null);

@@ -945,6 +945,33 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         return () => window.removeEventListener('resize', updateStageSize);
     }, [activePhoto]);
 
+    // Zooms toward a screen point (cursor position, or pinch center) instead
+    // of always scaling around the stage's own center. Keeps whatever content
+    // point was under (clientX, clientY) under it after the zoom change: with
+    // the transform as `translate(pan) scale(zoom)` around the stage's
+    // center, that holds when `pan' = pan*ratio + offsetFromCenter*(1-ratio)`,
+    // ratio = newZoom/oldZoom.
+    const zoomAtPoint = useCallback((targetZoom: number, clientX: number, clientY: number) => {
+        const oldZoom = zoomRef.current;
+        const next = clamp(Number(targetZoom.toFixed(2)), 1, 4);
+        if (next === 1) {
+            setZoom(1);
+            setPan({ x: 0, y: 0 });
+            return;
+        }
+        const rect = stageRef.current?.getBoundingClientRect();
+        if (rect && next !== oldZoom) {
+            const ratio = next / oldZoom;
+            const offsetX = clientX - (rect.left + rect.width / 2);
+            const offsetY = clientY - (rect.top + rect.height / 2);
+            setPan((p) => ({
+                x: p.x * ratio + offsetX * (1 - ratio),
+                y: p.y * ratio + offsetY * (1 - ratio),
+            }));
+        }
+        setZoom(next);
+    }, []);
+
     useEffect(() => {
         if (!stageRef.current) {
             return undefined;
@@ -955,7 +982,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
                 return;
             }
             event.preventDefault();
-            setZoom((current) => clamp(Number((current + (event.deltaY < 0 ? 0.18 : -0.18)).toFixed(2)), 1, 4));
+            zoomAtPoint(zoomRef.current + (event.deltaY < 0 ? 0.18 : -0.18), event.clientX, event.clientY);
         };
         const onTouchMove = (event: TouchEvent) => {
             if (event.touches.length !== 2) {
@@ -969,7 +996,9 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
             if (!previousDistance) {
                 return;
             }
-            setZoom((current) => clamp(Number((current * (nextDistance / previousDistance)).toFixed(2)), 1, 4));
+            const midX = (first.clientX + second.clientX) / 2;
+            const midY = (first.clientY + second.clientY) / 2;
+            zoomAtPoint(zoomRef.current * (nextDistance / previousDistance), midX, midY);
         };
         const onPointerDown = (event: PointerEvent) => {
             const currentZoom = zoomRef.current;
@@ -1054,7 +1083,7 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
             stage.removeEventListener('pointerup', onPointerUp);
             stage.removeEventListener('pointercancel', onPointerUp);
         };
-    }, [activePhoto]);
+    }, [activePhoto, zoomAtPoint]);
 
     if (!activePhoto) {
         return null;

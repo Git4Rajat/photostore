@@ -66,6 +66,11 @@ export const PhotoViewer: React.FC = () => {
     const zoomRef = useRef(1);
     useEffect(() => { zoomRef.current = zoom; }, [zoom]);
     const [pan, setPan] = useState({ x: 0, y: 0 });
+    // Mirrors `pan` for the same reason zoomRef mirrors `zoom` -- the pinch/
+    // gesture listeners below read it as a baseline without depending on it,
+    // since depending on it would re-attach the listeners mid-gesture.
+    const panStateRef = useRef(pan);
+    useEffect(() => { panStateRef.current = pan; }, [pan]);
     const [fullRes, setFullRes] = useState(false);
     const [showInfo, setShowInfo] = useState(false);
     const [meta, setMeta] = useState<PhotoMetadata | null>(null);
@@ -123,6 +128,8 @@ export const PhotoViewer: React.FC = () => {
     const { url: mainSrc, loading: fullResLoading, progress: fullResProgress } = useMainMedia(photo, fullRes);
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
+    const photoRef = useRef<HTMLDivElement>(null);
+
     const resetZoom = useCallback(() => { setZoom(1); setPan({ x: 0, y: 0 }); }, []);
     const zoomBy = useCallback((delta: number) => {
         setZoom((z) => {
@@ -130,6 +137,33 @@ export const PhotoViewer: React.FC = () => {
             if (next === 1) setPan({ x: 0, y: 0 });
             return next;
         });
+    }, []);
+    // Zooms toward a screen point (a click, cursor position, or pinch/gesture
+    // center) instead of always scaling around the image's own center -- the
+    // standard "zoom toward where you clicked/pinched" lightbox behavior.
+    // Keeps whatever content point was under (clientX, clientY) under it after
+    // the zoom change: with the transform as `translate(pan) scale(zoom)`
+    // around the container's center, that point stays fixed when
+    // `pan' = pan*ratio + offsetFromCenter*(1-ratio)`, ratio = newZoom/oldZoom.
+    const zoomAtPoint = useCallback((targetZoom: number, clientX: number, clientY: number) => {
+        const oldZoom = zoomRef.current;
+        const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +targetZoom.toFixed(2)));
+        if (next === 1) {
+            setZoom(1);
+            setPan({ x: 0, y: 0 });
+            return;
+        }
+        const rect = photoRef.current?.getBoundingClientRect();
+        if (rect && next !== oldZoom) {
+            const ratio = next / oldZoom;
+            const offsetX = clientX - (rect.left + rect.width / 2);
+            const offsetY = clientY - (rect.top + rect.height / 2);
+            setPan((p) => ({
+                x: p.x * ratio + offsetX * (1 - ratio),
+                y: p.y * ratio + offsetY * (1 - ratio),
+            }));
+        }
+        setZoom(next);
     }, []);
 
     const rotate = useCallback((delta: number) => {
@@ -142,7 +176,6 @@ export const PhotoViewer: React.FC = () => {
         });
     }, [photo]);
 
-    const photoRef = useRef<HTMLDivElement>(null);
     // Zoom listeners (wheel/gesture/touch) bind here, to the whole media area,
     // not just the image element -- a real pinch or ctrl+scroll rarely lands
     // exactly on the photo, and when it lands on the surrounding stage the
@@ -168,7 +201,7 @@ export const PhotoViewer: React.FC = () => {
         const onWheel = (e: WheelEvent) => {
             if (!e.ctrlKey && !e.metaKey) return;
             e.preventDefault();
-            zoomBy(e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP);
+            zoomAtPoint(zoomRef.current + (e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP), e.clientX, e.clientY);
         };
         el.addEventListener('wheel', onWheel, { passive: false });
         return () => el.removeEventListener('wheel', onWheel);
@@ -176,23 +209,44 @@ export const PhotoViewer: React.FC = () => {
         // so the ref is null on the initial mount and only becomes the real
         // element once a photo opens -- without re-running here, the listener
         // would never attach and pinch/scroll-zoom silently no-ops.
-    }, [zoomBy, photo?.id]);
+    }, [zoomAtPoint, photo?.id]);
 
     // Two-finger trackpad pinch on desktop: Chrome/Firefox report it as a
     // ctrl/cmd+wheel event (handled above); Safari instead fires its
     // non-standard gesture* events, which never carry a ctrlKey wheel at all.
-    const gestureStartZoomRef = useRef(1);
+    const gestureStartRef = useRef<{ zoom: number; pan: { x: number; y: number }; offsetX: number; offsetY: number }>({
+        zoom: 1, pan: { x: 0, y: 0 }, offsetX: 0, offsetY: 0,
+    });
     useEffect(() => {
         const el = stageWrapRef.current;
         if (!el) return undefined;
         const onGestureStart = (e: Event) => {
             e.preventDefault();
-            gestureStartZoomRef.current = zoomRef.current;
+            const { clientX, clientY } = e as unknown as { clientX?: number; clientY?: number };
+            const rect = photoRef.current?.getBoundingClientRect();
+            const hasPoint = rect && typeof clientX === 'number' && typeof clientY === 'number';
+            gestureStartRef.current = {
+                zoom: zoomRef.current,
+                pan: panStateRef.current,
+                offsetX: hasPoint ? clientX - (rect.left + rect.width / 2) : 0,
+                offsetY: hasPoint ? clientY - (rect.top + rect.height / 2) : 0,
+            };
         };
         const onGestureChange = (e: Event) => {
             e.preventDefault();
             const scale = (e as unknown as { scale: number }).scale;
-            setZoom(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +(gestureStartZoomRef.current * scale).toFixed(2))));
+            const start = gestureStartRef.current;
+            const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +(start.zoom * scale).toFixed(2)));
+            if (next === 1) {
+                setPan({ x: 0, y: 0 });
+            } else {
+                const ratio = next / start.zoom;
+                setPan({
+                    x: start.pan.x * ratio + start.offsetX * (1 - ratio),
+                    y: start.pan.y * ratio + start.offsetY * (1 - ratio),
+                });
+            }
+            setZoom(next);
         };
         const onGestureEnd = (e: Event) => e.preventDefault();
         el.addEventListener('gesturestart', onGestureStart);
@@ -210,22 +264,42 @@ export const PhotoViewer: React.FC = () => {
     // points. touch-action:none on .pt-viewer-photo (see CSS) stops the browser
     // from claiming the gesture for its own page-zoom; passive:false lets us
     // preventDefault so the pinch scales the photo instead of the page.
-    const touchPinchRef = useRef<{ dist: number; zoom: number } | null>(null);
+    const touchPinchRef = useRef<{ dist: number; zoom: number; pan: { x: number; y: number }; offsetX: number; offsetY: number } | null>(null);
     useEffect(() => {
         const el = stageWrapRef.current;
         if (!el) return undefined;
         const touchDist = (t: TouchList) => t.length >= 2 ? Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) : 0;
+        const touchMid = (t: TouchList) => ({ x: (t[0].clientX + t[1].clientX) / 2, y: (t[0].clientY + t[1].clientY) / 2 });
         const onTouchStart = (e: TouchEvent) => {
             if (e.touches.length === 2) {
                 e.preventDefault();
-                touchPinchRef.current = { dist: touchDist(e.touches) || 1, zoom: zoomRef.current };
+                const mid = touchMid(e.touches);
+                const rect = photoRef.current?.getBoundingClientRect();
+                touchPinchRef.current = {
+                    dist: touchDist(e.touches) || 1,
+                    zoom: zoomRef.current,
+                    pan: panStateRef.current,
+                    offsetX: rect ? mid.x - (rect.left + rect.width / 2) : 0,
+                    offsetY: rect ? mid.y - (rect.top + rect.height / 2) : 0,
+                };
             }
         };
         const onTouchMove = (e: TouchEvent) => {
             if (e.touches.length >= 2 && touchPinchRef.current) {
                 e.preventDefault();
-                const ratio = touchDist(e.touches) / touchPinchRef.current.dist;
-                setZoom(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +(touchPinchRef.current.zoom * ratio).toFixed(2))));
+                const start = touchPinchRef.current;
+                const ratio = touchDist(e.touches) / start.dist;
+                const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +(start.zoom * ratio).toFixed(2)));
+                if (next === 1) {
+                    setPan({ x: 0, y: 0 });
+                } else {
+                    const zoomRatio = next / start.zoom;
+                    setPan({
+                        x: start.pan.x * zoomRatio + start.offsetX * (1 - zoomRatio),
+                        y: start.pan.y * zoomRatio + start.offsetY * (1 - zoomRatio),
+                    });
+                }
+                setZoom(next);
             }
         };
         const onTouchEnd = (e: TouchEvent) => {
@@ -290,7 +364,7 @@ export const PhotoViewer: React.FC = () => {
                     <div
                         ref={photoRef}
                         className="pt-viewer-photo"
-                        onDoubleClick={() => (zoomed ? resetZoom() : zoomBy(ZOOM_STEP * 2))}
+                        onDoubleClick={(e) => (zoomed ? resetZoom() : zoomAtPoint(zoom + ZOOM_STEP * 2, e.clientX, e.clientY))}
                         onMouseDown={(e) => { if (zoomed) panRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y }; }}
                         onMouseMove={(e) => {
                             const p = panRef.current;

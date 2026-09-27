@@ -83,12 +83,24 @@ def public_album(token: str):
     # Issue a signed grant so the browser can subsequently load the (code-protected)
     # media, which are fetched as <img src> and cannot carry the access code themselves.
     if access_code:
+        is_secure = app.request.is_secure
         resp.set_cookie(
             app._album_grant_cookie_name(token),
             app._sign_album_grant(token, access_code),
             httponly=True,
-            secure=app.request.is_secure,
-            samesite='Lax',
+            secure=is_secure,
+            # The SPA and this API live on different origins in every real
+            # deployment, and the media routes below are loaded as <img src>
+            # -- a cross-site subresource request. SameSite=Lax withholds the
+            # cookie on those (browsers only send Lax cookies for same-site or
+            # top-level navigations), so every preview/image/thumbnail proxy
+            # request 404'd on _album_grant_valid and the lightbox silently
+            # fell back to the thumbnail for every photo. SameSite=None (only
+            # honored by browsers when Secure) restores cross-site delivery;
+            # local plain-HTTP dev (frontend+backend both on localhost, so
+            # same-site anyway) falls back to Lax since None without Secure is
+            # rejected outright rather than silently downgraded.
+            samesite='None' if is_secure else 'Lax',
             max_age=60 * 60 * 6,
             path='/',
         )

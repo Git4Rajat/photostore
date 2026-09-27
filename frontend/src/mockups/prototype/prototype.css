@@ -373,6 +373,9 @@
 @media (max-width: 620px) {
   .pt-floating-menu { bottom: 75px; z-index: 50; gap: 10px; padding: 10px; }
 }
+.pt-fm-close { background: none; border: 0; color: inherit; cursor: pointer; width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; transition: background 0.2s ease; flex: 0 0 auto; opacity: 0.75; }
+.pt-fm-close:hover { background: rgba(127,127,127,0.25); opacity: 1; }
+.pt-fm-close svg { width: 18px; height: 18px; }
 .pt-fm-badge { position: relative; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; border-radius: 50%; background: rgba(127,127,127,0.15); font-weight: 700; font-size: 0.9rem; flex: 0 0 auto; }
 .pt-fm-delete { background: none; border: 0; color: inherit; cursor: pointer; width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; transition: background 0.2s ease; flex: 0 0 auto; }
 .pt-fm-delete:hover { background: rgba(127,127,127,0.25); }

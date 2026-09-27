@@ -4319,6 +4319,15 @@ html[data-theme='light'] .notification-item.unread {
 .public-album-studio {
   display: grid;
   gap: 12px;
+  /* This page renders standalone, directly under #root, with no .pt-shell
+     wrapper -- unlike the authenticated app it has no internal fixed-height
+     scroll container of its own to rely on. The global `html, body, #root
+     { overflow: hidden }` rule (the authenticated app's outer scroll is
+     always internal, never the document) otherwise clips this page's
+     content with no way to reach it: it needs to be its own scroll box. */
+  height: 100vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .public-banner {

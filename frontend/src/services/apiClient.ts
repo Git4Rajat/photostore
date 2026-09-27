@@ -135,7 +135,7 @@ try {
 
 export const get = async <T = any>(url: string, config?: Parameters<typeof apiClient.get>[1]) => requestJson<T>(apiClient, 'get', url, undefined, config);
 export const getUpload = async <T = any>(url: string, config?: Parameters<typeof uploadClient.get>[1]) => requestJson<T>(uploadClient, 'get', url, undefined, config);
-export const post = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(apiClient, 'post', url, data);
+export const post = async <T = any, D = unknown>(url: string, data: D, config?: Parameters<typeof apiClient.post>[2]) => requestJson<T>(apiClient, 'post', url, data, config);
 export const postUpload = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
 export const getUploadJson = async <T = any>(url: string) => requestJson<T>(uploadClient, 'get', url);
 export const postUploadJson = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
@@ -144,4 +144,4 @@ export const postTools = async <T = any, D = unknown>(url: string, data: D) => r
 export const getAdmin = async <T = any>(url: string, config?: Parameters<typeof adminClient.get>[1]) => requestJson<T>(adminClient, 'get', url, undefined, config);
 export const postAdmin = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(adminClient, 'post', url, data);
 export const getExtras = async <T = any>(url: string, config?: Parameters<typeof extrasClient.get>[1]) => requestJson<T>(extrasClient, 'get', url, undefined, config);
-export const postExtras = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(extrasClient, 'post', url, data);
+export const postExtras = async <T = any, D = unknown>(url: string, data: D, config?: Parameters<typeof extrasClient.post>[2]) => requestJson<T>(extrasClient, 'post', url, data, config);
