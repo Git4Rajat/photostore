@@ -1,12 +1,23 @@
 import React, { useEffect, useState } from 'react';
 import {
-    ArrowLeftIcon, ArrowPathIcon, CalendarDaysIcon, CheckIcon, ClipboardDocumentIcon, ClockIcon,
-    MapPinIcon, PlusIcon, ShareIcon, SparklesIcon, TagIcon, TrashIcon, UserGroupIcon,
-} from '@heroicons/react/24/outline';
+    ArrowLeft as ArrowLeftIcon,
+    RefreshCw as ArrowPathIcon,
+    CalendarDays as CalendarDaysIcon,
+    Check as CheckIcon,
+    Copy as ClipboardDocumentIcon,
+    Clock as ClockIcon,
+    MapPin as MapPinIcon,
+    Plus as PlusIcon,
+    Share2 as ShareIcon,
+    Sparkles as SparklesIcon,
+    Tag as TagIcon,
+    Trash2 as TrashIcon,
+    Users as UserGroupIcon,
+} from 'lucide-react';
 import { useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
-import { Menu } from '../components/bits';
-import { confirmDialog } from '../../../components/shared/dialogs';
+import { Menu, Spinner, SelectionBar } from '../components/bits';
+import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 
 const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
@@ -38,8 +49,6 @@ export const AlbumsPage: React.FC = () => {
     const [smartCreatingRule, setSmartCreatingRule] = useState<string | null>(null);
     const selectedId = route.params.albumId ?? albums[0]?.id;
     const album = albums.find((a) => a.id === selectedId) ?? albums[0];
-    const [renaming, setRenaming] = useState(false);
-    const [draft, setDraft] = useState('');
     const [copied, setCopied] = useState(false);
     const [expiry, setExpiry] = useState('7');
     const covers = useProtectedBlobUrls(albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
@@ -62,6 +71,18 @@ export const AlbumsPage: React.FC = () => {
         setSelectedAlbumIds([]);
     };
 
+    const confirmDeleteAlbum = async () => {
+        const confirmed = await confirmDialog({
+            title: `Delete “${album.name}”?`,
+            message: 'The photos inside stay in your library — only the album is removed.',
+            confirmLabel: 'Delete',
+            danger: true,
+        });
+        if (!confirmed) return;
+        deleteAlbum(album.id);
+        navigate('albums', {});
+    };
+
     const bulkDelete = async () => {
         const count = selectedAlbumIds.length;
         if (!count) return;
@@ -77,15 +98,26 @@ export const AlbumsPage: React.FC = () => {
         exitSelectMode();
     };
 
+    // One rename pattern app-wide: a prompt dialog (matches the library rename on
+    // the Sharing page), instead of the old double-click-title / inline-input.
+    const renameAlbumPrompt = async (targetId: string = album?.id ?? '', currentName: string = album?.name ?? '') => {
+        if (!targetId) return;
+        const next = await promptDialog({
+            title: 'Rename album',
+            label: 'Album name',
+            defaultValue: currentName,
+            placeholder: 'e.g. Summer trip',
+            confirmLabel: 'Rename',
+        });
+        if (next && next.trim()) renameAlbum(targetId, next.trim());
+    };
+
     const handleCreate = async (thenRename = false) => {
         const id = await createAlbum('New album');
         if (!id) return;
         navigate('albums', { albumId: id });
         setShowMobileDetail(true);
-        if (thenRename) {
-            setDraft('New album');
-            setRenaming(true);
-        }
+        if (thenRename) await renameAlbumPrompt(id, 'New album');
     };
 
     const handleSmartCreate = async (rule: string, closeMenu: () => void) => {
@@ -108,7 +140,7 @@ export const AlbumsPage: React.FC = () => {
     if (!album) {
         return (
             <div className="pt-empty-page">
-                <p>{albumsLoading ? 'Loading albums…' : 'No albums yet.'}</p>
+                {albumsLoading ? <Spinner label="Loading albums…" /> : <p>No albums yet.</p>}
                 {!albumsLoading && (
                     <button type="button" className="btn mock-cta" onClick={() => void handleCreate(true)}>
                         <PlusIcon className="toolbar-icon" /> New album
@@ -124,10 +156,6 @@ export const AlbumsPage: React.FC = () => {
         setCopied(true);
         window.setTimeout(() => setCopied(false), 1400);
         void navigator.clipboard?.writeText(url).catch(() => {});
-    };
-    const commitRename = () => {
-        if (draft.trim()) renameAlbum(album.id, draft.trim());
-        setRenaming(false);
     };
     const togglePublic = () => {
         if (album.isPublic) {
@@ -194,14 +222,6 @@ export const AlbumsPage: React.FC = () => {
                     </button>
                 );
             })}
-            {selectMode && selectedAlbumIds.length > 0 && (
-                <div className="pt-album-select-bar">
-                    <span>{selectedAlbumIds.length} selected</span>
-                    <button type="button" className="btn btn-danger" onClick={() => void bulkDelete()}>
-                        <TrashIcon className="toolbar-icon" /> Delete
-                    </button>
-                </div>
-            )}
         </>
     );
 
@@ -263,24 +283,12 @@ export const AlbumsPage: React.FC = () => {
                     <section className="pt-album-detail">
                         <div className="pt-album-detail-head">
                             <div>
-                                {renaming ? (
-                                    <input
-                                        className="field albm-title-input"
-                                        autoFocus
-                                        value={draft}
-                                        onChange={(e) => setDraft(e.target.value)}
-                                        onBlur={commitRename}
-                                        onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setRenaming(false); }}
-                                        aria-label="Album name"
-                                    />
-                                ) : (
-                                    <h1 className="pt-page-title" onDoubleClick={() => { setDraft(album.name); setRenaming(true); }}>{album.name}</h1>
-                                )}
+                                <h1 className="pt-page-title">{album.name}</h1>
                                 <p className="pt-page-sub">
                                     {album.photoCount} photos ·{' '}
-                                    <button type="button" className="pt-linkish" onClick={() => { setDraft(album.name); setRenaming(true); }}>Rename</button>
+                                    <button type="button" className="pt-linkish" onClick={() => void renameAlbumPrompt()}>Rename</button>
                                     {' · '}
-                                    <button type="button" className="pt-linkish" onClick={() => { deleteAlbum(album.id); navigate('albums', {}); }}>Delete</button>
+                                    <button type="button" className="pt-linkish danger" onClick={() => void confirmDeleteAlbum()}>Delete</button>
                                 </p>
                             </div>
                             <button type="button" className="btn mock-cta" onClick={togglePublic}>
@@ -330,13 +338,26 @@ export const AlbumsPage: React.FC = () => {
                             <button type="button" className="pt-linkish" onClick={() => { navigate('gallery'); toast('Select photos, then use “Add to album”'); }}><PlusIcon className="toolbar-icon" /> Add photos</button>
                         </div>
                         {activePhotos === undefined && albumPhotosLoading ? (
-                            <p className="pt-grid-empty">Loading photos…</p>
+                            <Spinner label="Loading photos…" center={false} />
                         ) : (
                             <PhotoGrid photos={activePhotos ?? []} emptyHint="No photos yet — add some from the gallery." />
                         )}
                     </section>
                 </div>
             </div>
+
+            {selectMode && selectedAlbumIds.length > 0 && (
+                <SelectionBar count={selectedAlbumIds.length} onClear={exitSelectMode} label="Albums selection actions">
+                    <button
+                        type="button"
+                        className="pt-fm-delete"
+                        onClick={() => void bulkDelete()}
+                        aria-label={`Delete ${selectedAlbumIds.length} album${selectedAlbumIds.length > 1 ? 's' : ''}`}
+                    >
+                        <TrashIcon />
+                    </button>
+                </SelectionBar>
+            )}
         </div>
     );
 };

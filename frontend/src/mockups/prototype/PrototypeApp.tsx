@@ -1,7 +1,22 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
-import { PlusIcon, MagnifyingGlassIcon, PhotoIcon, RectangleStackIcon, UserGroupIcon, SparklesIcon } from '@heroicons/react/24/outline';
-import { MagnifyingGlassIcon as MagnifyingGlassIconSolid, PhotoIcon as PhotoIconSolid, RectangleStackIcon as RectangleStackIconSolid, UserGroupIcon as UserGroupIconSolid, SparklesIcon as SparklesIconSolid } from '@heroicons/react/24/solid';
+import {
+    Plus as PlusIcon,
+    Search as MagnifyingGlassIcon,
+    Image as PhotoIcon,
+    Images as RectangleStackIcon,
+    Users as UserGroupIcon,
+    Sparkles as SparklesIcon,
+    MoreHorizontal as EllipsisHorizontalIcon,
+    // The active-tab "solid" cue is handled by color + a heavier stroke in the
+    // tab bar (Lucide is a single outline set), so the solid aliases point at
+    // the same glyphs.
+    Search as MagnifyingGlassIconSolid,
+    Image as PhotoIconSolid,
+    Images as RectangleStackIconSolid,
+    Users as UserGroupIconSolid,
+    Sparkles as SparklesIconSolid,
+} from 'lucide-react';
 import { LogoLockup } from '../../components/shared/Logo';
 import Loading from '../../components/shared/Loading';
 import { AppServicesProvider, useAppServices } from '../../components/AppServicesProvider';
@@ -77,7 +92,12 @@ const NAV: { id: PageId; label: string }[] = [
     { id: 'tools', label: 'Tools' },
     { id: 'sharing', label: 'Sharing' },
 ];
+// The phone tab bar holds 5 primary destinations; the remaining ones live
+// behind a "More" tab (HIG: fold overflow beyond 5 tabs into More rather than
+// dropping those destinations, which previously left Tools/Sharing unreachable
+// on mobile).
 const MOBILE_NAV = NAV.slice(0, 5);
+const MOBILE_MORE = NAV.slice(5); // Tools, Sharing
 
 const MOBILE_NAV_ICONS: Record<string, [React.ElementType, React.ElementType]> = {
     ask: [MagnifyingGlassIcon, MagnifyingGlassIconSolid],
@@ -130,7 +150,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 
     return (
         <header className="ios-header">
-            <button type="button" className="pt-wordmark-btn" onClick={() => navigate('gallery')} aria-label="Home">
+            <button type="button" className="pt-wordmark-btn" onClick={() => navigate('gallery')} aria-label="Go to Gallery">
                 <LogoLockup size={30} className="ios-header-wordmark" />
             </button>
             <nav className="ios-tabs" aria-label="Primary navigation">
@@ -157,8 +177,8 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                         <div className="pt-account-menu">
                             <div className="pt-account-head"><b>{accountName}</b>{accountEmail && <span>{accountEmail}</span>}</div>
                             <button type="button" onClick={() => { navigate('trash'); close(); }}>Recently Deleted</button>
-                            <button type="button" onClick={() => { toast('Corrupted uploads: all clear'); close(); }}>Corrupted uploads</button>
-                            <button type="button" onClick={() => { navigate('additional'); close(); }}>Additional info</button>
+                            <button type="button" onClick={() => { toast('Corrupted uploads: all clear'); close(); }}>Corrupted Uploads</button>
+                            <button type="button" onClick={() => { navigate('additional'); close(); }}>Additional Info</button>
                             <div className="pt-account-sep" />
                             <div className="pt-account-theme">
                                 <span>Theme</span>
@@ -169,7 +189,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                                 </div>
                             </div>
                             <div className="pt-account-sep" />
-                            <button type="button" onClick={() => { close(); onSignOut(); }}>Sign out</button>
+                            <button type="button" onClick={() => { close(); onSignOut(); }}>Sign Out</button>
                         </div>
                     )}
                 </Menu>
@@ -181,6 +201,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 const MobileTabbar: React.FC = () => {
     const { route, navigate } = useStore();
     const active = activeNavFor(route.page);
+    const moreActive = MOBILE_MORE.some((item) => item.id === route.page);
     return (
         <nav className="mock-tabbar" aria-label="Primary navigation (mobile)">
             {MOBILE_NAV.map((item) => {
@@ -189,11 +210,29 @@ const MobileTabbar: React.FC = () => {
                 const Icon = isActive ? Solid : Outline;
                 return (
                     <button key={item.id} type="button" className={isActive ? 'on' : undefined} onClick={() => navigate(item.id)}>
-                        <Icon className="mock-tabbar-icon" aria-hidden="true" />
+                        <Icon className="mock-tabbar-icon" aria-hidden="true" strokeWidth={isActive ? 2.5 : 2} />
                         <span>{item.label}</span>
                     </button>
                 );
             })}
+            <Menu
+                align="right"
+                className="mock-tabbar-more"
+                renderTrigger={(toggle) => (
+                    <button type="button" className={moreActive ? 'on' : undefined} onClick={toggle} aria-haspopup="menu" aria-label="More">
+                        <EllipsisHorizontalIcon className="mock-tabbar-icon" aria-hidden="true" />
+                        <span>More</span>
+                    </button>
+                )}
+            >
+                {(close) => (
+                    <div className="pt-more-menu">
+                        {MOBILE_MORE.map((item) => (
+                            <button key={item.id} type="button" onClick={() => { navigate(item.id); close(); }}>{item.label}</button>
+                        ))}
+                    </div>
+                )}
+            </Menu>
         </nav>
     );
 };

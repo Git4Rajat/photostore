@@ -18,11 +18,17 @@
 
 /* The real .ios-tab is an <a>; we render <button>s, so strip the UA button
    chrome while keeping the underline-on-active treatment. */
-.ios-tabs .ios-tab { appearance: none; -webkit-appearance: none; background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
+.ios-tabs .ios-tab { appearance: none; -webkit-appearance: none; background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; min-height: var(--tap-min); display: inline-flex; align-items: center; }
 .ios-tabs .ios-tab.active { border-bottom-color: var(--accent); }
-.mock-tabbar button { appearance: none; -webkit-appearance: none; background: none; border: 0; color: inherit; font: inherit; font-size: 0.66rem; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; flex: 1; min-width: 44px; min-height: 44px; padding: 4px 6px; }
+.mock-tabbar button { appearance: none; -webkit-appearance: none; background: none; border: 0; color: inherit; font: inherit; font-size: 0.72rem; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; flex: 1; min-width: 44px; min-height: 44px; padding: 4px 6px; }
 .mock-tabbar button.on { color: var(--accent); font-weight: 700; }
 .mock-tabbar-icon { width: 22px; height: 22px; flex: 0 0 auto; }
+/* The "More" overflow tab is a Menu anchor; make it behave like the sibling
+   tab buttons (equal flex width) and open its panel upward, above the bar. */
+.mock-tabbar .pt-menu-anchor.mock-tabbar-more { flex: 1; display: flex; }
+.mock-tabbar .pt-menu-panel { top: auto; bottom: calc(100% + 8px); }
+.mock-tabbar .pt-menu-panel.right { right: 8px; max-width: calc(100vw - 16px); }
+.mock-tabbar .pt-more-menu button { min-height: var(--tap-min); }
 
 .pt-wordmark-btn { background: none; border: 0; padding: 0; cursor: pointer; display: inline-flex; align-items: center; min-height: 44px; }
 .pt-upload-btn { white-space: nowrap; }
@@ -45,10 +51,10 @@
 }
 .pt-menu-panel.left { left: 0; }
 .pt-menu-panel.right { right: 0; }
-.pt-menu-label { font-family: var(--font-label); font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; padding: 0 4px; }
+.pt-menu-label { font-family: var(--font-label); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; padding: 0 4px; }
 
 .pt-account-menu { min-width: 240px; }
-.pt-account-menu > button { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: var(--r-xs); font: inherit; font-size: 0.88rem; color: var(--text); cursor: pointer; }
+.pt-account-menu > button { display: flex; align-items: center; width: 100%; min-height: var(--tap-min); text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: var(--r-xs); font: inherit; font-size: 0.88rem; color: var(--text); cursor: pointer; }
 .pt-account-menu > button:hover { background: var(--lg-surface-wash); }
 .pt-account-head { padding: 6px 10px 10px; }
 .pt-account-head b { display: block; font-size: 0.9rem; }
@@ -61,7 +67,7 @@
 .pt-suggest-card + .pt-suggest-card { border-top: 1px solid var(--lg-edge); }
 .pt-suggest-card p { margin: 0 0 8px; font-size: 0.88rem; }
 .pt-suggest-actions { display: flex; gap: 14px; }
-.pt-linkish { background: none; border: 0; color: var(--accent); font: inherit; font-weight: 600; cursor: pointer; padding: 0; display: inline-flex; align-items: center; gap: 4px; }
+.pt-linkish { background: none; border: 0; color: var(--accent); font: inherit; font-weight: 600; cursor: pointer; padding: 4px 2px; min-height: var(--tap-min); display: inline-flex; align-items: center; gap: 4px; }
 .pt-linkish.strong { font-weight: 700; }
 .pt-linkish.muted { color: var(--muted); }
 /* Heroicons ship no intrinsic size -- without this, a .toolbar-icon inside
@@ -85,14 +91,14 @@
 
 /* ---- stars ---- */
 .pt-stars { display: inline-flex; gap: 2px; }
-.pt-star { background: none; border: 0; padding: 0; cursor: pointer; color: #e2b33f; display: inline-grid; place-items: center; }
-.pt-star:disabled, .pt-star.static { cursor: default; }
-.pt-star svg { width: 100%; height: 100%; }
+.pt-star { background: none; border: 0; padding: 0; cursor: pointer; color: #e2b33f; display: inline-grid; place-items: center; min-width: var(--tap-min); min-height: var(--tap-min); }
+.pt-star:disabled, .pt-star.static { cursor: default; min-width: 0; min-height: 0; }
+.pt-star svg { display: block; }
 /* Compact single-star, partial-fill rating indicator -- hidden by default;
    only swapped in for the full 5-star row on narrow lightbox viewports (see
    the .pt-viewer-bar override below), where 5 separate buttons crowd into
    the neighboring Like button. */
-.pt-star-compact { display: none; position: relative; background: none; border: 0; padding: 0; cursor: pointer; }
+.pt-star-compact { display: none; position: relative; background: none; border: 0; padding: 0; cursor: pointer; min-width: var(--tap-min); min-height: var(--tap-min); }
 .pt-star-compact:disabled, .pt-star-compact.static { cursor: default; }
 .pt-star-compact-bg, .pt-star-compact-fg { position: absolute; inset: 0; width: 100%; height: 100%; color: #e2b33f; }
 .pt-star-compact-fg { clip-path: inset(0 calc(100% - var(--pt-star-fill, 0%)) 0 0); }
@@ -114,10 +120,10 @@
 .pt-timeline-crumbs button:hover { color: var(--text); }
 .pt-timeline-crumbs button.on { color: var(--accent); }
 .pt-timeline { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; -webkit-overflow-scrolling: touch; }
-.pt-timeline-chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--lg-edge); background: var(--lg-surface-wash); border-radius: var(--r-pill); padding: 5px 12px; font: inherit; font-size: 0.8rem; font-weight: 600; color: var(--text); cursor: pointer; }
+.pt-timeline-chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; min-height: var(--tap-min); border: 1px solid var(--lg-edge); background: var(--lg-surface-wash); border-radius: var(--r-pill); padding: 5px 12px; font: inherit; font-size: 0.8rem; font-weight: 600; color: var(--text); cursor: pointer; }
 .pt-timeline-chip:hover { border-color: var(--accent); }
 .pt-timeline-chip.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
-.pt-timeline-count { font-size: 0.66rem; font-weight: 700; color: var(--muted); }
+.pt-timeline-count { font-size: 0.72rem; font-weight: 700; color: var(--muted); }
 .pt-timeline-chip.on .pt-timeline-count { color: var(--accent); }
 .pt-suggest-empty { color: var(--muted); padding: 10px 6px; font-size: 0.84rem; }
 @media (max-width: 620px) {
@@ -144,9 +150,22 @@
 .pt-tile-check.on { color: var(--accent); }
 .pt-tile-badges { position: absolute; bottom: 6px; right: 6px; display: flex; gap: 4px; align-items: center; }
 .pt-tile-badges .liked { width: 16px; height: 16px; color: #ff6b7d; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
-.pt-tile-badges .rating { display: inline-flex; align-items: center; gap: 2px; font-size: 0.66rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.42); border-radius: var(--r-pill); padding: 1px 6px; }
+.pt-tile-badges .rating { display: inline-flex; align-items: center; gap: 2px; font-size: 0.72rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.42); border-radius: var(--r-pill); padding: 1px 6px; }
 .pt-tile-badges .rating svg { width: 10px; height: 10px; color: #e2b33f; }
 .pt-grid-empty { color: var(--muted); padding: 24px 0; }
+
+/* ---- shared inline loading indicator (one look for every "Loading…" state) ---- */
+.pt-loading { display: flex; align-items: center; gap: 10px; color: var(--muted); padding: 24px 0; font-size: 0.9rem; }
+.pt-loading.center { justify-content: center; }
+.pt-spinner { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--lg-edge); border-top-color: var(--accent); animation: pt-spin 0.7s linear infinite; flex: 0 0 auto; }
+@keyframes pt-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .pt-spinner { animation-duration: 1.8s; } }
+/* On the dark photo viewer the light-surface border is invisible; brighten it. */
+.pt-viewer-loading .pt-spinner { border-color: rgba(255,255,255,0.25); border-top-color: #fff; }
+
+/* Destructive text actions read as destructive (danger), so "Delete" never
+   looks identical to a neutral accent link like "Rename". */
+.pt-linkish.danger { color: var(--danger); }
 
 /* ---- gallery drop + arrive ---- */
 .pt-drop-surface { position: relative; border-radius: var(--r-md); }
@@ -212,7 +231,6 @@
 .pt-album-row-check { width: 20px; height: 20px; flex: 0 0 auto; border-radius: 999px; border: 1.5px solid var(--lg-edge); display: inline-flex; align-items: center; justify-content: center; color: transparent; }
 .pt-album-row-check svg { width: 13px; height: 13px; }
 .pt-album-row-check.on { background: var(--accent); border-color: var(--accent); color: #fff; }
-.pt-album-select-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px; margin-top: 4px; border-radius: var(--r-sm); background: var(--lg-surface-wash); font-size: 0.82rem; font-weight: 600; }
 .pt-album-detail { padding: 16px; }
 .pt-album-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .pt-album-photos-head { display: flex; align-items: center; justify-content: space-between; margin: 6px 0 10px; }
@@ -269,8 +287,12 @@
 }
 
 /* ---- ask ---- */
-.pt-ask-box { display: flex; align-items: center; gap: 10px; border: 1px solid var(--lg-edge); border-radius: var(--r-lg); background: var(--lg-surface-strong); padding: 12px 16px; margin-bottom: 12px; }
+.pt-ask-box { display: flex; align-items: center; gap: 8px; border: 1px solid var(--lg-edge); border-radius: var(--r-lg); background: var(--lg-surface-strong); padding: 4px 10px 4px 4px; margin-bottom: 12px; }
 .pt-ask-box svg { width: 20px; height: 20px; color: var(--muted); flex: 0 0 auto; }
+/* Leading magnifier doubles as a submit button (visible search affordance,
+   not just Enter-to-search); the form also gives mobile keyboards a Search key. */
+.pt-ask-search { background: none; border: 0; padding: 0; margin: 0; cursor: pointer; color: var(--muted); display: inline-grid; place-items: center; flex: 0 0 auto; min-width: var(--tap-min); min-height: var(--tap-min); border-radius: 50%; }
+.pt-ask-search:hover { color: var(--accent); }
 .pt-ask-input { flex: 1; border: 0; background: none; font: inherit; font-size: 1rem; color: var(--text); outline: none; min-width: 0; }
 /* Keep the "Save as album" CTA a single, vertically-centred, non-shrinking pill
    so its icon + label don't wrap or drift out of line on narrow screens. */
@@ -313,9 +335,9 @@
 .wb-tile { position: relative; border-radius: var(--r-sm); overflow: visible; display: flex; flex-direction: column; }
 .wb-tile.selected .wb-tile-img { outline: 3px solid var(--accent); outline-offset: -3px; }
 .wb-tile-img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; border-radius: var(--r-sm); background: inherit; -webkit-user-drag: none; user-select: none; }
-.wb-tile-select, .wb-tile-info { position: absolute; top: 6px; width: 22px; height: 22px; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; padding: 0; z-index: 2; }
-.wb-tile-select { left: 6px; }
-.wb-tile-info { right: 6px; }
+.wb-tile-select, .wb-tile-info { position: absolute; top: 0; width: var(--tap-min); height: var(--tap-min); display: grid; place-items: center; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; padding: 6px; z-index: 2; }
+.wb-tile-select { left: 0; }
+.wb-tile-info { right: 0; }
 .wb-tile-select svg, .wb-tile-info svg { width: 22px; height: 22px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5)); }
 .wb-tile-select.on, .wb-tile[class*=selected] .wb-tile-select { color: var(--accent); }
 .wb-tile-foot { padding: 6px 4px 0; background: var(--bg-1); border-radius: 0 0 var(--r-sm) var(--r-sm); }
@@ -324,14 +346,21 @@
 .wb-step-icon { width: 15px; height: 15px; flex: 0 0 auto; color: var(--lg-edge); }
 .wb-step-icon.done { color: #34c759; }
 .wb-step-icon.pending { color: var(--muted); opacity: 0.6; }
-.wb-step-icon.no-data { color: #ffd60a; }
+.wb-step-icon.no-data { color: #d19a00; }
 .wb-step-icon.failed { color: #ff453a; }
-.wb-info-panel { position: absolute; top: 32px; right: 6px; left: 6px; z-index: 5; background: var(--bg-1); border: 1px solid var(--lg-edge); border-radius: var(--r-sm); padding: 10px 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.28); }
+/* Non-color status cue: a tiny shape badge so done/failed/no-data are
+   distinguishable without relying on the icon tint. */
+.wb-step { position: relative; display: inline-flex; line-height: 0; }
+.wb-step::after { position: absolute; right: -3px; bottom: -3px; font-size: 9px; font-weight: 800; line-height: 1; }
+.wb-step-done::after { content: '✓'; color: #34c759; }
+.wb-step-failed::after { content: '✕'; color: #ff453a; }
+.wb-step-no-data::after { content: '!'; color: #d19a00; }
+.wb-info-panel { position: absolute; top: 44px; right: 6px; left: 6px; z-index: 5; background: var(--bg-1); border: 1px solid var(--lg-edge); border-radius: var(--r-sm); padding: 10px 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.28); }
 .wb-info-title { font-weight: 700; font-size: 0.78rem; margin-bottom: 6px; word-break: break-all; }
 .wb-info-row { font-size: 0.78rem; color: var(--text); margin-bottom: 3px; }
 .wb-info-row.muted { color: var(--muted); }
 .wb-info-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
-.wb-info-tag { font-size: 0.68rem; color: var(--accent); background: var(--accent-soft); border-radius: var(--r-pill); padding: 2px 8px; }
+.wb-info-tag { font-size: 0.72rem; color: var(--accent); background: var(--accent-soft); border-radius: var(--r-pill); padding: 2px 8px; }
 .pt-step-row.wb-force { position: sticky; bottom: 0; background: var(--bg-1); padding: 10px 0; border-top: 1px solid var(--lg-edge); }
 .pt-inline-icon { width: 14px; height: 14px; vertical-align: -2px; display: inline-block; }
 
@@ -354,7 +383,7 @@
 .qchip.warn { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 
 .pt-history-row-with-action { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.pt-history-reselect { flex: 0 0 auto; width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--lg-edge); background: transparent; color: var(--text); cursor: pointer; display: grid; place-items: center; }
+.pt-history-reselect { flex: 0 0 auto; width: var(--tap-min); height: var(--tap-min); border-radius: 50%; border: 1px solid var(--lg-edge); background: transparent; color: var(--text); cursor: pointer; display: grid; place-items: center; }
 .pt-history-reselect:hover { background: var(--lg-surface-wash); }
 .pt-history-reselect:disabled { opacity: 0.5; cursor: default; }
 .pt-history-reselect svg { width: 16px; height: 16px; }
@@ -368,23 +397,28 @@
 .pt-trash-tile { cursor: default; }
 .pt-trash-actions { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 10px; opacity: 0; transition: opacity 0.12s ease; background: rgba(0,0,0,0.35); }
 .pt-trash-tile:hover .pt-trash-actions { opacity: 1; }
-.pt-trash-actions button { width: 36px; height: 36px; border-radius: 50%; border: 0; background: rgba(255,255,255,0.92); color: #1e1c18; cursor: pointer; display: grid; place-items: center; }
+/* Touch devices have no hover, so surface the restore/delete actions directly
+   instead of leaving them permanently invisible (and the tile unusable). */
+@media (hover: none) and (pointer: coarse) {
+  .pt-trash-actions { opacity: 1; background: rgba(0,0,0,0.28); }
+}
+.pt-trash-actions button { width: var(--tap-min); height: var(--tap-min); border-radius: 50%; border: 0; background: rgba(255,255,255,0.92); color: #1e1c18; cursor: pointer; display: grid; place-items: center; }
 .pt-trash-actions button svg { width: 18px; height: 18px; }
-.pt-trash-days { position: absolute; top: 6px; right: 6px; font-size: 0.66rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.4); border-radius: var(--r-pill); padding: 1px 6px; }
+.pt-trash-days { position: absolute; top: 6px; right: 6px; font-size: 0.72rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.4); border-radius: var(--r-pill); padding: 1px 6px; }
 
 /* ---- floating menu (centered, compact, minimal delete + options) ---- */
 .pt-floating-menu { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 60; display: flex; align-items: center; justify-content: center; gap: 12px; background: var(--text); color: var(--bg-1); padding: 12px; border-radius: var(--r-pill); box-shadow: 0 14px 44px rgba(0,0,0,0.4); }
 @media (max-width: 620px) {
   .pt-floating-menu { bottom: 75px; z-index: 50; gap: 10px; padding: 10px; }
 }
-.pt-fm-close { background: none; border: 0; color: inherit; cursor: pointer; width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; transition: background 0.2s ease; flex: 0 0 auto; opacity: 0.75; }
+.pt-fm-close { background: none; border: 0; color: inherit; cursor: pointer; width: var(--tap-min); height: var(--tap-min); display: grid; place-items: center; border-radius: 50%; transition: background 0.2s ease; flex: 0 0 auto; opacity: 0.75; }
 .pt-fm-close:hover { background: rgba(127,127,127,0.25); opacity: 1; }
 .pt-fm-close svg { width: 18px; height: 18px; }
 .pt-fm-badge { position: relative; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; border-radius: 50%; background: rgba(127,127,127,0.15); font-weight: 700; font-size: 0.9rem; flex: 0 0 auto; }
-.pt-fm-delete { background: none; border: 0; color: inherit; cursor: pointer; width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; transition: background 0.2s ease; flex: 0 0 auto; }
+.pt-fm-delete { background: none; border: 0; color: inherit; cursor: pointer; width: var(--tap-min); height: var(--tap-min); display: grid; place-items: center; border-radius: 50%; transition: background 0.2s ease; flex: 0 0 auto; }
 .pt-fm-delete:hover { background: rgba(127,127,127,0.25); }
 .pt-fm-delete svg { width: 20px; height: 20px; }
-.pt-fm-more { background: none; border: 0; color: inherit; cursor: pointer; width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; transition: background 0.2s ease; flex: 0 0 auto; }
+.pt-fm-more { background: none; border: 0; color: inherit; cursor: pointer; width: var(--tap-min); height: var(--tap-min); display: grid; place-items: center; border-radius: 50%; transition: background 0.2s ease; flex: 0 0 auto; }
 .pt-fm-more:hover { background: rgba(127,127,127,0.25); }
 .pt-fm-more svg { width: 20px; height: 20px; }
 .pt-fm-menu { display: flex; flex-direction: column; gap: 0; }
@@ -423,7 +457,7 @@
 .pt-viewer-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #9c9486; font-size: 0.9rem; }
 /* Floating image controls (zoom / rotate / full-res) over the stage. */
 .pt-viewer-tools { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); padding: 4px 8px; backdrop-filter: blur(8px); z-index: 2; }
-.pt-viewer-tools button { display: inline-grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 50%; background: none; color: #ece6d9; cursor: pointer; }
+.pt-viewer-tools button { display: inline-grid; place-items: center; width: var(--tap-min); height: var(--tap-min); border: 0; border-radius: 50%; background: none; color: #ece6d9; cursor: pointer; }
 .pt-viewer-tools button:hover:not(:disabled) { background: rgba(255,255,255,0.14); }
 .pt-viewer-tools button:disabled { opacity: 0.35; cursor: default; }
 .pt-viewer-tools button.on { color: var(--accent); background: rgba(255,255,255,0.14); }
@@ -460,7 +494,7 @@
 .pt-vb-group.left { flex: 1 1 0; justify-content: flex-start; }
 .pt-vb-group.center { flex: 0 0 auto; justify-content: center; }
 .pt-vb-group.right { flex: 1 1 0; justify-content: flex-end; }
-.pt-vb-btn { display: inline-flex; flex-direction: column; align-items: center; gap: 2px; background: none; border: 0; color: #ece6d9; font: inherit; font-size: 0.64rem; cursor: pointer; padding: 4px 6px; }
+.pt-vb-btn { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: var(--tap-min); min-height: var(--tap-min); background: none; border: 0; color: #ece6d9; font: inherit; font-size: 0.72rem; cursor: pointer; padding: 4px 6px; }
 .pt-vb-btn svg { width: 20px; height: 20px; }
 .pt-vb-btn.on { color: #ff6b7d; }
 /* Touch devices navigate by swipe, so the prev/next buttons aren't needed. */
@@ -495,6 +529,10 @@
 }
 .pt-toast { pointer-events: auto; display: flex; align-items: center; gap: 14px; background: var(--text); color: var(--bg-1); padding: 10px 16px; border-radius: var(--r-pill); box-shadow: 0 10px 30px rgba(0,0,0,0.3); font-size: 0.85rem; }
 .pt-toast-action { background: none; border: 0; color: inherit; font: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; }
+/* Error toasts read distinctly from routine confirmations (which use the
+   default near-black pill) so a failure isn't mistaken for a success. */
+.pt-toast.error { background: var(--danger); color: #fff; }
+.pt-toast-icon { flex: 0 0 auto; width: 18px; height: 18px; }
 
 /* ---- narrow (phone) tweaks; mock-viewport is the query container ---- */
 @container (max-width: 620px) {

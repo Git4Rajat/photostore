@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUpTrayIcon, MagnifyingGlassMinusIcon, MagnifyingGlassPlusIcon, PhotoIcon, UserPlusIcon } from '@heroicons/react/24/outline';
+import { Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
 import type { MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineRail from '../components/TimelineRail';
+import { Spinner } from '../components/bits';
 
 const TILE_MIN = 120;
 const TILE_STEP = 30;
@@ -151,9 +152,7 @@ export const GalleryPage: React.FC = () => {
     if (photos.length === 0 && (photosLoading || hasMorePhotos)) {
         return (
             <div className="pt-arrive">
-                <div className="empty-state">
-                    <p className="empty-state-message">Loading your photos…</p>
-                </div>
+                <Spinner label="Loading your photos…" />
             </div>
         );
     }
@@ -255,7 +254,7 @@ export const GalleryPage: React.FC = () => {
                     <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
                 )}
                 <div ref={sentinelRef} className="pt-scroll-sentinel" aria-hidden="true" />
-                {photosLoading && photos.length > 0 && <p className="pt-grid-empty">Loading more…</p>}
+                {photosLoading && photos.length > 0 && <Spinner label="Loading more…" />}
                 <div className="pt-drop-overlay">
                     <span className="drop-icon"><ArrowUpTrayIcon /></span>
                     <b>Drop to add to Keepsake</b>

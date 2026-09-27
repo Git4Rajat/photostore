@@ -274,7 +274,7 @@ interface Store {
     renameLibrary: (name: string) => void;
 
     // toasts
-    toast: (message: string, actionLabel?: string, onAction?: () => void) => void;
+    toast: (message: string, actionLabel?: string, onAction?: () => void, tone?: 'info' | 'error') => void;
     dismissToast: (id: string) => void;
 }
 
@@ -463,13 +463,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, []);
 
     const toast = useCallback(
-        (message: string, actionLabel?: string, onAction?: () => void) => {
+        (message: string, actionLabel?: string, onAction?: () => void, tone: 'info' | 'error' = 'info') => {
             const id = nextId();
-            setToasts((prev) => [...prev, { id, message, actionLabel, onAction }]);
+            setToasts((prev) => [...prev, { id, message, actionLabel, onAction, tone }]);
             toastTimers.current[id] = window.setTimeout(() => {
                 setToasts((prev) => prev.filter((t) => t.id !== id));
                 delete toastTimers.current[id];
-            }, 4200);
+                // Errors linger a little longer so a failure isn't missed.
+            }, tone === 'error' ? 6500 : 4200);
         },
         [],
     );
@@ -547,7 +548,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 .then(() => reloadAlbums())
                 .catch(() => {
                     setPhotos((prev) => prev.map((p) => (prevRatings.has(p.id) ? { ...p, rating: prevRatings.get(p.id)! } : p)));
-                    toast('Couldn’t save rating');
+                    toast('Couldn’t save rating', undefined, undefined, 'error');
                 });
         },
         [photos, toast, reloadAlbums],
@@ -571,7 +572,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     setPhotos((prev) => prev.map((p) => (p.id === id
                         ? { ...p, liked: Boolean(current?.liked), likes: prevLikes }
                         : p)));
-                    toast('Couldn’t update like');
+                    toast('Couldn’t update like', undefined, undefined, 'error');
                 });
         },
         [photos, toast, reloadAlbums],
@@ -639,7 +640,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const movedSet = new Set(moved.map((p) => p.id));
             setPhotos((cur) => cur.filter((p) => !movedSet.has(p.id)));
             setTrash((prev) => [...moved.map((photo) => ({ photo, purgesInDays: 30 })), ...prev]);
-            toast('Couldn’t restore photos');
+            toast('Couldn’t restore photos', undefined, undefined, 'error');
         });
     }, [toast]);
 
@@ -660,7 +661,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const set = new Set(ids);
                 setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
                 setPhotos((cur) => [...doomed, ...cur]);
-                toast('Couldn’t delete photos');
+                toast('Couldn’t delete photos', undefined, undefined, 'error');
             });
         },
         [photosByIds, removeFromEverywhere, toast, restorePhotos],
@@ -694,7 +695,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast('Restored everything from Recently Deleted'))
             .catch(() => {
                 setTrash(snapshot);
-                toast('Couldn’t restore everything');
+                toast('Couldn’t restore everything', undefined, undefined, 'error');
             });
     }, [trash, toast]);
 
@@ -703,7 +704,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setTrash((prev) => prev.filter((t) => t.photo.id !== id));
         void post('/photos/trash/purge', { filenames: [id] }).catch(() => {
             setTrash(snapshot);
-            toast('Couldn’t delete photo');
+            toast('Couldn’t delete photo', undefined, undefined, 'error');
         });
     }, [trash, toast]);
 
@@ -716,7 +717,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast('Recently Deleted emptied'))
             .catch(() => {
                 setTrash(snapshot);
-                toast('Couldn’t empty Recently Deleted');
+                toast('Couldn’t empty Recently Deleted', undefined, undefined, 'error');
             });
     }, [trash, toast]);
 
@@ -747,7 +748,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         void post(`/albums/${encodeURIComponent(id)}/restore`, {}).catch(() => {
             setAlbumTrash(snapshot);
             if (restored) setAlbums((prev) => prev.filter((a) => a.id !== id));
-            toast('Couldn’t restore album');
+            toast('Couldn’t restore album', undefined, undefined, 'error');
         });
     }, [albumTrash, toast]);
 
@@ -756,7 +757,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setAlbumTrash((prev) => prev.filter((t) => t.album.id !== id));
         void post(`/albums/${encodeURIComponent(id)}/purge`, {}).catch(() => {
             setAlbumTrash(snapshot);
-            toast('Couldn’t permanently delete album');
+            toast('Couldn’t permanently delete album', undefined, undefined, 'error');
         });
     }, [albumTrash, toast]);
 
@@ -812,7 +813,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     return created.id;
                 }
             } catch {
-                toast('Couldn’t create album');
+                toast('Couldn’t create album', undefined, undefined, 'error');
             }
             return '';
         },
@@ -834,7 +835,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 }
                 return { albumId: '', count: 0, message: res?.message };
             } catch {
-                toast('Couldn’t create smart album');
+                toast('Couldn’t create smart album', undefined, undefined, 'error');
                 return { albumId: '', count: 0 };
             }
         },
@@ -848,7 +849,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: trimmed } : a)));
         void post(`/albums/${encodeURIComponent(id)}/rename`, { name: trimmed }).catch(() => {
             setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: previous ?? a.name } : a)));
-            toast('Couldn’t rename album');
+            toast('Couldn’t rename album', undefined, undefined, 'error');
         });
     }, [albums, toast]);
 
@@ -865,7 +866,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 })
                 .catch(() => {
                     setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: Math.max(0, a.photoCount - ids.length) } : a)));
-                    toast('Couldn’t add photos to album');
+                    toast('Couldn’t add photos to album', undefined, undefined, 'error');
                 });
         },
         [albums, albumPhotos, openAlbum, toast],
@@ -878,7 +879,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast(`Deleted “${removed?.name ?? 'album'}”`))
             .catch(() => {
                 if (removed) setAlbums((prev) => [...prev, removed]);
-                toast('Couldn’t delete album');
+                toast('Couldn’t delete album', undefined, undefined, 'error');
             });
     }, [albums, toast]);
 
@@ -891,7 +892,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast(`Deleted ${removed.length} album${removed.length === 1 ? '' : 's'}`))
             .catch(() => {
                 if (removed.length) setAlbums((prev) => [...prev, ...removed]);
-                toast('Couldn’t delete albums');
+                toast('Couldn’t delete albums', undefined, undefined, 'error');
             });
     }, [albums, toast]);
 
@@ -907,7 +908,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
             }
         } catch {
-            toast('Couldn’t update share link');
+            toast('Couldn’t update share link', undefined, undefined, 'error');
         }
     }, [toast]);
 
@@ -918,7 +919,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 ? { ...a, ...(res?.album ?? {}), isPublic: false, publicUrl: undefined }
                 : a)));
         } catch {
-            toast('Couldn’t revoke share link');
+            toast('Couldn’t revoke share link', undefined, undefined, 'error');
         }
     }, [toast]);
 
@@ -962,7 +963,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: trimmed || null } : p)));
         void faceService.labelPerson(id, trimmed).catch(() => {
             setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: previous } : p)));
-            toast('Couldn’t save name');
+            toast('Couldn’t save name', undefined, undefined, 'error');
         });
     }, [people, toast]);
 
@@ -978,7 +979,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 })
                 .catch(() => {
                     if (removed) setPeople((prev) => [...prev, removed]);
-                    toast('Couldn’t merge people');
+                    toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
         },
         [people, fetchPeople, toast],
@@ -1002,7 +1003,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 })
                 .catch(() => {
                     if (removed.length) setPeople((prev) => [...prev, ...removed]);
-                    toast('Couldn’t merge people');
+                    toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
         },
         [people, fetchPeople, toast],
@@ -1018,7 +1019,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast('Person deleted'))
             .catch(() => {
                 if (removed) setPeople((prev) => [...prev, removed]);
-                toast('Couldn’t delete person');
+                toast('Couldn’t delete person', undefined, undefined, 'error');
             });
     }, [people, toast]);
 
@@ -1031,7 +1032,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`))
             .catch(() => {
                 if (removed.length) setPeople((prev) => [...prev, ...removed]);
-                toast('Couldn’t delete people');
+                toast('Couldn’t delete people', undefined, undefined, 'error');
             });
     }, [people, toast]);
 
@@ -1060,21 +1061,21 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const invite = useCallback((email: string, targetType: 'join' | 'fresh') => {
         void library.sendInvite(email, targetType)
             .then(() => { toast(`Invite sent to ${email}`); void fetchMembers(); })
-            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t send invite'));
+            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t send invite', undefined, undefined, 'error'));
     }, [fetchMembers, toast]);
 
     const revokeInvite = useCallback((inviteId: string) => {
         setPendingInvites((prev) => prev.filter((p) => p.inviteId !== inviteId));
         void library.revokePendingInvite(inviteId)
             .then(() => toast('Invitation revoked'))
-            .catch(() => { toast('Couldn’t revoke invite'); void fetchMembers(); });
+            .catch(() => { toast('Couldn’t revoke invite', undefined, undefined, 'error'); void fetchMembers(); });
     }, [fetchMembers, toast]);
 
     const removeMember = useCallback((userId: string) => {
         setMembers((prev) => prev.filter((m) => m.userId !== userId));
         void library.removeMember(userId)
             .then(() => toast('Member removed'))
-            .catch(() => { toast('Couldn’t remove member'); void fetchMembers(); });
+            .catch(() => { toast('Couldn’t remove member', undefined, undefined, 'error'); void fetchMembers(); });
     }, [fetchMembers, toast]);
 
     const renameLibrary = useCallback((name: string) => {
@@ -1084,7 +1085,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setLibraryName(trimmed);
         void library.renameLibrary(trimmed)
             .then(() => toast('Library renamed'))
-            .catch(() => { setLibraryName(previous); toast('Couldn’t rename library'); });
+            .catch(() => { setLibraryName(previous); toast('Couldn’t rename library', undefined, undefined, 'error'); });
     }, [libraryName, toast]);
 
     const value = useMemo<Store>(

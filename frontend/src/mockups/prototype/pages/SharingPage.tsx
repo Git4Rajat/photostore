@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { PaperAirplaneIcon } from '@heroicons/react/24/outline';
+import { Send as PaperAirplaneIcon } from 'lucide-react';
 import { useStore } from '../store';
-import { Avatar } from '../components/bits';
+import { Avatar, Spinner } from '../components/bits';
 import * as library from '../../../services/libraryClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
@@ -71,7 +71,7 @@ export const SharingPage: React.FC = () => {
         }
         void library.requestLibraryClean(password)
             .then((res) => toast(res.sentTo?.length ? `Confirmation link sent to ${res.sentTo.join(', ')}` : 'Cleanup confirmation requested'))
-            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t start cleanup'));
+            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t start cleanup', undefined, undefined, 'error'));
     };
 
     return (
@@ -84,7 +84,7 @@ export const SharingPage: React.FC = () => {
             </div>
 
             <div className="card-glass lib-card">
-                {membersLoading && members.length === 0 && <div className="member-row"><span className="member-meta"><b>Loading members…</b></span></div>}
+                {membersLoading && members.length === 0 && <Spinner label="Loading members…" center={false} />}
                 {members.map((m) => (
                     <div key={m.userId} className="member-row">
                         <Avatar initials={initialsFor(m.email || m.userId)} />

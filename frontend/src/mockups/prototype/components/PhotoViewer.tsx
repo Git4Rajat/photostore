@@ -1,19 +1,18 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-    ArrowLeftIcon,
-    ArrowUturnLeftIcon,
-    ArrowUturnRightIcon,
-    ChevronLeftIcon,
-    ChevronRightIcon,
-    EllipsisHorizontalIcon,
-    MagnifyingGlassMinusIcon,
-    MagnifyingGlassPlusIcon,
-    PlusIcon,
-    TrashIcon,
-} from '@heroicons/react/24/outline';
-import { HeartIcon as HeartSolid } from '@heroicons/react/24/solid';
-import { HeartIcon as HeartOutline } from '@heroicons/react/24/outline';
-import { Menu, Stars } from './bits';
+    ArrowLeft as ArrowLeftIcon,
+    RotateCcw as ArrowUturnLeftIcon,
+    RotateCw as ArrowUturnRightIcon,
+    ChevronLeft as ChevronLeftIcon,
+    ChevronRight as ChevronRightIcon,
+    MoreHorizontal as EllipsisHorizontalIcon,
+    ZoomOut as MagnifyingGlassMinusIcon,
+    ZoomIn as MagnifyingGlassPlusIcon,
+    Plus as PlusIcon,
+    Trash2 as TrashIcon,
+    Heart,
+} from 'lucide-react';
+import { Menu, Stars, Spinner } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
 import { useStore, isVideoFilename } from '../store';
 import { useMainMedia, downloadPhoto, fetchPhotoMetadata, setPhotoRotation } from '../media';
@@ -90,7 +89,7 @@ export const PhotoViewer: React.FC = () => {
         applyPhotoRotation(pending.filename, pending.rotation);
         void setPhotoRotation(pending.filename, pending.rotation).catch(() => {
             applyPhotoRotation(pending.filename, pending.previous);
-            toast('Couldn’t save rotation');
+            toast('Couldn’t save rotation', undefined, undefined, 'error');
         });
     }, [toast, applyPhotoRotation]);
 
@@ -129,6 +128,21 @@ export const PhotoViewer: React.FC = () => {
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
     const photoRef = useRef<HTMLDivElement>(null);
+    // Focus management for the modal (HIG: a modal traps focus and restores it
+    // to the trigger on close).
+    const rootRef = useRef<HTMLDivElement>(null);
+    const restoreFocusRef = useRef<HTMLElement | null>(null);
+    const isOpen = Boolean(viewer);
+    useEffect(() => {
+        if (!isOpen) return undefined;
+        restoreFocusRef.current = (document.activeElement as HTMLElement) ?? null;
+        // Focus the dialog itself so Tab starts inside it and SR announces it.
+        rootRef.current?.focus();
+        return () => {
+            const el = restoreFocusRef.current;
+            if (el && typeof el.focus === 'function' && document.contains(el)) el.focus();
+        };
+    }, [isOpen]);
 
     const resetZoom = useCallback(() => { setZoom(1); setPan({ x: 0, y: 0 }); }, []);
     const zoomBy = useCallback((delta: number) => {
@@ -190,6 +204,28 @@ export const PhotoViewer: React.FC = () => {
             if (e.key === 'ArrowRight') viewerStep(1);
             if (e.key === '+' || e.key === '=') zoomBy(ZOOM_STEP);
             if (e.key === '-' || e.key === '_') zoomBy(-ZOOM_STEP);
+            if (e.key === 'Tab') {
+                // Trap Tab within the dialog so focus can't wander to the
+                // (visually hidden) page behind the overlay.
+                const root = rootRef.current;
+                if (!root) return;
+                const focusables = Array.from(
+                    root.querySelectorAll<HTMLElement>(
+                        'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+                    ),
+                ).filter((el) => el.offsetParent !== null || el === root);
+                if (!focusables.length) { e.preventDefault(); root.focus(); return; }
+                const first = focusables[0];
+                const last = focusables[focusables.length - 1];
+                const active = document.activeElement as HTMLElement;
+                if (e.shiftKey && (active === first || active === root)) {
+                    e.preventDefault();
+                    last.focus();
+                } else if (!e.shiftKey && active === last) {
+                    e.preventDefault();
+                    first.focus();
+                }
+            }
         };
         document.addEventListener('keydown', onKey);
         return () => document.removeEventListener('keydown', onKey);
@@ -328,7 +364,7 @@ export const PhotoViewer: React.FC = () => {
     const locationLine = [loc.city, loc.country].filter(Boolean).join(', ');
 
     return (
-        <div className="pt-viewer" role="dialog" aria-modal="true" aria-label="Photo viewer">
+        <div ref={rootRef} tabIndex={-1} className="pt-viewer" role="dialog" aria-modal="true" aria-label="Photo viewer">
             <div className="pt-viewer-top">
                 <button type="button" className="pt-viewer-back" onClick={closeViewer}>
                     <ArrowLeftIcon /> Back
@@ -384,7 +420,7 @@ export const PhotoViewer: React.FC = () => {
                                 style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)` }}
                             />
                         ) : (
-                            <div className="pt-viewer-loading">Loading…</div>
+                            <div className="pt-viewer-loading"><Spinner label="" center={false} /></div>
                         )}
                     </div>
                     <button
@@ -487,7 +523,7 @@ export const PhotoViewer: React.FC = () => {
                 </div>
                 <div className="pt-vb-group center">
                     <button type="button" className={`pt-vb-btn${photo.liked ? ' on' : ''}`} onClick={() => toggleLike(photo.id)}>
-                        {photo.liked ? <HeartSolid /> : <HeartOutline />} <span>Like</span>
+                        <Heart fill={photo.liked ? 'currentColor' : 'none'} /> <span>Like</span>
                     </button>
                     <AddToAlbumMenu
                         photoIds={[photo.id]}
@@ -509,7 +545,7 @@ export const PhotoViewer: React.FC = () => {
                         {(close) => (
                             <div className="pt-more-menu">
                                 <button type="button" onClick={() => { setShowInfo(true); close(); }}>Photo info</button>
-                                <button type="button" onClick={() => { close(); void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed')); }}>Download</button>
+                                <button type="button" onClick={() => { close(); void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed', undefined, undefined, 'error')); }}>Download</button>
                                 <button type="button" onClick={() => { close(); navigate('tools', { filenames: photo.filename }); }}>Open in Workbench</button>
                                 {route.page !== 'gallery' && (
                                     <button

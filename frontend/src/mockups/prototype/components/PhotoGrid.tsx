@@ -1,6 +1,5 @@
 import React from 'react';
-import { CheckCircleIcon, HeartIcon } from '@heroicons/react/24/solid';
-import { StarIcon } from '@heroicons/react/24/solid';
+import { CircleCheck as CheckCircleIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { usePhotoThumbnails } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
@@ -191,10 +190,10 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                             <CheckCircleIcon />
                         </button>
                         <span className="pt-tile-badges" aria-hidden="true">
-                            {photo.liked && <HeartIcon className="liked" />}
+                            {photo.liked && <HeartIcon className="liked" fill="currentColor" />}
                             {photo.rating > 0 && (
                                 <span className="rating">
-                                    <StarIcon /> {photo.rating}
+                                    <StarIcon fill="currentColor" /> {photo.rating}
                                 </span>
                             )}
                         </span>

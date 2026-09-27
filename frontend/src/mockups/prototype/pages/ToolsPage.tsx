@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowsPointingOutIcon, InformationCircleIcon } from '@heroicons/react/24/outline';
+import { Maximize2 as ArrowsPointingOutIcon, Info as InformationCircleIcon } from 'lucide-react';
 import { useStore } from '../store';
 import WorkbenchGrid from '../components/WorkbenchGrid';
+import { Spinner } from '../components/bits';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import type { BrowserProcessingAction } from '../../../components/AppServicesProvider';
 import { getTools, postTools, postAdmin, getExtras } from '../../../services/apiClient';
@@ -84,12 +85,12 @@ export const ToolsPage: React.FC = () => {
             const res = await getTools<{ filenames?: string[] }>(`/api/tools/workbench/actions/${actionId}`);
             const filenames = Array.isArray(res?.filenames) ? res.filenames : [];
             if (!filenames.length) {
-                toast("Those photos aren't available anymore");
+                toast("Those photos aren't available anymore", undefined, undefined, 'error');
                 return;
             }
             navigate('tools', { filenames: filenames.join(',') });
         } catch {
-            toast('Couldn’t reselect those photos');
+            toast('Couldn’t reselect those photos', undefined, undefined, 'error');
         } finally {
             setReselectingId(null);
         }
@@ -176,7 +177,7 @@ export const ToolsPage: React.FC = () => {
                 ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${wbSteps.join(', ')}`
                 : `Queued ${wbSelection.length} photo${wbSelection.length === 1 ? '' : 's'} · ${wbSteps.join(', ')}`);
         } catch {
-            toast('Couldn’t start processing');
+            toast('Couldn’t start processing', undefined, undefined, 'error');
         }
     };
 
@@ -195,7 +196,7 @@ export const ToolsPage: React.FC = () => {
                 ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${steps.join(', ')}`
                 : `Started ${steps.join(', ')} — pulling pending photos…`);
         } catch {
-            toast('Couldn’t start processing');
+            toast('Couldn’t start processing', undefined, undefined, 'error');
         }
     };
 
@@ -213,7 +214,7 @@ export const ToolsPage: React.FC = () => {
             recordAction([], 'library', undefined, label);
             toast(`${label} started`);
         } catch {
-            toast(`Couldn’t start ${label.toLowerCase()}`);
+            toast(`Couldn’t start ${label.toLowerCase()}`, undefined, undefined, 'error');
         } finally {
             setBusy(false);
         }
@@ -353,7 +354,7 @@ export const ToolsPage: React.FC = () => {
             {tab === 'History' && (
                 <div className="card-glass pt-history">
                     {historyLoading ? (
-                        <div className="pt-history-row">Loading history…</div>
+                        <Spinner label="Loading history…" center={false} />
                     ) : history.length === 0 ? (
                         <div className="pt-history-row">No recent actions.</div>
                     ) : (
@@ -392,7 +393,7 @@ export const ToolsPage: React.FC = () => {
                                 {diagnosticLoading ? 'Refreshing…' : 'Refresh'}
                             </button>
                         </div>
-                        {diagnosticLoading && !diagnostic && <span>Running diagnostics…</span>}
+                        {diagnosticLoading && !diagnostic && <Spinner label="Running diagnostics…" center={false} />}
                         {!diagnosticLoading && !diagnostic && <span>Couldn’t load diagnostics.</span>}
                         {diagnostic && (
                             <>

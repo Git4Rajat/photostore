@@ -1,7 +1,8 @@
 import React, { useEffect } from 'react';
-import { ArrowUturnLeftIcon, TrashIcon } from '@heroicons/react/24/outline';
+import { Undo2 as ArrowUturnLeftIcon, Trash2 as TrashIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { usePhotoThumbnails } from '../media';
+import { confirmDialog } from '../../../components/shared/dialogs';
 
 /** Recently Deleted — restore individually or all, or purge for good. */
 export const TrashPage: React.FC = () => {
@@ -18,6 +19,36 @@ export const TrashPage: React.FC = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    // Purging is the one irreversible action in the app, so each entry point
+    // confirms first (HIG: confirm destructive, unrecoverable actions).
+    const confirmPurgePhoto = async (id: string) => {
+        const ok = await confirmDialog({
+            title: 'Delete this photo forever?',
+            message: 'This permanently removes it. This can’t be undone.',
+            confirmLabel: 'Delete forever',
+            danger: true,
+        });
+        if (ok) purgePhoto(id);
+    };
+    const confirmPurgeAll = async () => {
+        const ok = await confirmDialog({
+            title: `Empty Recently Deleted?`,
+            message: `This permanently removes all ${trash.length} photo${trash.length === 1 ? '' : 's'}. This can’t be undone.`,
+            confirmLabel: 'Empty trash',
+            danger: true,
+        });
+        if (ok) purgeAllTrash();
+    };
+    const confirmPurgeAlbum = async (id: string, name: string) => {
+        const ok = await confirmDialog({
+            title: `Delete “${name}” forever?`,
+            message: 'This permanently removes the album. This can’t be undone.',
+            confirmLabel: 'Delete forever',
+            danger: true,
+        });
+        if (ok) purgeAlbum(id);
+    };
+
     return (
         <div>
             <div className="pt-toolbar">
@@ -28,7 +59,7 @@ export const TrashPage: React.FC = () => {
                 {trash.length > 0 && (
                     <div className="pt-toolbar-actions">
                         <button type="button" className="btn" onClick={restoreAllTrash}>Restore all</button>
-                        <button type="button" className="btn btn-danger" onClick={purgeAllTrash}>Empty trash</button>
+                        <button type="button" className="btn btn-danger" onClick={() => void confirmPurgeAll()}>Empty trash</button>
                     </div>
                 )}
             </div>
@@ -51,7 +82,7 @@ export const TrashPage: React.FC = () => {
                             )}
                             <div className="pt-trash-actions">
                                 <button type="button" title="Restore" aria-label="Restore" onClick={() => restorePhotos([t.photo.id])}><ArrowUturnLeftIcon /></button>
-                                <button type="button" title="Delete forever" aria-label="Delete forever" onClick={() => purgePhoto(t.photo.id)}><TrashIcon /></button>
+                                <button type="button" title="Delete forever" aria-label="Delete forever" onClick={() => void confirmPurgePhoto(t.photo.id)}><TrashIcon /></button>
                             </div>
                             <span className="pt-trash-days">{t.purgesInDays}d</span>
                         </div>
@@ -73,7 +104,7 @@ export const TrashPage: React.FC = () => {
                                     <span className="pt-album-trash-label">{t.album.name || 'Untitled album'} · purges in {t.purgesInDays}d</span>
                                     <span className="pt-album-trash-actions">
                                         <button type="button" className="btn-link" onClick={() => restoreAlbum(t.album.id)}>Restore</button>
-                                        <button type="button" className="btn-link pt-album-trash-purge" onClick={() => purgeAlbum(t.album.id)}>Delete forever</button>
+                                        <button type="button" className="btn-link pt-album-trash-purge" onClick={() => void confirmPurgeAlbum(t.album.id, t.album.name || 'Untitled album')}>Delete forever</button>
                                     </span>
                                 </div>
                             ))

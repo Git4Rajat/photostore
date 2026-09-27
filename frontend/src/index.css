@@ -27,7 +27,7 @@
   --bg-blob-2-end: rgba(111, 163, 201, 0.02);
 
   --text: #1e1c18;
-  --muted: #726c61;
+  --muted: #6b6458;
   --accent: #2f5d82;
   --accent-soft: rgba(47, 93, 130, 0.12);
   --danger: #d24b5a;
@@ -138,7 +138,7 @@ html[data-theme='light'] {
   --bg-blob-2-end: rgba(111, 163, 201, 0.02);
 
   --text: #1e1c18;
-  --muted: #726c61;
+  --muted: #6b6458;
   --accent: #2f5d82;
   --accent-soft: rgba(47, 93, 130, 0.12);
   --danger: #d24b5a;

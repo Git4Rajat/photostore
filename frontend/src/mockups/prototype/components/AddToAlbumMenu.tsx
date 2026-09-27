@@ -1,5 +1,5 @@
 import React from 'react';
-import { PlusIcon } from '@heroicons/react/24/outline';
+import { Plus as PlusIcon } from 'lucide-react';
 import { Menu } from './bits';
 import { useStore } from '../store';
 import { useProtectedBlobUrls } from '../../../services/imageClient';

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { MagnifyingGlassIcon, PlusIcon } from '@heroicons/react/24/outline';
+import { Search as MagnifyingGlassIcon, Plus as PlusIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
@@ -212,22 +212,23 @@ export const AskPage: React.FC = () => {
                 </div>
             </div>
 
-            <div className="pt-ask-box">
-                <MagnifyingGlassIcon />
+            <form className="pt-ask-box" role="search" onSubmit={(e) => { e.preventDefault(); runSearch(); }}>
+                <button type="submit" className="pt-ask-search" aria-label="Search">
+                    <MagnifyingGlassIcon />
+                </button>
                 <input
                     className="pt-ask-input"
+                    type="search"
+                    enterKeyHint="search"
                     autoFocus
                     placeholder="Search people, places, things, years…"
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                        if (e.key === 'Enter') runSearch();
-                    }}
                 />
                 {results.length > 0 && (
                     <button type="button" className="btn mock-cta" onClick={saveAsAlbum}><PlusIcon className="toolbar-icon" /> Save as album</button>
                 )}
-            </div>
+            </form>
 
             {suggestions.length > 0 && (
                 <div className="pt-suggest-row">
@@ -245,18 +246,24 @@ export const AskPage: React.FC = () => {
                 <>
                     {(matchedPeople.length > 0 || matchedPlaces.length > 0) && (
                         <div className="pt-match-cards">
-                            {matchedPeople.map((p) => (
-                                <div key={p.id} className="card-glass pt-match-card" onClick={() => navigate('person', { personId: p.id })} role="button" tabIndex={0}>
-                                    <Swatch swatch={p.swatch} className="pt-match-face" />
-                                    <div><b>{p.name}</b><span>{p.faceCount ?? 0} photos</span></div>
-                                </div>
-                            ))}
-                            {matchedPlaces.map((pl) => (
-                                <div key={pl.id} className="card-glass pt-match-card" onClick={() => navigate('ask', { query: pl.name })} role="button" tabIndex={0}>
-                                    <Swatch swatch={pl.swatch} className="pt-match-face" />
-                                    <div><b>{pl.name}</b><span>place</span></div>
-                                </div>
-                            ))}
+                            {matchedPeople.map((p) => {
+                                const go = () => navigate('person', { personId: p.id });
+                                return (
+                                    <div key={p.id} className="card-glass pt-match-card" onClick={go} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }} role="button" tabIndex={0}>
+                                        <Swatch swatch={p.swatch} className="pt-match-face" />
+                                        <div><b>{p.name}</b><span>{p.faceCount ?? 0} photos</span></div>
+                                    </div>
+                                );
+                            })}
+                            {matchedPlaces.map((pl) => {
+                                const go = () => navigate('ask', { query: pl.name });
+                                return (
+                                    <div key={pl.id} className="card-glass pt-match-card" onClick={go} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }} role="button" tabIndex={0}>
+                                        <Swatch swatch={pl.swatch} className="pt-match-face" />
+                                        <div><b>{pl.name}</b><span>place</span></div>
+                                    </div>
+                                );
+                            })}
                         </div>
                     )}
                     <div className="pt-menu-label">

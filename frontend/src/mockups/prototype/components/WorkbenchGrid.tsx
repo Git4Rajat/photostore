@@ -1,18 +1,16 @@
 import React, { useMemo, useState } from 'react';
 import {
-    CheckCircleIcon as CheckCircleSolid,
-    MagnifyingGlassIcon,
-} from '@heroicons/react/24/solid';
-import {
-    CameraIcon,
-    DocumentMagnifyingGlassIcon,
-    DocumentTextIcon,
-    InformationCircleIcon,
-    MapPinIcon,
-    Square2StackIcon,
-    SparklesIcon,
-    UserIcon,
-} from '@heroicons/react/24/outline';
+    CircleCheck as CheckCircleSolid,
+    Search as MagnifyingGlassIcon,
+    Camera as CameraIcon,
+    FileSearch as DocumentMagnifyingGlassIcon,
+    FileText as DocumentTextIcon,
+    Info as InformationCircleIcon,
+    MapPin as MapPinIcon,
+    Copy as Square2StackIcon,
+    Sparkles as SparklesIcon,
+    User as UserIcon,
+} from 'lucide-react';
 import { usePhotoThumbnails, fetchPhotoMetadata } from '../media';
 import type { PhotoMetadata } from '../media';
 import type { Photo } from '../types';
@@ -102,7 +100,14 @@ const WorkbenchTile: React.FC<{
                     {WORKBENCH_STEPS.map((step) => {
                         const status = statusFor(photo, step);
                         const Icon = STEP_ICONS[step];
-                        return <Icon key={step} className={`wb-step-icon ${status}`} title={`${step}: ${status}`} />;
+                        // A small shape badge (✓ ✕ ! ·) rides each icon so status
+                        // isn't conveyed by color alone (HIG/WCAG: don't rely on
+                        // color to communicate meaning).
+                        return (
+                            <span key={step} className={`wb-step wb-step-${status}`} title={`${step}: ${status}`}>
+                                <Icon className={`wb-step-icon ${status}`} />
+                            </span>
+                        );
                     })}
                 </div>
             </div>

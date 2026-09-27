@@ -1,13 +1,12 @@
 import React from 'react';
 import {
-    EllipsisVerticalIcon,
-    PlusIcon,
-    StarIcon,
-    TrashIcon,
-    WrenchScrewdriverIcon,
-    XMarkIcon,
-} from '@heroicons/react/24/outline';
-import { Menu, Stars } from './bits';
+    MoreVertical as EllipsisVerticalIcon,
+    Plus as PlusIcon,
+    Star as StarIcon,
+    Trash2 as TrashIcon,
+    Wrench as WrenchScrewdriverIcon,
+} from 'lucide-react';
+import { Menu, Stars, SelectionBar } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
 import { useStore } from '../store';
 
@@ -24,18 +23,7 @@ export const CommandBar: React.FC = () => {
     if (!selection.length) return null;
 
     return (
-        <div className="pt-floating-menu" role="toolbar" aria-label="Selection actions">
-            <button
-                type="button"
-                className="pt-fm-close"
-                onClick={clearSelection}
-                aria-label="Clear selection"
-            >
-                <XMarkIcon />
-            </button>
-
-            <div className="pt-fm-badge">{selection.length}</div>
-
+        <SelectionBar count={selection.length} onClear={clearSelection} label="Selection actions">
             <button
                 type="button"
                 className="pt-fm-delete"
@@ -85,7 +73,7 @@ export const CommandBar: React.FC = () => {
                     </div>
                 )}
             </Menu>
-        </div>
+        </SelectionBar>
     );
 };
 

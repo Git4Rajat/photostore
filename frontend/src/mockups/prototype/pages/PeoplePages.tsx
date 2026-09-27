@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeftIcon, CheckIcon, SparklesIcon, TrashIcon, UserGroupIcon } from '@heroicons/react/24/outline';
+import { ArrowLeft as ArrowLeftIcon, Check as CheckIcon, Sparkles as SparklesIcon, Trash2 as TrashIcon, Users as UserGroupIcon } from 'lucide-react';
 import { useStore } from '../store';
-import { Swatch } from '../components/bits';
+import { Swatch, Spinner, SelectionBar } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { confirmDialog } from '../../../components/shared/dialogs';
@@ -56,7 +56,10 @@ export const PeoplePage: React.FC = () => {
 
     if (peopleLoading && people.length === 0) {
         return (
-            <div className="pt-toolbar"><div><h1 className="pt-page-title">People</h1><p className="pt-page-sub">Loading…</p></div></div>
+            <div>
+                <div className="pt-toolbar"><div><h1 className="pt-page-title">People</h1></div></div>
+                <Spinner label="Loading people…" />
+            </div>
         );
     }
 
@@ -99,8 +102,7 @@ export const PeoplePage: React.FC = () => {
                 })}
             </div>
             {selectMode && selectedIds.length > 0 && (
-                <div className="pt-floating-menu" role="toolbar" aria-label="People selection actions">
-                    <div className="pt-fm-badge">{selectedIds.length}</div>
+                <SelectionBar count={selectedIds.length} onClear={exitSelectMode} label="People selection actions">
                     <button
                         type="button"
                         className="pt-fm-delete"
@@ -114,7 +116,7 @@ export const PeoplePage: React.FC = () => {
                             <UserGroupIcon />
                         </button>
                     )}
-                </div>
+                </SelectionBar>
             )}
         </div>
     );
@@ -190,7 +192,7 @@ export const PersonDetailPage: React.FC = () => {
             <p className="pt-page-sub pt-person-count">{photos?.length ?? person.faceCount ?? 0} photos</p>
 
             {photos === undefined && personPhotosLoading ? (
-                <p className="pt-grid-empty">Loading photos…</p>
+                <Spinner label="Loading photos…" center={false} />
             ) : (
                 <PhotoGrid photos={photos ?? []} emptyHint="No photos for this person yet." />
             )}
