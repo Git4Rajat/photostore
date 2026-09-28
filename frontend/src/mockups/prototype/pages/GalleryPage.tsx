@@ -3,6 +3,7 @@ import { ArrowUpTrayIcon, MagnifyingGlassMinusIcon, MagnifyingGlassPlusIcon, Pho
 import { useStore, isVideoFilename } from '../store';
 import type { MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
+import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineRail from '../components/TimelineRail';
 
@@ -69,8 +70,12 @@ export const GalleryPage: React.FC = () => {
         if (e.touches.length < 2) pinchRef.current = null;
     };
 
-    // Refresh the grid whenever an upload session finishes so new photos appear.
-    useEffect(() => registerUploadCompletionHandler(() => { reloadPhotos(); }), [registerUploadCompletionHandler, reloadPhotos]);
+    // Refresh the grid whenever an upload session finishes so new photos
+    // appear. The cached sort-index (see localSortIndex.ts) must be dropped
+    // first -- otherwise reloadPhotos would re-sort/paginate the same stale
+    // in-memory snapshot from before the upload instead of picking up the
+    // newly-added photos.
+    useEffect(() => registerUploadCompletionHandler(() => { invalidateLocalSortIndex(); reloadPhotos(); }), [registerUploadCompletionHandler, reloadPhotos]);
 
     // Deleting every currently-loaded photo (e.g. "Select visible" + delete)
     // can empty `photos` while more pages still exist further down -- without

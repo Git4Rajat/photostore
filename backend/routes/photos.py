@@ -820,6 +820,49 @@ def photos_search_index():
         response_payload.update(vector_index_payload)
     return app.jsonify(response_payload)
 
+@photos_bp.route('/api/photos/sort-index', methods=['GET'])
+def photos_sort_index():
+    # Hands the browser a direct SAS URL to the per-user sort-index blob
+    # (filename/captureDate/rating/likes/uploadDate only) -- see
+    # localSortIndex.ts on the frontend, which downloads this once per
+    # session and does its own local sort/paginate over it so /photos page
+    # requests don't have to materialize and sort the whole library
+    # server-side. Own manifest/dirty-cycle, independent of the lexical
+    # index -- see get_user_sort_index's module comment in storage_utils.py.
+    # Mirrors photos_search_index below almost exactly, just without the
+    # vector-index/people-name-index payload this doesn't need -- EXCEPT for
+    # status code on the "not available" case: this endpoint gates the
+    # primary gallery load (see fetchPhotos in store.tsx), unlike
+    # photos_search_index which only gates a bonus search feature. A plain
+    # 503 here would hit httpClient.ts's cold-start retry loop (any 503 is
+    # treated as "ingress rejected before reaching the app, safe to retry" --
+    # see isRetriableColdStart), stalling the gallery for up to ~90s of
+    # retries before the frontend's own fallback-to-legacy-endpoint path ever
+    # gets a chance to run. 200 with available:false lets the frontend react
+    # immediately.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    try:
+        sort_index = app.get_user_sort_index(user_id, allow_refresh=True)
+    except Exception:
+        sort_index = None
+    if sort_index is None:
+        return app.jsonify({'available': False})
+    try:
+        container_name, blob_name = app.get_sort_index_blob_location(user_id)
+        index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
+    except Exception:
+        app.app.logger.exception('Failed to mint sort index SAS URL for %s', user_id)
+        return app.jsonify({'available': False})
+    return app.jsonify({
+        'available': True,
+        'indexUrl': index_url,
+        'expiresAt': expires_at,
+        'sourceVersion': sort_index.get('source_version'),
+        'updatedAt': sort_index.get('updated_at'),
+    })
+
 @photos_bp.route('/photos/metadata', methods=['POST'])
 @photos_bp.route('/photos/metadata/', methods=['POST'])
 @photos_bp.route('/api/photos/metadata', methods=['POST'])

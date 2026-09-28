@@ -93,6 +93,10 @@ def test_touch_marks_both_index_kinds_dirty(ctx):
 
     assert storage_utils._get_dirty_search_index_filenames('u1', 'lexical') == {'a.jpg', 'b.jpg'}
     assert storage_utils._get_dirty_search_index_filenames('u1', 'vector') == {'a.jpg', 'b.jpg'}
+    # touch_user_search_indexes_state also dirties the sort index (see
+    # test_sort_index.py for its independent-dirtying tests) -- this pins
+    # that the shared _SEARCH_INDEX_KINDS loop still covers it here too.
+    assert storage_utils._get_dirty_search_index_filenames('u1', 'sort') == {'a.jpg', 'b.jpg'}
 
 
 def test_touch_with_single_filename_string_not_list(ctx):

@@ -96,6 +96,11 @@ from storage_utils import (
     delete_user_vector_index_data,
     touch_user_search_indexes_state,
     metadata_updates_affect_search_indexes,
+    metadata_updates_affect_sort_index,
+    touch_user_sort_index_dirty,
+    get_user_sort_index,
+    get_sort_index_blob_location,
+    delete_user_sort_index_data,
     get_user_lexical_index,
     get_lexical_index_blob_location,
     invalidate_user_lexical_index_cache,
@@ -2702,6 +2707,8 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             _invalidate_metadata_scan_cache(user_id)
             if metadata_updates_affect_search_indexes(updates or {}):
                 touch_user_search_indexes_state(user_id, filenames=filename)
+            elif metadata_updates_affect_sort_index(updates or {}):
+                touch_user_sort_index_dirty(user_id, [filename])
             return entity
         except ResourceNotFoundError:
             # Deleted between our read and this write -- nothing left to retry.
@@ -7947,6 +7954,7 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_vector_index_data(library_id)
     delete_user_lexical_index_data(library_id)
     delete_user_tag_embedding_index_data(library_id)
+    delete_user_sort_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
     return {'photosDeleted': len(metadata_rows), 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}

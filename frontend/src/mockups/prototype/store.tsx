@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
+import { getLocalSortIndex, patchLocalSortIndexRow } from '../../services/localSortIndex';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
@@ -362,33 +363,95 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const albumById = useCallback((id: string) => albums.find((a) => a.id === id), [albums]);
     const personById = useCallback((id: string) => people.find((p) => p.id === id), [people]);
 
-    // Server-paged photo fetch (mirrors PhotoGallery's /photos?sort=..&offset=..&limit=..).
+    // Legacy server-paged fetch (was the only path; now the fallback -- see
+    // fetchPhotos below). Materializes and sorts the whole library
+    // server-side per request, which is the O(library size) cost the
+    // sort-index path exists to avoid; kept only so the gallery degrades
+    // gracefully instead of breaking when the sort-index is unavailable.
+    const fetchPhotosViaLegacyEndpoint = useCallback(async (offset: number, reset: boolean) => {
+        const range = captureRangeRef.current;
+        const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
+        const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
+            `/photos?sort=capture&offset=${offset}&limit=${PAGE_SIZE}${rangeQuery}`,
+        );
+        const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
+        photoOffsetRef.current = offset + list.length;
+        photoHasMoreRef.current = list.length === PAGE_SIZE;
+        setHasMorePhotos(photoHasMoreRef.current);
+        if (typeof res?.total === 'number') setTotalPhotos(res.total);
+        setPhotos((prev) => (reset ? list : [...prev, ...list]));
+    }, []);
+
+    // Server-paged photo fetch. Primary path: download the whole-library
+    // sort-index once per session (see localSortIndex.ts), sort/paginate it
+    // locally, then a single targeted /api/photos/lookup-batch call for just
+    // this page's full photo data -- so a scroll/page-load no longer makes
+    // the backend materialize and sort the entire library per request (see
+    // the sort-index's module comment in storage_utils.py). Falls back to
+    // fetchPhotosViaLegacyEndpoint above on any failure (cold library with no
+    // index built yet, network error, anything) so the gallery never breaks.
     const fetchPhotos = useCallback(async (reset: boolean) => {
         if (photoLoadingRef.current) return;
         if (!reset && !photoHasMoreRef.current) return;
         photoLoadingRef.current = true;
         setPhotosLoading(true);
         const offset = reset ? 0 : photoOffsetRef.current;
-        const range = captureRangeRef.current;
-        const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
         try {
-            const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
-                `/photos?sort=capture&offset=${offset}&limit=${PAGE_SIZE}${rangeQuery}`,
-            );
-            const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
-            photoOffsetRef.current = offset + list.length;
-            photoHasMoreRef.current = list.length === PAGE_SIZE;
+            const sortIndex = await getLocalSortIndex();
+            if (!sortIndex) {
+                throw new Error('sort index unavailable');
+            }
+            const range = captureRangeRef.current;
+            const startMs = range?.start ? new Date(range.start).getTime() : null;
+            const endMs = range?.end ? new Date(range.end).getTime() : null;
+            const filtered = (startMs === null && endMs === null)
+                ? sortIndex
+                : sortIndex.filter((row) => {
+                    if (!row.captureDate) return false;
+                    const t = new Date(row.captureDate).getTime();
+                    if (Number.isNaN(t)) return false;
+                    if (startMs !== null && t < startMs) return false;
+                    if (endMs !== null && t > endMs) return false;
+                    return true;
+                });
+            // captureDate desc, filename tie-break -- matches the backend's
+            // own default order (see app.py's _cached_sorted_metadata_list_rows_for_user).
+            const sorted = [...filtered].sort((a, b) => {
+                const at = a.captureDate ? new Date(a.captureDate).getTime() : 0;
+                const bt = b.captureDate ? new Date(b.captureDate).getTime() : 0;
+                if (at !== bt) return bt - at;
+                return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
+            });
+            const total = sorted.length;
+            const pageFilenames = sorted.slice(offset, offset + PAGE_SIZE).map((row) => row.filename);
+            const lookupRes = pageFilenames.length
+                ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames })
+                : { photos: [] };
+            const byFilename = new Map((lookupRes?.photos ?? []).map((p) => [p.filename, p]));
+            // Re-order to match the sort-index's order -- lookup-batch may
+            // silently drop a filename deleted between the index build and
+            // this page fetch, so don't assume a 1:1 positional response.
+            const list = pageFilenames
+                .map((f) => byFilename.get(f))
+                .filter((p): p is BackendPhoto => Boolean(p))
+                .map(mapPhoto);
+            photoOffsetRef.current = offset + pageFilenames.length;
+            photoHasMoreRef.current = offset + pageFilenames.length < total;
             setHasMorePhotos(photoHasMoreRef.current);
-            if (typeof res?.total === 'number') setTotalPhotos(res.total);
+            setTotalPhotos(total);
             setPhotos((prev) => (reset ? list : [...prev, ...list]));
         } catch {
-            photoHasMoreRef.current = false;
-            setHasMorePhotos(false);
+            try {
+                await fetchPhotosViaLegacyEndpoint(offset, reset);
+            } catch {
+                photoHasMoreRef.current = false;
+                setHasMorePhotos(false);
+            }
         } finally {
             photoLoadingRef.current = false;
             setPhotosLoading(false);
         }
-    }, []);
+    }, [fetchPhotosViaLegacyEndpoint]);
 
     useEffect(() => {
         void fetchPhotos(true);
@@ -543,10 +606,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const set = new Set(ids);
             const prevRatings = new Map(photos.filter((p) => set.has(p.id)).map((p) => [p.id, p.rating]));
             setPhotos((prev) => prev.map((p) => (set.has(p.id) ? { ...p, rating } : p)));
+            // Keep the local sort-index in step so a re-sort/re-scroll this
+            // session reflects the new rating immediately, without waiting on
+            // the backend's independent sort-index manifest to catch up.
+            ids.forEach((id) => patchLocalSortIndexRow(id, { rating }));
             void post('/photos/rate-multiple', { filenames: ids, rating })
                 .then(() => reloadAlbums())
                 .catch(() => {
                     setPhotos((prev) => prev.map((p) => (prevRatings.has(p.id) ? { ...p, rating: prevRatings.get(p.id)! } : p)));
+                    prevRatings.forEach((prevRating, id) => patchLocalSortIndexRow(id, { rating: prevRating }));
                     toast('Couldn’t save rating');
                 });
         },
@@ -560,17 +628,21 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const prevLikes = current?.likes ?? 0;
             const optimisticLikes = Math.max(0, prevLikes + (nextLiked ? 1 : -1));
             setPhotos((prev) => prev.map((p) => (p.id === id ? { ...p, liked: nextLiked, likes: optimisticLikes } : p)));
+            patchLocalSortIndexRow(id, { likes: optimisticLikes });
             void post<{ liked?: boolean; likes?: number }>(`/photos/${encodeURIComponent(id)}/like`, {})
                 .then((res) => {
+                    const likes = res.likes ?? optimisticLikes;
                     setPhotos((prev) => prev.map((p) => (p.id === id
-                        ? { ...p, liked: res.liked ?? nextLiked, likes: res.likes ?? optimisticLikes }
+                        ? { ...p, liked: res.liked ?? nextLiked, likes }
                         : p)));
+                    patchLocalSortIndexRow(id, { likes });
                     reloadAlbums();
                 })
                 .catch(() => {
                     setPhotos((prev) => prev.map((p) => (p.id === id
                         ? { ...p, liked: Boolean(current?.liked), likes: prevLikes }
                         : p)));
+                    patchLocalSortIndexRow(id, { likes: prevLikes });
                     toast('Couldn’t update like');
                 });
         },
