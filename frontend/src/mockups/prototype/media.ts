@@ -3,6 +3,7 @@ import { get, post, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress } from '../../services/imageClient';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
+import { resolveMediaAccessUrls } from '../../services/mediaAccessCache';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
 import { isRawFilename } from '../../utils/photoDisplay';
 import type { Photo } from './types';
@@ -83,14 +84,39 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
 
 // Mint a scoped access URL for one of the photo's media tiers. Returns '' when
 // that tier isn't available yet (e.g. a preview that hasn't been generated).
+//
+// Routed through the batched, cached resolvers (mediaAccessCache.ts /
+// thumbnailAccessCache.ts) instead of the single-item
+// GET /api/photos/access/<kind>/<filename> route this used to call directly:
+// that route did a guaranteed Table Storage point-read on every single photo
+// view/navigation, never cached, never batched. Even resolving one filename
+// through the batch endpoint is cheaper (it reads the already-warm gallery
+// scan cache instead of a fresh point-read), and a photo re-opened within the
+// session -- or preloaded as a viewer neighbor, see preloadMediaAccessUrls
+// below -- resolves from the in-memory/localStorage cache with no backend
+// call at all.
 const accessUrl = async (kind: 'preview' | 'image' | 'thumbnail', filename: string): Promise<string> => {
-    try {
-        const res = await get(`/api/photos/access/${kind}/${encodeURIComponent(filename)}`);
-        return res && typeof res.url === 'string' ? res.url : '';
-    } catch {
-        return '';
-    }
+    const map = kind === 'thumbnail'
+        ? await resolveThumbnailAccessUrls([filename])
+        : await resolveMediaAccessUrls(kind, [filename]);
+    return map.get(filename) || '';
 };
+
+/**
+ * Fire-and-forget cache warm for the viewer's neighbor photos (see
+ * PhotoViewer.tsx's preload effect): resolves 'preview' URLs for whichever of
+ * the given filenames aren't already cached, in one batched call, so
+ * navigating to them next/prev finds the URL already resolved instead of
+ * triggering a fresh backend round trip. Never throws -- resolveMediaAccessUrls
+ * already degrades to '' per filename on failure.
+ */
+export function preloadMediaAccessUrls(filenames: string[]): void {
+    const targets = filenames.filter(Boolean);
+    if (targets.length === 0) {
+        return;
+    }
+    void resolveMediaAccessUrls('preview', targets);
+}
 
 /**
  * Resolves the viewer image for a photo to an object URL, revoking it on
@@ -222,13 +248,10 @@ export async function setPhotoRotation(filename: string, rotation: number): Prom
 // original if available, then the preview, then a direct thumbnail SAS.
 const resolveDownloadTarget = async (photo: Photo): Promise<string> => {
     for (const kind of ['image', 'preview'] as const) {
-        try {
-            const res = await get(`/api/photos/access/${kind}/${encodeURIComponent(photo.filename)}`);
-            if (res && typeof res.url === 'string' && res.url) {
-                return res.url;
-            }
-        } catch {
-            // try the next kind
+        const map = await resolveMediaAccessUrls(kind, [photo.filename]);
+        const url = map.get(photo.filename);
+        if (url) {
+            return url;
         }
     }
     return photo.thumbnailUrl && isHttpUrl(photo.thumbnailUrl) ? photo.thumbnailUrl : '';

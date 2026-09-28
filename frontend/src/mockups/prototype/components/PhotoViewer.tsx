@@ -16,7 +16,7 @@ import { HeartIcon as HeartOutline } from '@heroicons/react/24/outline';
 import { Menu, Stars } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
 import { useStore, isVideoFilename } from '../store';
-import { useMainMedia, downloadPhoto, fetchPhotoMetadata, setPhotoRotation } from '../media';
+import { useMainMedia, downloadPhoto, fetchPhotoMetadata, setPhotoRotation, preloadMediaAccessUrls } from '../media';
 import type { PhotoMetadata } from '../media';
 
 const ZOOM_MIN = 1;
@@ -49,6 +49,18 @@ export const PhotoViewer: React.FC = () => {
 
     const index = viewer ? Math.min(viewer.index, Math.max(0, live.length - 1)) : 0;
     const photo = viewer && live.length ? live[index] : null;
+
+    // Warm the immediate next/prev neighbors' preview-access URLs in one
+    // batched call (see preloadMediaAccessUrls/mediaAccessCache.ts) whenever
+    // the active photo changes, so stepping through the viewer finds the URL
+    // already cached instead of firing a fresh backend round trip per photo.
+    useEffect(() => {
+        if (!photo) return;
+        const neighbors = [live[index - 1], live[index + 1]]
+            .filter((p): p is NonNullable<typeof p> => Boolean(p) && !isVideoFilename(p!.filename))
+            .map((p) => p!.filename);
+        preloadMediaAccessUrls(neighbors);
+    }, [live, index, photo]);
 
     // `rotation` is the photo's *absolute* manual orientation (0/90/180/270).
     // The server bakes only EXIF orientation into the preview it serves, never
