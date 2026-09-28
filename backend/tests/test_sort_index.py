@@ -431,3 +431,94 @@ def test_photos_sort_index_returns_available_true_with_sas_url(monkeypatch, sort
     assert payload['indexUrl'] == 'https://example.invalid/abc-sort.json.gz?sas'
     assert payload['sourceVersion'] == 'v2'
     assert payload['updatedAt'] == '2026-01-01'
+
+
+def test_photos_sort_index_route_never_forces_a_synchronous_cold_build(monkeypatch, sort_index_route_ctx):
+    """Regression pin: the gallery-load endpoint must call get_user_sort_index
+    with allow_sync_build=False so a cold library returns available:false
+    immediately (client falls back to legacy) instead of blocking the initial
+    load on a full-library scan -- which would also re-create the O(library
+    size) memory spike the whole sort index exists to eliminate."""
+    captured = {}
+
+    def _spy(user_id, **kwargs):
+        captured.update(kwargs)
+        return None  # simulate a cold library
+
+    monkeypatch.setattr(app, 'get_user_sort_index', _spy)
+
+    with app.app.test_request_context('/api/photos/sort-index'):
+        response = photos_sort_index()
+
+    assert captured.get('allow_sync_build') is False
+    assert response.status_code == 200
+    assert response.get_json() == {'available': False}
+
+
+# --- cold-build is non-blocking + column projection --------------------------
+
+def test_build_snapshot_selects_only_narrow_columns(sort_ctx, monkeypatch):
+    """Regression pin for the memory fix: the full-library build must SELECT a
+    narrow column set (no photoEmbedding/semanticEmbedding/ocrText/etc.), or a
+    cold build re-creates the very O(library-size) memory spike this index is
+    meant to relieve."""
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-sel', 'a.jpg', rating=1)
+
+    captured = {}
+    real_query = table.query_entities
+
+    def spying_query(filter_str, select=None):
+        captured['select'] = select
+        return real_query(filter_str, select=select)
+
+    monkeypatch.setattr(table, 'query_entities', spying_query)
+
+    storage_utils._build_user_sort_index_snapshot('lib-sel', 'v1')
+
+    assert captured['select'] is not None, 'build must pass a select= projection, not scan all columns'
+    assert 'photoEmbedding' not in captured['select']
+    assert 'semanticEmbedding' not in captured['select']
+    assert 'ocrText' not in captured['select']
+    # ...but must keep everything captureDate derivation + the deleted filter need.
+    for required in ('RowKey', 'processing_state', 'rating', 'likes', 'uploadDate', 'exifData', 'clientLastModified'):
+        assert required in captured['select'], f'{required} missing from sort-index select'
+
+
+def test_get_user_sort_index_cold_non_blocking_returns_none_then_builds_in_background(sort_ctx):
+    """With allow_sync_build=False, a cold library (no snapshot ever built)
+    returns None immediately WITHOUT running the full build inline, and kicks
+    the build off-thread so the next read is fast. If it had built
+    synchronously, the first call would have returned rows, not None."""
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-cold', 'a.jpg', rating=3)
+
+    result = storage_utils.get_user_sort_index('lib-cold', allow_refresh=True, allow_sync_build=False)
+    assert result is None  # did NOT block on a synchronous build
+
+    # The background rebuild it kicked off populates the blob; wait for the
+    # rebuild lock to free, then a non-refreshing read should serve it.
+    lock = storage_utils._SORT_INDEX_REBUILD_LOCKS.lock_for('lib-cold')
+    for _ in range(50):
+        if lock.acquire(blocking=False):
+            lock.release()
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail('background sort index build never completed')
+
+    built = storage_utils.get_user_sort_index('lib-cold', allow_refresh=False)
+    assert built is not None
+    assert [row['RowKey'] for row in built['rows']] == ['a.jpg']
+
+
+def test_get_user_sort_index_cold_sync_build_default_still_builds_inline(sort_ctx):
+    """Backward-compat pin: internal callers keep the default
+    allow_sync_build=True and get a synchronous cold build (result in hand on
+    the first call)."""
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-sync', 'a.jpg', rating=3)
+
+    result = storage_utils.get_user_sort_index('lib-sync', allow_refresh=True)
+    assert result is not None
+    assert [row['RowKey'] for row in result['rows']] == ['a.jpg']

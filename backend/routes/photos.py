@@ -844,7 +844,12 @@ def photos_sort_index():
     if error:
         return error
     try:
-        sort_index = app.get_user_sort_index(user_id, allow_refresh=True)
+        # allow_sync_build=False: never block the gallery's initial load on a
+        # cold full-library build (see get_user_sort_index). A not-yet-built
+        # library returns available:false immediately + builds off-thread; the
+        # client falls back to the legacy endpoint for this one load and the
+        # next load gets the fast path.
+        sort_index = app.get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
     except Exception:
         sort_index = None
     if sort_index is None:

@@ -2513,11 +2513,22 @@ _SORT_INDEX_SCHEMA_VERSION = 'v1'
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
-# The narrow row fields this index carries -- deliberately not
-# PHOTO_LIST_SELECT_FIELDS (that still carries raw exifData/processing status/
-# tags for the "listing" projection above); this index only needs what a
-# client-side sort/paginate over the whole library actually orders by.
-_SORT_INDEX_ROW_FIELDS = ('RowKey', 'captureDate', 'rating', 'likes', 'uploadDate')
+# The Table columns _build_user_sort_index_snapshot SELECTs -- deliberately
+# narrow (no photoEmbedding/semanticEmbedding/ocrText/tagMetadata/etc.),
+# because the whole point of this index is to relieve the backend-memory
+# pressure a full-column gallery scan causes; pulling the big columns just to
+# emit 5 small fields would reintroduce that spike on every cold build. Covers
+# the deleted-row filter (processing_state), the emitted fields (rating/likes/
+# uploadDate), and every field metadata_capture_datetime reads to derive
+# captureDate (exifData -> clientLastModified -> uploadDate/upload_started_at/
+# last_processing_update). RowKey is listed explicitly so a projecting select
+# still yields it -- real Azure returns PartitionKey/RowKey regardless, but a
+# strict projection (and the test fakes) only return selected columns.
+_SORT_INDEX_SOURCE_FIELDS = [
+    'PartitionKey', 'RowKey', 'processing_state',
+    'rating', 'likes', 'uploadDate',
+    'exifData', 'clientLastModified', 'upload_started_at', 'last_processing_update',
+]
 
 
 def _sort_index_json_blob_name(user_id: str) -> str:
@@ -2693,7 +2704,12 @@ def _build_user_sort_index_snapshot(user_id: str, source_version: str) -> Option
     if metadata_table_client is None:
         return None
     try:
-        rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        # select= keeps this full-library scan from pulling the large
+        # embedding/OCR/tag columns it never uses -- see _SORT_INDEX_SOURCE_FIELDS.
+        rows = list(metadata_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'",
+            select=_SORT_INDEX_SOURCE_FIELDS,
+        ))
     except Exception:
         # A transient query failure must not be treated as "empty library" --
         # refresh_user_sort_index persists whatever this returns as the new
@@ -2878,11 +2894,24 @@ def _rebuild_sort_index_in_background(key: str, manifest: Dict[str, str]) -> Non
     threading.Thread(target=_worker, name='sort-index-rebuild', daemon=True).start()
 
 
-def get_user_sort_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
+def get_user_sort_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
     """Mirrors get_user_lexical_index's "serve stale immediately, rebuild
     off-thread" read path -- a sort-index rebuild should almost never hit the
     cold/full-scan branch once warm, since edits dirty it far more often
-    (every rating/like tap) than a full-library reprocessing event would."""
+    (every rating/like tap) than a full-library reprocessing event would.
+
+    allow_sync_build=False makes the cold path (no snapshot ever built)
+    non-blocking: it kicks the first build off-thread and returns None instead
+    of running the full-library scan inline. The gallery's
+    /api/photos/sort-index request passes this, so a brand-new (or just-cleaned,
+    or first-load-after-deploy) library falls back to the legacy endpoint for
+    that one load rather than hanging ~a minute on a full scan -- which would
+    also re-create the exact O(library-size) memory spike this index exists to
+    eliminate. The next load picks up the background-built blob. Internal /
+    warming callers keep the default (True) to force a synchronous build when
+    they need the result in hand."""
     key = str(user_id or '').strip()
     if not key:
         return None
@@ -2899,7 +2928,7 @@ def get_user_sort_index(user_id: str, *, allow_refresh: bool = True) -> Optional
                 'rows': stale.rows,
             }
             _rebuild_sort_index_in_background(key, manifest)
-        else:
+        elif allow_sync_build:
             with _SORT_INDEX_REBUILD_LOCKS.lock_for(key):
                 fresh = _sort_index_fresh_cache_entry(key, _load_sort_index_manifest(key))
                 if fresh is None:
@@ -2912,6 +2941,11 @@ def get_user_sort_index(user_id: str, *, allow_refresh: bool = True) -> Optional
                             'updated_at': refreshed.updated_at,
                             'rows': refreshed.rows,
                         }
+        else:
+            # Cold + caller must not block (the gallery's initial load): build
+            # off-thread so the next request is fast, and report "not ready"
+            # now so the caller falls back rather than waiting on a full scan.
+            _rebuild_sort_index_in_background(key, manifest)
     if fresh is None:
         return None
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
