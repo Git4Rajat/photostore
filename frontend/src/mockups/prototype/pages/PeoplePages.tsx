@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ArrowLeft as ArrowLeftIcon, Check as CheckIcon, Sparkles as SparklesIcon, Trash2 as TrashIcon, Users as UserGroupIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch, Spinner, SelectionBar } from '../components/bits';
+import { ThumbSizeControl, useTileSize } from '../components/controls';
 import PhotoGrid from '../components/PhotoGrid';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { confirmDialog } from '../../../components/shared/dialogs';
@@ -124,11 +125,12 @@ export const PeoplePage: React.FC = () => {
 
 /** Person detail — rename / name, browse their photos, and merge in another cluster. */
 export const PersonDetailPage: React.FC = () => {
-    const { route, people, personById, openPerson, personPhotosById, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, toast } = useStore();
+    const { route, people, personById, openPerson, personPhotosById, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
     const personId = route.params.personId;
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
     const [mergeId, setMergeId] = useState('');
+    const [personTile, setPersonTile] = useTileSize('photostore.personTileSize');
     const headCover = useProtectedBlobUrls(person?.coverThumbnailUrl ? [person.coverThumbnailUrl] : []);
 
     useEffect(() => {
@@ -189,12 +191,24 @@ export const PersonDetailPage: React.FC = () => {
                     <button type="button" className="btn btn-danger" onClick={() => void handleDeletePerson()}><TrashIcon className="toolbar-icon" /> Delete</button>
                 </div>
             </div>
-            <p className="pt-page-sub pt-person-count">{photos?.length ?? person.faceCount ?? 0} photos</p>
+            <div className="pt-album-photos-head pt-person-photos-head">
+                <p className="pt-page-sub" style={{ margin: 0 }}>{photos?.length ?? person.faceCount ?? 0} photos</p>
+                <div className="pt-album-photos-actions">
+                    <ThumbSizeControl value={personTile} onChange={setPersonTile} />
+                    {photos && photos.length > 0 && (
+                        <button type="button" className="pt-linkish" onClick={() => setPhotoSelectMode(!photoSelectMode)}>
+                            {photoSelectMode ? 'Done' : 'Select'}
+                        </button>
+                    )}
+                </div>
+            </div>
 
             {photos === undefined && personPhotosLoading ? (
                 <Spinner label="Loading photos…" center={false} />
             ) : (
-                <PhotoGrid photos={photos ?? []} emptyHint="No photos for this person yet." />
+                <div style={{ ['--pt-tile-min' as string]: `${personTile}px` } as React.CSSProperties}>
+                    <PhotoGrid photos={photos ?? []} emptyHint="No photos for this person yet." />
+                </div>
             )}
 
             <div className="card-glass pt-merge">

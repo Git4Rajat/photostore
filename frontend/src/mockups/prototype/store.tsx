@@ -216,6 +216,11 @@ interface Store {
     toggleSelect: (id: string) => void;
     selectMany: (ids: string[]) => void;
     clearSelection: () => void;
+    // iOS-style explicit selection mode: photo grids only show checkboxes and
+    // treat a tap as "toggle selection" while this is on, so scrolling can't
+    // trigger accidental selections. Reset on navigate / clear.
+    selectMode: boolean;
+    setSelectMode: (on: boolean) => void;
 
     // viewer
     openViewer: (ids: string[], index: number, opts?: { extendable?: boolean }) => void;
@@ -318,6 +323,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [albumTrash, setAlbumTrash] = useState<AlbumTrashItem[]>([]);
     const [albumTrashLoading, setAlbumTrashLoading] = useState<boolean>(false);
     const [selection, setSelection] = useState<string[]>([]);
+    const [selectMode, setSelectModeState] = useState<boolean>(false);
     const [viewer, setViewer] = useState<ViewerState | null>(null);
     const [toasts, setToasts] = useState<Toast[]>([]);
     const toastTimers = useRef<Record<string, number>>({});
@@ -478,6 +484,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const navigate = useCallback((page: PageId, params: RouteParams = {}) => {
         setRoute({ page, params });
         setSelection([]);
+        setSelectModeState(false);
         setViewer(null);
         window.scrollTo(0, 0);
     }, []);
@@ -486,7 +493,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setSelection((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
     }, []);
     const selectMany = useCallback((ids: string[]) => setSelection(ids), []);
-    const clearSelection = useCallback(() => setSelection([]), []);
+    // Turning select mode off also drops the current selection; turning it on
+    // just reveals the checkboxes.
+    const setSelectMode = useCallback((on: boolean) => {
+        setSelectModeState(on);
+        if (!on) setSelection([]);
+    }, []);
+    const clearSelection = useCallback(() => { setSelection([]); setSelectModeState(false); }, []);
 
     const openViewer = useCallback((ids: string[], index: number, opts?: { extendable?: boolean }) => (
         setViewer({ ids, index, extendable: opts?.extendable })
@@ -857,19 +870,37 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         (albumId: string, ids: string[]) => {
             if (!ids.length) return;
             const album = albums.find((a) => a.id === albumId);
+            const idSet = new Set(ids);
+            const added = photosByIds(ids);
             setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: a.photoCount + ids.length } : a)));
+            // Optimistically drop the added photos into the album's photo cache
+            // so opening the album shows them *immediately* -- otherwise a brand
+            // new album (or one whose /albums/{id} fetch is slow) appears empty
+            // for as long as the server round-trip takes, which read as "nothing
+            // happened" for minutes. The server fetch below reconciles order/cover.
+            if (added.length) {
+                setAlbumPhotos((prev) => {
+                    const existing = prev[albumId] ?? [];
+                    const rest = existing.filter((p) => !idSet.has(p.id));
+                    return { ...prev, [albumId]: [...added, ...rest] };
+                });
+            }
             void post(`/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids })
                 .then(() => {
                     toast(`Added ${ids.length} to “${album?.name ?? 'album'}”`);
-                    // Refresh the album's photos if it's currently open/cached.
-                    if (albumPhotos[albumId]) void openAlbum(albumId);
+                    // Reconcile with the server (cover, ordering). The cache is
+                    // already seeded above, so this refresh never shows a spinner.
+                    void openAlbum(albumId);
                 })
                 .catch(() => {
                     setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: Math.max(0, a.photoCount - ids.length) } : a)));
+                    setAlbumPhotos((prev) => (prev[albumId]
+                        ? { ...prev, [albumId]: prev[albumId].filter((p) => !idSet.has(p.id)) }
+                        : prev));
                     toast('Couldn’t add photos to album', undefined, undefined, 'error');
                 });
         },
-        [albums, albumPhotos, openAlbum, toast],
+        [albums, photosByIds, openAlbum, toast],
     );
 
     const deleteAlbum = useCallback((id: string) => {
@@ -1131,6 +1162,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             toggleSelect,
             selectMany,
             clearSelection,
+            selectMode,
+            setSelectMode,
             openViewer,
             closeViewer,
             viewerStep,
@@ -1180,12 +1213,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }),
         [
             route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
-            placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, viewer, toasts,
+            placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, selectMode, viewer, toasts,
             photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
             mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
-            clearSelection, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
+            clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,

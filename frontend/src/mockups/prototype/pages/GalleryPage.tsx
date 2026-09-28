@@ -1,30 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
-import type { MediaFilter } from '../store';
+import type { CaptureRange, MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import PhotoGrid from '../components/PhotoGrid';
-import TimelineRail from '../components/TimelineRail';
+import TimelineBrowser from '../components/TimelineBrowser';
 import { Spinner } from '../components/bits';
-
-const TILE_MIN = 120;
-const TILE_STEP = 30;
-const TILE_RANGE = { min: 72, max: 260 };
-const clampTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(TILE_RANGE.min, n));
-
-// Persisted across sessions so returning to the Gallery doesn't reset the
-// thumbnail size the user picked (pinch or the +/- toolbar buttons) back to
-// the default every time.
-const TILE_SIZE_KEY = 'photostore.galleryTileSize';
-const loadStoredTileSize = (): number => {
-    try {
-        const raw = window.localStorage.getItem(TILE_SIZE_KEY);
-        const parsed = raw ? Number(raw) : NaN;
-        return Number.isFinite(parsed) ? clampTile(parsed) : TILE_MIN;
-    } catch {
-        return TILE_MIN;
-    }
-};
+import { clampTile, useTileSize, TILE_RANGE, TILE_STEP } from '../components/controls';
 
 const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
@@ -32,52 +14,91 @@ const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'video', label: 'Videos' },
 ];
 
+type ZoomLevel = 'days' | 'months' | 'years';
+
 /** Gallery — the populated grid + drag-and-drop upload + the empty first-run state. */
 export const GalleryPage: React.FC = () => {
     const {
-        photos, navigate, selectMany, clearSelection, selection, photosLoading, hasMorePhotos,
+        photos, navigate, selectMany, photosLoading, hasMorePhotos,
         loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
-        route, focusPhoto,
+        route, focusPhoto, selectMode, setSelectMode,
     } = useStore();
     const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
     const [dragging, setDragging] = useState(false);
-    const [tileMin, setTileMin] = useState(loadStoredTileSize);
+    const [tileMin, setTileMin] = useTileSize('photostore.galleryTileSize');
+    // iOS-style zoom levels: keep zooming out past the smallest tiles to browse
+    // Months, then Years (replaces the old timeline rail).
+    const [level, setLevel] = useState<ZoomLevel>('days');
+    const [focusYear, setFocusYear] = useState<string | null>(null);
 
-    useEffect(() => {
-        try {
-            window.localStorage.setItem(TILE_SIZE_KEY, String(tileMin));
-        } catch {
-            // ignore storage failures (private browsing, quota, ...)
-        }
-    }, [tileMin]);
     const depth = useRef(0);
     const gridRef = useRef<HTMLDivElement>(null);
     const sentinelRef = useRef<HTMLDivElement>(null);
     const pinchRef = useRef<{ dist: number; tile: number } | null>(null);
+
+    // Zoom-out steps: shrink tiles until the floor, then Days → Months → Years.
+    const zoomOut = () => {
+        if (level === 'years') return;
+        if (level === 'months') { setLevel('years'); return; }
+        if (tileMin > TILE_RANGE.min) setTileMin((n) => clampTile(n - TILE_STEP));
+        else { setFocusYear(null); setLevel('months'); }
+    };
+    // Zoom-in steps: Years → Months → Days, then grow tiles.
+    const zoomIn = () => {
+        if (level === 'years') { setLevel('months'); return; }
+        if (level === 'months') { setLevel('days'); return; }
+        if (tileMin < TILE_RANGE.max) setTileMin((n) => clampTile(n + TILE_STEP));
+    };
+    const zoomedOutFully = level === 'years';
+    const zoomedInFully = level === 'days' && tileMin >= TILE_RANGE.max;
 
     const touchDistance = (t: React.TouchList) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
     const onTouchStart = (e: React.TouchEvent) => {
         if (e.touches.length === 2) pinchRef.current = { dist: touchDistance(e.touches), tile: tileMin };
     };
     const onTouchMove = (e: React.TouchEvent) => {
-        if (e.touches.length === 2 && pinchRef.current) {
-            const ratio = touchDistance(e.touches) / pinchRef.current.dist;
-            // Pinch out (ratio > 1) => bigger tiles; pinch in => smaller.
-            setTileMin(clampTile(Math.round(pinchRef.current.tile * ratio)));
+        if (e.touches.length !== 2 || !pinchRef.current) return;
+        const ratio = touchDistance(e.touches) / pinchRef.current.dist;
+        if (level === 'days') {
+            const target = Math.round(pinchRef.current.tile * ratio);
+            // Pinched in past the smallest tile => keep zooming out into Months.
+            if (ratio < 1 && target <= TILE_RANGE.min) {
+                setFocusYear(null);
+                setLevel('months');
+                pinchRef.current = null;
+                return;
+            }
+            setTileMin(clampTile(target));
+        } else if (ratio > 1.25) {
+            zoomIn();
+            pinchRef.current = null;
+        } else if (ratio < 0.8) {
+            zoomOut();
+            pinchRef.current = null;
         }
     };
     const onTouchEnd = (e: React.TouchEvent) => {
         if (e.touches.length < 2) pinchRef.current = null;
     };
 
+    // Returning to the Gallery (a tap on the already-active tab, or a fresh
+    // navigation) starts at the top again: full library, Days zoom. Mirror the
+    // store's captureRange into a ref so this only re-runs on navigation, not
+    // when a drill-down sets the range itself.
+    const captureRangeStoreRef = useRef(captureRange);
+    useEffect(() => { captureRangeStoreRef.current = captureRange; }, [captureRange]);
+    useEffect(() => {
+        setLevel('days');
+        setFocusYear(null);
+        if (captureRangeStoreRef.current) setCaptureRange(null);
+    }, [route, setCaptureRange]);
+
     // Refresh the grid whenever an upload session finishes so new photos appear.
     useEffect(() => registerUploadCompletionHandler(() => { reloadPhotos(); }), [registerUploadCompletionHandler, reloadPhotos]);
 
-    // Deleting every currently-loaded photo (e.g. "Select visible" + delete)
-    // can empty `photos` while more pages still exist further down -- without
-    // this, that state rendered the same "library is empty" first-run screen
-    // as an actually-empty library, and only a full page refresh re-fetched
-    // the next page. Pull it in automatically instead.
+    // Deleting every currently-loaded photo (e.g. "Select all" + delete) can
+    // empty `photos` while more pages still exist further down -- pull the next
+    // page in automatically instead of showing the empty first-run screen.
     useEffect(() => {
         if (photos.length === 0 && hasMorePhotos && !photosLoading) {
             loadMorePhotos();
@@ -87,29 +108,13 @@ export const GalleryPage: React.FC = () => {
     // Infinite scroll: load the next page when the bottom sentinel scrolls into view.
     useEffect(() => {
         const node = sentinelRef.current;
-        if (!node || !hasMorePhotos) return undefined;
+        if (!node || !hasMorePhotos || level !== 'days') return undefined;
         const observer = new IntersectionObserver((entries) => {
             if (entries.some((e) => e.isIntersecting)) loadMorePhotos();
         }, { rootMargin: '600px' });
         observer.observe(node);
         return () => observer.disconnect();
-    }, [hasMorePhotos, loadMorePhotos, photos.length]);
-
-    const selectVisible = () => {
-        if (!gridRef.current) return;
-        const container = gridRef.current;
-        const containerRect = container.getBoundingClientRect();
-        const tiles = container.querySelectorAll('.pt-tile');
-        const visible: string[] = [];
-        tiles.forEach((tile) => {
-            const rect = tile.getBoundingClientRect();
-            if (rect.bottom > containerRect.top && rect.top < containerRect.bottom) {
-                const id = tile.getAttribute('data-photo-id');
-                if (id) visible.push(id);
-            }
-        });
-        if (visible.length > 0) selectMany(visible);
-    };
+    }, [hasMorePhotos, loadMorePhotos, photos.length, level]);
 
     const onDrop = (e: React.DragEvent) => {
         e.preventDefault();
@@ -124,18 +129,13 @@ export const GalleryPage: React.FC = () => {
     const pct = progress && progress.totalCount ? Math.round((progress.uploadedCount / progress.totalCount) * 100) : 0;
     const showFailed = !uploading && (pendingUploadSummary?.failedCount ?? 0) > 0;
 
-    // Client-side photo/video split over the loaded page(s). Media type isn't a
-    // server filter here, so this narrows what's already fetched by extension.
+    // Client-side photo/video split over the loaded page(s).
     const visiblePhotos = useMemo(() => {
         if (mediaFilter === 'all') return photos;
         return photos.filter((p) => (mediaFilter === 'video' ? isVideoFilename(p.filename) : !isVideoFilename(p.filename)));
     }, [photos, mediaFilter]);
 
-    // Open the viewer at a photo handed off via ?photo= (the PhotoViewer's
-    // "Show in Gallery" action). focusPhoto resolves it by exact lookup when
-    // it isn't on a loaded gallery page, so it works for any photo regardless
-    // of how deep in the library it sits. Guarded by a ref so it fires once per
-    // distinct param value (not again after the user closes the viewer).
+    // Open the viewer at a photo handed off via ?photo=.
     const openedPhotoParamRef = useRef<string | null>(null);
     useEffect(() => {
         const target = route.params.photo;
@@ -145,11 +145,36 @@ export const GalleryPage: React.FC = () => {
         focusPhoto(target);
     }, [route.params.photo, focusPhoto]);
 
+    // Drill from Years → Months → Days.
+    const openYear = (y: string) => { setFocusYear(y); setLevel('months'); };
+    const openMonth = (range: CaptureRange, y: string) => { setFocusYear(y); setCaptureRange(range); setLevel('days'); };
+    const resetToTop = () => { setLevel('days'); setFocusYear(null); setCaptureRange(null); };
+
     const countLabel = totalPhotos !== null
         ? `${totalPhotos.toLocaleString()} photo${totalPhotos === 1 ? '' : 's'}`
         : `${photos.length}${hasMorePhotos ? '+' : ''} photos`;
 
-    if (photos.length === 0 && (photosLoading || hasMorePhotos)) {
+    const zoomControl = (
+        <div className="pt-zoom" role="group" aria-label="Zoom level">
+            <button type="button" className="btn" aria-label="Zoom out" disabled={zoomedOutFully} onClick={zoomOut}>
+                <MagnifyingGlassMinusIcon className="toolbar-icon" />
+            </button>
+            <button type="button" className="btn" aria-label="Zoom in" disabled={zoomedInFully} onClick={zoomIn}>
+                <MagnifyingGlassPlusIcon className="toolbar-icon" />
+            </button>
+        </div>
+    );
+
+    const scopeCrumbs = (level !== 'days' || captureRange) ? (
+        <div className="pt-zoom-crumbs" aria-label="Zoom scope">
+            <button type="button" onClick={resetToTop}>All Photos</button>
+            {level === 'years' && (<><span aria-hidden="true">›</span><span className="on">Years</span></>)}
+            {level === 'months' && (<><span aria-hidden="true">›</span><span className="on">{focusYear ?? 'Months'}</span></>)}
+            {level === 'days' && captureRange && (<><span aria-hidden="true">›</span><span className="on">{captureRange.label}</span></>)}
+        </div>
+    ) : null;
+
+    if (photos.length === 0 && level === 'days' && !captureRange && (photosLoading || hasMorePhotos)) {
         return (
             <div className="pt-arrive">
                 <Spinner label="Loading your photos…" />
@@ -157,7 +182,7 @@ export const GalleryPage: React.FC = () => {
         );
     }
 
-    if (photos.length === 0 && !uploading) {
+    if (photos.length === 0 && level === 'days' && !captureRange && !uploading) {
         return (
             <div className="pt-arrive">
                 <div className="empty-state">
@@ -179,44 +204,46 @@ export const GalleryPage: React.FC = () => {
         );
     }
 
+    const levelTitle = level === 'years' ? 'Years' : level === 'months' ? (focusYear ?? 'Months') : 'Gallery';
+
     return (
         <div>
             <div className="pt-toolbar">
                 <div>
-                    <h1 className="pt-page-title">Gallery</h1>
+                    <h1 className="pt-page-title">{levelTitle}</h1>
                     <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
                 </div>
                 <div className="pt-toolbar-actions">
-                    <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
-                        {MEDIA_FILTERS.map((f) => (
-                            <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} onClick={() => setMediaFilter(f.value)}>
-                                {f.label}
+                    {level === 'days' && (
+                        <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
+                            {MEDIA_FILTERS.map((f) => (
+                                <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} onClick={() => setMediaFilter(f.value)}>
+                                    {f.label}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                    {zoomControl}
+                    {level === 'days' && (
+                        selectMode ? (
+                            <>
+                                <button type="button" className="btn" onClick={() => selectMany(visiblePhotos.map((p) => p.id))}>
+                                    Select all
+                                </button>
+                                <button type="button" className="btn mock-cta" onClick={() => setSelectMode(false)}>
+                                    Done
+                                </button>
+                            </>
+                        ) : (
+                            <button type="button" className="btn" onClick={() => setSelectMode(true)}>
+                                Select
                             </button>
-                        ))}
-                    </div>
-                    <div className="pt-zoom" role="group" aria-label="Thumbnail size">
-                        <button type="button" className="btn" aria-label="Smaller thumbnails" disabled={tileMin <= TILE_RANGE.min} onClick={() => setTileMin((n) => clampTile(n - TILE_STEP))}>
-                            <MagnifyingGlassMinusIcon className="toolbar-icon" />
-                        </button>
-                        <button type="button" className="btn" aria-label="Larger thumbnails" disabled={tileMin >= TILE_RANGE.max} onClick={() => setTileMin((n) => clampTile(n + TILE_STEP))}>
-                            <MagnifyingGlassPlusIcon className="toolbar-icon" />
-                        </button>
-                    </div>
-                    {selection.length === 0 ? (
-                        <button type="button" className="btn" onClick={selectVisible}>
-                            Select visible
-                        </button>
-                    ) : (
-                        <button type="button" className="btn" onClick={clearSelection}>
-                            Clear
-                        </button>
+                        )
                     )}
                 </div>
             </div>
 
-            {timeline && (
-                <TimelineRail timeline={timeline} captureRange={captureRange} onSelect={setCaptureRange} />
-            )}
+            {scopeCrumbs}
 
             {(uploading || showFailed) && (
                 <div className={`upload-dock${!uploading ? ' is-done' : ''}`}>
@@ -237,30 +264,42 @@ export const GalleryPage: React.FC = () => {
                 </div>
             )}
 
-            <div
-                className={`pt-drop-surface${dragging ? ' dragging' : ''}`}
-                ref={gridRef}
-                style={{ ['--pt-tile-min' as string]: `${tileMin}px` } as React.CSSProperties}
-                onDragEnter={(e) => { e.preventDefault(); depth.current += 1; setDragging(true); }}
-                onDragOver={(e) => e.preventDefault()}
-                onDragLeave={(e) => { e.preventDefault(); depth.current = Math.max(0, depth.current - 1); if (!depth.current) setDragging(false); }}
-                onDrop={onDrop}
-                onTouchStart={onTouchStart}
-                onTouchMove={onTouchMove}
-                onTouchEnd={onTouchEnd}
-            >
-                <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable />
-                {mediaFilter !== 'all' && visiblePhotos.length === 0 && (
-                    <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
-                )}
-                <div ref={sentinelRef} className="pt-scroll-sentinel" aria-hidden="true" />
-                {photosLoading && photos.length > 0 && <Spinner label="Loading more…" />}
-                <div className="pt-drop-overlay">
-                    <span className="drop-icon"><ArrowUpTrayIcon /></span>
-                    <b>Drop to add to Keepsake</b>
-                    <span className="sub">Release to start uploading</span>
+            {level !== 'days' && timeline ? (
+                <div onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
+                    <TimelineBrowser
+                        timeline={timeline}
+                        level={level}
+                        focusYear={focusYear}
+                        onOpenYear={openYear}
+                        onOpenMonth={openMonth}
+                    />
                 </div>
-            </div>
+            ) : (
+                <div
+                    className={`pt-drop-surface${dragging ? ' dragging' : ''}`}
+                    ref={gridRef}
+                    style={{ ['--pt-tile-min' as string]: `${tileMin}px` } as React.CSSProperties}
+                    onDragEnter={(e) => { e.preventDefault(); depth.current += 1; setDragging(true); }}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDragLeave={(e) => { e.preventDefault(); depth.current = Math.max(0, depth.current - 1); if (!depth.current) setDragging(false); }}
+                    onDrop={onDrop}
+                    onTouchStart={onTouchStart}
+                    onTouchMove={onTouchMove}
+                    onTouchEnd={onTouchEnd}
+                >
+                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable />
+                    {mediaFilter !== 'all' && visiblePhotos.length === 0 && (
+                        <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
+                    )}
+                    <div ref={sentinelRef} className="pt-scroll-sentinel" aria-hidden="true" />
+                    {photosLoading && photos.length > 0 && <Spinner label="Loading more…" />}
+                    <div className="pt-drop-overlay">
+                        <span className="drop-icon"><ArrowUpTrayIcon /></span>
+                        <b>Drop to add to Keepsake</b>
+                        <span className="sub">Release to start uploading</span>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };

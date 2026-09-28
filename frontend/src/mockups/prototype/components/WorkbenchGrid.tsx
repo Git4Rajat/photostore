@@ -12,8 +12,13 @@ import {
     User as UserIcon,
 } from 'lucide-react';
 import { usePhotoThumbnails, fetchPhotoMetadata } from '../media';
+import { ThumbSizeControl, useTileSize } from './controls';
 import type { PhotoMetadata } from '../media';
 import type { Photo } from '../types';
+
+// The Workbench tile carries a filename + 7 processing-step badges under the
+// thumbnail, so it needs a larger floor than the plain photo grids.
+const WB_TILE = { min: 150, max: 320, default: 200, step: 40 };
 
 export type WorkbenchStep = 'Preview' | 'Thumbnails' | 'EXIF' | 'OCR' | 'Vision' | 'Geo' | 'Faces';
 
@@ -151,6 +156,7 @@ export const WorkbenchGrid: React.FC<{
     const [query, setQuery] = useState('');
     const [sort, setSort] = useState<SortMode>('uploaded');
     const [infoOpenId, setInfoOpenId] = useState<string | null>(null);
+    const [tile, setTile] = useTileSize('photostore.workbenchTileSize', WB_TILE);
 
     const filtered = useMemo(() => {
         const q = query.trim().toLowerCase();
@@ -184,6 +190,7 @@ export const WorkbenchGrid: React.FC<{
                     <option value="uploaded">Recently uploaded</option>
                     <option value="name">Filename</option>
                 </select>
+                <ThumbSizeControl value={tile} onChange={setTile} min={WB_TILE.min} max={WB_TILE.max} step={WB_TILE.step} />
                 <button
                     type="button"
                     className="pt-linkish"
@@ -196,7 +203,7 @@ export const WorkbenchGrid: React.FC<{
             {filtered.length === 0 ? (
                 <p className="pt-grid-empty">No photos match “{query}”.</p>
             ) : (
-                <div className="wb-grid">
+                <div className="wb-grid" style={{ ['--wb-tile-min' as string]: `${tile}px` } as React.CSSProperties}>
                     {filtered.map((photo) => (
                         <WorkbenchTile
                             key={photo.id}

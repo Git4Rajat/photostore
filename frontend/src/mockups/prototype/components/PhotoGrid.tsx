@@ -23,7 +23,7 @@ const tileRotationStyle = (photo: Photo): React.CSSProperties | undefined => {
  * state show as small overlays.
  */
 export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean }> = ({ photos, emptyHint, extendable }) => {
-    const { selection, toggleSelect, selectMany, openViewer } = useStore();
+    const { selection, toggleSelect, selectMany, openViewer, selectMode, setSelectMode } = useStore();
     const thumbs = usePhotoThumbnails(photos);
     const [lastSelected, setLastSelected] = React.useState<number | null>(null);
     // Drag origin is a ref, not state: mouseenter fires as the pointer moves and
@@ -94,6 +94,9 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
     };
 
     const handleMouseDown = (i: number) => {
+        // Mouse sweep-select only inside select mode, so an ordinary click never
+        // begins a selection.
+        if (!selectMode) return;
         dragStartRef.current = i;
         draggedRef.current = false;
         preDragSelectionRef.current = selection;
@@ -119,7 +122,7 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
 
     return (
         <div
-            className="pt-grid"
+            className={`pt-grid${selectMode ? ' select-mode' : ''}`}
             ref={gridRef}
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
@@ -142,12 +145,20 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                                 draggedRef.current = false;
                                 return;
                             }
+                            // In select mode a tap toggles selection instead of
+                            // opening the viewer (iOS Photos behaviour).
+                            if (selectMode) {
+                                toggleSelect(ids[i]);
+                                setLastSelected(i);
+                                return;
+                            }
                             openViewer(ids, i, { extendable });
                         }}
                         onKeyDown={(e) => {
                             if (e.key === 'Enter' || e.key === ' ') {
                                 e.preventDefault();
-                                openViewer(ids, i, { extendable });
+                                if (selectMode) { toggleSelect(ids[i]); setLastSelected(i); }
+                                else openViewer(ids, i, { extendable });
                             }
                         }}
                         onMouseDown={() => handleMouseDown(i)}
@@ -155,8 +166,12 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                         onTouchStart={() => {
                             longPressedRef.current = false;
                             clearLongPress();
+                            // Long-press enters select mode (if not already) and
+                            // selects this tile -- a deliberate hold, so scrolling
+                            // (which cancels the timer via onTouchMove) can't trip it.
                             longPressTimer.current = window.setTimeout(() => {
                                 longPressedRef.current = true;
+                                if (!selectMode) setSelectMode(true);
                                 toggleSelect(ids[i]);
                                 setLastSelected(i);
                             }, 400);

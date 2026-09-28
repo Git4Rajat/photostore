@@ -16,6 +16,13 @@
    its dropdowns. Lift the header (and its menus) back above the body. */
 .mock-app > .ios-header { z-index: 30; }
 
+/* The body is the single scroll container (overflow-y:auto). Setting only one
+   overflow axis makes the browser compute the other to `auto` too (a CSS spec
+   quirk), so a hair of sub-pixel content width let the whole gallery scroll
+   sideways -- the "wiggle". Clip the horizontal axis explicitly (x:hidden +
+   y:auto is a well-defined pair, so vertical scrolling is unaffected). */
+.pt-body { overflow-x: hidden; }
+
 /* The real .ios-tab is an <a>; we render <button>s, so strip the UA button
    chrome while keeping the underline-on-active treatment. */
 .ios-tabs .ios-tab { appearance: none; -webkit-appearance: none; background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; min-height: var(--tap-min); display: inline-flex; align-items: center; }
@@ -100,7 +107,10 @@
    the neighboring Like button. */
 .pt-star-compact { display: none; position: relative; background: none; border: 0; padding: 0; cursor: pointer; min-width: var(--tap-min); min-height: var(--tap-min); }
 .pt-star-compact:disabled, .pt-star-compact.static { cursor: default; }
-.pt-star-compact-bg, .pt-star-compact-fg { position: absolute; inset: 0; width: 100%; height: 100%; color: #e2b33f; }
+/* Constrain the compact star's glyph to a 20px box centred in its 44px tap
+   target -- otherwise it filled the whole target and rendered ~2x the size of
+   the neighbouring Like/Delete icons (which are 20px) in the viewer bar. */
+.pt-star-compact-bg, .pt-star-compact-fg { position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%); color: #e2b33f; }
 .pt-star-compact-fg { clip-path: inset(0 calc(100% - var(--pt-star-fill, 0%)) 0 0); }
 
 /* ---- toolbar / page headers ---- */
@@ -140,12 +150,12 @@
 /* 44x44 tap target flush with the tile's corner (the tile clips overflow, so
    the hit area can't extend past it) with the 22px glyph inset via padding
    to sit where it visually sat before. */
-.pt-tile-check { position: absolute; top: 0; left: 0; width: 44px; height: 44px; box-sizing: border-box; display: flex; align-items: flex-start; justify-content: flex-start; padding: 6px; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; opacity: 0; transition: opacity 0.12s ease; touch-action: none; }
-.pt-tile:hover .pt-tile-check, .pt-tile-check.on { opacity: 1; }
-/* Touch devices have no hover, so surface the selection affordance directly. */
-@media (hover: none) and (pointer: coarse) {
-  .pt-tile-check { opacity: 0.85; }
-}
+.pt-tile-check { position: absolute; top: 0; left: 0; width: 44px; height: 44px; box-sizing: border-box; display: flex; align-items: flex-start; justify-content: flex-start; padding: 6px; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; opacity: 0; pointer-events: none; transition: opacity 0.12s ease; touch-action: none; }
+/* Checkboxes only appear (and become clickable) in Select mode, so an ordinary
+   tap or a scroll can't accidentally select photos -- the top complaint was
+   that scrolling kept catching the always-visible checkbox. */
+.pt-grid.select-mode .pt-tile-check { opacity: 0.9; pointer-events: auto; }
+.pt-grid.select-mode .pt-tile:hover .pt-tile-check, .pt-grid.select-mode .pt-tile-check.on { opacity: 1; }
 .pt-tile-check svg { width: 22px; height: 22px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
 .pt-tile-check.on { color: var(--accent); }
 .pt-tile-badges { position: absolute; bottom: 6px; right: 6px; display: flex; gap: 4px; align-items: center; }
@@ -256,7 +266,11 @@
 .pt-person-name-row { display: flex; gap: 8px; align-items: center; min-width: 0; flex: 1; }
 .pt-person-name-row .field { flex: 0 1 240px; min-width: 0; }
 .pt-person-name-row .btn { flex: 0 0 auto; white-space: nowrap; padding: 8px 12px; }
-.pt-person-count { margin: 6px 0 16px 62px; }
+/* The person-detail photo count now lives in its own header row (see
+   .pt-person-photos-head); it no longer needs the left-indent that used to
+   align it under the name -- and that indent was leaking onto the People-grid
+   cards' `.pt-person-count`, pushing their count off-centre. */
+.pt-person-photos-head { margin-top: 10px; }
 .pt-merge { padding: 16px; margin-top: 16px; }
 .pt-merge-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 
@@ -331,7 +345,7 @@
 .wb-search svg { width: 16px; height: 16px; color: var(--muted); flex: 0 0 auto; }
 .wb-search input { border: 0; background: none; outline: none; font: inherit; font-size: 0.86rem; color: var(--text); width: 100%; }
 .wb-sort { border: 1px solid var(--lg-edge); border-radius: var(--r-sm); background: var(--lg-surface-wash); padding: 6px 10px; font: inherit; font-size: 0.84rem; color: var(--text); }
-.wb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.wb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--wb-tile-min, 200px), 1fr)); gap: 12px; }
 .wb-tile { position: relative; border-radius: var(--r-sm); overflow: visible; display: flex; flex-direction: column; }
 .wb-tile.selected .wb-tile-img { outline: 3px solid var(--accent); outline-offset: -3px; }
 .wb-tile-img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; border-radius: var(--r-sm); background: inherit; -webkit-user-drag: none; user-select: none; }
@@ -542,3 +556,146 @@
     .pt-viewer-title { display: none; }
     .pt-toolbar { align-items: flex-start; }
 }
+
+/* ---- viewer floating tools: tap-to-reveal on touch ---- */
+/* The zoom/rotate toolbar floats over the top of the photo, covering tall
+   portrait shots on a phone. On touch, keep it hidden until the user taps the
+   photo (iOS-style chrome toggle); desktop leaves it always visible. */
+@media (hover: none) and (pointer: coarse) {
+  .pt-viewer-tools { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.16s ease, visibility 0.16s ease; }
+  .pt-viewer.tools-visible .pt-viewer-tools { opacity: 1; visibility: visible; pointer-events: auto; }
+}
+
+/* ---- People card count: centred under the face ---- */
+.pt-person-name, .pt-person-count { text-align: center; max-width: 100%; }
+
+/* ---- shared per-view header action row (album detail / person photos) ---- */
+.pt-album-photos-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+/* Compact the zoom control when it rides inside a header action row. */
+.pt-album-photos-actions .pt-zoom .btn { min-width: 38px; min-height: 38px; padding: 5px 7px; }
+
+/* ---- zoom levels: Months / Years card grid (replaces the timeline rail) ---- */
+.pt-zoom-crumbs { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; font-size: 0.82rem; color: var(--muted); flex-wrap: wrap; }
+.pt-zoom-crumbs button { background: none; border: 0; color: var(--accent); font: inherit; font-weight: 650; cursor: pointer; padding: 4px 6px; border-radius: 6px; min-height: var(--tap-min); }
+.pt-zoom-crumbs button:hover { background: var(--accent-soft); }
+.pt-zoom-crumbs .on { color: var(--text); font-weight: 650; }
+.pt-period-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.pt-period-card { position: relative; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; aspect-ratio: 4 / 3; padding: 14px; border: 0; border-radius: var(--r-md); cursor: pointer; text-align: left; color: #fff; font: inherit; overflow: hidden; isolation: isolate; }
+.pt-period-card::after { content: ''; position: absolute; inset: 0; z-index: -1; background: linear-gradient(160deg, rgba(0,0,0,0.05), rgba(0,0,0,0.42)); }
+.pt-period-card:hover { transform: translateY(-1px); }
+.pt-period-card:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.pt-period-label { font-family: var(--font-display); font-size: 1.35rem; font-weight: 700; text-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+.pt-period-count { font-size: 0.8rem; font-weight: 600; opacity: 0.92; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
+
+/* ---- bottom sheet (Add to album / New smart album) ---- */
+.pt-sheet-overlay { position: fixed; inset: 0; z-index: 100; display: flex; align-items: flex-end; justify-content: center; background: rgba(0,0,0,0.45); animation: pt-sheet-fade 0.16s ease; }
+@keyframes pt-sheet-fade { from { opacity: 0; } to { opacity: 1; } }
+.pt-sheet {
+    width: 100%;
+    max-width: 520px;
+    max-height: min(80vh, 720px);
+    display: flex;
+    flex-direction: column;
+    background: var(--lg-surface-strong);
+    border: 1px solid var(--lg-edge);
+    border-radius: var(--r-lg) var(--r-lg) 0 0;
+    box-shadow: var(--lg-shadow-raised);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+    padding: 8px 16px calc(16px + env(safe-area-inset-bottom));
+    animation: pt-sheet-rise 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+    outline: none;
+}
+@keyframes pt-sheet-rise { from { transform: translateY(100%); } to { transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .pt-sheet { animation: none; } .pt-sheet-overlay { animation: none; } }
+/* Centre it as a floating dialog on larger screens. */
+@media (min-width: 621px) {
+    .pt-sheet-overlay { align-items: center; }
+    .pt-sheet { border-radius: var(--r-lg); animation: pt-sheet-fade 0.16s ease; }
+}
+.pt-sheet-head { position: relative; display: flex; align-items: center; justify-content: center; padding: 8px 40px 10px; }
+.pt-sheet-grip { position: absolute; top: 4px; left: 50%; transform: translateX(-50%); width: 38px; height: 4px; border-radius: 999px; background: var(--lg-edge); }
+.pt-sheet-title { font-family: var(--font-display); font-size: 1.02rem; font-weight: 700; margin: 6px 0 0; text-align: center; }
+.pt-sheet-close { position: absolute; right: 0; top: 6px; width: var(--tap-min); height: var(--tap-min); display: grid; place-items: center; border: 0; background: none; color: var(--muted); cursor: pointer; border-radius: 50%; }
+.pt-sheet-close:hover { background: var(--lg-surface-wash); color: var(--text); }
+.pt-sheet-close svg { width: 20px; height: 20px; }
+.pt-sheet-header { padding: 4px 0 8px; }
+.pt-sheet-body { overflow-y: auto; -webkit-overflow-scrolling: touch; min-height: 0; }
+.pt-sheet-search { display: flex; align-items: center; gap: 8px; border: 1px solid var(--lg-edge); border-radius: var(--r-pill); background: var(--lg-surface-wash); padding: 8px 14px; }
+.pt-sheet-search svg { width: 18px; height: 18px; color: var(--muted); flex: 0 0 auto; }
+.pt-sheet-search input { flex: 1; border: 0; background: none; outline: none; font: inherit; font-size: 0.95rem; color: var(--text); min-width: 0; }
+.pt-sheet-new { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; background: none; border: 0; padding: 12px 8px; border-radius: var(--r-sm); color: var(--accent); font: inherit; font-weight: 650; cursor: pointer; }
+.pt-sheet-new:hover { background: var(--lg-surface-wash); }
+.pt-sheet-new-icon { width: 44px; height: 44px; border-radius: var(--r-xs); background: var(--accent-soft); display: grid; place-items: center; flex: 0 0 auto; }
+.pt-sheet-new-icon svg { width: 22px; height: 22px; }
+.pt-sheet-albums { display: flex; flex-direction: column; }
+.pt-sheet-album { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; background: none; border: 0; padding: 8px; border-radius: var(--r-sm); cursor: pointer; font: inherit; color: var(--text); }
+.pt-sheet-album:hover { background: var(--lg-surface-wash); }
+.pt-sheet-album-cover { width: 48px; height: 48px; border-radius: var(--r-xs); flex: 0 0 auto; object-fit: cover; }
+.pt-sheet-album-cover.empty { background: var(--lg-edge); }
+.pt-sheet-album-meta { display: flex; flex-direction: column; min-width: 0; }
+.pt-sheet-album-meta b { font-size: 0.92rem; }
+.pt-sheet-album-meta span { font-size: 0.76rem; color: var(--muted); }
+.pt-sheet-empty { color: var(--muted); padding: 20px 8px; font-size: 0.86rem; text-align: center; }
+.pt-sheet-intro { color: var(--muted); font-size: 0.86rem; margin: 0 0 10px; padding: 0 4px; }
+.pt-sheet-rules { display: flex; flex-direction: column; gap: 2px; }
+.pt-sheet-rule { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; background: none; border: 0; padding: 12px 8px; border-radius: var(--r-sm); cursor: pointer; font: inherit; color: var(--text); }
+.pt-sheet-rule:hover { background: var(--lg-surface-wash); }
+.pt-sheet-rule:disabled { opacity: 0.5; cursor: default; }
+.pt-sheet-rule-icon { width: 44px; height: 44px; border-radius: var(--r-xs); background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; flex: 0 0 auto; }
+.pt-sheet-rule-icon svg { width: 22px; height: 22px; }
+.pt-sheet-rule-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.pt-sheet-rule-text b { font-size: 0.92rem; }
+.pt-sheet-rule-text small { color: var(--muted); font-size: 0.78rem; }
+
+/* ---- public shared album (standalone page, its own app-shell chrome) ----
+   Rendered directly under #root by PrototypeApp's public-link branch, outside
+   the signed-in Shell -- so it recreates the .mock-app shell here (warm blob
+   backdrop, glass header, single scrolling body) to match the rest of the app
+   instead of the old bespoke banner layout. */
+.pt-public-shell .pt-public-tag {
+    margin-left: auto;
+    font-family: var(--font-label);
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border: 1px solid var(--lg-edge);
+    border-radius: var(--r-pill);
+    padding: 5px 10px;
+    white-space: nowrap;
+    flex: 0 0 auto;
+}
+/* No mobile tab bar on this page, so reclaim the bottom gap mockups.css
+   reserves for one on narrow (container) widths. */
+@container (max-width: 620px) {
+    .pt-public-shell .mock-body { padding-bottom: clamp(12px, 3vw, 20px); }
+}
+
+.pt-public-grid { --pt-tile-min: 128px; margin-bottom: 8px; }
+/* Unlike the app's PhotoGrid (mock-swatch gradient behind every tile), these
+   tiles are just the served thumbnail -- give them a neutral fill so a
+   lazy-loading or failed thumbnail reads as an empty photo cell, not a
+   transparent hole over the backdrop (matches the prototype's empty covers). */
+.pt-public-grid .pt-tile { background: var(--lg-edge); }
+/* Visitors can always open a photo; the corner check only appears in select
+   mode (the tile only renders it then), matching iOS Photos' shared albums. */
+.pt-public-grid .pt-tile-check { opacity: 0.92; pointer-events: auto; }
+
+.pt-tile-video { position: absolute; top: 8px; right: 8px; color: #fff; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5)); pointer-events: none; }
+.pt-tile-video svg { width: 22px; height: 22px; display: block; }
+/* When select mode brings the top-left checkbox in, nudge the video badge down
+   so the two never overlap on a portrait clip. */
+.pt-public-grid.select-mode .pt-tile-video { top: auto; bottom: 8px; }
+
+.pt-public-state { padding-top: clamp(24px, 8vh, 72px); }
+.pt-public-buffering { display: grid; gap: 12px; max-width: 320px; margin: 0 auto; padding-top: clamp(24px, 10vh, 96px); }
+.pt-public-buffering .progress-track { width: 100%; }
+
+.pt-public-lock { max-width: 400px; margin: 0 auto; }
+.pt-public-lock-form { display: flex; gap: 8px; width: 100%; max-width: 320px; margin: 6px auto 0; }
+.pt-public-lock-form .field { flex: 1 1 auto; min-width: 0; }
+.pt-public-lock-form .btn { flex: 0 0 auto; white-space: nowrap; }
+
+.pt-public-footer { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 32px; padding: 20px 0 8px; border-top: 1px solid var(--lg-edge); color: var(--muted); font-size: 0.82rem; text-align: center; }
+.pt-public-footer strong { color: var(--text); font-weight: 700; }

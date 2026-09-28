@@ -73,6 +73,10 @@ export const PhotoViewer: React.FC = () => {
     const [fullRes, setFullRes] = useState(false);
     const [showInfo, setShowInfo] = useState(false);
     const [meta, setMeta] = useState<PhotoMetadata | null>(null);
+    // On touch devices the floating zoom/rotate toolbar sits over the top of the
+    // photo (it overlaps tall portrait shots). Hide it until the user taps the
+    // photo, iOS-style; a tap toggles it. Desktop keeps it always visible (CSS).
+    const [showTools, setShowTools] = useState(false);
     const panRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
     // Rotation is applied to the CSS transform immediately (see `rotate` below)
     // but the save request is deliberately deferred -- it fires once the user
@@ -106,6 +110,7 @@ export const PhotoViewer: React.FC = () => {
         setFullRes(false);
         setShowInfo(false);
         setMeta(null);
+        setShowTools(false);
         return () => flushPendingRotation();
     }, [photo?.id, flushPendingRotation]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -395,7 +400,7 @@ export const PhotoViewer: React.FC = () => {
     const locationLine = [loc.city, loc.country].filter(Boolean).join(', ');
 
     return (
-        <div ref={rootRef} tabIndex={-1} className="pt-viewer" role="dialog" aria-modal="true" aria-label="Photo viewer">
+        <div ref={rootRef} tabIndex={-1} className={`pt-viewer${showTools ? ' tools-visible' : ''}`} role="dialog" aria-modal="true" aria-label="Photo viewer">
             <div className="pt-viewer-top">
                 <button type="button" className="pt-viewer-back" onClick={closeViewer}>
                     <ArrowLeftIcon /> Back
@@ -431,6 +436,10 @@ export const PhotoViewer: React.FC = () => {
                     <div
                         ref={photoRef}
                         className="pt-viewer-photo"
+                        // Tapping the photo toggles the floating tools on touch
+                        // (they're always shown on desktop via CSS, so this is a
+                        // no-op there).
+                        onClick={() => setShowTools((v) => !v)}
                         onDoubleClick={(e) => (zoomed ? resetZoom() : zoomAtPoint(zoom + ZOOM_STEP * 2, e.clientX, e.clientY))}
                         onMouseDown={(e) => { if (zoomed) panRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y }; }}
                         onMouseMove={(e) => {

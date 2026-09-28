@@ -16,7 +16,9 @@ import {
 } from 'lucide-react';
 import { useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
-import { Menu, Spinner, SelectionBar } from '../components/bits';
+import { Spinner, SelectionBar } from '../components/bits';
+import { BottomSheet } from '../components/BottomSheet';
+import { ThumbSizeControl, useTileSize } from '../components/controls';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 
@@ -42,11 +44,17 @@ export const AlbumsPage: React.FC = () => {
     const {
         albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, albumPhotosLoading,
         createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
+        selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode,
     } = useStore();
-    const [showMobileDetail, setShowMobileDetail] = useState(false);
+    // Detail vs. list is derived from the route (?albumId=…) rather than local
+    // state, so tapping the Albums tab (which clears the param) always returns
+    // to the album list on mobile instead of leaving you stuck inside an album.
+    const showDetail = Boolean(route.params.albumId);
     const [selectMode, setSelectMode] = useState(false);
     const [selectedAlbumIds, setSelectedAlbumIds] = useState<string[]>([]);
     const [smartCreatingRule, setSmartCreatingRule] = useState<string | null>(null);
+    const [smartSheetOpen, setSmartSheetOpen] = useState(false);
+    const [albumTile, setAlbumTile] = useTileSize('photostore.albumTileSize');
     const selectedId = route.params.albumId ?? albums[0]?.id;
     const album = albums.find((a) => a.id === selectedId) ?? albums[0];
     const [copied, setCopied] = useState(false);
@@ -116,18 +124,16 @@ export const AlbumsPage: React.FC = () => {
         const id = await createAlbum('New album');
         if (!id) return;
         navigate('albums', { albumId: id });
-        setShowMobileDetail(true);
         if (thenRename) await renameAlbumPrompt(id, 'New album');
     };
 
-    const handleSmartCreate = async (rule: string, closeMenu: () => void) => {
-        closeMenu();
+    const handleSmartCreate = async (rule: string) => {
+        setSmartSheetOpen(false);
         setSmartCreatingRule(rule);
         try {
             const { albumId, count, message } = await autoCreateAlbum(rule);
             if (albumId) {
                 navigate('albums', { albumId });
-                setShowMobileDetail(true);
                 toast(`Created smart album with ${count} photo${count === 1 ? '' : 's'}`);
             } else {
                 toast(message || 'No matching photos found for that rule.');
@@ -202,7 +208,6 @@ export const AlbumsPage: React.FC = () => {
                                 return;
                             }
                             navigate('albums', { albumId: a.id });
-                            setShowMobileDetail(true);
                         }}
                     >
                         {selectMode && (
@@ -230,51 +235,33 @@ export const AlbumsPage: React.FC = () => {
             <button type="button" className="albm-newbtn" onClick={() => void handleCreate(true)}>
                 <PlusIcon /> New album
             </button>
-            <Menu
-                renderTrigger={(toggle) => (
-                    <button type="button" className="albm-newbtn" onClick={toggle} disabled={smartCreatingRule !== null}>
-                        <SparklesIcon /> {smartCreatingRule ? 'Creating…' : 'Smart album'}
-                    </button>
-                )}
-            >
-                {(close) => (
-                    <div className="pt-more-menu pt-smart-album-menu">
-                        {SMART_ALBUM_RULES.map(({ id, label, description, Icon }) => (
-                            <button key={id} type="button" onClick={() => void handleSmartCreate(id, close)} disabled={smartCreatingRule !== null}>
-                                <Icon className="toolbar-icon" />
-                                <span>
-                                    <b>{label}</b>
-                                    <small>{description}</small>
-                                </span>
-                            </button>
-                        ))}
-                    </div>
-                )}
-            </Menu>
+            <button type="button" className="albm-newbtn" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
+                <SparklesIcon /> {smartCreatingRule ? 'Creating…' : 'Smart album'}
+            </button>
         </div>
     );
 
     return (
         <div className="pt-albums-wrapper">
             {/* Mobile list view */}
-            <div className={`pt-albums-mobile-list${showMobileDetail ? ' hidden' : ''}`}>
+            <div className={`pt-albums-mobile-list${showDetail ? ' hidden' : ''}`}>
                 <div className="pt-album-list-scroll">{albumListRows}</div>
                 {albumListFooter}
             </div>
 
             {/* Desktop sidebar + mobile detail view */}
             <div className="pt-albums-desktop-sidebar">
-                {showMobileDetail && (
+                {showDetail && (
                     <button
                         type="button"
                         className="pt-back"
-                        onClick={() => setShowMobileDetail(false)}
+                        onClick={() => navigate('albums', {})}
                         aria-label="Back to albums"
                     >
                         <ArrowLeftIcon /> Back
                     </button>
                 )}
-                <div className={`pt-albums${showMobileDetail ? ' show-detail' : ''}`}>
+                <div className={`pt-albums${showDetail ? ' show-detail' : ''}`}>
                     <aside className="pt-album-sidebar">
                         <div className="pt-album-list-scroll">{albumListRows}</div>
                         {albumListFooter}
@@ -335,12 +322,22 @@ export const AlbumsPage: React.FC = () => {
 
                         <div className="pt-album-photos-head">
                             <div className="pt-menu-label" style={{ margin: 0 }}>Photos</div>
-                            <button type="button" className="pt-linkish" onClick={() => { navigate('gallery'); toast('Select photos, then use “Add to album”'); }}><PlusIcon className="toolbar-icon" /> Add photos</button>
+                            <div className="pt-album-photos-actions">
+                                <ThumbSizeControl value={albumTile} onChange={setAlbumTile} />
+                                {activePhotos && activePhotos.length > 0 && (
+                                    <button type="button" className="pt-linkish" onClick={() => setPhotoSelectMode(!photoSelectMode)}>
+                                        {photoSelectMode ? 'Done' : 'Select'}
+                                    </button>
+                                )}
+                                <button type="button" className="pt-linkish" onClick={() => { navigate('gallery'); toast('Select photos, then use “Add to album”'); }}><PlusIcon className="toolbar-icon" /> Add photos</button>
+                            </div>
                         </div>
                         {activePhotos === undefined && albumPhotosLoading ? (
                             <Spinner label="Loading photos…" center={false} />
                         ) : (
-                            <PhotoGrid photos={activePhotos ?? []} emptyHint="No photos yet — add some from the gallery." />
+                            <div style={{ ['--pt-tile-min' as string]: `${albumTile}px` } as React.CSSProperties}>
+                                <PhotoGrid photos={activePhotos ?? []} emptyHint="No photos yet — add some from the gallery." />
+                            </div>
                         )}
                     </section>
                 </div>
@@ -358,6 +355,20 @@ export const AlbumsPage: React.FC = () => {
                     </button>
                 </SelectionBar>
             )}
+
+            {/* iOS-style bottom sheet for picking a smart-album rule (rendered
+                once at the page root, not inside the duplicated album footers). */}
+            <BottomSheet open={smartSheetOpen} onClose={() => setSmartSheetOpen(false)} title="New smart album">
+                <p className="pt-sheet-intro">Keepsake builds these automatically from your library.</p>
+                <div className="pt-sheet-rules">
+                    {SMART_ALBUM_RULES.map(({ id, label, description, Icon }) => (
+                        <button key={id} type="button" className="pt-sheet-rule" onClick={() => void handleSmartCreate(id)} disabled={smartCreatingRule !== null}>
+                            <span className="pt-sheet-rule-icon"><Icon /></span>
+                            <span className="pt-sheet-rule-text"><b>{label}</b><small>{description}</small></span>
+                        </button>
+                    ))}
+                </div>
+            </BottomSheet>
         </div>
     );
 };

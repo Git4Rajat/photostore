@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
     MoreVertical as EllipsisVerticalIcon,
     Plus as PlusIcon,
@@ -7,7 +7,7 @@ import {
     Wrench as WrenchScrewdriverIcon,
 } from 'lucide-react';
 import { Menu, Stars, SelectionBar } from './bits';
-import { AddToAlbumMenu } from './AddToAlbumMenu';
+import { AddToAlbumSheet } from './AddToAlbumMenu';
 import { useStore } from '../store';
 
 /**
@@ -20,6 +20,7 @@ import { useStore } from '../store';
  */
 export const CommandBar: React.FC = () => {
     const { selection, ratePhotos, deletePhotos, navigate, toast, clearSelection } = useStore();
+    const [albumOpen, setAlbumOpen] = useState(false);
     if (!selection.length) return null;
 
     return (
@@ -58,14 +59,9 @@ export const CommandBar: React.FC = () => {
                             )}
                         </Menu>
 
-                        <AddToAlbumMenu
-                            photoIds={selection}
-                            renderTrigger={(toggle) => (
-                                <button type="button" className="pt-fm-item" onClick={toggle}>
-                                    <PlusIcon /> Album
-                                </button>
-                            )}
-                        />
+                        <button type="button" className="pt-fm-item" onClick={() => { setAlbumOpen(true); close(); }}>
+                            <PlusIcon /> Album
+                        </button>
 
                         <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
                             <WrenchScrewdriverIcon /> Workbench
@@ -73,6 +69,11 @@ export const CommandBar: React.FC = () => {
                     </div>
                 )}
             </Menu>
+
+            {/* Rendered outside the More menu so the sheet survives that menu
+                closing (it's portalled to <body>; a click inside it reads as an
+                outside-click to the popover). */}
+            <AddToAlbumSheet open={albumOpen} onClose={() => setAlbumOpen(false)} photoIds={selection} />
         </SelectionBar>
     );
 };
