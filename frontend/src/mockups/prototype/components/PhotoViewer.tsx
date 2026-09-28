@@ -301,11 +301,20 @@ export const PhotoViewer: React.FC = () => {
     // from claiming the gesture for its own page-zoom; passive:false lets us
     // preventDefault so the pinch scales the photo instead of the page.
     const touchPinchRef = useRef<{ dist: number; zoom: number; pan: { x: number; y: number }; offsetX: number; offsetY: number } | null>(null);
+    // Single-finger drag-to-pan while zoomed. The mouse handlers on
+    // .pt-viewer-photo cover pointer devices, but touch devices never get those
+    // synthesized reliably, so a pinched-in photo couldn't be moved around on
+    // mobile (reported: "can't pan the zoom"). Baseline (px,py) is seeded from
+    // the current pan and deltas are measured from the finger's start point.
+    const touchPanRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
     useEffect(() => {
         const el = stageWrapRef.current;
         if (!el) return undefined;
         const touchDist = (t: TouchList) => t.length >= 2 ? Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) : 0;
         const touchMid = (t: TouchList) => ({ x: (t[0].clientX + t[1].clientX) / 2, y: (t[0].clientY + t[1].clientY) / 2 });
+        const seedPan = (t: Touch) => {
+            touchPanRef.current = { x: t.clientX, y: t.clientY, px: panStateRef.current.x, py: panStateRef.current.y };
+        };
         const onTouchStart = (e: TouchEvent) => {
             if (e.touches.length === 2) {
                 e.preventDefault();
@@ -318,6 +327,13 @@ export const PhotoViewer: React.FC = () => {
                     offsetX: rect ? mid.x - (rect.left + rect.width / 2) : 0,
                     offsetY: rect ? mid.y - (rect.top + rect.height / 2) : 0,
                 };
+                // A second finger starts a pinch, so drop any single-finger pan.
+                touchPanRef.current = null;
+            } else if (e.touches.length === 1 && zoomRef.current > 1) {
+                // Only claim the single-finger gesture when zoomed -- otherwise
+                // leave it to the swipe-to-navigate handler on .pt-viewer-stage.
+                e.preventDefault();
+                seedPan(e.touches[0]);
             }
         };
         const onTouchMove = (e: TouchEvent) => {
@@ -336,10 +352,25 @@ export const PhotoViewer: React.FC = () => {
                     });
                 }
                 setZoom(next);
+            } else if (e.touches.length === 1 && zoomRef.current > 1) {
+                e.preventDefault();
+                // Seed lazily if the drag began before zoom, or after lifting one
+                // finger out of a pinch, so the photo doesn't jump.
+                if (!touchPanRef.current) { seedPan(e.touches[0]); return; }
+                const start = touchPanRef.current;
+                const t = e.touches[0];
+                setPan({ x: start.px + (t.clientX - start.x), y: start.py + (t.clientY - start.y) });
             }
         };
         const onTouchEnd = (e: TouchEvent) => {
             if (e.touches.length < 2) touchPinchRef.current = null;
+            if (e.touches.length === 0) {
+                touchPanRef.current = null;
+            } else if (e.touches.length === 1 && zoomRef.current > 1) {
+                // Transitioning from pinch (2 fingers) down to one: re-seed the
+                // pan baseline against the remaining finger so it doesn't jump.
+                seedPan(e.touches[0]);
+            }
         };
         el.addEventListener('touchstart', onTouchStart, { passive: false });
         el.addEventListener('touchmove', onTouchMove, { passive: false });
