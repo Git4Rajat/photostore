@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import * as library from '../services/libraryClient';
-import { LogoLockup } from './shared/Logo';
+import AuthShell from './shared/AuthShell';
 
 // Public page reached from the "confirm cleanup" link in a library-clean
 // confirmation email:
@@ -61,10 +61,7 @@ const ConfirmLibraryCleanPage: React.FC = () => {
     }, [jobId, outcome]);
 
     return (
-        <section className="auth-page card-glass">
-            <LogoLockup size={46} className="auth-logo" />
-            <p className="additional-kicker">CONFIRM CLEANUP</p>
-            <h2 className="auth-page-title">Confirm library cleanup</h2>
+        <AuthShell kicker="CONFIRM CLEANUP" title="Confirm library cleanup">
             {!token ? (
                 <p className="status error">This link is missing its confirmation token.</p>
             ) : outcome === 'idle' ? (
@@ -100,7 +97,7 @@ const ConfirmLibraryCleanPage: React.FC = () => {
             ) : (
                 <p className="status">Cleanup is running in the background…</p>
             )}
-        </section>
+        </AuthShell>
     );
 };
 

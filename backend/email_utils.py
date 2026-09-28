@@ -118,6 +118,10 @@ def _wrap_email(*, app_name: str, heading: str, body_html: str, cta_url: Optiona
                 cta_label: str, footer_note: str) -> str:
     """Wrap message content in a branded, email-client-safe HTML shell.
 
+    Matches the app's "Light Table" theme — a warm cream page, a slate-blue
+    accent (``--accent`` #2f5d82) and warm near-black ink — so the emails read
+    as the same product as the web UI, replacing the old cool-blue shell.
+
     Uses table layout and inline styles only (no <style> block or external
     assets) so it renders consistently across mail clients. ``app_name``,
     ``heading``, ``cta_label`` and ``footer_note`` are escaped here; ``body_html``
@@ -128,35 +132,59 @@ def _wrap_email(*, app_name: str, heading: str, body_html: str, cta_url: Optiona
     """
     safe_app = html.escape(app_name or 'Keepsake')
     safe_heading = html.escape(heading)
-    accent = '#1e6ae1'
+
+    # Light Table palette (mirrors frontend/src/index.css design tokens).
+    accent = '#2f5d82'          # --accent (slate-blue)
+    ink = '#1e1c18'             # --text
+    muted = '#6b6458'           # --muted
+    page_bg = '#f1ece1'         # --bg-2 (warm cream page)
+    card_bg = '#fbf9f5'         # --bg-1 (near-white warm card)
+    card_edge = '#e4ddcf'       # warm hairline
+    footer_bg = '#f4efe6'
     font = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+
+    # Brand lockup: a rounded "photo card" badge with a heart (echoing the app
+    # logo) beside the wordmark, on the accent header band. A text heart glyph
+    # (U+2665) is used rather than an emoji so it inherits the accent colour
+    # instead of rendering as a colour emoji.
+    brand_html = (
+        '<table role="presentation" cellpadding="0" cellspacing="0"><tr>'
+        '<td style="vertical-align:middle;padding-right:12px;">'
+        '<div style="width:40px;height:40px;border-radius:12px;background:#ffffff;'
+        f'text-align:center;line-height:40px;font-size:21px;color:{accent};'
+        'font-family:Arial,sans-serif;">&#9829;</div>'
+        '</td>'
+        '<td style="vertical-align:middle;">'
+        '<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.01em;">'
+        f'{safe_app}</span>'
+        '</td></tr></table>'
+    )
+
     cta_html = (
-        '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:22px 0;">'
-        f'<tr><td style="border-radius:10px;background:{accent};">'
-        f'<a href="{cta_url}" style="display:inline-block;padding:12px 26px;color:#ffffff;'
-        'text-decoration:none;font-weight:600;font-size:15px;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 8px;">'
+        f'<tr><td style="border-radius:12px;background:{accent};box-shadow:0 6px 16px rgba(47,93,130,0.28);">'
+        f'<a href="{cta_url}" style="display:inline-block;padding:13px 30px;color:#ffffff;'
+        'text-decoration:none;font-weight:600;font-size:15px;border-radius:12px;">'
         f'{html.escape(cta_label)}</a></td></tr></table>'
     ) if cta_url else ''
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
-        '<body style="margin:0;padding:0;background:#f2efe9;">'
+        f'<body style="margin:0;padding:0;background:{page_bg};">'
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-        'style="background:#f2efe9;padding:32px 12px;"><tr><td align="center">'
+        f'style="background:{page_bg};padding:36px 12px;"><tr><td align="center">'
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-        'style="max-width:520px;background:#ffffff;border-radius:16px;overflow:hidden;'
-        f'border:1px solid #e6e0d6;font-family:{font};">'
-        f'<tr><td style="background:{accent};padding:22px 28px;">'
-        f'<span style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:-0.01em;">{safe_app}</span>'
-        '</td></tr>'
-        '<tr><td style="padding:28px;color:#1a1a1a;font-size:15px;line-height:1.6;">'
-        f'<h1 style="margin:0 0 16px;font-size:20px;font-weight:700;color:#1a1a1a;">{safe_heading}</h1>'
+        f'style="max-width:520px;background:{card_bg};border-radius:18px;overflow:hidden;'
+        f'border:1px solid {card_edge};font-family:{font};">'
+        f'<tr><td style="background:{accent};padding:22px 28px;">{brand_html}</td></tr>'
+        f'<tr><td style="padding:30px 28px;color:{ink};font-size:15px;line-height:1.6;">'
+        f'<h1 style="margin:0 0 16px;font-size:21px;font-weight:700;letter-spacing:-0.01em;color:{ink};">{safe_heading}</h1>'
         f'{body_html}'
         f'{cta_html}'
-        f'<p style="margin:16px 0 0;color:#6a6a6a;font-size:13px;line-height:1.6;">{html.escape(footer_note)}</p>'
+        f'<p style="margin:18px 0 0;color:{muted};font-size:13px;line-height:1.6;">{html.escape(footer_note)}</p>'
         '</td></tr>'
-        '<tr><td style="padding:16px 28px;background:#faf8f4;border-top:1px solid #eee7dc;'
-        f'color:#9a938a;font-size:12px;">Sent by {safe_app} — your own private photo library.</td></tr>'
+        f'<tr><td style="padding:18px 28px;background:{footer_bg};border-top:1px solid {card_edge};'
+        f'color:{muted};font-size:12px;line-height:1.5;">Sent by {safe_app} — an elegant home for your memories.</td></tr>'
         '</table></td></tr></table></body></html>'
     )
 
