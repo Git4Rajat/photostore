@@ -2442,7 +2442,20 @@ def _rebuild_lexical_index_in_background(key: str, manifest: Dict[str, str]) -> 
     threading.Thread(target=_worker, name='lexical-index-rebuild', daemon=True).start()
 
 
-def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
+def get_user_lexical_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
+    """allow_sync_build=False (mirrors get_user_sort_index) skips the
+    synchronous cold-build branch below: a user with no snapshot ever built
+    gets None back immediately (with a background build kicked off) instead
+    of blocking ~60-75s on a full Table scan. photos_search_index passes this
+    -- it only ever hands out a SAS URL, and the frontend
+    (runLocalSemanticSearch) already degrades to server-side /photos/search
+    when the local index isn't ready, so there's nothing to gain by blocking
+    that request on a build nobody's waiting synchronously for. search_photos
+    keeps the default (True): it needs real rows to answer the query *now*,
+    and a synchronous build here produces a durable, reusable index instead of
+    just falling through to its own equally-expensive raw-scan fallback."""
     key = str(user_id or '').strip()
     if not key:
         return None
@@ -2459,7 +2472,7 @@ def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optio
         # snapshot already exists (even stale/dirty), serve it immediately
         # and rebuild off-thread; only a true cold start (no snapshot has
         # ever been built) pays the synchronous cost, since there's nothing
-        # else to serve.
+        # else to serve -- unless allow_sync_build=False, see above.
         stale = _load_lexical_index_blob(key)
         if stale is not None:
             fresh = {
@@ -2469,7 +2482,7 @@ def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optio
                 'rows': stale.rows,
             }
             _rebuild_lexical_index_in_background(key, manifest)
-        else:
+        elif allow_sync_build:
             with _LEXICAL_INDEX_REBUILD_LOCKS.lock_for(key):
                 # Re-check after acquiring: another thread may have just
                 # finished rebuilding while this one waited for the lock.
@@ -2484,6 +2497,8 @@ def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optio
                             'updated_at': refreshed.updated_at,
                             'rows': refreshed.rows,
                         }
+        else:
+            _rebuild_lexical_index_in_background(key, manifest)
     if fresh is None:
         return None
     # Fresh per-call copy of the shared cached rows list -- multiple concurrent

@@ -769,7 +769,13 @@ def photos_search_index():
     # from storage, never through this request.
     #
     # Lexical index: ensured fresh via allow_refresh=True (safe -- built from
-    # plain metadata fields, no ML/version dependency). Vector index:
+    # plain metadata fields, no ML/version dependency). allow_sync_build=False
+    # -- like photos_sort_index -- means a user with no snapshot ever built
+    # gets available:false back immediately (background build kicked off)
+    # instead of blocking ~60-75s on a full Table scan: this route only hands
+    # out a SAS URL, and the frontend (runLocalSemanticSearch) already
+    # degrades to server-side /photos/search when the local index isn't
+    # ready, so nothing here needs the synchronous build. Vector index:
     # deliberately NOT read via get_user_vector_index -- see
     # get_vector_index_manifest_summary's docstring for why that function's
     # version-gated freshness check is both always-false and actively
@@ -780,17 +786,23 @@ def photos_search_index():
     if error:
         return error
     try:
-        lexical_index = app.get_user_lexical_index(user_id, allow_refresh=True)
+        lexical_index = app.get_user_lexical_index(user_id, allow_refresh=True, allow_sync_build=False)
     except Exception:
         lexical_index = None
     if lexical_index is None:
-        return app.jsonify({'available': False}), 503
+        # 200, not 503: a plain 503 here would hit httpClient.ts's cold-start
+        # retry loop (any 503 is treated as "ingress rejected before reaching
+        # the app, safe to retry" -- see isRetriableColdStart), stalling for
+        # ~90s of retries before localSearchIndex.ts's caller ever sees the
+        # null it needs to fall back to server-side search. Same fix as
+        # photos_sort_index's identical bug (see that route's comment).
+        return app.jsonify({'available': False})
     try:
         container_name, blob_name = app.get_lexical_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
     except Exception:
         app.app.logger.exception('Failed to mint lexical index SAS URL for %s', user_id)
-        return app.jsonify({'available': False}), 503
+        return app.jsonify({'available': False})
 
     vector_index_payload = None
     try:

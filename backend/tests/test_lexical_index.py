@@ -322,6 +322,46 @@ def test_get_user_lexical_index_never_blocks_once_a_stale_snapshot_exists(monkey
         pytest.fail('background lexical index rebuild never completed')
 
 
+# --- allow_sync_build=False: non-blocking cold path --------------------------
+# Same fix as the sort index (see test_sort_index.py): a route that only
+# hands out a SAS URL, with a frontend that already degrades gracefully when
+# the index isn't ready, has nothing to gain from blocking ~60-75s on a cold
+# full-library build.
+
+def test_get_user_lexical_index_cold_non_blocking_returns_none_then_builds_in_background(lexical_ctx):
+    table, _ = lexical_ctx
+    _seed_row(table, 'lib-cold', 'a.jpg', tags='[]')
+
+    result = storage_utils.get_user_lexical_index('lib-cold', allow_refresh=True, allow_sync_build=False)
+    assert result is None  # did NOT block on a synchronous build
+
+    lock = storage_utils._LEXICAL_INDEX_REBUILD_LOCKS.lock_for('lib-cold')
+    for _ in range(50):
+        if lock.acquire(blocking=False):
+            lock.release()
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail('background lexical index build never completed')
+
+    built = storage_utils.get_user_lexical_index('lib-cold', allow_refresh=False)
+    assert built is not None
+    assert [row['RowKey'] for row in built['rows']] == ['a.jpg']
+
+
+def test_get_user_lexical_index_cold_sync_build_default_still_builds_inline(lexical_ctx):
+    """Backward-compat pin: search_photos (and any other internal caller)
+    keeps the default allow_sync_build=True and gets a synchronous cold
+    build -- it needs real rows to answer the query now, and a sync build
+    here produces a durable, reusable index rather than a one-off scan."""
+    table, _ = lexical_ctx
+    _seed_row(table, 'lib-sync', 'a.jpg', tags='[]')
+
+    result = storage_utils.get_user_lexical_index('lib-sync', allow_refresh=True)
+    assert result is not None
+    assert [row['RowKey'] for row in result['rows']] == ['a.jpg']
+
+
 # --- search_photos fallback --------------------------------------------------
 
 def _fallback_row(filename: str) -> dict:

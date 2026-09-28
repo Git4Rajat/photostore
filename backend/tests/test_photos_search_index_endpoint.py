@@ -10,18 +10,47 @@ import app
 from routes.photos import photos_search_index
 
 
-def test_returns_503_when_lexical_index_unavailable(monkeypatch):
+def test_returns_200_available_false_when_lexical_index_unavailable(monkeypatch):
+    # Deliberately 200, not 503 -- a 503 here hits httpClient.ts's cold-start
+    # retry loop (isRetriableColdStart treats any 503 as "ingress rejected
+    # before reaching the app, safe to retry"), stalling for ~90s before
+    # runLocalSemanticSearch's caller (AskPage.tsx) ever sees the null it
+    # needs to fall back to server-side /photos/search. Same fix as
+    # photos_sort_index's identical bug -- see that route's comment in
+    # routes/photos.py.
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)
 
     with app.app.test_request_context('/api/photos/search-index'):
-        response, status = photos_search_index()
+        response = photos_search_index()
 
-    assert status == 503
+    assert not isinstance(response, tuple)  # no explicit status -> Flask's default 200
+    assert response.status_code == 200
     assert response.get_json()['available'] is False
 
 
-def test_returns_503_when_sas_minting_fails(monkeypatch):
+def test_passes_allow_sync_build_false_so_a_cold_library_never_blocks(monkeypatch):
+    """A user with no lexical snapshot ever built must not block this request
+    on a ~60-75s synchronous full-library scan -- this route only hands out a
+    SAS URL, and the frontend already degrades to server-side search when the
+    index isn't ready (see get_user_lexical_index's allow_sync_build
+    docstring)."""
+    captured = {}
+
+    def _spy(user_id, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, 'get_user_lexical_index', _spy)
+
+    with app.app.test_request_context('/api/photos/search-index'):
+        photos_search_index()
+
+    assert captured.get('allow_sync_build') is False
+
+
+def test_returns_200_available_false_when_sas_minting_fails(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: {'source_version': 'v1', 'updated_at': 'now'})
 
@@ -31,9 +60,10 @@ def test_returns_503_when_sas_minting_fails(monkeypatch):
     monkeypatch.setattr(app, 'get_lexical_index_blob_location', _raise)
 
     with app.app.test_request_context('/api/photos/search-index'):
-        response, status = photos_search_index()
+        response = photos_search_index()
 
-    assert status == 503
+    assert not isinstance(response, tuple)
+    assert response.status_code == 200
     assert response.get_json()['available'] is False
 
 
