@@ -101,6 +101,10 @@ from storage_utils import (
     get_user_sort_index,
     get_sort_index_blob_location,
     delete_user_sort_index_data,
+    touch_user_albums_index_state,
+    get_user_albums_index,
+    get_albums_index_blob_location,
+    delete_user_albums_index_data,
     get_user_lexical_index,
     get_lexical_index_blob_location,
     invalidate_user_lexical_index_cache,
@@ -6926,6 +6930,11 @@ def _save_album_entity(entity: Dict) -> None:
     if albums_table_client is None:
         return
     albums_table_client.upsert_entity(entity)
+    # Single choke point every album mutation (create, rename, delete/restore,
+    # add/remove photos, share/revoke, autocreate) already runs through -- see
+    # routes/albums.py -- so hooking the albums index's dirty-marking in here
+    # once covers all of them without scattering the call across every route.
+    touch_user_albums_index_state(str(entity.get('PartitionKey') or ''))
 
 
 def _store_album_token_index(token: str, user_id: str, album_id: str) -> None:
@@ -6972,6 +6981,9 @@ def _hard_delete_album_now(user_id: str, album_id: str, existing: Optional[Dict]
     old_token = str((existing or {}).get('publicToken') or '')
     if old_token:
         _delete_album_token_index(old_token)
+    # Unlike every other mutation (see _save_album_entity), a hard delete
+    # never upserts the row, so it needs its own dirty-marking call.
+    touch_user_albums_index_state(user_id)
     return True
 
 
@@ -7955,6 +7967,7 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_lexical_index_data(library_id)
     delete_user_tag_embedding_index_data(library_id)
     delete_user_sort_index_data(library_id)
+    delete_user_albums_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
     return {'photosDeleted': len(metadata_rows), 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}

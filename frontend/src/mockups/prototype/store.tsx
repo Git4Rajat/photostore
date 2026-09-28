@@ -2,6 +2,8 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
 import { getLocalSortIndex, patchLocalSortIndexRow } from '../../services/localSortIndex';
+import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
+import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
@@ -299,6 +301,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const photoHasMoreRef = useRef(true);
     const [albums, setAlbums] = useState<Album[]>([]);
     const [albumsLoading, setAlbumsLoading] = useState<boolean>(true);
+    // Populated by fetchAlbums's primary (local-index) path -- lets openAlbum
+    // resolve an album's photos via the existing batched
+    // /api/photos/lookup-batch instead of GET /albums/<id>'s sequential
+    // per-photo point-read loop. Empty (album not found here) means the
+    // fallback path (GET /albums/<id>) should be used instead.
+    const albumFilenamesRef = useRef<Record<string, string[]>>({});
     const [albumPhotos, setAlbumPhotos] = useState<Record<string, Photo[]>>({});
     const [albumPhotosLoading, setAlbumPhotosLoading] = useState<boolean>(false);
     const [placesState, setPlacesState] = useState<Place[]>([]);
@@ -583,17 +591,48 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .catch(() => { /* viewer will show its own empty/loading state */ });
     }, [photos, openViewer, registerPhotos]);
 
+    // Primary path: the whole-library albums index (see localAlbumsIndex.ts),
+    // downloaded once per session -- covers picked from the sort index, not
+    // list_albums's whole-library scan. Falls back to the legacy GET /albums
+    // on any failure (cold index, network error) so the page never breaks.
+    const fetchAlbumsViaLegacyEndpoint = useCallback(async () => {
+        const res = await get<{ albums?: Album[] }>('/albums');
+        albumFilenamesRef.current = {};
+        setAlbums(Array.isArray(res?.albums) ? res.albums : []);
+    }, []);
+
     const fetchAlbums = useCallback(async () => {
         setAlbumsLoading(true);
         try {
-            const res = await get<{ albums?: Album[] }>('/albums');
-            setAlbums(Array.isArray(res?.albums) ? res.albums : []);
+            const rows = await getLocalAlbumsIndex();
+            if (!rows) {
+                throw new Error('albums index unavailable');
+            }
+            const coverFilenames = rows.map((r) => r.coverFilename).filter(Boolean);
+            const covers = coverFilenames.length ? await resolveThumbnailAccessUrls(coverFilenames) : new Map<string, string>();
+            albumFilenamesRef.current = Object.fromEntries(rows.map((r) => [r.albumId, r.filenames]));
+            const mapped: Album[] = rows.map((r) => ({
+                id: r.albumId,
+                name: r.name,
+                photoCount: r.photoCount,
+                coverThumbnailUrl: r.coverFilename ? covers.get(r.coverFilename) || undefined : undefined,
+                isPublic: r.isPublic,
+                publicUrl: r.publicUrl || undefined,
+                publicExpiresAt: r.publicExpiresAt || undefined,
+                hasAccessCode: r.hasAccessCode,
+                isExpired: r.isExpired,
+            }));
+            setAlbums(mapped);
         } catch {
-            // leave the current list in place on transient failures
+            try {
+                await fetchAlbumsViaLegacyEndpoint();
+            } catch {
+                // leave the current list in place on transient failures
+            }
         } finally {
             setAlbumsLoading(false);
         }
-    }, []);
+    }, [fetchAlbumsViaLegacyEndpoint]);
 
     const reloadAlbums = useCallback(() => { void fetchAlbums(); }, [fetchAlbums]);
 
@@ -611,7 +650,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             // the backend's independent sort-index manifest to catch up.
             ids.forEach((id) => patchLocalSortIndexRow(id, { rating }));
             void post('/photos/rate-multiple', { filenames: ids, rating })
-                .then(() => reloadAlbums())
+                .then(() => { invalidateLocalAlbumsIndex(); reloadAlbums(); })
                 .catch(() => {
                     setPhotos((prev) => prev.map((p) => (prevRatings.has(p.id) ? { ...p, rating: prevRatings.get(p.id)! } : p)));
                     prevRatings.forEach((prevRating, id) => patchLocalSortIndexRow(id, { rating: prevRating }));
@@ -636,6 +675,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                         ? { ...p, liked: res.liked ?? nextLiked, likes }
                         : p)));
                     patchLocalSortIndexRow(id, { likes });
+                    invalidateLocalAlbumsIndex();
                     reloadAlbums();
                 })
                 .catch(() => {
@@ -816,6 +856,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const restored = snapshot.find((t) => t.album.id === id);
         setAlbumTrash((prev) => prev.filter((t) => t.album.id !== id));
         if (restored) setAlbums((prev) => [restored.album, ...prev]);
+        invalidateLocalAlbumsIndex();
         void post(`/albums/${encodeURIComponent(id)}/restore`, {}).catch(() => {
             setAlbumTrash(snapshot);
             if (restored) setAlbums((prev) => prev.filter((a) => a.id !== id));
@@ -826,6 +867,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const purgeAlbum = useCallback((id: string) => {
         const snapshot = albumTrash;
         setAlbumTrash((prev) => prev.filter((t) => t.album.id !== id));
+        invalidateLocalAlbumsIndex();
         void post(`/albums/${encodeURIComponent(id)}/purge`, {}).catch(() => {
             setAlbumTrash(snapshot);
             toast('Couldn’t permanently delete album');
@@ -855,21 +897,63 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const reloadExplore = useCallback(() => { void fetchExplore(); }, [fetchExplore]);
 
+    // /api/photos/lookup-batch caps a single call at 200 filenames -- chunk
+    // and resolve chunks concurrently rather than sequentially, so a large
+    // album's cost is one round trip's worth of latency, not N.
+    const LOOKUP_BATCH_CHUNK = 200;
+    const lookupPhotosByFilenames = useCallback(async (filenames: string[]): Promise<Photo[]> => {
+        if (filenames.length === 0) return [];
+        const chunks: string[][] = [];
+        for (let i = 0; i < filenames.length; i += LOOKUP_BATCH_CHUNK) {
+            chunks.push(filenames.slice(i, i + LOOKUP_BATCH_CHUNK));
+        }
+        const responses = await Promise.all(
+            chunks.map((chunk) => post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: chunk })),
+        );
+        const byFilename = new Map<string, BackendPhoto>();
+        responses.forEach((res) => (res?.photos ?? []).forEach((p) => byFilename.set(p.filename, p)));
+        // Re-order to match the album's stored order -- lookup-batch may
+        // silently drop a filename deleted since the index was built.
+        return filenames
+            .map((f) => byFilename.get(f))
+            .filter((p): p is BackendPhoto => Boolean(p))
+            .map(mapPhoto);
+    }, []);
+
+    // Legacy path: the sequential per-photo point-read GET /albums/<id> does
+    // server-side. Kept only as a fallback for when the album isn't in the
+    // locally-cached index (cold index, network error) so opening an album
+    // never breaks.
+    const openAlbumViaLegacyEndpoint = useCallback(async (id: string) => {
+        const res = await get<{ album?: Album; photos?: BackendPhoto[] }>(`/albums/${encodeURIComponent(id)}`);
+        const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
+        setAlbumPhotos((prev) => ({ ...prev, [id]: list }));
+        if (res?.album) {
+            setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
+        }
+    }, []);
+
     const openAlbum = useCallback(async (id: string) => {
         setAlbumPhotosLoading(true);
         try {
-            const res = await get<{ album?: Album; photos?: BackendPhoto[] }>(`/albums/${encodeURIComponent(id)}`);
-            const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
-            setAlbumPhotos((prev) => ({ ...prev, [id]: list }));
-            if (res?.album) {
-                setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
+            const filenames = albumFilenamesRef.current[id];
+            if (filenames === undefined) {
+                // Not in the locally-cached index (cold/unavailable) -- fall
+                // back rather than silently showing an empty album.
+                throw new Error('album not in local index');
             }
+            const list = await lookupPhotosByFilenames(filenames);
+            setAlbumPhotos((prev) => ({ ...prev, [id]: list }));
         } catch {
-            setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
+            try {
+                await openAlbumViaLegacyEndpoint(id);
+            } catch {
+                setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
+            }
         } finally {
             setAlbumPhotosLoading(false);
         }
-    }, []);
+    }, [lookupPhotosByFilenames, openAlbumViaLegacyEndpoint]);
 
     const albumPhotosById = useCallback((id: string) => albumPhotos[id], [albumPhotos]);
 
@@ -881,6 +965,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const created = res?.album;
                 if (created) {
                     setAlbums((prev) => [...prev, created]);
+                    albumFilenamesRef.current = { ...albumFilenamesRef.current, [created.id]: [] };
+                    invalidateLocalAlbumsIndex();
                     return created.id;
                 }
             } catch {
@@ -902,6 +988,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const count = Number(res?.count || 0);
                 if (count > 0 && created) {
                     setAlbums((prev) => (prev.some((a) => a.id === created.id) ? prev : [created, ...prev]));
+                    invalidateLocalAlbumsIndex();
                     return { albumId: created.id, count };
                 }
                 return { albumId: '', count: 0, message: res?.message };
@@ -918,6 +1005,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         if (!trimmed) return;
         const previous = albums.find((a) => a.id === id)?.name;
         setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: trimmed } : a)));
+        invalidateLocalAlbumsIndex();
         void post(`/albums/${encodeURIComponent(id)}/rename`, { name: trimmed }).catch(() => {
             setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: previous ?? a.name } : a)));
             toast('Couldn’t rename album');
@@ -929,9 +1017,19 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             if (!ids.length) return;
             const album = albums.find((a) => a.id === albumId);
             setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: a.photoCount + ids.length } : a)));
+            invalidateLocalAlbumsIndex();
             void post(`/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids })
                 .then(() => {
                     toast(`Added ${ids.length} to “${album?.name ?? 'album'}”`);
+                    // Keep the cached filename list in step so, if this album
+                    // is currently open, the openAlbum call below (which reads
+                    // from this ref) sees the new photos immediately instead
+                    // of the stale pre-add list.
+                    const existing = albumFilenamesRef.current[albumId] ?? [];
+                    albumFilenamesRef.current = {
+                        ...albumFilenamesRef.current,
+                        [albumId]: Array.from(new Set([...existing, ...ids])),
+                    };
                     // Refresh the album's photos if it's currently open/cached.
                     if (albumPhotos[albumId]) void openAlbum(albumId);
                 })
@@ -946,6 +1044,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const deleteAlbum = useCallback((id: string) => {
         const removed = albums.find((a) => a.id === id);
         setAlbums((prev) => prev.filter((a) => a.id !== id));
+        invalidateLocalAlbumsIndex();
         void post('/albums/delete-multiple', { albumIds: [id] })
             .then(() => toast(`Deleted “${removed?.name ?? 'album'}”`))
             .catch(() => {
@@ -959,6 +1058,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const idSet = new Set(ids);
         const removed = albums.filter((a) => idSet.has(a.id));
         setAlbums((prev) => prev.filter((a) => !idSet.has(a.id)));
+        invalidateLocalAlbumsIndex();
         void post('/albums/delete-multiple', { albumIds: ids })
             .then(() => toast(`Deleted ${removed.length} album${removed.length === 1 ? '' : 's'}`))
             .catch(() => {
@@ -978,6 +1078,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             if (res?.album) {
                 setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
             }
+            invalidateLocalAlbumsIndex();
         } catch {
             toast('Couldn’t update share link');
         }
@@ -989,6 +1090,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setAlbums((prev) => prev.map((a) => (a.id === id
                 ? { ...a, ...(res?.album ?? {}), isPublic: false, publicUrl: undefined }
                 : a)));
+            invalidateLocalAlbumsIndex();
         } catch {
             toast('Couldn’t revoke share link');
         }

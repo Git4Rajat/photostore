@@ -39,7 +39,7 @@ from image_utils import (
     RAW_EXTENSIONS_RAWPY,
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
-from ordering_utils import metadata_capture_datetime
+from ordering_utils import metadata_capture_datetime, parse_iso_date
 from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
 import maps_utils
 import vision_utils
@@ -2620,6 +2620,13 @@ def touch_user_sort_index_state(user_id: str) -> str:
         except Exception:
             pass
     invalidate_user_sort_index_cache(key)
+    # Album covers are picked from the sort index's rating/likes/captureDate
+    # (see _pick_album_cover_filename) -- anything that dirties the sort
+    # index (rating, likes, or an EXIF/captureDate change via
+    # touch_user_search_indexes_state's fan-out) can change which photo an
+    # album's cover should be, so keep the albums index in lockstep here
+    # rather than duplicating this trigger at every photo-mutation call site.
+    touch_user_albums_index_state(key)
     return source_version
 
 
@@ -2961,6 +2968,437 @@ def get_user_sort_index(
             # off-thread so the next request is fast, and report "not ready"
             # now so the caller falls back rather than waiting on a full scan.
             _rebuild_sort_index_in_background(key, manifest)
+    if fresh is None:
+        return None
+    return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
+
+
+# --- Albums index --------------------------------------------------------------
+# Same "own blob + own manifest, downloaded once per session" architecture as
+# the sort index above, applied to Albums: {albumId, name, photoCount,
+# coverFilename, updatedAt, filenames} for every album, so the frontend can
+# render the Albums list AND open an album's full photo set without either of
+# the two real inefficiencies this replaces:
+#   - list_albums's per-album cover computation (_album_cover_thumbnail_url,
+#     app.py) rides the whole-library rating/likes/date sorted scan; this
+#     index instead looks each album's cover up against the already-built
+#     sort index's rows (get_user_sort_index) -- no fresh library scan.
+#   - get_album's _load_photos_for_filenames (app.py) does a sequential,
+#     non-batched, non-concurrent Table point-read per photo in the album.
+#     The index carries each album's filenames directly (already stored on
+#     the album entity, see _album_filenames) so the frontend can skip
+#     GET /albums/<id> entirely and resolve full photo data via the existing
+#     batched /api/photos/lookup-batch instead.
+#
+# Deliberately NO incremental-merge machinery (unlike the sort/lexical
+# indexes): album count is small relative to library size -- the whole reason
+# those indexes need point-read-only incremental rebuilds -- so a full
+# rebuild (re-scan the small album partition + look up cover data from the
+# already-resident sort index) is cheap enough to just always do. Own dirty
+# flag only (no per-album dirty-filenames partition).
+_ALBUMS_INDEX_SCHEMA_VERSION = 'v1'
+_ALBUMS_INDEX_CACHE_LOCK = threading.RLock()
+_ALBUMS_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_ALBUMS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
+
+
+def _albums_index_json_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-albums.json.gz'
+
+
+def _albums_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-albums.json'
+
+
+def get_albums_index_blob_location(user_id: str) -> Tuple[str, str]:
+    """(container_name, blob_name) for user_id's albums index data blob --
+    mirrors get_sort_index_blob_location/get_lexical_index_blob_location."""
+    return _lexical_index_container_name(), _albums_index_json_blob_name(user_id)
+
+
+def _albums_index_blob_client(blob_name: str):
+    container_name = _lexical_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_albums_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _ALBUMS_INDEX_CACHE_LOCK:
+        _ALBUMS_INDEX_CACHE.pop(key, None)
+
+
+def delete_user_albums_index_data(user_id: str) -> None:
+    """Delete a library's cached albums-index blobs (data + manifest) and
+    drop it from the in-memory cache. Best-effort: a missing blob is not an
+    error. Mirrors delete_user_sort_index_data."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for blob_name in (_albums_index_json_blob_name(key), _albums_index_manifest_blob_name(key)):
+        blob_client = _albums_index_blob_client(blob_name)
+        if blob_client is None:
+            continue
+        try:
+            blob_client.delete_blob()
+        except Exception:
+            pass
+    invalidate_user_albums_index_cache(key)
+
+
+def touch_user_albums_index_state(user_id: str) -> str:
+    """Mark the albums index's manifest dirty with a fresh sourceVersion --
+    mirrors touch_user_sort_index_state. No per-album dirty-filenames
+    partition (see module comment above): a full rebuild is cheap enough that
+    incremental tracking isn't worth the complexity here."""
+    key = str(user_id or '').strip()
+    if not key:
+        return ''
+    source_version = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        'userId': key,
+        'sourceVersion': source_version,
+        'schemaVersion': _ALBUMS_INDEX_SCHEMA_VERSION,
+        'dirty': True,
+        'updatedAt': source_version,
+    }
+    blob_client = _albums_index_blob_client(_albums_index_manifest_blob_name(key))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    invalidate_user_albums_index_cache(key)
+    return source_version
+
+
+def _load_albums_index_manifest(user_id: str) -> Dict[str, str]:
+    blob_client = _albums_index_blob_client(_albums_index_manifest_blob_name(user_id))
+    if blob_client is None:
+        return {}
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_albums_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    blob_client = _albums_index_blob_client(_albums_index_json_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        rows = parsed.get('rows')
+        if not isinstance(rows, list):
+            return None
+        return LexicalIndexSnapshot(
+            user_id=str(user_id),
+            source_version=str(parsed.get('sourceVersion') or ''),
+            schema_version=str(parsed.get('schemaVersion') or ''),
+            updated_at=str(parsed.get('updatedAt') or ''),
+            rows=rows,
+        )
+    except Exception:
+        return None
+
+
+def _serialize_albums_index(snapshot: LexicalIndexSnapshot) -> bytes:
+    payload = {
+        'userId': snapshot.user_id,
+        'sourceVersion': snapshot.source_version,
+        'schemaVersion': snapshot.schema_version,
+        'updatedAt': snapshot.updated_at,
+        'rowCount': len(snapshot.rows),
+        'rows': snapshot.rows,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+    return gzip.compress(raw, compresslevel=6)
+
+
+def _pick_album_cover_filename(filenames: List[str], sort_rows_by_filename: Dict[str, Dict[str, object]]) -> str:
+    """Highest rating -> most likes -> most recent capture -> filename,
+    matching _album_cover_thumbnail_url's existing selection rule -- sourced
+    from the sort index's already-resident rows instead of a fresh
+    whole-library scan. A filename the sort index doesn't have (index still
+    cold/rebuilding) is treated as lowest-priority, never crashes: falls back
+    to the first filename in album order if none are found in the sort index
+    at all."""
+    if not filenames:
+        return ''
+    best_filename = ''
+    best_key: Optional[Tuple[int, int, str]] = None
+    for filename in filenames:
+        row = sort_rows_by_filename.get(filename)
+        if row is None:
+            continue
+        key = (int(row.get('rating') or 0), int(row.get('likes') or 0), str(row.get('captureDate') or ''))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_filename = filename
+    return best_filename or filenames[0]
+
+
+def _album_coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ('1', 'true', 'yes')
+
+
+def _album_share_fields(row: Dict) -> Dict[str, object]:
+    """Mirrors app.py's _album_entity_to_payload's share-status fields
+    (isPublic/publicUrl/publicExpiresAt/hasAccessCode/isExpired) -- these are
+    cheap, O(1)-per-album fields already stored directly on the entity (not
+    something the sort-index-backed cover lookup helps with), so the index
+    carries them too rather than dropping them and regressing the Albums
+    page's sharing UI (AlbumsPage.tsx reads album.isPublic/publicUrl/
+    hasAccessCode directly).
+
+    Deliberately reimplemented here (not calling _album_entity_to_payload
+    directly) rather than importing across the app.py/storage_utils.py
+    boundary -- app.py imports FROM storage_utils.py, not the reverse, so a
+    reverse import would be circular. Also deliberately does NOT fall back to
+    request.host_url the way _album_entity_to_payload does: this can run on a
+    background rebuild thread (see _rebuild_albums_index_in_background) with
+    no active Flask request context at all. EXTRAS_PUBLIC_BASE_URL is read
+    directly from the environment (same variable, independently) -- a
+    publicUrl is only ever omitted if that's unset in a real deployment,
+    which the live SPA_BASE_URL/EXTRAS_PUBLIC_BASE_URL convention treats as a
+    misconfiguration anyway, not an expected runtime state.
+    """
+    is_public = _album_coerce_bool(row.get('isPublic', False))
+    token = str(row.get('publicToken') or '')
+    expires_at_raw = str(row.get('publicExpiresAt') or '')
+    expires_dt = parse_iso_date(expires_at_raw) if expires_at_raw else None
+    is_expired = bool(expires_dt and datetime.now(timezone.utc) > expires_dt)
+    public_url = ''
+    if is_public and token and not is_expired:
+        base = os.getenv('EXTRAS_PUBLIC_BASE_URL', '').strip()
+        if base:
+            public_url = f"{base.rstrip('/')}/public/album/{token}"
+    return {
+        'isPublic': is_public and not is_expired,
+        'publicUrl': public_url,
+        'publicExpiresAt': expires_at_raw,
+        'hasAccessCode': bool(str(row.get('accessCode', '')).strip()),
+        'isExpired': is_expired,
+    }
+
+
+def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
+    albums_table_client = _CTX.get('albums_table_client')
+    if albums_table_client is None:
+        return None
+    try:
+        rows = list(albums_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        # A transient query failure must not be treated as "no albums" --
+        # refresh_user_albums_index persists whatever this returns as the new
+        # dirty:false state (see refresh_user_sort_index's identical note).
+        return None
+
+    # Best-effort cover data source -- never blocks this build on the sort
+    # index's own cold-build path (allow_sync_build=False): covers just fall
+    # back to "first filename in the album" until the sort index catches up.
+    sort_rows_by_filename: Dict[str, Dict[str, object]] = {}
+    try:
+        sort_index = get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
+        if sort_index is not None:
+            sort_rows_by_filename = {
+                str(row.get('RowKey') or ''): row for row in sort_index.get('rows', []) if row.get('RowKey')
+            }
+    except Exception:
+        sort_rows_by_filename = {}
+
+    trimmed_rows: List[Dict[str, object]] = []
+    for row in rows:
+        album_id = str(row.get('RowKey') or '').strip()
+        if not album_id:
+            continue
+        if str(row.get('deleted') or '').strip().lower() in ('true', '1'):
+            continue
+        try:
+            filenames = json.loads(row.get('filenames', '[]') or '[]')
+        except Exception:
+            filenames = []
+        if not isinstance(filenames, list):
+            filenames = []
+        trimmed_rows.append({
+            'albumId': album_id,
+            'name': str(row.get('name') or ''),
+            'photoCount': len(filenames),
+            'coverFilename': _pick_album_cover_filename(filenames, sort_rows_by_filename),
+            'updatedAt': str(row.get('updatedAt') or ''),
+            'filenames': filenames,
+            **_album_share_fields(row),
+        })
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_ALBUMS_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=trimmed_rows,
+    )
+
+
+def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+
+    snapshot = _build_user_albums_index_snapshot(key, source_version)
+    if snapshot is None:
+        return None
+    container_name = _lexical_index_container_name()
+    if container_name:
+        blob_client = _get_blob_client(container_name, _albums_index_json_blob_name(key))
+        if blob_client is not None:
+            try:
+                blob_client.upload_blob(
+                    _serialize_albums_index(snapshot),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                )
+            except Exception:
+                pass
+        manifest = {
+            'userId': key,
+            'sourceVersion': snapshot.source_version,
+            'schemaVersion': snapshot.schema_version,
+            'rowCount': len(snapshot.rows),
+            'dirty': False,
+            'updatedAt': snapshot.updated_at,
+        }
+        manifest_client = _get_blob_client(container_name, _albums_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            try:
+                manifest_client.upload_blob(
+                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json'),
+                )
+            except Exception:
+                pass
+    with _ALBUMS_INDEX_CACHE_LOCK:
+        _ALBUMS_INDEX_CACHE[key] = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+    return snapshot
+
+
+def _albums_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:
+    """Mirrors _sort_index_fresh_cache_entry: fresh in-memory-or-blob
+    snapshot dict for key if one matches manifest and isn't dirty, else
+    None."""
+    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
+    manifest_dirty = bool(manifest.get('dirty'))
+
+    with _ALBUMS_INDEX_CACHE_LOCK:
+        cached = _ALBUMS_INDEX_CACHE.get(key)
+        if (
+            cached
+            and cached.get('source_version') == manifest_source_version
+            and cached.get('schema_version') == _ALBUMS_INDEX_SCHEMA_VERSION
+            and not manifest_dirty
+        ):
+            return cached
+
+    snapshot = _load_albums_index_blob(key)
+    if (
+        snapshot
+        and snapshot.source_version == manifest_source_version
+        and snapshot.schema_version == _ALBUMS_INDEX_SCHEMA_VERSION
+        and not manifest_dirty
+    ):
+        data = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+        with _ALBUMS_INDEX_CACHE_LOCK:
+            _ALBUMS_INDEX_CACHE[key] = data
+        return data
+    return None
+
+
+def _rebuild_albums_index_in_background(key: str, manifest: Dict[str, str]) -> None:
+    """Mirrors _rebuild_sort_index_in_background: kicks off a rebuild off the
+    request thread if one isn't already running for this user."""
+    lock = _ALBUMS_INDEX_REBUILD_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+            refresh_user_albums_index(key, source_version=source_version)
+        except Exception:
+            _LOGGER.exception('Background albums index rebuild failed for user %s', key)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='albums-index-rebuild', daemon=True).start()
+
+
+def get_user_albums_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
+    """Mirrors get_user_sort_index's "serve stale immediately, rebuild
+    off-thread" read path, including allow_sync_build=False for the
+    gallery-load-gating route (GET /api/albums/index) so a cold library
+    returns available:false immediately instead of blocking on a build."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    manifest = _load_albums_index_manifest(key)
+    fresh = _albums_index_fresh_cache_entry(key, manifest)
+    if fresh is None and allow_refresh:
+        stale = _load_albums_index_blob(key)
+        if stale is not None:
+            fresh = {
+                'source_version': stale.source_version,
+                'schema_version': stale.schema_version,
+                'updated_at': stale.updated_at,
+                'rows': stale.rows,
+            }
+            _rebuild_albums_index_in_background(key, manifest)
+        elif allow_sync_build:
+            with _ALBUMS_INDEX_REBUILD_LOCKS.lock_for(key):
+                fresh = _albums_index_fresh_cache_entry(key, _load_albums_index_manifest(key))
+                if fresh is None:
+                    source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                    refreshed = refresh_user_albums_index(key, source_version=source_version)
+                    if refreshed is not None:
+                        fresh = {
+                            'source_version': refreshed.source_version,
+                            'schema_version': refreshed.schema_version,
+                            'updated_at': refreshed.updated_at,
+                            'rows': refreshed.rows,
+                        }
+        else:
+            _rebuild_albums_index_in_background(key, manifest)
     if fresh is None:
         return None
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
