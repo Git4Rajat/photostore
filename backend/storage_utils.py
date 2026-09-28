@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 import base64
 import threading
@@ -3152,7 +3153,10 @@ def _pick_album_cover_filename(filenames: List[str], sort_rows_by_filename: Dict
     return best_filename or filenames[0]
 
 
-def _album_coerce_bool(value: object) -> bool:
+def _index_coerce_bool(value: object) -> bool:
+    """General-purpose Table-Storage boolean coercion (handles real bools,
+    numeric 0/1, and 'true'/'1'/'yes' strings) -- shared by the albums and
+    people index builders, mirrors app.py's _coerce_bool."""
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
@@ -3181,7 +3185,7 @@ def _album_share_fields(row: Dict) -> Dict[str, object]:
     which the live SPA_BASE_URL/EXTRAS_PUBLIC_BASE_URL convention treats as a
     misconfiguration anyway, not an expected runtime state.
     """
-    is_public = _album_coerce_bool(row.get('isPublic', False))
+    is_public = _index_coerce_bool(row.get('isPublic', False))
     token = str(row.get('publicToken') or '')
     expires_at_raw = str(row.get('publicExpiresAt') or '')
     expires_dt = parse_iso_date(expires_at_raw) if expires_at_raw else None
@@ -3399,6 +3403,467 @@ def get_user_albums_index(
                         }
         else:
             _rebuild_albums_index_in_background(key, manifest)
+    if fresh is None:
+        return None
+    return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
+
+
+# --- People index ---------------------------------------------------------------
+# Same "own blob + own manifest, downloaded once per session" architecture as
+# the albums index above, applied to People: {personId, name, isNamed,
+# faceCount, coverFaceId, coverFilename, coverBbox, updatedAt} for every
+# person, so the People grid can render the whole list client-side instead of
+# routes/people.py:list_persons's hardcoded single page (the live frontend
+# calls faceService.listPersons(undefined, 0, 200) -- a person beyond the
+# 200th is silently never shown, not real pagination).
+#
+# Dirty-marking piggybacks on _invalidate_people_scan_cache (see
+# _InvalidatingTableClient) rather than being wired into individual routes:
+# person/face rows are written from dozens of call sites across app.py AND
+# the background clustering worker, all funnelled through the SAME wrapped
+# person_table_client/face_table_client, so hooking the ONE existing
+# choke-point invalidation function gives complete coverage for free --
+# mirrors how the albums index hooks touch_user_sort_index_state instead of
+# scattering calls across every album-mutation route.
+#
+# Deliberately NO incremental-merge machinery, same reasoning as the albums
+# index: the full build's cost here (comparable to list_persons's existing
+# Phase A/B full face-table scan, already run today on every People page
+# load behind a 20s TTL cache) doesn't get materially cheaper by tracking
+# per-person dirty filenames, and the existing serve-stale/coalesced
+# background-rebuild machinery already ensures a burst of writes (e.g. a
+# clustering run reassigning hundreds of faces) triggers at most one real
+# rebuild per idle period, not one per write.
+_PEOPLE_INDEX_SCHEMA_VERSION = 'v1'
+_PEOPLE_INDEX_CACHE_LOCK = threading.RLock()
+_PEOPLE_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_PEOPLE_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
+_PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY = 16
+
+
+def _people_index_json_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-people.json.gz'
+
+
+def _people_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-people.json'
+
+
+def get_people_index_blob_location(user_id: str) -> Tuple[str, str]:
+    """(container_name, blob_name) for user_id's people index data blob --
+    mirrors get_albums_index_blob_location/get_sort_index_blob_location."""
+    return _lexical_index_container_name(), _people_index_json_blob_name(user_id)
+
+
+def _people_index_blob_client(blob_name: str):
+    container_name = _lexical_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_people_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _PEOPLE_INDEX_CACHE_LOCK:
+        _PEOPLE_INDEX_CACHE.pop(key, None)
+
+
+def delete_user_people_index_data(user_id: str) -> None:
+    """Delete a library's cached people-index blobs (data + manifest) and
+    drop it from the in-memory cache. Best-effort: a missing blob is not an
+    error. Mirrors delete_user_albums_index_data."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for blob_name in (_people_index_json_blob_name(key), _people_index_manifest_blob_name(key)):
+        blob_client = _people_index_blob_client(blob_name)
+        if blob_client is None:
+            continue
+        try:
+            blob_client.delete_blob()
+        except Exception:
+            pass
+    invalidate_user_people_index_cache(key)
+
+
+def touch_user_people_index_state(user_id: str) -> str:
+    """Mark the people index's manifest dirty with a fresh sourceVersion --
+    mirrors touch_user_albums_index_state. No per-person dirty-tracking (see
+    module comment above)."""
+    key = str(user_id or '').strip()
+    if not key:
+        return ''
+    source_version = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        'userId': key,
+        'sourceVersion': source_version,
+        'schemaVersion': _PEOPLE_INDEX_SCHEMA_VERSION,
+        'dirty': True,
+        'updatedAt': source_version,
+    }
+    blob_client = _people_index_blob_client(_people_index_manifest_blob_name(key))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    invalidate_user_people_index_cache(key)
+    return source_version
+
+
+def _load_people_index_manifest(user_id: str) -> Dict[str, str]:
+    blob_client = _people_index_blob_client(_people_index_manifest_blob_name(user_id))
+    if blob_client is None:
+        return {}
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_people_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    blob_client = _people_index_blob_client(_people_index_json_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        rows = parsed.get('rows')
+        if not isinstance(rows, list):
+            return None
+        return LexicalIndexSnapshot(
+            user_id=str(user_id),
+            source_version=str(parsed.get('sourceVersion') or ''),
+            schema_version=str(parsed.get('schemaVersion') or ''),
+            updated_at=str(parsed.get('updatedAt') or ''),
+            rows=rows,
+        )
+    except Exception:
+        return None
+
+
+def _serialize_people_index(snapshot: LexicalIndexSnapshot) -> bytes:
+    payload = {
+        'userId': snapshot.user_id,
+        'sourceVersion': snapshot.source_version,
+        'schemaVersion': snapshot.schema_version,
+        'updatedAt': snapshot.updated_at,
+        'rowCount': len(snapshot.rows),
+        'rows': snapshot.rows,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+    return gzip.compress(raw, compresslevel=6)
+
+
+def _people_index_is_unnamed_name(name: str) -> bool:
+    return bool(re.match(r'^unnamed\s*\d*$', (name or '').strip(), re.IGNORECASE))
+
+
+def _people_index_person_is_named(person: Dict) -> bool:
+    """Mirrors app.py's _person_entity_is_named -- reimplemented here (not
+    imported) for the same cross-module reason as _album_share_fields:
+    app.py imports FROM storage_utils.py, not the reverse."""
+    name = str((person or {}).get('name') or '').strip()
+    return bool(name) and not _people_index_is_unnamed_name(name)
+
+
+def _people_index_face_is_rejected(face: Dict) -> bool:
+    return _index_coerce_bool(face.get('rejected', False)) or str(face.get('reviewStatus') or '').lower() == 'rejected'
+
+
+def _people_index_face_is_owned_by_person(face: Optional[Dict], person_id: str) -> bool:
+    if not face or not person_id:
+        return False
+    return str(face.get('personId') or '') == str(person_id)
+
+
+def _people_index_face_preview_priority(face: Dict) -> Tuple[int, float, int]:
+    """Mirrors app.py's _face_preview_priority: confirmed faces first, then
+    higher confidence, then non-rejected -- used to pick each person's
+    representative/cover face."""
+    try:
+        confidence = float(face.get('confidence', 0.0) or 0.0)
+    except Exception:
+        confidence = 0.0
+    confirmed = 1 if (
+        _index_coerce_bool(face.get('confirmedByUser', False)) or str(face.get('reviewStatus') or '').lower() == 'confirmed'
+    ) else 0
+    rejected = 1 if _people_index_face_is_rejected(face) else 0
+    return (confirmed, confidence, -rejected)
+
+
+def _people_index_face_bbox(face: Dict) -> Dict[str, object]:
+    bbox_value = face.get('bbox', {})
+    if isinstance(bbox_value, str):
+        try:
+            bbox_value = json.loads(bbox_value or '{}')
+        except Exception:
+            bbox_value = {}
+    return bbox_value if isinstance(bbox_value, dict) else {}
+
+
+def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
+    person_table_client = _CTX.get('person_table_client')
+    face_table_client = _CTX.get('face_table_client')
+    if person_table_client is None or face_table_client is None:
+        return None
+    try:
+        person_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        # A transient query failure must not be treated as "no people" --
+        # refresh_user_people_index persists whatever this returns as the new
+        # dirty:false state (see refresh_user_sort_index's identical note).
+        return None
+    try:
+        face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        return None
+    face_by_id: Dict[str, Dict[str, object]] = {str(row.get('RowKey') or ''): row for row in face_rows if row.get('RowKey')}
+
+    def _resolve_face(face_id: str) -> Tuple[str, Optional[Dict[str, object]]]:
+        face = face_by_id.get(face_id)
+        if face is not None:
+            return face_id, face
+        try:
+            return face_id, face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            return face_id, None
+
+    trimmed_rows: List[Dict[str, object]] = []
+    unnamed_counter = 1
+    for row in person_rows:
+        person_id = str(row.get('RowKey') or '').strip()
+        if not person_id:
+            continue
+        try:
+            face_ids = [str(fid) for fid in json.loads(row.get('faceIds', '[]') or '[]')]
+        except Exception:
+            face_ids = []
+        is_named = _people_index_person_is_named(row)
+        raw_name = str(row.get('name', '') or '').strip()
+        if raw_name:
+            name = raw_name
+        else:
+            name = f'Unnamed {unnamed_counter}'
+            unnamed_counter += 1
+
+        active_face_ids: List[str] = []
+        cover_face_id = ''
+        cover_filename = ''
+        cover_bbox: Dict[str, object] = {}
+        cover_score: Optional[Tuple[int, float, int]] = None
+        indeterminate = False
+
+        if face_ids:
+            with ThreadPoolExecutor(max_workers=min(_PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY, max(1, len(face_ids)))) as executor:
+                resolved = dict(executor.map(_resolve_face, face_ids))
+            for face_id in face_ids:
+                face = resolved.get(face_id)
+                if face is None:
+                    # Missing from both the bulk map and a direct point-read --
+                    # could be a genuinely deleted face or a transient error;
+                    # conservatively don't count it as delete-eligible (same
+                    # "indeterminate" guard list_persons uses).
+                    indeterminate = True
+                    continue
+                if _people_index_face_is_rejected(face) or not _people_index_face_is_owned_by_person(face, person_id):
+                    continue
+                active_face_ids.append(face_id)
+                score = _people_index_face_preview_priority(face)
+                if cover_score is None or score > cover_score:
+                    cover_score = score
+                    cover_face_id = face_id
+                    cover_filename = str(face.get('filename') or '')
+                    cover_bbox = _people_index_face_bbox(face)
+
+        # Auto-remove empty clusters so they stop cluttering the People page
+        # -- but never a cluster the user explicitly named (see
+        # _people_index_person_is_named's docstring). Mirrors list_persons's
+        # Phase B cleanup exactly, just run for every person instead of only
+        # the requested page slice.
+        if not active_face_ids and not indeterminate and not is_named:
+            try:
+                person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+            except Exception:
+                pass
+            continue
+
+        trimmed_rows.append({
+            'personId': person_id,
+            'name': name,
+            'isNamed': is_named,
+            'faceCount': len(active_face_ids),
+            'coverFaceId': cover_face_id,
+            'coverFilename': cover_filename,
+            'coverBbox': cover_bbox,
+            'updatedAt': source_version,
+        })
+
+    # Named clusters first, ties preserve RowKey (query) order -- mirrors
+    # list_persons's stable sort.
+    trimmed_rows.sort(key=lambda r: 0 if r['isNamed'] else 1)
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_PEOPLE_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=trimmed_rows,
+    )
+
+
+def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+
+    snapshot = _build_user_people_index_snapshot(key, source_version)
+    if snapshot is None:
+        return None
+    container_name = _lexical_index_container_name()
+    if container_name:
+        blob_client = _get_blob_client(container_name, _people_index_json_blob_name(key))
+        if blob_client is not None:
+            try:
+                blob_client.upload_blob(
+                    _serialize_people_index(snapshot),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                )
+            except Exception:
+                pass
+        manifest = {
+            'userId': key,
+            'sourceVersion': snapshot.source_version,
+            'schemaVersion': snapshot.schema_version,
+            'rowCount': len(snapshot.rows),
+            'dirty': False,
+            'updatedAt': snapshot.updated_at,
+        }
+        manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            try:
+                manifest_client.upload_blob(
+                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json'),
+                )
+            except Exception:
+                pass
+    with _PEOPLE_INDEX_CACHE_LOCK:
+        _PEOPLE_INDEX_CACHE[key] = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+    return snapshot
+
+
+def _people_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:
+    """Mirrors _albums_index_fresh_cache_entry."""
+    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
+    manifest_dirty = bool(manifest.get('dirty'))
+
+    with _PEOPLE_INDEX_CACHE_LOCK:
+        cached = _PEOPLE_INDEX_CACHE.get(key)
+        if (
+            cached
+            and cached.get('source_version') == manifest_source_version
+            and cached.get('schema_version') == _PEOPLE_INDEX_SCHEMA_VERSION
+            and not manifest_dirty
+        ):
+            return cached
+
+    snapshot = _load_people_index_blob(key)
+    if (
+        snapshot
+        and snapshot.source_version == manifest_source_version
+        and snapshot.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
+        and not manifest_dirty
+    ):
+        data = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+        with _PEOPLE_INDEX_CACHE_LOCK:
+            _PEOPLE_INDEX_CACHE[key] = data
+        return data
+    return None
+
+
+def _rebuild_people_index_in_background(key: str, manifest: Dict[str, str]) -> None:
+    """Mirrors _rebuild_albums_index_in_background: kicks off a rebuild off
+    the request thread if one isn't already running for this user."""
+    lock = _PEOPLE_INDEX_REBUILD_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+            refresh_user_people_index(key, source_version=source_version)
+        except Exception:
+            _LOGGER.exception('Background people index rebuild failed for user %s', key)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='people-index-rebuild', daemon=True).start()
+
+
+def get_user_people_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
+    """Mirrors get_user_albums_index's "serve stale immediately, rebuild
+    off-thread" read path, including allow_sync_build=False for the
+    gallery-load-gating route (GET /api/persons/index) so a cold library
+    returns available:false immediately instead of blocking on a build."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    manifest = _load_people_index_manifest(key)
+    fresh = _people_index_fresh_cache_entry(key, manifest)
+    if fresh is None and allow_refresh:
+        stale = _load_people_index_blob(key)
+        if stale is not None:
+            fresh = {
+                'source_version': stale.source_version,
+                'schema_version': stale.schema_version,
+                'updated_at': stale.updated_at,
+                'rows': stale.rows,
+            }
+            _rebuild_people_index_in_background(key, manifest)
+        elif allow_sync_build:
+            with _PEOPLE_INDEX_REBUILD_LOCKS.lock_for(key):
+                fresh = _people_index_fresh_cache_entry(key, _load_people_index_manifest(key))
+                if fresh is None:
+                    source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                    refreshed = refresh_user_people_index(key, source_version=source_version)
+                    if refreshed is not None:
+                        fresh = {
+                            'source_version': refreshed.source_version,
+                            'schema_version': refreshed.schema_version,
+                            'updated_at': refreshed.updated_at,
+                            'rows': refreshed.rows,
+                        }
+        else:
+            _rebuild_people_index_in_background(key, manifest)
     if fresh is None:
         return None
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}

@@ -3,6 +3,7 @@ import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
 import { getLocalSortIndex, patchLocalSortIndexRow } from '../../services/localSortIndex';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
+import { getLocalPeopleIndex, invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
@@ -1096,18 +1097,50 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, [toast]);
 
+    // Legacy path: a single hardcoded page (listPersons(undefined, 0, 200)) --
+    // anyone with 201+ face clusters silently never sees the rest. Kept only
+    // as a fallback for when the local index is unavailable.
+    const fetchPeopleViaLegacyEndpoint = useCallback(async () => {
+        const res = await faceService.listPersons(undefined, 0, 200);
+        const list = Array.isArray(res?.persons) ? (res.persons as PersonSummary[]).map(mapPerson) : [];
+        setPeople(list);
+    }, []);
+
+    // Primary path: the whole-library people index (see localPeopleIndex.ts),
+    // downloaded once per session -- covers the full list (fixing the 200
+    // cap) without list_persons's per-page face-table work. Falls back to
+    // the legacy endpoint on any failure (cold index, network error) so the
+    // page never breaks.
     const fetchPeople = useCallback(async () => {
         setPeopleLoading(true);
         try {
-            const res = await faceService.listPersons(undefined, 0, 200);
-            const list = Array.isArray(res?.persons) ? (res.persons as PersonSummary[]).map(mapPerson) : [];
-            setPeople(list);
+            const rows = await getLocalPeopleIndex();
+            if (!rows) {
+                throw new Error('people index unavailable');
+            }
+            const mapped: Person[] = rows.map((r) => ({
+                id: r.personId,
+                name: r.isNamed && r.name.trim() ? r.name : null,
+                swatch: swatchFor(r.personId),
+                photoIds: [],
+                // Stable backend-proxy path, not a day-expiring SAS -- same
+                // fallback shape mapPerson already used when a face had no
+                // pre-minted thumbnailUrl, so no separate resolve step is
+                // needed here (unlike album covers).
+                coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
+                faceCount: r.faceCount,
+            }));
+            setPeople(mapped);
         } catch {
-            // keep the current list on transient failures
+            try {
+                await fetchPeopleViaLegacyEndpoint();
+            } catch {
+                // keep the current list on transient failures
+            }
         } finally {
             setPeopleLoading(false);
         }
-    }, []);
+    }, [fetchPeopleViaLegacyEndpoint]);
 
     useEffect(() => {
         void fetchPeople();
@@ -1134,6 +1167,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const trimmed = name.trim();
         const previous = people.find((p) => p.id === id)?.name ?? null;
         setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: trimmed || null } : p)));
+        invalidateLocalPeopleIndex();
         void faceService.labelPerson(id, trimmed).catch(() => {
             setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: previous } : p)));
             toast('Couldn’t save name');
@@ -1145,9 +1179,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             // Optimistically drop the source cluster; the target absorbs it.
             const removed = people.find((p) => p.id === sourceId);
             setPeople((prev) => prev.filter((p) => p.id !== sourceId));
+            invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, [sourceId])
                 .then(() => {
                     toast('People merged');
+                    invalidateLocalPeopleIndex();
                     void fetchPeople();
                 })
                 .catch(() => {
@@ -1169,9 +1205,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const removedSet = new Set(ids);
             const removed = people.filter((p) => removedSet.has(p.id));
             setPeople((prev) => prev.filter((p) => !removedSet.has(p.id)));
+            invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, ids)
                 .then(() => {
                     toast(`Merged ${ids.length + 1} people`);
+                    invalidateLocalPeopleIndex();
                     void fetchPeople();
                 })
                 .catch(() => {
@@ -1188,6 +1226,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const deletePerson = useCallback((id: string) => {
         const removed = people.find((p) => p.id === id);
         setPeople((prev) => prev.filter((p) => p.id !== id));
+        invalidateLocalPeopleIndex();
         void faceService.deletePersons([id])
             .then(() => toast('Person deleted'))
             .catch(() => {
@@ -1201,6 +1240,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const idSet = new Set(ids);
         const removed = people.filter((p) => idSet.has(p.id));
         setPeople((prev) => prev.filter((p) => !idSet.has(p.id)));
+        invalidateLocalPeopleIndex();
         void faceService.deletePersons(ids)
             .then(() => toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`))
             .catch(() => {

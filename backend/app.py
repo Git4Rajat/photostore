@@ -105,6 +105,10 @@ from storage_utils import (
     get_user_albums_index,
     get_albums_index_blob_location,
     delete_user_albums_index_data,
+    touch_user_people_index_state,
+    get_user_people_index,
+    get_people_index_blob_location,
+    delete_user_people_index_data,
     get_user_lexical_index,
     get_lexical_index_blob_location,
     invalidate_user_lexical_index_cache,
@@ -1039,6 +1043,12 @@ def _invalidate_people_scan_cache(user_id: str) -> None:
     _person_scan_cache.invalidate(user_id)
     _face_summary_scan_cache.invalidate(user_id)
     _people_embedding_index_cache.invalidate(user_id)
+    # This is the one choke point _InvalidatingTableClient calls on every
+    # write to person_table_client/face_table_client, from any code path
+    # (HTTP routes or the background clustering worker) -- hooking the
+    # people index's dirty-marking in here once gives complete coverage
+    # without scattering calls across dozens of mutation call sites.
+    touch_user_people_index_state(user_id)
 
 
 def _partition_key_from_write_call(method_name: str, args: tuple, kwargs: dict) -> str:
@@ -7968,6 +7978,7 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_tag_embedding_index_data(library_id)
     delete_user_sort_index_data(library_id)
     delete_user_albums_index_data(library_id)
+    delete_user_people_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
     return {'photosDeleted': len(metadata_rows), 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}

@@ -39,6 +39,49 @@ def trigger_clustering():
         app.app.logger.exception('People clustering endpoint failed')
         return app.jsonify({'error': 'People clustering failed'}), 500
 
+@people_bp.route('/api/persons/index', methods=['GET'])
+def people_index():
+    # Hands the browser a direct SAS URL to the per-user people-index blob
+    # ({personId, name, isNamed, faceCount, coverFaceId, coverFilename,
+    # coverBbox, updatedAt} for every person) -- see localPeopleIndex.ts on
+    # the frontend, which downloads this once per session so the People grid
+    # can render the whole list client-side instead of list_persons's
+    # hardcoded single page (the live frontend calls listPersons(undefined,
+    # 0, 200) -- anyone with 201+ clusters silently never sees the rest).
+    # Own manifest/dirty-cycle -- see get_user_people_index's module comment
+    # in storage_utils.py.
+    #
+    # allow_sync_build=False + 200 (not 503) on unavailable: same fix as
+    # photos_sort_index/albums_index (see those routes' comments) -- this
+    # gates the People list's initial load, so it must never block on a cold
+    # full build, and a 503 would hit httpClient.ts's cold-start retry loop
+    # before the frontend's fallback-to-listPersons path ever got a chance
+    # to run.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._people_features_available():
+        return app.jsonify({'available': False})
+    try:
+        people_index_data = app.get_user_people_index(user_id, allow_refresh=True, allow_sync_build=False)
+    except Exception:
+        people_index_data = None
+    if people_index_data is None:
+        return app.jsonify({'available': False})
+    try:
+        container_name, blob_name = app.get_people_index_blob_location(user_id)
+        index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
+    except Exception:
+        app.app.logger.exception('Failed to mint people index SAS URL for %s', user_id)
+        return app.jsonify({'available': False})
+    return app.jsonify({
+        'available': True,
+        'indexUrl': index_url,
+        'expiresAt': expires_at,
+        'sourceVersion': people_index_data.get('source_version'),
+        'updatedAt': people_index_data.get('updated_at'),
+    })
+
 @people_bp.route('/api/persons', methods=['GET'])
 def list_persons():
     try:
