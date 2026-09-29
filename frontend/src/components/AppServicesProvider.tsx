@@ -3444,8 +3444,25 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // budget grows -- draining by index (re-checking .length each
             // iteration) picks those up too, unlike a Promise.all snapshot
             // taken at call time.
+            //
+            // Each await is individually try/caught (rather than letting a
+            // rejection break out of the loop) because a Stop rejects every
+            // lane's worker() at once -- breaking out on the first one would
+            // leave the rest of workerPromises un-awaited, and their later
+            // rejections would surface as uncaught "upload_stopped_by_user"
+            // errors instead of being handled below.
+            let firstWorkerError: unknown;
             for (let i = 0; i < workerPromises.length; i += 1) {
-                await workerPromises[i];
+                try {
+                    await workerPromises[i];
+                } catch (err) {
+                    if (firstWorkerError === undefined) {
+                        firstWorkerError = err;
+                    }
+                }
+            }
+            if (firstWorkerError !== undefined) {
+                throw firstWorkerError;
             }
 
             // Every lane has finished transferring bytes (whether by running out
