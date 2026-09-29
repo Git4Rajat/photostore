@@ -302,7 +302,7 @@
 
 /* ---- ask ---- */
 .pt-ask-box { display: flex; align-items: center; gap: 8px; border: 1px solid var(--lg-edge); border-radius: var(--r-lg); background: var(--lg-surface-strong); padding: 4px 10px 4px 4px; margin-bottom: 12px; }
-.pt-ask-box svg { width: 20px; height: 20px; color: var(--muted); flex: 0 0 auto; }
+.pt-ask-box svg:not(button svg) { width: 20px; height: 20px; color: var(--muted); flex: 0 0 auto; }
 /* Leading magnifier doubles as a submit button (visible search affordance,
    not just Enter-to-search); the form also gives mobile keyboards a Search key. */
 .pt-ask-search { background: none; border: 0; padding: 0; margin: 0; cursor: pointer; color: var(--muted); display: inline-grid; place-items: center; flex: 0 0 auto; min-width: var(--tap-min); min-height: var(--tap-min); border-radius: 50%; }
