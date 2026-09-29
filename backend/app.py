@@ -1008,6 +1008,36 @@ class _UserScanCache:
                     self._cache[key] = (time.monotonic() + self._ttl, [dict(row) for row in rows])
             return rows
 
+    def get_or_kick_background(self, key: str, fetch_fn: Callable[[], List[Dict]]) -> Optional[List[Dict]]:
+        """Non-blocking counterpart to get(): returns the cached rows if
+        fresh, otherwise kicks the scan on a detached daemon thread (deduped
+        with any other in-flight scan for this key via the same non-blocking
+        lock-acquire idiom as _rebuild_lexical_index_in_background) and
+        returns None immediately instead of blocking the caller on a scan
+        that can take 60-80s on a large library. For callers where the
+        gallery/UI already degrades gracefully to an empty/stale result
+        while the real one populates in the background on the next request."""
+        cached = self._fresh(key)
+        if cached is not None:
+            return cached
+        lock = self._lock_for(key)
+        if not lock.acquire(blocking=False):
+            return None
+
+        def _worker() -> None:
+            try:
+                rows = fetch_fn()
+                if self._ttl > 0:
+                    with self._guard:
+                        self._cache[key] = (time.monotonic() + self._ttl, [dict(row) for row in rows])
+            except Exception:
+                logging.exception('Background scan (get_or_kick_background) failed for %s', key)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_worker, name='user-scan-cache-rebuild', daemon=True).start()
+        return None
+
     def invalidate(self, key: str) -> None:
         with self._guard:
             self._cache.pop(key, None)
@@ -3281,9 +3311,20 @@ def _cached_sorted_metadata_rows_for_user(user_id: str, purpose: str) -> List[Di
     return _photo_default_sort_cache.get(user_id, _compute)
 
 
-def _cached_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
+def _cached_metadata_list_rows_for_user(user_id: str, purpose: str, *, allow_sync_build: bool = True) -> List[Dict]:
     """Narrow-column counterpart of _cached_metadata_rows_for_user -- see
     PHOTO_LIST_SELECT_FIELDS above for which purposes this is safe for.
+
+    allow_sync_build=False (photos_timeline's caller only -- see that route)
+    swaps the live-scan fallback's blocking _metadata_list_scan_cache.get()
+    for its non-blocking get_or_kick_background() counterpart: a genuinely
+    cold account (no listing-index blob ever built) gets [] back immediately
+    instead of blocking ~47-80s on a full Table scan, with the scan kicked
+    off-thread so the next request picks up a warm cache. Other callers
+    (list/access_batch/filter/suggestions) keep the default True since they
+    have no graceful empty-result fallback the way an empty timeline rail
+    does -- see the 2026-09-29 forenkla-qa HAR investigation that also fixed
+    /explore's equivalent blocking gap.
 
     Tries the "listing" search-index projection (get_user_listing_index) --
     the same PHOTO_LIST_SELECT_FIELDS columns, sourced from a small blob
@@ -3317,10 +3358,10 @@ def _cached_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict
         # natural rebuild. Filter defensively here rather than trust staleness
         # timing.
         return [row for row in (listing_index.get('rows') or []) if row.get('processing_state') != 'deleted']
-    return _metadata_list_scan_cache.get(
-        user_id,
-        lambda: _query_metadata_rows_for_user(user_id, select=list(PHOTO_LIST_SELECT_FIELDS), purpose=purpose),
-    )
+    fetch_fn = lambda: _query_metadata_rows_for_user(user_id, select=list(PHOTO_LIST_SELECT_FIELDS), purpose=purpose)
+    if allow_sync_build:
+        return _metadata_list_scan_cache.get(user_id, fetch_fn)
+    return _metadata_list_scan_cache.get_or_kick_background(user_id, fetch_fn) or []
 
 
 def _cached_sorted_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
@@ -7121,8 +7162,18 @@ def _explore_places_and_things(user_id: str) -> Dict[str, List[Dict]]:
     iteration over rows already sitting in memory. Grouping/normalization
     mirrors _smart_album_candidates's 'location' and 'tag-object' rules
     exactly, so the same city spelled two ways or the same tag in different
-    case collapses into one group here too."""
-    lexical = get_user_lexical_index(user_id, allow_refresh=True)
+    case collapses into one group here too.
+
+    allow_sync_build=False -- like photos_sort_index/photos_search_index --
+    means a user whose lexical index has never been built gets empty
+    places/things back immediately (background build kicked off, deduped
+    with any concurrent kick from photos_prime_indexes) instead of blocking
+    ~60-75s on a full Table scan. Explore is fetched unconditionally on every
+    session start (store.tsx's fetchExplore), so without this it was one of
+    two calls (alongside /photos/timeline) that could occupy both of this
+    backend's gunicorn threads for the entire scan, queuing every other
+    request behind it -- see the 2026-09-29 forenkla-qa HAR investigation."""
+    lexical = get_user_lexical_index(user_id, allow_refresh=True, allow_sync_build=False)
     rows = (lexical or {}).get('rows') or []
     pid_to_name, _ = _load_people_name_index(user_id)
 

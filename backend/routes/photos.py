@@ -586,11 +586,20 @@ def photos_timeline():
     # cached full-partition scan as /photos, so a newly-uploaded photo appears
     # here within the same staleness window (METADATA_SCAN_CACHE_TTL_SECONDS)
     # it appears in the gallery, with no separate cache/invalidation to manage.
+    #
+    # allow_sync_build=False: fetched unconditionally on every session start
+    # (GalleryPage's Months/Years zoom levels) alongside several other
+    # requests, so a genuinely cold account (no listing-index blob yet) gets
+    # an empty timeline back immediately instead of blocking ~47-80s on a
+    # full Table scan -- which, on this backend's 1-worker/2-thread gunicorn
+    # config, was occupying both available threads and queuing every other
+    # request behind it. See the 2026-09-29 forenkla-qa HAR investigation
+    # (same fix as /explore).
     user_id, error = app._require_user_id()
     if error:
         return error
     try:
-        metadata_rows = app._cached_metadata_list_rows_for_user(user_id, purpose='photos.timeline')
+        metadata_rows = app._cached_metadata_list_rows_for_user(user_id, purpose='photos.timeline', allow_sync_build=False)
     except Exception as exc:
         app.app.logger.exception('Timeline metadata read failed')
         return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
