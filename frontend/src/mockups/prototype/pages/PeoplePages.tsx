@@ -20,6 +20,7 @@ const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.n
 export const PeoplePage: React.FC = () => {
     const { people, peopleLoading, navigate, mergePeopleBatch, deletePeopleBatch } = useStore();
     const covers = useProtectedBlobUrls(people.map((p) => p.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
+    const unnamedCount = people.filter((p) => !p.name).length;
     const [selectMode, setSelectMode] = useState(false);
     const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
@@ -69,7 +70,7 @@ export const PeoplePage: React.FC = () => {
             <div className="pt-toolbar">
                 <div>
                     <h1 className="pt-page-title">People</h1>
-                    <p className="pt-page-sub">{people.length} people · {people.filter((p) => !p.name).length} to name</p>
+                    <p className="pt-page-sub">{people.length} people{unnamedCount > 0 ? ` · ${unnamedCount} to name` : ''}</p>
                 </div>
                 {people.length > 1 && (
                     <button type="button" className="pt-linkish" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}>

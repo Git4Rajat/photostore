@@ -8,13 +8,15 @@ import type { Photo } from '../types';
 // The served thumbnail bakes in only the client's auto-orientation
 // (thumbnailRotation); the user's manual rotate action lives in `rotation` and
 // is applied on top as a CSS transform -- mirrors PhotoTile's remainingRotation
-// so the grid tile matches what the viewer shows. The 0.74 down-scale on
-// quarter-turns keeps a rotated landscape thumbnail from overflowing its square.
+// so the grid tile matches what the viewer shows. No down-scale is needed: the
+// img is already forced to a square via object-fit: cover (see .pt-tile-img),
+// so a 90/270 rotation keeps the same square footprint and can't overflow —
+// scaling it down just left the tile looking unfilled after a manual rotate.
 const normRot = (value?: number) => { const r = Number(value || 0) % 360; return r < 0 ? r + 360 : r; };
 const tileRotationStyle = (photo: Photo): React.CSSProperties | undefined => {
     const remaining = normRot(normRot(photo.rotation) - normRot(photo.thumbnailRotation));
     if (!remaining) return undefined;
-    return { transform: `rotate(${remaining}deg) scale(${remaining % 180 === 0 ? 1 : 0.74})` };
+    return { transform: `rotate(${remaining}deg)` };
 };
 
 /**

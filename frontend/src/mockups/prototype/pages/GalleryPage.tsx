@@ -7,7 +7,7 @@ import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
 import { Spinner } from '../components/bits';
-import { clampTile, useTileSize, TILE_RANGE, TILE_STEP } from '../components/controls';
+import { useTileSize, TILE_RANGE, TILE_STEP } from '../components/controls';
 
 const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
@@ -16,6 +16,13 @@ const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
 ];
 
 type ZoomLevel = 'days' | 'months' | 'years';
+
+// iOS's own "All Photos" zoom-out packs ~12 tiny tiles per row before it
+// switches to the Months grouping -- the shared TILE_RANGE.min (72px, ~4
+// columns on a phone) stopped shrinking far short of that and jumped to
+// Months too early, so the Gallery gets its own, much smaller floor.
+const GALLERY_TILE_MIN = 24;
+const clampGalleryTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(GALLERY_TILE_MIN, n));
 
 /** Gallery — the populated grid + drag-and-drop upload + the empty first-run state. */
 export const GalleryPage: React.FC = () => {
@@ -26,7 +33,7 @@ export const GalleryPage: React.FC = () => {
     } = useStore();
     const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
     const [dragging, setDragging] = useState(false);
-    const [tileMin, setTileMin] = useTileSize('photostore.galleryTileSize');
+    const [tileMin, setTileMin] = useTileSize('photostore.galleryTileSize', { min: GALLERY_TILE_MIN });
     // iOS-style zoom levels: keep zooming out past the smallest tiles to browse
     // Months, then Years (replaces the old timeline rail).
     const [level, setLevel] = useState<ZoomLevel>('days');
@@ -41,14 +48,14 @@ export const GalleryPage: React.FC = () => {
     const zoomOut = () => {
         if (level === 'years') return;
         if (level === 'months') { setLevel('years'); return; }
-        if (tileMin > TILE_RANGE.min) setTileMin((n) => clampTile(n - TILE_STEP));
+        if (tileMin > GALLERY_TILE_MIN) setTileMin((n) => clampGalleryTile(n - TILE_STEP));
         else { setFocusYear(null); setLevel('months'); }
     };
     // Zoom-in steps: Years → Months → Days, then grow tiles.
     const zoomIn = () => {
         if (level === 'years') { setLevel('months'); return; }
         if (level === 'months') { setLevel('days'); return; }
-        if (tileMin < TILE_RANGE.max) setTileMin((n) => clampTile(n + TILE_STEP));
+        if (tileMin < TILE_RANGE.max) setTileMin((n) => clampGalleryTile(n + TILE_STEP));
     };
     const zoomedOutFully = level === 'years';
     const zoomedInFully = level === 'days' && tileMin >= TILE_RANGE.max;
@@ -63,13 +70,13 @@ export const GalleryPage: React.FC = () => {
         if (level === 'days') {
             const target = Math.round(pinchRef.current.tile * ratio);
             // Pinched in past the smallest tile => keep zooming out into Months.
-            if (ratio < 1 && target <= TILE_RANGE.min) {
+            if (ratio < 1 && target <= GALLERY_TILE_MIN) {
                 setFocusYear(null);
                 setLevel('months');
                 pinchRef.current = null;
                 return;
             }
-            setTileMin(clampTile(target));
+            setTileMin(clampGalleryTile(target));
         } else if (ratio > 1.25) {
             zoomIn();
             pinchRef.current = null;

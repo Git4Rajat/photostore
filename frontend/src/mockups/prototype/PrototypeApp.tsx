@@ -20,6 +20,7 @@ import {
 import { LogoLockup } from '../../components/shared/Logo';
 import Loading from '../../components/shared/Loading';
 import { AppServicesProvider, useAppServices } from '../../components/AppServicesProvider';
+import { formatBytes } from '../../components/browserAiShared';
 import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
@@ -239,6 +240,60 @@ const MobileTabbar: React.FC = () => {
     );
 };
 
+// A paused upload session (some files failed, none retried/discarded) never
+// surfaced Retry/Discard in this UI -- only App.tsx (the legacy shell) ported
+// them. Mirrors that banner (same appServices state, same classes from
+// index.css) at the root so it's visible from every page, not just Gallery.
+const UploadPausedBanner: React.FC = () => {
+    const { pendingUploadSummary, pendingUploadFailedFiles, retryPersistedUploadSession, discardPersistedUploadSession, uploading } = useAppServices();
+    if (!pendingUploadSummary) return null;
+    return (
+        <div className="upload-approval-bar root-upload-approval-bar">
+            <div>
+                <p className="upload-approval-title">Upload paused</p>
+                <p className="upload-approval-details">
+                    {pendingUploadSummary.fileCount} file(s) waiting
+                    {pendingUploadSummary.failedCount > 0 ? `, ${pendingUploadSummary.failedCount} failed` : ''}
+                    {pendingUploadSummary.failedCount > 0
+                        ? '. If Retry can’t find them, use Upload and reselect the same photos (or the whole folder) — files already uploaded are skipped automatically, so there’s no need to pick out just the failed ones.'
+                        : ''}
+                </p>
+                {pendingUploadFailedFiles.length > 0 && (
+                    <details className="upload-approval-failed-details">
+                        <summary>Show {pendingUploadFailedFiles.length} failed file(s)</summary>
+                        <ul className="upload-approval-failed-list">
+                            {pendingUploadFailedFiles.map((file) => (
+                                <li key={file.key} className="upload-approval-failed-item">
+                                    {file.previewDataUrl ? (
+                                        <img src={file.previewDataUrl} alt="" className="upload-approval-failed-thumb" />
+                                    ) : (
+                                        <span className="upload-approval-failed-thumb upload-approval-failed-thumb-fallback">
+                                            <PhotoIcon />
+                                        </span>
+                                    )}
+                                    <span className="upload-approval-failed-info">
+                                        <span className="upload-approval-failed-name">{file.name}</span>
+                                        <span className="upload-approval-failed-size">{formatBytes(file.size)}</span>
+                                        <span className="upload-approval-failed-reason">{file.error || 'Upload failed.'}</span>
+                                    </span>
+                                </li>
+                            ))}
+                        </ul>
+                    </details>
+                )}
+            </div>
+            <div className="upload-approval-actions">
+                <button type="button" className="btn btn-primary" onClick={() => void retryPersistedUploadSession()} disabled={uploading}>
+                    Retry
+                </button>
+                <button type="button" className="btn btn-soft" onClick={() => void discardPersistedUploadSession()} disabled={uploading}>
+                    Discard
+                </button>
+            </div>
+        </div>
+    );
+};
+
 const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
     const [theme, setTheme] = useState<Theme>('system');
     useEffect(() => applyTheme(theme), [theme]);
@@ -250,6 +305,7 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
                     <div className="mock-app">
                         <Topbar theme={theme} onTheme={setTheme} onSignOut={onSignOut} />
                         <div className="mock-body pt-body">
+                            <UploadPausedBanner />
                             <Page />
                         </div>
                         <MobileTabbar />

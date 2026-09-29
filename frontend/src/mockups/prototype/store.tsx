@@ -271,7 +271,7 @@ interface Store {
     reloadAlbums: () => void;
     openAlbum: (id: string) => void;
     albumPhotosById: (id: string) => Photo[] | undefined;
-    albumPhotosLoading: boolean;
+    isAlbumPhotosLoading: (id: string) => boolean;
     createAlbum: (name?: string) => Promise<string>;
     autoCreateAlbum: (rule: string) => Promise<{ albumId: string; count: number; message?: string }>;
     renameAlbum: (id: string, name: string) => void;
@@ -332,7 +332,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // fallback path (GET /albums/<id>) should be used instead.
     const albumFilenamesRef = useRef<Record<string, string[]>>({});
     const [albumPhotos, setAlbumPhotos] = useState<Record<string, Photo[]>>({});
-    const [albumPhotosLoading, setAlbumPhotosLoading] = useState<boolean>(false);
+    // Keyed per album id -- a single shared flag raced when switching albums
+    // quickly: a fast fetch for album B finishing after a slow fetch for album
+    // A was still in flight cleared the flag for both, so A's still-loading,
+    // still-undefined photo list briefly read as "no photos in this album".
+    const [albumPhotosLoadingIds, setAlbumPhotosLoadingIds] = useState<Record<string, boolean>>({});
     const [placesState, setPlacesState] = useState<Place[]>([]);
     const [thingsState, setThingsState] = useState<ThingTag[]>([]);
     const [exploreLoading, setExploreLoading] = useState<boolean>(true);
@@ -967,7 +971,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, []);
 
     const openAlbum = useCallback(async (id: string) => {
-        setAlbumPhotosLoading(true);
+        setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: true }));
         try {
             const filenames = albumFilenamesRef.current[id];
             if (filenames === undefined) {
@@ -984,11 +988,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
             }
         } finally {
-            setAlbumPhotosLoading(false);
+            setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: false }));
         }
     }, [lookupPhotosByFilenames, openAlbumViaLegacyEndpoint]);
 
     const albumPhotosById = useCallback((id: string) => albumPhotos[id], [albumPhotos]);
+    const isAlbumPhotosLoading = useCallback((id: string) => Boolean(albumPhotosLoadingIds[id]), [albumPhotosLoadingIds]);
 
     const createAlbum = useCallback(
         async (name?: string): Promise<string> => {
@@ -1415,7 +1420,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             reloadAlbums,
             openAlbum,
             albumPhotosById,
-            albumPhotosLoading,
+            isAlbumPhotosLoading,
             createAlbum,
             autoCreateAlbum,
             renameAlbum,
@@ -1452,7 +1457,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
-            albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,
+            albumsLoading, reloadAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, reloadPeople, openPerson, personPhotosById, personPhotosLoading,
             renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, invite, revokeInvite,

@@ -42,7 +42,7 @@ const randomCode = () => Math.random().toString(16).slice(2, 6).toUpperCase();
 /** Albums — list first on mobile, detail view on larger screens. */
 export const AlbumsPage: React.FC = () => {
     const {
-        albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, albumPhotosLoading,
+        albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, isAlbumPhotosLoading,
         createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
         selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode,
     } = useStore();
@@ -143,15 +143,37 @@ export const AlbumsPage: React.FC = () => {
         }
     };
 
+    // Shared across the empty-list state and the normal detail view -- both
+    // need a way to trigger a smart album, not just a plain "New album".
+    const smartAlbumSheet = (
+        <BottomSheet open={smartSheetOpen} onClose={() => setSmartSheetOpen(false)} title="New smart album">
+            <p className="pt-sheet-intro">Keepsake builds these automatically from your library.</p>
+            <div className="pt-sheet-rules">
+                {SMART_ALBUM_RULES.map(({ id, label, description, Icon }) => (
+                    <button key={id} type="button" className="pt-sheet-rule" onClick={() => void handleSmartCreate(id)} disabled={smartCreatingRule !== null}>
+                        <span className="pt-sheet-rule-icon"><Icon /></span>
+                        <span className="pt-sheet-rule-text"><b>{label}</b><small>{description}</small></span>
+                    </button>
+                ))}
+            </div>
+        </BottomSheet>
+    );
+
     if (!album) {
         return (
             <div className="pt-empty-page">
                 {albumsLoading ? <Spinner label="Loading albums…" /> : <p>No albums yet.</p>}
                 {!albumsLoading && (
-                    <button type="button" className="btn mock-cta" onClick={() => void handleCreate(true)}>
-                        <PlusIcon className="toolbar-icon" /> New album
-                    </button>
+                    <div className="pt-arrive-actions">
+                        <button type="button" className="btn mock-cta" onClick={() => void handleCreate(true)}>
+                            <PlusIcon className="toolbar-icon" /> New album
+                        </button>
+                        <button type="button" className="btn" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
+                            <SparklesIcon className="toolbar-icon" /> {smartCreatingRule ? 'Creating…' : 'Smart album'}
+                        </button>
+                    </div>
                 )}
+                {smartAlbumSheet}
             </div>
         );
     }
@@ -332,7 +354,7 @@ export const AlbumsPage: React.FC = () => {
                                 <button type="button" className="pt-linkish" onClick={() => { navigate('gallery'); toast('Select photos, then use “Add to album”'); }}><PlusIcon className="toolbar-icon" /> Add photos</button>
                             </div>
                         </div>
-                        {activePhotos === undefined && albumPhotosLoading ? (
+                        {activePhotos === undefined && isAlbumPhotosLoading(album.id) ? (
                             <Spinner label="Loading photos…" center={false} />
                         ) : (
                             <div style={{ ['--pt-tile-min' as string]: `${albumTile}px` } as React.CSSProperties}>
@@ -356,19 +378,7 @@ export const AlbumsPage: React.FC = () => {
                 </SelectionBar>
             )}
 
-            {/* iOS-style bottom sheet for picking a smart-album rule (rendered
-                once at the page root, not inside the duplicated album footers). */}
-            <BottomSheet open={smartSheetOpen} onClose={() => setSmartSheetOpen(false)} title="New smart album">
-                <p className="pt-sheet-intro">Keepsake builds these automatically from your library.</p>
-                <div className="pt-sheet-rules">
-                    {SMART_ALBUM_RULES.map(({ id, label, description, Icon }) => (
-                        <button key={id} type="button" className="pt-sheet-rule" onClick={() => void handleSmartCreate(id)} disabled={smartCreatingRule !== null}>
-                            <span className="pt-sheet-rule-icon"><Icon /></span>
-                            <span className="pt-sheet-rule-text"><b>{label}</b><small>{description}</small></span>
-                        </button>
-                    ))}
-                </div>
-            </BottomSheet>
+            {smartAlbumSheet}
         </div>
     );
 };

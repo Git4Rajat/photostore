@@ -27,6 +27,31 @@ const dash = (value?: string | number): string => {
     return text || '—';
 };
 
+// EXIF arrives as raw, unrounded numeric strings (e.g. a computed FNumber of
+// "7.66082624558859") -- these convert them to the rounded, unit-suffixed
+// form a camera's own display would show (ISO 6400, 500mm, f8, 1/100s).
+const formatIso = (iso?: string): string | null => {
+    if (!iso) return null;
+    const n = parseFloat(iso);
+    return `ISO ${Number.isFinite(n) ? Math.round(n) : iso}`;
+};
+const formatFocalLength = (focalLength?: string): string | null => {
+    if (!focalLength) return null;
+    const n = parseFloat(focalLength);
+    return Number.isFinite(n) ? `${Math.round(n)} mm` : focalLength;
+};
+const formatAperture = (fNumber?: string): string | null => {
+    if (!fNumber) return null;
+    const n = parseFloat(fNumber);
+    return `f${Number.isFinite(n) ? Math.round(n) : fNumber}`;
+};
+const formatShutterSpeed = (exposureTime?: string): string | null => {
+    if (!exposureTime) return null;
+    const n = parseFloat(exposureTime);
+    if (!Number.isFinite(n) || n <= 0) return `${exposureTime} s`;
+    return n >= 1 ? `${Number.isInteger(n) ? n : n.toFixed(1)} s` : `1/${Math.round(1 / n)} s`;
+};
+
 /** Full-screen photo viewer with a persistent action bar, prev/next, keyboard,
  *  rotate + zoom controls, an EXIF/location info panel, and on-demand full-res. */
 export const PhotoViewer: React.FC = () => {
@@ -547,10 +572,10 @@ export const PhotoViewer: React.FC = () => {
                                         <dt>Exposure</dt>
                                         <dd>
                                             {[
-                                                exif.focalLength && `${exif.focalLength}`,
-                                                exif.fNumber && `ƒ/${exif.fNumber}`,
-                                                exif.exposureTime && `${exif.exposureTime}s`,
-                                                exif.iso && `ISO ${exif.iso}`,
+                                                formatIso(exif.iso),
+                                                formatFocalLength(exif.focalLength),
+                                                formatAperture(exif.fNumber),
+                                                formatShutterSpeed(exif.exposureTime),
                                             ].filter(Boolean).join(' · ') || '—'}
                                         </dd>
                                     </>

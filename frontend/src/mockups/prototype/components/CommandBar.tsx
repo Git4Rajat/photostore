@@ -73,7 +73,7 @@ export const CommandBar: React.FC = () => {
             {/* Rendered outside the More menu so the sheet survives that menu
                 closing (it's portalled to <body>; a click inside it reads as an
                 outside-click to the popover). */}
-            <AddToAlbumSheet open={albumOpen} onClose={() => setAlbumOpen(false)} photoIds={selection} />
+            <AddToAlbumSheet open={albumOpen} onClose={() => setAlbumOpen(false)} photoIds={selection} onAdded={clearSelection} />
         </SelectionBar>
     );
 };

@@ -15,7 +15,11 @@ export const AddToAlbumSheet: React.FC<{
     open: boolean;
     onClose: () => void;
     photoIds: string[];
-}> = ({ open, onClose, photoIds }) => {
+    // Fired after photos are actually added (not on a plain cancel/close) --
+    // lets the selection command bar clear its selection the way iOS Photos
+    // does once the add completes, instead of leaving it stuck selected.
+    onAdded?: () => void;
+}> = ({ open, onClose, photoIds, onAdded }) => {
     const { albums, addPhotosToAlbum, createAlbum } = useStore();
     const [query, setQuery] = useState('');
     const covers = useProtectedBlobUrls(
@@ -40,7 +44,7 @@ export const AddToAlbumSheet: React.FC<{
             });
             if (name === null) return; // cancelled
             const id = await createAlbum(name.trim() || 'New album');
-            if (id) addPhotosToAlbum(id, photoIds);
+            if (id) { addPhotosToAlbum(id, photoIds); onAdded?.(); }
             close();
         })();
     };
@@ -70,7 +74,7 @@ export const AddToAlbumSheet: React.FC<{
                         key={a.id}
                         type="button"
                         className="pt-sheet-album"
-                        onClick={() => { addPhotosToAlbum(a.id, photoIds); close(); }}
+                        onClick={() => { addPhotosToAlbum(a.id, photoIds); onAdded?.(); close(); }}
                     >
                         {a.coverThumbnailUrl && covers[a.coverThumbnailUrl] ? (
                             <img className="pt-sheet-album-cover" src={covers[a.coverThumbnailUrl]} alt="" />
