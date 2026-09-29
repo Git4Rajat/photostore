@@ -606,8 +606,28 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // already spiking to 89% on THIS 1.0vCPU tier during the one day
             // with real traffic. Cutting to 0.5vCPU would have reintroduced
             // the exact 502/503 incident above on data, not just risk.
-            cpu: json('1.0')
-            memory: '2Gi'
+            //
+            // 2026-09-29: cut to 0.5vCPU/1Gi again on forenkla-ppe, this time
+            // deliberately retried (not a blind repeat of the 2026-09-21
+            // attempt above) because three fixes landed on this app's
+            // remaining surface since that revert: 591adc4 (jobs table
+            // split, fixes the unscoped partition scan behind
+            // /api/jobs/status), 532304f (/api/photos/search-index no longer
+            // blocks inline on a dirty lexical-index rebuild), and
+            // 9075cfc/abfefb2 (/explore and /photos/timeline no longer block
+            // on a cold full-library scan). Confirmed live and stable
+            // (0 restarts) after real traffic including a 713-file upload
+            // burst the same day. Residual risk, NOT covered by any of the
+            // above: semantic/CLIP cosine-similarity scoring for
+            // /photos/search still runs inline per-candidate on request
+            // threads, and CR3/RAW on-demand preview decode is a known
+            // memory-spike risk that's now much closer to this 1Gi ceiling
+            // than the 2Gi budget it was originally sized against. Watch
+            // WorkingSetBytes/p90 latency for OOM or 502/503 recurrence; if
+            // it reappears, these two are the first places to look before
+            // reverting to 1.0/2Gi.
+            cpu: json('0.5')
+            memory: '1Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
@@ -963,6 +983,17 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
 // Right-sizing the CORE backend now that it no longer carries this load is a
 // deliberate follow-up, not done here -- better done from real per-service
 // metrics post-split than guessed upfront.
+//
+// 2026-09-29: that follow-up done on forenkla-ppe -- a 2-hour Azure Monitor
+// window (including a real 713-file upload burst) showed this app only
+// hitting 0.43vCPU (21%) and 341MB (8% of 4Gi) at peak. Cut to 0.75vCPU/1.5Gi
+// (~2x headroom over the observed peak); a follow-up 15-minute watch at the
+// new size confirmed 0 restarts and CPU/memory both well within the new
+// ceiling. Unlike worker/backend, this app has no documented OOM/starvation
+// incident history at a smaller size -- init-batch/finalize-batch are
+// lightweight coordination calls (the actual image bytes go browser->Blob
+// directly, never through this app), so this resize carries materially less
+// risk than the sibling apps' below.
 resource upload 'Microsoft.App/containerApps@2024-03-01' = {
   name: uploadAppName
   location: location
@@ -992,8 +1023,8 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'upload'
           image: backendImage
           resources: {
-            cpu: json('2')
-            memory: '4Gi'
+            cpu: json('0.75')
+            memory: '1.5Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'upload' }
@@ -1144,12 +1175,27 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
           // 1Gi that caused the OOM crash-loop) specifically because that
           // incident was memory-driven, not CPU-driven -- observed peak
           // memory in the same window was only 14% of 4Gi (~560MB), so 2Gi
-          // still leaves real headroom. Watch WorkingSetBytes/OOMKilled next
-          // time a library_clean or large full-reclustering job runs; raise
-          // back to 2.0/4Gi if either recurs.
+          // still leaves real headroom.
+          //
+          // 2026-09-29: cut further to 0.5vCPU/1Gi on forenkla-ppe based on a
+          // 2-hour Azure Monitor window (including a real 713-file upload
+          // burst) showing peak 0.32vCPU (32%) and peak 580MB (28% of 2Gi).
+          // A follow-up 15-minute watch at the new size measured a peak of
+          // 782MB (76% of the new 1Gi ceiling) under ordinary background
+          // load, with 0 restarts -- notably close to the exact 1Gi ceiling
+          // that caused the 2026-08-12 OOM crash-loop (see that incident's
+          // notes above and library-clean-worker-oom memory). That incident's
+          // root cause (an unprojected Table Storage query pulling 1.3GB+
+          // into memory in _execute_library_clean) was fixed the same day
+          // (commit 36ff8ed) and this resize was made with that fix in place
+          // and the risk knowingly accepted -- but this app has NOT been
+          // re-tested against a real library_clean or full-reclustering burst
+          // at this size. Watch WorkingSetBytes/OOMKilled/restartCount
+          // closely the next time either job runs; raise back to 1.0/2Gi (or
+          // higher) immediately if either recurs.
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            cpu: json('0.5')
+            memory: '1Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'worker' }
