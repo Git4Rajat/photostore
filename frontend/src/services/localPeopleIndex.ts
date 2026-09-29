@@ -94,8 +94,23 @@ const normalizeRows = (raw: Record<string, unknown>[]): PersonIndexRow[] => raw
     }))
     .filter((row) => row.personId);
 
+// A plain fetch() has no default timeout -- a stalled connection hangs this
+// promise forever instead of rejecting, which (via getLocalPeopleIndex's
+// module-scoped inFlight dedup) would wedge every caller behind the same
+// permanently-pending promise for the rest of the tab session. See
+// localSearchIndex.ts's BLOB_FETCH_TIMEOUT_MS for the full writeup --
+// confirmed live 2026-09-29 for that index's blob fetch; same latent gap
+// here since the code shape is identical.
+const BLOB_FETCH_TIMEOUT_MS = 120000;
+
+const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+};
+
 const downloadPeopleIndexBlob = async (indexUrl: string): Promise<PersonIndexRow[]> => {
-    const response = await fetch(indexUrl);
+    const response = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     if (!response.ok) {
         throw new Error(`Failed to download people index (${response.status})`);
     }

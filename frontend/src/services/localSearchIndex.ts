@@ -49,6 +49,27 @@ let inFlight: Promise<LocalSearchIndex | null> | null = null;
 
 const indexKey = (): string => getActiveLibraryFromToken() || '__default__';
 
+// Large index blobs normally land in 20-35s; a plain fetch() has no default
+// timeout, so a stalled connection (dropped mid-transfer, a starved
+// HTTP/1.1 connection slot against Blob Storage's per-origin cap -- see
+// azure-blob-upload-speed-ceiling) hangs this promise forever instead of
+// rejecting. getLocalSearchIndex()'s module-scoped `inFlight` dedup then
+// keeps returning that same permanently-pending promise to every caller
+// (PrototypeApp.tsx's eager retry loop AND Ask's own on-demand call), so
+// one stalled download silently wedges search for the rest of the tab
+// session -- confirmed live 2026-09-29: the metadata call succeeded but the
+// actual blob fetch never completed or even appeared as a finished request
+// in a 4.5-minute HAR capture. Aborting after a generous ceiling lets the
+// existing catch-and-clear-cache handling (see getLocalSearchIndex) treat a
+// stall as a normal failure, so the next call retries with a fresh request.
+const BLOB_FETCH_TIMEOUT_MS = 120000;
+
+const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+};
+
 const decompressGzip = async (buffer: ArrayBuffer): Promise<string> => {
     // DecompressionStream is the standard, dependency-free way to gunzip in a
     // browser (no polyfill/library needed) -- available in every browser this
@@ -59,7 +80,7 @@ const decompressGzip = async (buffer: ArrayBuffer): Promise<string> => {
 };
 
 const downloadIndexBlob = async (indexUrl: string): Promise<Record<string, unknown>[]> => {
-    const response = await fetch(indexUrl);
+    const response = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     if (!response.ok) {
         throw new Error(`Failed to download search index (${response.status})`);
     }
@@ -86,7 +107,7 @@ const downloadIndexBlob = async (indexUrl: string): Promise<Record<string, unkno
 
 const downloadVectorIndex = async (vectorIndexUrl: string, embeddingVersion: string): Promise<LocalVectorIndex | null> => {
     try {
-        const response = await fetch(vectorIndexUrl);
+        const response = await fetchWithTimeout(vectorIndexUrl, BLOB_FETCH_TIMEOUT_MS);
         if (!response.ok) {
             return null;
         }
