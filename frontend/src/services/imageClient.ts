@@ -30,6 +30,27 @@ export const fetchProtectedBlobUrl = async (path: string): Promise<string> => {
     throw new Error(body || `Failed to fetch protected image: ${response.status}`);
   }
 
+  // Some backend-relative paths (e.g. /api/faces/crop/<faceId>) return a JSON
+  // envelope pointing at the real image -- a SAS URL, data URL, or another
+  // backend-relative path -- rather than image bytes directly (mirrors
+  // faceMediaCache.ts's toDisplayableUrl). Without this, response.blob() on
+  // the JSON body still succeeds and createObjectURL() still returns a
+  // syntactically valid blob: URL, but the <img> can't decode it and renders
+  // broken. Resolve one level of indirection before treating the body as
+  // image bytes.
+  const contentType = response.headers.get('Content-Type') || '';
+  if (contentType.includes('application/json')) {
+    const payload = await response.json();
+    const resolvedUrl = payload?.url;
+    if (typeof resolvedUrl !== 'string' || !resolvedUrl) {
+      throw new Error('Invalid image reference');
+    }
+    if (resolvedUrl.startsWith('data:') || /^https?:\/\//i.test(resolvedUrl)) {
+      return resolvedUrl;
+    }
+    return fetchProtectedBlobUrl(resolvedUrl);
+  }
+
   const blob = await response.blob();
   return URL.createObjectURL(blob);
 };
