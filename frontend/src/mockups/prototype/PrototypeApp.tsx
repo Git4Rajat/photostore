@@ -24,6 +24,7 @@ import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
 import { post } from '../../services/apiClient';
+import { getLocalSearchIndex } from '../../services/localSearchIndex';
 import { StoreProvider, useStore } from './store';
 import { Menu } from './components/bits';
 import CommandBar from './components/CommandBar';
@@ -300,6 +301,21 @@ const PrototypeApp: React.FC = () => {
     useEffect(() => {
         if (!signedIn) return;
         void post('/api/photos/prime-indexes', {}).catch(() => {});
+    }, [signedIn]);
+
+    // Fire-and-forget: starts downloading the client-side lexical/vector
+    // search index as soon as a session starts, instead of only on the
+    // user's first Ask keystroke (localSearchIndex.ts's original lazy-load
+    // design -- deliberately traded a per-search delay for never paying the
+    // download on sessions that never search). That blob can be very large
+    // (hundreds of MB compressed on a big library) and takes real time to
+    // fetch + gunzip, so the trade favors eating that cost during the app
+    // shell's load instead of freezing the first Ask query on it. Errors are
+    // swallowed the same way prime-indexes' are -- getLocalSearchIndex caches
+    // its own result/failure and Ask's own call just re-awaits it.
+    useEffect(() => {
+        if (!signedIn) return;
+        void getLocalSearchIndex().catch(() => {});
     }, [signedIn]);
 
     // Public share links render the real album page regardless of auth state.

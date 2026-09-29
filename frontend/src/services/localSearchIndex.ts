@@ -36,8 +36,13 @@ interface SearchIndexResponse {
 
 // Keyed by active library so switching libraries can't serve one library's
 // index rows while browsing another -- same reasoning as photoCache.ts's
-// photoCacheKey(). Fetched lazily on first search rather than eagerly at
-// login: a session that never searches never pays for the download at all.
+// photoCacheKey(). getLocalSearchIndex() itself stays lazy/on-demand (any
+// caller just awaits whatever's cached or in flight) -- PrototypeApp.tsx now
+// calls it fire-and-forget right after sign-in so the download/decompress
+// happens during the app shell's load instead of blocking the user's first
+// Ask query, but callers that don't proactively warm it (e.g. the legacy
+// PhotoGallery.tsx tree) still only pay for the download the first time they
+// actually call this.
 let cachedKey: string | null = null;
 let cachedIndex: LocalSearchIndex | null = null;
 let inFlight: Promise<LocalSearchIndex | null> | null = null;
