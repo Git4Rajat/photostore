@@ -96,17 +96,45 @@ export const useProtectedBlobUrls = (paths: string[], maxConcurrent = DEFAULT_MA
   }, [urls]);
 
   useEffect(() => {
-    if (!isAuthEnabled() || paths.length === 0) {
+    if (paths.length === 0) {
       return undefined;
     }
 
     let active = true;
     const uniquePaths = Array.from(new Set(paths.filter((path): path is string => Boolean(path))));
+
+    // Absolute (SAS/signed) URLs are already directly loadable by the browser
+    // -- pass them straight through instead of round-tripping every one
+    // through an authenticated fetch + blob conversion. That round trip is
+    // only needed for backend-relative paths, which carry a bearer token an
+    // <img src> can't send on its own. This also means covers still render
+    // when isAuthEnabled() is false (no token to attach either way), instead
+    // of the whole hook silently doing nothing.
+    const directPaths = uniquePaths.filter((path) => /^https?:\/\//i.test(path));
+    if (directPaths.length) {
+      setUrls((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const path of directPaths) {
+          if (next[path] !== path) {
+            next[path] = path;
+            changed = true;
+          }
+        }
+        if (!changed) {
+          return prev;
+        }
+        urlsRef.current = next;
+        return next;
+      });
+    }
+
+    const scopedPaths = uniquePaths.filter((path) => !directPaths.includes(path));
     let cursor = 0;
 
     const loadNext = async () => {
-      while (active && cursor < uniquePaths.length) {
-        const path = uniquePaths[cursor];
+      while (active && cursor < scopedPaths.length) {
+        const path = scopedPaths[cursor];
         cursor += 1;
         if (!path || urlsRef.current[path]) {
           continue;
@@ -137,7 +165,7 @@ export const useProtectedBlobUrls = (paths: string[], maxConcurrent = DEFAULT_MA
       }
     };
 
-    const workerCount = Math.min(Math.max(1, maxConcurrent), uniquePaths.length);
+    const workerCount = Math.min(Math.max(1, maxConcurrent), scopedPaths.length);
     void Promise.all(Array.from({ length: workerCount }, () => loadNext()));
 
     return () => {
