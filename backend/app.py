@@ -96,6 +96,19 @@ from storage_utils import (
     delete_user_vector_index_data,
     touch_user_search_indexes_state,
     metadata_updates_affect_search_indexes,
+    metadata_updates_affect_sort_index,
+    touch_user_sort_index_dirty,
+    get_user_sort_index,
+    get_sort_index_blob_location,
+    delete_user_sort_index_data,
+    touch_user_albums_index_state,
+    get_user_albums_index,
+    get_albums_index_blob_location,
+    delete_user_albums_index_data,
+    touch_user_people_index_state,
+    get_user_people_index,
+    get_people_index_blob_location,
+    delete_user_people_index_data,
     get_user_lexical_index,
     get_lexical_index_blob_location,
     invalidate_user_lexical_index_cache,
@@ -1030,6 +1043,12 @@ def _invalidate_people_scan_cache(user_id: str) -> None:
     _person_scan_cache.invalidate(user_id)
     _face_summary_scan_cache.invalidate(user_id)
     _people_embedding_index_cache.invalidate(user_id)
+    # This is the one choke point _InvalidatingTableClient calls on every
+    # write to person_table_client/face_table_client, from any code path
+    # (HTTP routes or the background clustering worker) -- hooking the
+    # people index's dirty-marking in here once gives complete coverage
+    # without scattering calls across dozens of mutation call sites.
+    touch_user_people_index_state(user_id)
 
 
 def _partition_key_from_write_call(method_name: str, args: tuple, kwargs: dict) -> str:
@@ -2702,6 +2721,8 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             _invalidate_metadata_scan_cache(user_id)
             if metadata_updates_affect_search_indexes(updates or {}):
                 touch_user_search_indexes_state(user_id, filenames=filename)
+            elif metadata_updates_affect_sort_index(updates or {}):
+                touch_user_sort_index_dirty(user_id, [filename])
             return entity
         except ResourceNotFoundError:
             # Deleted between our read and this write -- nothing left to retry.
@@ -6919,6 +6940,11 @@ def _save_album_entity(entity: Dict) -> None:
     if albums_table_client is None:
         return
     albums_table_client.upsert_entity(entity)
+    # Single choke point every album mutation (create, rename, delete/restore,
+    # add/remove photos, share/revoke, autocreate) already runs through -- see
+    # routes/albums.py -- so hooking the albums index's dirty-marking in here
+    # once covers all of them without scattering the call across every route.
+    touch_user_albums_index_state(str(entity.get('PartitionKey') or ''))
 
 
 def _store_album_token_index(token: str, user_id: str, album_id: str) -> None:
@@ -6965,6 +6991,9 @@ def _hard_delete_album_now(user_id: str, album_id: str, existing: Optional[Dict]
     old_token = str((existing or {}).get('publicToken') or '')
     if old_token:
         _delete_album_token_index(old_token)
+    # Unlike every other mutation (see _save_album_entity), a hard delete
+    # never upserts the row, so it needs its own dirty-marking call.
+    touch_user_albums_index_state(user_id)
     return True
 
 
@@ -7947,6 +7976,9 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_vector_index_data(library_id)
     delete_user_lexical_index_data(library_id)
     delete_user_tag_embedding_index_data(library_id)
+    delete_user_sort_index_data(library_id)
+    delete_user_albums_index_data(library_id)
+    delete_user_people_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
     return {'photosDeleted': len(metadata_rows), 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}

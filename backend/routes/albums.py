@@ -87,6 +87,48 @@ def delete_multiple_albums_people():
         'success': len(album_errors) == 0 and len(person_errors) == 0,
     })
 
+@albums_bp.route('/api/albums/index', methods=['GET'])
+def albums_index():
+    # Hands the browser a direct SAS URL to the per-user albums-index blob
+    # ({albumId, name, photoCount, coverFilename, updatedAt, filenames} for
+    # every album) -- see localAlbumsIndex.ts on the frontend, which
+    # downloads this once per session and uses it to render the Albums list
+    # (cover picked from the already-built sort index, not a fresh
+    # whole-library scan -- see _pick_album_cover_filename in
+    # storage_utils.py) and to open an album (filenames read straight from
+    # the blob, full photo data resolved via the existing
+    # /api/photos/lookup-batch, instead of the sequential per-photo
+    # point-read GET /albums/<id> does). Own manifest/dirty-cycle -- see
+    # get_user_albums_index's module comment in storage_utils.py.
+    #
+    # allow_sync_build=False + 200 (not 503) on unavailable: same fix as
+    # photos_sort_index (see that route's comment) -- this gates the Albums
+    # list's initial load, so it must never block on a cold full build, and a
+    # 503 would hit httpClient.ts's cold-start retry loop before the
+    # frontend's fallback-to-GET-/albums path ever got a chance to run.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    try:
+        albums_index_data = app.get_user_albums_index(user_id, allow_refresh=True, allow_sync_build=False)
+    except Exception:
+        albums_index_data = None
+    if albums_index_data is None:
+        return app.jsonify({'available': False})
+    try:
+        container_name, blob_name = app.get_albums_index_blob_location(user_id)
+        index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
+    except Exception:
+        app.app.logger.exception('Failed to mint albums index SAS URL for %s', user_id)
+        return app.jsonify({'available': False})
+    return app.jsonify({
+        'available': True,
+        'indexUrl': index_url,
+        'expiresAt': expires_at,
+        'sourceVersion': albums_index_data.get('source_version'),
+        'updatedAt': albums_index_data.get('updated_at'),
+    })
+
 @albums_bp.route('/albums', methods=['GET'])
 @albums_bp.route('/api/albums', methods=['GET'])
 def list_albums():

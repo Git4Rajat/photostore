@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 import base64
 import threading
@@ -39,6 +40,7 @@ from image_utils import (
     RAW_EXTENSIONS_RAWPY,
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
+from ordering_utils import metadata_capture_datetime, parse_iso_date
 from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
 import maps_utils
 import vision_utils
@@ -242,6 +244,20 @@ _VECTOR_INDEX_RELEVANT_FIELDS = {
     'tagMetadata',
     'weakTags',
 }
+# Fields that change a photo's position in the gallery's default sort orders
+# (rating -> likes -> date -> filename, see app.py's
+# _cached_sorted_metadata_list_rows_for_user) without changing anything the
+# lexical/vector/tag-embedding indexes care about. Kept as its own set (not
+# folded into _VECTOR_INDEX_RELEVANT_FIELDS) so a rating tap dirties only the
+# sort index -- see metadata_updates_affect_sort_index and
+# touch_user_sort_index_dirty below -- instead of also triggering those other
+# indexes' full OCR/tag/embedding rebuild for a plain number change. Capture
+# date itself isn't listed here because it's never a directly-written column
+# (see ordering_utils.metadata_capture_datetime) -- it only changes via EXIF
+# extraction/client-processing writeback, which already unconditionally calls
+# touch_user_search_indexes_state (now also touching the sort index, see
+# _SEARCH_INDEX_KINDS below), so no separate trigger is needed for it here.
+_SORT_INDEX_RELEVANT_FIELDS = {'rating', 'likes', 'likedBy'}
 
 _CTX: Dict[str, object] = {}
 
@@ -653,6 +669,12 @@ def metadata_updates_affect_search_indexes(updates: Dict) -> bool:
     return bool(_VECTOR_INDEX_RELEVANT_FIELDS.intersection(updates.keys()))
 
 
+def metadata_updates_affect_sort_index(updates: Dict) -> bool:
+    if not isinstance(updates, dict) or not updates:
+        return False
+    return bool(_SORT_INDEX_RELEVANT_FIELDS.intersection(updates.keys()))
+
+
 def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
@@ -674,6 +696,8 @@ def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             if metadata_updates_affect_search_indexes(updates):
                 touch_user_search_indexes_state(user_id, filenames=filename)
+            elif metadata_updates_affect_sort_index(updates):
+                touch_user_sort_index_dirty(user_id, [filename])
             return dict(entity)
         except ResourceModifiedError as exc:
             last_exc = exc
@@ -2085,7 +2109,7 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     return source_version
 
 
-_SEARCH_INDEX_KINDS = ('vector', 'lexical')
+_SEARCH_INDEX_KINDS = ('vector', 'lexical', 'sort')
 
 
 def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
@@ -2149,17 +2173,21 @@ def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames
 def touch_user_search_indexes_state(
     user_id: str, *, embedding_version: Optional[str] = None, filenames=None,
 ) -> None:
-    """Mark the vector, lexical, and tag-embedding indexes stale for user_id,
-    and (when filenames is given) record exactly which photos changed so the
-    next rebuild of each index can merge in just those instead of re-scanning
-    and re-embedding the user's entire library for a single-photo edit.
-    All three touch_*_state calls are dirtied by the exact same condition today
-    (metadata_updates_affect_search_indexes) -- call this instead of either
-    directly so the triggers can't drift apart at a call site the way the old
-    duplicated field lists already did."""
+    """Mark the vector, lexical, tag-embedding, and sort indexes stale for
+    user_id, and (when filenames is given) record exactly which photos
+    changed so the next rebuild of each index can merge in just those instead
+    of re-scanning and re-embedding the user's entire library for a
+    single-photo edit. All four touch_*_state calls are dirtied by the exact
+    same condition today (metadata_updates_affect_search_indexes) -- call this
+    instead of any of them directly so the triggers can't drift apart at a
+    call site the way the old duplicated field lists already did. Edits that
+    ONLY affect sort order (rating/likes) skip this entirely and call
+    touch_user_sort_index_dirty instead -- see metadata_updates_affect_sort_index --
+    so they don't pay for a vector/lexical/tag-embedding rebuild too."""
     touch_user_vector_index_state(user_id, embedding_version=embedding_version)
     touch_user_lexical_index_state(user_id)
     touch_user_tag_embedding_index_state(user_id)
+    touch_user_sort_index_state(user_id)
     if filenames:
         _mark_search_index_dirty_filenames(user_id, filenames if isinstance(filenames, (list, set, tuple)) else [filenames])
 
@@ -2415,7 +2443,20 @@ def _rebuild_lexical_index_in_background(key: str, manifest: Dict[str, str]) -> 
     threading.Thread(target=_worker, name='lexical-index-rebuild', daemon=True).start()
 
 
-def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
+def get_user_lexical_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
+    """allow_sync_build=False (mirrors get_user_sort_index) skips the
+    synchronous cold-build branch below: a user with no snapshot ever built
+    gets None back immediately (with a background build kicked off) instead
+    of blocking ~60-75s on a full Table scan. photos_search_index passes this
+    -- it only ever hands out a SAS URL, and the frontend
+    (runLocalSemanticSearch) already degrades to server-side /photos/search
+    when the local index isn't ready, so there's nothing to gain by blocking
+    that request on a build nobody's waiting synchronously for. search_photos
+    keeps the default (True): it needs real rows to answer the query *now*,
+    and a synchronous build here produces a durable, reusable index instead of
+    just falling through to its own equally-expensive raw-scan fallback."""
     key = str(user_id or '').strip()
     if not key:
         return None
@@ -2432,7 +2473,7 @@ def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optio
         # snapshot already exists (even stale/dirty), serve it immediately
         # and rebuild off-thread; only a true cold start (no snapshot has
         # ever been built) pays the synchronous cost, since there's nothing
-        # else to serve.
+        # else to serve -- unless allow_sync_build=False, see above.
         stale = _load_lexical_index_blob(key)
         if stale is not None:
             fresh = {
@@ -2442,7 +2483,7 @@ def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optio
                 'rows': stale.rows,
             }
             _rebuild_lexical_index_in_background(key, manifest)
-        else:
+        elif allow_sync_build:
             with _LEXICAL_INDEX_REBUILD_LOCKS.lock_for(key):
                 # Re-check after acquiring: another thread may have just
                 # finished rebuilding while this one waited for the lock.
@@ -2457,11 +2498,1374 @@ def get_user_lexical_index(user_id: str, *, allow_refresh: bool = True) -> Optio
                             'updated_at': refreshed.updated_at,
                             'rows': refreshed.rows,
                         }
+        else:
+            _rebuild_lexical_index_in_background(key, manifest)
     if fresh is None:
         return None
     # Fresh per-call copy of the shared cached rows list -- multiple concurrent
     # /photos/search requests read this same cache entry, and callers (e.g.
     # _metadata_with_people_names) mutate rows in place.
+    return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
+
+
+# --- Sort index ---------------------------------------------------------------
+# A third, deliberately independent index alongside vector/lexical: just
+# {RowKey, captureDate, rating, likes, uploadDate} for every photo, small
+# enough (a few hundred KB gzipped even for tens of thousands of photos) for
+# the browser to download once per session and do its own local sort/paginate
+# over, instead of every /photos page request materializing and sorting the
+# user's entire library server-side (see routes/photos.py:list_photos and
+# app.py's _cached_sorted_metadata_list_rows_for_user, the O(library size)
+# per-request cost this index exists to let the client route around).
+#
+# Own blob pair + own manifest + own 'sort' dirty-index-kind partition --
+# NOT built as a side effect of the lexical index the way the "listing"
+# projection above is (_write_user_listing_index only ever refreshes when the
+# *lexical* manifest goes dirty, which rating/likes edits never do -- see
+# _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
+# tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
+# lexical rebuild -- so this index tracks its own staleness end to end.
+_SORT_INDEX_SCHEMA_VERSION = 'v1'
+_SORT_INDEX_CACHE_LOCK = threading.RLock()
+_SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
+# The Table columns _build_user_sort_index_snapshot SELECTs -- deliberately
+# narrow (no photoEmbedding/semanticEmbedding/ocrText/tagMetadata/etc.),
+# because the whole point of this index is to relieve the backend-memory
+# pressure a full-column gallery scan causes; pulling the big columns just to
+# emit 5 small fields would reintroduce that spike on every cold build. Covers
+# the deleted-row filter (processing_state), the emitted fields (rating/likes/
+# uploadDate), and every field metadata_capture_datetime reads to derive
+# captureDate (exifData -> clientLastModified -> uploadDate/upload_started_at/
+# last_processing_update). RowKey is listed explicitly so a projecting select
+# still yields it -- real Azure returns PartitionKey/RowKey regardless, but a
+# strict projection (and the test fakes) only return selected columns.
+_SORT_INDEX_SOURCE_FIELDS = [
+    'PartitionKey', 'RowKey', 'processing_state',
+    'rating', 'likes', 'uploadDate',
+    'exifData', 'clientLastModified', 'upload_started_at', 'last_processing_update',
+]
+
+
+def _sort_index_json_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-sort.json.gz'
+
+
+def _sort_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-sort.json'
+
+
+def get_sort_index_blob_location(user_id: str) -> Tuple[str, str]:
+    """(container_name, blob_name) for user_id's sort index data blob -- the
+    pair a caller needs to mint its own SAS URL (see
+    routes/photos.py:photos_sort_index, which hands this blob straight to the
+    browser instead of proxying it through a backend request, same pattern as
+    get_lexical_index_blob_location)."""
+    return _lexical_index_container_name(), _sort_index_json_blob_name(user_id)
+
+
+def _sort_index_blob_client(blob_name: str):
+    container_name = _lexical_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_sort_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _SORT_INDEX_CACHE_LOCK:
+        _SORT_INDEX_CACHE.pop(key, None)
+
+
+def delete_user_sort_index_data(user_id: str) -> None:
+    """Delete a library's cached sort-index blobs (data + manifest) and drop
+    it from the in-memory cache. Best-effort: a missing blob is not an error.
+    Mirrors delete_user_lexical_index_data."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for blob_name in (_sort_index_json_blob_name(key), _sort_index_manifest_blob_name(key)):
+        blob_client = _sort_index_blob_client(blob_name)
+        if blob_client is None:
+            continue
+        try:
+            blob_client.delete_blob()
+        except Exception:
+            pass
+    invalidate_user_sort_index_cache(key)
+
+
+def touch_user_sort_index_state(user_id: str) -> str:
+    """Mark the sort index's own manifest dirty with a fresh sourceVersion --
+    mirrors touch_user_lexical_index_state, but writes the sort index's own
+    manifest blob, independent of the lexical one."""
+    key = str(user_id or '').strip()
+    if not key:
+        return ''
+    source_version = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        'userId': key,
+        'sourceVersion': source_version,
+        'schemaVersion': _SORT_INDEX_SCHEMA_VERSION,
+        'dirty': True,
+        'updatedAt': source_version,
+    }
+    blob_client = _sort_index_blob_client(_sort_index_manifest_blob_name(key))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    invalidate_user_sort_index_cache(key)
+    # Album covers are picked from the sort index's rating/likes/captureDate
+    # (see _pick_album_cover_filename) -- anything that dirties the sort
+    # index (rating, likes, or an EXIF/captureDate change via
+    # touch_user_search_indexes_state's fan-out) can change which photo an
+    # album's cover should be, so keep the albums index in lockstep here
+    # rather than duplicating this trigger at every photo-mutation call site.
+    touch_user_albums_index_state(key)
+    return source_version
+
+
+def touch_user_sort_index_dirty(user_id: str, filenames) -> None:
+    """Mark specific filenames dirty for the sort index's incremental rebuild,
+    WITHOUT touching the vector/lexical/tag-embedding indexes -- the whole
+    point of keeping this index independent (see the module comment above).
+    Call this instead of touch_user_search_indexes_state for edits (rating,
+    likes) that only ever affect sort order, never search content."""
+    key = str(user_id or '').strip()
+    if not key or not filenames:
+        return
+    touch_user_sort_index_state(key)
+    table = _CTX.get('search_index_dirty_table_client')
+    if table is None:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    partition_key = _search_index_dirty_partition_key(key, 'sort')
+    for filename in filenames:
+        filename = str(filename or '').strip()
+        if not filename:
+            continue
+        try:
+            table.upsert_entity({'PartitionKey': partition_key, 'RowKey': filename, 'dirtyAt': now})
+        except Exception:
+            pass
+
+
+def _load_sort_index_manifest(user_id: str) -> Dict[str, str]:
+    blob_client = _sort_index_blob_client(_sort_index_manifest_blob_name(user_id))
+    if blob_client is None:
+        return {}
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_sort_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    blob_client = _sort_index_blob_client(_sort_index_json_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        rows = parsed.get('rows')
+        if not isinstance(rows, list):
+            return None
+        return LexicalIndexSnapshot(
+            user_id=str(user_id),
+            source_version=str(parsed.get('sourceVersion') or ''),
+            schema_version=str(parsed.get('schemaVersion') or ''),
+            updated_at=str(parsed.get('updatedAt') or ''),
+            rows=rows,
+        )
+    except Exception:
+        return None
+
+
+def _serialize_sort_index(snapshot: LexicalIndexSnapshot) -> bytes:
+    payload = {
+        'userId': snapshot.user_id,
+        'sourceVersion': snapshot.source_version,
+        'schemaVersion': snapshot.schema_version,
+        'updatedAt': snapshot.updated_at,
+        'rowCount': len(snapshot.rows),
+        'rows': snapshot.rows,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+    return gzip.compress(raw, compresslevel=6)
+
+
+def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
+    filename = str(entity.get('RowKey') or '').strip()
+    if not filename:
+        return None
+    capture_dt = metadata_capture_datetime(entity)
+    return {
+        'RowKey': filename,
+        'captureDate': capture_dt.isoformat() if capture_dt else None,
+        'rating': entity.get('rating') or 0,
+        'likes': entity.get('likes') or 0,
+        'uploadDate': entity.get('uploadDate') or None,
+    }
+
+
+def _build_user_sort_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return None
+    try:
+        # select= keeps this full-library scan from pulling the large
+        # embedding/OCR/tag columns it never uses -- see _SORT_INDEX_SOURCE_FIELDS.
+        rows = list(metadata_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'",
+            select=_SORT_INDEX_SOURCE_FIELDS,
+        ))
+    except Exception:
+        # A transient query failure must not be treated as "empty library" --
+        # refresh_user_sort_index persists whatever this returns as the new
+        # dirty:false state (see refresh_user_lexical_index's identical note).
+        return None
+
+    trimmed_rows: List[Dict[str, object]] = []
+    for row in rows:
+        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+            continue
+        trimmed = _sort_index_row(dict(row))
+        if trimmed is not None:
+            trimmed_rows.append(trimmed)
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_SORT_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=trimmed_rows,
+    )
+
+
+def _merge_user_sort_index_snapshot(
+    user_id: str, existing: LexicalIndexSnapshot, dirty_filenames: Set[str], source_version: str,
+) -> Optional[LexicalIndexSnapshot]:
+    """Incremental counterpart to _build_user_sort_index_snapshot: only
+    re-fetch the filenames known to have changed and merge them into the
+    existing snapshot's rows, instead of re-scanning the whole partition --
+    mirrors _merge_user_lexical_index_snapshot exactly."""
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return None
+    by_filename: Dict[str, Dict[str, object]] = {
+        str(row.get('RowKey') or ''): row for row in existing.rows if row.get('RowKey')
+    }
+
+    def _refresh_one(filename: str) -> Tuple[str, Optional[Dict[str, object]]]:
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            return filename, None
+        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+            return filename, None
+        return filename, _sort_index_row(dict(entity))
+
+    if dirty_filenames:
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty_filenames)))) as executor:
+            for filename, trimmed_row in executor.map(_refresh_one, dirty_filenames):
+                if trimmed_row is None:
+                    by_filename.pop(filename, None)
+                else:
+                    by_filename[filename] = trimmed_row
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_SORT_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=list(by_filename.values()),
+    )
+
+
+def refresh_user_sort_index(
+    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
+) -> Optional[LexicalIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+
+    snapshot = None
+    dirty_to_clear: Optional[Set[str]] = None
+    if not force_full:
+        existing = _load_sort_index_blob(key)
+        if existing is not None and existing.schema_version == _SORT_INDEX_SCHEMA_VERSION:
+            dirty = _get_dirty_search_index_filenames(key, 'sort')
+            if dirty is not None:
+                snapshot = _merge_user_sort_index_snapshot(key, existing, dirty, source_version)
+                if snapshot is not None:
+                    dirty_to_clear = dirty
+    if snapshot is None:
+        snapshot = _build_user_sort_index_snapshot(key, source_version)
+        if snapshot is not None:
+            dirty_to_clear = _get_dirty_search_index_filenames(key, 'sort') or set()
+    if snapshot is None:
+        return None
+    container_name = _lexical_index_container_name()
+    if container_name:
+        blob_client = _get_blob_client(container_name, _sort_index_json_blob_name(key))
+        if blob_client is not None:
+            try:
+                blob_client.upload_blob(
+                    _serialize_sort_index(snapshot),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                )
+            except Exception:
+                pass
+        manifest = {
+            'userId': key,
+            'sourceVersion': snapshot.source_version,
+            'schemaVersion': snapshot.schema_version,
+            'rowCount': len(snapshot.rows),
+            'dirty': False,
+            'updatedAt': snapshot.updated_at,
+        }
+        manifest_client = _get_blob_client(container_name, _sort_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            try:
+                manifest_client.upload_blob(
+                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json'),
+                )
+            except Exception:
+                pass
+    with _SORT_INDEX_CACHE_LOCK:
+        _SORT_INDEX_CACHE[key] = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+    if dirty_to_clear:
+        _clear_dirty_search_index_filenames(key, 'sort', dirty_to_clear)
+    return snapshot
+
+
+def _sort_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:
+    """Mirrors _lexical_index_fresh_cache_entry: fresh in-memory-or-blob
+    snapshot dict for key if one matches manifest and isn't dirty, else
+    None."""
+    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
+    manifest_dirty = bool(manifest.get('dirty'))
+
+    with _SORT_INDEX_CACHE_LOCK:
+        cached = _SORT_INDEX_CACHE.get(key)
+        if (
+            cached
+            and cached.get('source_version') == manifest_source_version
+            and cached.get('schema_version') == _SORT_INDEX_SCHEMA_VERSION
+            and not manifest_dirty
+        ):
+            return cached
+
+    snapshot = _load_sort_index_blob(key)
+    if (
+        snapshot
+        and snapshot.source_version == manifest_source_version
+        and snapshot.schema_version == _SORT_INDEX_SCHEMA_VERSION
+        and not manifest_dirty
+    ):
+        data = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+        with _SORT_INDEX_CACHE_LOCK:
+            _SORT_INDEX_CACHE[key] = data
+        return data
+    return None
+
+
+def _rebuild_sort_index_in_background(key: str, manifest: Dict[str, str]) -> None:
+    """Mirrors _rebuild_lexical_index_in_background: kicks off a rebuild off
+    the request thread if one isn't already running for this user."""
+    lock = _SORT_INDEX_REBUILD_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+            refresh_user_sort_index(key, source_version=source_version)
+        except Exception:
+            _LOGGER.exception('Background sort index rebuild failed for user %s', key)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='sort-index-rebuild', daemon=True).start()
+
+
+def get_user_sort_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
+    """Mirrors get_user_lexical_index's "serve stale immediately, rebuild
+    off-thread" read path -- a sort-index rebuild should almost never hit the
+    cold/full-scan branch once warm, since edits dirty it far more often
+    (every rating/like tap) than a full-library reprocessing event would.
+
+    allow_sync_build=False makes the cold path (no snapshot ever built)
+    non-blocking: it kicks the first build off-thread and returns None instead
+    of running the full-library scan inline. The gallery's
+    /api/photos/sort-index request passes this, so a brand-new (or just-cleaned,
+    or first-load-after-deploy) library falls back to the legacy endpoint for
+    that one load rather than hanging ~a minute on a full scan -- which would
+    also re-create the exact O(library-size) memory spike this index exists to
+    eliminate. The next load picks up the background-built blob. Internal /
+    warming callers keep the default (True) to force a synchronous build when
+    they need the result in hand."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    manifest = _load_sort_index_manifest(key)
+    fresh = _sort_index_fresh_cache_entry(key, manifest)
+    if fresh is None and allow_refresh:
+        stale = _load_sort_index_blob(key)
+        if stale is not None:
+            fresh = {
+                'source_version': stale.source_version,
+                'schema_version': stale.schema_version,
+                'updated_at': stale.updated_at,
+                'rows': stale.rows,
+            }
+            _rebuild_sort_index_in_background(key, manifest)
+        elif allow_sync_build:
+            with _SORT_INDEX_REBUILD_LOCKS.lock_for(key):
+                fresh = _sort_index_fresh_cache_entry(key, _load_sort_index_manifest(key))
+                if fresh is None:
+                    source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                    refreshed = refresh_user_sort_index(key, source_version=source_version)
+                    if refreshed is not None:
+                        fresh = {
+                            'source_version': refreshed.source_version,
+                            'schema_version': refreshed.schema_version,
+                            'updated_at': refreshed.updated_at,
+                            'rows': refreshed.rows,
+                        }
+        else:
+            # Cold + caller must not block (the gallery's initial load): build
+            # off-thread so the next request is fast, and report "not ready"
+            # now so the caller falls back rather than waiting on a full scan.
+            _rebuild_sort_index_in_background(key, manifest)
+    if fresh is None:
+        return None
+    return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
+
+
+# --- Albums index --------------------------------------------------------------
+# Same "own blob + own manifest, downloaded once per session" architecture as
+# the sort index above, applied to Albums: {albumId, name, photoCount,
+# coverFilename, updatedAt, filenames} for every album, so the frontend can
+# render the Albums list AND open an album's full photo set without either of
+# the two real inefficiencies this replaces:
+#   - list_albums's per-album cover computation (_album_cover_thumbnail_url,
+#     app.py) rides the whole-library rating/likes/date sorted scan; this
+#     index instead looks each album's cover up against the already-built
+#     sort index's rows (get_user_sort_index) -- no fresh library scan.
+#   - get_album's _load_photos_for_filenames (app.py) does a sequential,
+#     non-batched, non-concurrent Table point-read per photo in the album.
+#     The index carries each album's filenames directly (already stored on
+#     the album entity, see _album_filenames) so the frontend can skip
+#     GET /albums/<id> entirely and resolve full photo data via the existing
+#     batched /api/photos/lookup-batch instead.
+#
+# Deliberately NO incremental-merge machinery (unlike the sort/lexical
+# indexes): album count is small relative to library size -- the whole reason
+# those indexes need point-read-only incremental rebuilds -- so a full
+# rebuild (re-scan the small album partition + look up cover data from the
+# already-resident sort index) is cheap enough to just always do. Own dirty
+# flag only (no per-album dirty-filenames partition).
+_ALBUMS_INDEX_SCHEMA_VERSION = 'v1'
+_ALBUMS_INDEX_CACHE_LOCK = threading.RLock()
+_ALBUMS_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_ALBUMS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
+
+
+def _albums_index_json_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-albums.json.gz'
+
+
+def _albums_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-albums.json'
+
+
+def get_albums_index_blob_location(user_id: str) -> Tuple[str, str]:
+    """(container_name, blob_name) for user_id's albums index data blob --
+    mirrors get_sort_index_blob_location/get_lexical_index_blob_location."""
+    return _lexical_index_container_name(), _albums_index_json_blob_name(user_id)
+
+
+def _albums_index_blob_client(blob_name: str):
+    container_name = _lexical_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_albums_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _ALBUMS_INDEX_CACHE_LOCK:
+        _ALBUMS_INDEX_CACHE.pop(key, None)
+
+
+def delete_user_albums_index_data(user_id: str) -> None:
+    """Delete a library's cached albums-index blobs (data + manifest) and
+    drop it from the in-memory cache. Best-effort: a missing blob is not an
+    error. Mirrors delete_user_sort_index_data."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for blob_name in (_albums_index_json_blob_name(key), _albums_index_manifest_blob_name(key)):
+        blob_client = _albums_index_blob_client(blob_name)
+        if blob_client is None:
+            continue
+        try:
+            blob_client.delete_blob()
+        except Exception:
+            pass
+    invalidate_user_albums_index_cache(key)
+
+
+def touch_user_albums_index_state(user_id: str) -> str:
+    """Mark the albums index's manifest dirty with a fresh sourceVersion --
+    mirrors touch_user_sort_index_state. No per-album dirty-filenames
+    partition (see module comment above): a full rebuild is cheap enough that
+    incremental tracking isn't worth the complexity here."""
+    key = str(user_id or '').strip()
+    if not key:
+        return ''
+    source_version = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        'userId': key,
+        'sourceVersion': source_version,
+        'schemaVersion': _ALBUMS_INDEX_SCHEMA_VERSION,
+        'dirty': True,
+        'updatedAt': source_version,
+    }
+    blob_client = _albums_index_blob_client(_albums_index_manifest_blob_name(key))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    invalidate_user_albums_index_cache(key)
+    return source_version
+
+
+def _load_albums_index_manifest(user_id: str) -> Dict[str, str]:
+    blob_client = _albums_index_blob_client(_albums_index_manifest_blob_name(user_id))
+    if blob_client is None:
+        return {}
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_albums_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    blob_client = _albums_index_blob_client(_albums_index_json_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        rows = parsed.get('rows')
+        if not isinstance(rows, list):
+            return None
+        return LexicalIndexSnapshot(
+            user_id=str(user_id),
+            source_version=str(parsed.get('sourceVersion') or ''),
+            schema_version=str(parsed.get('schemaVersion') or ''),
+            updated_at=str(parsed.get('updatedAt') or ''),
+            rows=rows,
+        )
+    except Exception:
+        return None
+
+
+def _serialize_albums_index(snapshot: LexicalIndexSnapshot) -> bytes:
+    payload = {
+        'userId': snapshot.user_id,
+        'sourceVersion': snapshot.source_version,
+        'schemaVersion': snapshot.schema_version,
+        'updatedAt': snapshot.updated_at,
+        'rowCount': len(snapshot.rows),
+        'rows': snapshot.rows,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+    return gzip.compress(raw, compresslevel=6)
+
+
+def _pick_album_cover_filename(filenames: List[str], sort_rows_by_filename: Dict[str, Dict[str, object]]) -> str:
+    """Highest rating -> most likes -> most recent capture -> filename,
+    matching _album_cover_thumbnail_url's existing selection rule -- sourced
+    from the sort index's already-resident rows instead of a fresh
+    whole-library scan. A filename the sort index doesn't have (index still
+    cold/rebuilding) is treated as lowest-priority, never crashes: falls back
+    to the first filename in album order if none are found in the sort index
+    at all."""
+    if not filenames:
+        return ''
+    best_filename = ''
+    best_key: Optional[Tuple[int, int, str]] = None
+    for filename in filenames:
+        row = sort_rows_by_filename.get(filename)
+        if row is None:
+            continue
+        key = (int(row.get('rating') or 0), int(row.get('likes') or 0), str(row.get('captureDate') or ''))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_filename = filename
+    return best_filename or filenames[0]
+
+
+def _index_coerce_bool(value: object) -> bool:
+    """General-purpose Table-Storage boolean coercion (handles real bools,
+    numeric 0/1, and 'true'/'1'/'yes' strings) -- shared by the albums and
+    people index builders, mirrors app.py's _coerce_bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ('1', 'true', 'yes')
+
+
+def _album_share_fields(row: Dict) -> Dict[str, object]:
+    """Mirrors app.py's _album_entity_to_payload's share-status fields
+    (isPublic/publicUrl/publicExpiresAt/hasAccessCode/isExpired) -- these are
+    cheap, O(1)-per-album fields already stored directly on the entity (not
+    something the sort-index-backed cover lookup helps with), so the index
+    carries them too rather than dropping them and regressing the Albums
+    page's sharing UI (AlbumsPage.tsx reads album.isPublic/publicUrl/
+    hasAccessCode directly).
+
+    Deliberately reimplemented here (not calling _album_entity_to_payload
+    directly) rather than importing across the app.py/storage_utils.py
+    boundary -- app.py imports FROM storage_utils.py, not the reverse, so a
+    reverse import would be circular. Also deliberately does NOT fall back to
+    request.host_url the way _album_entity_to_payload does: this can run on a
+    background rebuild thread (see _rebuild_albums_index_in_background) with
+    no active Flask request context at all. EXTRAS_PUBLIC_BASE_URL is read
+    directly from the environment (same variable, independently) -- a
+    publicUrl is only ever omitted if that's unset in a real deployment,
+    which the live SPA_BASE_URL/EXTRAS_PUBLIC_BASE_URL convention treats as a
+    misconfiguration anyway, not an expected runtime state.
+    """
+    is_public = _index_coerce_bool(row.get('isPublic', False))
+    token = str(row.get('publicToken') or '')
+    expires_at_raw = str(row.get('publicExpiresAt') or '')
+    expires_dt = parse_iso_date(expires_at_raw) if expires_at_raw else None
+    is_expired = bool(expires_dt and datetime.now(timezone.utc) > expires_dt)
+    public_url = ''
+    if is_public and token and not is_expired:
+        base = os.getenv('EXTRAS_PUBLIC_BASE_URL', '').strip()
+        if base:
+            public_url = f"{base.rstrip('/')}/public/album/{token}"
+    return {
+        'isPublic': is_public and not is_expired,
+        'publicUrl': public_url,
+        'publicExpiresAt': expires_at_raw,
+        'hasAccessCode': bool(str(row.get('accessCode', '')).strip()),
+        'isExpired': is_expired,
+    }
+
+
+def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
+    albums_table_client = _CTX.get('albums_table_client')
+    if albums_table_client is None:
+        return None
+    try:
+        rows = list(albums_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        # A transient query failure must not be treated as "no albums" --
+        # refresh_user_albums_index persists whatever this returns as the new
+        # dirty:false state (see refresh_user_sort_index's identical note).
+        return None
+
+    # Best-effort cover data source -- never blocks this build on the sort
+    # index's own cold-build path (allow_sync_build=False): covers just fall
+    # back to "first filename in the album" until the sort index catches up.
+    sort_rows_by_filename: Dict[str, Dict[str, object]] = {}
+    try:
+        sort_index = get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
+        if sort_index is not None:
+            sort_rows_by_filename = {
+                str(row.get('RowKey') or ''): row for row in sort_index.get('rows', []) if row.get('RowKey')
+            }
+    except Exception:
+        sort_rows_by_filename = {}
+
+    trimmed_rows: List[Dict[str, object]] = []
+    for row in rows:
+        album_id = str(row.get('RowKey') or '').strip()
+        if not album_id:
+            continue
+        if str(row.get('deleted') or '').strip().lower() in ('true', '1'):
+            continue
+        try:
+            filenames = json.loads(row.get('filenames', '[]') or '[]')
+        except Exception:
+            filenames = []
+        if not isinstance(filenames, list):
+            filenames = []
+        trimmed_rows.append({
+            'albumId': album_id,
+            'name': str(row.get('name') or ''),
+            'photoCount': len(filenames),
+            'coverFilename': _pick_album_cover_filename(filenames, sort_rows_by_filename),
+            'updatedAt': str(row.get('updatedAt') or ''),
+            'filenames': filenames,
+            **_album_share_fields(row),
+        })
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_ALBUMS_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=trimmed_rows,
+    )
+
+
+def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+
+    snapshot = _build_user_albums_index_snapshot(key, source_version)
+    if snapshot is None:
+        return None
+    container_name = _lexical_index_container_name()
+    if container_name:
+        blob_client = _get_blob_client(container_name, _albums_index_json_blob_name(key))
+        if blob_client is not None:
+            try:
+                blob_client.upload_blob(
+                    _serialize_albums_index(snapshot),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                )
+            except Exception:
+                pass
+        manifest = {
+            'userId': key,
+            'sourceVersion': snapshot.source_version,
+            'schemaVersion': snapshot.schema_version,
+            'rowCount': len(snapshot.rows),
+            'dirty': False,
+            'updatedAt': snapshot.updated_at,
+        }
+        manifest_client = _get_blob_client(container_name, _albums_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            try:
+                manifest_client.upload_blob(
+                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json'),
+                )
+            except Exception:
+                pass
+    with _ALBUMS_INDEX_CACHE_LOCK:
+        _ALBUMS_INDEX_CACHE[key] = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+    return snapshot
+
+
+def _albums_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:
+    """Mirrors _sort_index_fresh_cache_entry: fresh in-memory-or-blob
+    snapshot dict for key if one matches manifest and isn't dirty, else
+    None."""
+    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
+    manifest_dirty = bool(manifest.get('dirty'))
+
+    with _ALBUMS_INDEX_CACHE_LOCK:
+        cached = _ALBUMS_INDEX_CACHE.get(key)
+        if (
+            cached
+            and cached.get('source_version') == manifest_source_version
+            and cached.get('schema_version') == _ALBUMS_INDEX_SCHEMA_VERSION
+            and not manifest_dirty
+        ):
+            return cached
+
+    snapshot = _load_albums_index_blob(key)
+    if (
+        snapshot
+        and snapshot.source_version == manifest_source_version
+        and snapshot.schema_version == _ALBUMS_INDEX_SCHEMA_VERSION
+        and not manifest_dirty
+    ):
+        data = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+        with _ALBUMS_INDEX_CACHE_LOCK:
+            _ALBUMS_INDEX_CACHE[key] = data
+        return data
+    return None
+
+
+def _rebuild_albums_index_in_background(key: str, manifest: Dict[str, str]) -> None:
+    """Mirrors _rebuild_sort_index_in_background: kicks off a rebuild off the
+    request thread if one isn't already running for this user."""
+    lock = _ALBUMS_INDEX_REBUILD_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+            refresh_user_albums_index(key, source_version=source_version)
+        except Exception:
+            _LOGGER.exception('Background albums index rebuild failed for user %s', key)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='albums-index-rebuild', daemon=True).start()
+
+
+def get_user_albums_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
+    """Mirrors get_user_sort_index's "serve stale immediately, rebuild
+    off-thread" read path, including allow_sync_build=False for the
+    gallery-load-gating route (GET /api/albums/index) so a cold library
+    returns available:false immediately instead of blocking on a build."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    manifest = _load_albums_index_manifest(key)
+    fresh = _albums_index_fresh_cache_entry(key, manifest)
+    if fresh is None and allow_refresh:
+        stale = _load_albums_index_blob(key)
+        if stale is not None:
+            fresh = {
+                'source_version': stale.source_version,
+                'schema_version': stale.schema_version,
+                'updated_at': stale.updated_at,
+                'rows': stale.rows,
+            }
+            _rebuild_albums_index_in_background(key, manifest)
+        elif allow_sync_build:
+            with _ALBUMS_INDEX_REBUILD_LOCKS.lock_for(key):
+                fresh = _albums_index_fresh_cache_entry(key, _load_albums_index_manifest(key))
+                if fresh is None:
+                    source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                    refreshed = refresh_user_albums_index(key, source_version=source_version)
+                    if refreshed is not None:
+                        fresh = {
+                            'source_version': refreshed.source_version,
+                            'schema_version': refreshed.schema_version,
+                            'updated_at': refreshed.updated_at,
+                            'rows': refreshed.rows,
+                        }
+        else:
+            _rebuild_albums_index_in_background(key, manifest)
+    if fresh is None:
+        return None
+    return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
+
+
+# --- People index ---------------------------------------------------------------
+# Same "own blob + own manifest, downloaded once per session" architecture as
+# the albums index above, applied to People: {personId, name, isNamed,
+# faceCount, coverFaceId, coverFilename, coverBbox, updatedAt} for every
+# person, so the People grid can render the whole list client-side instead of
+# routes/people.py:list_persons's hardcoded single page (the live frontend
+# calls faceService.listPersons(undefined, 0, 200) -- a person beyond the
+# 200th is silently never shown, not real pagination).
+#
+# Dirty-marking piggybacks on _invalidate_people_scan_cache (see
+# _InvalidatingTableClient) rather than being wired into individual routes:
+# person/face rows are written from dozens of call sites across app.py AND
+# the background clustering worker, all funnelled through the SAME wrapped
+# person_table_client/face_table_client, so hooking the ONE existing
+# choke-point invalidation function gives complete coverage for free --
+# mirrors how the albums index hooks touch_user_sort_index_state instead of
+# scattering calls across every album-mutation route.
+#
+# Deliberately NO incremental-merge machinery, same reasoning as the albums
+# index: the full build's cost here (comparable to list_persons's existing
+# Phase A/B full face-table scan, already run today on every People page
+# load behind a 20s TTL cache) doesn't get materially cheaper by tracking
+# per-person dirty filenames, and the existing serve-stale/coalesced
+# background-rebuild machinery already ensures a burst of writes (e.g. a
+# clustering run reassigning hundreds of faces) triggers at most one real
+# rebuild per idle period, not one per write.
+_PEOPLE_INDEX_SCHEMA_VERSION = 'v1'
+_PEOPLE_INDEX_CACHE_LOCK = threading.RLock()
+_PEOPLE_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_PEOPLE_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
+_PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY = 16
+
+
+def _people_index_json_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-people.json.gz'
+
+
+def _people_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-people.json'
+
+
+def get_people_index_blob_location(user_id: str) -> Tuple[str, str]:
+    """(container_name, blob_name) for user_id's people index data blob --
+    mirrors get_albums_index_blob_location/get_sort_index_blob_location."""
+    return _lexical_index_container_name(), _people_index_json_blob_name(user_id)
+
+
+def _people_index_blob_client(blob_name: str):
+    container_name = _lexical_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_people_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _PEOPLE_INDEX_CACHE_LOCK:
+        _PEOPLE_INDEX_CACHE.pop(key, None)
+
+
+def delete_user_people_index_data(user_id: str) -> None:
+    """Delete a library's cached people-index blobs (data + manifest) and
+    drop it from the in-memory cache. Best-effort: a missing blob is not an
+    error. Mirrors delete_user_albums_index_data."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for blob_name in (_people_index_json_blob_name(key), _people_index_manifest_blob_name(key)):
+        blob_client = _people_index_blob_client(blob_name)
+        if blob_client is None:
+            continue
+        try:
+            blob_client.delete_blob()
+        except Exception:
+            pass
+    invalidate_user_people_index_cache(key)
+
+
+def touch_user_people_index_state(user_id: str) -> str:
+    """Mark the people index's manifest dirty with a fresh sourceVersion --
+    mirrors touch_user_albums_index_state. No per-person dirty-tracking (see
+    module comment above)."""
+    key = str(user_id or '').strip()
+    if not key:
+        return ''
+    source_version = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        'userId': key,
+        'sourceVersion': source_version,
+        'schemaVersion': _PEOPLE_INDEX_SCHEMA_VERSION,
+        'dirty': True,
+        'updatedAt': source_version,
+    }
+    blob_client = _people_index_blob_client(_people_index_manifest_blob_name(key))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    invalidate_user_people_index_cache(key)
+    return source_version
+
+
+def _load_people_index_manifest(user_id: str) -> Dict[str, str]:
+    blob_client = _people_index_blob_client(_people_index_manifest_blob_name(user_id))
+    if blob_client is None:
+        return {}
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_people_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    blob_client = _people_index_blob_client(_people_index_json_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        rows = parsed.get('rows')
+        if not isinstance(rows, list):
+            return None
+        return LexicalIndexSnapshot(
+            user_id=str(user_id),
+            source_version=str(parsed.get('sourceVersion') or ''),
+            schema_version=str(parsed.get('schemaVersion') or ''),
+            updated_at=str(parsed.get('updatedAt') or ''),
+            rows=rows,
+        )
+    except Exception:
+        return None
+
+
+def _serialize_people_index(snapshot: LexicalIndexSnapshot) -> bytes:
+    payload = {
+        'userId': snapshot.user_id,
+        'sourceVersion': snapshot.source_version,
+        'schemaVersion': snapshot.schema_version,
+        'updatedAt': snapshot.updated_at,
+        'rowCount': len(snapshot.rows),
+        'rows': snapshot.rows,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+    return gzip.compress(raw, compresslevel=6)
+
+
+def _people_index_is_unnamed_name(name: str) -> bool:
+    return bool(re.match(r'^unnamed\s*\d*$', (name or '').strip(), re.IGNORECASE))
+
+
+def _people_index_person_is_named(person: Dict) -> bool:
+    """Mirrors app.py's _person_entity_is_named -- reimplemented here (not
+    imported) for the same cross-module reason as _album_share_fields:
+    app.py imports FROM storage_utils.py, not the reverse."""
+    name = str((person or {}).get('name') or '').strip()
+    return bool(name) and not _people_index_is_unnamed_name(name)
+
+
+def _people_index_face_is_rejected(face: Dict) -> bool:
+    return _index_coerce_bool(face.get('rejected', False)) or str(face.get('reviewStatus') or '').lower() == 'rejected'
+
+
+def _people_index_face_is_owned_by_person(face: Optional[Dict], person_id: str) -> bool:
+    if not face or not person_id:
+        return False
+    return str(face.get('personId') or '') == str(person_id)
+
+
+def _people_index_face_preview_priority(face: Dict) -> Tuple[int, float, int]:
+    """Mirrors app.py's _face_preview_priority: confirmed faces first, then
+    higher confidence, then non-rejected -- used to pick each person's
+    representative/cover face."""
+    try:
+        confidence = float(face.get('confidence', 0.0) or 0.0)
+    except Exception:
+        confidence = 0.0
+    confirmed = 1 if (
+        _index_coerce_bool(face.get('confirmedByUser', False)) or str(face.get('reviewStatus') or '').lower() == 'confirmed'
+    ) else 0
+    rejected = 1 if _people_index_face_is_rejected(face) else 0
+    return (confirmed, confidence, -rejected)
+
+
+def _people_index_face_bbox(face: Dict) -> Dict[str, object]:
+    bbox_value = face.get('bbox', {})
+    if isinstance(bbox_value, str):
+        try:
+            bbox_value = json.loads(bbox_value or '{}')
+        except Exception:
+            bbox_value = {}
+    return bbox_value if isinstance(bbox_value, dict) else {}
+
+
+def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
+    person_table_client = _CTX.get('person_table_client')
+    face_table_client = _CTX.get('face_table_client')
+    if person_table_client is None or face_table_client is None:
+        return None
+    try:
+        person_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        # A transient query failure must not be treated as "no people" --
+        # refresh_user_people_index persists whatever this returns as the new
+        # dirty:false state (see refresh_user_sort_index's identical note).
+        return None
+    try:
+        face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        return None
+    face_by_id: Dict[str, Dict[str, object]] = {str(row.get('RowKey') or ''): row for row in face_rows if row.get('RowKey')}
+
+    def _resolve_face(face_id: str) -> Tuple[str, Optional[Dict[str, object]]]:
+        face = face_by_id.get(face_id)
+        if face is not None:
+            return face_id, face
+        try:
+            return face_id, face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            return face_id, None
+
+    trimmed_rows: List[Dict[str, object]] = []
+    unnamed_counter = 1
+    for row in person_rows:
+        person_id = str(row.get('RowKey') or '').strip()
+        if not person_id:
+            continue
+        try:
+            face_ids = [str(fid) for fid in json.loads(row.get('faceIds', '[]') or '[]')]
+        except Exception:
+            face_ids = []
+        is_named = _people_index_person_is_named(row)
+        raw_name = str(row.get('name', '') or '').strip()
+        if raw_name:
+            name = raw_name
+        else:
+            name = f'Unnamed {unnamed_counter}'
+            unnamed_counter += 1
+
+        active_face_ids: List[str] = []
+        cover_face_id = ''
+        cover_filename = ''
+        cover_bbox: Dict[str, object] = {}
+        cover_score: Optional[Tuple[int, float, int]] = None
+        indeterminate = False
+
+        if face_ids:
+            with ThreadPoolExecutor(max_workers=min(_PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY, max(1, len(face_ids)))) as executor:
+                resolved = dict(executor.map(_resolve_face, face_ids))
+            for face_id in face_ids:
+                face = resolved.get(face_id)
+                if face is None:
+                    # Missing from both the bulk map and a direct point-read --
+                    # could be a genuinely deleted face or a transient error;
+                    # conservatively don't count it as delete-eligible (same
+                    # "indeterminate" guard list_persons uses).
+                    indeterminate = True
+                    continue
+                if _people_index_face_is_rejected(face) or not _people_index_face_is_owned_by_person(face, person_id):
+                    continue
+                active_face_ids.append(face_id)
+                score = _people_index_face_preview_priority(face)
+                if cover_score is None or score > cover_score:
+                    cover_score = score
+                    cover_face_id = face_id
+                    cover_filename = str(face.get('filename') or '')
+                    cover_bbox = _people_index_face_bbox(face)
+
+        # Auto-remove empty clusters so they stop cluttering the People page
+        # -- but never a cluster the user explicitly named (see
+        # _people_index_person_is_named's docstring). Mirrors list_persons's
+        # Phase B cleanup exactly, just run for every person instead of only
+        # the requested page slice.
+        if not active_face_ids and not indeterminate and not is_named:
+            try:
+                person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+            except Exception:
+                pass
+            continue
+
+        trimmed_rows.append({
+            'personId': person_id,
+            'name': name,
+            'isNamed': is_named,
+            'faceCount': len(active_face_ids),
+            'coverFaceId': cover_face_id,
+            'coverFilename': cover_filename,
+            'coverBbox': cover_bbox,
+            'updatedAt': source_version,
+        })
+
+    # Named clusters first, ties preserve RowKey (query) order -- mirrors
+    # list_persons's stable sort.
+    trimmed_rows.sort(key=lambda r: 0 if r['isNamed'] else 1)
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_PEOPLE_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=trimmed_rows,
+    )
+
+
+def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+
+    snapshot = _build_user_people_index_snapshot(key, source_version)
+    if snapshot is None:
+        return None
+    container_name = _lexical_index_container_name()
+    if container_name:
+        blob_client = _get_blob_client(container_name, _people_index_json_blob_name(key))
+        if blob_client is not None:
+            try:
+                blob_client.upload_blob(
+                    _serialize_people_index(snapshot),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                )
+            except Exception:
+                pass
+        manifest = {
+            'userId': key,
+            'sourceVersion': snapshot.source_version,
+            'schemaVersion': snapshot.schema_version,
+            'rowCount': len(snapshot.rows),
+            'dirty': False,
+            'updatedAt': snapshot.updated_at,
+        }
+        manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            try:
+                manifest_client.upload_blob(
+                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json'),
+                )
+            except Exception:
+                pass
+    with _PEOPLE_INDEX_CACHE_LOCK:
+        _PEOPLE_INDEX_CACHE[key] = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+    return snapshot
+
+
+def _people_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:
+    """Mirrors _albums_index_fresh_cache_entry."""
+    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
+    manifest_dirty = bool(manifest.get('dirty'))
+
+    with _PEOPLE_INDEX_CACHE_LOCK:
+        cached = _PEOPLE_INDEX_CACHE.get(key)
+        if (
+            cached
+            and cached.get('source_version') == manifest_source_version
+            and cached.get('schema_version') == _PEOPLE_INDEX_SCHEMA_VERSION
+            and not manifest_dirty
+        ):
+            return cached
+
+    snapshot = _load_people_index_blob(key)
+    if (
+        snapshot
+        and snapshot.source_version == manifest_source_version
+        and snapshot.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
+        and not manifest_dirty
+    ):
+        data = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+        with _PEOPLE_INDEX_CACHE_LOCK:
+            _PEOPLE_INDEX_CACHE[key] = data
+        return data
+    return None
+
+
+def _rebuild_people_index_in_background(key: str, manifest: Dict[str, str]) -> None:
+    """Mirrors _rebuild_albums_index_in_background: kicks off a rebuild off
+    the request thread if one isn't already running for this user."""
+    lock = _PEOPLE_INDEX_REBUILD_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+            refresh_user_people_index(key, source_version=source_version)
+        except Exception:
+            _LOGGER.exception('Background people index rebuild failed for user %s', key)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='people-index-rebuild', daemon=True).start()
+
+
+def get_user_people_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
+    """Mirrors get_user_albums_index's "serve stale immediately, rebuild
+    off-thread" read path, including allow_sync_build=False for the
+    gallery-load-gating route (GET /api/persons/index) so a cold library
+    returns available:false immediately instead of blocking on a build."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    manifest = _load_people_index_manifest(key)
+    fresh = _people_index_fresh_cache_entry(key, manifest)
+    if fresh is None and allow_refresh:
+        stale = _load_people_index_blob(key)
+        if stale is not None:
+            fresh = {
+                'source_version': stale.source_version,
+                'schema_version': stale.schema_version,
+                'updated_at': stale.updated_at,
+                'rows': stale.rows,
+            }
+            _rebuild_people_index_in_background(key, manifest)
+        elif allow_sync_build:
+            with _PEOPLE_INDEX_REBUILD_LOCKS.lock_for(key):
+                fresh = _people_index_fresh_cache_entry(key, _load_people_index_manifest(key))
+                if fresh is None:
+                    source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                    refreshed = refresh_user_people_index(key, source_version=source_version)
+                    if refreshed is not None:
+                        fresh = {
+                            'source_version': refreshed.source_version,
+                            'schema_version': refreshed.schema_version,
+                            'updated_at': refreshed.updated_at,
+                            'rows': refreshed.rows,
+                        }
+        else:
+            _rebuild_people_index_in_background(key, manifest)
+    if fresh is None:
+        return None
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
 
 

@@ -769,7 +769,13 @@ def photos_search_index():
     # from storage, never through this request.
     #
     # Lexical index: ensured fresh via allow_refresh=True (safe -- built from
-    # plain metadata fields, no ML/version dependency). Vector index:
+    # plain metadata fields, no ML/version dependency). allow_sync_build=False
+    # -- like photos_sort_index -- means a user with no snapshot ever built
+    # gets available:false back immediately (background build kicked off)
+    # instead of blocking ~60-75s on a full Table scan: this route only hands
+    # out a SAS URL, and the frontend (runLocalSemanticSearch) already
+    # degrades to server-side /photos/search when the local index isn't
+    # ready, so nothing here needs the synchronous build. Vector index:
     # deliberately NOT read via get_user_vector_index -- see
     # get_vector_index_manifest_summary's docstring for why that function's
     # version-gated freshness check is both always-false and actively
@@ -780,17 +786,23 @@ def photos_search_index():
     if error:
         return error
     try:
-        lexical_index = app.get_user_lexical_index(user_id, allow_refresh=True)
+        lexical_index = app.get_user_lexical_index(user_id, allow_refresh=True, allow_sync_build=False)
     except Exception:
         lexical_index = None
     if lexical_index is None:
-        return app.jsonify({'available': False}), 503
+        # 200, not 503: a plain 503 here would hit httpClient.ts's cold-start
+        # retry loop (any 503 is treated as "ingress rejected before reaching
+        # the app, safe to retry" -- see isRetriableColdStart), stalling for
+        # ~90s of retries before localSearchIndex.ts's caller ever sees the
+        # null it needs to fall back to server-side search. Same fix as
+        # photos_sort_index's identical bug (see that route's comment).
+        return app.jsonify({'available': False})
     try:
         container_name, blob_name = app.get_lexical_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
     except Exception:
         app.app.logger.exception('Failed to mint lexical index SAS URL for %s', user_id)
-        return app.jsonify({'available': False}), 503
+        return app.jsonify({'available': False})
 
     vector_index_payload = None
     try:
@@ -819,6 +831,54 @@ def photos_search_index():
     if vector_index_payload:
         response_payload.update(vector_index_payload)
     return app.jsonify(response_payload)
+
+@photos_bp.route('/api/photos/sort-index', methods=['GET'])
+def photos_sort_index():
+    # Hands the browser a direct SAS URL to the per-user sort-index blob
+    # (filename/captureDate/rating/likes/uploadDate only) -- see
+    # localSortIndex.ts on the frontend, which downloads this once per
+    # session and does its own local sort/paginate over it so /photos page
+    # requests don't have to materialize and sort the whole library
+    # server-side. Own manifest/dirty-cycle, independent of the lexical
+    # index -- see get_user_sort_index's module comment in storage_utils.py.
+    # Mirrors photos_search_index below almost exactly, just without the
+    # vector-index/people-name-index payload this doesn't need -- EXCEPT for
+    # status code on the "not available" case: this endpoint gates the
+    # primary gallery load (see fetchPhotos in store.tsx), unlike
+    # photos_search_index which only gates a bonus search feature. A plain
+    # 503 here would hit httpClient.ts's cold-start retry loop (any 503 is
+    # treated as "ingress rejected before reaching the app, safe to retry" --
+    # see isRetriableColdStart), stalling the gallery for up to ~90s of
+    # retries before the frontend's own fallback-to-legacy-endpoint path ever
+    # gets a chance to run. 200 with available:false lets the frontend react
+    # immediately.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    try:
+        # allow_sync_build=False: never block the gallery's initial load on a
+        # cold full-library build (see get_user_sort_index). A not-yet-built
+        # library returns available:false immediately + builds off-thread; the
+        # client falls back to the legacy endpoint for this one load and the
+        # next load gets the fast path.
+        sort_index = app.get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
+    except Exception:
+        sort_index = None
+    if sort_index is None:
+        return app.jsonify({'available': False})
+    try:
+        container_name, blob_name = app.get_sort_index_blob_location(user_id)
+        index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
+    except Exception:
+        app.app.logger.exception('Failed to mint sort index SAS URL for %s', user_id)
+        return app.jsonify({'available': False})
+    return app.jsonify({
+        'available': True,
+        'indexUrl': index_url,
+        'expiresAt': expires_at,
+        'sourceVersion': sort_index.get('source_version'),
+        'updatedAt': sort_index.get('updated_at'),
+    })
 
 @photos_bp.route('/photos/metadata', methods=['POST'])
 @photos_bp.route('/photos/metadata/', methods=['POST'])
