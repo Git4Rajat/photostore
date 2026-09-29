@@ -23,6 +23,7 @@ import { AppServicesProvider, useAppServices } from '../../components/AppService
 import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
+import { post } from '../../services/apiClient';
 import { StoreProvider, useStore } from './store';
 import { Menu } from './components/bits';
 import CommandBar from './components/CommandBar';
@@ -292,6 +293,14 @@ const PrototypeApp: React.FC = () => {
         await signOut();
         await refreshAuthState();
     }, [refreshAuthState]);
+
+    // Fire-and-forget: kicks the sort/lexical index rebuilds in the background
+    // as soon as a session starts, so a cold-start user pays that cost while
+    // looking at the app shell instead of on their first Gallery/Ask request.
+    useEffect(() => {
+        if (!signedIn) return;
+        void post('/api/photos/prime-indexes', {}).catch(() => {});
+    }, [signedIn]);
 
     // Public share links render the real album page regardless of auth state.
     if (isPublicAlbumPath()) {

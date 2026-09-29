@@ -880,6 +880,28 @@ def photos_sort_index():
         'updatedAt': sort_index.get('updated_at'),
     })
 
+@photos_bp.route('/api/photos/prime-indexes', methods=['POST'])
+def photos_prime_indexes():
+    # Fire-and-forget: called right after login/session-start so the
+    # sort/lexical index rebuilds (if the user's snapshot is missing or
+    # stale) happen in the background while the user is still looking at the
+    # app shell, instead of being triggered -- and felt -- by their first
+    # Gallery or Ask request. allow_sync_build=False on both calls means this
+    # never blocks the response even on a true cold start; it just kicks the
+    # same background rebuild thread these indexes already use.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    try:
+        app.get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
+    except Exception:
+        app.app.logger.exception('Sort index priming failed for %s', user_id)
+    try:
+        app.get_user_lexical_index(user_id, allow_refresh=True, allow_sync_build=False)
+    except Exception:
+        app.app.logger.exception('Lexical index priming failed for %s', user_id)
+    return app.jsonify({'ok': True})
+
 @photos_bp.route('/photos/metadata', methods=['POST'])
 @photos_bp.route('/photos/metadata/', methods=['POST'])
 @photos_bp.route('/api/photos/metadata', methods=['POST'])
