@@ -78,6 +78,35 @@ def _seed_photo(table: FakeTable, user_id: str, filename: str, **overrides) -> N
     table.upsert_entity(row)
 
 
+def test_configure_storage_wires_albums_table_client_into_ctx():
+    """Regression pin: every other test in this file monkeypatches
+    storage_utils._CTX['albums_table_client'] directly, which masked a real
+    bug where app.py's actual startup call to configure_storage() never
+    passed albums_table_client through at all -- the parameter didn't exist
+    on configure_storage, so _CTX['albums_table_client'] was permanently None
+    in production regardless of how many times the real app initialized.
+    _build_user_albums_index_snapshot silently no-ops on a None table client
+    (by design, to avoid treating a transient outage as "no albums"), so this
+    produced zero errors/log lines while the albums index blob was simply
+    never written -- see the 2026-09-29 forenkla-qa investigation that found
+    the live blob container had sort/lexical/listing/people blobs for the
+    active account but no albums blob at all, ever."""
+    fake_albums_table = object()
+    # configure_storage() replaces _CTX's contents wholesale and isn't
+    # monkeypatch-scoped like the setitem calls elsewhere in this file --
+    # snapshot/restore by hand so this test can't leak state into others.
+    snapshot = dict(storage_utils._CTX)
+    try:
+        storage_utils.configure_storage(
+            metadata_table_client=object(),
+            albums_table_client=fake_albums_table,
+        )
+        assert storage_utils._CTX.get('albums_table_client') is fake_albums_table
+    finally:
+        storage_utils._CTX.clear()
+        storage_utils._CTX.update(snapshot)
+
+
 @pytest.fixture
 def albums_ctx(monkeypatch):
     albums_table = FakeTable()

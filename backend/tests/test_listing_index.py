@@ -7,6 +7,9 @@ index directly used to.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 import storage_utils
@@ -138,6 +141,52 @@ def test_listing_index_reflects_incremental_merge_updates(ctx):
 
     listing = storage_utils.get_user_listing_index('u1', allow_refresh=False)
     assert listing['rows'][0]['rating'] == 5
+
+
+def test_listing_index_allow_sync_build_false_never_blocks_on_cold_account(ctx, monkeypatch):
+    """Regression pin: get_user_listing_index's fallback to
+    get_user_lexical_index used to hardcode allow_refresh=True with no
+    allow_sync_build plumbing at all, so a caller passing
+    allow_sync_build=False (e.g. /photos/timeline via
+    _cached_metadata_list_rows_for_user) still blocked on the lexical
+    index's own default (blocking) cold-build path -- defeating the whole
+    point of the non-blocking call. On a genuinely cold account (no listing
+    blob, no lexical snapshot ever built), this must return None immediately
+    instead of blocking on the ~60-75s full scan."""
+    metadata, _blobs = ctx
+    _seed_row(metadata, 'u1', 'a.jpg', tags='["cat"]')
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_build(user_id, source_version):
+        entered.set()
+        release.wait(timeout=5)
+        return storage_utils.LexicalIndexSnapshot(
+            user_id=user_id, source_version=source_version,
+            schema_version=storage_utils._LEXICAL_INDEX_SCHEMA_VERSION,
+            updated_at=source_version, rows=[{'RowKey': 'a.jpg'}],
+        )
+
+    monkeypatch.setattr(storage_utils, '_build_user_lexical_index_snapshot', slow_build)
+
+    start = time.monotonic()
+    result = storage_utils.get_user_listing_index('u1', allow_refresh=True, allow_sync_build=False)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, f'get_user_listing_index blocked for {elapsed:.2f}s on a cold account'
+    assert result is None
+    assert entered.wait(timeout=5), 'background lexical rebuild never started'
+
+    release.set()
+    lock = storage_utils._LEXICAL_INDEX_REBUILD_LOCKS.lock_for('u1')
+    for _ in range(50):
+        if lock.acquire(blocking=False):
+            lock.release()
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail('background lexical index rebuild never completed')
 
 
 def test_delete_user_lexical_index_data_also_clears_listing_blob(ctx):

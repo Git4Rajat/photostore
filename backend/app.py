@@ -1379,6 +1379,7 @@ def _init_storage_clients():
         metadata_table_client=metadata_table_client,
         face_table_client=face_table_client,
         person_table_client=person_table_client,
+        albums_table_client=albums_table_client,
         blob_service_client=blob_service_client,
         blob_image_container=BLOB_IMAGE_CONTAINER,
         blob_thumbnail_container=BLOB_THUMBNAIL_CONTAINER,
@@ -3346,7 +3347,7 @@ def _cached_metadata_list_rows_for_user(user_id: str, purpose: str, *, allow_syn
     search_photos's own fallback.
     """
     try:
-        listing_index = get_user_listing_index(user_id, allow_refresh=True)
+        listing_index = get_user_listing_index(user_id, allow_refresh=True, allow_sync_build=allow_sync_build)
     except Exception:
         listing_index = None
         app.logger.exception('Listing index lookup failed purpose=%s user=%s, falling back to full scan', purpose, user_id)

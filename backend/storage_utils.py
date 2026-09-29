@@ -333,6 +333,7 @@ def configure_storage(
     metadata_table_client,
     face_table_client=None,
     person_table_client=None,
+    albums_table_client=None,
     blob_service_client=None,
     blob_image_container: Optional[str] = None,
     blob_thumbnail_container: Optional[str] = None,
@@ -350,6 +351,7 @@ def configure_storage(
     _CTX['metadata_table_client'] = metadata_table_client
     _CTX['face_table_client'] = face_table_client
     _CTX['person_table_client'] = person_table_client
+    _CTX['albums_table_client'] = albums_table_client
     _CTX['blob_service_client'] = blob_service_client
     _CTX['blob_image_container'] = (blob_image_container or '').strip()
     _CTX['blob_thumbnail_container'] = (blob_thumbnail_container or '').strip()
@@ -2006,12 +2008,24 @@ def _write_user_listing_index(user_id: str, lexical_snapshot: LexicalIndexSnapsh
         }
 
 
-def get_user_listing_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
+def get_user_listing_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
     """Narrow gallery/timeline-listing projection of the lexical index (see
     _write_user_listing_index). Never triggers its own rebuild -- it's purely
     a byproduct of refresh_user_lexical_index -- so a stale/missing listing
     blob just falls back to the full lexical index (which will itself
-    (re)build the listing blob as a side effect for next time)."""
+    (re)build the listing blob as a side effect for next time).
+
+    allow_sync_build=False threads straight through to that fallback's own
+    get_user_lexical_index call: without this, a cold listing blob fell back
+    to get_user_lexical_index's *default* (blocking) allow_sync_build=True,
+    silently defeating _cached_metadata_list_rows_for_user's own
+    allow_sync_build=False for /photos/timeline -- the calling thread still
+    blocked ~47-80s (or, worse, on the lexical rebuild's lock if another
+    caller like /explore had already kicked one in the background, since a
+    blocking lock_for(key) acquire waits for that whole rebuild to finish
+    too). See the 2026-09-29 forenkla-qa HAR investigation, round 2."""
     key = str(user_id or '').strip()
     if not key:
         return None
@@ -2039,7 +2053,7 @@ def get_user_listing_index(user_id: str, *, allow_refresh: bool = True) -> Optio
 
     if not allow_refresh:
         return None
-    lexical = get_user_lexical_index(key, allow_refresh=True)
+    lexical = get_user_lexical_index(key, allow_refresh=True, allow_sync_build=allow_sync_build)
     if lexical is None:
         return None
     # refresh_user_lexical_index already wrote/cached the listing blob as a
@@ -3281,7 +3295,7 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
                     content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
                 )
             except Exception:
-                pass
+                _LOGGER.exception('Failed to upload albums index data blob for user %s', key)
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -3299,7 +3313,7 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
                     content_settings=BlobContentSettings(content_type='application/json'),
                 )
             except Exception:
-                pass
+                _LOGGER.exception('Failed to upload albums index manifest blob for user %s', key)
     with _ALBUMS_INDEX_CACHE_LOCK:
         _ALBUMS_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
@@ -3744,7 +3758,7 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
                     content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
                 )
             except Exception:
-                pass
+                _LOGGER.exception('Failed to upload people index data blob for user %s', key)
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -3762,7 +3776,7 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
                     content_settings=BlobContentSettings(content_type='application/json'),
                 )
             except Exception:
-                pass
+                _LOGGER.exception('Failed to upload people index manifest blob for user %s', key)
     with _PEOPLE_INDEX_CACHE_LOCK:
         _PEOPLE_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
