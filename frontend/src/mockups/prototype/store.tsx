@@ -31,6 +31,24 @@ import type {
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const PAGE_SIZE = 100;
 
+// The sort/albums/people local indexes all report "unavailable" immediately
+// on a cold account instead of blocking (their backend routes kick a
+// background rebuild and return right away) -- see the 2026-09-29 forenkla-qa
+// HAR investigation. Each caller below used to treat that first null as
+// final and fall straight through to its O(library size) legacy endpoint,
+// which is exactly the multi-second-to-minutes cost the index exists to
+// avoid. A short bounded retry gives the just-kicked-off rebuild a chance to
+// land before paying that cost -- and still falls back for a genuinely
+// unavailable index (network error, feature not supported) after 3 tries.
+const withIndexRetry = async <T,>(fetchIndex: () => Promise<T | null>): Promise<T | null> => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        const result = await fetchIndex();
+        if (result) return result;
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+    return null;
+};
+
 // Stable placeholder swatch derived from the filename, so a photo shows the same
 // tint every render while its real thumbnail loads.
 const swatchFor = (filename: string): SwatchKey => {
@@ -412,7 +430,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setPhotosLoading(true);
         const offset = reset ? 0 : photoOffsetRef.current;
         try {
-            const sortIndex = await getLocalSortIndex();
+            const sortIndex = await withIndexRetry(getLocalSortIndex);
             if (!sortIndex) {
                 throw new Error('sort index unavailable');
             }
@@ -619,7 +637,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const fetchAlbums = useCallback(async () => {
         setAlbumsLoading(true);
         try {
-            const rows = await getLocalAlbumsIndex();
+            const rows = await withIndexRetry(getLocalAlbumsIndex);
             if (!rows) {
                 throw new Error('albums index unavailable');
             }
@@ -1145,7 +1163,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const fetchPeople = useCallback(async () => {
         setPeopleLoading(true);
         try {
-            const rows = await getLocalPeopleIndex();
+            const rows = await withIndexRetry(getLocalPeopleIndex);
             if (!rows) {
                 throw new Error('people index unavailable');
             }

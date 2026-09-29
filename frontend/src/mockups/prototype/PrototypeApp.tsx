@@ -310,12 +310,32 @@ const PrototypeApp: React.FC = () => {
     // download on sessions that never search). That blob can be very large
     // (hundreds of MB compressed on a big library) and takes real time to
     // fetch + gunzip, so the trade favors eating that cost during the app
-    // shell's load instead of freezing the first Ask query on it. Errors are
-    // swallowed the same way prime-indexes' are -- getLocalSearchIndex caches
-    // its own result/failure and Ask's own call just re-awaits it.
+    // shell's load instead of freezing the first Ask query on it.
+    //
+    // On a cold account the server-side index itself hasn't finished
+    // building yet, so /api/photos/search-index responds with
+    // available:false (by design -- it never blocks the request on the
+    // rebuild). A single fire-and-forget attempt made right at sign-in used
+    // to just accept that "not available" and give up for the rest of the
+    // session, so the actual ~30s+ blob download ended up happening
+    // synchronously the moment the user opened Ask and searched, right when
+    // they were staring at the box waiting on results. Retry on a timer
+    // instead so the download still happens in the background, once the
+    // server-side rebuild it kicked off finishes, well before Ask is opened.
     useEffect(() => {
         if (!signedIn) return;
-        void getLocalSearchIndex().catch(() => {});
+        let cancelled = false;
+        const warm = async () => {
+            for (let attempt = 0; attempt < 20 && !cancelled; attempt += 1) {
+                const result = await getLocalSearchIndex().catch(() => null);
+                if (result || cancelled) return;
+                await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+        };
+        void warm();
+        return () => {
+            cancelled = true;
+        };
     }, [signedIn]);
 
     // Public share links render the real album page regardless of auth state.
