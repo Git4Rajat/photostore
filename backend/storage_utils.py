@@ -34,6 +34,7 @@ from image_utils import (
     compute_file_hash,
     create_thumbnail_data,
     create_video_thumbnail_data,
+    crop_face_thumbnail,
     extract_raw_preview_bytes,
     is_video_file,
     RAW_EXTENSIONS_CINEMA,
@@ -996,6 +997,55 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
                 pass
 
     return stored_ids
+
+
+def _face_cover_blob_name(user_id: str, face_id: str) -> str:
+    return f'{hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16]}/{secure_filename(face_id)}.jpg'
+
+
+def _warm_face_crops_for_photo(
+    user_id: str, filename: str, face_ids: List[str], get_image_bytes: Callable[[], bytes], rotation: int,
+) -> None:
+    """Best-effort background pre-generation of each newly-detected face's
+    cover-crop cache entry, run off-thread right after _store_client_face_entities
+    (see that call site above) instead of waiting for a human to open the
+    People page. Without this, routes/people.py's face_crop() generates each
+    face's crop on first view -- download the full original, decode, crop,
+    re-encode, upload -- synchronously in that request; fine for one face,
+    but a library with thousands of faces nobody has ever viewed turns
+    opening People into a multi-minute wait (see the 2026-09-29 forenkla-qa
+    HAR investigation). get_image_bytes is the SAME memoized closure
+    _apply_client_processing_results already threads through for its own
+    fallback paths, so a multi-face photo downloads the original at most
+    once here, not once per face. Never raises and never blocks the caller
+    (run via threading.Thread) -- any face this misses just falls back to
+    face_crop()'s on-demand path exactly as if this had never run.
+    """
+    face_table_client = _CTX.get('face_table_client')
+    if not face_ids or face_table_client is None:
+        return
+    image_bytes: Optional[bytes] = None
+    for face_id in face_ids:
+        cover_blob = _face_cover_blob_name(user_id, face_id)
+        try:
+            if get_media_properties('cover', cover_blob):
+                continue  # already generated -- e.g. a re-detection of an existing face
+        except Exception:
+            pass
+        try:
+            entity = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+            bbox = json.loads(entity.get('bbox') or '{}')
+            img_w = int(entity.get('imageWidth', 0) or 0)
+            img_h = int(entity.get('imageHeight', 0) or 0)
+            if img_w <= 0 or img_h <= 0:
+                continue
+            if image_bytes is None:
+                image_bytes = get_image_bytes()
+            cover_bytes = crop_face_thumbnail(image_bytes, filename, bbox, img_w, img_h, rotation)
+            if cover_bytes:
+                upload_media_file('cover', cover_blob, cover_bytes, 'image/jpeg')
+        except Exception:
+            continue
 
 
 def _get_blob_client(container_name: str, filename: str):
@@ -5304,6 +5354,13 @@ def _apply_client_processing_results(
                 user_id, filename, faces_with_embeddings,
                 force_reconcile=face_was_forced and detection_genuinely_ran,
             )
+            if stored_face_ids:
+                rotation = int(metadata.get('rotation', 0) or 0) % 360
+                threading.Thread(
+                    target=_warm_face_crops_for_photo,
+                    args=(user_id, filename, list(stored_face_ids), get_image_bytes, rotation),
+                    name='face-crop-warm', daemon=True,
+                ).start()
             if faces_with_embeddings:
                 faces_for_metadata = [{k: v for k, v in f.items() if k != 'embedding'} for f in faces_with_embeddings]
                 metadata['faces'] = json.dumps(faces_for_metadata, ensure_ascii=False, separators=(',', ':'))

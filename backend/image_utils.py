@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Optional
+from typing import Dict, Optional
 
 from PIL import Image, ImageDraw, ImageOps
 
@@ -770,3 +770,53 @@ def convert_image_to_jpeg(image_bytes: bytes, filename: str = '') -> bytes:
         if preview:
             return _encode_preview_for_browser(preview) or preview
         return image_bytes
+
+
+def crop_face_thumbnail(
+    image_bytes: bytes, filename: str, bbox: Dict, img_w: int, img_h: int, rotation: int = 0,
+) -> Optional[bytes]:
+    """Crop one detected face out of its full source photo into a small
+    (<=512x512) JPEG cover thumbnail -- the same pixel math routes/people.py's
+    face_crop() route uses for its on-demand generation, factored out here
+    (no app.py/storage_utils.py dependency) so storage_utils.py can also call
+    it from a background thread right after face detection, instead of every
+    face waiting for its first People-page view to pay this cost (see the
+    2026-09-29 forenkla-qa HAR investigation). Returns None on any failure
+    (bad bbox, undecodable bytes, etc.) -- callers fall back to their own
+    on-demand path exactly as if this had never run.
+    """
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
+    if ext in BROWSER_UNVIEWABLE_EXTENSIONS:
+        try:
+            converted = convert_image_to_jpeg(image_bytes, filename)
+            if converted:
+                image_bytes = converted
+        except Exception:
+            pass
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img = ImageOps.exif_transpose(img)
+            if rotation:
+                img = img.rotate(-rotation, expand=True)
+            tw, th = img.size
+            if img_w <= 0 or img_h <= 0:
+                return None
+            sx, sy = tw / img_w, th / img_h
+            x = int(bbox.get('left', bbox.get('x', 0)) or 0)
+            y = int(bbox.get('top', bbox.get('y', 0)) or 0)
+            w = int(bbox.get('width', 0) or 0)
+            h = int(bbox.get('height', 0) or 0)
+            if w <= 0 or h <= 0:
+                return None
+            pad = max(1, int(min(w, h) * 0.35))
+            left = max(0, int(x * sx) - pad)
+            top = max(0, int(y * sy) - pad)
+            right = min(tw, int((x + w) * sx) + pad)
+            bottom = min(th, int((y + h) * sy) + pad)
+            cropped = img.crop((left, top, right, bottom))
+            cropped.thumbnail((512, 512), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
+            buf = io.BytesIO()
+            cropped.convert('RGB').save(buf, format='JPEG', quality=88, optimize=True)
+            return buf.getvalue()
+    except Exception:
+        return None

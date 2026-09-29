@@ -53,6 +53,7 @@ from image_utils import (
     RAW_EXTENSIONS_RAWPY,
     allowed_file,
     convert_image_to_jpeg,
+    crop_face_thumbnail,
     create_placeholder_thumbnail,
     extract_raw_native_preview_bytes,
     is_video_file,

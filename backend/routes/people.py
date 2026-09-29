@@ -496,56 +496,32 @@ def face_crop(face_id: str):
         except Exception:
             return app.jsonify({'error': 'Image not available'}), 404
 
-    # RAW/cinema-RAW/HEIC originals aren't directly decodable the way a plain
-    # JPEG is (same check the preview pipeline uses, _filename_requires_backend_preview)
-    # -- extract a real preview first so Image.open below doesn't blow up with
-    # PIL.UnidentifiedImageError on bytes it can't parse.
-    if app._filename_requires_backend_preview(filename):
-        try:
-            converted = app.convert_image_to_jpeg(image_bytes, filename)
-            if converted:
-                image_bytes = converted
-        except Exception:
-            pass
-
     try:
-        with app.Image.open(app.io.BytesIO(image_bytes)) as img:
-            img = app.ImageOps.exif_transpose(img)
-            try:
-                metadata = app._get_metadata_entity(user_id, filename) or {}
-                rotation = app._normalize_rotation(metadata.get('rotation', 0))
-            except Exception:
-                rotation = 0
-            if rotation:
-                img = img.rotate(-rotation, expand=True)
-            tw, th = img.size
-            sx = tw / img_w
-            sy = th / img_h
-            pad = max(1, int(min(w, h) * 0.35))
-            left = max(0, int(x * sx) - pad)
-            top = max(0, int(y * sy) - pad)
-            right = min(tw, int((x + w) * sx) + pad)
-            bottom = min(th, int((y + h) * sy) + pad)
-            cropped = img.crop((left, top, right, bottom))
-            cropped.thumbnail((512, 512), app.Image.Resampling.LANCZOS if hasattr(app.Image, 'Resampling') else app.Image.LANCZOS)
-            buf = app.io.BytesIO()
-            cropped.convert('RGB').save(buf, format='JPEG', quality=88, optimize=True)
-            buf.seek(0)
-            cover_bytes = buf.read()
-            try:
-                app.upload_media_file('cover', cover_blob, cover_bytes, 'image/jpeg')
-                resp = app.jsonify({'url': app.make_media_url(cover_blob, 'cover')})
-                resp.headers['Cache-Control'] = 'public, max-age=3600, immutable'
-                return resp
-            except Exception:
-                data_url = 'data:image/jpeg;base64,' + app.base64.b64encode(cover_bytes).decode('ascii')
+        metadata = app._get_metadata_entity(user_id, filename) or {}
+        rotation = app._normalize_rotation(metadata.get('rotation', 0))
     except Exception:
+        rotation = 0
+
+    # Shared with storage_utils.py's background pre-generation (kicked right
+    # after face detection -- see _warm_face_crops_for_photo) so both paths
+    # crop pixels identically; this on-demand path only still runs for faces
+    # the background warm-up hasn't gotten to yet (still queued, or predates
+    # this fix).
+    cover_bytes = app.crop_face_thumbnail(image_bytes, filename, bbox, img_w, img_h, rotation)
+    if cover_bytes is None:
         try:
             return app.jsonify({'url': _crop_from_thumbnail()})
         except Exception:
             return app.jsonify({'error': 'Image not available'}), 404
 
-    return app.jsonify({'url': data_url})
+    try:
+        app.upload_media_file('cover', cover_blob, cover_bytes, 'image/jpeg')
+        resp = app.jsonify({'url': app.make_media_url(cover_blob, 'cover')})
+        resp.headers['Cache-Control'] = 'public, max-age=3600, immutable'
+        return resp
+    except Exception:
+        data_url = 'data:image/jpeg;base64,' + app.base64.b64encode(cover_bytes).decode('ascii')
+        return app.jsonify({'url': data_url})
 
 @people_bp.route('/api/persons/<person_id>/confirm-face', methods=['POST'])
 def confirm_face(person_id: str):
