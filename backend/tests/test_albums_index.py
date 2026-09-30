@@ -389,6 +389,50 @@ def test_hard_delete_album_now_marks_albums_index_dirty(monkeypatch, albums_ctx)
     assert calls == ['lib-F']
 
 
+def test_touch_user_albums_index_state_debounces_repeated_calls(albums_ctx):
+    """A rapid run of album mutations (e.g. a bulk add-to-album) shouldn't
+    rewrite the manifest blob once per mutation -- mirrors the same gate
+    already covering vector/lexical/tag_embedding/sort. See
+    _manifest_already_marked_dirty."""
+    first = storage_utils.touch_user_albums_index_state('lib-Z')
+    second = storage_utils.touch_user_albums_index_state('lib-Z')
+
+    assert first != ''
+    assert second == ''
+    assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS[('lib-Z', 'albums')] is True
+
+
+def test_albums_manifest_dirty_flag_clears_after_a_real_rebuild(albums_ctx):
+    storage_utils.touch_user_albums_index_state('lib-Z')
+    assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS.get(('lib-Z', 'albums')) is True
+
+    storage_utils.refresh_user_albums_index('lib-Z', source_version='v1')
+
+    assert ('lib-Z', 'albums') not in storage_utils._INDEX_MANIFEST_DIRTY_FLAGS
+    assert storage_utils.touch_user_albums_index_state('lib-Z') != ''
+
+
+def test_albums_rebuild_cooldown_skips_a_second_trigger_right_after_the_first(albums_ctx, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        storage_utils, 'refresh_user_albums_index',
+        lambda key, source_version=None: calls.append(key) or None,
+    )
+    manifest = {'sourceVersion': 'v1'}
+
+    storage_utils._rebuild_albums_index_in_background('lib-Y', manifest)
+    for thread in list(threading.enumerate()):
+        if thread.name == 'albums-index-rebuild':
+            thread.join(timeout=2)
+    assert calls == ['lib-Y']
+
+    storage_utils._rebuild_albums_index_in_background('lib-Y', manifest)
+    for thread in list(threading.enumerate()):
+        if thread.name == 'albums-index-rebuild':
+            thread.join(timeout=2)
+    assert calls == ['lib-Y']
+
+
 def test_touch_user_sort_index_state_also_touches_albums_index(monkeypatch):
     """Rating/likes changes (and anything else that dirties the sort index)
     must also dirty the albums index, since cover selection is derived from

@@ -354,6 +354,51 @@ def test_invalidate_people_scan_cache_noop_for_empty_user_id(monkeypatch):
     assert calls == []
 
 
+def test_touch_user_people_index_state_debounces_repeated_calls(people_ctx):
+    """_invalidate_people_scan_cache fires on every write to
+    person_table_client/face_table_client -- during upload face detection
+    that's once per detected FACE, not once per photo. Repeated calls in a
+    burst must not rewrite the manifest blob every time. See
+    _manifest_already_marked_dirty."""
+    first = storage_utils.touch_user_people_index_state('lib-Z')
+    second = storage_utils.touch_user_people_index_state('lib-Z')
+
+    assert first != ''
+    assert second == ''
+    assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS[('lib-Z', 'people')] is True
+
+
+def test_people_manifest_dirty_flag_clears_after_a_real_rebuild(people_ctx):
+    storage_utils.touch_user_people_index_state('lib-Z')
+    assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS.get(('lib-Z', 'people')) is True
+
+    storage_utils.refresh_user_people_index('lib-Z', source_version='v1')
+
+    assert ('lib-Z', 'people') not in storage_utils._INDEX_MANIFEST_DIRTY_FLAGS
+    assert storage_utils.touch_user_people_index_state('lib-Z') != ''
+
+
+def test_people_rebuild_cooldown_skips_a_second_trigger_right_after_the_first(people_ctx, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        storage_utils, 'refresh_user_people_index',
+        lambda key, source_version=None: calls.append(key) or None,
+    )
+    manifest = {'sourceVersion': 'v1'}
+
+    storage_utils._rebuild_people_index_in_background('lib-Y', manifest)
+    for thread in list(threading.enumerate()):
+        if thread.name == 'people-index-rebuild':
+            thread.join(timeout=2)
+    assert calls == ['lib-Y']
+
+    storage_utils._rebuild_people_index_in_background('lib-Y', manifest)
+    for thread in list(threading.enumerate()):
+        if thread.name == 'people-index-rebuild':
+            thread.join(timeout=2)
+    assert calls == ['lib-Y']
+
+
 # --- cleanup -------------------------------------------------------------
 
 def test_delete_user_people_index_data_removes_blobs_and_cache(people_ctx):
