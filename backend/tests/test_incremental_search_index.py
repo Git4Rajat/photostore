@@ -68,7 +68,7 @@ class _CountingTable(FakeTable):
 
 
 def _seed_row(table, user_id: str, filename: str, **overrides) -> None:
-    table.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, **overrides})
+    table.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, 'processing_complete': True, **overrides})
 
 
 @pytest.fixture
@@ -132,7 +132,7 @@ def test_lexical_incremental_refresh_only_point_reads_the_dirty_filename(ctx):
     assert metadata.scan_count == 1  # the initial full build
 
     # Edit just one photo and mark only it dirty.
-    metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'b.jpg', 'tags': '["dog", "park"]'})
+    metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'b.jpg', 'tags': '["dog", "park"]', 'processing_complete': True})
     storage_utils.touch_user_search_indexes_state('u1', filenames='b.jpg')
 
     second = storage_utils.refresh_user_lexical_index('u1', source_version='v2')
@@ -153,6 +153,23 @@ def test_lexical_incremental_refresh_drops_deleted_photos(ctx):
     storage_utils.refresh_user_lexical_index('u1', source_version='v1')
 
     metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'b.jpg', 'tags': '[]', 'processing_state': 'deleted'})
+    storage_utils.touch_user_search_indexes_state('u1', filenames='b.jpg')
+
+    second = storage_utils.refresh_user_lexical_index('u1', source_version='v2')
+
+    assert {row['RowKey'] for row in second.rows} == {'a.jpg'}
+
+
+def test_lexical_incremental_refresh_drops_still_processing_photos(ctx):
+    """A dirty photo that hasn't finished processing is dropped from the
+    index like a delete, not merged in half-empty -- it comes back once
+    processing_complete flips true on a later dirty pass."""
+    metadata, _dirty, _blobs = ctx
+    _seed_row(metadata, 'u1', 'a.jpg', tags='[]')
+    _seed_row(metadata, 'u1', 'b.jpg', tags='[]')
+    storage_utils.refresh_user_lexical_index('u1', source_version='v1')
+
+    metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'b.jpg', 'tags': '[]', 'processing_complete': False})
     storage_utils.touch_user_search_indexes_state('u1', filenames='b.jpg')
 
     second = storage_utils.refresh_user_lexical_index('u1', source_version='v2')

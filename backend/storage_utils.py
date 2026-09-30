@@ -126,6 +126,28 @@ def _safe_get_entity(table_client, partition_key: str, row_key: str, default=Non
         return default
 CLIENT_PROCESSING_TERMINAL_STATUSES = {'done', 'skipped', 'failed', 'timeout', 'unsupported'}
 BROWSER_PROCESSING_STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face')
+# Mirrors app.py's BROWSER_PROCESSING_TERMINAL_STATUSES (duplicated, not
+# imported -- app.py imports from this module, not the reverse). Deliberately
+# includes 'no_data': that's the normal terminal outcome for e.g. a
+# GPS-less photo's map_detection step or a text-less photo's ocr step, not a
+# failure -- excluding it here would mean most real photos' processing_complete
+# below never flips true.
+_PROCESSING_STEP_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout'}
+
+
+def _photo_processing_complete(entity: Dict) -> bool:
+    """True once every BROWSER_PROCESSING_STEPS status field on this
+    (already-read) row has reached a terminal state. Callers stamp the
+    result into a persisted `processing_complete` column right before their
+    own write, so a downstream full-partition scan (e.g. the lexical index
+    rebuild) can filter server-side on one boolean column instead of
+    re-deriving this from 7 separate fields for every row on every rebuild --
+    see _build_user_lexical_index_snapshot."""
+    for step in BROWSER_PROCESSING_STEPS:
+        status = str(entity.get(f'{step}_status') or '').strip().lower()
+        if status not in _PROCESSING_STEP_TERMINAL_STATUSES:
+            return False
+    return True
 HEIF_EXTENSIONS = {'heic', 'heif'}
 CLIENT_PROCESSING_ALLOWED_REASONS = {
     'done',
@@ -691,6 +713,7 @@ def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
             raise RuntimeError('Photo has been deleted.')
         entity.update(updates or {})
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        entity['processing_complete'] = _photo_processing_complete(entity)
         try:
             # Conditional on the etag just read -- a concurrent writer (another
             # processing step, a user edit, a lease race) between our get_entity
@@ -2313,7 +2336,16 @@ def _build_user_lexical_index_snapshot(user_id: str, source_version: str) -> Opt
     if metadata_table_client is None:
         return None
     try:
-        rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        # processing_complete eq true is a server-side filter (see
+        # _photo_processing_complete/its write-time callers) -- a photo still
+        # mid-upload/processing has no OCR text/tags/faces yet, so indexing it
+        # here would just add an empty entry that gets marked dirty again (and
+        # re-fetched) the moment each remaining step lands. Skipping it here
+        # also means fewer entities come back over the wire during an active
+        # upload burst, instead of paying to fetch-then-discard them below.
+        rows = list(metadata_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and processing_complete eq true"
+        ))
     except Exception:
         # Unlike _build_user_vector_index_snapshot, a transient query failure
         # must not be treated as "empty library" -- refresh_user_lexical_index
@@ -2360,6 +2392,13 @@ def _merge_user_lexical_index_snapshot(
         except Exception:
             return filename, None
         if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+            return filename, None
+        # Same gate as _build_user_lexical_index_snapshot's query filter -- a
+        # point-read can't use the OData filter, so check the flag directly.
+        # A dirty-but-still-processing photo is dropped from the index (like a
+        # delete) rather than added half-empty; it gets marked dirty again the
+        # moment the remaining steps land and processing_complete flips true.
+        if not row.get('processing_complete'):
             return filename, None
         return filename, {k: v for k, v in dict(row).items() if k not in _LEXICAL_INDEX_EXCLUDED_FIELDS}
 
@@ -5554,6 +5593,7 @@ def _apply_client_processing_results(
 
     if status_updates:
         metadata.update(status_updates)
+    metadata['processing_complete'] = _photo_processing_complete(metadata)
     _extract_and_store_embeddings(user_id, filename, metadata)
     # Deliberately NOT a conditional/etag-checked write: mark_step_done/
     # mark_step_no_data calls above (see their call sites throughout this
@@ -5948,6 +5988,7 @@ def update_processing_status(
 
         entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        entity['processing_complete'] = _photo_processing_complete(entity)
         try:
             # Conditional on the etag just read -- see _update_metadata_fields's
             # identical comment. A concurrent writer (another ipwork step, a

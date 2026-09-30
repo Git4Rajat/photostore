@@ -50,7 +50,7 @@ class _FakeBlobServiceClient:
 
 
 def _seed_row(table, user_id: str, filename: str, **overrides) -> None:
-    table.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, **overrides})
+    table.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, 'processing_complete': True, **overrides})
 
 
 @pytest.fixture
@@ -135,7 +135,7 @@ def test_listing_index_reflects_incremental_merge_updates(ctx):
     _seed_row(metadata, 'u1', 'a.jpg', tags='["cat"]', rating=1)
     storage_utils.refresh_user_lexical_index('u1', source_version='v1')
 
-    metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'a.jpg', 'tags': '["cat"]', 'rating': 5})
+    metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'a.jpg', 'tags': '["cat"]', 'rating': 5, 'processing_complete': True})
     storage_utils.touch_user_search_indexes_state('u1', filenames='a.jpg')
     storage_utils.refresh_user_lexical_index('u1', source_version='v2')
 

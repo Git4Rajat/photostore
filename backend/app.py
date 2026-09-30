@@ -97,6 +97,7 @@ from storage_utils import (
     delete_user_vector_index_data,
     touch_user_search_indexes_state,
     metadata_updates_affect_search_indexes,
+    _photo_processing_complete,
     metadata_updates_affect_sort_index,
     touch_user_sort_index_dirty,
     get_user_sort_index,
@@ -2746,6 +2747,7 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             return None
         entity.update(updates or {})
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        entity['processing_complete'] = _photo_processing_complete(entity)
         try:
             # Conditional on the etag just read -- see _update_metadata_fields's
             # identical comment in storage_utils.py.

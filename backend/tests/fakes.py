@@ -44,14 +44,22 @@ class FakeTable:
 
     def query_entities(self, filter_str, select=None):
         # Compound clause checked first -- the plain-PartitionKey pattern's
-        # greedy '(.*)' would otherwise swallow " and field eq '...'" as part
-        # of the partition key value itself.
+        # greedy '(.*)' would otherwise swallow " and field eq ..." as part
+        # of the partition key value itself. Second alternative covers
+        # unquoted OData boolean literals (e.g. "processing_complete eq
+        # true"), which don't fit the quoted-string '(.*)' form.
         m = re.match(r"PartitionKey eq '(.*)' and (\w+) eq '(.*)'$", filter_str.strip())
         if m:
             pk, field, value = m.group(1), m.group(2), m.group(3)
             rows = [
                 dict(v) for (p, _), v in self.rows.items()
                 if p == pk and str(v.get(field, '')) == value
+            ]
+        elif (m := re.match(r"PartitionKey eq '(.*)' and (\w+) eq (true|false)$", filter_str.strip())):
+            pk, field, value = m.group(1), m.group(2), m.group(3) == 'true'
+            rows = [
+                dict(v) for (p, _), v in self.rows.items()
+                if p == pk and bool(v.get(field, False)) == value
             ]
         else:
             m = re.match(r"PartitionKey eq '(.*)'$", filter_str.strip())

@@ -59,7 +59,7 @@ class _FakeBlobServiceClient:
 
 
 def _seed_row(table: FakeTable, user_id: str, filename: str, **overrides) -> None:
-    row = {'PartitionKey': user_id, 'RowKey': filename, **overrides}
+    row = {'PartitionKey': user_id, 'RowKey': filename, 'processing_complete': True, **overrides}
     table.upsert_entity(row)
 
 
@@ -93,6 +93,21 @@ def test_build_snapshot_excludes_embedding_fields_keeps_others(lexical_ctx):
     assert row['tags'] == '["dog"]'
     assert row['caption'] == 'a dog'
     assert row['photoEmbeddingVersion'] == 'v1'  # small version string, not the array itself -- kept
+
+
+def test_build_snapshot_excludes_photos_still_processing(lexical_ctx):
+    """A photo mid-upload/processing has no OCR text/tags/faces yet -- indexing
+    it would just add an empty entry that gets marked dirty again (and
+    re-fetched) the moment each remaining step lands. See
+    _photo_processing_complete/its write-time callers."""
+    table, _ = lexical_ctx
+    _seed_row(table, 'lib-A', 'done.jpg', tags='["dog"]')
+    _seed_row(table, 'lib-A', 'still-processing.jpg', tags='[]', processing_complete=False)
+    table.rows[('lib-A', 'never-stamped.jpg')] = {'PartitionKey': 'lib-A', 'RowKey': 'never-stamped.jpg', 'tags': '[]'}
+
+    snapshot = storage_utils._build_user_lexical_index_snapshot('lib-A', 'v1')
+
+    assert [row['RowKey'] for row in snapshot.rows] == ['done.jpg']
 
 
 def test_build_snapshot_skips_rows_without_a_filename(lexical_ctx):
