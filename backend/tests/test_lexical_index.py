@@ -394,6 +394,9 @@ def _fallback_row(filename: str) -> dict:
 
 @pytest.fixture
 def search_route_ctx(monkeypatch):
+    # Server-side search is frozen by default (SERVER_SEARCH_ENABLED); these
+    # tests exercise the real scoring path, which still lives behind the flag.
+    monkeypatch.setattr(app, 'SERVER_SEARCH_ENABLED', True)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'person_table_client', None)  # _load_people_name_index short-circuits
     monkeypatch.setattr(app.vision_utils, 'encode_text_embedding', lambda text: [])

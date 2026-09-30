@@ -29,6 +29,9 @@ def _row(filename: str, **overrides) -> dict:
 
 
 def test_color_object_query_surfaces_a_photo_found_only_via_semantic_score(monkeypatch):
+    # Server-side search is frozen by default (SERVER_SEARCH_ENABLED) -- this
+    # test exercises the real scoring path, which still lives behind the flag.
+    monkeypatch.setattr(app, 'SERVER_SEARCH_ENABLED', True)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'person_table_client', None)
     monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)

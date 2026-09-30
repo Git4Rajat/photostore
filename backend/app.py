@@ -120,6 +120,9 @@ from storage_utils import (
     get_index_manifest_summary,
     get_user_index_build_state,
     index_prime_in_progress,
+    store_explore_summary,
+    load_explore_summary,
+    delete_user_explore_summary_data,
     get_user_tag_embedding_index,
     delete_user_tag_embedding_index_data,
     nearest_tags_for_word,
@@ -447,6 +450,16 @@ CONFIG_TABLE = os.getenv('CONFIG_TABLE', 'photostoreconfig')
 # replicas — set it explicitly (a Container App secret) in production.
 SESSION_SECRET = os.getenv('SESSION_SECRET', '') or secrets.token_hex(32)
 SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(30 * 24 * 3600)))
+# Server-side /photos/search is FROZEN by default (2026-09-30). It loads the
+# full per-user lexical index into this process to score candidates and runs a
+# CLIP text-embedding encode inline -- genuinely heavy work that repeatedly
+# OOM-ed the 1Gi backend. Client-side search (localSearchIndex.ts, which
+# downloads the same lexical blob and runs the identical lexical + CLIP scoring
+# in the browser) is the real search path; the server route was only ever a
+# fallback for before the client index finished downloading. Frozen to a cheap
+# empty result instead of doing that work on the backend. Set
+# SERVER_SEARCH_ENABLED=1 to re-enable (only on a backend tier sized for it).
+SERVER_SEARCH_ENABLED = os.getenv('SERVER_SEARCH_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 # Base URL of the web app, used to build password-reset links in emails.
 PUBLIC_APP_BASE_URL = os.getenv('PUBLIC_APP_BASE_URL', '').strip() or SPA_BASE_URL
 # Base URL of the 'extras' role (public_bp lives there, not on 'backend' -- see
@@ -7250,6 +7263,32 @@ def _explore_places_and_things(user_id: str) -> Dict[str, List[Dict]]:
         return results
 
     return {'places': _finalize(place_groups, True), 'things': _finalize(thing_groups, False)}
+
+
+def refresh_user_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
+    """Recompute the Explore Places/Things summary and persist it as a small
+    blob (store_explore_summary). Runs on the `tools` role right after it
+    (re)builds the lexical index (see routes/tools.py) -- tools is 2vCPU/4Gi
+    and already has the freshly-built lexical snapshot cached, so the
+    _explore_places_and_things groupBy here reuses that in-memory snapshot
+    rather than forcing a reload. Deliberately NOT called from the `backend`
+    role's request path: /explore there now only reads the stored summary
+    (load_explore_summary), never this, so it never pulls the lexical blob
+    into the 1Gi backend. Stamped with the lexical index's sourceVersion so a
+    reader can tell which build produced it."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    summary = _explore_places_and_things(key)
+    lexical_summary = get_index_manifest_summary(key, 'lexical')
+    payload = {
+        'sourceVersion': (lexical_summary or {}).get('source_version') or datetime.now(timezone.utc).isoformat(),
+        'updatedAt': datetime.now(timezone.utc).isoformat(),
+        'places': summary.get('places', []),
+        'things': summary.get('things', []),
+    }
+    store_explore_summary(key, payload)
+    return payload
 
 
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))

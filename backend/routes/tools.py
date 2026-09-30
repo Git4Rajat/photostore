@@ -119,6 +119,17 @@ def _index_build_progress_callback(user_id: str):
             status,
             result={'indexes': indexes, 'ready': ready},
         )
+        # When the build finishes (building=False) and the lexical index is
+        # built, recompute the Explore summary here on tools (4Gi) from the
+        # freshly-built, still-cached lexical snapshot and store it as a small
+        # blob. The backend's /explore route then serves that blob without ever
+        # loading the lexical index into its 1Gi memory. Best-effort: a failure
+        # here never fails the index build itself.
+        if not building and indexes.get('lexical'):
+            try:
+                app.refresh_user_explore_summary(user_id)
+            except Exception:
+                app.app.logger.exception('Explore summary refresh failed for %s', user_id)
     return _cb
 
 

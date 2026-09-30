@@ -339,6 +339,8 @@ def test_tools_build_passes_progress_callback_that_writes_job_row(monkeypatch, r
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', _fake_prime)
     job_rows = []
     monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: job_rows.append((job_id, uid, jt, status, f)))
+    explore_refreshed = []
+    monkeypatch.setattr(app, 'refresh_user_explore_summary', lambda uid: explore_refreshed.append(uid))
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
         tools_build_indexes()
@@ -347,9 +349,13 @@ def test_tools_build_passes_progress_callback_that_writes_job_row(monkeypatch, r
     # mirror progress into an index_build jobs-table row.
     assert callable(captured.get('on_progress'))
     captured['on_progress']({'sort': True, 'lexical': False, 'albums': False, 'people': False}, True)
+    assert explore_refreshed == []  # not yet: build still running
     captured['on_progress']({'sort': True, 'lexical': True, 'albums': True, 'people': True}, False)
     assert len(job_rows) == 2
     assert job_rows[0][2] == app.INDEX_BUILD_JOB_TYPE
+    # On completion (building=False) with lexical built, the callback recomputes
+    # the Explore summary here on tools so backend never has to.
+    assert explore_refreshed == ['owner']
     assert job_rows[0][3] == 'running'
     assert job_rows[1][3] == 'done'  # building=False + all ready
 

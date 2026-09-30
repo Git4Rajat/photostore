@@ -179,6 +179,7 @@ def _row(filename: str, **overrides) -> dict:
 
 
 def test_search_photos_surfaces_photo_via_tag_embedding_expansion(monkeypatch):
+    monkeypatch.setattr(app, 'SERVER_SEARCH_ENABLED', True)  # real scoring path lives behind the freeze flag
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'person_table_client', None)
     monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)

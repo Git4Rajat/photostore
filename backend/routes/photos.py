@@ -610,6 +610,17 @@ def photos_timeline():
 @photos_bp.route('/api/photos/search', methods=['GET'])
 @photos_bp.route('/api/photos/search/', methods=['GET'])
 def search_photos():
+    # Server-side search is frozen by default -- it loads the full lexical
+    # index into backend memory + runs an inline CLIP encode, the heavy work
+    # that OOM-ed the 1Gi backend. The browser does the identical search
+    # client-side against the same index (localSearchIndex.ts); this route is
+    # only a fallback, so when frozen it returns an empty result immediately
+    # (no blob load) and the client's own search stands in. See
+    # SERVER_SEARCH_ENABLED in app.py. `serverSearchDisabled` lets the client
+    # distinguish "frozen" from a genuine zero-match if it ever wants to.
+    if not app.SERVER_SEARCH_ENABLED:
+        return app.jsonify({'photos': [], 'total': 0, 'serverSearchDisabled': True})
+
     query = (app.request.args.get('q') or '').strip()
     if not query:
         return app.jsonify({'photos': [], 'total': 0})

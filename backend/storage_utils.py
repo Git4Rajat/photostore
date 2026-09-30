@@ -2239,6 +2239,9 @@ def delete_user_lexical_index_data(user_id: str) -> None:
             blob_client.delete_blob()
         except Exception:
             pass
+    # The Explore summary is derived from the lexical index, so it's cleaned
+    # on the same purge (defined below; safe to call regardless of order).
+    delete_user_explore_summary_data(key)
     invalidate_user_lexical_index_cache(key)
     invalidate_user_listing_index_cache(key)
 
@@ -4343,6 +4346,86 @@ def get_user_index_build_state(user_id: str) -> Dict[str, object]:
         if not built or bool(manifest.get('dirty')):
             needs_rebuild = True
     return {'ready': all(indexes.values()), 'needs_rebuild': needs_rebuild, 'indexes': indexes}
+
+
+# ---------------------------------------------------------------------------
+# Explore summary (Places + Things for the Explore page)
+#
+# The Explore grouping is a full-library groupBy over the lexical index rows
+# (tags/objects/geo per photo) -- computing it on the `backend` role meant
+# loading the whole lexical blob into its 1Gi memory, one of the paths that
+# OOM-ed it (2026-09-30). Instead the `tools` role (4Gi) computes the tiny
+# finalized result (<=24 Places + <=24 Things, each a label/count/one photo
+# summary) right after it (re)builds the lexical index and stores it here as a
+# small JSON blob; the backend's /explore route just serves this blob, never
+# touching the big lexical one. The stored photo summaries use stable proxy
+# URLs (/api/photos/thumbnail/<name>), not expiring SAS, so a cached summary
+# never goes stale-linked -- only its data ages, refreshed on the next build.
+def _explore_summary_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-explore.json'
+
+
+def _explore_summary_blob_client(user_id: str):
+    container_name = _lexical_index_container_name()
+    if not container_name:
+        return None
+    return _get_blob_client(container_name, _explore_summary_blob_name(user_id))
+
+
+def store_explore_summary(user_id: str, payload: Dict[str, object]) -> None:
+    """Persist the precomputed {sourceVersion, updatedAt, places, things}
+    Explore summary. Best-effort: a storage hiccup just means /explore serves
+    stale/empty until the next build re-stores it."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    blob_client = _explore_summary_blob_client(key)
+    if blob_client is None:
+        return
+    try:
+        blob_client.upload_blob(
+            json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+            overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json'),
+        )
+    except Exception:
+        _LOGGER.exception('Failed to store explore summary for user %s', key)
+
+
+def load_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
+    """Return the precomputed Explore summary dict, or None if never built.
+    A pure, cheap blob read -- this is what the backend /explore route serves
+    instead of scanning the lexical index into memory."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    blob_client = _explore_summary_blob_client(key)
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def delete_user_explore_summary_data(user_id: str) -> None:
+    """Best-effort delete of the Explore summary blob (account purge / library
+    clean). Mirrors delete_user_albums_index_data."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    blob_client = _explore_summary_blob_client(key)
+    if blob_client is None:
+        return
+    try:
+        blob_client.delete_blob()
+    except Exception:
+        pass
 
 
 def _vector_index_container_client():
