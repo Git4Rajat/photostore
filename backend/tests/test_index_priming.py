@@ -1,19 +1,23 @@
 """Unit tests for the sequential index primer (storage_utils.
-prime_all_user_indexes_sequentially / get_user_index_readiness) and the
-/api/photos/prime-indexes + /api/photos/index-status routes that use them.
+prime_all_user_indexes_sequentially / get_user_index_readiness), the backend
+readiness route (/api/photos/index-status), and the tools-role index builder
+routes (/api/tools/indexes/build + /status).
 
 Added alongside the 2026-09-30 microsvcpoc-dev HAR investigation: on a
 genuinely cold account, get_user_sort_index/get_user_lexical_index/
 get_user_albums_index/get_user_people_index each independently kick their
 own background rebuild thread, so a session start that hits all four could
-land four concurrent full-account Table scans on the backend at once --
-observed live to help trigger a ContainerBackOff crash loop. These tests
-pin: (1) the primer runs the four refresh_user_*_index calls one at a time,
-not in parallel, (2) it's single-flighted per user, (3) it goes through each
-kind's own rebuild lock so a concurrent page-level request never races it,
-(4) one kind failing doesn't stop the rest, and (5) the readiness check
-itself never triggers a rebuild as a side effect (unlike calling
-get_user_*_index directly).
+land four concurrent full-account Table scans at once -- observed live to
+help trigger a ContainerBackOff crash loop. The heavy build was then moved
+off the 1Gi `backend` role onto the 2vCPU/4Gi `tools` role: backend only
+reports readiness (cheap manifest reads) and mints SAS tokens; tools runs
+the actual build. These tests pin: (1) the primer runs the four
+refresh_user_*_index calls one at a time, not in parallel, (2) it's
+single-flighted per user, (3) it goes through each kind's own rebuild lock so
+a concurrent page-level request never races it, (4) one kind failing doesn't
+stop the rest, (5) the readiness check never triggers a rebuild as a side
+effect, and (6) the tools build route kicks the primer only when incomplete
+while backend's index-status never builds.
 """
 from __future__ import annotations
 
@@ -23,7 +27,8 @@ import time
 import pytest
 
 import app
-from routes.photos import photos_index_status, photos_prime_indexes
+from routes.photos import photos_index_status
+from routes.tools import tools_build_indexes, tools_indexes_status
 import storage_utils
 
 
@@ -126,6 +131,35 @@ def test_prime_all_user_indexes_sequentially_noop_for_blank_user_id(monkeypatch)
     assert calls == []
 
 
+def test_prime_emits_progress_at_start_each_step_and_end(monkeypatch):
+    calls = []
+    _patch_refreshers(monkeypatch, calls)
+    # Keep readiness cheap/deterministic for the progress snapshots.
+    monkeypatch.setattr(storage_utils, 'get_user_index_readiness',
+                        lambda uid: {'sort': True, 'lexical': True, 'albums': True, 'people': True})
+    progress = []
+
+    storage_utils.prime_all_user_indexes_sequentially(
+        'lib-progress', on_progress=lambda indexes, building: progress.append(building),
+    )
+    _wait_for_prime_lock_free('lib-progress')
+
+    # start(True) + one per kind(True x4) + terminal(False) = 6 emissions.
+    assert progress == [True, True, True, True, True, False]
+
+
+def test_index_prime_in_progress_reflects_held_lock():
+    assert storage_utils.index_prime_in_progress('lib-probe') is False
+    lock = storage_utils._INDEX_PRIME_LOCKS.lock_for('lib-probe')
+    assert lock.acquire(blocking=False)
+    try:
+        assert storage_utils.index_prime_in_progress('lib-probe') is True
+    finally:
+        lock.release()
+    assert storage_utils.index_prime_in_progress('lib-probe') is False
+    assert storage_utils.index_prime_in_progress('') is False
+
+
 # --- get_user_index_readiness -------------------------------------------------
 
 def test_get_user_index_readiness_reads_manifests_without_triggering_rebuilds(monkeypatch):
@@ -149,82 +183,32 @@ def test_get_user_index_readiness_all_false_for_blank_user_id():
     }
 
 
-# --- POST /api/photos/prime-indexes ------------------------------------------
-
 @pytest.fixture
-def prime_route_ctx(monkeypatch):
+def route_ctx(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
 
 
-def test_prime_indexes_route_does_not_prime_when_all_ready(monkeypatch, prime_route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': True, 'lexical': True, 'albums': True, 'people': True,
-    })
-    primed = []
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid: primed.append(uid))
+# --- GET /api/photos/index-status (backend: readiness only, never builds) -----
 
-    with app.app.test_request_context('/api/photos/prime-indexes', method='POST'):
-        response = photos_prime_indexes()
-
-    assert primed == []
-    assert response.get_json() == {
-        'ok': True, 'ready': True,
-        'indexes': {'sort': True, 'lexical': True, 'albums': True, 'people': True},
-    }
-
-
-def test_prime_indexes_route_kicks_primer_when_any_index_missing(monkeypatch, prime_route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': True, 'lexical': False, 'albums': True, 'people': True,
-    })
-    primed = []
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid: primed.append(uid))
-
-    with app.app.test_request_context('/api/photos/prime-indexes', method='POST'):
-        response = photos_prime_indexes()
-
-    assert primed == ['owner']
-    payload = response.get_json()
-    assert payload['ok'] is True
-    assert payload['ready'] is False
-    assert payload['indexes']['lexical'] is False
-
-
-def test_prime_indexes_route_survives_primer_exception(monkeypatch, prime_route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': False, 'lexical': False, 'albums': False, 'people': False,
-    })
-
-    def _boom(uid):
-        raise RuntimeError('thread pool exhausted')
-
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', _boom)
-
-    with app.app.test_request_context('/api/photos/prime-indexes', method='POST'):
-        response = photos_prime_indexes()  # must not raise
-
-    assert response.get_json()['ready'] is False
-
-
-# --- GET /api/photos/index-status ---------------------------------------------
-
-def test_index_status_route_never_primes(monkeypatch, prime_route_ctx):
+def test_backend_index_status_never_builds(monkeypatch, route_ctx):
     monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
         'sort': True, 'lexical': False, 'albums': True, 'people': False,
     })
     primed = []
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid: primed.append(uid))
+    # backend no longer imports the primer, but pin that even if something tried
+    # to reach it through app.* it isn't called from this route.
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda *a, **k: primed.append(a))
 
     with app.app.test_request_context('/api/photos/index-status'):
         response = photos_index_status()
 
-    assert primed == []  # read-only: polling must never itself kick a rebuild
+    assert primed == []  # read-only: backend must never build (OOM risk it was moved off)
     payload = response.get_json()
     assert payload['ready'] is False
     assert payload['indexes'] == {'sort': True, 'lexical': False, 'albums': True, 'people': False}
 
 
-def test_index_status_route_ready_true_when_all_built(monkeypatch, prime_route_ctx):
+def test_backend_index_status_ready_true_when_all_built(monkeypatch, route_ctx):
     monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
         'sort': True, 'lexical': True, 'albums': True, 'people': True,
     })
@@ -233,3 +217,179 @@ def test_index_status_route_ready_true_when_all_built(monkeypatch, prime_route_c
         response = photos_index_status()
 
     assert response.get_json()['ready'] is True
+
+
+# --- POST /api/tools/indexes/build (tools: the actual builder) ----------------
+
+def test_tools_build_does_not_prime_when_all_ready(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
+        'sort': True, 'lexical': True, 'albums': True, 'people': True,
+    })
+    primed = []
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(uid))
+
+    with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
+        response = tools_build_indexes()
+
+    assert primed == []
+    payload = response.get_json()
+    assert payload['ok'] is True
+    assert payload['ready'] is True
+    assert payload['building'] is False
+
+
+def test_tools_build_kicks_primer_when_any_index_missing(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
+        'sort': True, 'lexical': False, 'albums': True, 'people': True,
+    })
+    primed = []
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(uid))
+
+    with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
+        response = tools_build_indexes()
+
+    assert primed == ['owner']
+    payload = response.get_json()
+    assert payload['ok'] is True
+    assert payload['ready'] is False
+    assert payload['building'] is True
+    assert payload['indexes']['lexical'] is False
+
+
+def test_tools_build_survives_primer_exception(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
+        'sort': False, 'lexical': False, 'albums': False, 'people': False,
+    })
+
+    def _boom(uid, **k):
+        raise RuntimeError('thread pool exhausted')
+
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', _boom)
+
+    with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
+        response = tools_build_indexes()  # must not raise
+
+    payload = response.get_json()
+    assert payload['ready'] is False
+    assert payload['building'] is False  # kick failed, so not reported as building
+
+
+def test_tools_build_passes_progress_callback_that_writes_job_row(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
+        'sort': False, 'lexical': False, 'albums': False, 'people': False,
+    })
+    captured = {}
+
+    def _fake_prime(uid, *, on_progress=None):
+        captured['on_progress'] = on_progress
+
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', _fake_prime)
+    job_rows = []
+    monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: job_rows.append((job_id, uid, jt, status, f)))
+
+    with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
+        tools_build_indexes()
+
+    # The route must hand the primer a progress callback; invoking it should
+    # mirror progress into an index_build jobs-table row.
+    assert callable(captured.get('on_progress'))
+    captured['on_progress']({'sort': True, 'lexical': False, 'albums': False, 'people': False}, True)
+    captured['on_progress']({'sort': True, 'lexical': True, 'albums': True, 'people': True}, False)
+    assert len(job_rows) == 2
+    assert job_rows[0][2] == app.INDEX_BUILD_JOB_TYPE
+    assert job_rows[0][3] == 'running'
+    assert job_rows[1][3] == 'done'  # building=False + all ready
+
+
+# --- GET /api/tools/indexes/status --------------------------------------------
+
+def test_tools_status_reports_ready_without_building(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
+        'sort': True, 'lexical': True, 'albums': True, 'people': True,
+    })
+    monkeypatch.setattr(app, 'index_prime_in_progress', lambda uid: False)
+
+    with app.app.test_request_context('/api/tools/indexes/status'):
+        response = tools_indexes_status()
+
+    payload = response.get_json()
+    assert payload['ready'] is True
+    assert payload['building'] is False
+
+
+def test_tools_status_reports_building_when_incomplete_and_prime_running(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
+        'sort': True, 'lexical': False, 'albums': False, 'people': False,
+    })
+    monkeypatch.setattr(app, 'index_prime_in_progress', lambda uid: True)
+
+    with app.app.test_request_context('/api/tools/indexes/status'):
+        response = tools_indexes_status()
+
+    payload = response.get_json()
+    assert payload['ready'] is False
+    assert payload['building'] is True
+
+
+# --- ipworker rebuild trigger helpers -----------------------------------------
+
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _NoopThread:
+    def start(self):
+        pass
+
+
+class _ImmediateThread:
+    def __init__(self, target, sink):
+        self._target = target
+        sink.append(target)
+
+    def start(self):
+        if self._target:
+            self._target()
+
+
+def test_ipwork_message_user_id_parses_both_key_spellings():
+    assert app._ipwork_message_user_id(_FakeMessage('{"user_id": "u1"}')) == 'u1'
+    assert app._ipwork_message_user_id(_FakeMessage('{"userId": "u2"}')) == 'u2'
+    assert app._ipwork_message_user_id(_FakeMessage('not json')) == ''
+    assert app._ipwork_message_user_id(_FakeMessage('{}')) == ''
+
+
+def test_trigger_tools_index_rebuild_noop_without_env(monkeypatch):
+    monkeypatch.delenv('TOOLS_INTERNAL_URL', raising=False)
+    started = []
+    monkeypatch.setattr(app.threading, 'Thread', lambda *a, **k: started.append((a, k)) or _NoopThread())
+
+    app._trigger_tools_index_rebuild('u1')
+
+    assert started == []  # no env -> no thread spawned at all
+
+
+def test_trigger_tools_index_rebuild_posts_with_bearer_token(monkeypatch):
+    monkeypatch.setenv('TOOLS_INTERNAL_URL', 'https://tools.example.invalid')
+    monkeypatch.setattr(app, '_issue_session_for', lambda uid: f'token-for-{uid}')
+
+    captured_fns = []
+    monkeypatch.setattr(app.threading, 'Thread',
+                        lambda target=None, **k: _ImmediateThread(target, captured_fns))
+
+    posts = []
+
+    class _FakeRequests:
+        @staticmethod
+        def post(url, json=None, headers=None, timeout=None):
+            posts.append({'url': url, 'headers': headers, 'timeout': timeout})
+
+    import sys
+    monkeypatch.setitem(sys.modules, 'requests', _FakeRequests)
+
+    app._trigger_tools_index_rebuild('u1')
+
+    assert len(posts) == 1
+    assert posts[0]['url'] == 'https://tools.example.invalid/api/tools/indexes/build'
+    assert posts[0]['headers']['Authorization'] == 'Bearer token-for-u1'

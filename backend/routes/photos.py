@@ -889,40 +889,17 @@ def photos_sort_index():
         'updatedAt': sort_index.get('updated_at'),
     })
 
-@photos_bp.route('/api/photos/prime-indexes', methods=['POST'])
-def photos_prime_indexes():
-    # Called right after login/session-start. If any per-user derived index
-    # (sort/lexical/albums/people) has never been built, kicks a single
-    # sequential background pass that builds all four one at a time instead
-    # of racing four independent rebuild threads -- each of those threads
-    # does a full-account Table scan, and four of them landing concurrently
-    # on a cold, low-CPU replica was observed live to help trigger a
-    # ContainerBackOff crash loop (2026-09-30 microsvcpoc-dev HAR
-    # investigation). prime_all_user_indexes_sequentially is single-flighted
-    # per user, so a duplicate POST (e.g. a second tab) safely no-ops.
-    #
-    # The frontend uses the ready/indexes payload to decide whether to show
-    # a "building your library" gate instead of firing the rest of its
-    # session-start data calls (Gallery/Explore/People/Albums) into the same
-    # cold window -- see AppServicesProvider's libraryIndexReady state.
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-    indexes = app.get_user_index_readiness(user_id)
-    if not all(indexes.values()):
-        try:
-            app.prime_all_user_indexes_sequentially(user_id)
-        except Exception:
-            app.app.logger.exception('Sequential index priming failed to start for %s', user_id)
-    return app.jsonify({'ok': True, 'ready': all(indexes.values()), 'indexes': indexes})
-
 @photos_bp.route('/api/photos/index-status', methods=['GET'])
 def photos_index_status():
-    # Read-only counterpart to prime-indexes, for polling: same four
-    # non-blocking readiness checks, but never kicks a rebuild itself (that
-    # already happened via prime-indexes at session start). Cheap enough
-    # (manifest-blob reads only) to poll every few seconds while a cold
-    # account's frontend gate is waiting.
+    # The "do my derived index files exist?" check the frontend hits at
+    # session start (and the gate the backend uses before minting SAS tokens
+    # for those files). Read-only and cheap -- get_user_index_readiness reads
+    # only the small per-index manifest blobs, never scans the metadata table
+    # and never kicks a rebuild. Backend deliberately does NOT build indexes
+    # anymore (that scan OOM-ed this 1Gi container): when this returns
+    # ready:false the frontend asks the `tools` role (2vCPU/4Gi) to build them
+    # via POST /api/tools/indexes/build, then polls tools until ready and comes
+    # back here / to the SAS-mint routes. See routes/tools.py.
     user_id, error = app._require_user_id()
     if error:
         return error

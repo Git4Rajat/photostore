@@ -67,7 +67,14 @@ def test_backend_role_does_not_serve_extras_routes():
 def test_tools_role_serves_only_tools_routes():
     paths = _rule_paths_for_role('tools')
     non_static = {p for p in paths if not p.startswith('/static')}
-    assert non_static == {'/api/tools/workbench/actions', '/api/tools/workbench/actions/<action_id>'}
+    assert non_static == {
+        '/api/tools/workbench/actions',
+        '/api/tools/workbench/actions/<action_id>',
+        # The derived-index builder moved here from backend (2026-09-30): tools
+        # is the 2vCPU/4Gi role that can safely scan a full metadata partition.
+        '/api/tools/indexes/build',
+        '/api/tools/indexes/status',
+    }
 
 
 def test_upload_role_serves_only_upload_routes():

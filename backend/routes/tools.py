@@ -101,3 +101,64 @@ def get_workbench_action(action_id: str):
     except Exception:
         return app.jsonify({'error': 'Not found'}), 404
     return app.jsonify({'filenames': app.json.loads(row.get('filenames', '[]') or '[]')})
+
+
+def _index_build_progress_callback(user_id: str):
+    # Mirrors prime_all_user_indexes_sequentially's live progress into a single
+    # per-user index_build jobs-table row (updated in place, deterministic
+    # RowKey) so the build is visible cross-replica and to the notification
+    # bell -- storage_utils can't write this itself without importing app
+    # (circular), so it hands each step out through this callback instead.
+    def _cb(indexes: dict, building: bool) -> None:
+        ready = all(indexes.values())
+        status = 'running' if building else ('done' if ready else 'failed')
+        app._upsert_job_status(
+            app._index_build_job_id(user_id),
+            user_id,
+            app.INDEX_BUILD_JOB_TYPE,
+            status,
+            result={'indexes': indexes, 'ready': ready},
+        )
+    return _cb
+
+
+@tools_bp.route('/api/tools/indexes/build', methods=['POST'])
+def tools_build_indexes():
+    # THE index builder. Moved off the `backend` role (1Gi, serves the gallery
+    # hot path) onto `tools` (2vCPU/4Gi) precisely because building the lexical
+    # index scans a user's full metadata partition (OCR/tags/faces per row) and
+    # was OOM-ing backend. Kicks the existing single-flighted sequential
+    # builder; a build already in flight (or one triggered by a second tab / an
+    # ipworker milestone) no-ops against the prime lock. Fire-and-forget: the
+    # build runs off-thread, this returns the current readiness immediately so
+    # the frontend can start polling /api/tools/indexes/status.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    indexes = app.get_user_index_readiness(user_id)
+    building = False
+    if not all(indexes.values()):
+        try:
+            app.prime_all_user_indexes_sequentially(
+                user_id, on_progress=_index_build_progress_callback(user_id),
+            )
+            building = True
+        except Exception:
+            app.app.logger.exception('Index build failed to start for %s', user_id)
+    return app.jsonify({'ok': True, 'ready': all(indexes.values()), 'building': building, 'indexes': indexes})
+
+
+@tools_bp.route('/api/tools/indexes/status', methods=['GET'])
+def tools_indexes_status():
+    # Read-only poll target for the frontend's "Building your library index"
+    # gate. Readiness is sourced from the manifest blobs (the source of truth
+    # for "is this index built"); `building` additionally reflects an in-process
+    # prime on this replica, so a just-kicked build reports building=true even
+    # in the instant before the first index lands.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    indexes = app.get_user_index_readiness(user_id)
+    ready = all(indexes.values())
+    building = (not ready) and app.index_prime_in_progress(user_id)
+    return app.jsonify({'ready': ready, 'building': building, 'indexes': indexes})

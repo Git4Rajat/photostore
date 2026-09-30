@@ -117,6 +117,7 @@ from storage_utils import (
     delete_user_lexical_index_data,
     prime_all_user_indexes_sequentially,
     get_user_index_readiness,
+    index_prime_in_progress,
     get_user_tag_embedding_index,
     delete_user_tag_embedding_index_data,
     nearest_tags_for_word,
@@ -2672,6 +2673,17 @@ def _humanize_job(row: Dict) -> Dict:
             message = f"{name} is ready to view." if name else 'A preview finished generating.'
         elif status == 'failed':
             title = 'Preview generation failed'
+    elif job_type == INDEX_BUILD_JOB_TYPE:
+        # The library-index build the tools role runs on a cold account (or an
+        # ipworker-triggered rebuild). The frontend's own "Building your
+        # library index" gate is the primary UX for this -- the bell entry is
+        # just a secondary record, so keep it quiet and non-toasting.
+        kind = 'index_build'
+        if status == 'done':
+            title = 'Library index ready'
+            message = 'Your library index finished building.'
+        elif status == 'failed':
+            title = 'Library index build failed'
     elif job_type == 'clustering':
         recluster_keys = {'peopleAlbums', 'detectedFaces', 'candidateFaces', 'skippedConfirmedFaces', 'assignments'}
         cluster_keys = {'createdPeople', 'clusterCount', 'faceCount'}
@@ -7177,8 +7189,8 @@ def _explore_places_and_things(user_id: str) -> Dict[str, List[Dict]]:
     allow_sync_build=False -- like photos_sort_index/photos_search_index --
     means a user whose lexical index has never been built gets empty
     places/things back immediately (background build kicked off, deduped
-    with any concurrent kick from photos_prime_indexes) instead of blocking
-    ~60-75s on a full Table scan. Explore is fetched unconditionally on every
+    with any concurrent build from the tools role's index builder) instead of
+    blocking ~60-75s on a full Table scan. Explore is fetched unconditionally on every
     session start (store.tsx's fetchExplore), so without this it was one of
     two calls (alongside /photos/timeline) that could occupy both of this
     backend's gunicorn threads for the entire scan, queuing every other
@@ -8519,6 +8531,19 @@ def _looks_like_jpeg(data: bytes) -> bool:
 
 
 PREVIEW_JOB_TYPE = 'media_preview'
+# Per-user derived-index build job (sort/lexical/albums/people). Written by the
+# tools role's /api/tools/indexes/build route as it runs
+# prime_all_user_indexes_sequentially, so the frontend gate and the bell can
+# see build progress. userId-partitioned (not library-scoped) via
+# _job_partition_key, so it shows up in the initiating user's own bell feed.
+INDEX_BUILD_JOB_TYPE = 'index_build'
+
+
+def _index_build_job_id(user_id: str) -> str:
+    """Deterministic per-user job id so repeated build triggers (session start
+    plus every ipworker milestone/drain) update ONE row in place rather than
+    spawning a new job row each time."""
+    return f'index-build-{str(user_id or "").strip()}'
 
 
 def _preview_cache_blob_name(blob_name: str) -> str:
@@ -11970,6 +11995,63 @@ def _log_ipwork_memory_sample(in_flight_after: int) -> None:
     worker_logger.info('ipwork memory sample: peak_rss_mb=%.1f in_flight=%s', peak_rss_mb, in_flight_after)
 
 
+# How many processed files (per user) between ipworker-driven index rebuilds.
+# The worker also always fires one final rebuild when it fully drains the
+# queue, so on a batch smaller than this the user still gets exactly one
+# rebuild at the end; on a batch larger than this they get one every
+# IPWORKER_INDEX_REBUILD_MILESTONE files plus a final one at drain, so a very
+# large import keeps the derived indexes reasonably fresh mid-flight instead
+# of only at the very end.
+IPWORKER_INDEX_REBUILD_MILESTONE = int(os.getenv('IPWORKER_INDEX_REBUILD_MILESTONE', '10000'))
+
+
+def _ipwork_message_user_id(message) -> str:
+    """Best-effort re-parse of the user/library id from a completed ipwork
+    queue message, for per-user rebuild accounting in run_ipworker. The
+    processing path itself already parsed this; re-reading here keeps the
+    _process_ipwork_message outcome contract (a plain string) unchanged."""
+    try:
+        payload = json.loads(getattr(message, 'content', '') or '{}')
+        if isinstance(payload, dict):
+            return str(payload.get('user_id') or payload.get('userId') or '').strip()
+    except Exception:
+        pass
+    return ''
+
+
+def _trigger_tools_index_rebuild(user_id: str) -> None:
+    """Ask the `tools` role (2vCPU/4Gi) to rebuild this user's derived indexes.
+
+    Direct service-to-service HTTP: the worker mints a normal session token for
+    the user (SESSION_SECRET is a shared secret across all container-app roles,
+    so tools validates it through its usual _require_user_id) and POSTs the same
+    /api/tools/indexes/build the frontend uses. Fire-and-forget on a daemon
+    thread with a short timeout so a cold/slow tools replica never stalls the
+    processing loop; tools' own single-flight prime lock + the index_build job
+    row dedupe overlapping triggers. No-op (silent) when TOOLS_INTERNAL_URL is
+    unset, so browser-processing envs with no tools rebuild wiring are
+    unaffected."""
+    tools_url = os.getenv('TOOLS_INTERNAL_URL', '').strip()
+    key = str(user_id or '').strip()
+    if not tools_url or not key:
+        return
+
+    def _fire() -> None:
+        try:
+            import requests
+            token = _issue_session_for(key)
+            requests.post(
+                f"{tools_url.rstrip('/')}/api/tools/indexes/build",
+                json={},
+                headers={'Authorization': f'Bearer {token}'},
+                timeout=float(os.getenv('TOOLS_INDEX_REBUILD_TIMEOUT_SECONDS', '15')),
+            )
+        except Exception:
+            worker_logger.exception('Failed to trigger tools index rebuild for %s', key)
+
+    threading.Thread(target=_fire, name='index-rebuild-trigger', daemon=True).start()
+
+
 def run_ipworker() -> None:
     """Poll the ipwork queue for jobs in a standalone container."""
     logging.basicConfig(
@@ -12019,6 +12101,11 @@ def run_ipworker() -> None:
 
     executor = ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork')
     in_flight = {}  # future -> message
+    # Files successfully processed per user since that user's last index
+    # rebuild trigger. Drives the "every IPWORKER_INDEX_REBUILD_MILESTONE
+    # files, plus once at full drain" rebuild cadence (see _trigger_tools_
+    # index_rebuild). Per-user because the queue is multi-tenant.
+    processed_by_user: Dict[str, int] = {}
     shutdown_deadline: Optional[float] = None
     grace_exhausted = False
     try:
@@ -12052,6 +12139,17 @@ def run_ipworker() -> None:
                         in_flight[future] = message
 
                 if not in_flight:
+                    # Queue fully drained (no in-flight work AND the receive
+                    # above returned nothing): fire a final rebuild for every
+                    # user who had files processed since their last trigger --
+                    # this is the "at end of processing all files from queue"
+                    # case, and the only trigger a batch smaller than the
+                    # milestone ever hits.
+                    if processed_by_user:
+                        for uid, count in list(processed_by_user.items()):
+                            if count > 0:
+                                _trigger_tools_index_rebuild(uid)
+                        processed_by_user.clear()
                     if shutdown_requested.is_set():
                         break
                     time.sleep(poll_seconds)
@@ -12103,6 +12201,18 @@ def run_ipworker() -> None:
                         continue
                     if outcome == 'error':
                         continue
+                    # A real processing completion ('done', vs a noop/not_found
+                    # that changed nothing) counts toward this user's rebuild
+                    # milestone. Firing at every IPWORKER_INDEX_REBUILD_MILESTONE
+                    # keeps a very large import's indexes fresh mid-flight; the
+                    # drain-flush above covers the tail / smaller batches.
+                    if outcome == 'done':
+                        uid = _ipwork_message_user_id(message)
+                        if uid:
+                            processed_by_user[uid] = processed_by_user.get(uid, 0) + 1
+                            if processed_by_user[uid] >= IPWORKER_INDEX_REBUILD_MILESTONE:
+                                _trigger_tools_index_rebuild(uid)
+                                processed_by_user[uid] = 0
                     try:
                         queue_client.delete_message(message)
                     except Exception:

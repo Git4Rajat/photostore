@@ -4176,7 +4176,21 @@ def get_user_people_index(
 _INDEX_PRIME_LOCKS = _KeyedLockRegistry()
 
 
-def prime_all_user_indexes_sequentially(user_id: str) -> None:
+def prime_all_user_indexes_sequentially(
+    user_id: str,
+    *,
+    on_progress: Optional[Callable[[Dict[str, bool], bool], None]] = None,
+) -> None:
+    """Build all four derived indexes for a user, one at a time, off-thread.
+
+    on_progress (optional) is invoked with (readiness_dict, building) at the
+    start, after each index, and once at the end (building=False). The
+    readiness_dict is a fresh get_user_index_readiness snapshot each time, so
+    a caller (see routes/tools.py's index-build route) can mirror live
+    progress into an `index_build` jobs-table row without this module needing
+    to import app.py's job helpers (which would be a circular import --
+    storage_utils is imported BY app). Kept fully best-effort: a raising
+    callback is logged and swallowed, never failing the build itself."""
     key = str(user_id or '').strip()
     if not key:
         return
@@ -4184,8 +4198,17 @@ def prime_all_user_indexes_sequentially(user_id: str) -> None:
     if not lock.acquire(blocking=False):
         return
 
+    def _emit(building: bool) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(get_user_index_readiness(key), building)
+        except Exception:
+            _LOGGER.exception('Index prime progress callback failed user=%s', key)
+
     def _worker() -> None:
         try:
+            _emit(True)
             source_version = datetime.now(timezone.utc).isoformat()
             for kind, refresh_fn, kind_locks in (
                 ('sort', refresh_user_sort_index, _SORT_INDEX_REBUILD_LOCKS),
@@ -4211,10 +4234,27 @@ def prime_all_user_indexes_sequentially(user_id: str) -> None:
                     _LOGGER.exception('Sequential index priming failed kind=%s user=%s', kind, key)
                 finally:
                     kind_lock.release()
+                _emit(True)
         finally:
             lock.release()
+            _emit(False)
 
     threading.Thread(target=_worker, name='index-prime-sequential', daemon=True).start()
+
+
+def index_prime_in_progress(user_id: str) -> bool:
+    """True if a sequential prime is currently running for this user in THIS
+    process (the _INDEX_PRIME_LOCKS lock is held). Per-process only -- for a
+    cross-replica 'building' signal, callers use the index_build jobs-table
+    row instead (see routes/tools.py). Cheap, non-blocking probe."""
+    key = str(user_id or '').strip()
+    if not key:
+        return False
+    lock = _INDEX_PRIME_LOCKS.lock_for(key)
+    if lock.acquire(blocking=False):
+        lock.release()
+        return False
+    return True
 
 
 def get_user_index_readiness(user_id: str) -> Dict[str, bool]:

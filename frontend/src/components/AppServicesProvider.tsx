@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { get, getUpload, post, postUpload, resolveApiUrl } from '../services/apiClient';
+import { get, getTools, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
@@ -265,6 +265,7 @@ interface AppServicesContextValue {
     ipworkActive: boolean;
     ipworkStatusLabel: string;
     libraryIndexReady: boolean | null;
+    libraryIndexBuiltCount: number;
 }
 
 export type BrowserProcessingAction = 'preview' | 'thumbnails' | 'exif' | 'ocr' | 'vision' | 'map' | 'faces';
@@ -915,30 +916,40 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // brief, barely-visible loading flash there -- same shape as the
     // existing !authReady gate above.
     const [libraryIndexReady, setLibraryIndexReady] = useState<boolean | null>(null);
+    // How many of the 4 derived indexes (sort/lexical/albums/people) are built
+    // so far, for the "Building your library index — N of 4 ready…" gate label.
+    const [libraryIndexBuiltCount, setLibraryIndexBuiltCount] = useState<number>(0);
 
     // Fires once per session (this provider only mounts once signed in):
-    // kicks the sequential index build (if this account has never had one)
-    // and, if it's not ready yet, polls until it is. This replaces firing
-    // Gallery/Timeline/Explore/People/Albums's data calls blind at session
-    // start -- on a cold account those calls land on the backend at the
-    // same time as it's still trying to build the sort/lexical/albums/
-    // people indexes, which independently kick their own rebuild threads
-    // and was observed live to pile up four concurrent full-library Table
-    // scans and help trigger a ContainerBackOff crash loop (2026-09-30
-    // microsvcpoc-dev HAR investigation). See prime_all_user_indexes_
-    // sequentially / /api/photos/index-status on the backend.
+    // 1. Ask BACKEND whether this account's derived index files already exist
+    //    (GET /api/photos/index-status -- a cheap manifest read, no table
+    //    scan). Warm account (the common case) -> ready immediately, no gate.
+    // 2. Cold account -> ask the TOOLS role (2vCPU/4Gi) to build them
+    //    (POST /api/tools/indexes/build). Backend deliberately never builds:
+    //    the lexical-index scan pulls OCR/tags/faces for every row and OOM-ed
+    //    backend's 1Gi container (2026-09-30 microsvcpoc-dev HAR). Gating here
+    //    (above StoreProvider, see AppShellGate) also keeps Gallery/Explore/
+    //    People/Albums from firing their own data calls during the build.
+    // 3. Poll tools for progress (N of 4 built) until ready, then flip the
+    //    gate so the app mounts and fetches the now-built indexes as usual.
     useEffect(() => {
         if (!isLikelyAuthenticated()) {
             return;
         }
         let cancelled = false;
-        const pollUntilReady = async () => {
+        const countBuilt = (indexes?: Record<string, boolean> | null): number =>
+            indexes ? Object.values(indexes).filter(Boolean).length : 0;
+
+        const pollTools = async () => {
             const startedAt = Date.now();
             while (!cancelled && Date.now() - startedAt < INDEX_READY_POLL_MAX_MS) {
                 await new Promise((resolve) => setTimeout(resolve, INDEX_READY_POLL_INTERVAL_MS));
                 if (cancelled) return;
-                const status = await get<{ ready?: boolean }>('/api/photos/index-status').catch(() => null);
+                const status = await getTools<{ ready?: boolean; indexes?: Record<string, boolean> }>(
+                    '/api/tools/indexes/status',
+                ).catch(() => null);
                 if (cancelled) return;
+                if (status?.indexes) setLibraryIndexBuiltCount(countBuilt(status.indexes));
                 if (status?.ready) {
                     setLibraryIndexReady(true);
                     return;
@@ -948,18 +959,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 setLibraryIndexReady(true); // give up waiting; per-page fallbacks take it from here
             }
         };
+
         void (async () => {
-            const primed = await post<{ ready?: boolean }>('/api/photos/prime-indexes', {}).catch(() => null);
+            const status = await get<{ ready?: boolean; indexes?: Record<string, boolean> }>(
+                '/api/photos/index-status',
+            ).catch(() => null);
             if (cancelled) return;
-            if (!primed || primed.ready) {
-                // Also treat a failed prime-indexes call as ready: this is a
-                // best-effort UX nicety, not a correctness gate, so a
-                // network hiccup here should never block the app shell.
+            if (!status || status.ready) {
+                // Warm account, or a failed check we don't want to block on:
+                // this gate is a best-effort UX nicety, not a correctness gate.
                 setLibraryIndexReady(true);
                 return;
             }
+            setLibraryIndexBuiltCount(countBuilt(status.indexes));
             setLibraryIndexReady(false);
-            void pollUntilReady();
+            await postTools('/api/tools/indexes/build', {}).catch(() => null);
+            if (cancelled) return;
+            void pollTools();
         })();
         return () => {
             cancelled = true;
@@ -4674,6 +4690,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         ipworkActive,
         ipworkStatusLabel,
         libraryIndexReady,
+        libraryIndexBuiltCount,
     }), [
         notifications,
         unreadCount,
@@ -4708,6 +4725,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         ipworkActive,
         ipworkStatusLabel,
         libraryIndexReady,
+        libraryIndexBuiltCount,
     ]);
 
     return (

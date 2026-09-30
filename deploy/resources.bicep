@@ -782,9 +782,14 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'tools'
           image: backendImage
+          // 2vCPU/4Gi (was 0.5/1Gi): tools is now the derived-index builder
+          // (POST /api/tools/indexes/build). Building the lexical index scans
+          // a user's full metadata partition (OCR/tags/faces per row) -- the
+          // exact work that OOM-ed the 1Gi backend, so it gets worker-class
+          // headroom here. See prime_all_user_indexes_sequentially.
           resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'tools' }
@@ -1385,6 +1390,13 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // a replica only stays up for that rule's 5-minute window, so
             // this only needs to fire once per wake.
             { name: 'IPWORK_SWEEP_INTERVAL_SECONDS', value: '432000' }
+            // Lets the ipworker trigger a derived-index rebuild on the tools
+            // role (2vCPU/4Gi) when it drains the queue -- and every
+            // IPWORKER_INDEX_REBUILD_MILESTONE files on a very large import --
+            // via a direct service-to-service POST authenticated with a session
+            // token it mints itself (SESSION_SECRET is shared across all
+            // roles). See _trigger_tools_index_rebuild in backend/app.py.
+            { name: 'TOOLS_INTERNAL_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
           ])
         }
       ]

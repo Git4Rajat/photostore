@@ -298,16 +298,18 @@ const UploadPausedBanner: React.FC = () => {
 // fetchPeople) fire unconditionally as soon as it mounts, regardless of
 // which page is actually showing, so holding the gate inside Shell (i.e.
 // below StoreProvider) doesn't stop them. libraryIndexReady starts null
-// ("prime-indexes response not back yet") and only flips true once the
-// backend confirms every per-user index is built (or the poll gives up) --
-// see AppServicesProvider's index-priming effect.
+// ("backend readiness check not back yet") and only flips true once the
+// backend confirms every per-user index exists, or the tools-role build it
+// kicked off reports ready, or the poll gives up -- see AppServicesProvider's
+// index-readiness effect.
 const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
-    const { libraryIndexReady } = useAppServices();
+    const { libraryIndexReady, libraryIndexBuiltCount } = useAppServices();
     if (libraryIndexReady !== true) {
+        const buildingLabel = libraryIndexBuiltCount > 0
+            ? `Building your library index — ${libraryIndexBuiltCount} of 4 ready…`
+            : 'Building your library index — this can take a minute for large libraries…';
         return (
-            <Loading label={libraryIndexReady === false
-                ? 'Building your library index — this can take a minute for large libraries…'
-                : 'Loading Keepsake…'} />
+            <Loading label={libraryIndexReady === false ? buildingLabel : 'Loading Keepsake…'} />
         );
     }
     return (
