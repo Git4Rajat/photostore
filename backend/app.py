@@ -1329,13 +1329,33 @@ def _init_storage_clients():
     library_ops_queue_client = library_ops_queue_client_local
     queue_service_client = queue_service_client_local
 
-    # Ensure the multi-tenant tables exist and wire up the library store.
-    for tbl in (users_table_client, libraries_table_client, memberships_table_client,
-                invites_table_client, audit_table_client, clean_requests_table_client):
-        try:
-            tbl.create_table()
-        except Exception as exc:
-            app.logger.debug('Library table ensure skipped: %s', exc)
+    # Ensure the multi-tenant tables/queues exist. Each create call is an
+    # independent, idempotent Azure REST round-trip whose steady-state outcome
+    # (every boot after the first) is always "already exists" -- with
+    # GUNICORN_WORKERS=1 and no --preload, this whole function runs inline in
+    # the sole worker before it can accept any request, so running these ~10
+    # calls one after another (confirmed via a cold-start HAR: uniform
+    # ~19.6-19.8s 503s across every request hitting a just-woken replica) taxes
+    # every cold start with their full sum instead of just the slowest one.
+    _ensure_fns = [
+        lambda t=tbl: t.create_table()
+        for tbl in (users_table_client, libraries_table_client, memberships_table_client,
+                    invites_table_client, audit_table_client, clean_requests_table_client)
+    ] + [
+        lambda q=clustering_queue_client: q.create_queue(),
+        lambda q=ipwork_queue_client: q.create_queue(),
+        lambda q=library_ops_queue_client: q.create_queue(),
+    ]
+    if AUTH_MODE == 'password':
+        _ensure_fns.append(lambda: config_table_client.create_table())
+    with ThreadPoolExecutor(max_workers=len(_ensure_fns)) as _ensure_pool:
+        _ensure_futures = [_ensure_pool.submit(fn) for fn in _ensure_fns]
+        for _fut in _ensure_futures:
+            try:
+                _fut.result()
+            except Exception as exc:
+                app.logger.debug('Table/queue ensure skipped: %s', exc)
+
     library_store = library_utils.LibraryStore(
         users_table=users_table_client,
         libraries_table=libraries_table_client,
@@ -1345,26 +1365,10 @@ def _init_storage_clients():
         clean_requests_table=clean_requests_table_client,
     )
 
-    try:
-        clustering_queue_client.create_queue()
-    except Exception as exc:
-        app.logger.debug('Queue ensure skipped for %s: %s', CLUSTERING_QUEUE_NAME, exc)
-    try:
-        ipwork_queue_client.create_queue()
-    except Exception as exc:
-        app.logger.debug('Queue ensure skipped for %s: %s', IPWORKER_QUEUE_NAME, exc)
-    try:
-        library_ops_queue_client.create_queue()
-    except Exception as exc:
-        app.logger.debug('Queue ensure skipped for %s: %s', LIBRARY_OPS_QUEUE_NAME, exc)
-
-    # Password-mode: ensure the config table exists and seed the initial owner
-    # credential from OWNER_EMAIL/OWNER_PASSWORD on first boot (no-op afterwards).
+    # Password-mode: seed the initial owner credential from
+    # OWNER_EMAIL/OWNER_PASSWORD on first boot (no-op afterwards). Needs the
+    # config table from the parallel batch above to exist first.
     if AUTH_MODE == 'password':
-        try:
-            config_table_client.create_table()
-        except Exception as exc:
-            app.logger.debug('Config table ensure skipped for %s: %s', CONFIG_TABLE, exc)
         try:
             if password_auth.seed_owner_if_missing(config_table_client, OWNER_EMAIL, OWNER_PASSWORD):
                 app.logger.info('Seeded initial owner credential for %s', OWNER_EMAIL or '(no email)')
