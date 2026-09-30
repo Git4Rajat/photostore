@@ -16,12 +16,26 @@ class ResourceNotFound(Exception):
 class FakeTable:
     def __init__(self) -> None:
         self.rows: dict = {}  # (pk, rk) -> dict
+        self.submit_transaction_calls: list = []  # list of the operations lists passed in
 
     def create_table(self):
         pass
 
     def upsert_entity(self, entity):
         self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
+
+    def submit_transaction(self, operations):
+        # Real azure-data-tables requires every entity in one transaction to
+        # share a PartitionKey and caps it at 100 operations -- not enforced
+        # here since nothing in this test suite needs that failure mode, only
+        # the "N upserts become 1 call" behavior storage_utils's dirty-
+        # filename batching relies on (see _flush_dirty_filename_buffer).
+        self.submit_transaction_calls.append(list(operations))
+        for op_type, entity in operations:
+            if op_type == 'upsert':
+                self.upsert_entity(entity)
+            else:
+                raise ValueError(f'Unsupported fake transaction op: {op_type}')
 
     def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
         # No real etag/optimistic-concurrency simulation here -- tests that

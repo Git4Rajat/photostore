@@ -1200,9 +1200,78 @@ def delete_user_vector_index_data(user_id: str) -> None:
     invalidate_user_vector_index_cache(key)
 
 
+# Shared by all four touch_user_*_index_state functions below: a burst of
+# per-step metadata writes (e.g. a large upload's OCR/face/vision/geo steps
+# landing for thousands of photos) each independently call
+# touch_user_search_indexes_state -> all four of these, unconditionally
+# rewriting every manifest blob to the SAME {dirty: True} it already said,
+# plus invalidating an in-memory cache that was already invalidated one
+# call ago. None of that repetition adds information a rebuild needs -- the
+# per-filename dirty set (_mark_search_index_dirty_filenames) is the actual
+# record of *what* changed; the manifest's dirty flag only needs to flip
+# true ONCE per dirty period to tell a reader "go check". This flag is
+# cleared right before each refresh_user_*_index writes its own clean
+# (dirty: False) manifest -- deliberately *before*, not after, so a touch
+# racing concurrently with that clean write falls through to a real write
+# (worst case: its write is immediately clobbered by the clean write that
+# was already in flight -- the same narrow race this code already accepted
+# pre-existing) rather than seeing a stale "already dirty" flag and staying
+# silently stuck at dirty=False forever.
+_INDEX_MANIFEST_DIRTY_FLAGS: Dict[Tuple[str, str], bool] = {}
+_INDEX_MANIFEST_DIRTY_LOCK = threading.Lock()
+
+
+def _manifest_already_marked_dirty(user_id: str, kind: str) -> bool:
+    key = (user_id, kind)
+    with _INDEX_MANIFEST_DIRTY_LOCK:
+        if _INDEX_MANIFEST_DIRTY_FLAGS.get(key):
+            return True
+        _INDEX_MANIFEST_DIRTY_FLAGS[key] = True
+        return False
+
+
+def _clear_manifest_dirty_flag(user_id: str, kind: str) -> None:
+    with _INDEX_MANIFEST_DIRTY_LOCK:
+        _INDEX_MANIFEST_DIRTY_FLAGS.pop((user_id, kind), None)
+
+
+# Caps how often a background rebuild can actually START for one user+kind,
+# independent of how often a read requests one. The per-user Lock these
+# _rebuild_*_in_background functions already take only stops two rebuilds
+# from running AT THE SAME TIME -- it does nothing to stop a brand new one
+# from starting the instant the previous one finishes, which under a
+# sustained upload (steady stream of dirty-marking writes, see
+# _INDEX_MANIFEST_DIRTY_FLAGS above) plus frequent reads (e.g. a client
+# polling /api/photos/search-index) can still mean near-continuous
+# back-to-back rebuilds. This is a soft, in-process, best-effort cooldown
+# (wall-clock, not monotonic -- consistent with this module's existing
+# datetime.now(timezone.utc) style elsewhere): worst case under a clock
+# adjustment is one skipped or one extra rebuild, not a correctness issue,
+# since a skipped rebuild just serves the existing (still-correct, just
+# staler) cached snapshot.
+INDEX_REBUILD_COOLDOWN_SECONDS = float(os.getenv('INDEX_REBUILD_COOLDOWN_SECONDS', '15'))
+_INDEX_REBUILD_LAST_COMPLETED_AT: Dict[Tuple[str, str], datetime] = {}
+_INDEX_REBUILD_COOLDOWN_LOCK = threading.Lock()
+
+
+def _index_rebuild_in_cooldown(user_id: str, kind: str) -> bool:
+    with _INDEX_REBUILD_COOLDOWN_LOCK:
+        last = _INDEX_REBUILD_LAST_COMPLETED_AT.get((user_id, kind))
+    if last is None:
+        return False
+    return (datetime.now(timezone.utc) - last).total_seconds() < INDEX_REBUILD_COOLDOWN_SECONDS
+
+
+def _mark_index_rebuild_completed(user_id: str, kind: str) -> None:
+    with _INDEX_REBUILD_COOLDOWN_LOCK:
+        _INDEX_REBUILD_LAST_COMPLETED_AT[(user_id, kind)] = datetime.now(timezone.utc)
+
+
 def touch_user_vector_index_state(user_id: str, *, embedding_version: Optional[str] = None) -> str:
     key = str(user_id or '').strip()
     if not key:
+        return ''
+    if _manifest_already_marked_dirty(key, 'vector'):
         return ''
     source_version = datetime.now(timezone.utc).isoformat()
     manifest = {
@@ -1514,6 +1583,7 @@ def refresh_user_vector_index(
                 )
             except Exception:
                 pass
+        _clear_manifest_dirty_flag(key, 'vector')
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -1662,6 +1732,8 @@ def touch_user_tag_embedding_index_state(user_id: str) -> str:
     key = str(user_id or '').strip()
     if not key:
         return ''
+    if _manifest_already_marked_dirty(key, 'tag_embedding'):
+        return ''
     source_version = datetime.now(timezone.utc).isoformat()
     manifest = {
         'userId': key,
@@ -1805,6 +1877,7 @@ def refresh_user_tag_embedding_index(user_id: str, *, source_version: Optional[s
                 )
             except Exception:
                 pass
+        _clear_manifest_dirty_flag(key, 'tag_embedding')
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -2174,6 +2247,8 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     key = str(user_id or '').strip()
     if not key:
         return ''
+    if _manifest_already_marked_dirty(key, 'lexical'):
+        return ''
     source_version = datetime.now(timezone.utc).isoformat()
     manifest = {
         'userId': key,
@@ -2203,37 +2278,98 @@ def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
     return f'{user_id}#{index_kind}'
 
 
+# Azure Table Storage's own cap on operations per submit_transaction call --
+# also doubles as this buffer's per-(user, kind) flush threshold below.
+_DIRTY_FILENAME_BATCH_SIZE = 100
+_DIRTY_FILENAME_BUFFER: Dict[Tuple[str, str], Set[str]] = {}
+_DIRTY_FILENAME_BUFFER_LOCK = threading.Lock()
+
+
+def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
+    """Write out whatever _mark_search_index_dirty_filenames has accumulated
+    in memory for this (user, kind) partition, as batched submit_transaction
+    calls instead of one upsert per filename. Called both eagerly (once a
+    partition's buffer hits _DIRTY_FILENAME_BATCH_SIZE) and defensively by
+    _get_dirty_search_index_filenames before every read, so a rebuild can
+    never miss a filename that's only sitting in this process's memory --
+    the buffer is purely a write-side coalescing optimization, never a
+    source of truth a reader relies on directly."""
+    table = _CTX.get('search_index_dirty_table_client')
+    with _DIRTY_FILENAME_BUFFER_LOCK:
+        pending = _DIRTY_FILENAME_BUFFER.pop((user_id, index_kind), None)
+    if not pending or table is None:
+        return
+    partition_key = _search_index_dirty_partition_key(user_id, index_kind)
+    now = datetime.now(timezone.utc).isoformat()
+    submit_transaction = getattr(table, 'submit_transaction', None)
+    pending_list = list(pending)
+    for start in range(0, len(pending_list), _DIRTY_FILENAME_BATCH_SIZE):
+        chunk = pending_list[start:start + _DIRTY_FILENAME_BATCH_SIZE]
+        entities = [
+            {'PartitionKey': partition_key, 'RowKey': filename, 'dirtyAt': now}
+            for filename in chunk
+        ]
+        try:
+            if submit_transaction is not None:
+                submit_transaction([('upsert', entity) for entity in entities])
+            else:
+                for entity in entities:
+                    table.upsert_entity(entity)
+        except Exception:
+            # Best-effort, same as before batching -- these filenames' dirty
+            # state is lost for this cycle; the next real change to any of
+            # them re-marks it dirty (see _mark_search_index_dirty_filenames).
+            pass
+
+
 def _mark_search_index_dirty_filenames(user_id: str, filenames) -> None:
-    """Record filenames as dirty for the vector and lexical indexes'
+    """Buffer filenames as dirty for the vector/lexical/sort indexes'
     incremental rebuilds (kept in separate partitions per index kind so one
     index's rebuild consuming its dirty set doesn't blind the other to the
-    same changes -- they refresh on independent schedules). Best-effort: a
-    failed write here just means the next rebuild for this user falls back to
-    a full rescan (see _get_dirty_search_index_filenames), not wrong results."""
-    table = _CTX.get('search_index_dirty_table_client')
-    if table is None or not filenames:
+    same changes -- they refresh on independent schedules).
+
+    Buffered in memory rather than written immediately: a large upload's
+    per-step processing (OCR/face/vision/geo, each independently calling
+    this for the same handful of photos in quick succession) used to mean
+    one Table upsert per filename per kind per step -- up to ~3 kinds x 7
+    steps x every photo in the batch, almost all of it re-marking filenames
+    already known dirty. Deduped here (a Set, not a list) and flushed as a
+    batch once a partition's buffer reaches _DIRTY_FILENAME_BATCH_SIZE (see
+    _flush_dirty_filename_buffer), collapsing what could be tens of
+    thousands of individual writes during one large upload into a much
+    smaller number of batched transactions. Best-effort: a failed flush just
+    means the next real change to an affected filename re-marks it dirty,
+    not wrong results -- same tolerance _get_dirty_search_index_filenames
+    already documented before this buffering existed."""
+    if not filenames:
         return
-    now = datetime.now(timezone.utc).isoformat()
-    for filename in filenames:
-        filename = str(filename or '').strip()
-        if not filename:
-            continue
-        for kind in _SEARCH_INDEX_KINDS:
-            try:
-                table.upsert_entity({
-                    'PartitionKey': _search_index_dirty_partition_key(user_id, kind),
-                    'RowKey': filename,
-                    'dirtyAt': now,
-                })
-            except Exception:
-                pass
+    to_flush: List[Tuple[str, str]] = []
+    with _DIRTY_FILENAME_BUFFER_LOCK:
+        for filename in filenames:
+            filename = str(filename or '').strip()
+            if not filename:
+                continue
+            for kind in _SEARCH_INDEX_KINDS:
+                key = (user_id, kind)
+                bucket = _DIRTY_FILENAME_BUFFER.setdefault(key, set())
+                bucket.add(filename)
+                if len(bucket) >= _DIRTY_FILENAME_BATCH_SIZE:
+                    to_flush.append(key)
+    for flush_user_id, flush_kind in to_flush:
+        _flush_dirty_filename_buffer(flush_user_id, flush_kind)
 
 
 def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional[Set[str]]:
     """Filenames marked dirty for this user's index_kind since its last
     successful rebuild, or None if the dirty table isn't usable (unconfigured,
     or the query failed). Callers must treat None as "can't do an incremental
-    merge, fall back to a full rebuild" -- never as "nothing changed"."""
+    merge, fall back to a full rebuild" -- never as "nothing changed".
+
+    Flushes the in-memory dirty-filename buffer for this (user, kind) first
+    (see _mark_search_index_dirty_filenames) so a rebuild reading "what's
+    dirty" always sees filenames that were marked dirty moments ago but
+    hadn't hit the batch-size flush threshold yet."""
+    _flush_dirty_filename_buffer(user_id, index_kind)
     table = _CTX.get('search_index_dirty_table_client')
     if table is None:
         return None
@@ -2246,9 +2382,19 @@ def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional
 
 
 def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames) -> None:
+    """Clear filenames as no-longer-dirty for this user's index_kind.
+
+    Flushes the in-memory dirty-filename buffer first, same reasoning as
+    _get_dirty_search_index_filenames: a filename can be marked dirty (see
+    _mark_search_index_dirty_filenames) and still be sitting only in memory,
+    never yet written to the table. Deleting straight from the table without
+    flushing first would silently no-op on that filename -- its buffered
+    copy would survive and get flushed later, resurrecting a mark this call
+    was meant to clear."""
     table = _CTX.get('search_index_dirty_table_client')
     if table is None or not filenames:
         return
+    _flush_dirty_filename_buffer(user_id, index_kind)
     partition_key = _search_index_dirty_partition_key(user_id, index_kind)
     for filename in filenames:
         try:
@@ -2457,6 +2603,7 @@ def refresh_user_lexical_index(
                 )
             except Exception:
                 pass
+        _clear_manifest_dirty_flag(key, 'lexical')
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -2529,7 +2676,12 @@ def _rebuild_lexical_index_in_background(key: str, manifest: Dict[str, str]) -> 
     for this user; no-ops otherwise (the in-flight rebuild will refresh the
     cache when it finishes). Non-blocking acquire -- this is only ever called
     when we already have a stale snapshot to serve in the meantime, so a
-    caller never needs to wait on this lock."""
+    caller never needs to wait on this lock. Also gated by
+    _index_rebuild_in_cooldown: see that function's comment -- without it,
+    frequent reads during a sustained upload could otherwise start a fresh
+    background rebuild the instant each prior one finishes."""
+    if _index_rebuild_in_cooldown(key, 'lexical'):
+        return
     lock = _LEXICAL_INDEX_REBUILD_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
         return
@@ -2538,6 +2690,7 @@ def _rebuild_lexical_index_in_background(key: str, manifest: Dict[str, str]) -> 
         try:
             source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
             refresh_user_lexical_index(key, source_version=source_version)
+            _mark_index_rebuild_completed(key, 'lexical')
         except Exception:
             _LOGGER.exception('Background lexical index rebuild failed for user %s', key)
         finally:
@@ -2704,6 +2857,8 @@ def touch_user_sort_index_state(user_id: str) -> str:
     manifest blob, independent of the lexical one."""
     key = str(user_id or '').strip()
     if not key:
+        return ''
+    if _manifest_already_marked_dirty(key, 'sort'):
         return ''
     source_version = datetime.now(timezone.utc).isoformat()
     manifest = {
@@ -2935,6 +3090,7 @@ def refresh_user_sort_index(
                 )
             except Exception:
                 pass
+        _clear_manifest_dirty_flag(key, 'sort')
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -3003,7 +3159,10 @@ def _sort_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optiona
 
 def _rebuild_sort_index_in_background(key: str, manifest: Dict[str, str]) -> None:
     """Mirrors _rebuild_lexical_index_in_background: kicks off a rebuild off
-    the request thread if one isn't already running for this user."""
+    the request thread if one isn't already running for this user, gated by
+    the same _index_rebuild_in_cooldown check."""
+    if _index_rebuild_in_cooldown(key, 'sort'):
+        return
     lock = _SORT_INDEX_REBUILD_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
         return
@@ -3012,6 +3171,7 @@ def _rebuild_sort_index_in_background(key: str, manifest: Dict[str, str]) -> Non
         try:
             source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
             refresh_user_sort_index(key, source_version=source_version)
+            _mark_index_rebuild_completed(key, 'sort')
         except Exception:
             _LOGGER.exception('Background sort index rebuild failed for user %s', key)
         finally:
@@ -3155,9 +3315,15 @@ def touch_user_albums_index_state(user_id: str) -> str:
     """Mark the albums index's manifest dirty with a fresh sourceVersion --
     mirrors touch_user_sort_index_state. No per-album dirty-filenames
     partition (see module comment above): a full rebuild is cheap enough that
-    incremental tracking isn't worth the complexity here."""
+    incremental tracking isn't worth the complexity here. Still gated by
+    _manifest_already_marked_dirty (see that function's comment) -- a rapid
+    run of album mutations (e.g. a bulk add-to-album) shouldn't rewrite this
+    manifest once per mutation any more than an upload burst should rewrite
+    the search manifests once per processing step."""
     key = str(user_id or '').strip()
     if not key:
+        return ''
+    if _manifest_already_marked_dirty(key, 'albums'):
         return ''
     source_version = datetime.now(timezone.utc).isoformat()
     manifest = {
@@ -3385,6 +3551,7 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
                 )
             except Exception:
                 _LOGGER.exception('Failed to upload albums index data blob for user %s', key)
+        _clear_manifest_dirty_flag(key, 'albums')
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -3451,7 +3618,10 @@ def _albums_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optio
 
 def _rebuild_albums_index_in_background(key: str, manifest: Dict[str, str]) -> None:
     """Mirrors _rebuild_sort_index_in_background: kicks off a rebuild off the
-    request thread if one isn't already running for this user."""
+    request thread if one isn't already running for this user, gated by the
+    same _index_rebuild_in_cooldown check."""
+    if _index_rebuild_in_cooldown(key, 'albums'):
+        return
     lock = _ALBUMS_INDEX_REBUILD_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
         return
@@ -3460,6 +3630,7 @@ def _rebuild_albums_index_in_background(key: str, manifest: Dict[str, str]) -> N
         try:
             source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
             refresh_user_albums_index(key, source_version=source_version)
+            _mark_index_rebuild_completed(key, 'albums')
         except Exception:
             _LOGGER.exception('Background albums index rebuild failed for user %s', key)
         finally:
@@ -3592,9 +3763,17 @@ def delete_user_people_index_data(user_id: str) -> None:
 def touch_user_people_index_state(user_id: str) -> str:
     """Mark the people index's manifest dirty with a fresh sourceVersion --
     mirrors touch_user_albums_index_state. No per-person dirty-tracking (see
-    module comment above)."""
+    module comment above).
+
+    Gated by _manifest_already_marked_dirty: this is called from
+    _invalidate_people_scan_cache, the one choke point hit on EVERY write to
+    person_table_client/face_table_client -- during upload face detection
+    that's once per detected FACE, not once per photo, so this gate matters
+    even more here than on the search-index manifests."""
     key = str(user_id or '').strip()
     if not key:
+        return ''
+    if _manifest_already_marked_dirty(key, 'people'):
         return ''
     source_version = datetime.now(timezone.utc).isoformat()
     manifest = {
@@ -3848,6 +4027,7 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
                 )
             except Exception:
                 _LOGGER.exception('Failed to upload people index data blob for user %s', key)
+        _clear_manifest_dirty_flag(key, 'people')
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -3912,7 +4092,10 @@ def _people_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optio
 
 def _rebuild_people_index_in_background(key: str, manifest: Dict[str, str]) -> None:
     """Mirrors _rebuild_albums_index_in_background: kicks off a rebuild off
-    the request thread if one isn't already running for this user."""
+    the request thread if one isn't already running for this user, gated by
+    the same _index_rebuild_in_cooldown check."""
+    if _index_rebuild_in_cooldown(key, 'people'):
+        return
     lock = _PEOPLE_INDEX_REBUILD_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
         return
@@ -3921,6 +4104,7 @@ def _rebuild_people_index_in_background(key: str, manifest: Dict[str, str]) -> N
         try:
             source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
             refresh_user_people_index(key, source_version=source_version)
+            _mark_index_rebuild_completed(key, 'people')
         except Exception:
             _LOGGER.exception('Background people index rebuild failed for user %s', key)
         finally:
