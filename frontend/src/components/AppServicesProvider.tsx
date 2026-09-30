@@ -264,6 +264,7 @@ interface AppServicesContextValue {
     clusteringStatusLabel: string;
     ipworkActive: boolean;
     ipworkStatusLabel: string;
+    libraryIndexReady: boolean | null;
 }
 
 export type BrowserProcessingAction = 'preview' | 'thumbnails' | 'exif' | 'ocr' | 'vision' | 'map' | 'faces';
@@ -604,6 +605,13 @@ const UPLOAD_WARMUP_MAX_MS = 120000;
 // transfers. AbortSignal.timeout is supported iOS Safari 16+.
 const WARMUP_REQUEST_TIMEOUT_MS = 8000;
 const BACKEND_KEEPALIVE_INTERVAL_MS = 30000;
+const INDEX_READY_POLL_INTERVAL_MS = 4000;
+// Same 2-minute shape as UPLOAD_WARMUP_MAX_MS just above: a genuinely stuck
+// index build (backend error, account edge case) must never trap the user
+// on the "building your library" gate forever -- give up and let Shell
+// render normally, falling back to the same per-page legacy-endpoint/local-
+// index-miss handling that already exists for an index that isn't ready.
+const INDEX_READY_POLL_MAX_MS = 120000;
 // requestUpload already fires a warm-up poll before the native picker opens
 // (pollUntilWarm(warmUpload, ...)), and warmBackend/warmUpload both hit the
 // exact same backend /health endpoint (APP_CONFIG_API_BASE_URL and
@@ -894,6 +902,69 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // cold (uncached) download+warm-up has gotten so the UI can show real progress
     // instead of an indeterminate spinner for up to ~90s.
     const [browserAiLoadProgress, setBrowserAiLoadProgress] = useState<BrowserAiLoadStage | null>(null);
+    // True once every per-user derived index (sort/lexical/albums/people)
+    // has been built at least once; false while a genuinely cold account's
+    // first session is still building. Starts null ("not checked yet") --
+    // NOT true -- so Shell holds off mounting Gallery/Explore/People/Albums
+    // (see the index-priming effect below) until the first prime-indexes
+    // response is back. Defaulting this to true would let Page mount
+    // immediately on every load, firing those pages' own data calls before
+    // the async readiness check ever resolves -- exactly the concurrent
+    // cold-start pile-up this feature exists to prevent. The round trip is
+    // cheap (a manifest-only check) on a warm account, so this only costs a
+    // brief, barely-visible loading flash there -- same shape as the
+    // existing !authReady gate above.
+    const [libraryIndexReady, setLibraryIndexReady] = useState<boolean | null>(null);
+
+    // Fires once per session (this provider only mounts once signed in):
+    // kicks the sequential index build (if this account has never had one)
+    // and, if it's not ready yet, polls until it is. This replaces firing
+    // Gallery/Timeline/Explore/People/Albums's data calls blind at session
+    // start -- on a cold account those calls land on the backend at the
+    // same time as it's still trying to build the sort/lexical/albums/
+    // people indexes, which independently kick their own rebuild threads
+    // and was observed live to pile up four concurrent full-library Table
+    // scans and help trigger a ContainerBackOff crash loop (2026-09-30
+    // microsvcpoc-dev HAR investigation). See prime_all_user_indexes_
+    // sequentially / /api/photos/index-status on the backend.
+    useEffect(() => {
+        if (!isLikelyAuthenticated()) {
+            return;
+        }
+        let cancelled = false;
+        const pollUntilReady = async () => {
+            const startedAt = Date.now();
+            while (!cancelled && Date.now() - startedAt < INDEX_READY_POLL_MAX_MS) {
+                await new Promise((resolve) => setTimeout(resolve, INDEX_READY_POLL_INTERVAL_MS));
+                if (cancelled) return;
+                const status = await get<{ ready?: boolean }>('/api/photos/index-status').catch(() => null);
+                if (cancelled) return;
+                if (status?.ready) {
+                    setLibraryIndexReady(true);
+                    return;
+                }
+            }
+            if (!cancelled) {
+                setLibraryIndexReady(true); // give up waiting; per-page fallbacks take it from here
+            }
+        };
+        void (async () => {
+            const primed = await post<{ ready?: boolean }>('/api/photos/prime-indexes', {}).catch(() => null);
+            if (cancelled) return;
+            if (!primed || primed.ready) {
+                // Also treat a failed prime-indexes call as ready: this is a
+                // best-effort UX nicety, not a correctness gate, so a
+                // network hiccup here should never block the app shell.
+                setLibraryIndexReady(true);
+                return;
+            }
+            setLibraryIndexReady(false);
+            void pollUntilReady();
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []);
 
     const warmEndpoint = useCallback(async (
         runner: () => Promise<any>,
@@ -4602,6 +4673,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clusteringStatusLabel,
         ipworkActive,
         ipworkStatusLabel,
+        libraryIndexReady,
     }), [
         notifications,
         unreadCount,
@@ -4635,6 +4707,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clusteringStatusLabel,
         ipworkActive,
         ipworkStatusLabel,
+        libraryIndexReady,
     ]);
 
     return (

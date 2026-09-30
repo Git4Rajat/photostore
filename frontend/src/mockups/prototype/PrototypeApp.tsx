@@ -24,7 +24,6 @@ import { formatBytes } from '../../components/browserAiShared';
 import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
-import { post } from '../../services/apiClient';
 import { getLocalSearchIndex } from '../../services/localSearchIndex';
 import { StoreProvider, useStore } from './store';
 import { Menu } from './components/bits';
@@ -294,6 +293,30 @@ const UploadPausedBanner: React.FC = () => {
     );
 };
 
+// Gates StoreProvider itself, not just what Shell renders inside it --
+// StoreProvider's own mount effects (fetchPhotos, /explore, fetchAlbums,
+// fetchPeople) fire unconditionally as soon as it mounts, regardless of
+// which page is actually showing, so holding the gate inside Shell (i.e.
+// below StoreProvider) doesn't stop them. libraryIndexReady starts null
+// ("prime-indexes response not back yet") and only flips true once the
+// backend confirms every per-user index is built (or the poll gives up) --
+// see AppServicesProvider's index-priming effect.
+const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
+    const { libraryIndexReady } = useAppServices();
+    if (libraryIndexReady !== true) {
+        return (
+            <Loading label={libraryIndexReady === false
+                ? 'Building your library index — this can take a minute for large libraries…'
+                : 'Loading Keepsake…'} />
+        );
+    }
+    return (
+        <StoreProvider>
+            <Shell onSignOut={onSignOut} />
+        </StoreProvider>
+    );
+};
+
 const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
     const [theme, setTheme] = useState<Theme>('system');
     useEffect(() => applyTheme(theme), [theme]);
@@ -350,14 +373,6 @@ const PrototypeApp: React.FC = () => {
         await signOut();
         await refreshAuthState();
     }, [refreshAuthState]);
-
-    // Fire-and-forget: kicks the sort/lexical index rebuilds in the background
-    // as soon as a session starts, so a cold-start user pays that cost while
-    // looking at the app shell instead of on their first Gallery/Ask request.
-    useEffect(() => {
-        if (!signedIn) return;
-        void post('/api/photos/prime-indexes', {}).catch(() => {});
-    }, [signedIn]);
 
     // Fire-and-forget: starts downloading the client-side lexical/vector
     // search index as soon as a session starts, instead of only on the
@@ -474,9 +489,7 @@ const PrototypeApp: React.FC = () => {
 
     return (
         <AppServicesProvider>
-            <StoreProvider>
-                <Shell onSignOut={handleSignOut} />
-            </StoreProvider>
+            <AppShellGate onSignOut={handleSignOut} />
         </AppServicesProvider>
     );
 };

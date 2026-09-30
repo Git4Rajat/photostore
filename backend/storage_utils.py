@@ -4156,6 +4156,92 @@ def get_user_people_index(
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
 
 
+# ---------------------------------------------------------------------------
+# Sequential index priming
+#
+# get_user_sort_index/get_user_lexical_index/get_user_albums_index/
+# get_user_people_index each independently kick their own background rebuild
+# thread the first time a cold account's GET route is hit. On a genuinely
+# cold account, session start can fire all four of those routes within the
+# same few seconds (prime-indexes, sort-index, search-index, /explore,
+# albums/index, persons/index), landing four full-account Table scans on the
+# backend concurrently -- observed live to be a major contributor to a
+# ContainerBackOff crash loop on a small container (2026-09-30 microsvcpoc-dev
+# HAR investigation). prime_all_user_indexes_sequentially instead builds all
+# four, one at a time, in a single background thread, so a cold account pays
+# this cost as one bounded, serialized pass rather than a concurrent pile-up.
+# Composes safely with the per-kind locks/cooldowns above: if a page-level
+# request independently triggers one of these mid-priming, it just no-ops
+# against the held lock exactly like today.
+_INDEX_PRIME_LOCKS = _KeyedLockRegistry()
+
+
+def prime_all_user_indexes_sequentially(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    lock = _INDEX_PRIME_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = datetime.now(timezone.utc).isoformat()
+            for kind, refresh_fn, kind_locks in (
+                ('sort', refresh_user_sort_index, _SORT_INDEX_REBUILD_LOCKS),
+                ('lexical', refresh_user_lexical_index, _LEXICAL_INDEX_REBUILD_LOCKS),
+                ('albums', refresh_user_albums_index, _ALBUMS_INDEX_REBUILD_LOCKS),
+                ('people', refresh_user_people_index, _PEOPLE_INDEX_REBUILD_LOCKS),
+            ):
+                # Go through this kind's own rebuild lock (not just this
+                # function's own priming lock) so a concurrent page-level
+                # request (e.g. GET /api/photos/sort-index) sees the lock
+                # held and no-ops instead of kicking a second, parallel
+                # rebuild of the same kind -- the exact concurrent-scan
+                # pile-up this function exists to avoid. Non-blocking: if
+                # something else already holds it, that rebuild is already
+                # in flight, so this step is skipped rather than queued.
+                kind_lock = kind_locks.lock_for(key)
+                if not kind_lock.acquire(blocking=False):
+                    continue
+                try:
+                    refresh_fn(key, source_version=source_version)
+                    _mark_index_rebuild_completed(key, kind)
+                except Exception:
+                    _LOGGER.exception('Sequential index priming failed kind=%s user=%s', kind, key)
+                finally:
+                    kind_lock.release()
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='index-prime-sequential', daemon=True).start()
+
+
+def get_user_index_readiness(user_id: str) -> Dict[str, bool]:
+    """Cheap, side-effect-free readiness snapshot: has each of the four
+    per-user derived indexes (sort/lexical/albums/people) ever been built at
+    least once? Reads only the small manifest blob per kind (never the data
+    blob, never kicks a rebuild) -- unlike calling get_user_*_index directly,
+    which on a cold miss kicks that index's own background rebuild thread as
+    a side effect. Used by /api/photos/prime-indexes and /api/photos/
+    index-status so checking readiness never itself triggers the four
+    concurrent rebuild kicks prime_all_user_indexes_sequentially exists to
+    avoid."""
+    key = str(user_id or '').strip()
+    if not key:
+        return {'sort': False, 'lexical': False, 'albums': False, 'people': False}
+    loaders = {
+        'sort': _load_sort_index_manifest,
+        'lexical': _load_lexical_index_manifest,
+        'albums': _load_albums_index_manifest,
+        'people': _load_people_index_manifest,
+    }
+    return {
+        kind: bool(str(loader(key).get('sourceVersion') or '').strip())
+        for kind, loader in loaders.items()
+    }
+
+
 def _vector_index_container_client():
     blob_service_client = _CTX.get('blob_service_client')
     container_name = _vector_index_container_name()

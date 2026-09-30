@@ -115,6 +115,8 @@ from storage_utils import (
     get_lexical_index_blob_location,
     invalidate_user_lexical_index_cache,
     delete_user_lexical_index_data,
+    prime_all_user_indexes_sequentially,
+    get_user_index_readiness,
     get_user_tag_embedding_index,
     delete_user_tag_embedding_index_data,
     nearest_tags_for_word,

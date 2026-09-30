@@ -891,25 +891,43 @@ def photos_sort_index():
 
 @photos_bp.route('/api/photos/prime-indexes', methods=['POST'])
 def photos_prime_indexes():
-    # Fire-and-forget: called right after login/session-start so the
-    # sort/lexical index rebuilds (if the user's snapshot is missing or
-    # stale) happen in the background while the user is still looking at the
-    # app shell, instead of being triggered -- and felt -- by their first
-    # Gallery or Ask request. allow_sync_build=False on both calls means this
-    # never blocks the response even on a true cold start; it just kicks the
-    # same background rebuild thread these indexes already use.
+    # Called right after login/session-start. If any per-user derived index
+    # (sort/lexical/albums/people) has never been built, kicks a single
+    # sequential background pass that builds all four one at a time instead
+    # of racing four independent rebuild threads -- each of those threads
+    # does a full-account Table scan, and four of them landing concurrently
+    # on a cold, low-CPU replica was observed live to help trigger a
+    # ContainerBackOff crash loop (2026-09-30 microsvcpoc-dev HAR
+    # investigation). prime_all_user_indexes_sequentially is single-flighted
+    # per user, so a duplicate POST (e.g. a second tab) safely no-ops.
+    #
+    # The frontend uses the ready/indexes payload to decide whether to show
+    # a "building your library" gate instead of firing the rest of its
+    # session-start data calls (Gallery/Explore/People/Albums) into the same
+    # cold window -- see AppServicesProvider's libraryIndexReady state.
     user_id, error = app._require_user_id()
     if error:
         return error
-    try:
-        app.get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
-    except Exception:
-        app.app.logger.exception('Sort index priming failed for %s', user_id)
-    try:
-        app.get_user_lexical_index(user_id, allow_refresh=True, allow_sync_build=False)
-    except Exception:
-        app.app.logger.exception('Lexical index priming failed for %s', user_id)
-    return app.jsonify({'ok': True})
+    indexes = app.get_user_index_readiness(user_id)
+    if not all(indexes.values()):
+        try:
+            app.prime_all_user_indexes_sequentially(user_id)
+        except Exception:
+            app.app.logger.exception('Sequential index priming failed to start for %s', user_id)
+    return app.jsonify({'ok': True, 'ready': all(indexes.values()), 'indexes': indexes})
+
+@photos_bp.route('/api/photos/index-status', methods=['GET'])
+def photos_index_status():
+    # Read-only counterpart to prime-indexes, for polling: same four
+    # non-blocking readiness checks, but never kicks a rebuild itself (that
+    # already happened via prime-indexes at session start). Cheap enough
+    # (manifest-blob reads only) to poll every few seconds while a cold
+    # account's frontend gate is waiting.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    indexes = app.get_user_index_readiness(user_id)
+    return app.jsonify({'ready': all(indexes.values()), 'indexes': indexes})
 
 @photos_bp.route('/photos/metadata', methods=['POST'])
 @photos_bp.route('/photos/metadata/', methods=['POST'])
