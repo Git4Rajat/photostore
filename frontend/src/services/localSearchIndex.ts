@@ -70,6 +70,24 @@ const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => 
     return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
 };
 
+class IndexTooLargeError extends Error {
+    constructor(byteLength: number) {
+        super(`Search index is too large to load in-browser (${byteLength} bytes)`);
+        this.name = 'IndexTooLargeError';
+    }
+}
+
+// V8 caps JS string length at ~536,870,888 UTF-16 code units -- decoding a
+// gzip-decompressed index anywhere near that throws RangeError: Invalid
+// string length. Fail fast below that ceiling with a typed error instead of
+// letting TextDecoder/JSON.parse crash: confirmed live 2026-09-30 on
+// microsvcpoc-dev, a 709MB index made every download attempt throw, and the
+// warm-up retry loop below had no way to tell "permanently too big" from
+// "transient failure" -- it re-downloaded the 47.5MB gzipped blob every 15s
+// for up to 20 attempts, saturating the connection pool and starving
+// thumbnail/image requests for the rest of the session.
+const MAX_INDEX_BYTES = 480 * 1024 * 1024;
+
 const decompressGzip = async (buffer: ArrayBuffer): Promise<string> => {
     // DecompressionStream is the standard, dependency-free way to gunzip in a
     // browser (no polyfill/library needed) -- available in every browser this
@@ -85,6 +103,9 @@ const downloadIndexBlob = async (indexUrl: string): Promise<Record<string, unkno
         throw new Error(`Failed to download search index (${response.status})`);
     }
     const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > MAX_INDEX_BYTES) {
+        throw new IndexTooLargeError(buffer.byteLength);
+    }
     // The blob is stored with Content-Encoding: gzip -- most browsers
     // transparently decompress it before we ever see the bytes, so try
     // parsing directly first and only fall back to manual decompression if
@@ -124,12 +145,30 @@ const downloadVectorIndex = async (vectorIndexUrl: string, embeddingVersion: str
     }
 };
 
-const fetchLocalSearchIndex = async (): Promise<LocalSearchIndex | null> => {
+// Set when a download throws IndexTooLargeError, so repeat warm-up attempts
+// for that exact sourceVersion skip straight past the multi-MB blob fetch
+// instead of re-downloading it every 15s (see MAX_INDEX_BYTES above). Cleared
+// automatically once the server produces a new sourceVersion (a rebuild).
+let unavailableVersionKey: string | null = null;
+
+const fetchLocalSearchIndex = async (key: string): Promise<LocalSearchIndex | null> => {
     const response: SearchIndexResponse = await get('/api/photos/search-index');
     if (!response?.available || !response.indexUrl) {
         return null;
     }
-    const rows = await downloadIndexBlob(response.indexUrl);
+    const versionKey = `${key}::${response.sourceVersion || ''}`;
+    if (versionKey === unavailableVersionKey) {
+        return null;
+    }
+    let rows: Record<string, unknown>[];
+    try {
+        rows = await downloadIndexBlob(response.indexUrl);
+    } catch (err) {
+        if (err instanceof IndexTooLargeError) {
+            unavailableVersionKey = versionKey;
+        }
+        throw err;
+    }
     const vectorIndex = response.vectorIndexUrl
         ? await downloadVectorIndex(response.vectorIndexUrl, response.embeddingVersion || '')
         : null;
@@ -151,7 +190,7 @@ export const getLocalSearchIndex = async (): Promise<LocalSearchIndex | null> =>
         return inFlight;
     }
     cachedKey = key;
-    inFlight = fetchLocalSearchIndex()
+    inFlight = fetchLocalSearchIndex(key)
         .then((result) => {
             cachedIndex = result;
             return result;
