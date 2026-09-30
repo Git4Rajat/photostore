@@ -794,11 +794,21 @@ def photos_search_index():
     user_id, error = app._require_user_id()
     if error:
         return error
+    # Manifest-only read -- do NOT call get_user_lexical_index here. That loads
+    # the entire lexical data blob (OCR/tags/objects/faces per row, hundreds of
+    # MB on a big library) into THIS process's memory just to read two version
+    # fields, and this route is polled every ~15s by the frontend's search-index
+    # warm-up -- which pinned the 1Gi backend's working set over its cap and
+    # OOM-crash-looped it (2026-09-30 microsvcpoc-dev). The browser downloads
+    # the blob itself via the SAS URL below; the backend only needs the manifest
+    # to mint that URL. If the manifest is dirty we fire a rebuild on the tools
+    # role (never here) to preserve the freshness the old allow_refresh=True
+    # call used to provide.
     try:
-        lexical_index = app.get_user_lexical_index(user_id, allow_refresh=True, allow_sync_build=False)
+        lexical_summary = app.get_index_manifest_summary(user_id, 'lexical')
     except Exception:
-        lexical_index = None
-    if lexical_index is None:
+        lexical_summary = None
+    if lexical_summary is None:
         # 200, not 503: a plain 503 here would hit httpClient.ts's cold-start
         # retry loop (any 503 is treated as "ingress rejected before reaching
         # the app, safe to retry" -- see isRetriableColdStart), stalling for
@@ -806,6 +816,8 @@ def photos_search_index():
         # null it needs to fall back to server-side search. Same fix as
         # photos_sort_index's identical bug (see that route's comment).
         return app.jsonify({'available': False})
+    if lexical_summary.get('dirty'):
+        app._trigger_tools_index_rebuild(user_id)
     try:
         container_name, blob_name = app.get_lexical_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
@@ -833,8 +845,8 @@ def photos_search_index():
         'available': True,
         'indexUrl': index_url,
         'expiresAt': expires_at,
-        'sourceVersion': lexical_index.get('source_version'),
-        'updatedAt': lexical_index.get('updated_at'),
+        'sourceVersion': lexical_summary.get('source_version'),
+        'updatedAt': lexical_summary.get('updated_at'),
         'peopleNameIndex': {'pidToName': pid_to_name, 'nameToIds': name_to_ids},
     }
     if vector_index_payload:
@@ -864,17 +876,20 @@ def photos_sort_index():
     user_id, error = app._require_user_id()
     if error:
         return error
+    # Manifest-only read, same reasoning as photos_search_index above: minting
+    # the SAS URL needs the manifest's version fields, not the data blob in
+    # backend memory. get_user_sort_index would load+cache the whole sort blob
+    # here. A not-yet-built library returns available:false immediately (the
+    # frontend falls back to the legacy endpoint for that one load); a dirty
+    # index is served as-is while a rebuild is kicked on the tools role.
     try:
-        # allow_sync_build=False: never block the gallery's initial load on a
-        # cold full-library build (see get_user_sort_index). A not-yet-built
-        # library returns available:false immediately + builds off-thread; the
-        # client falls back to the legacy endpoint for this one load and the
-        # next load gets the fast path.
-        sort_index = app.get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
+        sort_summary = app.get_index_manifest_summary(user_id, 'sort')
     except Exception:
-        sort_index = None
-    if sort_index is None:
+        sort_summary = None
+    if sort_summary is None:
         return app.jsonify({'available': False})
+    if sort_summary.get('dirty'):
+        app._trigger_tools_index_rebuild(user_id)
     try:
         container_name, blob_name = app.get_sort_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
@@ -885,8 +900,8 @@ def photos_sort_index():
         'available': True,
         'indexUrl': index_url,
         'expiresAt': expires_at,
-        'sourceVersion': sort_index.get('source_version'),
-        'updatedAt': sort_index.get('updated_at'),
+        'sourceVersion': sort_summary.get('source_version'),
+        'updatedAt': sort_summary.get('updated_at'),
     })
 
 @photos_bp.route('/api/photos/index-status', methods=['GET'])

@@ -3,6 +3,12 @@ the per-user lexical-index blob plus the people-name index, so client-side
 lexical search (frontend/src/services/localSearchIndex.ts) doesn't need to
 proxy the blob's bytes through a backend request. See
 backend-cpu-optimization-2026-09 memory for the feature this backs.
+
+2026-09-30: this route now reads only the lexical index MANIFEST
+(get_index_manifest_summary) to mint the URL, never get_user_lexical_index --
+that loaded the whole data blob into the 1Gi backend's memory and, polled
+every ~15s by the frontend warm-up, OOM-crash-looped it. The browser fetches
+the blob itself via the SAS URL.
 """
 from __future__ import annotations
 
@@ -10,16 +16,20 @@ import app
 from routes.photos import photos_search_index
 
 
+def _happy_manifest(**over):
+    base = {'source_version': 'v42', 'updated_at': '2026-09-15T00:00:00+00:00', 'dirty': False}
+    base.update(over)
+    return base
+
+
 def test_returns_200_available_false_when_lexical_index_unavailable(monkeypatch):
     # Deliberately 200, not 503 -- a 503 here hits httpClient.ts's cold-start
     # retry loop (isRetriableColdStart treats any 503 as "ingress rejected
     # before reaching the app, safe to retry"), stalling for ~90s before
     # runLocalSemanticSearch's caller (AskPage.tsx) ever sees the null it
-    # needs to fall back to server-side /photos/search. Same fix as
-    # photos_sort_index's identical bug -- see that route's comment in
-    # routes/photos.py.
+    # needs to fall back to server-side /photos/search.
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: None)
 
     with app.app.test_request_context('/api/photos/search-index'):
         response = photos_search_index()
@@ -29,30 +39,65 @@ def test_returns_200_available_false_when_lexical_index_unavailable(monkeypatch)
     assert response.get_json()['available'] is False
 
 
-def test_passes_allow_sync_build_false_so_a_cold_library_never_blocks(monkeypatch):
-    """A user with no lexical snapshot ever built must not block this request
-    on a ~60-75s synchronous full-library scan -- this route only hands out a
-    SAS URL, and the frontend already degrades to server-side search when the
-    index isn't ready (see get_user_lexical_index's allow_sync_build
-    docstring)."""
-    captured = {}
-
-    def _spy(user_id, **kwargs):
-        captured.update(kwargs)
-        return None
-
+def test_never_loads_the_data_blob_into_backend_memory(monkeypatch):
+    """Regression pin for the 2026-09-30 OOM: this route must mint the URL from
+    the manifest only. Calling get_user_lexical_index here loads the entire
+    lexical blob (OCR/tags/faces per row) into this process -- the exact thing
+    that OOM-crash-looped the 1Gi backend under the frontend's ~15s poll."""
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    monkeypatch.setattr(app, 'get_user_lexical_index', _spy)
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: _happy_manifest())
+    monkeypatch.setattr(app, 'get_lexical_index_blob_location', lambda uid: ('lexical-index', f'{uid}.json.gz'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda c, b: (f'https://x/{c}/{b}?sas', 'exp'))
+    monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
+    monkeypatch.setattr(app, 'get_vector_index_manifest_summary', lambda uid: None)
+
+    def _boom(*a, **k):
+        raise AssertionError('search-index must not call get_user_lexical_index (loads the blob)')
+
+    monkeypatch.setattr(app, 'get_user_lexical_index', _boom)
+
+    with app.app.test_request_context('/api/photos/search-index'):
+        response = photos_search_index()
+
+    assert response.get_json()['available'] is True
+
+
+def test_dirty_manifest_fires_tools_rebuild_but_still_serves(monkeypatch):
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: _happy_manifest(dirty=True))
+    monkeypatch.setattr(app, 'get_lexical_index_blob_location', lambda uid: ('lexical-index', f'{uid}.json.gz'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda c, b: (f'https://x/{c}/{b}?sas', 'exp'))
+    monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
+    monkeypatch.setattr(app, 'get_vector_index_manifest_summary', lambda uid: None)
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: triggered.append(uid))
+
+    with app.app.test_request_context('/api/photos/search-index'):
+        response = photos_search_index()
+
+    assert triggered == ['owner']  # dirty -> nudge tools to rebuild (backend never builds)
+    assert response.get_json()['available'] is True  # still serves the stale-but-usable index
+
+
+def test_clean_manifest_does_not_trigger_rebuild(monkeypatch):
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: _happy_manifest(dirty=False))
+    monkeypatch.setattr(app, 'get_lexical_index_blob_location', lambda uid: ('lexical-index', f'{uid}.json.gz'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda c, b: (f'https://x/{c}/{b}?sas', 'exp'))
+    monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
+    monkeypatch.setattr(app, 'get_vector_index_manifest_summary', lambda uid: None)
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: triggered.append(uid))
 
     with app.app.test_request_context('/api/photos/search-index'):
         photos_search_index()
 
-    assert captured.get('allow_sync_build') is False
+    assert triggered == []
 
 
 def test_returns_200_available_false_when_sas_minting_fails(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: {'source_version': 'v1', 'updated_at': 'now'})
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: _happy_manifest())
 
     def _raise(*a, **k):
         raise RuntimeError('storage not configured')
@@ -69,13 +114,11 @@ def test_returns_200_available_false_when_sas_minting_fails(monkeypatch):
 
 def test_happy_path_returns_sas_url_and_people_index(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: {
-        'source_version': 'v42',
-        'updated_at': '2026-09-15T00:00:00+00:00',
-    })
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: _happy_manifest())
     monkeypatch.setattr(app, 'get_lexical_index_blob_location', lambda uid: ('lexical-index', f'{uid}.json.gz'))
     monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda container, blob: (f'https://example.blob/{container}/{blob}?sas=1', '2026-09-17T00:00:00+00:00'))
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({'p1': 'Alice'}, {'alice': ['p1']}))
+    monkeypatch.setattr(app, 'get_vector_index_manifest_summary', lambda uid: None)
 
     with app.app.test_request_context('/api/photos/search-index'):
         response = photos_search_index()
@@ -91,10 +134,7 @@ def test_happy_path_returns_sas_url_and_people_index(monkeypatch):
 
 def _patch_lexical_happy_path(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: {
-        'source_version': 'v42',
-        'updated_at': '2026-09-15T00:00:00+00:00',
-    })
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: _happy_manifest())
     monkeypatch.setattr(app, 'get_lexical_index_blob_location', lambda uid: ('lexical-index', f'{uid}.json.gz'))
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
 

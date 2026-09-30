@@ -117,6 +117,8 @@ from storage_utils import (
     delete_user_lexical_index_data,
     prime_all_user_indexes_sequentially,
     get_user_index_readiness,
+    get_index_manifest_summary,
+    get_user_index_build_state,
     index_prime_in_progress,
     get_user_tag_embedding_index,
     delete_user_tag_embedding_index_data,
@@ -12019,22 +12021,38 @@ def _ipwork_message_user_id(message) -> str:
     return ''
 
 
+_TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS = float(os.getenv('TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS', '30'))
+_TOOLS_REBUILD_TRIGGER_LAST: Dict[str, float] = {}
+_TOOLS_REBUILD_TRIGGER_LOCK = threading.Lock()
+
+
 def _trigger_tools_index_rebuild(user_id: str) -> None:
     """Ask the `tools` role (2vCPU/4Gi) to rebuild this user's derived indexes.
 
-    Direct service-to-service HTTP: the worker mints a normal session token for
+    Direct service-to-service HTTP: the caller mints a normal session token for
     the user (SESSION_SECRET is a shared secret across all container-app roles,
     so tools validates it through its usual _require_user_id) and POSTs the same
     /api/tools/indexes/build the frontend uses. Fire-and-forget on a daemon
     thread with a short timeout so a cold/slow tools replica never stalls the
-    processing loop; tools' own single-flight prime lock + the index_build job
-    row dedupe overlapping triggers. No-op (silent) when TOOLS_INTERNAL_URL is
-    unset, so browser-processing envs with no tools rebuild wiring are
-    unaffected."""
+    caller; tools' own single-flight prime lock + the index_build job row dedupe
+    overlapping triggers. No-op (silent) when TOOLS_INTERNAL_URL is unset, so
+    envs with no tools rebuild wiring are unaffected.
+
+    Callers: ipworker (queue-drain / every 10k files) and the backend's
+    search-index/sort-index SAS-mint routes when they observe a dirty manifest
+    (replacing the per-GET background rebuild backend used to run in-process).
+    A short per-user cooldown keeps the every-~15s search-index poll from firing
+    a trigger on every request while an index sits dirty waiting to rebuild."""
     tools_url = os.getenv('TOOLS_INTERNAL_URL', '').strip()
     key = str(user_id or '').strip()
     if not tools_url or not key:
         return
+    now = time.monotonic()
+    with _TOOLS_REBUILD_TRIGGER_LOCK:
+        last = _TOOLS_REBUILD_TRIGGER_LAST.get(key)
+        if last is not None and (now - last) < _TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS:
+            return
+        _TOOLS_REBUILD_TRIGGER_LAST[key] = now
 
     def _fire() -> None:
         try:

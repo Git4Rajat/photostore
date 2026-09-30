@@ -177,6 +177,42 @@ def test_get_user_index_readiness_reads_manifests_without_triggering_rebuilds(mo
     assert rebuild_calls == []  # a pure read -- never kicks a rebuild
 
 
+def test_get_index_manifest_summary_returns_none_when_never_built(monkeypatch):
+    monkeypatch.setattr(storage_utils, '_load_lexical_index_manifest', lambda uid: {})
+    assert storage_utils.get_index_manifest_summary('u', 'lexical') is None
+
+
+def test_get_index_manifest_summary_returns_version_and_dirty(monkeypatch):
+    monkeypatch.setattr(storage_utils, '_load_sort_index_manifest',
+                        lambda uid: {'sourceVersion': 'v9', 'updatedAt': '2026-01-01', 'dirty': True})
+    summary = storage_utils.get_index_manifest_summary('u', 'sort')
+    assert summary == {'source_version': 'v9', 'updated_at': '2026-01-01', 'dirty': True}
+
+
+def test_get_user_index_build_state_flags_dirty_as_needs_rebuild(monkeypatch):
+    monkeypatch.setattr(storage_utils, '_load_sort_index_manifest', lambda uid: {'sourceVersion': 'v1', 'dirty': True})
+    monkeypatch.setattr(storage_utils, '_load_lexical_index_manifest', lambda uid: {'sourceVersion': 'v1'})
+    monkeypatch.setattr(storage_utils, '_load_albums_index_manifest', lambda uid: {'sourceVersion': 'v1'})
+    monkeypatch.setattr(storage_utils, '_load_people_index_manifest', lambda uid: {'sourceVersion': 'v1'})
+
+    state = storage_utils.get_user_index_build_state('u')
+    assert state['ready'] is True          # all built
+    assert state['needs_rebuild'] is True  # but sort is dirty
+    assert state['indexes'] == {'sort': True, 'lexical': True, 'albums': True, 'people': True}
+
+
+def test_get_user_index_build_state_flags_missing_as_needs_rebuild(monkeypatch):
+    monkeypatch.setattr(storage_utils, '_load_sort_index_manifest', lambda uid: {'sourceVersion': 'v1'})
+    monkeypatch.setattr(storage_utils, '_load_lexical_index_manifest', lambda uid: {})  # missing
+    monkeypatch.setattr(storage_utils, '_load_albums_index_manifest', lambda uid: {'sourceVersion': 'v1'})
+    monkeypatch.setattr(storage_utils, '_load_people_index_manifest', lambda uid: {'sourceVersion': 'v1'})
+
+    state = storage_utils.get_user_index_build_state('u')
+    assert state['ready'] is False
+    assert state['needs_rebuild'] is True
+    assert state['indexes']['lexical'] is False
+
+
 def test_get_user_index_readiness_all_false_for_blank_user_id():
     assert storage_utils.get_user_index_readiness('') == {
         'sort': False, 'lexical': False, 'albums': False, 'people': False,
@@ -221,10 +257,13 @@ def test_backend_index_status_ready_true_when_all_built(monkeypatch, route_ctx):
 
 # --- POST /api/tools/indexes/build (tools: the actual builder) ----------------
 
-def test_tools_build_does_not_prime_when_all_ready(monkeypatch, route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': True, 'lexical': True, 'albums': True, 'people': True,
-    })
+def _build_state(indexes, needs_rebuild):
+    return {'ready': all(indexes.values()), 'needs_rebuild': needs_rebuild, 'indexes': indexes}
+
+
+def test_tools_build_does_not_prime_when_all_built_and_clean(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
+        {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=False))
     primed = []
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(uid))
 
@@ -239,9 +278,8 @@ def test_tools_build_does_not_prime_when_all_ready(monkeypatch, route_ctx):
 
 
 def test_tools_build_kicks_primer_when_any_index_missing(monkeypatch, route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': True, 'lexical': False, 'albums': True, 'people': True,
-    })
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
+        {'sort': True, 'lexical': False, 'albums': True, 'people': True}, needs_rebuild=True))
     primed = []
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(uid))
 
@@ -256,10 +294,26 @@ def test_tools_build_kicks_primer_when_any_index_missing(monkeypatch, route_ctx)
     assert payload['indexes']['lexical'] is False
 
 
+def test_tools_build_kicks_primer_when_built_but_dirty(monkeypatch, route_ctx):
+    # All four built (ready=True) but one dirty -> still rebuild, and the gate
+    # is already satisfied (ready stays True) so the frontend won't block.
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
+        {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=True))
+    primed = []
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(uid))
+
+    with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
+        response = tools_build_indexes()
+
+    assert primed == ['owner']
+    payload = response.get_json()
+    assert payload['ready'] is True
+    assert payload['building'] is True
+
+
 def test_tools_build_survives_primer_exception(monkeypatch, route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': False, 'lexical': False, 'albums': False, 'people': False,
-    })
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
+        {'sort': False, 'lexical': False, 'albums': False, 'people': False}, needs_rebuild=True))
 
     def _boom(uid, **k):
         raise RuntimeError('thread pool exhausted')
@@ -275,9 +329,8 @@ def test_tools_build_survives_primer_exception(monkeypatch, route_ctx):
 
 
 def test_tools_build_passes_progress_callback_that_writes_job_row(monkeypatch, route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': False, 'lexical': False, 'albums': False, 'people': False,
-    })
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
+        {'sort': False, 'lexical': False, 'albums': False, 'people': False}, needs_rebuild=True))
     captured = {}
 
     def _fake_prime(uid, *, on_progress=None):

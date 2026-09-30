@@ -135,9 +135,16 @@ def tools_build_indexes():
     user_id, error = app._require_user_id()
     if error:
         return error
-    indexes = app.get_user_index_readiness(user_id)
+    # Kick a build when any index is MISSING or DIRTY (needs_rebuild) -- the
+    # dirty case is what preserves the freshness the backend's per-GET-route
+    # background rebuild used to provide before that was moved off the 1Gi
+    # container. prime runs a cheap incremental merge for a dirty index and a
+    # full build only for a missing one, all here on the 4Gi tools role.
+    # `ready` (all built) is what the frontend gate waits on -- a built-but-
+    # dirty index is still usable, so it doesn't hold the gate.
+    state = app.get_user_index_build_state(user_id)
     building = False
-    if not all(indexes.values()):
+    if state['needs_rebuild']:
         try:
             app.prime_all_user_indexes_sequentially(
                 user_id, on_progress=_index_build_progress_callback(user_id),
@@ -145,7 +152,7 @@ def tools_build_indexes():
             building = True
         except Exception:
             app.app.logger.exception('Index build failed to start for %s', user_id)
-    return app.jsonify({'ok': True, 'ready': all(indexes.values()), 'building': building, 'indexes': indexes})
+    return app.jsonify({'ok': True, 'ready': state['ready'], 'building': building, 'indexes': state['indexes']})
 
 
 @tools_bp.route('/api/tools/indexes/status', methods=['GET'])

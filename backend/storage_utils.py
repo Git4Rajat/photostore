@@ -4270,16 +4270,79 @@ def get_user_index_readiness(user_id: str) -> Dict[str, bool]:
     key = str(user_id or '').strip()
     if not key:
         return {'sort': False, 'lexical': False, 'albums': False, 'people': False}
-    loaders = {
+    return {
+        kind: bool(str(loader(key).get('sourceVersion') or '').strip())
+        for kind, loader in _index_manifest_loaders().items()
+    }
+
+
+def _index_manifest_loaders() -> Dict[str, Callable[[str], Dict[str, str]]]:
+    """The four per-kind manifest loaders, resolved fresh on each call so a
+    monkeypatched loader (tests) is picked up -- a module-level dict would
+    capture the original function objects at import time and silently ignore
+    the patch. Kept in one place so get_user_index_readiness /
+    get_index_manifest_summary / get_user_index_build_state stay in sync."""
+    return {
         'sort': _load_sort_index_manifest,
         'lexical': _load_lexical_index_manifest,
         'albums': _load_albums_index_manifest,
         'people': _load_people_index_manifest,
     }
+
+
+def get_index_manifest_summary(user_id: str, kind: str) -> Optional[Dict[str, object]]:
+    """Manifest-only summary for one derived index: {source_version,
+    updated_at, dirty} if it's ever been built, else None. Reads ONLY the
+    small manifest blob -- never the (potentially hundreds-of-MB, OCR/tags/
+    faces-per-row) data blob.
+
+    This is what the SAS-minting routes (routes/photos.py's search-index /
+    sort-index) use instead of get_user_*_index: they only need the version
+    fields to build the response and a yes/no on existence to mint the URL,
+    but get_user_*_index *loads the whole data blob into this process's
+    memory* to serve it -- which, polled every ~15s by the frontend's
+    search-index warm-up on a large library, pinned the 1Gi backend's working
+    set over its cap and OOM-crash-looped it (2026-09-30 microsvcpoc-dev).
+    The browser downloads the actual blob straight from storage via the SAS
+    URL; the backend never needs it in memory just to hand out that URL."""
+    key = str(user_id or '').strip()
+    loader = _index_manifest_loaders().get(kind)
+    if not key or loader is None:
+        return None
+    manifest = loader(key)
+    source_version = str(manifest.get('sourceVersion') or '').strip()
+    if not source_version:
+        return None
     return {
-        kind: bool(str(loader(key).get('sourceVersion') or '').strip())
-        for kind, loader in loaders.items()
+        'source_version': source_version,
+        'updated_at': manifest.get('updatedAt') or source_version,
+        'dirty': bool(manifest.get('dirty')),
     }
+
+
+def get_user_index_build_state(user_id: str) -> Dict[str, object]:
+    """One manifest read per kind, summarized for the tools build/status
+    routes: {ready, needs_rebuild, indexes}.
+
+    - ready: every index has been built at least once (what the frontend gate
+      waits on -- a built-but-slightly-stale index is still usable, so dirty
+      does NOT hold the gate).
+    - needs_rebuild: any index is missing OR built-but-dirty (what the build
+      trigger acts on -- this is the "should tools run a (re)build" signal,
+      replacing the per-GET-route background rebuild backend used to kick
+      before that was moved off the 1Gi container).
+    - indexes: per-kind built bool (the readiness map the frontend renders as
+      'N of 4 ready')."""
+    key = str(user_id or '').strip()
+    indexes: Dict[str, bool] = {}
+    needs_rebuild = False
+    for kind, loader in _index_manifest_loaders().items():
+        manifest = loader(key) if key else {}
+        built = bool(str(manifest.get('sourceVersion') or '').strip())
+        indexes[kind] = built
+        if not built or bool(manifest.get('dirty')):
+            needs_rebuild = True
+    return {'ready': all(indexes.values()), 'needs_rebuild': needs_rebuild, 'indexes': indexes}
 
 
 def _vector_index_container_client():

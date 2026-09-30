@@ -392,7 +392,7 @@ def sort_index_route_ctx(monkeypatch):
 
 
 def test_photos_sort_index_returns_200_available_false_when_index_none(monkeypatch, sort_index_route_ctx):
-    monkeypatch.setattr(app, 'get_user_sort_index', lambda *a, **k: None)
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: None)
 
     with app.app.test_request_context('/api/photos/sort-index'):
         response = photos_sort_index()
@@ -403,7 +403,7 @@ def test_photos_sort_index_returns_200_available_false_when_index_none(monkeypat
 
 
 def test_photos_sort_index_returns_200_available_false_on_sas_mint_failure(monkeypatch, sort_index_route_ctx):
-    monkeypatch.setattr(app, 'get_user_sort_index', lambda *a, **k: {'source_version': 'v1', 'updated_at': 'v1', 'rows': []})
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: {'source_version': 'v1', 'updated_at': 'v1', 'dirty': False})
 
     def _boom(*a, **k):
         raise RuntimeError('storage account not configured')
@@ -418,7 +418,7 @@ def test_photos_sort_index_returns_200_available_false_on_sas_mint_failure(monke
 
 
 def test_photos_sort_index_returns_available_true_with_sas_url(monkeypatch, sort_index_route_ctx):
-    monkeypatch.setattr(app, 'get_user_sort_index', lambda *a, **k: {'source_version': 'v2', 'updated_at': '2026-01-01', 'rows': []})
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: {'source_version': 'v2', 'updated_at': '2026-01-01', 'dirty': False})
     monkeypatch.setattr(app, 'get_sort_index_blob_location', lambda *a, **k: ('lexical-index', 'abc-sort.json.gz'))
     monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: ('https://example.invalid/abc-sort.json.gz?sas', '2026-01-02'))
 
@@ -433,26 +433,38 @@ def test_photos_sort_index_returns_available_true_with_sas_url(monkeypatch, sort
     assert payload['updatedAt'] == '2026-01-01'
 
 
-def test_photos_sort_index_route_never_forces_a_synchronous_cold_build(monkeypatch, sort_index_route_ctx):
-    """Regression pin: the gallery-load endpoint must call get_user_sort_index
-    with allow_sync_build=False so a cold library returns available:false
-    immediately (client falls back to legacy) instead of blocking the initial
-    load on a full-library scan -- which would also re-create the O(library
-    size) memory spike the whole sort index exists to eliminate."""
-    captured = {}
+def test_photos_sort_index_route_never_loads_the_data_blob(monkeypatch, sort_index_route_ctx):
+    """Regression pin for the 2026-09-30 OOM: the gallery-load endpoint must
+    mint the URL from the manifest only (get_index_manifest_summary), never
+    get_user_sort_index -- that loads+caches the whole sort blob into this 1Gi
+    process, the memory pattern that OOM-crash-looped backend."""
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: {'source_version': 'v3', 'updated_at': 'v3', 'dirty': False})
+    monkeypatch.setattr(app, 'get_sort_index_blob_location', lambda *a, **k: ('lexical-index', 'abc-sort.json.gz'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: ('https://example.invalid/abc?sas', 'exp'))
 
-    def _spy(user_id, **kwargs):
-        captured.update(kwargs)
-        return None  # simulate a cold library
+    def _boom(*a, **k):
+        raise AssertionError('sort-index must not call get_user_sort_index (loads the blob)')
 
-    monkeypatch.setattr(app, 'get_user_sort_index', _spy)
+    monkeypatch.setattr(app, 'get_user_sort_index', _boom)
 
     with app.app.test_request_context('/api/photos/sort-index'):
         response = photos_sort_index()
 
-    assert captured.get('allow_sync_build') is False
-    assert response.status_code == 200
-    assert response.get_json() == {'available': False}
+    assert response.get_json()['available'] is True
+
+
+def test_photos_sort_index_dirty_manifest_triggers_tools_rebuild(monkeypatch, sort_index_route_ctx):
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: {'source_version': 'v4', 'updated_at': 'v4', 'dirty': True})
+    monkeypatch.setattr(app, 'get_sort_index_blob_location', lambda *a, **k: ('lexical-index', 'abc-sort.json.gz'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: ('https://example.invalid/abc?sas', 'exp'))
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: triggered.append(uid))
+
+    with app.app.test_request_context('/api/photos/sort-index'):
+        response = photos_sort_index()
+
+    assert triggered == ['owner']
+    assert response.get_json()['available'] is True
 
 
 # --- cold-build is non-blocking + column projection --------------------------

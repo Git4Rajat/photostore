@@ -700,6 +700,14 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // to this app's OWN host, which 404s since backend no longer
             // serves that route. See public-album-share-preview memory.
             { name: 'EXTRAS_PUBLIC_BASE_URL', value: 'https://${extras.properties.configuration.ingress.fqdn}' }
+            // Lets the search-index/sort-index SAS-mint routes fire a
+            // fire-and-forget rebuild on the tools role when they observe a
+            // dirty manifest -- replacing the in-process background rebuild
+            // backend used to run (which loaded the whole index blob into this
+            // 1Gi container's memory, the OOM driver fixed 2026-09-30). Backend
+            // never builds/loads the blob itself now; it only mints the URL and
+            // nudges tools. See _trigger_tools_index_rebuild in backend/app.py.
+            { name: 'TOOLS_INTERNAL_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
           ])
         }
       ]
