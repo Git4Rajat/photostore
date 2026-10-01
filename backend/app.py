@@ -11826,14 +11826,37 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
 
     renewal_thread = threading.Thread(target=_renew_lease, daemon=True)
     renewal_thread.start()
+    start_time = time.monotonic()
     try:
         payload = json.loads(message.content or '{}')
         if isinstance(payload, dict):
             job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
             user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
             job_type = str(payload.get('type') or '').strip()
+            # Logged BEFORE dispatch, not just after -- this is the one line
+            # that survives a genuine hang: if processing never returns, this
+            # is still on record showing exactly which job_type/filename/user
+            # was in flight, instead of needing an external forensic
+            # investigation (queue peeks, CPU/transaction metrics, replica
+            # state) to even guess what was running. Confirmed live
+            # 2026-10-01 on microsvcpoc-dev: this worker had zero per-message
+            # visibility at all, unlike ipworker's equivalent timing logs.
+            worker_logger.info(
+                'clustering message started job_type=%s filename=%s user=%s dequeue_count=%s',
+                job_type or 'people_incremental_assign', payload.get('filename') or '', user_id, dequeue_count,
+            )
             _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
+            worker_logger.info(
+                'clustering message done job_type=%s filename=%s user=%s elapsed_ms=%d',
+                job_type or 'people_incremental_assign', payload.get('filename') or '', user_id,
+                int((time.monotonic() - start_time) * 1000),
+            )
     except Exception as exc:
+        worker_logger.info(
+            'clustering message failed job_type=%s filename=%s user=%s elapsed_ms=%d',
+            job_type or 'people_incremental_assign', payload.get('filename') if isinstance(payload, dict) else '', user_id,
+            int((time.monotonic() - start_time) * 1000),
+        )
         if job_id and user_id:
             try:
                 _upsert_job_status(job_id, user_id, 'clustering', 'failed', error='Clustering failed')
