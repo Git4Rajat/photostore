@@ -245,6 +245,7 @@ _VECTOR_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
 
 _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK = threading.RLock()
 _PEOPLE_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_PEOPLE_EMBEDDING_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 _VECTOR_INDEX_RELEVANT_FIELDS = {
     'address',
     'aiPersonLabel',
@@ -2076,6 +2077,39 @@ def refresh_user_people_embedding_index(
     return snapshot
 
 
+def _rebuild_people_embedding_index_in_background(key: str, manifest: Dict[str, object]) -> None:
+    """Mirrors _rebuild_people_index_in_background: kicks off a rebuild off
+    the request thread if one isn't already running for this user, gated by
+    the same _index_rebuild_in_cooldown check.
+
+    Without this, every message that dirty-marks the manifest (i.e. nearly
+    every incremental assignment) forced the NEXT get_user_people_embedding_index
+    call to pay for a full person+face table scan plus NPZ/blob upload
+    synchronously, inline, in the clustering worker's message loop -- a
+    recurring ~18-20s stall roughly every PEOPLE_SCAN_CACHE_TTL_SECONDS,
+    capping throughput far below what the dedicated faces table alone should
+    allow. Serving the still-correct-as-of-last-write stale snapshot and
+    refreshing off-thread removes that stall from the hot path entirely.
+    """
+    if _index_rebuild_in_cooldown(key, 'people_embedding'):
+        return
+    lock = _PEOPLE_EMBEDDING_INDEX_REBUILD_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+            refresh_user_people_embedding_index(key, source_version=source_version)
+            _mark_index_rebuild_completed(key, 'people_embedding')
+        except Exception:
+            _LOGGER.exception('Background people-embedding index rebuild failed for user %s', key)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='people-embedding-index-rebuild', daemon=True).start()
+
+
 def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
     key = str(user_id or '').strip()
     if not key:
@@ -2087,11 +2121,18 @@ def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True)
 
     with _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK:
         cached = _PEOPLE_EMBEDDING_INDEX_CACHE.get(key)
-        if cached and cached.get('source_version') == manifest_source_version and not manifest_dirty:
+        if cached and cached.get('source_version') == manifest_source_version:
+            return cached
+        if cached and manifest_dirty:
+            # Dirty just means a newer sourceVersion was stamped by a
+            # touch_* call -- the cached snapshot is still correct as of its
+            # own source_version, just not the very latest. Serve it
+            # immediately and refresh off-thread instead of blocking here.
+            _rebuild_people_embedding_index_in_background(key, manifest)
             return cached
 
     snapshot = _load_people_embedding_index_npz(key)
-    if snapshot and snapshot.source_version == manifest_source_version and not manifest_dirty:
+    if snapshot and snapshot.source_version == manifest_source_version:
         data = {
             'source_version': snapshot.source_version,
             'embedding_version': snapshot.embedding_version,
@@ -2102,6 +2143,19 @@ def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True)
         }
         with _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK:
             _PEOPLE_EMBEDDING_INDEX_CACHE[key] = data
+        return data
+    if snapshot and manifest_dirty:
+        data = {
+            'source_version': snapshot.source_version,
+            'embedding_version': snapshot.embedding_version,
+            'updated_at': snapshot.updated_at,
+            'person_ids': snapshot.person_ids,
+            'embeddings': snapshot.embeddings,
+            'people_meta': snapshot.people_meta,
+        }
+        with _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK:
+            _PEOPLE_EMBEDDING_INDEX_CACHE[key] = data
+        _rebuild_people_embedding_index_in_background(key, manifest)
         return data
 
     if not allow_refresh:

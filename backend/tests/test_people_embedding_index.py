@@ -10,6 +10,7 @@ scan is already cheap at real-world person-count scale.
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -209,21 +210,7 @@ def test_get_user_people_embedding_index_uses_warm_cache_without_reloading_blob(
     assert result['person_ids'] == ['p1']
 
 
-def test_get_user_people_embedding_index_no_refresh_returns_none_when_dirty(ctx):
-    person_table, face_table, _blobs = ctx
-    _seed_person(person_table, 'u1', 'p1', ['f1'], [1.0, 0.0])
-    _seed_face(face_table, 'u1', 'f1', 'p1')
-    storage_utils.refresh_user_people_embedding_index('u1')
-    storage_utils.touch_user_people_embedding_index_state('u1')
-    storage_utils.invalidate_user_people_embedding_index_cache('u1')
-
-    # allow_refresh=False must not perform the expensive rebuild itself --
-    # this is the lazy-cold-start contract _load_people_embedding_index
-    # relies on.
-    assert storage_utils.get_user_people_embedding_index('u1', allow_refresh=False) is None
-
-
-def test_get_user_people_embedding_index_refreshes_when_dirty_and_allowed(ctx):
+def test_get_user_people_embedding_index_serves_stale_snapshot_when_dirty_without_blocking(ctx):
     person_table, face_table, _blobs = ctx
     _seed_person(person_table, 'u1', 'p1', ['f1'], [1.0, 0.0])
     _seed_face(face_table, 'u1', 'f1', 'p1')
@@ -233,7 +220,36 @@ def test_get_user_people_embedding_index_refreshes_when_dirty_and_allowed(ctx):
     _seed_person(person_table, 'u1', 'p2', ['f2'], [0.0, 1.0])
     _seed_face(face_table, 'u1', 'f2', 'p2')
 
-    result = storage_utils.get_user_people_embedding_index('u1', allow_refresh=True)
+    # allow_refresh=False must serve the last-known-good snapshot immediately
+    # instead of forcing a synchronous rebuild when merely dirty -- that
+    # synchronous rebuild (a full person+face scan) is exactly what used to
+    # run inline in the clustering worker's message loop on every cache-TTL
+    # expiry, since real traffic keeps this dirty nearly continuously.
+    result = storage_utils.get_user_people_embedding_index('u1', allow_refresh=False)
+    assert result is not None
+    assert set(result['person_ids']) == {'p1'}  # stale: p2 not folded in yet
+
+    for thread in threading.enumerate():
+        if thread.name == 'people-embedding-index-rebuild':
+            thread.join(timeout=5)
+
+
+def test_get_user_people_embedding_index_background_refresh_picks_up_new_person(ctx):
+    person_table, face_table, _blobs = ctx
+    _seed_person(person_table, 'u1', 'p1', ['f1'], [1.0, 0.0])
+    _seed_face(face_table, 'u1', 'f1', 'p1')
+    storage_utils.refresh_user_people_embedding_index('u1')
+    storage_utils.touch_user_people_embedding_index_state('u1')
+    storage_utils.invalidate_user_people_embedding_index_cache('u1')
+    _seed_person(person_table, 'u1', 'p2', ['f2'], [0.0, 1.0])
+    _seed_face(face_table, 'u1', 'f2', 'p2')
+
+    storage_utils.get_user_people_embedding_index('u1', allow_refresh=False)
+    for thread in threading.enumerate():
+        if thread.name == 'people-embedding-index-rebuild':
+            thread.join(timeout=5)
+
+    result = storage_utils.get_user_people_embedding_index('u1', allow_refresh=False)
     assert result is not None
     assert set(result['person_ids']) == {'p1', 'p2'}
 
