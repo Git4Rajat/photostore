@@ -1,3 +1,5 @@
+import contextlib
+import contextvars
 import gzip
 import io
 import hashlib
@@ -6627,18 +6629,23 @@ def apply_client_processing_results_for_file(
         return image_bytes_cache[0]
 
     try:
-        _apply_client_processing_results(
-            user_id,
-            filename,
-            metadata,
-            get_image_bytes,
-            client_processing,
-            client_processing_report,
-            client_asset_id,
-            thumbnail_already_uploaded=thumbnail_already_uploaded,
-            origin=origin,
-            claimed_steps=claimed_steps,
-        )
+        # Batches every update_processing_status call _apply_client_processing_results
+        # makes (one per completed step -- thumbnail/exif/ocr/face/ai_vision/
+        # map_detection) into a single Table Storage read + write on exit,
+        # instead of one round trip per step. See batched_processing_status_updates.
+        with batched_processing_status_updates(user_id, filename):
+            _apply_client_processing_results(
+                user_id,
+                filename,
+                metadata,
+                get_image_bytes,
+                client_processing,
+                client_processing_report,
+                client_asset_id,
+                thumbnail_already_uploaded=thumbnail_already_uploaded,
+                origin=origin,
+                claimed_steps=claimed_steps,
+            )
     except Exception as exc:
         _unstick_claimed_steps_still_running(user_id, filename, claimed_steps, str(exc))
         raise
@@ -6870,6 +6877,39 @@ PROCESSING_STEPS = (*BROWSER_PROCESSING_STEPS, 'verify')
 CLIENT_PROCESSING_LEASE_SECONDS = int(os.getenv('CLIENT_PROCESSING_LEASE_SECONDS', '120'))
 
 
+# apply_client_processing_results_for_file's single call processes several
+# steps (ocr/face/ai_vision/map_detection/...) per photo, and each used to
+# call update_processing_status separately -- one full Table Storage
+# read-then-conditional-write round trip per step. Under a large ipworker
+# backlog (many messages in flight concurrently against the same account)
+# this was the dominant cost in that call's "apply" phase (confirmed live
+# 2026-10-01: apply_ms running 11-23s per photo against a ~400-500/hr
+# backlog, vs. sub-second actual inference time). A contextvar (not a plain
+# parameter threaded through every mark_step_done call site) so none of
+# _apply_client_processing_results's many existing call sites need to
+# change -- batching is entirely opt-in from the two outer functions that
+# wrap a single photo's worth of step updates. None (the default) preserves
+# the original immediate-write behavior for every other caller.
+_STEP_UPDATE_BATCH: 'contextvars.ContextVar[Optional[List[Dict]]]' = contextvars.ContextVar(
+    '_photostore_step_update_batch', default=None,
+)
+
+
+@contextlib.contextmanager
+def batched_processing_status_updates(user_id: str, filename: str):
+    """Collect every update_processing_status call made while this context is
+    active and flush them as a single read + conditional-write on exit,
+    instead of one round trip per call. See _STEP_UPDATE_BATCH above."""
+    token = _STEP_UPDATE_BATCH.set([])
+    try:
+        yield
+    finally:
+        batch = _STEP_UPDATE_BATCH.get()
+        _STEP_UPDATE_BATCH.reset(token)
+        if batch:
+            _flush_processing_status_batch(user_id, filename, batch)
+
+
 def update_processing_status(
     user_id: str,
     filename: str,
@@ -6880,6 +6920,13 @@ def update_processing_status(
     error: Optional[str] = None,
     increment_retry: bool = False,
 ) -> None:
+    batch = _STEP_UPDATE_BATCH.get()
+    if batch is not None:
+        batch.append({
+            'step': step, 'status': status, 'result': result,
+            'error': error, 'increment_retry': increment_retry,
+        })
+        return
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
     for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
@@ -6913,6 +6960,51 @@ def update_processing_status(
             # identical comment. A concurrent writer (another ipwork step, a
             # user edit) between the read and this write loses this attempt
             # and retries against a fresh read instead of clobbering it.
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            return
+        except ResourceModifiedError:
+            import time
+            time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
+            continue
+        except ResourceNotFoundError:
+            return  # deleted between our read and this write -- nothing left to update
+
+
+def _flush_processing_status_batch(user_id: str, filename: str, updates: List[Dict]) -> None:
+    """Applies every queued update_processing_status call from one
+    batched_processing_status_updates context as a single read + conditional
+    write. Mirrors update_processing_status's own single-step logic exactly,
+    just folding N steps into one entity mutation instead of N."""
+    _require_context()
+    metadata_table_client = _CTX['metadata_table_client']
+    for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            return
+        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+            return
+
+        processing = _safe_json_load(entity.get('processing_metadata'))
+        for update in updates:
+            step = update['step']
+            status = update['status']
+            result = update.get('result')
+            error = update.get('error')
+            entity[f'{step}_status'] = status
+            if result is not None:
+                processing[step] = result
+            elif status == 'no_data':
+                processing[step] = None
+            if error:
+                entity['last_error'] = str(error)
+                if update.get('increment_retry'):
+                    entity['retry_count'] = int(entity.get('retry_count', 0) or 0) + 1
+
+        entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        entity['processing_complete'] = _photo_processing_complete(entity)
+        try:
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             return
         except ResourceModifiedError:
