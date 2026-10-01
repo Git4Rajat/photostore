@@ -17,6 +17,39 @@ import app
 import storage_utils
 from fakes import FakeTable
 
+
+class _FakeBlob:
+    def __init__(self, store: dict, key: str) -> None:
+        self._store = store
+        self._key = key
+
+    def upload_blob(self, data, overwrite=True, content_settings=None):
+        self._store[self._key] = data
+
+    def download_blob(self):
+        if self._key not in self._store:
+            raise KeyError(self._key)
+        return _Downloaded(self._store[self._key])
+
+    def delete_blob(self):
+        self._store.pop(self._key, None)
+
+
+class _Downloaded:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def readall(self) -> bytes:
+        return self._data
+
+
+class _FakeBlobServiceClient:
+    def __init__(self) -> None:
+        self.blobs: dict = {}
+
+    def get_blob_client(self, container, blob):
+        return _FakeBlob(self.blobs, f'{container}/{blob}')
+
 # Two embeddings deliberately far enough apart (near-orthogonal) that cosine
 # similarity sits well below any of the assign-threshold presets (0.68-0.80),
 # and one embedding pair deliberately near-identical (cosine ~1.0) so tests
@@ -123,6 +156,47 @@ def test_matches_using_embedding_from_dedicated_table_when_row_has_no_inline_emb
     assert face_table.get_entity(user_id, 'new-face')['personId'] == 'person-1'
     # Only the one pre-existing person row -- no new person was minted.
     assert len(person_table.rows) == 1
+
+
+def test_load_people_embedding_index_uses_blob_instead_of_scanning_tables(
+    clustering_tables, monkeypatch,
+):
+    """_load_people_embedding_index's blob-first branch must find a fresh
+    people-embedding-index blob and use it, without needing to scan
+    person_table_client/face_table_client at all -- the whole point of the
+    durable index for a freshly-scaled-up worker replica's first call."""
+    face_table, person_table = clustering_tables
+    user_id = 'lib-A'
+    blob_service = _FakeBlobServiceClient()
+    monkeypatch.setitem(storage_utils._CTX, 'blob_service_client', blob_service)
+    monkeypatch.setitem(storage_utils._CTX, 'blob_people_embedding_index_container', 'people-embedding-index')
+    # storage_utils._build_user_people_embedding_index_snapshot reads its own
+    # _CTX-level table clients (separate from app.py's globals this fixture
+    # already patched) -- point both at the same fixture tables so the blob
+    # build sees the exact data app.py's own scan would have.
+    monkeypatch.setitem(storage_utils._CTX, 'person_table_client', person_table)
+    monkeypatch.setitem(storage_utils._CTX, 'face_table_client', face_table)
+
+    _seed_person(person_table, user_id, 'person-1', ['face-1'], PERSON_A_EMBEDDING, name='Alice')
+    _seed_face(face_table, user_id, 'face-1', 'photo.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    storage_utils.refresh_user_people_embedding_index(user_id)
+
+    # Sabotage the live tables -- if _load_people_embedding_index fell
+    # through to its Table-scan path instead of using the blob, it would
+    # find nothing and return an empty index.
+    person_table.rows.clear()
+    face_table.rows.clear()
+
+    index = app._load_people_embedding_index(user_id)
+
+    assert len(index) == 1
+    assert index[0]['personId'] == 'person-1'
+    assert index[0]['name'] == 'Alice'
+    assert index[0]['faceIds'] == ['face-1']
+    # pytest.approx -- the blob stores embeddings as float32 (same as the
+    # photo vector index), so a float64 round trip loses precision in the
+    # last couple of digits; this is expected, not a correctness bug.
+    assert index[0]['repEmbedding'] == pytest.approx(PERSON_A_EMBEDDING, rel=1e-6)
 
 
 def test_no_match_creates_exactly_one_new_unnamed_person(clustering_tables):

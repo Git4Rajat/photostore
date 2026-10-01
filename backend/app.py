@@ -116,6 +116,10 @@ from storage_utils import (
     get_user_people_index,
     get_people_index_blob_location,
     delete_user_people_index_data,
+    touch_user_people_embedding_index_state,
+    get_user_people_embedding_index,
+    refresh_user_people_embedding_index,
+    delete_user_people_embedding_index_data,
     get_user_lexical_index,
     get_lexical_index_blob_location,
     invalidate_user_lexical_index_cache,
@@ -551,6 +555,12 @@ STORAGE_CONNECTION_POOL_MAXSIZE = int(os.getenv('STORAGE_CONNECTION_POOL_MAXSIZE
 MEDIA_URL_MODE = os.getenv('MEDIA_URL_MODE', 'sas').strip().lower()
 BLOB_VECTOR_INDEX_CONTAINER = os.getenv('BLOB_VECTOR_INDEX_CONTAINER', 'vector-index').strip()
 BLOB_LEXICAL_INDEX_CONTAINER = os.getenv('BLOB_LEXICAL_INDEX_CONTAINER', 'lexical-index').strip()
+# Person-level rep-embedding index for worker's clustering matcher
+# (_load_people_embedding_index) -- distinct from BLOB_LEXICAL_INDEX_CONTAINER's
+# People-page listing index (touch_user_people_index_state/
+# refresh_user_people_index, a LexicalIndexSnapshot of names/cover photos, not
+# embeddings). See PeopleEmbeddingIndexSnapshot in storage_utils.py.
+BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER = os.getenv('BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER', 'people-embedding-index').strip()
 VECTOR_INDEX_PRIME_ON_STARTUP = os.getenv('VECTOR_INDEX_PRIME_ON_STARTUP', 'false').lower() in ('1', 'true', 'yes')
 VECTOR_INDEX_PRIME_MAX_USERS = max(0, int(os.getenv('VECTOR_INDEX_PRIME_MAX_USERS', '200')))
 SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS = os.getenv(
@@ -1428,6 +1438,7 @@ def _init_storage_clients():
         blob_cover_container=BLOB_COVER_CONTAINER,
         blob_vector_index_container=BLOB_VECTOR_INDEX_CONTAINER,
         blob_lexical_index_container=BLOB_LEXICAL_INDEX_CONTAINER,
+        blob_people_embedding_index_container=BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER,
         image_names_table_client=image_names_table_client,
         hash_index_table_client=hash_index_table_client,
         filename_owners_table_client=filename_owners_table_client,
@@ -1579,7 +1590,7 @@ def create_filename_owners_table() -> None:
 def create_blob_containers() -> None:
     if blob_service_client is None:
         return
-    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER, BLOB_MERGE_PAYLOADS_CONTAINER):
+    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER, BLOB_MERGE_PAYLOADS_CONTAINER):
         if not container_name:
             continue
         try:
@@ -4167,11 +4178,41 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
     # person/face table write), so this adds no new staleness window beyond
     # what those two already tolerate.
     def _build() -> List[Dict]:
-        rows = _cached_person_rows_for_user(user_id)
         try:
             import numpy as np
         except Exception:
             np = None
+
+        # Durable blob first (allow_refresh=False -- a cold/missing/dirty
+        # blob just falls through to the scan below rather than forcing an
+        # expensive synchronous rebuild here; that scan separately refreshes
+        # the blob for the NEXT cold start, see the end of this function).
+        # Lets a freshly-scaled-up worker replica skip straight to a ready
+        # index instead of redoing the full person+face scan this cache
+        # build would otherwise always pay on its very first call.
+        if np is not None:
+            blob_data = get_user_people_embedding_index(user_id, allow_refresh=False)
+            if blob_data is not None:
+                index: List[Dict] = []
+                raw_reps: List[List[float]] = []
+                embeddings = blob_data.get('embeddings')
+                for i, person_id in enumerate(blob_data.get('person_ids') or []):
+                    meta = (blob_data.get('people_meta') or [{}])[i]
+                    face_ids = [str(f) for f in (meta.get('faceIds') or [])]
+                    rep = embeddings[i].tolist() if embeddings is not None else []
+                    index.append({
+                        'personId': str(person_id),
+                        'name': meta.get('name', ''),
+                        'faceIds': face_ids,
+                        'repEmbedding': rep,
+                        'confirmedFaceCount': _confirmed_face_count(user_id, face_ids, str(person_id)),
+                    })
+                    raw_reps.append(rep)
+                if index:
+                    _attach_normalized_embeddings_batched(index, raw_reps, np)
+                return index
+
+        rows = _cached_person_rows_for_user(user_id)
 
         index = []
         raw_reps: List[List[float]] = []
@@ -4211,6 +4252,15 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
             # uploaded photo, was the other half of this function's
             # unvectorized CPU cost (see module docstring above).
             _attach_normalized_embeddings_batched(index, raw_reps, np)
+        # Best-effort: persist this fresh scan to the durable blob so the
+        # NEXT cold start (worker scaling up from zero) can skip straight to
+        # it via the allow_refresh=False read above, instead of every cold
+        # start always paying this same scan. Never blocks/fails this call
+        # on a storage hiccup.
+        try:
+            refresh_user_people_embedding_index(user_id)
+        except Exception:
+            pass
         return index
 
     return _people_embedding_index_cache.get(user_id, _build)
@@ -4964,6 +5014,12 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     # -- all Table Storage round-trips this process already has the answer
     # to in memory.
     _people_embedding_index_cache.set(user_id, session_embedding_index)
+    if assignments:
+        # Cheap dirty-mark only (deduped by _manifest_already_marked_dirty) --
+        # the durable blob's actual rebuild happens lazily on the next read
+        # that finds it dirty, not synchronously here. See
+        # touch_user_people_embedding_index_state's module docstring.
+        touch_user_people_embedding_index_state(user_id)
     return assignments, created_person_ids
 
 

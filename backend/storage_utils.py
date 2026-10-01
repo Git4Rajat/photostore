@@ -242,6 +242,9 @@ class _KeyedLockRegistry:
 
 _VECTOR_INDEX_CACHE_LOCK = threading.RLock()
 _VECTOR_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+
+_PEOPLE_EMBEDDING_INDEX_CACHE_LOCK = threading.RLock()
+_PEOPLE_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
 _VECTOR_INDEX_RELEVANT_FIELDS = {
     'address',
     'aiPersonLabel',
@@ -329,6 +332,28 @@ class LexicalIndexSnapshot:
 
 
 @dataclass
+class PeopleEmbeddingIndexSnapshot:
+    """Durable counterpart to app.py's in-process _load_people_embedding_index/
+    _people_embedding_index_cache -- a person-level rep-embedding index for
+    worker's clustering matcher (_best_two_person_matches), not to be
+    confused with VectorIndexSnapshot (photo-level, search) or
+    LexicalIndexSnapshot-via-touch_user_people_index_state (the People-page
+    listing index, names/cover photos, no embeddings at all)."""
+    user_id: str
+    source_version: str
+    embedding_version: str
+    updated_at: str
+    person_ids: List[str]
+    embeddings: np.ndarray
+    # Aligned by index with person_ids/embeddings. {'name': str, 'faceIds':
+    # List[str]} per person -- deliberately NOT confirmedFaceCount, which
+    # needs a face-summary scan to compute; the consumer (app.py) recomputes
+    # that cheaply from whatever face-summary cache it already has warm,
+    # rather than duplicating that scan here.
+    people_meta: List[Dict[str, object]]
+
+
+@dataclass
 class TagEmbeddingIndexSnapshot:
     user_id: str
     source_version: str
@@ -365,6 +390,7 @@ def configure_storage(
     blob_cover_container: Optional[str] = None,
     blob_vector_index_container: Optional[str] = None,
     blob_lexical_index_container: Optional[str] = None,
+    blob_people_embedding_index_container: Optional[str] = None,
     image_names_table_client=None,
     hash_index_table_client=None,
     filename_owners_table_client=None,
@@ -385,6 +411,7 @@ def configure_storage(
     _CTX['blob_cover_container'] = (blob_cover_container or '').strip()
     _CTX['blob_vector_index_container'] = (blob_vector_index_container or '').strip()
     _CTX['blob_lexical_index_container'] = (blob_lexical_index_container or '').strip()
+    _CTX['blob_people_embedding_index_container'] = (blob_people_embedding_index_container or '').strip()
     _CTX['image_names_table_client'] = image_names_table_client
     _CTX['hash_index_table_client'] = hash_index_table_client
     _CTX['filename_owners_table_client'] = filename_owners_table_client
@@ -1734,6 +1761,363 @@ def get_user_vector_index(user_id: str, *, allow_refresh: bool = True) -> Option
         'updated_at': refreshed.updated_at,
         'row_keys': refreshed.row_keys,
         'embeddings': refreshed.embeddings,
+    }
+
+
+# --- Per-user people-embedding index (clustering) ----------------------------
+# Durable counterpart to app.py's in-process _load_people_embedding_index --
+# a person-level rep-embedding blob the `worker` role's clustering matcher
+# can load on a cold start instead of always rebuilding from a Table Storage
+# scan. At real scale (~1,913 people on the account this was built against)
+# the blob is a few MB; the win is skipping the scan+rebuild's Table Storage
+# round trips and unvectorized CPU cost on the first message after
+# worker scales up from zero, not solving a cross-replica staleness problem
+# that doesn't exist here -- `worker` runs at a confirmed maxReplicas=1
+# (deploy/resources.bicep), so there is only ever one in-process cache to
+# keep warm, never multiple copies to reconcile. Deliberately simpler than
+# the photo vector index above: a full rebuild every time (no incremental
+# per-person dirty-set merge) since a full scan is already cheap at this
+# data scale, and dirty-marking only needs to flip a cheap manifest flag
+# (reusing _manifest_already_marked_dirty's existing dedup) -- the actual
+# rebuild stays lazy, happening on the next read that finds it dirty, not
+# synchronously inside the hot per-message assignment path.
+def _people_embedding_index_container_name() -> str:
+    return str(
+        _CTX.get('blob_people_embedding_index_container')
+        or os.getenv('BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER', 'people-embedding-index')
+    ).strip()
+
+
+def _people_embedding_index_blob_key(user_id: str) -> str:
+    return hashlib.sha256(str(user_id or '').encode('utf-8')).hexdigest()
+
+
+def _people_embedding_index_npz_blob_name(user_id: str) -> str:
+    return f'{_people_embedding_index_blob_key(user_id)}.npz'
+
+
+def _people_embedding_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_people_embedding_index_blob_key(user_id)}.json'
+
+
+def _people_embedding_index_blob_client(blob_name: str):
+    container_name = _people_embedding_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_people_embedding_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK:
+        _PEOPLE_EMBEDDING_INDEX_CACHE.pop(key, None)
+
+
+def delete_user_people_embedding_index_data(user_id: str) -> None:
+    """Delete a library's cached people-embedding-index blobs (npz +
+    manifest) and drop it from the in-memory cache. Best-effort: a missing
+    blob is not an error. Mirrors delete_user_vector_index_data."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for blob_name in (_people_embedding_index_npz_blob_name(key), _people_embedding_index_manifest_blob_name(key)):
+        blob_client = _people_embedding_index_blob_client(blob_name)
+        if blob_client is None:
+            continue
+        try:
+            blob_client.delete_blob()
+        except Exception:
+            pass
+    invalidate_user_people_embedding_index_cache(key)
+
+
+# Schema version for the blob format itself, NOT an ML embedding-model
+# version -- unlike the photo vector index (which must gate on CLIP model
+# compatibility for query-time matching), this blob is just a faster path
+# to the same repEmbedding data Table Storage already holds, already
+# versioned/validated at the source (person rows' own embeddingVersion
+# tracking via face rows). Bump this only if the NPZ layout changes.
+_PEOPLE_EMBEDDING_INDEX_SCHEMA_VERSION = '1'
+
+
+def touch_user_people_embedding_index_state(user_id: str) -> str:
+    """Dirty-mark the people-embedding-index manifest. Call this (not an
+    eager rebuild) wherever a person's faceIds/repEmbedding changes -- the
+    actual expensive rebuild happens lazily on the next
+    get_user_people_embedding_index call that finds it dirty."""
+    key = str(user_id or '').strip()
+    if not key:
+        return ''
+    if _manifest_already_marked_dirty(key, 'people_embedding'):
+        return ''
+    source_version = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        'userId': key,
+        'sourceVersion': source_version,
+        'embeddingVersion': _PEOPLE_EMBEDDING_INDEX_SCHEMA_VERSION,
+        'dirty': True,
+        'updatedAt': source_version,
+    }
+    blob_client = _people_embedding_index_blob_client(_people_embedding_index_manifest_blob_name(key))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    invalidate_user_people_embedding_index_cache(key)
+    return source_version
+
+
+def _load_people_embedding_index_manifest(user_id: str) -> Dict[str, str]:
+    blob_client = _people_embedding_index_blob_client(_people_embedding_index_manifest_blob_name(user_id))
+    if blob_client is None:
+        return {}
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_people_embedding_index_npz(user_id: str) -> Optional[PeopleEmbeddingIndexSnapshot]:
+    blob_client = _people_embedding_index_blob_client(_people_embedding_index_npz_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as data:
+            embeddings = np.asarray(data['embeddings'], dtype=np.float32)
+            person_ids_json = str(data['person_ids'].item() if np.asarray(data['person_ids']).shape == () else data['person_ids'][0])
+            people_meta_json = str(data['people_meta'].item() if np.asarray(data['people_meta']).shape == () else data['people_meta'][0])
+            source_version = str(data['source_version'].item() if np.asarray(data['source_version']).shape == () else data['source_version'][0])
+            embedding_version = str(data['embedding_version'].item() if np.asarray(data['embedding_version']).shape == () else data['embedding_version'][0])
+            updated_at = str(data['updated_at'].item() if np.asarray(data['updated_at']).shape == () else data['updated_at'][0])
+            person_ids = json.loads(person_ids_json) if person_ids_json else []
+            people_meta = json.loads(people_meta_json) if people_meta_json else []
+            if not isinstance(person_ids, list) or not isinstance(people_meta, list):
+                return None
+            person_ids = [str(item) for item in person_ids]
+            if embeddings.ndim != 2 or len(person_ids) != int(embeddings.shape[0]) or len(people_meta) != len(person_ids):
+                return None
+            return PeopleEmbeddingIndexSnapshot(
+                user_id=str(user_id),
+                source_version=source_version,
+                embedding_version=embedding_version,
+                updated_at=updated_at,
+                person_ids=person_ids,
+                embeddings=embeddings,
+                people_meta=people_meta,
+            )
+    except Exception:
+        return None
+
+
+def _serialize_people_embedding_index(snapshot: PeopleEmbeddingIndexSnapshot) -> bytes:
+    buffer = io.BytesIO()
+    np.savez_compressed(
+        buffer,
+        embeddings=np.asarray(snapshot.embeddings, dtype=np.float32),
+        person_ids=np.asarray([json.dumps(snapshot.person_ids, ensure_ascii=False, separators=(',', ':'))]),
+        people_meta=np.asarray([json.dumps(snapshot.people_meta, ensure_ascii=False, separators=(',', ':'))]),
+        source_version=np.asarray([snapshot.source_version]),
+        embedding_version=np.asarray([snapshot.embedding_version]),
+        updated_at=np.asarray([snapshot.updated_at]),
+    )
+    return buffer.getvalue()
+
+
+def _build_user_people_embedding_index_snapshot(user_id: str, source_version: str) -> Optional[PeopleEmbeddingIndexSnapshot]:
+    person_table_client = _CTX.get('person_table_client')
+    face_table_client = _CTX.get('face_table_client')
+    empty = PeopleEmbeddingIndexSnapshot(
+        user_id=str(user_id), source_version=source_version,
+        embedding_version=_PEOPLE_EMBEDDING_INDEX_SCHEMA_VERSION, updated_at=source_version,
+        person_ids=[], embeddings=np.zeros((0, 0), dtype=np.float32), people_meta=[],
+    )
+    if person_table_client is None or face_table_client is None:
+        return None
+    try:
+        person_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        person_rows = []
+    if not person_rows:
+        return empty
+
+    # Active-face cross-verification, same shape as app.py's
+    # _active_face_ids_for_person: a person's faceIds list is only trusted
+    # for faces that ALSO point back to that person (and aren't rejected).
+    # One cheap metadata-only scan (no embedding column -- this function
+    # never needs individual face embeddings, only each person's own
+    # repEmbedding) instead of a per-person point-read per face_id.
+    try:
+        face_rows = list(face_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'",
+            select=['RowKey', 'personId', 'rejected', 'reviewStatus'],
+        ))
+    except Exception:
+        face_rows = []
+    face_owner_by_id: Dict[str, str] = {}
+    for row in face_rows:
+        if row.get('rejected') or str(row.get('reviewStatus') or '').strip().lower() == 'rejected':
+            continue
+        fid = str(row.get('RowKey') or '')
+        if fid:
+            face_owner_by_id[fid] = str(row.get('personId') or '')
+
+    person_ids: List[str] = []
+    people_meta: List[Dict[str, object]] = []
+    raw_reps: List[List[float]] = []
+    for row in person_rows:
+        person_id = str(row.get('RowKey') or '')
+        if not person_id:
+            continue
+        try:
+            face_ids = [str(fid) for fid in json.loads(row.get('faceIds', '[]') or '[]')]
+        except Exception:
+            face_ids = []
+        active_face_ids = [fid for fid in face_ids if face_owner_by_id.get(fid) == person_id]
+        if not active_face_ids:
+            continue
+        try:
+            rep = json.loads(row.get('repEmbedding', '[]') or '[]')
+        except Exception:
+            rep = []
+        if not rep:
+            continue
+        person_ids.append(person_id)
+        people_meta.append({'name': row.get('name', ''), 'faceIds': active_face_ids})
+        raw_reps.append([float(v) for v in rep if isinstance(v, (int, float))])
+
+    if not person_ids:
+        return empty
+
+    target_dim = max(len(rep) for rep in raw_reps)
+
+    def _aligned(rep: List[float]) -> List[float]:
+        if len(rep) == target_dim:
+            return rep
+        if len(rep) > target_dim:
+            return rep[:target_dim]
+        return rep + [0.0] * (target_dim - len(rep))
+
+    embeddings = np.asarray([_aligned(rep) for rep in raw_reps], dtype=np.float32)
+    return PeopleEmbeddingIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        embedding_version=_PEOPLE_EMBEDDING_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        person_ids=person_ids,
+        embeddings=embeddings,
+        people_meta=people_meta,
+    )
+
+
+def refresh_user_people_embedding_index(
+    user_id: str, *, source_version: Optional[str] = None,
+) -> Optional[PeopleEmbeddingIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+    snapshot = _build_user_people_embedding_index_snapshot(key, source_version)
+    if snapshot is None:
+        return None
+    container_name = _people_embedding_index_container_name()
+    if container_name:
+        blob_client = _people_embedding_index_blob_client(_people_embedding_index_npz_blob_name(key))
+        if blob_client is not None:
+            try:
+                blob_client.upload_blob(
+                    _serialize_people_embedding_index(snapshot),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/octet-stream'),
+                )
+            except Exception:
+                pass
+        _clear_manifest_dirty_flag(key, 'people_embedding')
+        manifest = {
+            'userId': key,
+            'sourceVersion': snapshot.source_version,
+            'embeddingVersion': snapshot.embedding_version,
+            'rowCount': len(snapshot.person_ids),
+            'dirty': False,
+            'updatedAt': snapshot.updated_at,
+        }
+        manifest_client = _people_embedding_index_blob_client(_people_embedding_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            try:
+                manifest_client.upload_blob(
+                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json'),
+                )
+            except Exception:
+                pass
+    with _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK:
+        _PEOPLE_EMBEDDING_INDEX_CACHE[key] = {
+            'source_version': snapshot.source_version,
+            'embedding_version': snapshot.embedding_version,
+            'updated_at': snapshot.updated_at,
+            'person_ids': snapshot.person_ids,
+            'embeddings': snapshot.embeddings,
+            'people_meta': snapshot.people_meta,
+        }
+    return snapshot
+
+
+def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    manifest = _load_people_embedding_index_manifest(key)
+    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
+    manifest_dirty = bool(manifest.get('dirty'))
+
+    with _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK:
+        cached = _PEOPLE_EMBEDDING_INDEX_CACHE.get(key)
+        if cached and cached.get('source_version') == manifest_source_version and not manifest_dirty:
+            return cached
+
+    snapshot = _load_people_embedding_index_npz(key)
+    if snapshot and snapshot.source_version == manifest_source_version and not manifest_dirty:
+        data = {
+            'source_version': snapshot.source_version,
+            'embedding_version': snapshot.embedding_version,
+            'updated_at': snapshot.updated_at,
+            'person_ids': snapshot.person_ids,
+            'embeddings': snapshot.embeddings,
+            'people_meta': snapshot.people_meta,
+        }
+        with _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK:
+            _PEOPLE_EMBEDDING_INDEX_CACHE[key] = data
+        return data
+
+    if not allow_refresh:
+        return None
+
+    source_version = manifest_source_version or datetime.now(timezone.utc).isoformat()
+    refreshed = refresh_user_people_embedding_index(key, source_version=source_version)
+    if refreshed is None:
+        return None
+    return {
+        'source_version': refreshed.source_version,
+        'embedding_version': refreshed.embedding_version,
+        'updated_at': refreshed.updated_at,
+        'person_ids': refreshed.person_ids,
+        'embeddings': refreshed.embeddings,
+        'people_meta': refreshed.people_meta,
     }
 
 
