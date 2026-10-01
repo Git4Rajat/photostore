@@ -4502,7 +4502,10 @@ def _remove_faces_for_filename(user_id: str, filename: str) -> None:
         return
     try:
         query = f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
-        rows = list(face_table_client.query_entities(query))
+        # select= excludes the large 'embedding' column -- only RowKey/personId
+        # are read below, and every row here is only ever delete_entity'd by
+        # key, never re-upserted, so dropping embedding from the read is safe.
+        rows = list(face_table_client.query_entities(query, select=FACE_SUMMARY_COLUMNS))
     except Exception:
         rows = []
     removed_face_ids = []
@@ -5792,12 +5795,19 @@ def _rebuild_metadata_faces_for_filename(
         metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
     except Exception:
         return {'updated': False, 'missingMetadata': True}
-    try:
-        rows = list(face_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
-        ))
-    except Exception:
-        rows = []
+    # Was an uncached query_entities("PartitionKey eq user and filename eq X")
+    # -- same bug class as _store_client_face_entities's (storage_utils.py)
+    # and _face_ids_awaiting_person_assignment's, just never fixed here: no
+    # secondary index on filename means Table Storage scans the whole
+    # partition regardless. This is the hottest of the three -- called on
+    # every people_incremental_assign message that produces an assignment
+    # (see _assign_faces_to_people_incrementally's call below), the dominant
+    # message type behind a 63k-deep clustering queue when this was found
+    # live 2026-10-01 on microsvcpoc-dev, with a 99k-row face partition.
+    # _load_user_face_summary_by_id is the same cached per-user face scan
+    # those other two fixes use, filtered here in-memory by filename.
+    summary = _load_user_face_summary_by_id(user_id)
+    rows = [row for row in summary.values() if str(row.get('filename') or '') == filename]
     if searchable_person_index is None:
         searchable_person_index = _load_searchable_person_name_index(user_id)
     rows = sorted([row for row in rows if not _face_is_rejected(row)], key=lambda row: str(row.get('RowKey') or ''))
@@ -6065,7 +6075,11 @@ def _suppress_suspicious_faces(user_id: str, *, dry_run: bool = True) -> Dict:
     if face_table_client is None or person_table_client is None:
         return {'success': False, 'error': 'People features not configured'}
     try:
-        rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        # select= excludes 'embedding' -- this scan only feeds decision-making
+        # (confidence/bbox/personId checks below); the actual write path
+        # re-fetches a fresh full row per face before mutating+upserting it,
+        # so this read is never the one that gets written back.
+        rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'", select=FACE_SUMMARY_COLUMNS))
     except Exception:
         rows = []
 
@@ -6302,7 +6316,11 @@ def _rebuild_photo_people_index(user_id: str, *, dry_run: bool = True) -> Dict:
     if metadata_table_client is None or face_table_client is None or person_table_client is None:
         return {'success': False, 'error': 'People features not configured'}
     try:
-        rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        # select= excludes 'embedding' -- only filename/rejected-status are
+        # read below; actual metadata rebuilding happens via
+        # _rebuild_metadata_faces_for_filenames, which has its own
+        # (separately cached) read of the face rows it needs.
+        rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'", select=FACE_SUMMARY_COLUMNS))
     except Exception:
         rows = []
 
@@ -6548,6 +6566,21 @@ FACE_SUMMARY_COLUMNS = [
     # cached summary, so this projection needs to carry everything that
     # decision already depended on.
     'assignedByPropagation',
+    # Read by _face_payload_for_metadata via _rebuild_metadata_faces_for_filename
+    # -- added when that function switched from its own uncached
+    # filename-filtered full-partition scan (same bug class as
+    # _store_client_face_entities's, just never fixed there) to this shared
+    # cached summary. All small scalar/string fields, same as everything
+    # else in this projection -- the point of this list is to exclude only
+    # the large 'embedding' column, not to minimize row width further.
+    'qualityScore',
+    'detector',
+    'alignmentMethod',
+    'alignmentFailureReason',
+    'model',
+    'modelVersion',
+    'embeddingVersion',
+    'runtime',
 ]
 
 
@@ -9159,7 +9192,11 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
     owner_face_ids_by_person: Dict[str, set] = {}
     if face_table_client is not None:
         try:
-            all_face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+            # select= excludes 'embedding' -- only RowKey/personId are read
+            # here, for membership bookkeeping. The actual mutated-and-upserted
+            # face_ent below is a separate, fresh get_entity() per face_id, not
+            # this scan's rows, so dropping embedding here is safe.
+            all_face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'", select=FACE_SUMMARY_COLUMNS))
         except Exception:
             all_face_rows = []
         for face_row in all_face_rows:
@@ -10855,7 +10892,10 @@ def _batch_remove_faces_for_filenames(user_id: str, names_set: set) -> set:
     if face_table_client is None or not names_set:
         return deleted_person_ids
     try:
-        face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        # select= excludes 'embedding' -- only RowKey/filename are read below,
+        # and matched rows are only ever delete_entity'd by key, never
+        # re-upserted.
+        face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'", select=FACE_SUMMARY_COLUMNS))
     except Exception:
         face_rows = []
     matched_face_ids = [
