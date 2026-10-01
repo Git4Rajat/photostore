@@ -4744,6 +4744,37 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     index_by_person_id = {
         str(entry.get('personId') or ''): entry for entry in session_embedding_index
     }
+
+    # Reverse index: face_id -> (person_id, raw person row), built from every
+    # person's RAW faceIds list -- not just the cross-verified "active" faces
+    # session_embedding_index exposes (_active_face_ids_for_person drops any
+    # face whose OWN personId doesn't point back yet). Person-side and
+    # face-side state are written as two separate, non-atomic calls below
+    # (_create_person_entity/_add_face_to_person, then this loop's own
+    # face_table_client.upsert_entity) -- Table Storage batch transactions
+    # can't span two different tables, so true atomicity isn't available
+    # here. If this process dies between those two writes (confirmed
+    # happening repeatedly live 2026-10-01 on microsvcpoc-dev: a worker that
+    # kept getting killed mid-message), the face never gets its personId
+    # stamp, so it's still reported "awaiting assignment" on redelivery --
+    # but the person row it was already claimed by is invisible to matching
+    # (zero active faces), so without this, every redelivery created ANOTHER
+    # new orphan person for the same face. This map lets the loop below
+    # recognize "a person already claims this face, just finish the stamp"
+    # instead of re-matching/re-creating. Confirmed live: 450k+ person rows
+    # against ~100k faces on this account before this fix.
+    face_already_claimed_by: Dict[str, Tuple[str, Dict]] = {}
+    for row in _cached_person_rows_for_user(user_id):
+        claimant_id = str(row.get('RowKey') or '')
+        if not claimant_id:
+            continue
+        try:
+            claimed_face_ids = json.loads(row.get('faceIds', '[]') or '[]')
+        except Exception:
+            claimed_face_ids = []
+        for fid in claimed_face_ids:
+            face_already_claimed_by.setdefault(str(fid), (claimant_id, row))
+
     assignments: Dict[str, str] = {}
     created_person_ids: set = set()
     people_to_refresh = set()
@@ -4763,41 +4794,71 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
             continue
         face_norm = _normalized_embedding(emb, np)
 
-        best_score, second_best_score, best_person = _best_two_person_matches(
-            face_norm, session_embedding_index, np,
-        )
-
-        person_id = ''
         # Whether _add_face_to_person already ran _update_person_rep_embedding
         # for this person as part of this same write -- if so, the
         # people_to_refresh loop below must not redo it (that used to happen
         # unconditionally for every matched face: get person + get every one
         # of its face entities + upsert, all a second time for no new data).
         rep_already_refreshed = False
-        if (
-            best_person
-            and best_score >= PEOPLE_CLUSTER_ASSIGN_THRESHOLD
-            and (best_score - second_best_score) >= PEOPLE_CLUSTER_ASSIGN_MARGIN
-        ):
-            person_id = str(best_person.get('personId') or '')
-            rep_already_refreshed = _add_face_to_person(user_id, person_id, face_id)
-            if rep_already_refreshed:
-                best_person['faceIds'] = [*best_person.get('faceIds', []), face_id]
+        claim = face_already_claimed_by.get(face_id)
+        if claim is not None:
+            # Self-heal: a prior attempt already recorded this face under an
+            # existing person but crashed before stamping personId back onto
+            # the face row below. Complete that missing half instead of
+            # re-matching or creating a new person -- also skips the O(num
+            # people) embedding comparison entirely, since where this face
+            # belongs is already known.
+            person_id, claimant_row = claim
+            if person_id not in index_by_person_id:
+                # This claimant has zero OTHER active faces (exactly why it
+                # was invisible to matching) -- add it so the cache this
+                # function hands back at the end reflects it correctly, and
+                # so a second claimed face_id in this same batch matches it
+                # too instead of each independently rebuilding the same fix.
+                try:
+                    claimant_rep = json.loads(claimant_row.get('repEmbedding', '[]') or '[]')
+                except Exception:
+                    claimant_rep = []
+                new_entry = {
+                    'personId': person_id,
+                    'name': claimant_row.get('name', ''),
+                    'faceIds': [face_id],
+                    'repEmbedding': claimant_rep or emb,
+                    '_normalized_rep_embedding': _normalized_embedding(claimant_rep or emb, np),
+                    'confirmedFaceCount': 0,
+                }
+                session_embedding_index.append(new_entry)
+                index_by_person_id[person_id] = new_entry
         else:
-            name = next_unnamed_person_name()
-            person_id = _create_person_entity(user_id, [face_id], emb, name=name)
-            if person_id:
-                created_person_ids.add(person_id)
-            new_entry = {
-                'personId': person_id,
-                'name': name,
-                'faceIds': [face_id],
-                'repEmbedding': emb,
-                '_normalized_rep_embedding': face_norm,
-                'confirmedFaceCount': 0,
-            }
-            session_embedding_index.append(new_entry)
-            index_by_person_id[person_id] = new_entry
+            best_score, second_best_score, best_person = _best_two_person_matches(
+                face_norm, session_embedding_index, np,
+            )
+
+            person_id = ''
+            if (
+                best_person
+                and best_score >= PEOPLE_CLUSTER_ASSIGN_THRESHOLD
+                and (best_score - second_best_score) >= PEOPLE_CLUSTER_ASSIGN_MARGIN
+            ):
+                person_id = str(best_person.get('personId') or '')
+                rep_already_refreshed = _add_face_to_person(user_id, person_id, face_id)
+                if rep_already_refreshed:
+                    best_person['faceIds'] = [*best_person.get('faceIds', []), face_id]
+            else:
+                name = next_unnamed_person_name()
+                person_id = _create_person_entity(user_id, [face_id], emb, name=name)
+                if person_id:
+                    created_person_ids.add(person_id)
+                new_entry = {
+                    'personId': person_id,
+                    'name': name,
+                    'faceIds': [face_id],
+                    'repEmbedding': emb,
+                    '_normalized_rep_embedding': face_norm,
+                    'confirmedFaceCount': 0,
+                }
+                session_embedding_index.append(new_entry)
+                index_by_person_id[person_id] = new_entry
 
         if not person_id:
             continue
