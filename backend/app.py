@@ -4001,6 +4001,17 @@ def _best_two_person_matches(
     return best_score, second_best_score, best_person
 
 
+def _cosine_eps_to_euclidean(eps_cosine: float, np) -> float:
+    """For L2-normalized vectors, ||a-b||^2 = 2 - 2*cos_sim(a,b) =
+    2*cosine_distance(a,b) -- an exact identity, not an approximation. So a
+    DBSCAN eps calibrated in cosine-distance terms (this codebase's existing
+    PEOPLE_CLUSTER_EPS* constants) converts losslessly to the equivalent
+    euclidean eps via sqrt(2*eps_cosine), letting DBSCAN run metric='euclidean'
+    directly on the normalized embeddings instead of metric='precomputed'
+    against a dense NxN distance matrix built from them."""
+    return float(np.sqrt(max(0.0, 2.0 * eps_cosine)))
+
+
 def _split_cluster_by_max_pair_distance(indices: List[int], dist_matrix, max_distance: float) -> List[List[int]]:
     if len(indices) <= 1:
         return [list(indices)]
@@ -4077,14 +4088,28 @@ def _split_cluster_by_max_pair_distance(indices: List[int], dist_matrix, max_dis
 
 def _refine_clusters_by_max_pair_distance(
     clusters: Dict[int, List[int]],
-    dist_matrix,
+    normalized_embeddings,
     max_distance: float,
 ) -> Dict[int, List[int]]:
+    """normalized_embeddings is the L2-normalized embedding matrix (Xn),
+    indexed by the same global positions clusters' indices refer to.
+
+    Builds a small per-cluster distance submatrix on demand instead of
+    slicing one shared matrix covering every face DBSCAN was asked to
+    cluster -- that candidate pool can be tens of thousands of faces wide
+    (see cluster_user_faces/_build_people_recluster_plan), where a single
+    NxN matrix would be gigabytes to tens of gigabytes. Each individual
+    DBSCAN cluster is comparatively tiny by construction, so a matrix scoped
+    to just its own members costs nothing by comparison.
+    """
+    import numpy as np
     refined: Dict[int, List[int]] = {}
     next_label = 0
     for indices in clusters.values():
-        for split_indices in _split_cluster_by_max_pair_distance(indices, dist_matrix, max_distance):
-            refined[next_label] = split_indices
+        local = np.asarray(indices, dtype=np.int64)
+        sub_matrix = np.clip(1.0 - (normalized_embeddings[local] @ normalized_embeddings[local].T), 0.0, 2.0)
+        for split_local in _split_cluster_by_max_pair_distance(list(range(len(indices))), sub_matrix, max_distance):
+            refined[next_label] = [indices[i] for i in split_local]
             next_label += 1
     return refined
 
@@ -5147,8 +5172,16 @@ def cluster_user_faces(
     ], dtype=_embedding_precision_dtype(np))
     norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
     Xn = X / norms
-    dist_matrix = np.clip(1.0 - (Xn @ Xn.T), 0.0, 2.0)
-    clustering = DBSCAN(eps=effective_eps, min_samples=effective_min_samples, metric='precomputed').fit(dist_matrix)
+    # metric='euclidean' directly on the normalized embeddings instead of
+    # metric='precomputed' against a dense NxN cosine-distance matrix -- at
+    # this account's scale (tens of thousands of not-yet-clustered faces
+    # during a backfill), that matrix would be tens of gigabytes and OOM the
+    # worker outright rather than just run slowly. See
+    # _cosine_eps_to_euclidean's docstring for why this is an exact
+    # reparameterization, not an approximation.
+    clustering = DBSCAN(
+        eps=_cosine_eps_to_euclidean(effective_eps, np), min_samples=effective_min_samples, metric='euclidean',
+    ).fit(Xn)
     labels = clustering.labels_
 
     clusters: Dict[int, List[int]] = {}
@@ -5161,7 +5194,7 @@ def cluster_user_faces(
             clusters.setdefault(int(label), []).append(idx)
     clusters = _refine_clusters_by_max_pair_distance(
         clusters,
-        dist_matrix,
+        Xn,
         min(
             effective_eps,
             PEOPLE_CLUSTER_MAX_PAIR_DISTANCE,
@@ -5707,8 +5740,13 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
         if not global_indices:
             return {}
         sub_Xn = Xn[global_indices]
-        sub_dist = np.clip(1.0 - (sub_Xn @ sub_Xn.T), 0.0, 2.0)
-        sub_labels = DBSCAN(eps=eps, min_samples=2, metric='precomputed').fit(sub_dist).labels_
+        # metric='euclidean' directly on the normalized embeddings instead of
+        # metric='precomputed' against a dense per-tier cosine-distance
+        # matrix -- the 'landmark-5pt' tier alone can hold tens of thousands
+        # of faces during a backfill (most faces land in one tier), where
+        # that matrix would be tens of gigabytes. See
+        # _cosine_eps_to_euclidean's docstring for the exact reparameterization.
+        sub_labels = DBSCAN(eps=_cosine_eps_to_euclidean(eps, np), min_samples=2, metric='euclidean').fit(sub_Xn).labels_
         local_clusters: Dict[int, List[int]] = {}
         next_noise_label = int(np.max(sub_labels)) + 1 if len(sub_labels) else 0
         for local_idx, label in enumerate(sub_labels):
@@ -5717,7 +5755,7 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
                 next_noise_label += 1
             else:
                 local_clusters.setdefault(int(label), []).append(local_idx)
-        local_clusters = _refine_clusters_by_max_pair_distance(local_clusters, sub_dist, max_pair_distance)
+        local_clusters = _refine_clusters_by_max_pair_distance(local_clusters, sub_Xn, max_pair_distance)
         return {label: [global_indices[li] for li in local_idxs] for label, local_idxs in local_clusters.items()}
 
     tier_indices: Dict[str, List[int]] = {tier: [] for tier in PEOPLE_CLUSTER_ALIGNMENT_TIERS}
