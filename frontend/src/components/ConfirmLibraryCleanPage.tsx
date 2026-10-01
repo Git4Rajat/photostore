@@ -17,6 +17,12 @@ const ConfirmLibraryCleanPage: React.FC = () => {
     const [jobId, setJobId] = useState('');
     const [statusResult, setStatusResult] = useState<library.CleanStatusResult | null>(null);
     const pollTimer = useRef<number | null>(null);
+    // Unbounded before this: a transient status-check error just kept polling
+    // forever at the same flat 3s interval with no ceiling. 100 attempts (~5
+    // min) comfortably covers a real cleanup job, which this page's own
+    // design already expects to finish in well under that.
+    const pollAttempts = useRef(0);
+    const MAX_POLL_ATTEMPTS = 100;
 
     const handleConfirm = async () => {
         setErrorMessage('');
@@ -41,7 +47,9 @@ const ConfirmLibraryCleanPage: React.FC = () => {
 
     useEffect(() => {
         if (!jobId || outcome === 'done' || outcome === 'failed') return undefined;
+        pollAttempts.current = 0;
         const poll = async () => {
+            pollAttempts.current += 1;
             try {
                 const result = await library.getLibraryCleanStatus(jobId);
                 setStatusResult(result);
@@ -51,6 +59,11 @@ const ConfirmLibraryCleanPage: React.FC = () => {
                 }
             } catch {
                 // Keep polling; a transient status-check failure isn't fatal.
+            }
+            if (pollAttempts.current >= MAX_POLL_ATTEMPTS) {
+                setOutcome('failed');
+                setErrorMessage('Lost track of the cleanup job’s status. It may still be running — check back later.');
+                return;
             }
             pollTimer.current = window.setTimeout(poll, 3000);
         };

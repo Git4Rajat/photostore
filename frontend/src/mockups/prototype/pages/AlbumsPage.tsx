@@ -21,6 +21,7 @@ import { BottomSheet } from '../components/BottomSheet';
 import { ThumbSizeControl, useTileSize } from '../components/controls';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
+import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
 const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
     { value: '1', label: 'In 1 day', days: 1 },
@@ -44,8 +45,20 @@ export const AlbumsPage: React.FC = () => {
     const {
         albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, isAlbumPhotosLoading,
         createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
-        selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode,
+        selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums,
     } = useStore();
+
+    // Loads albums when this tab is actually visited, queued behind whatever
+    // else is already in flight instead of racing it -- rather than
+    // StoreProvider firing this unconditionally on every app mount regardless
+    // of which tab is open. Aborted if the user navigates away before its
+    // turn comes up. See the 2026-10-01 boot-request audit.
+    useEffect(() => {
+        const controller = new AbortController();
+        void enqueueBackgroundRequest(() => fetchAlbums(), { signal: controller.signal }).catch(() => {});
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
     // Detail vs. list is derived from the route (?albumId=…) rather than local
     // state, so tapping the Albums tab (which clears the param) always returns
     // to the album list on mobile instead of leaving you stuck inside an album.

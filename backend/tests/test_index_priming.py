@@ -48,6 +48,7 @@ def _patch_refreshers(monkeypatch, calls, *, slow_kind=None, entered=None, relea
         return _fn
 
     monkeypatch.setattr(storage_utils, 'refresh_user_sort_index', _make('sort'))
+    monkeypatch.setattr(storage_utils, 'refresh_user_access_index', _make('access'))
     monkeypatch.setattr(storage_utils, 'refresh_user_lexical_index', _make('lexical'))
     monkeypatch.setattr(storage_utils, 'refresh_user_albums_index', _make('albums'))
     monkeypatch.setattr(storage_utils, 'refresh_user_people_index', _make('people'))
@@ -70,7 +71,7 @@ def test_prime_all_user_indexes_sequentially_calls_refresh_in_order(monkeypatch)
     storage_utils.prime_all_user_indexes_sequentially('lib-order')
     _wait_for_prime_lock_free('lib-order')
 
-    assert calls == ['sort', 'lexical', 'albums', 'people']
+    assert calls == ['sort', 'access', 'lexical', 'albums', 'people']
 
 
 def test_prime_all_user_indexes_sequentially_is_single_flighted(monkeypatch):
@@ -90,7 +91,7 @@ def test_prime_all_user_indexes_sequentially_is_single_flighted(monkeypatch):
 
     release.set()
     _wait_for_prime_lock_free('lib-flight')
-    assert calls == ['sort', 'lexical', 'albums', 'people']  # only ever ran once
+    assert calls == ['sort', 'access', 'lexical', 'albums', 'people']  # only ever ran once
 
 
 def test_prime_all_user_indexes_sequentially_skips_kind_whose_own_lock_is_held(monkeypatch):
@@ -109,7 +110,7 @@ def test_prime_all_user_indexes_sequentially_skips_kind_whose_own_lock_is_held(m
     finally:
         sort_lock.release()
 
-    assert calls == ['lexical', 'albums', 'people']  # sort skipped, rest still ran
+    assert calls == ['access', 'lexical', 'albums', 'people']  # sort skipped, rest still ran
 
 
 def test_prime_all_user_indexes_sequentially_continues_after_one_kind_raises(monkeypatch):
@@ -119,7 +120,7 @@ def test_prime_all_user_indexes_sequentially_continues_after_one_kind_raises(mon
     storage_utils.prime_all_user_indexes_sequentially('lib-raise')
     _wait_for_prime_lock_free('lib-raise')
 
-    assert calls == ['sort', 'lexical', 'albums', 'people']  # lexical failed but didn't block the rest
+    assert calls == ['sort', 'access', 'lexical', 'albums', 'people']  # lexical failed but didn't block the rest
 
 
 def test_prime_all_user_indexes_sequentially_noop_for_blank_user_id(monkeypatch):
@@ -144,8 +145,8 @@ def test_prime_emits_progress_at_start_each_step_and_end(monkeypatch):
     )
     _wait_for_prime_lock_free('lib-progress')
 
-    # start(True) + one per kind(True x4) + terminal(False) = 6 emissions.
-    assert progress == [True, True, True, True, True, False]
+    # start(True) + one per kind(True x5) + terminal(False) = 7 emissions.
+    assert progress == [True, True, True, True, True, True, False]
 
 
 def test_index_prime_in_progress_reflects_held_lock():

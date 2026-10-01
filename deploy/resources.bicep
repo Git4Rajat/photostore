@@ -634,11 +634,27 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // Gunicorn workers are separate processes and the app is imported
             // AFTER fork (no --preload), so every worker loads its own copy of
             // numpy/scipy/scikit-learn/Pillow + the Azure SDKs (~250-350 MB
-            // each) and primes its own vector-index cache. Keep process
-            // fan-out at 1 and use threads (below) for concurrency instead --
-            // each additional worker duplicates that baseline RSS, while
-            // threads share it.
-            { name: 'GUNICORN_WORKERS', value: '1' }
+            // each) and primes its own vector-index cache -- each additional
+            // worker duplicates that baseline RSS, while threads share it.
+            //
+            // 2026-10-01: raised 1->2 to fix a live ContainerBackOff crash
+            // loop on microsvcpoc-dev: with a single worker process, both of
+            // its GUNICORN_THREADS=2 request threads could get tied up by a
+            // slow access-batch call (Table Storage fallback for filenames
+            // outside the listing index), leaving nothing to answer the
+            // liveness probe -- "liveness probe failed: connection refused"
+            // in system events, 6+ restarts/replica in 40min. A second
+            // worker is a separate process with its own thread pool, so it
+            // keeps answering health checks even while worker 1 is
+            // saturated. NOTE: the ~250-350MB/worker RSS duplication this
+            // guards against above is only affordable because live
+            // microsvcpoc-dev-backend is actually running 2vCPU/4Gi right
+            // now, NOT the 0.5vCPU/1Gi this file's cpu/memory lines below
+            // still say (unreconciled bicep/live drift -- see that resource
+            // block's own comment history). Don't deploy this file's
+            // cpu/memory values live without reconciling that drift first,
+            // or this doubles RSS on a container sized for half a worker.
+            { name: 'GUNICORN_WORKERS', value: '2' }
             // 2026-08-28: tried raising 4->12 live on photostore-test to fix
             // slow /upload/finalize|init-batch|client-processing|processing-
             // claim calls (each 20-90s+, ~19-28 concurrent against a 20-slot
@@ -709,6 +725,38 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // nudges tools. See _trigger_tools_index_rebuild in backend/app.py.
             { name: 'TOOLS_INTERNAL_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
           ])
+          // Explicit liveness probe, replacing whatever Container Apps'
+          // unconfigured default was (no probes block existed here before --
+          // every env var and timing choice on this container was deliberate
+          // except this one). Targets the gunicorn-master-owned health
+          // sidecar (port 5001, see gunicorn.conf.py's on_starting) instead
+          // of the app's own port 5000: a liveness check against 5000 shares
+          // fate with GUNICORN_THREADS -- if both of backend's two request
+          // threads are tied up (e.g. access-batch's Table Storage
+          // fallback), the probe queues behind them too and times out, which
+          // is exactly the live 2026-10-01 ContainerBackOff crash loop this
+          // fixes. The sidecar has zero dependency on app.py/Flask/storage
+          // clients, so it keeps answering even when every app thread is
+          // saturated -- it only stops if the master process itself is
+          // actually dead, which is the one case a restart is correct.
+          // Deliberately NOT overriding readiness here: whether a replica
+          // should receive NEW traffic right now is a different question
+          // from whether it should be killed, and the default readiness
+          // behavior correctly reflects real app-port capacity.
+          probes: [
+            {
+              type: 'Liveness'
+              httpGet: {
+                path: '/'
+                port: 5001
+                scheme: 'HTTP'
+              }
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            }
+          ]
         }
       ]
       scale: {

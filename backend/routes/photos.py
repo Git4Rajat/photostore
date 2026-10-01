@@ -108,19 +108,42 @@ def photo_access_url_batch():
     if not app.blob_service_client or not app.account_name:
         return app.jsonify({'error': 'Media access is not configured'}), 503
 
-    # Resolve metadata from the same cached full-account scan /photos uses,
-    # instead of one Table Storage get_entity round trip per filename. That
-    # per-filename loop was the dominant cost of this endpoint -- it scales
-    # directly with batch size, and a zoomed-out gallery page can request
-    # 100+ filenames in one call (see pageSizeForZoomLevel), turning into
-    # 100+ sequential round trips (tens of seconds). The scan is normally
-    # already warm here: /photos populates it moments earlier for the same
-    # page, on the same 20s TTL (_metadata_scan_cache).
-    try:
-        cached_rows = app._cached_metadata_list_rows_for_user(user_id, purpose='photos.access_batch')
-        metadata_map = {row['RowKey']: row for row in cached_rows if row.get('RowKey')}
-    except Exception:
-        metadata_map = {}
+    # Resolve filename -> {anonymousImageId, thumbnail_status, preview_status}
+    # from the access index (see storage_utils.py's "Access index" section)
+    # instead of one Table Storage get_entity round trip per filename. Unlike
+    # the listing index /photos uses, this one deliberately INCLUDES trashed
+    # rows, so the Recently Deleted page no longer guarantees a fallback miss
+    # for every filename it requests -- that per-filename Table Storage
+    # fallback (up to 200 sequential-ish round trips for one page) was slow
+    # enough to tie up this backend's thin GUNICORN_THREADS pool long enough
+    # to starve the liveness probe and crash-loop the whole replica (see
+    # storage_utils.py's access-index module comment for the full incident).
+    #
+    # allow_sync_build=False: a cold account (index never built) must not
+    # block this request on a full-library scan -- fall back to the
+    # per-filename path below for this one call, same as /photos/timeline's
+    # identical allow_sync_build=False use of the listing index.
+    access_index = app.get_user_access_index(user_id, allow_refresh=True, allow_sync_build=False)
+    metadata_map: app.Dict[str, app.Dict] = {}
+    if access_index is not None:
+        for row in access_index.get('rows') or []:
+            row_name = row.get('RowKey')
+            if row_name:
+                metadata_map[row_name] = {
+                    'anonymousImageId': row.get('blobName'),
+                    'thumbnail_status': row.get('thumbnailStatus'),
+                    'preview_status': row.get('previewStatus'),
+                }
+    else:
+        # Missing/dirty and this request didn't wait for a sync build --
+        # nudge the tools role to build it in the background (same pattern
+        # the search-index/sort-index SAS-mint routes already use) so the
+        # NEXT access-batch call for this account is fast instead of every
+        # call paying the per-filename fallback below forever.
+        try:
+            app._trigger_tools_index_rebuild(user_id)
+        except Exception:
+            pass
 
     safe_names = []
     for raw_name in filenames:
@@ -128,15 +151,11 @@ def photo_access_url_batch():
         if safe_name:
             safe_names.append(safe_name)
 
-    # _cached_metadata_list_rows_for_user deliberately excludes trashed rows
-    # (processing_state == 'deleted'), so every filename on the Recently
-    # Deleted page misses the cache here -- not just brand-new uploads. A
-    # serial per-filename _get_metadata_entity fallback turned that page's
-    # batch (up to 200 filenames) into 200 sequential Table Storage round
-    # trips, slow enough that the whole request could fail and leave every
-    # tile showing the empty-thumbnail placeholder. Fan the misses out
-    # concurrently instead, same bounded-concurrency pattern the delete
-    # endpoint above already uses for per-file Table Storage I/O.
+    # Remaining misses are now the rare case (a brand-new upload not yet
+    # merged into the access index, or a genuinely cold/unbuilt index) rather
+    # than the guaranteed case trashed filenames used to be. Same
+    # bounded-concurrency per-filename fallback as before for whatever's
+    # still missing.
     misses = [name for name in safe_names if name not in metadata_map]
     if misses:
         with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:

@@ -5,6 +5,7 @@ import { getLocalSortIndex, patchLocalSortIndexRow } from '../../services/localS
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import { getLocalPeopleIndex, invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
+import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
@@ -220,6 +221,10 @@ interface Store {
     // explore (places / things from /explore)
     exploreLoading: boolean;
     reloadExplore: () => void;
+    // Promise-returning counterpart of reloadExplore, for callers (the
+    // Explore tab's own mount effect) that need to queue/await/cancel it
+    // instead of firing it unconditionally -- see that page's mount effect.
+    fetchExplore: () => Promise<void>;
 
     // lookups
     photoById: (id: string) => Photo | undefined;
@@ -269,6 +274,8 @@ interface Store {
     // albums (server-backed)
     albumsLoading: boolean;
     reloadAlbums: () => void;
+    // Promise-returning counterpart of reloadAlbums -- see fetchExplore above.
+    fetchAlbums: () => Promise<void>;
     openAlbum: (id: string) => void;
     albumPhotosById: (id: string) => Photo[] | undefined;
     isAlbumPhotosLoading: (id: string) => boolean;
@@ -284,6 +291,8 @@ interface Store {
     // people (server-backed)
     peopleLoading: boolean;
     reloadPeople: () => void;
+    // Promise-returning counterpart of reloadPeople -- see fetchExplore above.
+    fetchPeople: () => Promise<void>;
     openPerson: (id: string) => void;
     personPhotosById: (id: string) => Photo[] | undefined;
     personPhotosLoading: boolean;
@@ -295,6 +304,8 @@ interface Store {
 
     // members / sharing (server-backed shared libraries)
     reloadMembers: () => void;
+    // Promise-returning counterpart of reloadMembers -- see fetchExplore above.
+    fetchMembers: () => Promise<void>;
     invite: (email: string, targetType: 'join' | 'fresh') => void;
     revokeInvite: (inviteId: string) => void;
     removeMember: (userId: string) => void;
@@ -490,8 +501,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, [fetchPhotosViaLegacyEndpoint]);
 
+    // Queued (not called directly) so this doesn't race fetchTimeline below
+    // for the same backend -- both used to fire in the same mount tick.
+    // Interactive callers (loadMorePhotos, reloadPhotos, setCaptureRange,
+    // the viewer-prefetch effect below) deliberately call fetchPhotos
+    // directly, not through the queue -- scrolling/pagination needs to stay
+    // immediate, not wait behind other boot/tab work. See the 2026-10-01
+    // boot-request audit.
     useEffect(() => {
-        void fetchPhotos(true);
+        void enqueueBackgroundRequest(() => fetchPhotos(true)).catch(() => {});
     }, [fetchPhotos]);
 
     const loadMorePhotos = useCallback(() => { void fetchPhotos(false); }, [fetchPhotos]);
@@ -511,8 +529,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, []);
 
+    // Queued behind fetchPhotos above -- see that effect's comment.
     useEffect(() => {
-        void fetchTimeline();
+        void enqueueBackgroundRequest(() => fetchTimeline()).catch(() => {});
     }, [fetchTimeline]);
 
     // Narrow the gallery to a capture-date window (from the timeline rail) and
@@ -911,9 +930,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         });
     }, [albumTrash, toast]);
 
-    useEffect(() => {
-        void fetchAlbums();
-    }, [fetchAlbums]);
+    // No longer fetched unconditionally on app mount -- AlbumsPage's own
+    // mount effect enqueues this (queue-managed, canceled on tab-leave) only
+    // when the user actually visits Albums. See the 2026-10-01 boot-request
+    // audit: this was one of six independent fetches StoreProvider fired in
+    // parallel in the same mount tick regardless of which tab was open.
 
     const fetchExplore = useCallback(async () => {
         setExploreLoading(true);
@@ -928,9 +949,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, []);
 
-    useEffect(() => {
-        void fetchExplore();
-    }, [fetchExplore]);
+    // No longer fetched unconditionally on app mount -- see the fetchAlbums
+    // comment above; ExplorePage's own mount effect enqueues this instead.
 
     const reloadExplore = useCallback(() => { void fetchExplore(); }, [fetchExplore]);
 
@@ -1196,9 +1216,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, [fetchPeopleViaLegacyEndpoint]);
 
-    useEffect(() => {
-        void fetchPeople();
-    }, [fetchPeople]);
+    // No longer fetched unconditionally on app mount -- see the fetchAlbums
+    // comment above; PeoplePage's own mount effect enqueues this instead.
 
     const reloadPeople = useCallback(() => { void fetchPeople(); }, [fetchPeople]);
 
@@ -1319,9 +1338,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, []);
 
-    useEffect(() => {
-        void fetchMembers();
-    }, [fetchMembers]);
+    // No longer fetched unconditionally on app mount -- see the fetchAlbums
+    // comment above; SharingPage's own mount effect enqueues this instead
+    // (it used to ALSO call reloadMembers() itself on its own mount, so
+    // visiting Sharing actually fetched members twice -- once here, once
+    // there).
 
     const reloadMembers = useCallback(() => { void fetchMembers(); }, [fetchMembers]);
 
@@ -1389,6 +1410,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             timeline,
             exploreLoading,
             reloadExplore,
+            fetchExplore,
             photoById,
             photosByIds,
             albumById,
@@ -1418,6 +1440,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             purgeAlbum,
             albumsLoading,
             reloadAlbums,
+            fetchAlbums,
             openAlbum,
             albumPhotosById,
             isAlbumPhotosLoading,
@@ -1431,6 +1454,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             revokeAlbum,
             peopleLoading,
             reloadPeople,
+            fetchPeople,
             openPerson,
             personPhotosById,
             personPhotosLoading,
@@ -1440,6 +1464,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             deletePerson,
             deletePeopleBatch,
             reloadMembers,
+            fetchMembers,
             invite,
             revokeInvite,
             removeMember,
@@ -1452,15 +1477,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, selectMode, viewer, toasts,
             photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
             mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
-            exploreLoading, reloadExplore,
+            exploreLoading, reloadExplore, fetchExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
             clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
-            albumsLoading, reloadAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading,
+            albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
-            peopleLoading, reloadPeople, openPerson, personPhotosById, personPhotosLoading,
-            renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, invite, revokeInvite,
+            peopleLoading, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosLoading,
+            renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],
     );

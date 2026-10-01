@@ -2274,7 +2274,7 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     return source_version
 
 
-_SEARCH_INDEX_KINDS = ('vector', 'lexical', 'sort')
+_SEARCH_INDEX_KINDS = ('vector', 'lexical', 'sort', 'access')
 
 
 def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
@@ -2419,11 +2419,20 @@ def touch_user_search_indexes_state(
     call site the way the old duplicated field lists already did. Edits that
     ONLY affect sort order (rating/likes) skip this entirely and call
     touch_user_sort_index_dirty instead -- see metadata_updates_affect_sort_index --
-    so they don't pay for a vector/lexical/tag-embedding rebuild too."""
+    so they don't pay for a vector/lexical/tag-embedding rebuild too.
+
+    Also touches the access index (blobName/thumbnailStatus/previewStatus --
+    see that section below): every real write path that can change those
+    fields (finalize, client-processing results, server-side EXIF fallback,
+    trash/restore, a generic field edit affecting search) already calls this
+    function, so hooking in here instead of at each call site individually
+    is the same "can't drift apart" reasoning as the rest of this
+    docstring."""
     touch_user_vector_index_state(user_id, embedding_version=embedding_version)
     touch_user_lexical_index_state(user_id)
     touch_user_tag_embedding_index_state(user_id)
     touch_user_sort_index_state(user_id)
+    touch_user_access_index_state(user_id)
     if filenames:
         _mark_search_index_dirty_filenames(user_id, filenames if isinstance(filenames, (list, set, tuple)) else [filenames])
 
@@ -3235,6 +3244,428 @@ def get_user_sort_index(
             # off-thread so the next request is fast, and report "not ready"
             # now so the caller falls back rather than waiting on a full scan.
             _rebuild_sort_index_in_background(key, manifest)
+    if fresh is None:
+        return None
+    return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
+
+
+# --- Access index ---------------------------------------------------------------
+# Server-side-only projection of just what /api/photos/access-batch needs to
+# turn a filename into a media URL: {RowKey, blobName, thumbnailStatus,
+# previewStatus}. Fixes a real crash loop (2026-10-01, microsvcpoc-dev):
+# access-batch's cache-miss fallback did one live Table Storage get_entity
+# per filename not covered by the listing index -- and the listing index
+# deliberately EXCLUDES trashed rows (processing_state == 'deleted'), so every
+# Recently Deleted page request was guaranteed to hit that per-filename path,
+# tying up the backend's thin GUNICORN_THREADS=2 pool long enough to starve
+# the liveness probe ("connection refused" -> ContainerBackOff).
+#
+# Deliberately NOT reusing the sort/listing index for this: both are
+# downloaded by the BROWSER each session (small today, but blobName is a
+# near-incompressible UUID that would meaningfully bloat that download for
+# data the client never uses), both exclude trashed rows for their own
+# legitimate reasons (sorting/listing the visible library, not trash), and
+# both dirty on a narrower field set than this index needs (anonymousImageId/
+# thumbnail_status/preview_status aren't sort-relevant). This index is never
+# downloaded by the browser -- access-batch is the only reader -- so none of
+# those constraints apply, and importantly it NEVER filters by
+# processing_state: a soft-deleted row stays in this index (refreshed, not
+# dropped) so trash no longer forces the slow per-filename fallback. Only a
+# hard-deleted row (the physical Table entity gone) drops out.
+_ACCESS_INDEX_SCHEMA_VERSION = 'v1'
+_ACCESS_INDEX_CACHE_LOCK = threading.RLock()
+_ACCESS_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_ACCESS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
+# Deliberately narrow -- no photoEmbedding/ocrText/tagMetadata/etc., same
+# reasoning as _SORT_INDEX_SOURCE_FIELDS. No processing_state: unlike every
+# other derived index here, this one never filters on it, so there's nothing
+# to select it for.
+_ACCESS_INDEX_SOURCE_FIELDS = [
+    'PartitionKey', 'RowKey', 'anonymousImageId', 'thumbnail_status', 'preview_status',
+]
+
+
+def _access_index_json_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-access.json.gz'
+
+
+def _access_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-access.json'
+
+
+def _access_index_blob_client(blob_name: str):
+    container_name = _lexical_index_container_name()
+    return _get_blob_client(container_name, blob_name) if container_name else None
+
+
+def invalidate_user_access_index_cache(user_id: str) -> None:
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    with _ACCESS_INDEX_CACHE_LOCK:
+        _ACCESS_INDEX_CACHE.pop(key, None)
+
+
+def delete_user_access_index_data(user_id: str) -> None:
+    """Delete a library's cached access-index blobs (data + manifest) and drop
+    it from the in-memory cache. Best-effort: a missing blob is not an error.
+    Mirrors delete_user_sort_index_data."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for blob_name in (_access_index_json_blob_name(key), _access_index_manifest_blob_name(key)):
+        blob_client = _access_index_blob_client(blob_name)
+        if blob_client is None:
+            continue
+        try:
+            blob_client.delete_blob()
+        except Exception:
+            pass
+    invalidate_user_access_index_cache(key)
+
+
+def touch_user_access_index_state(user_id: str) -> str:
+    """Mark the access index's own manifest dirty with a fresh sourceVersion --
+    mirrors touch_user_sort_index_state, but writes the access index's own
+    manifest blob, independent of the others. Called from
+    touch_user_search_indexes_state (not duplicated at individual call sites)
+    so this can't drift out of sync the way per-call-site triggers already
+    proved they can -- see that function's own docstring."""
+    key = str(user_id or '').strip()
+    if not key:
+        return ''
+    if _manifest_already_marked_dirty(key, 'access'):
+        return ''
+    source_version = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        'userId': key,
+        'sourceVersion': source_version,
+        'schemaVersion': _ACCESS_INDEX_SCHEMA_VERSION,
+        'dirty': True,
+        'updatedAt': source_version,
+    }
+    blob_client = _access_index_blob_client(_access_index_manifest_blob_name(key))
+    if blob_client is not None:
+        try:
+            blob_client.upload_blob(
+                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json'),
+            )
+        except Exception:
+            pass
+    invalidate_user_access_index_cache(key)
+    return source_version
+
+
+def _load_access_index_manifest(user_id: str) -> Dict[str, str]:
+    blob_client = _access_index_blob_client(_access_index_manifest_blob_name(user_id))
+    if blob_client is None:
+        return {}
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_access_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    blob_client = _access_index_blob_client(_access_index_json_blob_name(user_id))
+    if blob_client is None:
+        return None
+    try:
+        payload = blob_client.download_blob().readall()
+    except Exception:
+        return None
+    try:
+        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        rows = parsed.get('rows')
+        if not isinstance(rows, list):
+            return None
+        return LexicalIndexSnapshot(
+            user_id=str(user_id),
+            source_version=str(parsed.get('sourceVersion') or ''),
+            schema_version=str(parsed.get('schemaVersion') or ''),
+            updated_at=str(parsed.get('updatedAt') or ''),
+            rows=rows,
+        )
+    except Exception:
+        return None
+
+
+def _serialize_access_index(snapshot: LexicalIndexSnapshot) -> bytes:
+    payload = {
+        'userId': snapshot.user_id,
+        'sourceVersion': snapshot.source_version,
+        'schemaVersion': snapshot.schema_version,
+        'updatedAt': snapshot.updated_at,
+        'rowCount': len(snapshot.rows),
+        'rows': snapshot.rows,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+    return gzip.compress(raw, compresslevel=6)
+
+
+def _access_index_row(entity: Dict) -> Optional[Dict[str, object]]:
+    filename = str(entity.get('RowKey') or '').strip()
+    if not filename:
+        return None
+    return {
+        'RowKey': filename,
+        'blobName': str(entity.get('anonymousImageId') or '').strip(),
+        'thumbnailStatus': str(entity.get('thumbnail_status') or '').strip(),
+        'previewStatus': str(entity.get('preview_status') or '').strip(),
+    }
+
+
+def _build_user_access_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return None
+    try:
+        # select= keeps this full-library scan narrow -- see
+        # _ACCESS_INDEX_SOURCE_FIELDS. Deliberately no processing_state filter:
+        # trashed rows belong in this index same as active ones, see the
+        # module comment above.
+        rows = list(metadata_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'",
+            select=_ACCESS_INDEX_SOURCE_FIELDS,
+        ))
+    except Exception:
+        # A transient query failure must not be treated as "empty library" --
+        # refresh_user_access_index persists whatever this returns as the new
+        # dirty:false state (see refresh_user_sort_index's identical note).
+        return None
+
+    trimmed_rows: List[Dict[str, object]] = []
+    for row in rows:
+        trimmed = _access_index_row(dict(row))
+        if trimmed is not None:
+            trimmed_rows.append(trimmed)
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_ACCESS_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=trimmed_rows,
+    )
+
+
+def _merge_user_access_index_snapshot(
+    user_id: str, existing: LexicalIndexSnapshot, dirty_filenames: Set[str], source_version: str,
+) -> Optional[LexicalIndexSnapshot]:
+    """Incremental counterpart to _build_user_access_index_snapshot: only
+    re-fetch the filenames known to have changed and merge them into the
+    existing snapshot's rows, instead of re-scanning the whole partition --
+    mirrors _merge_user_sort_index_snapshot, with one deliberate difference:
+    a dirty filename that now reads processing_state == 'deleted' (soft
+    trash) is refreshed and KEPT, not dropped -- see the module comment
+    above for why. Only a filename whose row is genuinely gone (hard delete
+    -- get_entity raises) is removed."""
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return None
+    by_filename: Dict[str, Dict[str, object]] = {
+        str(row.get('RowKey') or ''): row for row in existing.rows if row.get('RowKey')
+    }
+
+    def _refresh_one(filename: str) -> Tuple[str, Optional[Dict[str, object]]]:
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            return filename, None
+        return filename, _access_index_row(dict(entity))
+
+    if dirty_filenames:
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty_filenames)))) as executor:
+            for filename, trimmed_row in executor.map(_refresh_one, dirty_filenames):
+                if trimmed_row is None:
+                    by_filename.pop(filename, None)
+                else:
+                    by_filename[filename] = trimmed_row
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_ACCESS_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=list(by_filename.values()),
+    )
+
+
+def refresh_user_access_index(
+    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
+) -> Optional[LexicalIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+
+    snapshot = None
+    dirty_to_clear: Optional[Set[str]] = None
+    if not force_full:
+        existing = _load_access_index_blob(key)
+        if existing is not None and existing.schema_version == _ACCESS_INDEX_SCHEMA_VERSION:
+            dirty = _get_dirty_search_index_filenames(key, 'access')
+            if dirty is not None:
+                snapshot = _merge_user_access_index_snapshot(key, existing, dirty, source_version)
+                if snapshot is not None:
+                    dirty_to_clear = dirty
+    if snapshot is None:
+        snapshot = _build_user_access_index_snapshot(key, source_version)
+        if snapshot is not None:
+            dirty_to_clear = _get_dirty_search_index_filenames(key, 'access') or set()
+    if snapshot is None:
+        return None
+    container_name = _lexical_index_container_name()
+    if container_name:
+        blob_client = _get_blob_client(container_name, _access_index_json_blob_name(key))
+        if blob_client is not None:
+            try:
+                blob_client.upload_blob(
+                    _serialize_access_index(snapshot),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                )
+            except Exception:
+                pass
+        _clear_manifest_dirty_flag(key, 'access')
+        manifest = {
+            'userId': key,
+            'sourceVersion': snapshot.source_version,
+            'schemaVersion': snapshot.schema_version,
+            'rowCount': len(snapshot.rows),
+            'dirty': False,
+            'updatedAt': snapshot.updated_at,
+        }
+        manifest_client = _get_blob_client(container_name, _access_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            try:
+                manifest_client.upload_blob(
+                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                    overwrite=True,
+                    content_settings=BlobContentSettings(content_type='application/json'),
+                )
+            except Exception:
+                pass
+    with _ACCESS_INDEX_CACHE_LOCK:
+        _ACCESS_INDEX_CACHE[key] = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+    if dirty_to_clear:
+        _clear_dirty_search_index_filenames(key, 'access', dirty_to_clear)
+    return snapshot
+
+
+def _access_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:
+    """Mirrors _sort_index_fresh_cache_entry: fresh in-memory-or-blob snapshot
+    dict for key if one matches manifest and isn't dirty, else None."""
+    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
+    manifest_dirty = bool(manifest.get('dirty'))
+
+    with _ACCESS_INDEX_CACHE_LOCK:
+        cached = _ACCESS_INDEX_CACHE.get(key)
+        if (
+            cached
+            and cached.get('source_version') == manifest_source_version
+            and cached.get('schema_version') == _ACCESS_INDEX_SCHEMA_VERSION
+            and not manifest_dirty
+        ):
+            return cached
+
+    snapshot = _load_access_index_blob(key)
+    if (
+        snapshot
+        and snapshot.source_version == manifest_source_version
+        and snapshot.schema_version == _ACCESS_INDEX_SCHEMA_VERSION
+        and not manifest_dirty
+    ):
+        data = {
+            'source_version': snapshot.source_version,
+            'schema_version': snapshot.schema_version,
+            'updated_at': snapshot.updated_at,
+            'rows': snapshot.rows,
+        }
+        with _ACCESS_INDEX_CACHE_LOCK:
+            _ACCESS_INDEX_CACHE[key] = data
+        return data
+    return None
+
+
+def _rebuild_access_index_in_background(key: str, manifest: Dict[str, str]) -> None:
+    """Mirrors _rebuild_sort_index_in_background: kicks off a rebuild off the
+    request thread if one isn't already running for this user, gated by the
+    same _index_rebuild_in_cooldown check."""
+    if _index_rebuild_in_cooldown(key, 'access'):
+        return
+    lock = _ACCESS_INDEX_REBUILD_LOCKS.lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+            refresh_user_access_index(key, source_version=source_version)
+            _mark_index_rebuild_completed(key, 'access')
+        except Exception:
+            _LOGGER.exception('Background access index rebuild failed for user %s', key)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_worker, name='access-index-rebuild', daemon=True).start()
+
+
+def get_user_access_index(
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+) -> Optional[Dict[str, object]]:
+    """Mirrors get_user_sort_index's "serve stale immediately, rebuild
+    off-thread" read path. access-batch passes allow_sync_build=False (like
+    /photos/timeline does for the listing index) so a cold account doesn't
+    block the request on a full-library scan -- it falls back to the
+    existing per-filename Table lookup for that one request instead, and the
+    next request picks up the background-built blob."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+
+    manifest = _load_access_index_manifest(key)
+    fresh = _access_index_fresh_cache_entry(key, manifest)
+    if fresh is None and allow_refresh:
+        stale = _load_access_index_blob(key)
+        if stale is not None:
+            fresh = {
+                'source_version': stale.source_version,
+                'schema_version': stale.schema_version,
+                'updated_at': stale.updated_at,
+                'rows': stale.rows,
+            }
+            _rebuild_access_index_in_background(key, manifest)
+        elif allow_sync_build:
+            with _ACCESS_INDEX_REBUILD_LOCKS.lock_for(key):
+                fresh = _access_index_fresh_cache_entry(key, _load_access_index_manifest(key))
+                if fresh is None:
+                    source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                    refreshed = refresh_user_access_index(key, source_version=source_version)
+                    if refreshed is not None:
+                        fresh = {
+                            'source_version': refreshed.source_version,
+                            'schema_version': refreshed.schema_version,
+                            'updated_at': refreshed.updated_at,
+                            'rows': refreshed.rows,
+                        }
+        else:
+            # Cold + caller must not block (access-batch): build off-thread so
+            # the next request is fast, and report "not ready" now so the
+            # caller falls back rather than waiting on a full scan.
+            _rebuild_access_index_in_background(key, manifest)
     if fresh is None:
         return None
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
@@ -4215,6 +4646,7 @@ def prime_all_user_indexes_sequentially(
             source_version = datetime.now(timezone.utc).isoformat()
             for kind, refresh_fn, kind_locks in (
                 ('sort', refresh_user_sort_index, _SORT_INDEX_REBUILD_LOCKS),
+                ('access', refresh_user_access_index, _ACCESS_INDEX_REBUILD_LOCKS),
                 ('lexical', refresh_user_lexical_index, _LEXICAL_INDEX_REBUILD_LOCKS),
                 ('albums', refresh_user_albums_index, _ALBUMS_INDEX_REBUILD_LOCKS),
                 ('people', refresh_user_people_index, _PEOPLE_INDEX_REBUILD_LOCKS),

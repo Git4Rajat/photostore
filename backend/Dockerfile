@@ -33,8 +33,11 @@ COPY data/ ./data/
 COPY entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh
 
-# Expose port (Flask default is 5000)
+# Expose port (Flask default is 5000). 5001 is the gunicorn-master-owned
+# health sidecar (see gunicorn.conf.py's on_starting) -- stays up independent
+# of whether app worker threads are saturated.
 EXPOSE 5000
+EXPOSE 5001
 
 # Set environment variables for Flask
 ENV FLASK_APP=app.py

@@ -24,7 +24,6 @@ import { formatBytes } from '../../components/browserAiShared';
 import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
-import { getLocalSearchIndex } from '../../services/localSearchIndex';
 import { StoreProvider, useStore } from './store';
 import { Menu } from './components/bits';
 import CommandBar from './components/CommandBar';
@@ -376,40 +375,15 @@ const PrototypeApp: React.FC = () => {
         await refreshAuthState();
     }, [refreshAuthState]);
 
-    // Fire-and-forget: starts downloading the client-side lexical/vector
-    // search index as soon as a session starts, instead of only on the
-    // user's first Ask keystroke (localSearchIndex.ts's original lazy-load
-    // design -- deliberately traded a per-search delay for never paying the
-    // download on sessions that never search). That blob can be very large
-    // (hundreds of MB compressed on a big library) and takes real time to
-    // fetch + gunzip, so the trade favors eating that cost during the app
-    // shell's load instead of freezing the first Ask query on it.
-    //
-    // On a cold account the server-side index itself hasn't finished
-    // building yet, so /api/photos/search-index responds with
-    // available:false (by design -- it never blocks the request on the
-    // rebuild). A single fire-and-forget attempt made right at sign-in used
-    // to just accept that "not available" and give up for the rest of the
-    // session, so the actual ~30s+ blob download ended up happening
-    // synchronously the moment the user opened Ask and searched, right when
-    // they were staring at the box waiting on results. Retry on a timer
-    // instead so the download still happens in the background, once the
-    // server-side rebuild it kicked off finishes, well before Ask is opened.
-    useEffect(() => {
-        if (!signedIn) return;
-        let cancelled = false;
-        const warm = async () => {
-            for (let attempt = 0; attempt < 20 && !cancelled; attempt += 1) {
-                const result = await getLocalSearchIndex().catch(() => null);
-                if (result || cancelled) return;
-                await new Promise((resolve) => setTimeout(resolve, 15000));
-            }
-        };
-        void warm();
-        return () => {
-            cancelled = true;
-        };
-    }, [signedIn]);
+    // The client-side lexical/vector search index warm-up used to start
+    // unconditionally here, the moment ANY session signed in, regardless of
+    // whether Ask was ever opened -- one more fetch racing five others in
+    // the same mount window (see the 2026-10-01 boot-request audit). That
+    // blob can be very large (hundreds of MB compressed on a big library),
+    // so a session that never searches no longer pays for it at all now:
+    // AskPage's own mount effect starts the same warm-up (still a retry
+    // loop, since a cold account's server-side index may not have finished
+    // building yet), only when the user actually opens Ask.
 
     // Public share links render the real album page regardless of auth state.
     if (isPublicAlbumPath()) {

@@ -159,10 +159,11 @@ def test_hitting_the_batch_size_flushes_eagerly_without_a_read(ctx):
 
     storage_utils.touch_user_search_indexes_state('u1', filenames=filenames)
 
-    # One flush per index kind (vector/lexical/sort all hit the threshold
-    # together, since every filename dirties all three) -- each flush is
-    # still a single batched transaction covering the whole partition.
-    assert len(dirty.submit_transaction_calls) == 3
+    # One flush per index kind (vector/lexical/sort/access all hit the
+    # threshold together, since every filename dirties all four) -- each
+    # flush is still a single batched transaction covering the whole
+    # partition.
+    assert len(dirty.submit_transaction_calls) == 4
     assert all(len(call) == batch_size for call in dirty.submit_transaction_calls)
     assert storage_utils._DIRTY_FILENAME_BUFFER.get(('u1', 'lexical')) is None
 

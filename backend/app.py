@@ -103,6 +103,8 @@ from storage_utils import (
     get_user_sort_index,
     get_sort_index_blob_location,
     delete_user_sort_index_data,
+    get_user_access_index,
+    delete_user_access_index_data,
     touch_user_albums_index_state,
     get_user_albums_index,
     get_albums_index_blob_location,
@@ -8091,6 +8093,7 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_lexical_index_data(library_id)
     delete_user_tag_embedding_index_data(library_id)
     delete_user_sort_index_data(library_id)
+    delete_user_access_index_data(library_id)
     delete_user_albums_index_data(library_id)
     delete_user_people_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)

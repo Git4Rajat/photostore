@@ -6,6 +6,7 @@ import { ThumbSizeControl, useTileSize } from '../components/controls';
 import PhotoGrid from '../components/PhotoGrid';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { confirmDialog } from '../../../components/shared/dialogs';
+import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 import type { Person } from '../types';
 
 // The merge target when several selected clusters are merged at once: prefer
@@ -18,7 +19,18 @@ const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.n
  *  "Select" mode lets several clusters be picked and merged into one in a
  *  single action, instead of the one-at-a-time merge on the detail page. */
 export const PeoplePage: React.FC = () => {
-    const { people, peopleLoading, navigate, mergePeopleBatch, deletePeopleBatch } = useStore();
+    const { people, peopleLoading, navigate, mergePeopleBatch, deletePeopleBatch, fetchPeople } = useStore();
+
+    // Loads people when this tab is actually visited, queued behind whatever
+    // else is in flight, aborted if the user navigates away before its turn.
+    // See the 2026-10-01 boot-request audit.
+    useEffect(() => {
+        const controller = new AbortController();
+        void enqueueBackgroundRequest(() => fetchPeople(), { signal: controller.signal }).catch(() => {});
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
     const covers = useProtectedBlobUrls(people.map((p) => p.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
     const unnamedCount = people.filter((p) => !p.name).length;
     const [selectMode, setSelectMode] = useState(false);
@@ -126,7 +138,7 @@ export const PeoplePage: React.FC = () => {
 
 /** Person detail — rename / name, browse their photos, and merge in another cluster. */
 export const PersonDetailPage: React.FC = () => {
-    const { route, people, personById, openPerson, personPhotosById, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
+    const { route, people, personById, openPerson, personPhotosById, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, fetchPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
     const personId = route.params.personId;
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
@@ -138,6 +150,20 @@ export const PersonDetailPage: React.FC = () => {
         if (personId) void openPerson(personId);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [personId]);
+
+    // personById reads from the SAME people list the People tab's own mount
+    // effect populates -- a direct deep link to a person's detail page
+    // (shared link, browser back/forward) without ever visiting the People
+    // tab would otherwise find nobody and render the empty-state below even
+    // though the person exists. Queued/aborted same as every other tab
+    // fetch; redundant (and cheap, queue-deduped by nothing in particular
+    // but harmless) if People was already visited this session.
+    useEffect(() => {
+        const controller = new AbortController();
+        void enqueueBackgroundRequest(() => fetchPeople(), { signal: controller.signal }).catch(() => {});
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     useEffect(() => {
         setDraft(person?.name ?? '');

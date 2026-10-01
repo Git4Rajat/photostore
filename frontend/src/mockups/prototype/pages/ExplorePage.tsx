@@ -1,8 +1,9 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { useStore } from '../store';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { usePhotoThumbnails } from '../media';
 import { Swatch } from '../components/bits';
+import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
 /** A labelled, horizontally-scrolling row of cards (a "shelf"). */
 const Shelf: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
@@ -18,7 +19,28 @@ const Shelf: React.FC<{ title: string; children: React.ReactNode }> = ({ title, 
  * card deep-links into the relevant view.
  */
 export const ExplorePage: React.FC = () => {
-    const { places, things, people, albums, photos, exploreLoading, peopleLoading, navigate, openViewer } = useStore();
+    const {
+        places, things, people, albums, photos, exploreLoading, peopleLoading, navigate, openViewer,
+        fetchExplore, fetchPeople, fetchAlbums,
+    } = useStore();
+
+    // Loads everything this page renders when it's actually visited, queued
+    // (sequential, not parallel) behind whatever else is in flight, aborted
+    // if the user navigates away before its turn. Explore's shelves pull
+    // from the SAME people/albums state the People/Albums tabs populate
+    // (fetchExplore itself only fills places/things), so a user landing on
+    // Explore without having visited those tabs first needs this page to
+    // trigger all three itself, or the People/Albums shelves would render
+    // empty. photos is covered already -- Gallery's fetch stays boot-time
+    // eager. See the 2026-10-01 boot-request audit.
+    useEffect(() => {
+        const controller = new AbortController();
+        void enqueueBackgroundRequest(() => fetchExplore(), { signal: controller.signal }).catch(() => {});
+        void enqueueBackgroundRequest(() => fetchPeople(), { signal: controller.signal }).catch(() => {});
+        void enqueueBackgroundRequest(() => fetchAlbums(), { signal: controller.signal }).catch(() => {});
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     // Resolve every group cover in one batched pass (people/place/thing thumbs).
     const covers = useProtectedBlobUrls(

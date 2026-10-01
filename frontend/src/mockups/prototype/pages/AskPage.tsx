@@ -5,6 +5,8 @@ import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { get, post } from '../../../services/apiClient';
 import { runLocalSemanticSearch } from '../../../services/localSemanticSearch';
+import { getLocalSearchIndex } from '../../../services/localSearchIndex';
+import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 import type { Photo } from '../types';
 
@@ -70,6 +72,43 @@ export const AskPage: React.FC = () => {
     // why this particular search is taking longer.
     const [usingBackend, setUsingBackend] = useState(false);
     const seqRef = useRef(0);
+
+    // Starts downloading the client-side lexical/vector search index as soon
+    // as this page mounts, instead of only on the user's first keystroke --
+    // that blob can be very large (hundreds of MB compressed on a big
+    // library) and takes real time to fetch + gunzip, so the trade favors
+    // eating that cost while the user is reading/typing their query instead
+    // of freezing the first search on it. Used to start unconditionally the
+    // moment ANY session signed in (racing five other fetches in the same
+    // mount tick) regardless of whether Ask was ever opened -- now scoped to
+    // this page, so a session that never opens Ask never pays for it. See
+    // the 2026-10-01 boot-request audit.
+    //
+    // On a cold account the server-side index itself hasn't finished
+    // building yet, so /api/photos/search-index responds with
+    // available:false (by design -- it never blocks the request on the
+    // rebuild). Retry on a timer so the download still happens in the
+    // background, once the server-side rebuild it kicked off finishes.
+    // Each attempt (not the whole retry span) goes through the shared
+    // background queue, so it takes its turn alongside other tab prefetches
+    // instead of either blocking them for the full ~5min retry budget or
+    // jumping the line in front of them.
+    useEffect(() => {
+        let cancelled = false;
+        const controller = new AbortController();
+        const warm = async () => {
+            for (let attempt = 0; attempt < 20 && !cancelled; attempt += 1) {
+                const result = await enqueueBackgroundRequest(() => getLocalSearchIndex(), { signal: controller.signal }).catch(() => null);
+                if (result || cancelled) return;
+                await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+        };
+        void warm();
+        return () => {
+            cancelled = true;
+            controller.abort();
+        };
+    }, []);
 
     // Search results aren't part of the gallery's paginated photo list, so the
     // viewer can't resolve them by id unless they're registered here too --

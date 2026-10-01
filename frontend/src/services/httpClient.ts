@@ -130,12 +130,24 @@ const isBackendUnreachable = (error: unknown): boolean => {
 const isCanceled = (error: unknown): boolean =>
     axios.isAxiosError(error) && error.code === 'ERR_CANCELED';
 
+// Set by backgroundRequestQueue.ts: that queue is its own retry authority
+// (requeue-to-back on a retryable failure, drop on a terminal one) and needs
+// a single attempt per run to make that decision on, not this cold-start
+// loop's ~90s budget hidden underneath it -- two independent retry layers
+// stacked on each other just compounds load on a backend that's already
+// struggling, which is the opposite of what the queue exists to prevent.
+// Every other caller is unaffected; this only skips the loop when explicitly
+// opted in.
+export interface RequestConfig extends AxiosRequestConfig {
+    singleAttempt?: boolean;
+}
+
 export const requestJson = async <T = any>(
     client: ReturnType<typeof createHttpClient>,
     method: 'get' | 'post' | 'put' | 'delete',
     url: string,
     data?: unknown,
-    config?: AxiosRequestConfig,
+    config?: RequestConfig,
 ): Promise<T> => {
     // One correlation id for the whole call, shared across cold-start retries,
     // so a user-visible "ref" ties to a single logical request.
@@ -155,7 +167,7 @@ export const requestJson = async <T = any>(
                 reportBackendReachable();
                 return response.data;
             } catch (error: unknown) {
-                if (attempt < COLD_START_RETRIES && isRetriableColdStart(error, method)) {
+                if (!config?.singleAttempt && attempt < COLD_START_RETRIES && isRetriableColdStart(error, method)) {
                     // First sign of trouble: surface the "waking up" banner right
                     // away rather than only after the full ~90s budget below is
                     // exhausted, so a long wake doesn't just look like a hang.
