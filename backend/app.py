@@ -1418,11 +1418,12 @@ def _init_storage_clients():
         embeddings_table_client=embeddings_table_client,
         search_index_dirty_table_client=search_index_dirty_table_client,
         queue_map_on_upload=(MAPS_QUEUE_ON_UPLOAD and not MAPS_ON_UPLOAD),
-        # Lambda, not a direct reference: _load_user_face_summary_by_id is
-        # defined later in this module than this call runs at import time --
-        # deferring the name lookup to call time (long after the module has
-        # finished importing) sidesteps that ordering issue.
+        # Lambdas, not direct references: both targets are defined later in
+        # this module than this call runs at import time -- deferring the
+        # name lookup to call time (long after the module has finished
+        # importing) sidesteps that ordering issue.
         face_summary_lookup=lambda uid: _load_user_face_summary_by_id(uid),
+        face_summary_cache_writer=lambda uid, rows: _face_summary_scan_cache.set(uid, rows),
     )
     _prime_vector_indexes_on_startup()
 

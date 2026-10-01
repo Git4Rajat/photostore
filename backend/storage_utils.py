@@ -372,6 +372,7 @@ def configure_storage(
     search_index_dirty_table_client=None,
     queue_map_on_upload: bool = False,
     face_summary_lookup=None,
+    face_summary_cache_writer=None,
 ) -> None:
     _CTX['metadata_table_client'] = metadata_table_client
     _CTX['face_table_client'] = face_table_client
@@ -393,6 +394,11 @@ def configure_storage(
     # invalidated on every face-table write via _InvalidatingTableClient) --
     # see _store_client_face_entities for why this matters.
     _CTX['face_summary_lookup'] = face_summary_lookup
+    # (user_id, rows) -> None. Lets _store_client_face_entities patch the
+    # cache above with its own writes instead of leaving it for
+    # _InvalidatingTableClient to invalidate -- see that function's
+    # cache_writer call for why.
+    _CTX['face_summary_cache_writer'] = face_summary_cache_writer
 
 
 def _require_context() -> None:
@@ -839,6 +845,18 @@ def _client_face_passes_quality_gate(face: Dict) -> bool:
     return area_ratio <= FACE_LOW_CONFIDENCE_MAX_AREA_RATIO and side_ratio <= FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO
 
 
+# Mirrors app.py's FACE_SUMMARY_COLUMNS (the server-side `select=` projection
+# _load_user_face_summary_by_id uses) -- kept in sync by hand since the two
+# modules don't share a constant. _store_client_face_entities uses this to
+# patch the per-user face-summary cache (see its cache_writer call near the
+# end) with rows in the exact shape a real cached scan would produce.
+_FACE_SUMMARY_PROJECTION_FIELDS = (
+    'RowKey', 'filename', 'bbox', 'imageWidth', 'imageHeight', 'confidence',
+    'reviewStatus', 'suspiciousReason', 'personId', 'rejected',
+    'confirmedByUser', 'assignedByPropagation',
+)
+
+
 def _store_client_face_entities(user_id: str, filename: str, faces, *, force_reconcile: bool = False) -> List[str]:
     face_table_client = _CTX.get('face_table_client')
     if face_table_client is None or not isinstance(faces, list):
@@ -867,10 +885,20 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
     # _load_user_face_summary_by_id already uses elsewhere (PEOPLE_SCAN_CACHE_
     # TTL_SECONDS, shared across every call in a burst instead of one scan
     # per photo), filtered here in-memory by filename instead of server-side.
+    # summary/summary_lookup_ok are threaded through to the cache_writer
+    # call near the end of this function, so a successful lookup here can be
+    # patched in place with this call's own writes afterwards instead of
+    # left for _InvalidatingTableClient to simply blow away -- see that call
+    # site for why. summary_lookup_ok stays False on a failed lookup so a
+    # transient exception's empty {} never gets mistaken for "this user
+    # genuinely has zero faces" and written back as the new cache state.
+    summary: Dict[str, Dict] = {}
+    summary_lookup_ok = False
     face_summary_lookup = _CTX.get('face_summary_lookup')
     if callable(face_summary_lookup):
         try:
             summary = face_summary_lookup(user_id)
+            summary_lookup_ok = True
         except Exception:
             summary = {}
         existing_rows = [row for row in summary.values() if str(row.get('filename') or '') == filename]
@@ -891,6 +919,10 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
     matches = _match_faces_by_iou(candidate_bboxes, existing_bboxes)
 
     stored_ids: List[str] = []
+    # Populated alongside the writes below, then merged into `summary` for
+    # the cache_writer call near the end of this function.
+    updated_summary_rows: Dict[str, Dict] = {}
+    deleted_face_ids: List[str] = []
     for new_idx, face in enumerate(candidate_faces):
         bbox = candidate_bboxes[new_idx]
         existing_idx = matches.get(new_idx)
@@ -975,6 +1007,9 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
         try:
             face_table_client.upsert_entity(entity)
             stored_ids.append(face_id)
+            updated_summary_rows[face_id] = {
+                key: entity[key] for key in _FACE_SUMMARY_PROJECTION_FIELDS if key in entity
+            }
         except Exception:
             continue
 
@@ -999,6 +1034,8 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
                 continue
             try:
                 face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
+                deleted_face_ids.append(face_id)
+                updated_summary_rows.pop(face_id, None)
             except Exception:
                 continue
             person_id = str(row.get('personId') or '')
@@ -1020,6 +1057,33 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
                     person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
             except Exception:
                 pass
+
+    # Patch the per-user face-summary cache with this call's own writes
+    # instead of leaving it for _InvalidatingTableClient's blanket
+    # invalidate-on-write to clear. Without this, every photo that both
+    # reads (via face_summary_lookup above) and writes (via upsert_entity
+    # above) this cache invalidates the very entry it just populated, so the
+    # next photo's read always misses and re-scans the whole (growing)
+    # face partition from scratch -- the TTL never gets a chance to do
+    # anything under this read-then-write-every-call workload (confirmed
+    # live 2026-10-01 on microsvcpoc-dev: QueryEntities calls dominated
+    # Table Storage traffic, ~100-200 per photo, tracking the size of the
+    # face partition at the time -- same bug class already fixed for
+    # _assign_faces_to_people_incrementally's embedding-index cache, see
+    # _UserScanCache.set()'s docstring). Only runs when the lookup above
+    # actually succeeded (summary_lookup_ok) -- patching a cache entry from
+    # a failed/partial lookup would silently drop this user's other photos'
+    # faces from the next reader's view until the next invalidation.
+    cache_writer = _CTX.get('face_summary_cache_writer')
+    if callable(cache_writer) and summary_lookup_ok:
+        merged = dict(summary)
+        merged.update(updated_summary_rows)
+        for stale_id in deleted_face_ids:
+            merged.pop(stale_id, None)
+        try:
+            cache_writer(user_id, list(merged.values()))
+        except Exception:
+            pass
 
     return stored_ids
 
