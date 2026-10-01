@@ -369,6 +369,7 @@ def configure_storage(
     hash_index_table_client=None,
     filename_owners_table_client=None,
     embeddings_table_client=None,
+    face_embeddings_table_client=None,
     search_index_dirty_table_client=None,
     queue_map_on_upload: bool = False,
     face_summary_lookup=None,
@@ -388,6 +389,7 @@ def configure_storage(
     _CTX['hash_index_table_client'] = hash_index_table_client
     _CTX['filename_owners_table_client'] = filename_owners_table_client
     _CTX['embeddings_table_client'] = embeddings_table_client
+    _CTX['face_embeddings_table_client'] = face_embeddings_table_client
     _CTX['search_index_dirty_table_client'] = search_index_dirty_table_client
     _CTX['queue_map_on_upload'] = bool(queue_map_on_upload)
     # user_id -> {face_id: face_row_dict}, cached (PEOPLE_SCAN_CACHE_TTL_SECONDS,
@@ -1004,6 +1006,11 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
                     )
                 except Exception:
                     pass
+        # Pops 'embedding' off entity (in place) into FACE_EMBEDDINGS_TABLE --
+        # must run before upsert_entity below so the large array never lands
+        # on the photofaces row. No-op (puts the field back) if the table
+        # isn't configured, so older deploys keep today's inline behavior.
+        _extract_and_store_face_embedding(user_id, face_id, entity)
         try:
             face_table_client.upsert_entity(entity)
             stored_ids.append(face_id)
@@ -7432,6 +7439,111 @@ def get_photo_embeddings(user_id: str, filename: str) -> Dict[str, object]:
     except Exception:
         return {}
     return {field: entity.get(field) for field in _EMBEDDING_FIELDS}
+
+
+# Mirrors _EMBEDDING_FIELDS/_extract_and_store_embeddings/get_photo_embeddings/
+# delete_embeddings_entry above, for face-recognition embeddings instead of
+# photo-level ones -- same row-bloat reasoning (a 512-float JSON array on
+# every photofaces row shrinks Table Storage's effective page size well
+# below its 1000-row cap, inflating round-trip counts for any scan over the
+# partition; confirmed live 2026-10-01 on microsvcpoc-dev at 99k+ face rows).
+# Deliberately just the embedding array itself, NOT embeddingVersion/
+# modelTaxonomyVersion -- those are small scalar strings (not the source of
+# row bloat) read directly off photofaces rows by clustering version-gating
+# logic (_face_embedding_version, _face_embedding_allowed_for_clustering,
+# app.py), which would all need updating to merge in a second table's data
+# for fields that were never the actual problem. Only 'embedding' moves.
+_FACE_EMBEDDING_FIELDS = ('embedding',)
+
+
+def _extract_and_store_face_embedding(user_id: str, face_id: str, entity: Dict) -> None:
+    """Pop the embedding array off a face ``entity`` (in place) and persist
+    it to FACE_EMBEDDINGS_TABLE instead, so it never lands on the photofaces
+    row. Call this immediately before every face_table_client.upsert_entity(entity)
+    that might carry an embedding."""
+    face_embeddings_table_client = _CTX.get('face_embeddings_table_client')
+    values = {field: entity.pop(field, None) for field in _FACE_EMBEDDING_FIELDS}
+    if not any(v is not None for v in values.values()):
+        return
+    if face_embeddings_table_client is None:
+        # No face-embeddings table configured (e.g. older deploy) -- put the
+        # fields back rather than silently dropping real embedding data.
+        entity.update({k: v for k, v in values.items() if v is not None})
+        return
+    try:
+        face_embeddings_table_client.upsert_entity({
+            'PartitionKey': user_id,
+            'RowKey': face_id,
+            **{k: v for k, v in values.items() if v is not None},
+        })
+    except Exception:
+        pass
+
+
+def delete_face_embeddings_entry(user_id: str, face_id: str) -> None:
+    """Drop a deleted/merged-away face's row from FACE_EMBEDDINGS_TABLE.
+    Mirrors delete_embeddings_entry."""
+    face_embeddings_table_client = _CTX.get('face_embeddings_table_client')
+    if face_embeddings_table_client is None or not face_id:
+        return
+    try:
+        face_embeddings_table_client.delete_entity(partition_key=user_id, row_key=face_id)
+    except Exception:
+        pass
+
+
+def get_face_embedding(user_id: str, face_id: str) -> List[float]:
+    """Point-read a single face's embedding from FACE_EMBEDDINGS_TABLE.
+    Callers needing a fallback for rows migrated before this table existed
+    (a still-present inline 'embedding' field on the photofaces row) do that
+    merge themselves -- this function only ever reads the new table, mirroring
+    get_photo_embeddings's shape exactly."""
+    face_embeddings_table_client = _CTX.get('face_embeddings_table_client')
+    if face_embeddings_table_client is None or not face_id:
+        return []
+    try:
+        entity = face_embeddings_table_client.get_entity(partition_key=user_id, row_key=face_id)
+    except Exception:
+        return []
+    try:
+        return json.loads(entity.get('embedding', '[]') or '[]')
+    except Exception:
+        return []
+
+
+def get_face_embeddings_batch(user_id: str, face_ids: List[str]) -> Dict[str, List[float]]:
+    """Batch point-read for a BOUNDED list of face_ids (one person's faceIds,
+    never a full-partition scan) -- avoids turning a per-person embedding
+    refresh into one point-read per face on top of the existing per-face
+    metadata point-read it's paired with (same N+1 shape already fixed
+    elsewhere for face metadata; this prevents reintroducing it here for
+    embeddings specifically). One OR-filtered query instead of len(face_ids)
+    separate round trips."""
+    face_embeddings_table_client = _CTX.get('face_embeddings_table_client')
+    ids = [str(fid) for fid in (face_ids or []) if str(fid or '').strip()]
+    if face_embeddings_table_client is None or not ids:
+        return {}
+    result: Dict[str, List[float]] = {}
+    # Chunked, not one giant OR-filter -- a person with an unusually large
+    # face count shouldn't produce an unbounded query string.
+    chunk_size = 50
+    for start in range(0, len(ids), chunk_size):
+        chunk = ids[start:start + chunk_size]
+        clauses = ' or '.join(f"RowKey eq '{_escape_odata(fid)}'" for fid in chunk)
+        query = f"PartitionKey eq '{_escape_odata(user_id)}' and ({clauses})"
+        try:
+            rows = list(face_embeddings_table_client.query_entities(query))
+        except Exception:
+            continue
+        for row in rows:
+            face_id = str(row.get('RowKey') or '')
+            if not face_id:
+                continue
+            try:
+                result[face_id] = json.loads(row.get('embedding', '[]') or '[]')
+            except Exception:
+                result[face_id] = []
+    return result
 
 
 def _store_hash_index(user_id: str, file_hash: str, filename: str) -> None:

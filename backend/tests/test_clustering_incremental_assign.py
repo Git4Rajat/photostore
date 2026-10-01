@@ -14,6 +14,7 @@ import random
 import pytest
 
 import app
+import storage_utils
 from fakes import FakeTable
 
 # Two embeddings deliberately far enough apart (near-orthogonal) that cosine
@@ -83,6 +84,37 @@ def test_confident_match_assigns_to_existing_person_without_creating_new_one(clu
     _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
     _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1')
     _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE)
+
+    assignments, created = app._assign_faces_to_people_incrementally(user_id, 'photo.jpg', ['new-face'])
+
+    assert assignments == {'new-face': 'person-1'}
+    assert created == set()
+
+
+def test_matches_using_embedding_from_dedicated_table_when_row_has_no_inline_embedding(
+    clustering_tables, monkeypatch,
+):
+    """A face row written after the embeddings-table split carries no
+    inline 'embedding' at all -- _assign_faces_to_people_incrementally must
+    still find it via FACE_EMBEDDINGS_TABLE (_ensure_face_embedding_present)
+    and match exactly as if it had been inline all along."""
+    face_table, person_table = clustering_tables
+    user_id = 'lib-A'
+    face_embeddings_table = FakeTable()
+    monkeypatch.setitem(storage_utils._CTX, 'face_embeddings_table_client', face_embeddings_table)
+
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE)
+    # Simulate the post-split write path: strip the inline embedding off the
+    # face row and store it in the dedicated table instead.
+    row = face_table.get_entity(user_id, 'new-face')
+    del row['embedding']
+    face_table.upsert_entity(row)
+    face_embeddings_table.upsert_entity({
+        'PartitionKey': user_id, 'RowKey': 'new-face',
+        'embedding': json.dumps(PERSON_A_EMBEDDING_CLOSE),
+    })
 
     assignments, created = app._assign_faces_to_people_incrementally(user_id, 'photo.jpg', ['new-face'])
 

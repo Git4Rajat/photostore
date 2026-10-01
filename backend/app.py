@@ -73,6 +73,9 @@ from storage_utils import (
     apply_client_processing_results_for_file,
     get_photo_embeddings,
     delete_embeddings_entry,
+    get_face_embedding,
+    get_face_embeddings_batch,
+    delete_face_embeddings_entry,
     PHOTO_LIST_SELECT_FIELDS,
     get_user_listing_index,
     download_media_bytes,
@@ -387,6 +390,14 @@ METADATA_TABLE = os.getenv('METADATA_TABLE', 'photometadata')
 # every full-row read/scan for no benefit to the reader. See storage_utils.py's
 # _extract_and_store_embeddings.
 EMBEDDINGS_TABLE = os.getenv('EMBEDDINGS_TABLE', 'photoembeddings')
+# Same reasoning as EMBEDDINGS_TABLE above, for face-recognition embeddings
+# instead of photo-level ones: a 512-float JSON array on every photofaces row
+# shrinks Table Storage's effective page size well below its 1000-row cap,
+# inflating round-trip counts for any scan over the partition. Confirmed live
+# 2026-10-01 on microsvcpoc-dev at 99k+ face rows -- the dominant cost behind
+# three separate uncached-scan bugs fixed the same day. See storage_utils.py's
+# _extract_and_store_face_embedding.
+FACE_EMBEDDINGS_TABLE = os.getenv('FACE_EMBEDDINGS_TABLE', 'photofaceembeddings')
 # Dirty-set tracking for incremental search-index rebuilds: PartitionKey=
 # f"{user_id}#vector" or f"{user_id}#lexical", RowKey=filename. The vector and
 # lexical indexes used to be rebuilt as an all-or-nothing full re-scan/re-embed
@@ -938,6 +949,7 @@ account_name = None
 credential = None
 metadata_table_client = None
 embeddings_table_client = None
+face_embeddings_table_client = None
 search_index_dirty_table_client = None
 blob_service_client = None
 albums_table_client = None
@@ -1229,6 +1241,7 @@ def _init_storage_clients():
     global image_names_table_client
     global hash_index_table_client, filename_owners_table_client
     global embeddings_table_client
+    global face_embeddings_table_client
     global search_index_dirty_table_client
     global config_table_client
     global users_table_client, libraries_table_client, memberships_table_client
@@ -1242,6 +1255,7 @@ def _init_storage_clients():
         tbl_svc = TableServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         metadata_table_client_local = tbl_svc.get_table_client(METADATA_TABLE)
         embeddings_table_client_local = tbl_svc.get_table_client(EMBEDDINGS_TABLE)
+        face_embeddings_table_client_local = tbl_svc.get_table_client(FACE_EMBEDDINGS_TABLE)
         search_index_dirty_table_client_local = tbl_svc.get_table_client(SEARCH_INDEX_DIRTY_TABLE)
         albums_table_client_local = tbl_svc.get_table_client(ALBUMS_TABLE)
         album_token_index_table_client_local = tbl_svc.get_table_client(ALBUM_TOKEN_INDEX_TABLE)
@@ -1301,6 +1315,7 @@ def _init_storage_clients():
         )
         metadata_table_client_local = tbl_svc.get_table_client(METADATA_TABLE)
         embeddings_table_client_local = tbl_svc.get_table_client(EMBEDDINGS_TABLE)
+        face_embeddings_table_client_local = tbl_svc.get_table_client(FACE_EMBEDDINGS_TABLE)
         search_index_dirty_table_client_local = tbl_svc.get_table_client(SEARCH_INDEX_DIRTY_TABLE)
         albums_table_client_local = tbl_svc.get_table_client(ALBUMS_TABLE)
         album_token_index_table_client_local = tbl_svc.get_table_client(ALBUM_TOKEN_INDEX_TABLE)
@@ -1323,6 +1338,7 @@ def _init_storage_clients():
     # assign to globals
     metadata_table_client = metadata_table_client_local
     embeddings_table_client = embeddings_table_client_local
+    face_embeddings_table_client = face_embeddings_table_client_local
     search_index_dirty_table_client = search_index_dirty_table_client_local
     config_table_client = config_table_client_local
     blob_service_client = blob_service_client_local
@@ -1416,6 +1432,7 @@ def _init_storage_clients():
         hash_index_table_client=hash_index_table_client,
         filename_owners_table_client=filename_owners_table_client,
         embeddings_table_client=embeddings_table_client,
+        face_embeddings_table_client=face_embeddings_table_client,
         search_index_dirty_table_client=search_index_dirty_table_client,
         queue_map_on_upload=(MAPS_QUEUE_ON_UPLOAD and not MAPS_ON_UPLOAD),
         # Lambdas, not direct references: both targets are defined later in
@@ -1523,6 +1540,14 @@ def create_embeddings_table() -> None:
     try:
         svc = _ensure_table_service_client()
         svc.create_table_if_not_exists(table_name=EMBEDDINGS_TABLE)
+    except AzureError:
+        pass
+
+
+def create_face_embeddings_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=FACE_EMBEDDINGS_TABLE)
     except AzureError:
         pass
 
@@ -3674,6 +3699,22 @@ def _face_embedding_from_entity(face: Dict) -> List[float]:
         return []
 
 
+def _ensure_face_embedding_present(user_id: str, face_id: str, face_ent: Dict) -> Dict:
+    """Merge FACE_EMBEDDINGS_TABLE's embedding into face_ent (in place) when
+    the row doesn't already carry one inline -- covers both newly-written
+    faces (embedding never was inline, see _extract_and_store_face_embedding)
+    and not-yet-backfilled old rows transparently, so every existing
+    _face_embedding_from_entity(face_ent) call site downstream keeps working
+    unchanged regardless of which schema generation wrote this row. One
+    point-read, for the single-face-at-a-time call sites; see
+    get_face_embeddings_batch for the bounded-batch equivalent."""
+    if not face_ent.get('embedding'):
+        emb = get_face_embedding(user_id, face_id)
+        if emb:
+            face_ent['embedding'] = json.dumps(emb)
+    return face_ent
+
+
 def _face_embedding_version(face: Dict) -> str:
     return str(
         face.get('embeddingVersion')
@@ -4052,11 +4093,22 @@ def _update_person_rep_embedding(user_id: str, person_id: str) -> List[float]:
     except Exception:
         return []
 
+    # One batched fetch for this person's faces' embeddings, not one
+    # point-read per face_id added on top of the existing per-face_id
+    # metadata point-read below -- that would double this already-N+1 loop's
+    # round trips (same bug class fixed elsewhere for face metadata;
+    # get_face_embeddings_batch exists specifically to avoid reintroducing
+    # it here for embeddings).
+    embeddings_by_id = get_face_embeddings_batch(user_id, face_ids)
     face_entities = []
     for face_id in face_ids:
         try:
             face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
             if _face_is_owned_by_person(face, person_id):
+                if not face.get('embedding'):
+                    emb = embeddings_by_id.get(str(face_id))
+                    if emb:
+                        face['embedding'] = json.dumps(emb)
                 face_entities.append(face)
         except Exception:
             continue
@@ -4792,6 +4844,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
             continue
         if not _face_embedding_allowed_for_clustering(face_ent):
             continue
+        _ensure_face_embedding_present(user_id, face_id, face_ent)
         emb = _face_embedding_from_entity(face_ent)
         if not emb:
             continue
@@ -4959,6 +5012,22 @@ def cluster_user_faces(
     except Exception:
         return {'created': [], 'clusters': {}}
 
+    # Full-partition join with FACE_EMBEDDINGS_TABLE, mirroring
+    # _build_user_vector_index_snapshot's photo-level embeddings_by_filename
+    # join (storage_utils.py) -- one extra full scan, not a per-face
+    # point-read (would be 99k+ round trips on this account). Only fills in
+    # rows that don't already carry an inline embedding, so not-yet-migrated
+    # old rows keep working unchanged.
+    embeddings_by_face_id: Dict[str, List[float]] = {}
+    if face_embeddings_table_client is not None:
+        try:
+            embeddings_by_face_id = {
+                str(r.get('RowKey') or ''): json.loads(r.get('embedding', '[]') or '[]')
+                for r in face_embeddings_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
+            }
+        except Exception:
+            embeddings_by_face_id = {}
+
     # Faces that must never be re-clustered away from their current person:
     # confirmed / propagation-assigned (sticky), or any face already owned by a
     # user-named cluster. This is the upload path (people_cluster runs on every
@@ -4989,6 +5058,10 @@ def cluster_user_faces(
             owner_id = str(row.get('personId') or '')
             if owner_id and (_face_assignment_is_sticky(row) or owner_id in named_person_ids):
                 continue
+            if not row.get('embedding'):
+                fallback_emb = embeddings_by_face_id.get(str(row.get('RowKey') or ''))
+                if fallback_emb:
+                    row['embedding'] = json.dumps(fallback_emb)
             emb = _face_embedding_from_entity(row)
             if not emb:
                 continue
@@ -5460,6 +5533,18 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
         rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         rows = []
+    # Same bulk join as cluster_user_faces -- one extra full scan of
+    # FACE_EMBEDDINGS_TABLE instead of a per-face point-read, fills in rows
+    # that don't already carry an inline embedding.
+    embeddings_by_face_id: Dict[str, List[float]] = {}
+    if face_embeddings_table_client is not None:
+        try:
+            embeddings_by_face_id = {
+                str(r.get('RowKey') or ''): json.loads(r.get('embedding', '[]') or '[]')
+                for r in face_embeddings_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
+            }
+        except Exception:
+            embeddings_by_face_id = {}
     existing_rows = _cached_person_rows_for_user(user_id)
 
     existing_people = []
@@ -5501,6 +5586,10 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
     embedding_versions_seen = set()
     for row in rows:
         face_id = str(row.get('RowKey') or '')
+        if not row.get('embedding'):
+            fallback_emb = embeddings_by_face_id.get(face_id)
+            if fallback_emb:
+                row['embedding'] = json.dumps(fallback_emb)
         emb = _face_embedding_from_entity(row)
         if not face_id or not emb:
             skip_reasons['no_id_or_emb'] += 1
@@ -6995,34 +7084,61 @@ def _propagate_person_identity(
     except Exception:
         face_iter = []
 
+    # Same PEOPLE_PROPAGATE_SCAN_BATCH-bounded streaming this function was
+    # already rewritten around (see the comment above _flush_batch) applies
+    # to the embeddings-table join too: one chunked fetch per page of raw
+    # rows, not a per-row point-read and NOT a full-partition preload into a
+    # single dict (that would reintroduce the exact OOM this function exists
+    # to avoid, just against FACE_EMBEDDINGS_TABLE instead of photofaces).
+    page_rows: List[Dict] = []
+
+    def _process_page() -> None:
+        nonlocal candidate_face_count
+        if not page_rows:
+            return
+        if face_embeddings_table_client is not None:
+            missing_ids = [str(r.get('RowKey') or '') for r in page_rows if not r.get('embedding')]
+            if missing_ids:
+                fallback = get_face_embeddings_batch(user_id, missing_ids)
+                for r in page_rows:
+                    fid = str(r.get('RowKey') or '')
+                    if not r.get('embedding') and fallback.get(fid):
+                        r['embedding'] = json.dumps(fallback[fid])
+        for row in page_rows:
+            face_id = str(row.get('RowKey') or '')
+            if not face_id or face_id in declined:
+                continue
+            owner_id = str(row.get('personId') or '')
+            if owner_id == person_id:
+                continue
+            # Only pull from unclustered faces or *unnamed* clusters; never steal a
+            # face that already belongs to (or was confirmed for) another named person.
+            if owner_id and owner_id in named_person_ids:
+                continue
+            if _face_is_confirmed(row):
+                continue
+            if not _face_is_clusterable(row):
+                continue
+            if not _face_embedding_allowed_for_clustering(row):
+                continue
+            emb = _face_embedding_from_entity(row)
+            if not emb or len(emb) != target_dim:
+                continue
+            candidate_face_count += 1
+            batch_ids.append(face_id)
+            # Only retain the row when suggestions are collected (it feeds the review
+            # summary); the apply path re-reads the live row, so drop it to save RAM.
+            batch_rows.append(row if collect_suggestions else None)
+            batch_embeddings.append(emb)
+            if len(batch_embeddings) >= PEOPLE_PROPAGATE_SCAN_BATCH:
+                _flush_batch()
+        page_rows.clear()
+
     for row in face_iter:
-        face_id = str(row.get('RowKey') or '')
-        if not face_id or face_id in declined:
-            continue
-        owner_id = str(row.get('personId') or '')
-        if owner_id == person_id:
-            continue
-        # Only pull from unclustered faces or *unnamed* clusters; never steal a
-        # face that already belongs to (or was confirmed for) another named person.
-        if owner_id and owner_id in named_person_ids:
-            continue
-        if _face_is_confirmed(row):
-            continue
-        if not _face_is_clusterable(row):
-            continue
-        if not _face_embedding_allowed_for_clustering(row):
-            continue
-        emb = _face_embedding_from_entity(row)
-        if not emb or len(emb) != target_dim:
-            continue
-        candidate_face_count += 1
-        batch_ids.append(face_id)
-        # Only retain the row when suggestions are collected (it feeds the review
-        # summary); the apply path re-reads the live row, so drop it to save RAM.
-        batch_rows.append(row if collect_suggestions else None)
-        batch_embeddings.append(emb)
-        if len(batch_embeddings) >= PEOPLE_PROPAGATE_SCAN_BATCH:
-            _flush_batch()
+        page_rows.append(row)
+        if len(page_rows) >= PEOPLE_PROPAGATE_SCAN_BATCH:
+            _process_page()
+    _process_page()
     _flush_batch()
 
     if candidate_face_count == 0:
@@ -12422,7 +12538,7 @@ def _remove_file_quietly(path: str) -> None:
 
 
 # Guard other optional startup helpers to avoid import-time failures
-for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
+for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_face_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
     if _fn in globals() and callable(globals().get(_fn)):
         try:
             globals().get(_fn)()
