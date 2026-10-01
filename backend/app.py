@@ -4104,25 +4104,26 @@ def _update_person_rep_embedding(user_id: str, person_id: str) -> List[float]:
     except Exception:
         return []
 
-    # One batched fetch for this person's faces' embeddings, not one
-    # point-read per face_id added on top of the existing per-face_id
-    # metadata point-read below -- that would double this already-N+1 loop's
-    # round trips (same bug class fixed elsewhere for face metadata;
-    # get_face_embeddings_batch exists specifically to avoid reintroducing
-    # it here for embeddings).
+    # Pull face metadata from the already-cached, shared face-summary scan
+    # (_load_user_face_summary_by_id) instead of one face_table_client.get_entity()
+    # point-read per face_id -- for a person with hundreds/thousands of faces
+    # (exactly the popular-person case), that was hundreds/thousands of
+    # synchronous Table round trips on every single new assignment to them,
+    # in the clustering worker's hot path. Embeddings still come from the
+    # dedicated table via the existing batched fetch below, since the
+    # summary projection deliberately excludes that column.
+    summary = _load_user_face_summary_by_id(user_id)
     embeddings_by_id = get_face_embeddings_batch(user_id, face_ids)
     face_entities = []
     for face_id in face_ids:
-        try:
-            face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-            if _face_is_owned_by_person(face, person_id):
-                if not face.get('embedding'):
-                    emb = embeddings_by_id.get(str(face_id))
-                    if emb:
-                        face['embedding'] = json.dumps(emb)
-                face_entities.append(face)
-        except Exception:
-            continue
+        face = summary.get(str(face_id))
+        if face is not None and _face_is_owned_by_person(face, person_id):
+            if not face.get('embedding'):
+                emb = embeddings_by_id.get(str(face_id))
+                if emb:
+                    face = dict(face)
+                    face['embedding'] = json.dumps(emb)
+            face_entities.append(face)
 
     try:
         import numpy as np
