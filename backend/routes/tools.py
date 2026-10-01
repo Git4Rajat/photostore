@@ -140,9 +140,20 @@ def tools_build_indexes():
     # index scans a user's full metadata partition (OCR/tags/faces per row) and
     # was OOM-ing backend. Kicks the existing single-flighted sequential
     # builder; a build already in flight (or one triggered by a second tab / an
-    # ipworker milestone) no-ops against the prime lock. Fire-and-forget: the
-    # build runs off-thread, this returns the current readiness immediately so
-    # the frontend can start polling /api/tools/indexes/status.
+    # ipworker milestone) no-ops against the prime lock.
+    #
+    # Blocking, not fire-and-forget: tools runs minReplicas=0, and Container
+    # Apps' autoscaler counts in-flight HTTP requests to decide when to scale
+    # back to 0. A build that returned immediately and kept running on a
+    # background thread left nothing holding the replica open, so a routine
+    # scale-down could (and did, live on microsvcpoc-dev 2026-10-01) kill the
+    # build mid-run -- the orphaned job row then surfaced to the user as
+    # "Library index build failed: Job did not finish (worker restarted or
+    # timed out)". wait=True (see prime_all_user_indexes_sequentially) makes
+    # this request span the whole build so the replica stays alive for it.
+    # gunicorn's gthread workers (--threads 4) mean this doesn't stall other
+    # requests on the same replica, and --timeout 600 / the frontend's 600s
+    # client timeout both already cover a full cold-account build.
     user_id, error = app._require_user_id()
     if error:
         return error
@@ -154,16 +165,15 @@ def tools_build_indexes():
     # `ready` (all built) is what the frontend gate waits on -- a built-but-
     # dirty index is still usable, so it doesn't hold the gate.
     state = app.get_user_index_build_state(user_id)
-    building = False
     if state['needs_rebuild']:
         try:
             app.prime_all_user_indexes_sequentially(
-                user_id, on_progress=_index_build_progress_callback(user_id),
+                user_id, on_progress=_index_build_progress_callback(user_id), wait=True,
             )
-            building = True
         except Exception:
-            app.app.logger.exception('Index build failed to start for %s', user_id)
-    return app.jsonify({'ok': True, 'ready': state['ready'], 'building': building, 'indexes': state['indexes']})
+            app.app.logger.exception('Index build failed for %s', user_id)
+        state = app.get_user_index_build_state(user_id)
+    return app.jsonify({'ok': True, 'ready': state['ready'], 'building': False, 'indexes': state['indexes']})
 
 
 @tools_bp.route('/api/tools/indexes/status', methods=['GET'])

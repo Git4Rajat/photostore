@@ -132,6 +132,50 @@ def test_prime_all_user_indexes_sequentially_noop_for_blank_user_id(monkeypatch)
     assert calls == []
 
 
+def test_prime_all_user_indexes_sequentially_wait_runs_on_calling_thread(monkeypatch):
+    # wait=True is what /api/tools/indexes/build now uses so the HTTP request
+    # spans the whole build (a scale-to-zero tools replica otherwise gets torn
+    # down by the autoscaler mid-build, per the route's comment) -- pin that
+    # the call doesn't return until every refresh has actually run, i.e. it's
+    # not just spawning the usual background thread and returning early.
+    calls = []
+    _patch_refreshers(monkeypatch, calls)
+
+    storage_utils.prime_all_user_indexes_sequentially('lib-wait', wait=True)
+
+    assert calls == ['sort', 'access', 'lexical', 'albums', 'people']
+
+
+def test_prime_all_user_indexes_sequentially_wait_blocks_for_in_flight_prime(monkeypatch):
+    # If another prime for the same user is already running (e.g. two
+    # overlapping triggers on the same replica), wait=True must block until
+    # it finishes rather than returning immediately -- and must not re-run
+    # the build itself once it does.
+    calls = []
+    entered = threading.Event()
+    release = threading.Event()
+    _patch_refreshers(monkeypatch, calls, slow_kind='sort', entered=entered, release=release)
+
+    storage_utils.prime_all_user_indexes_sequentially('lib-wait-blocked')
+    assert entered.wait(timeout=5), 'first priming run never started'
+
+    waited_done = threading.Event()
+
+    def _waiter():
+        storage_utils.prime_all_user_indexes_sequentially('lib-wait-blocked', wait=True)
+        waited_done.set()
+
+    waiter_thread = threading.Thread(target=_waiter, daemon=True)
+    waiter_thread.start()
+    time.sleep(0.1)
+    assert not waited_done.is_set(), 'wait=True returned before the in-flight prime finished'
+
+    release.set()
+    waiter_thread.join(timeout=5)
+    assert waited_done.is_set()
+    assert calls == ['sort', 'access', 'lexical', 'albums', 'people']  # only ran once, not re-run by the waiter
+
+
 def test_prime_emits_progress_at_start_each_step_and_end(monkeypatch):
     calls = []
     _patch_refreshers(monkeypatch, calls)
@@ -291,7 +335,7 @@ def test_tools_build_kicks_primer_when_any_index_missing(monkeypatch, route_ctx)
     payload = response.get_json()
     assert payload['ok'] is True
     assert payload['ready'] is False
-    assert payload['building'] is True
+    assert payload['building'] is False  # build is synchronous now, so it's done by the time this returns
     assert payload['indexes']['lexical'] is False
 
 
@@ -309,7 +353,7 @@ def test_tools_build_kicks_primer_when_built_but_dirty(monkeypatch, route_ctx):
     assert primed == ['owner']
     payload = response.get_json()
     assert payload['ready'] is True
-    assert payload['building'] is True
+    assert payload['building'] is False  # build is synchronous now, so it's done by the time this returns
 
 
 def test_tools_build_survives_primer_exception(monkeypatch, route_ctx):
@@ -334,7 +378,7 @@ def test_tools_build_passes_progress_callback_that_writes_job_row(monkeypatch, r
         {'sort': False, 'lexical': False, 'albums': False, 'people': False}, needs_rebuild=True))
     captured = {}
 
-    def _fake_prime(uid, *, on_progress=None):
+    def _fake_prime(uid, *, on_progress=None, wait=False):
         captured['on_progress'] = on_progress
 
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', _fake_prime)

@@ -4614,8 +4614,9 @@ def prime_all_user_indexes_sequentially(
     user_id: str,
     *,
     on_progress: Optional[Callable[[Dict[str, bool], bool], None]] = None,
+    wait: bool = False,
 ) -> None:
-    """Build all four derived indexes for a user, one at a time, off-thread.
+    """Build all four derived indexes for a user, one at a time.
 
     on_progress (optional) is invoked with (readiness_dict, building) at the
     start, after each index, and once at the end (building=False). The
@@ -4624,12 +4625,39 @@ def prime_all_user_indexes_sequentially(
     progress into an `index_build` jobs-table row without this module needing
     to import app.py's job helpers (which would be a circular import --
     storage_utils is imported BY app). Kept fully best-effort: a raising
-    callback is logged and swallowed, never failing the build itself."""
+    callback is logged and swallowed, never failing the build itself.
+
+    wait=False (default) runs the build on a daemon thread and returns
+    immediately -- the original fire-and-forget shape. wait=True runs it on
+    the calling thread instead, so the build only finishes once this call
+    returns. The tools role's /api/tools/indexes/build route uses wait=True:
+    on a scale-to-zero container, "return immediately, keep building in the
+    background" meant the HTTP request that triggered the build no longer
+    held the replica open, so Container Apps' request-concurrency autoscaler
+    would scale the replica back to 0 mid-build (confirmed live on
+    microsvcpoc-dev 2026-10-01 -- a build kicked at 11:58:28 was killed by a
+    routine scale-down at 12:00:43, orphaning the job row, which the
+    /api/jobs/status staleness sweep then reported as "Job did not finish
+    (worker restarted or timed out)"). Blocking the request for the build's
+    duration keeps the replica alive via that same concurrency count instead.
+    Gunicorn's gthread worker class means one request thread blocking here
+    doesn't stall the others (--threads 4), and the liveness probe runs on an
+    independent sidecar port, so this doesn't reintroduce the thread-
+    starvation issue --timeout 600 / the frontend's 600s client timeout were
+    already sized to cover a full cold-account build."""
     key = str(user_id or '').strip()
     if not key:
         return
     lock = _INDEX_PRIME_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
+        if wait:
+            # Another prime is already running (in this process) -- block
+            # until it releases rather than returning immediately, so the
+            # caller's HTTP request still spans the actual build. Nothing
+            # left for this call to do once it does: re-running the build
+            # here would just redundantly redo the work that just finished.
+            lock.acquire(blocking=True)
+            lock.release()
         return
 
     def _emit(building: bool) -> None:
@@ -4674,7 +4702,10 @@ def prime_all_user_indexes_sequentially(
             lock.release()
             _emit(False)
 
-    threading.Thread(target=_worker, name='index-prime-sequential', daemon=True).start()
+    if wait:
+        _worker()
+    else:
+        threading.Thread(target=_worker, name='index-prime-sequential', daemon=True).start()
 
 
 def index_prime_in_progress(user_id: str) -> bool:

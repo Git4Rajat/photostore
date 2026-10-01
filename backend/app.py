@@ -12074,11 +12074,14 @@ def _trigger_tools_index_rebuild(user_id: str) -> None:
     Direct service-to-service HTTP: the caller mints a normal session token for
     the user (SESSION_SECRET is a shared secret across all container-app roles,
     so tools validates it through its usual _require_user_id) and POSTs the same
-    /api/tools/indexes/build the frontend uses. Fire-and-forget on a daemon
-    thread with a short timeout so a cold/slow tools replica never stalls the
-    caller; tools' own single-flight prime lock + the index_build job row dedupe
-    overlapping triggers. No-op (silent) when TOOLS_INTERNAL_URL is unset, so
-    envs with no tools rebuild wiring are unaffected.
+    /api/tools/indexes/build the frontend uses. Fire-and-forget from THIS
+    caller's point of view -- it runs on its own daemon thread so ipworker/
+    backend never block on it -- but the POST itself now blocks until tools
+    finishes the build (see prime_all_user_indexes_sequentially's wait=True),
+    so the timeout here has to cover a full build, not just a request
+    round-trip; tools' own single-flight prime lock + the index_build job row
+    dedupe overlapping triggers. No-op (silent) when TOOLS_INTERNAL_URL is
+    unset, so envs with no tools rebuild wiring are unaffected.
 
     Callers: ipworker (queue-drain / every 10k files) and the backend's
     search-index/sort-index SAS-mint routes when they observe a dirty manifest
@@ -12104,7 +12107,7 @@ def _trigger_tools_index_rebuild(user_id: str) -> None:
                 f"{tools_url.rstrip('/')}/api/tools/indexes/build",
                 json={},
                 headers={'Authorization': f'Bearer {token}'},
-                timeout=float(os.getenv('TOOLS_INDEX_REBUILD_TIMEOUT_SECONDS', '15')),
+                timeout=float(os.getenv('TOOLS_INDEX_REBUILD_TIMEOUT_SECONDS', '600')),
             )
         except Exception:
             worker_logger.exception('Failed to trigger tools index rebuild for %s', key)
