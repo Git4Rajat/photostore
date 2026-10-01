@@ -9600,16 +9600,28 @@ def _face_ids_awaiting_person_assignment(user_id: str, filename: str) -> List[st
     """Face rows for one photo that don't have a personId yet. metadata's own
     'faces' list never carries the server-assigned Table RowKey (it's built
     from the client-reported payload with the embedding stripped), so this is
-    the only way to get face_ids for the incremental matcher below."""
+    the only way to get face_ids for the incremental matcher below.
+
+    Was an uncached query_entities("PartitionKey eq user and filename eq X")
+    -- Table Storage has no secondary index on filename, so that scanned
+    every face row the account has EVER stored, on every single
+    people_incremental_assign message (same bug class already fixed for
+    _store_client_face_entities in storage_utils.py, just never ported to
+    this call site). Invisible at small scale, ruinous once the face table
+    is large: confirmed live 2026-10-01 on microsvcpoc-dev, clustering
+    throughput regressed from ~10k/hr to under 1k/hr as this account's face
+    partition grew to 99k+ rows -- this single query was the dominant cost
+    of every incremental-assign message. _load_user_face_summary_by_id is
+    the same cached, invalidate-on-write-patched per-user face scan
+    _store_client_face_entities already uses, filtered here in-memory by
+    filename instead of server-side."""
     if face_table_client is None:
         return []
-    try:
-        rows = list(face_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
-        ))
-    except Exception:
-        return []
-    return [str(r.get('RowKey') or '') for r in rows if r.get('RowKey') and not r.get('personId')]
+    summary = _load_user_face_summary_by_id(user_id)
+    return [
+        str(face_id) for face_id, row in summary.items()
+        if str(row.get('filename') or '') == filename and not row.get('personId')
+    ]
 
 
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
