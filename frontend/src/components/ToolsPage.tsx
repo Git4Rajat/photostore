@@ -1029,7 +1029,7 @@ const ToolsPage: React.FC = () => {
         const tick = async () => {
             attempts += 1;
             try {
-                const response = await get('/api/jobs/status') as { jobs?: Array<Record<string, unknown>> };
+                const response = await getTools('/api/jobs/status') as { jobs?: Array<Record<string, unknown>> };
                 const job = (response?.jobs || []).find((j) => j.jobId === jobId);
                 if (job && (job.status === 'done' || job.status === 'failed')) {
                     const snapshotId = String(job.snapshotId || '');

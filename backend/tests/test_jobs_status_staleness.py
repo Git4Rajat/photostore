@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import app
-from routes.system import jobs_status
+from routes.tools import jobs_status
 
 
 class _FakeJobsTable:

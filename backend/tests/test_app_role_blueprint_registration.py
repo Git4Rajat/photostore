@@ -74,7 +74,23 @@ def test_tools_role_serves_only_tools_routes():
         # is the 2vCPU/4Gi role that can safely scan a full metadata partition.
         '/api/tools/indexes/build',
         '/api/tools/indexes/status',
+        # jobs_status moved here from backend (2026-10-01): polled
+        # continuously by every session, indefinitely -- competed with
+        # interactive gallery traffic for backend's thin GUNICORN_WORKERS=2/
+        # THREADS=2 pool. See routes/tools.py's comment on jobs_status.
+        '/api/jobs/status',
+        '/jobs/status',
     }
+
+
+def test_backend_role_does_not_serve_jobs_status():
+    """jobs_status moved to tools (2026-10-01) -- see the tools-role test
+    above. Backend must not keep serving it too, or the move wouldn't
+    actually relieve backend's thread pool of this continuous poll."""
+    paths = _rule_paths_for_role(None)
+    assert '/api/jobs/status' not in paths
+    assert '/jobs/status' not in paths
+    assert '/health' in paths  # sanity: system_bp's other routes still registered
 
 
 def test_upload_role_serves_only_upload_routes():
