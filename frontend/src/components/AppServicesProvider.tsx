@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { get, getTools, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
+import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
@@ -265,7 +265,6 @@ interface AppServicesContextValue {
     ipworkActive: boolean;
     ipworkStatusLabel: string;
     libraryIndexReady: boolean | null;
-    libraryIndexBuiltCount: number;
 }
 
 export type BrowserProcessingAction = 'preview' | 'thumbnails' | 'exif' | 'ocr' | 'vision' | 'map' | 'faces';
@@ -606,13 +605,6 @@ const UPLOAD_WARMUP_MAX_MS = 120000;
 // transfers. AbortSignal.timeout is supported iOS Safari 16+.
 const WARMUP_REQUEST_TIMEOUT_MS = 8000;
 const BACKEND_KEEPALIVE_INTERVAL_MS = 30000;
-const INDEX_READY_POLL_INTERVAL_MS = 4000;
-// Same 2-minute shape as UPLOAD_WARMUP_MAX_MS just above: a genuinely stuck
-// index build (backend error, account edge case) must never trap the user
-// on the "building your library" gate forever -- give up and let Shell
-// render normally, falling back to the same per-page legacy-endpoint/local-
-// index-miss handling that already exists for an index that isn't ready.
-const INDEX_READY_POLL_MAX_MS = 120000;
 // requestUpload already fires a warm-up poll before the native picker opens
 // (pollUntilWarm(warmUpload, ...)), and warmBackend/warmUpload both hit the
 // exact same backend /health endpoint (APP_CONFIG_API_BASE_URL and
@@ -903,79 +895,39 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // cold (uncached) download+warm-up has gotten so the UI can show real progress
     // instead of an indeterminate spinner for up to ~90s.
     const [browserAiLoadProgress, setBrowserAiLoadProgress] = useState<BrowserAiLoadStage | null>(null);
-    // True once every per-user derived index (sort/lexical/albums/people)
-    // has been built at least once; false while a genuinely cold account's
-    // first session is still building. Starts null ("not checked yet") --
-    // NOT true -- so Shell holds off mounting Gallery/Explore/People/Albums
-    // (see the index-priming effect below) until the first prime-indexes
-    // response is back. Defaulting this to true would let Page mount
-    // immediately on every load, firing those pages' own data calls before
-    // the async readiness check ever resolves -- exactly the concurrent
-    // cold-start pile-up this feature exists to prevent. The round trip is
-    // cheap (a manifest-only check) on a warm account, so this only costs a
-    // brief, barely-visible loading flash there -- same shape as the
-    // existing !authReady gate above.
+    // True once the one-time "has this account's derived index ever been
+    // built" check is back; starts null ("not checked yet") -- NOT true --
+    // so Shell holds off mounting Gallery/Explore/People/Albums (StoreProvider's
+    // own mount effects fire unconditionally) until that single round trip
+    // resolves. Defaulting to true would let everything mount immediately on
+    // every load, firing each page's own data call before this ever resolves
+    // -- the concurrent cold-start pile-up this gate exists to prevent (same
+    // shape as the existing !authReady gate above). It is deliberately NOT a
+    // "wait for the index build to finish" gate -- see the effect below.
     const [libraryIndexReady, setLibraryIndexReady] = useState<boolean | null>(null);
-    // How many of the 4 derived indexes (sort/lexical/albums/people) are built
-    // so far, for the "Building your library index — N of 4 ready…" gate label.
-    const [libraryIndexBuiltCount, setLibraryIndexBuiltCount] = useState<number>(0);
 
-    // Fires once per session (this provider only mounts once signed in):
-    // 1. Ask BACKEND whether this account's derived index files already exist
-    //    (GET /api/photos/index-status -- a cheap manifest read, no table
-    //    scan). Warm account (the common case) -> ready immediately, no gate.
-    // 2. Cold account -> ask the TOOLS role (2vCPU/4Gi) to build them
-    //    (POST /api/tools/indexes/build). Backend deliberately never builds:
-    //    the lexical-index scan pulls OCR/tags/faces for every row and OOM-ed
-    //    backend's 1Gi container (2026-09-30 microsvcpoc-dev HAR). Gating here
-    //    (above StoreProvider, see AppShellGate) also keeps Gallery/Explore/
-    //    People/Albums from firing their own data calls during the build.
-    // 3. Poll tools for progress (N of 4 built) until ready, then flip the
-    //    gate so the app mounts and fetches the now-built indexes as usual.
+    // Fires once per session (this provider only mounts once signed in): asks
+    // BACKEND whether this account's derived index files already exist (GET
+    // /api/photos/index-status -- a cheap manifest read, no table scan), then
+    // immediately unblocks the app either way. A cold/dirty account also
+    // kicks the TOOLS role to (re)build its indexes (POST /api/tools/indexes/
+    // build), but strictly fire-and-forget: the frontend never awaits it, polls
+    // its progress, or blocks the UI on its outcome. Index building is a
+    // backend-owned background job -- each page's own data route already has
+    // its own cold/dirty-index fallback (/photos/timeline, /explore, etc.), so
+    // there is nothing for the UI to gate on beyond this one existence check.
     useEffect(() => {
         if (!isLikelyAuthenticated()) {
             return;
         }
         let cancelled = false;
-        const countBuilt = (indexes?: Record<string, boolean> | null): number =>
-            indexes ? Object.values(indexes).filter(Boolean).length : 0;
-
-        const pollTools = async () => {
-            const startedAt = Date.now();
-            while (!cancelled && Date.now() - startedAt < INDEX_READY_POLL_MAX_MS) {
-                await new Promise((resolve) => setTimeout(resolve, INDEX_READY_POLL_INTERVAL_MS));
-                if (cancelled) return;
-                const status = await getTools<{ ready?: boolean; indexes?: Record<string, boolean> }>(
-                    '/api/tools/indexes/status',
-                ).catch(() => null);
-                if (cancelled) return;
-                if (status?.indexes) setLibraryIndexBuiltCount(countBuilt(status.indexes));
-                if (status?.ready) {
-                    setLibraryIndexReady(true);
-                    return;
-                }
-            }
-            if (!cancelled) {
-                setLibraryIndexReady(true); // give up waiting; per-page fallbacks take it from here
-            }
-        };
-
         void (async () => {
-            const status = await get<{ ready?: boolean; indexes?: Record<string, boolean> }>(
-                '/api/photos/index-status',
-            ).catch(() => null);
+            const status = await get<{ ready?: boolean }>('/api/photos/index-status').catch(() => null);
             if (cancelled) return;
-            if (!status || status.ready) {
-                // Warm account, or a failed check we don't want to block on:
-                // this gate is a best-effort UX nicety, not a correctness gate.
-                setLibraryIndexReady(true);
-                return;
+            setLibraryIndexReady(true);
+            if (status && !status.ready) {
+                void postTools('/api/tools/indexes/build', {}).catch(() => null);
             }
-            setLibraryIndexBuiltCount(countBuilt(status.indexes));
-            setLibraryIndexReady(false);
-            await postTools('/api/tools/indexes/build', {}).catch(() => null);
-            if (cancelled) return;
-            void pollTools();
         })();
         return () => {
             cancelled = true;
@@ -4690,7 +4642,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         ipworkActive,
         ipworkStatusLabel,
         libraryIndexReady,
-        libraryIndexBuiltCount,
     }), [
         notifications,
         unreadCount,
@@ -4725,7 +4676,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         ipworkActive,
         ipworkStatusLabel,
         libraryIndexReady,
-        libraryIndexBuiltCount,
     ]);
 
     return (
