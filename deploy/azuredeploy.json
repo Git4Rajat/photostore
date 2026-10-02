@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "13348975969386736696"
+      "templateHash": "7829296632821210913"
     }
   },
   "parameters": {
@@ -99,6 +99,15 @@
       "metadata": {
         "description": "Quota in GiB for the dedicated worker FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage."
       }
+    },
+    "workerMinReplicas": {
+      "type": "int",
+      "defaultValue": 1,
+      "minValue": 0,
+      "maxValue": 1,
+      "metadata": {
+        "description": "Keep the live FAISS clustering worker warm across empty-queue gaps. Default 1 incurs continuous cost; 0 opts into repeated cold-start latency."
+      }
     }
   },
   "resources": [
@@ -148,6 +157,9 @@
           },
           "workerFileShareQuotaGiB": {
             "value": "[parameters('workerFileShareQuotaGiB')]"
+          },
+          "workerMinReplicas": {
+            "value": "[parameters('workerMinReplicas')]"
           }
         },
         "template": {
@@ -157,7 +169,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "12872160433327418459"
+              "templateHash": "9065384700512441344"
             }
           },
           "parameters": {
@@ -243,6 +255,15 @@
               "maxValue": 5120,
               "metadata": {
                 "description": "Quota in GiB for the dedicated worker FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage."
+              }
+            },
+            "workerMinReplicas": {
+              "type": "int",
+              "defaultValue": 1,
+              "minValue": 0,
+              "maxValue": 1,
+              "metadata": {
+                "description": "Minimum clustering worker replicas. Keep 1 for live FAISS to preserve the warm index across empty-queue gaps. Set 0 only to accept repeated cold builds and scale-to-zero latency; 1 incurs continuous worker cost."
               }
             },
             "sessionSecretParam": {
@@ -1065,7 +1086,7 @@
                     }
                   ],
                   "scale": {
-                    "minReplicas": 0,
+                    "minReplicas": "[parameters('workerMinReplicas')]",
                     "maxReplicas": 1,
                     "cooldownPeriod": 300,
                     "rules": [

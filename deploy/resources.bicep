@@ -65,6 +65,11 @@ param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 @maxValue(5120)
 param workerFileShareQuotaGiB int = 100
 
+@description('Minimum clustering worker replicas. Keep 1 for live FAISS to preserve the warm index across empty-queue gaps. Set 0 only to accept repeated cold builds and scale-to-zero latency; 1 incurs continuous worker cost.')
+@minValue(0)
+@maxValue(1)
+param workerMinReplicas int = 1
+
 @description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
 @secure()
 param sessionSecretParam string = '${newGuid()}${newGuid()}'
@@ -1339,22 +1344,12 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
         { name: 'faiss-checkpoints', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
-        minReplicas: 0
+        // Live FAISS cannot amortize training if queue lulls destroy its only
+        // replica. A replica floor, not merely cooldown, prevents this teardown.
+        // It does not prevent deployment/platform/OOM restarts or cache changes.
+        minReplicas: workerMinReplicas
         maxReplicas: 1
-        // 2026-09-21: found via forenkla2-qa telemetry during a real 986-file
-        // upload -- the platform's effective cooldown between the last active
-        // trigger and scale-to-zero was only ~60s (confirmed live via
-        // ContainerAppSystemLogs_CL: 'Deactivated...from 1 to 0' followed by
-        // 'Scaled...from 0 to 1' exactly 60s later), not the ~300s a GET on
-        // the resource reports as a schema default. Under one continuous
-        // upload session, the clustering queue kept draining to empty for
-        // brief gaps between bursts, so the worker fully cold-started 5
-        // separate times in ~65 minutes instead of staying warm across the
-        // session. Set explicitly to 300s so a short lull no longer tears
-        // the replica down -- cost impact is negligible (a few extra idle
-        // minutes on a 1.0vCPU app); benefit is removing repeated
-        // process-restart/reconnect latency right when a user is watching
-        // clustering results land.
+        // Relevant only when explicitly opting back into a zero-replica floor.
         cooldownPeriod: 300
         rules: [
           {

@@ -45,6 +45,8 @@ class RetryableLibraryLeaseError(RuntimeError):
 class _LeaseGuard:
     def __init__(self, lease, duration, renew_seconds, acquired_at):
         self.cache_generation = None
+        self.checkpoint_revision = None
+        self._publish_assignment_revision = None
         self._lease = lease
         self._duration = duration
         self._renew_seconds = renew_seconds
@@ -86,6 +88,12 @@ class _LeaseGuard:
                 if self._lost is None:
                     self._lost = error
             self._stop.set()
+
+    def begin_assignment(self):
+        """Invalidate durable snapshots BEFORE any possibly committed Table write."""
+        self.check()
+        self._publish_assignment_revision()
+        self.check()
 
     def _run(self):
         while not self._stop.wait(self._renew_seconds):
@@ -162,7 +170,8 @@ def _state(raw):
         if len(raw) > _MAX_STATE_BYTES:
             raise ValueError('Lease state is too large')
         state = json.loads(raw, object_pairs_hook=_unique_fields)
-        if not isinstance(state, dict) or set(state) != {'owner', 'generation'}:
+        if not isinstance(state, dict) or set(state) not in (
+            {'owner', 'generation'}, {'owner', 'generation', 'assignment_revision'}):
             raise ValueError('Invalid lease state fields')
         owner, generation = state['owner'], state['generation']
         if not isinstance(owner, str) or not isinstance(generation, str):
@@ -170,6 +179,10 @@ def _state(raw):
         if owner:
             uuid.UUID(owner)
         uuid.UUID(generation)
+        if 'assignment_revision' in state:
+            revision = state['assignment_revision']
+            if not isinstance(revision, str) or str(uuid.UUID(revision)) != revision:
+                raise ValueError('Invalid assignment revision')
         return state
     except (ValueError, TypeError, UnicodeError, AttributeError) as error:
         raise RetryableLibraryLeaseError('Invalid library lease state') from error
@@ -223,12 +236,22 @@ class BlobLibraryLeaseFactory:
             raw = blob.download_blob(lease=lease, offset=0, length=_MAX_STATE_BYTES + 1).readall()
             state = _state(raw)
             if state['owner'] != self._owner:
-                state = {'owner': self._owner, 'generation': str(uuid.uuid4())}
+                state = dict(state, owner=self._owner, generation=str(uuid.uuid4()))
             guard.check()
             # The state publication itself is atomically fenced by the Blob lease.
             blob.upload_blob(json.dumps(state), overwrite=True, lease=lease)
             source_revision = read_source_revision(self._client, self._container, user_id)
             guard.cache_generation = (state['generation'], source_revision)
+            guard.checkpoint_revision = (source_revision, state.get('assignment_revision', ''))
+
+            def publish_assignment_revision():
+                next_state = dict(state, assignment_revision=str(uuid.uuid4()))
+                guard.check()
+                blob.upload_blob(json.dumps(next_state), overwrite=True, lease=lease)
+                state.update(next_state)
+                guard.checkpoint_revision = (source_revision, state['assignment_revision'])
+
+            guard._publish_assignment_revision = publish_assignment_revision
             guard.check()
             yield guard
         finally:

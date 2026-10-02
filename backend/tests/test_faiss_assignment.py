@@ -93,6 +93,7 @@ class Harness:
         self.metadata = []
         self.metadata_error = None
         self.generation = None
+        self.assignment_revision = 0
         self.checks = 0
         self.fail_check = None
         self.assigner = FaissAssigner(
@@ -112,6 +113,13 @@ class Harness:
 
         class Guard:
             cache_generation = harness.generation
+
+            @property
+            def checkpoint_revision(self):
+                return (harness.generation, harness.assignment_revision)
+
+            def begin_assignment(self):
+                harness.assignment_revision += 1
 
             def check(self):
                 harness.checks += 1
@@ -197,6 +205,146 @@ def test_candidate_cloud_reads_bounded_by_valid_top_two(caplog):
     assert candidate_reads == 2
     assert 'candidate_face_reads=2 candidate_person_reads=2' in caplog.text
     assert 'faiss cold build' in caplog.text
+
+
+def test_repeated_build_logs_distinguish_source_revision_from_ownership(monkeypatch, caplog):
+    monkeypatch.setattr(assignment, '_COLD_BUILD_ATTEMPTS', 0)
+    h = Harness()
+    h.generation = ('owner-1', 'revision-1')
+    h.face('first')
+    with caplog.at_level('INFO', logger='faiss_assignment'):
+        h.assign('first')
+        h.generation = ('owner-1', 'revision-2')
+        h.face('second')
+        h.assign('second')
+    assert 'build_attempt=1 first_build_in_process=True' in caplog.text
+    assert 'build_attempt=2 first_build_in_process=False' in caplog.text
+    assert 'ownership_changed=False source_revision_changed=True' in caplog.text
+    assert len(h.faces.queries) == 2
+
+
+def test_checkpoint_restores_without_cloud_scan_or_training(tmp_path, monkeypatch, caplog):
+    config = AssignmentConfig(work_dir=str(tmp_path / 'work'),
+                              checkpoint_dir=str(tmp_path / 'share'),
+                              checkpoint_interval_seconds=0)
+    h = Harness(config=config)
+    h.face('first')
+    h.assign('first')
+    h.assigner.invalidate()
+    h.faces.fail_query = RuntimeError('restore must not scan cloud')
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'build',
+                        lambda *a, **kw: pytest.fail('restore must not train'))
+    h.face('second')
+    with caplog.at_level('INFO', logger='faiss_assignment'):
+        result, _ = h.assign('second')
+    assert result['second'] == h.faces.rows['u', 'first']['personId']
+    assert 'faiss checkpoint restored' in caplog.text
+
+
+def test_checkpoint_rejects_unsnapshotted_committed_assignment(tmp_path):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share'),
+                                       checkpoint_interval_seconds=3600))
+    h.face('first')
+    h.assign('first')  # snapshot revision 1
+    h.face('second', vector=(0, 1))
+    h.assign('second')  # revision 2, rate-limited: no new snapshot
+    h.assigner.invalidate()
+    h.face('third', vector=(0, 1))
+    result, _ = h.assign('third')
+    assert len(h.faces.queries) == 2  # old revision must require cloud build
+    assert result['third'] == h.faces.rows['u', 'second']['personId']
+
+
+def test_checkpoint_rejects_commit_then_error(tmp_path):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share'),
+                                       checkpoint_interval_seconds=0))
+    h.face('first')
+    h.assign('first')
+    h.face('second', vector=(0, 1))
+    h.faces.fail_write = HttpResponseError('unknown remote outcome')
+    h.faces.commit_then_fail = True
+    with pytest.raises(HttpResponseError):
+        h.assign('second')
+    assert h.faces.rows['u', 'second']['personId']
+    h.face('third', vector=(0, 1))
+    result, _ = h.assign('third')
+    assert len(h.faces.queries) == 2
+    assert result['third'] == h.faces.rows['u', 'second']['personId']
+
+
+def test_checkpoint_share_failure_keeps_assignment_durable(tmp_path, monkeypatch):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+
+    def unavailable(*args, **kwargs):
+        raise OSError('share offline')
+
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'restore_checkpoint', unavailable)
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'save_checkpoint', unavailable)
+    result, _ = h.assign('first')
+    assert result['first'] == h.faces.rows['u', 'first']['personId']
+
+
+def test_checkpoint_curation_invalidates_snapshot(tmp_path):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    h.generation = ('owner', 'new-curation')
+    h.face('second')
+    h.assign('second')
+    assert len(h.faces.queries) == 2
+
+
+def test_checkpoint_restores_across_real_lease_owner_transfer(tmp_path):
+    from clustering_lease import BlobLibraryLeaseFactory
+    from test_clustering_lease import FakeService
+
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share'),
+                                       checkpoint_interval_seconds=0))
+    service = FakeService()
+
+    def recording_factory(factory):
+        @contextmanager
+        def lease(user):
+            with factory(user) as guard:
+                class RecordedGuard:
+                    cache_generation = guard.cache_generation
+
+                    @property
+                    def checkpoint_revision(self):
+                        return guard.checkpoint_revision
+
+                    def check(self):
+                        h.events.append('check')
+                        guard.check()
+
+                    def begin_assignment(self):
+                        guard.begin_assignment()
+
+                yield RecordedGuard()
+        return lease
+
+    h.assigner.lease = recording_factory(BlobLibraryLeaseFactory(service, 'container'))
+    h.face('first')
+    h.assign('first')
+    h.assigner.invalidate()
+    h.assigner.lease = recording_factory(BlobLibraryLeaseFactory(service, 'container'))
+    h.faces.fail_query = RuntimeError('new owner must restore without scan')
+    h.face('second')
+    result, _ = h.assign('second')
+    assert result['second'] == h.faces.rows['u', 'first']['personId']
+
+
+def test_corrupt_checkpoint_falls_back_to_cold_build(tmp_path):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    pointer = next((tmp_path / 'share').glob('*/CURRENT'))
+    pointer.write_text('not json')
+    h.assigner.invalidate()
+    h.face('second')
+    h.assign('second')
+    assert len(h.faces.queries) == 2
 
 
 @pytest.mark.parametrize('change', [dict(tier='2pt'), dict(version='v2'), dict(vector=[1, 0, 0])])
@@ -517,8 +665,8 @@ def test_metadata_error_propagates_and_owned_retry_updates_metadata():
     assert len(h.people.rows) == 1 and len(h.metadata) == 2
 
 
-@pytest.mark.parametrize('fail_check,expected_writes', [(3, []), (4, ['person']),
-                                                       (5, ['person', 'member'])])
+@pytest.mark.parametrize('fail_check,expected_writes', [(4, []), (5, ['person']),
+                                                       (6, ['person', 'member'])])
 def test_lease_checked_immediately_before_every_write(fail_check, expected_writes):
     h = Harness()
     h.face('new')

@@ -154,6 +154,32 @@ def test_same_owner_stable_transfer_and_return_change_generation(setup):
     assert all(lease.releases == 1 for lease in blob.leases)
 
 
+def test_assignment_revision_durable_before_write_and_survives_owner_transfer(setup):
+    client, factory, blob = setup
+    with factory('library') as guard:
+        cache_generation = guard.cache_generation
+        initial = guard.checkpoint_revision
+        guard.begin_assignment()
+        changed = guard.checkpoint_revision
+        assert changed != initial
+        assert json.loads(blob.raw)['assignment_revision'] == changed[1]
+        assert guard.cache_generation == cache_generation
+    other = BlobLibraryLeaseFactory(client, 'existing-container')
+    with other('library') as guard:
+        assert guard.cache_generation != cache_generation
+        assert guard.checkpoint_revision == changed
+
+
+def test_assignment_revision_publication_error_fails_before_writes(setup):
+    _, factory, blob = setup
+    with factory('library') as guard:
+        initial = guard.checkpoint_revision
+        blob.publish_error = ServiceRequestError('publication unavailable')
+        with pytest.raises(ServiceRequestError):
+            guard.begin_assignment()
+        assert guard.checkpoint_revision == initial
+
+
 def source_blob(client, user='library'):
     name = 'faiss-source-revisions/' + hashlib.sha256(user.encode()).hexdigest() + '.json'
     return client.get_blob_client(container='existing-container', blob=name)

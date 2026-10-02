@@ -21,8 +21,11 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import hashlib
 import math
 import logging
+import os
+from pathlib import Path
 import tempfile
 import threading
 import time
@@ -47,6 +50,9 @@ class AssignmentConfig:
     delta_limit: int = 10000
     threads: int = 2
     cold_stream_embeddings: bool = False
+    work_dir: str | None = None
+    checkpoint_dir: str | None = None
+    checkpoint_interval_seconds: float = 300
 
     def __post_init__(self):
         if (not math.isfinite(self.threshold) or not -1 <= self.threshold <= 1
@@ -56,6 +62,13 @@ class AssignmentConfig:
             raise ValueError('person_cache_size must be a positive integer')
         if type(self.cold_stream_embeddings) is not bool:
             raise ValueError('cold_stream_embeddings must be a bool')
+        if (not math.isfinite(self.checkpoint_interval_seconds)
+                or self.checkpoint_interval_seconds < 0):
+            raise ValueError('Invalid checkpoint interval')
+        if self.work_dir and self.checkpoint_dir:
+            work, share = Path(self.work_dir).resolve(), Path(self.checkpoint_dir).resolve()
+            if work == share or work in share.parents or share in work.parents:
+                raise ValueError('Work and checkpoint directories must not overlap')
 
 
 @dataclass
@@ -65,12 +78,14 @@ class _ActiveLibrary:
     directory: object
     runtime: LiveFaceIndex
     generation: object
+    last_checkpoint: float = 0
 
 
 _LOCK = threading.RLock()
 _ACTIVE = None
 _LEGACY_MEMBERSHIP_BYTES = 60 * 1024
 _LOGGER = logging.getLogger(__name__)
+_COLD_BUILD_ATTEMPTS = 0
 
 
 def invalidate(user_id=None):
@@ -241,14 +256,46 @@ class FaissAssigner:
                        'embeddingVersion': self.version(face)}
 
     def _runtime(self, user_id, guard):
-        global _ACTIVE
+        global _ACTIVE, _COLD_BUILD_ATTEMPTS
         generation = getattr(guard, 'cache_generation', None)
         if (_ACTIVE is not None and (_ACTIVE.owner is not self
                 or _ACTIVE.user_id != user_id or _ACTIVE.generation != generation)):
             invalidate()
         if _ACTIVE is None:
+            if self.config.work_dir:
+                Path(self.config.work_dir).mkdir(parents=True, exist_ok=True)
+            directory = tempfile.TemporaryDirectory(prefix='photostore-faiss-', dir=self.config.work_dir)
+            checkpoint = self._checkpoint_path(user_id, guard)
+            runtime = None
+            try:
+                if checkpoint is not None:
+                    started = time.monotonic()
+                    try:
+                        runtime = LiveFaceIndex.restore_checkpoint(
+                            checkpoint, directory.name, source_revision=guard.checkpoint_revision,
+                            config=self.config.index_config, candidates=self.config.candidates,
+                            nprobe=self.config.nprobe, delta_limit=self.config.delta_limit,
+                            threads=self.config.threads)
+                    except OSError:
+                        _LOGGER.warning('faiss checkpoint restore unavailable user=%s', user_id, exc_info=True)
+                    guard.check()
+                    if runtime is not None:
+                        _ACTIVE = _ActiveLibrary(self, user_id, directory, runtime, generation,
+                                                 time.monotonic())
+                        _LOGGER.info('faiss checkpoint restored user=%s elapsed_ms=%d pid=%d',
+                                     user_id, int((time.monotonic() - started) * 1000), os.getpid())
+                        return runtime
+                    _LOGGER.info('faiss checkpoint missing stale or invalid user=%s', user_id)
+            except BaseException:
+                if runtime is not None:
+                    runtime.close()
+                directory.cleanup()
+                raise
+            _COLD_BUILD_ATTEMPTS += 1
             started = time.monotonic()
-            directory = tempfile.TemporaryDirectory(prefix='photostore-faiss-')
+            _LOGGER.info('faiss cold build started user=%s pid=%d build_attempt=%d '
+                         'first_build_in_process=%s', user_id, os.getpid(),
+                         _COLD_BUILD_ATTEMPTS, _COLD_BUILD_ATTEMPTS == 1)
             runtime = None
             ready = False
             try:
@@ -258,8 +305,9 @@ class FaissAssigner:
                                         delta_limit=self.config.delta_limit,
                                         threads=self.config.threads)
                 runtime.build(self._cold_rows(user_id))
-                _LOGGER.info('faiss cold build user=%s elapsed_ms=%d', user_id,
-                             int((time.monotonic() - started) * 1000))
+                guard.check()
+                _LOGGER.info('faiss cold build user=%s elapsed_ms=%d pid=%d build_attempt=%d', user_id,
+                             int((time.monotonic() - started) * 1000), os.getpid(), _COLD_BUILD_ATTEMPTS)
                 _ACTIVE = _ActiveLibrary(self, user_id, directory, runtime, generation)
                 ready = True
             finally:
@@ -270,6 +318,34 @@ class FaissAssigner:
                     finally:
                         directory.cleanup()
         return _ACTIVE.runtime
+
+    def _checkpoint_path(self, user_id, guard):
+        if not self.config.checkpoint_dir:
+            return None
+        if (getattr(guard, 'checkpoint_revision', None) is None
+                or not callable(getattr(guard, 'begin_assignment', None))):
+            raise TypeError('Checkpointing requires a revision-publishing lease guard')
+        return Path(self.config.checkpoint_dir) / hashlib.sha256(user_id.encode('utf-8')).hexdigest()
+
+    def _checkpoint(self, user_id, guard):
+        checkpoint = self._checkpoint_path(user_id, guard)
+        if checkpoint is None or _ACTIVE is None:
+            return
+        now = time.monotonic()
+        if (_ACTIVE.last_checkpoint and
+                now - _ACTIVE.last_checkpoint < self.config.checkpoint_interval_seconds):
+            return
+        guard.check()
+        try:
+            _ACTIVE.runtime.save_checkpoint(checkpoint, source_revision=guard.checkpoint_revision)
+        except OSError:
+            # A stale snapshot stays stale: its revision cannot cover these writes.
+            _LOGGER.warning('faiss checkpoint save unavailable user=%s', user_id, exc_info=True)
+        else:
+            _ACTIVE.last_checkpoint = time.monotonic()
+            _LOGGER.info('faiss checkpoint saved user=%s elapsed_ms=%d', user_id,
+                         int((time.monotonic() - now) * 1000))
+        guard.check()
 
     def _validator(self, user_id, tier, version, stats=None):
         # Bounded LRU belongs to ONE best_two query, never the library/adapter.
@@ -322,11 +398,19 @@ class FaissAssigner:
             if (_ACTIVE is not None and (_ACTIVE.owner is not self
                     or _ACTIVE.user_id != user_id or _ACTIVE.generation != generation)):
                 _LOGGER.info('faiss cache invalidated user=%s adapter_changed=%s '
-                             'library_changed=%s generation_changed=%s', user_id,
+                             'library_changed=%s generation_changed=%s pid=%d '
+                             'ownership_changed=%s source_revision_changed=%s', user_id,
                              _ACTIVE.owner is not self, _ACTIVE.user_id != user_id,
-                             _ACTIVE.generation != generation)
+                             _ACTIVE.generation != generation, os.getpid(),
+                             (isinstance(_ACTIVE.generation, tuple) and isinstance(generation, tuple)
+                              and len(_ACTIVE.generation) == len(generation) == 2
+                              and _ACTIVE.generation[0] != generation[0]),
+                             (isinstance(_ACTIVE.generation, tuple) and isinstance(generation, tuple)
+                              and len(_ACTIVE.generation) == len(generation) == 2
+                              and _ACTIVE.generation[1] != generation[1]))
                 invalidate()
             runtime = None
+            assignment_started = False
             for face_id in face_ids:
                 guard.check()
                 face = _point(self.face_table, user_id, face_id)
@@ -376,6 +460,15 @@ class FaissAssigner:
                     person['repEmbedding'] = json.dumps(vector.tolist(), allow_nan=False)
                     person['repEmbeddingTier'] = tier
                     person['embeddingVersion'] = version
+                if not assignment_started:
+                    # Enabled for all production guards, even without a share:
+                    # another process may have checkpointing enabled later.
+                    begin = getattr(guard, 'begin_assignment', None)
+                    if callable(begin):
+                        begin()
+                    elif self.config.checkpoint_dir:
+                        raise TypeError('Checkpointing requires revision publication')
+                    assignment_started = True
                 _persist(self.person_table, person, guard)
                 if self.member_table is not None:
                     member = {'PartitionKey': person_id, 'RowKey': face_id,
@@ -412,6 +505,8 @@ class FaissAssigner:
             if assignments:
                 guard.check()
                 self.metadata_callback(user_id, filename)
+            if runtime is not None:
+                self._checkpoint(user_id, guard)
             _LOGGER.info('faiss assignment user=%s filename=%s assigned=%d created=%d '
                      'candidate_face_reads=%d candidate_person_reads=%d search_ms=%d total_ms=%d',
                      user_id, filename, len(assignments), len(created),

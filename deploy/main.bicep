@@ -61,6 +61,11 @@ param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 @maxValue(5120)
 param workerFileShareQuotaGiB int = 100
 
+@description('Keep the live FAISS clustering worker warm across empty-queue gaps. Default 1 incurs continuous cost; 0 opts into repeated cold-start latency.')
+@minValue(0)
+@maxValue(1)
+param workerMinReplicas int = 1
+
 // Create the resource group that will hold everything.
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: resourceGroupName
@@ -82,6 +87,7 @@ module app 'resources.bicep' = {
     frontendImage: frontendImage
     ipworkerImage: ipworkerImage
     workerFileShareQuotaGiB: workerFileShareQuotaGiB
+    workerMinReplicas: workerMinReplicas
   }
 }
 

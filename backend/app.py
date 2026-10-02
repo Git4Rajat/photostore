@@ -5258,6 +5258,9 @@ def _get_live_faiss_assigner():
                 delta_limit=int(os.getenv('PEOPLE_FAISS_DELTA_LIMIT', '10000')),
                 threads=int(os.getenv('PEOPLE_FAISS_THREADS', '2')),
                 cold_stream_embeddings=True,
+                work_dir=os.getenv('PEOPLE_FAISS_WORK_DIR') or None,
+                checkpoint_dir=os.getenv('PEOPLE_FAISS_CHECKPOINT_DIR') or None,
+                checkpoint_interval_seconds=float(os.getenv('PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS', '300')),
                 index_config=IndexConfig(memory_budget_bytes=int(
                     os.getenv('PEOPLE_FAISS_MEMORY_BUDGET_BYTES', str(2 * 1024 ** 3)))),
             ),
