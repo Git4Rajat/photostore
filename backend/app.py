@@ -4313,28 +4313,6 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
     return _people_embedding_index_cache.get(user_id, _build)
 
 
-def _next_unnamed_person_name(user_id: str) -> str:
-    if person_table_client is None:
-        return 'Unnamed 1'
-    try:
-        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        return 'Unnamed 1'
-    max_suffix = 0
-    for row in rows:
-        candidate = str(row.get('name') or '').strip()
-        match = re.match(r'^unnamed\s*(\d+)$', candidate, re.IGNORECASE)
-        if not match:
-            continue
-        try:
-            value = int(match.group(1))
-        except ValueError:
-            continue
-        if value > max_suffix:
-            max_suffix = value
-    return f'Unnamed {max_suffix + 1}'
-
-
 def _make_unnamed_person_name_allocator(user_id: str, person_rows: Optional[List[Dict]] = None):
     """person_rows: pass an already-fetched full person-row list (e.g.
     _assign_faces_to_people_incrementally's own local snapshot) to skip
@@ -5205,14 +5183,22 @@ def cluster_user_faces(
     # person — the "named cluster gets cleaned up after upload" bug. Faces stay
     # glued to their person here; only genuinely free faces get (re)clustered,
     # mirroring the guard in _build_people_recluster_plan.
-    try:
-        named_person_ids = {
-            str(row.get('RowKey') or '')
-            for row in person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
-            if _person_entity_is_named(row)
-        }
-    except Exception:
-        named_person_ids = set()
+    #
+    # Through the cached scan (and kept as a local variable, below) instead
+    # of this function's own direct, uncached person_table_client.query_entities
+    # call -- that bypassed _cached_person_rows_for_user entirely, so this
+    # function paid for its own full person-partition scan here, ANOTHER
+    # one moments later inside _load_existing_people_for_matching, and (once
+    # per new-person-naming cluster) a third inside
+    # _make_unnamed_person_name_allocator -- three redundant full scans of
+    # the same data in one call. Warming the cache here first turns the
+    # other two into cache hits.
+    person_rows = _cached_person_rows_for_user(user_id)
+    named_person_ids = {
+        str(row.get('RowKey') or '')
+        for row in person_rows
+        if _person_entity_is_named(row)
+    }
 
     embeddings = []
     face_ids = []
@@ -5292,6 +5278,16 @@ def cluster_user_faces(
     if preserve_people is None:
         preserve_people = _load_existing_people_for_matching(user_id)
     match_index = _prepare_existing_people_match(preserve_people, np)
+    # Allocator created once, reused across every cluster below -- this
+    # loop runs once per DBSCAN cluster (thousands at this account's scale,
+    # see the person_entities_to_write comment below), and the two
+    # _next_unnamed_person_name(user_id) call sites it replaces each did
+    # their own full, uncached person-table scan on every single call. A
+    # backfill producing hundreds of new unnamed clusters paid for hundreds
+    # of redundant full-partition scans just to pick names. Passed the
+    # same person_rows snapshot taken above instead of letting it do its
+    # own fallback scan.
+    next_unnamed_person_name = _make_unnamed_person_name_allocator(user_id, person_rows)
     preserved_face_ids_by_person: Dict[str, List[str]] = {}
     for person in preserve_people or []:
         person_id = str(person.get('personId') or '')
@@ -5338,7 +5334,7 @@ def cluster_user_faces(
             rep_norm=rep_norm,
         )
         if not matched_name:
-            matched_name = _next_unnamed_person_name(user_id)
+            matched_name = next_unnamed_person_name()
 
         person_id = matched_id or str(uuid.uuid4())
         existing_created = created_by_person_id.get(person_id)
@@ -5350,7 +5346,7 @@ def cluster_user_faces(
             if cross_score is not None and cross_score < PEOPLE_MATCH_THRESHOLD:
                 person_id = str(uuid.uuid4())
                 matched_id = None
-                matched_name = _next_unnamed_person_name(user_id)
+                matched_name = next_unnamed_person_name()
                 existing_created = None
                 existing_face_ids = []
                 split_from_existing = True

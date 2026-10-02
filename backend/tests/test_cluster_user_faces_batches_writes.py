@@ -34,6 +34,7 @@ class _BatchTrackingFakeTable(FakeTable):
         super().__init__()
         self.transaction_calls: list = []
         self.direct_upsert_count = 0
+        self.query_count = 0
 
     def upsert_entity(self, entity):
         self.direct_upsert_count += 1
@@ -47,12 +48,17 @@ class _BatchTrackingFakeTable(FakeTable):
             self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
         return [{} for _ in ops]
 
+    def query_entities(self, filter_str, select=None):
+        self.query_count += 1
+        return super().query_entities(filter_str, select=select)
+
     def reset_call_tracking(self) -> None:
         """Seeding a fake with upsert_entity shouldn't count against the
         assertions below -- only calls made during the clustering run itself
         should."""
         self.transaction_calls = []
         self.direct_upsert_count = 0
+        self.query_count = 0
 
 
 @pytest.fixture
@@ -203,3 +209,38 @@ def test_batching_holds_at_larger_scale(clustering_tables):
     assert person_table.transaction_calls == [5]
     assert face_table.transaction_calls == [30]
     assert metadata_table.transaction_calls == [30]
+
+
+def test_new_unnamed_clusters_do_not_rescan_person_table_per_cluster(clustering_tables):
+    """Regression test: naming a new (unmatched) cluster used to call
+    _next_unnamed_person_name(user_id), which did its own full, uncached
+    person-table scan on every single call -- cluster_user_faces runs this
+    once per DBSCAN cluster, so a backfill producing many new unnamed
+    clusters paid for one redundant full-partition scan per cluster just to
+    pick a name. Naming now goes through one allocator created before the
+    per-cluster loop, so the person-table query count must stay flat
+    (one query total, from the no-existing-people-to-preserve load)
+    regardless of how many new clusters are found."""
+    face_table, person_table, metadata_table = clustering_tables
+    user_id = 'owner'
+
+    for group_idx, direction in enumerate(_GROUP_DIRECTIONS):
+        for member_idx in range(4):
+            face_id = f'face-{group_idx}-{member_idx}'
+            filename = f'{face_id}.jpg'
+            jitter = member_idx * 1e-4
+            embedding = [v + jitter if v else jitter for v in direction]
+            _seed_face(face_table, user_id, face_id, filename, embedding)
+            _seed_metadata(metadata_table, user_id, filename)
+
+    for table in (face_table, person_table, metadata_table):
+        table.reset_call_tracking()
+
+    result = app.cluster_user_faces(user_id, eps=0.3, min_samples=2)
+
+    assert 'error' not in result, result
+    assert len(result['clusters']) == 3  # 3 brand-new unnamed people created
+    assert person_table.query_count == 1, (
+        f"expected exactly 1 person-table scan for naming across 3 new "
+        f"clusters, got {person_table.query_count}"
+    )
