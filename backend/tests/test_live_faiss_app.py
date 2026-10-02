@@ -418,6 +418,98 @@ def test_live_metadata_projection_skips_missing_rejected_and_unnamed_rows(live):
     assert not live.faces.queries and not live.people.queries and not live.metadata.queries
 
 
+def test_metadata_face_and_person_reads_overlap_with_bounded_concurrency(live, monkeypatch):
+    import threading
+
+    monkeypatch.setenv('PEOPLE_FAISS_IO_CONCURRENCY', '2')
+    for fid, pid in [('d', 'alice'), ('b', 'alice'), ('c', 'bob'), ('a', 'bob')]:
+        live.face(fid, personId=pid)
+    for pid in ('alice', 'bob'):
+        live.people.seed(dict(PartitionKey='lib-live', RowKey=pid, name=pid.title()))
+    original_face = live.faces.get_entity
+    original_person = live.people.get_entity
+    face_barrier, person_barrier = threading.Barrier(2), threading.Barrier(2)
+    state = {'active': 0, 'peak': 0}
+    lock = threading.Lock()
+
+    def read(original, barrier, **kwargs):
+        with lock:
+            state['active'] += 1
+            state['peak'] = max(state['peak'], state['active'])
+        try:
+            barrier.wait(timeout=5)
+            return original(**kwargs)
+        finally:
+            with lock:
+                state['active'] -= 1
+
+    monkeypatch.setattr(live.faces, 'get_entity', lambda **kw: read(original_face, face_barrier, **kw))
+    monkeypatch.setattr(live.people, 'get_entity', lambda **kw: read(original_person, person_barrier, **kw))
+    app._live_faiss_metadata_update('lib-live', 'photo.jpg')
+    assert state['peak'] == 2
+    row = live.metadata.rows['lib-live', 'photo.jpg']
+    assert [face['faceId'] for face in json.loads(row['faces'])] == ['a', 'b', 'c', 'd']
+    assert json.loads(row['peopleIds']) == ['bob', 'alice']
+    assert live.people.reads == Counter({('lib-live', 'alice'): 1, ('lib-live', 'bob'): 1})
+
+
+def test_metadata_deduplicates_unnamed_and_missing_people_reads(live):
+    for fid, pid in [('a', 'unnamed'), ('b', 'unnamed'), ('c', 'missing'), ('d', 'missing')]:
+        live.face(fid, personId=pid)
+    live.filenames['photo.jpg'].append('a')
+    live.people.seed(dict(PartitionKey='lib-live', RowKey='unnamed', name='Unnamed 1'))
+    app._live_faiss_metadata_update('lib-live', 'photo.jpg')
+    row = live.metadata.rows['lib-live', 'photo.jpg']
+    assert row['faceCount'] == 4
+    assert json.loads(row['peopleIds']) == []
+    assert live.faces.reads['lib-live', 'a'] == 1
+    assert live.people.reads['lib-live', 'unnamed'] == 1
+    assert live.people.reads['lib-live', 'missing'] == 1
+
+
+@pytest.mark.parametrize('stage', ['face', 'person'])
+def test_metadata_parallel_transport_failure_does_not_write_partial_projection(live, monkeypatch, stage):
+    from azure.core.exceptions import ServiceRequestError
+
+    live.face('a', personId='alice')
+    live.face('b', personId='alice')
+    live.people.seed(dict(PartitionKey='lib-live', RowKey='alice', name='Alice'))
+    table = live.faces if stage == 'face' else live.people
+    original = table.get_entity
+
+    def fail(**kwargs):
+        if kwargs['row_key'] in ('a', 'alice'):
+            raise ServiceRequestError('read offline')
+        return original(**kwargs)
+
+    monkeypatch.setattr(table, 'get_entity', fail)
+    with pytest.raises(ServiceRequestError, match='read offline'):
+        app._live_faiss_metadata_update('lib-live', 'photo.jpg')
+    assert not live.metadata.writes
+
+
+def test_metadata_missing_filename_index_keeps_filtered_query_fallback(live, monkeypatch):
+    live.face('a', personId='alice')
+    live.people.seed(dict(PartitionKey='lib-live', RowKey='alice', name='Alice'))
+    monkeypatch.setattr(app, 'get_face_ids_for_filename', lambda *args: None)
+
+    def query(filter):
+        assert filter == "PartitionKey eq 'lib-live' and filename eq 'photo.jpg'"
+        yield live.faces.rows['lib-live', 'a']
+
+    monkeypatch.setattr(live.faces, 'query_entities', query)
+    app._live_faiss_metadata_update('lib-live', 'photo.jpg')
+    assert json.loads(live.metadata.rows['lib-live', 'photo.jpg']['peopleIds']) == ['alice']
+
+
+@pytest.mark.parametrize('value', ['0', '17', 'not-an-int'])
+def test_metadata_invalid_concurrency_fails_before_storage(live, monkeypatch, value):
+    monkeypatch.setenv('PEOPLE_FAISS_IO_CONCURRENCY', value)
+    with pytest.raises(ValueError):
+        app._live_faiss_metadata_update('lib-live', 'photo.jpg')
+    assert not live.faces.reads and not live.metadata.writes
+
+
 def test_app_factory_delta_writes_bypass_mutation_wrappers(live, monkeypatch):
     on_write = Mock(side_effect=AssertionError('assignment invalidated its own runtime'))
     monkeypatch.setattr(app, 'face_table_client',

@@ -38,6 +38,7 @@ class Table:
         self.commit_then_fail = False
         self.etags = {}
         self.conditional_writes = []
+        self.transactions = []
 
     def seed(self, row):
         self.rows[row['PartitionKey'], row['RowKey']] = dict(row)
@@ -81,6 +82,29 @@ class Table:
                               match_condition=MatchConditions.IfNotModified)
         assert '_assignment_etag' not in entity
         self.upsert_entity(entity)
+
+    def submit_transaction(self, operations):
+        assert self.events[-1] == 'check'
+        assert len(operations) <= 100
+        assert len({op[1]['PartitionKey'] for op in operations}) == 1
+        assert len({(op[1]['PartitionKey'], op[1]['RowKey']) for op in operations}) == len(operations)
+        self.transactions.append(operations)
+        error, self.fail_write = self.fail_write, None
+        if error and not self.commit_then_fail:
+            raise error
+        for op in operations:
+            kind, entity = op[:2]
+            key = entity['PartitionKey'], entity['RowKey']
+            if kind == 'create':
+                assert key not in self.rows
+            if kind == 'update':
+                assert op[2] == dict(mode=UpdateMode.MERGE, etag=self.etags[key],
+                                    match_condition=MatchConditions.IfNotModified)
+                self.conditional_writes.append((dict(entity), dict(op[2])))
+            self.seed(entity)
+        self.events.append(self.name)
+        if error:
+            raise error
 
 
 class Harness:
@@ -398,6 +422,157 @@ def test_microbatch_prefetch_transport_failure_never_writes():
             pytest.fail('failed preparation yielded')
     assert not h.people.rows
     assert not h.assignment_revision
+
+
+def test_staged_batch_coalesces_shared_person_and_preserves_order():
+    h = Harness()
+    for fid in ('a', 'b', 'c'):
+        h.face(fid)
+    with h.assigner.batch('u', ['a', 'b', 'c'], staged=True) as assign:
+        results = [assign(fid + '.jpg', [fid])[0][fid] for fid in ('a', 'b', 'c')]
+        assert not h.people.rows and not h.members.rows
+        assert not any(row.get('personId') for row in h.faces.rows.values())
+        assert not h.metadata
+    assert len(set(results)) == 1
+    assert len(h.people.transactions) == len(h.members.transactions) == len(h.faces.transactions) == 1
+    person = h.people.rows['u', results[0]]
+    assert json.loads(person['faceIds']) == ['a', 'b', 'c']
+    assert sorted(h.metadata) == [('u', 'a.jpg'), ('u', 'b.jpg'), ('u', 'c.jpg')]
+    assert h.assignment_revision == 1
+
+
+def test_staged_updates_keep_original_etag_and_unique_entities():
+    h = Harness()
+    h.person('alice', ['old'])
+    h.people.etags['u', 'alice'] = 'original-person-etag'
+    h.face('old', person='alice')
+    for fid in ('a', 'b'):
+        h.face(fid)
+        h.faces.etags['u', fid] = 'face-etag-' + fid
+    with h.assigner.batch('u', ['a', 'b'], staged=True) as assign:
+        assign('a.jpg', ['a'])
+        assign('b.jpg', ['b'])
+        assign('duplicate.jpg', ['a'])
+    assert len(h.people.transactions[0]) == 1
+    assert h.people.transactions[0][0][2]['etag'] == 'original-person-etag'
+    assert len(h.faces.transactions[0]) == 2
+    assert json.loads(h.people.rows['u', 'alice']['faceIds']) == ['old', 'a', 'b']
+
+
+@pytest.mark.parametrize('table_name', ['people', 'members', 'faces'])
+@pytest.mark.parametrize('committed', [False, True])
+def test_staged_partial_transaction_failure_invalidates_and_recovers(table_name, committed):
+    h = Harness()
+    h.face('a')
+    h.face('b')
+    table = getattr(h, table_name)
+    table.fail_write = HttpResponseError('uncertain transaction outcome')
+    table.commit_then_fail = committed
+    with pytest.raises(HttpResponseError):
+        with h.assigner.batch('u', ['a', 'b'], staged=True) as assign:
+            assign('a.jpg', ['a'])
+            assign('b.jpg', ['b'])
+    assert assignment._ACTIVE is None
+    assert not h.metadata
+    with h.assigner.batch('u', ['a', 'b'], staged=True) as assign:
+        a, _ = assign('a.jpg', ['a'])
+        b, _ = assign('b.jpg', ['b'])
+    assert a['a'] == b['b']
+    assert h.faces.rows['u', 'a']['personId'] == h.faces.rows['u', 'b']['personId']
+
+
+def test_staged_metadata_projects_concurrently_and_reports_individual_failures():
+    h = Harness(config=AssignmentConfig(io_concurrency=2))
+    h.face('a')
+    h.face('b')
+    barrier = threading.Barrier(2)
+
+    def project(user, filename):
+        assert h.faces.rows['u', 'a']['personId']
+        assert h.faces.rows['u', 'b']['personId']
+        barrier.wait(timeout=5)
+        if filename == 'a.jpg':
+            raise RuntimeError('metadata offline')
+
+    h.assigner.metadata_callback = project
+    with h.assigner.batch('u', ['a', 'b'], staged=True) as assign:
+        assign('a.jpg', ['a'])
+        assign('b.jpg', ['b'])
+        assign.project('a.jpg')
+    assert set(assign.metadata_errors) == {'a.jpg'}
+    assert assignment._ACTIVE is not None
+
+
+def test_transaction_partition_and_count_limits():
+    h = Harness()
+    rows = [dict(PartitionKey='one', RowKey=str(i)) for i in range(105)]
+    rows += [dict(PartitionKey='two', RowKey='x')]
+    with h.lease('u') as guard:
+        count = assignment._persist_grouped(h.members, rows, guard)
+    assert count == 3
+    assert [len(ops) for ops in h.members.transactions] == [100, 5, 1]
+
+
+def test_transaction_payload_budget_splits_before_count_cap():
+    h = Harness()
+    rows = [dict(PartitionKey='one', RowKey=str(i), data='x' * 20000) for i in range(75)]
+    with h.lease('u') as guard:
+        assignment._persist_grouped(h.members, rows, guard)
+    assert len(h.members.transactions) == 2
+    assert all(len(ops) < 100 for ops in h.members.transactions)
+
+
+def test_staged_conflicting_face_etag_does_not_publish_pending_index():
+    h = Harness()
+    h.face('a')
+    h.faces.etags['u', 'a'] = 'read-etag'
+    original = h.faces.submit_transaction
+
+    def conflict(operations):
+        assert operations[0][2]['etag'] == 'read-etag'
+        error = HttpResponseError('curation won ETag race')
+        error.status_code = 412
+        raise error
+
+    h.faces.submit_transaction = conflict
+    with pytest.raises(HttpResponseError):
+        with h.assigner.batch('u', ['a'], staged=True) as assign:
+            assign('a.jpg', ['a'])
+    assert assignment._ACTIVE is None
+    assert not h.faces.rows['u', 'a']['personId']
+    assert not h.metadata
+    h.faces.submit_transaction = original
+
+
+def test_staged_two_new_people_preserve_runner_up_margin():
+    h = Harness()
+    h.face('a', vector=(1, 0))
+    h.face('b', vector=(0, 1))
+    h.face('ambiguous', vector=(1, 1))
+    with h.assigner.batch('u', ['a', 'b', 'ambiguous'], staged=True) as assign:
+        a, _ = assign('a.jpg', ['a'])
+        b, _ = assign('b.jpg', ['b'])
+        ambiguous, _ = assign('ambiguous.jpg', ['ambiguous'])
+    assert len({a['a'], b['b'], ambiguous['ambiguous']}) == 3
+
+
+def test_assignment_metrics_distinguish_new_ownership_from_owned_retry(caplog):
+    h = Harness()
+    h.person('alice', ['a'])
+    h.face('a', person='alice')
+    h.face('b')
+    with caplog.at_level('INFO', logger='faiss_assignment'):
+        h.assign('b')
+    assert 'created=0' in caplog.text
+    assert 'newly_assigned_faces=1 already_owned_faces=0' in caplog.text
+    caplog.clear()
+    with caplog.at_level('INFO', logger='faiss_assignment'):
+        h.assign('b')
+    assert 'newly_assigned_faces=0 already_owned_faces=1' in caplog.text
+
+
+def test_write_coalescing_remains_explicit_opt_in():
+    assert AssignmentConfig().coalesce_writes is False
 
 
 @pytest.mark.parametrize('change', [dict(tier='2pt'), dict(version='v2'), dict(vector=[1, 0, 0])])

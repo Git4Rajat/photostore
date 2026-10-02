@@ -5190,34 +5190,43 @@ def _match_existing_person(
 
 def _live_faiss_metadata_update(user_id: str, filename: str) -> None:
     """Bounded, fresh per-photo projection; never scan all people/faces."""
+    concurrency = int(os.getenv('PEOPLE_FAISS_IO_CONCURRENCY', '4'))
+    if not 1 <= concurrency <= 16:
+        raise ValueError('PEOPLE_FAISS_IO_CONCURRENCY must be between 1 and 16')
+    started = time.monotonic()
     ids = get_face_ids_for_filename(user_id, filename)
-    if ids is None:
-        rows = face_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'")
-    else:
-        def keyed_rows():
-            for face_id in ids:
-                try:
-                    row = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-                except ResourceNotFoundError:
-                    continue
-                if row.get('filename') != filename:
-                    raise ValueError('Filename index references another photo')
-                yield row
-        rows = keyed_rows()
-    rows = sorted((row for row in rows if not _face_is_rejected(row)),
-                  key=lambda row: row['RowKey'])
-    people_ids = []
-    for row in rows:
-        pid = row.get('personId')
-        if not pid or pid in people_ids:
-            continue
+
+    def read_face(face_id):
+        try:
+            row = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except ResourceNotFoundError:
+            return None
+        if row.get('filename') != filename:
+            raise ValueError('Filename index references another photo')
+        return row
+
+    def read_person(pid):
         try:
             person = person_table_client.get_entity(partition_key=user_id, row_key=pid)
         except ResourceNotFoundError:
-            continue
-        if person.get('name') and not _is_unnamed_name(person['name']):
-            people_ids.append(pid)
+            return pid, False
+        return pid, bool(person.get('name') and not _is_unnamed_name(person['name']))
+
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix='faiss-metadata') as pool:
+        if ids is None:
+            rows = face_table_client.query_entities(
+                f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'")
+        else:
+            rows = _bounded_io_map(pool, read_face, dict.fromkeys(ids))
+        # Future completion order is nondeterministic; retain the original
+        # RowKey order for faces and first-face order for named people.
+        rows = sorted((row for row in rows if row is not None and not _face_is_rejected(row)),
+                      key=lambda row: row['RowKey'])
+        faces_finished = time.monotonic()
+        person_ids = list(dict.fromkeys(row['personId'] for row in rows if row.get('personId')))
+        named = dict(_bounded_io_map(pool, read_person, person_ids))
+        people_ids = [pid for pid in person_ids if named[pid]]
+    people_finished = time.monotonic()
     if metadata_table_client is not None:
         _update_metadata_entity_fields(user_id, filename, {
             'faces': json.dumps([_face_payload_for_metadata(row['RowKey'], row) for row in rows]),
@@ -5227,6 +5236,13 @@ def _live_faiss_metadata_update(user_id: str, filename: str) -> None:
     _person_scan_cache.invalidate(user_id)
     _face_summary_scan_cache.invalidate(user_id)
     _people_embedding_index_cache.invalidate(user_id)
+    worker_logger.info('faiss metadata projection user=%s filename=%s faces=%d people=%d '
+                       'concurrency=%d face_read_ms=%d person_read_ms=%d write_ms=%d total_ms=%d',
+                       user_id, filename, len(rows), len(person_ids), concurrency,
+                       int((faces_finished - started) * 1000),
+                       int((people_finished - faces_finished) * 1000),
+                       int((time.monotonic() - people_finished) * 1000),
+                       int((time.monotonic() - started) * 1000))
 
 
 def _get_live_faiss_assigner():
@@ -5259,6 +5275,7 @@ def _get_live_faiss_assigner():
                 threads=int(os.getenv('PEOPLE_FAISS_THREADS', '2')),
                 cold_stream_embeddings=True,
                 io_concurrency=int(os.getenv('PEOPLE_FAISS_IO_CONCURRENCY', '4')),
+                coalesce_writes=os.getenv('PEOPLE_FAISS_COALESCE_WRITES', 'false').strip().lower() in ('true', '1', 'yes'),
                 work_dir=os.getenv('PEOPLE_FAISS_WORK_DIR') or None,
                 checkpoint_dir=os.getenv('PEOPLE_FAISS_CHECKPOINT_DIR') or None,
                 checkpoint_interval_seconds=float(os.getenv('PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS', '300')),
@@ -12706,8 +12723,46 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
                 preparations = list(pool.map(prepare, group))
             all_ids = [fid for item in preparations if not isinstance(item, Exception)
                        for fid in item[1]]
+            assigner = _get_live_faiss_assigner()
+            staged = (getattr(assigner.config, 'coalesce_writes', False)
+                      and len(set(all_ids)) <= 256)
             try:
-                with _get_live_faiss_assigner().batch(user, all_ids) as assign:
+                if staged:
+                    completed = []
+                    batch_started = time.monotonic()
+                    worker_logger.info('clustering staged batch started user=%s messages=%d input_faces=%d',
+                                       user, len(group), len(set(all_ids)))
+                    # Keep ALL receipts with the pending renewer until flush,
+                    # projections and lease checks finish. No early acknowledgement.
+                    with assigner.batch(user, all_ids, staged=True) as assign:
+                        for i, prepared in zip(group, preparations):
+                            if isinstance(prepared, Exception):
+                                worker_logger.warning('FAISS batch preparation failed user=%s error=%s',
+                                                      user, type(prepared).__name__)
+                                continue
+                            filename, face_ids = prepared
+                            if filename:
+                                if face_ids:
+                                    assign(filename, face_ids)
+                                # Owned-face retries still need projection;
+                                # duplicate filenames project only once.
+                                assign.project(filename)
+                            completed.append((i, filename))
+                    acknowledged = 0
+                    for i, filename in completed:
+                        if filename in assign.metadata_errors:
+                            continue
+                        try:
+                            queue_client.delete_message(take(i))
+                            acknowledged += 1
+                        except Exception:
+                            worker_logger.exception('Failed to delete completed %s batch message', queue_name)
+                    worker_logger.info('clustering staged batch done user=%s messages=%d acknowledged=%d '
+                                       'metadata_failures=%d elapsed_ms=%d', user, len(group), acknowledged,
+                                       len(assign.metadata_errors), int((time.monotonic() - batch_started) * 1000))
+                    index = end
+                    continue
+                with assigner.batch(user, all_ids) as assign:
                     for i, prepared in zip(group, preparations):
                         def dispatch(payload, job_id, user_id, job_type, prepared=prepared):
                             if isinstance(prepared, Exception):

@@ -136,3 +136,82 @@ def test_pending_visibility_renewal_hands_off_latest_receipt(setup, monkeypatch)
     app._poll_clustering_queue_batch_once(queue, 'q', 5)
     assert len(queue.deleted) == 2
     assert all(msg.receipt == 'renewed' for msg in queue.deleted)
+
+
+@pytest.fixture
+def real_staged(monkeypatch):
+    import faiss_assignment
+    from test_faiss_assignment import Harness
+    from faiss_assignment import AssignmentConfig
+
+    faiss_assignment.invalidate()
+    h = Harness(config=AssignmentConfig(io_concurrency=2, coalesce_writes=True))
+    h.face('a.jpg')
+    h.face('b.jpg')
+    monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'faiss')
+    monkeypatch.setattr(app, '_get_live_faiss_assigner', lambda: h.assigner)
+    monkeypatch.setattr(app, '_prepare_incremental_assignment',
+                        lambda payload, user: (payload['filename'], [payload['filename']]))
+    yield h
+    faiss_assignment.invalidate()
+
+
+def test_staged_queue_ack_waits_for_all_table_commits_and_projection(real_staged):
+    h = real_staged
+
+    class CheckingQueue(Queue):
+        def delete_message(self, msg):
+            assert h.people.transactions and h.members.transactions and h.faces.transactions
+            filename = json.loads(msg.content)['filename']
+            assert ('u', filename) in h.metadata
+            super().delete_message(msg)
+
+    queue = CheckingQueue([message('a.jpg'), message('b.jpg')])
+    app._poll_clustering_queue_batch_once(queue, 'q', 5)
+    assert queue.deleted == queue.messages
+    assert len(h.people.transactions[0]) == 1
+
+
+@pytest.mark.parametrize('table', ['people', 'members', 'faces'])
+def test_staged_queue_partial_commit_retains_entire_group(real_staged, table):
+    from azure.core.exceptions import HttpResponseError
+    import faiss_assignment
+
+    h = real_staged
+    getattr(h, table).fail_write = HttpResponseError('response lost after commit')
+    getattr(h, table).commit_then_fail = True
+    queue = Queue([message('a.jpg'), message('b.jpg')])
+    app._poll_clustering_queue_batch_once(queue, 'q', 5)
+    assert not queue.deleted
+    assert faiss_assignment._ACTIVE is None
+    app._poll_clustering_queue_batch_once(queue, 'q', 5)
+    assert queue.deleted == queue.messages
+
+
+def test_staged_queue_metadata_failure_retains_only_affected_filename(real_staged):
+    h = real_staged
+
+    def metadata(user, filename):
+        if filename == 'a.jpg':
+            raise RuntimeError('projection offline')
+        h.metadata.append((user, filename))
+
+    h.assigner.metadata_callback = metadata
+    messages = [message('a.jpg'), message('b.jpg')]
+    queue = Queue(messages)
+    app._poll_clustering_queue_batch_once(queue, 'q', 5)
+    assert queue.deleted == [messages[1]]
+    assert all(row['personId'] for row in h.faces.rows.values())
+
+
+def test_owned_retry_projects_without_new_writes_or_index(real_staged):
+    import faiss_assignment
+    h = real_staged
+    h.faces.rows['u', 'a.jpg']['personId'] = 'alice'
+    h.faces.rows['u', 'b.jpg']['personId'] = 'alice'
+    queue = Queue([message('a.jpg'), message('b.jpg')])
+    app._poll_clustering_queue_batch_once(queue, 'q', 5)
+    assert queue.deleted == queue.messages
+    assert not h.people.transactions and not h.faces.transactions
+    assert faiss_assignment._ACTIVE is None
+    assert sorted(h.metadata) == [('u', 'a.jpg'), ('u', 'b.jpg')]

@@ -56,6 +56,7 @@ class AssignmentConfig:
     checkpoint_dir: str | None = None
     checkpoint_interval_seconds: float = 300
     io_concurrency: int = 4
+    coalesce_writes: bool = False
 
     def __post_init__(self):
         if (not math.isfinite(self.threshold) or not -1 <= self.threshold <= 1
@@ -67,6 +68,8 @@ class AssignmentConfig:
             raise ValueError('cold_stream_embeddings must be a bool')
         if type(self.io_concurrency) is not int or not 1 <= self.io_concurrency <= 16:
             raise ValueError('io_concurrency must be between 1 and 16')
+        if type(self.coalesce_writes) is not bool:
+            raise ValueError('coalesce_writes must be a bool')
         if (not math.isfinite(self.checkpoint_interval_seconds)
                 or self.checkpoint_interval_seconds < 0):
             raise ValueError('Invalid checkpoint interval')
@@ -157,6 +160,56 @@ def _persist(table, entity, guard):
         table.upsert_entity(payload)
 
 
+def _persist_grouped(table, entities, guard, *, new_keys=()):
+    """Partition-local, unique-entity transactions; preserve conditional ETags.
+
+    Conservative 2 MiB estimated payload cap leaves room for OData/multipart
+    encoding under the service's 4 MiB limit. Never combine different tables.
+    SDK-compatible fakes/older injected clients may use the sequential fallback.
+    """
+    partitions = {}
+    for entity in entities:
+        payload = dict(entity)
+        etag = payload.pop('_assignment_etag', None)
+        key = (payload['PartitionKey'], payload['RowKey'])
+        if key in new_keys:
+            operation = ('create', payload)
+        elif etag:
+            operation = ('update', payload, dict(mode=UpdateMode.MERGE, etag=etag,
+                          match_condition=MatchConditions.IfNotModified))
+        else:
+            operation = ('upsert', payload, dict(mode=UpdateMode.MERGE))
+        size = len(json.dumps(payload, ensure_ascii=True, default=str).encode('utf-8')) * 2 + 2048
+        if size > 2 * 1024 ** 2:
+            raise ValueError('Assignment entity exceeds transaction payload budget')
+        partitions.setdefault(key[0], []).append((operation, size, entity))
+    transactions = 0
+    for items in partitions.values():
+        chunk, size = [], 0
+
+        def submit():
+            nonlocal transactions
+            if not chunk:
+                return
+            if callable(getattr(table, 'submit_transaction', None)):
+                guard.check()
+                table.submit_transaction([item[0] for item in chunk])
+                transactions += 1
+            else:
+                for _, _, entity in chunk:
+                    _persist(table, entity, guard)
+                    transactions += 1
+
+        for item in items:
+            if chunk and (len(chunk) == 100 or size + item[1] > 2 * 1024 ** 2):
+                submit()
+                chunk, size = [], 0
+            chunk.append(item)
+            size += item[1]
+        submit()
+    return transactions
+
+
 class FaissAssigner:
     """assign(user_id, filename, face_ids) -> (face-to-person dict, created set).
 
@@ -198,7 +251,7 @@ class FaissAssigner:
         invalidate(user_id)
 
     @contextmanager
-    def batch(self, user_id, face_ids=()):
+    def batch(self, user_id, face_ids=(), *, staged=False):
         """One library lease/revision for a bounded group; ordered decisions.
 
         Prefetch only input faces/embeddings. Candidate validation remains fresh.
@@ -230,6 +283,8 @@ class FaissAssigner:
             prefetch_ms = int((time.monotonic() - prefetch_started) * 1000)
             begun, failed = False, False
             assigner = self
+            stage = ({'persons': {}, 'members': {}, 'faces': {}, 'new_people': set(),
+                      'projections': set()} if staged else None)
 
             class BatchGuard:
                 cache_generation = getattr(guard, 'cache_generation', None)
@@ -255,12 +310,58 @@ class FaissAssigner:
                 nonlocal failed
                 try:
                     return self.assign(user_id, filename, ids, _guard=BatchGuard(),
-                                       _prefetched=faces, _defer_checkpoint=True)
+                                       _prefetched=faces, _defer_checkpoint=True, _stage=stage)
                 except Exception:
                     failed = True
                     raise
 
-            yield assign
+            assign.metadata_errors = {}
+            assign.project = lambda filename: stage['projections'].add(filename)
+            try:
+                yield assign
+                if stage is not None:
+                    if failed:
+                        raise RuntimeError('Staged assignment failed; batch requires retry')
+                    flush_started = time.monotonic()
+                    transactions = 0
+                    # Dependency order is maintained across separate transactions.
+                    transactions += _persist_grouped(self.person_table, stage['persons'].values(), guard,
+                                                      new_keys=stage['new_people'])
+                    if self.member_table is not None:
+                        transactions += _persist_grouped(self.member_table, stage['members'].values(), guard)
+                    transactions += _persist_grouped(self.face_table, stage['faces'].values(), guard)
+                    guard.check()
+                    persistence_ms = int((time.monotonic() - flush_started) * 1000)
+                    projection_started = time.monotonic()
+
+                    def project(filename):
+                        try:
+                            guard.check()
+                            self.metadata_callback(user_id, filename)
+                            guard.check()
+                        except Exception as error:
+                            return filename, error
+                        return filename, None
+
+                    with ThreadPoolExecutor(max_workers=self.config.io_concurrency) as pool:
+                        for filename, error in pool.map(project, sorted(stage['projections'])):
+                            if error is not None:
+                                assign.metadata_errors[filename] = error
+                                _LOGGER.warning('faiss metadata projection failed user=%s filename=%s error=%s',
+                                                user_id, filename, type(error).__name__)
+                    guard.check()
+                    failed = bool(assign.metadata_errors)
+                    _LOGGER.info('faiss batch flush user=%s persons=%d members=%d faces=%d '
+                                 'transactions=%d persistence_ms=%d metadata_ms=%d metadata_failures=%d',
+                                 user_id, len(stage['persons']), len(stage['members']), len(stage['faces']),
+                                 transactions, persistence_ms,
+                                 int((time.monotonic() - projection_started) * 1000), len(assign.metadata_errors))
+            except BaseException:
+                # Runtime may contain private uncommitted exemplars. No reader
+                # outside this lock can observe them, and no checkpoint saves them.
+                if stage is not None:
+                    invalidate(user_id)
+                raise
             if not failed and _ACTIVE is not None and _ACTIVE.user_id == user_id and _ACTIVE.owner is self:
                 self._checkpoint(user_id, guard)
             _LOGGER.info('faiss batch user=%s prefetched_faces=%d failed=%s lease_ms=%d '
@@ -422,11 +523,16 @@ class FaissAssigner:
                          int((time.monotonic() - now) * 1000))
         guard.check()
 
-    def _validator(self, user_id, tier, version, stats=None):
+    def _validator(self, user_id, tier, version, stats=None, stage=None):
         # Bounded LRU belongs to ONE best_two query, never the library/adapter.
         people = OrderedDict()
 
         def validate(face_id, person_id):
+            if stage is not None and face_id in stage['faces']:
+                face = stage['faces'][face_id]
+                return (face.get('personId') == person_id and self._allowed(face)
+                        and self.tier(face) == tier and self.version(face) == version
+                        and person_id in stage['persons'])
             if stats is not None:
                 stats['candidate_face_reads'] += 1
             face = _point(self.face_table, user_id, face_id)
@@ -459,7 +565,7 @@ class FaissAssigner:
         return encoded
 
     def assign(self, user_id, filename, face_ids, *, _guard=None,
-               _prefetched=None, _defer_checkpoint=False):
+               _prefetched=None, _defer_checkpoint=False, _stage=None):
         if not isinstance(user_id, str) or not user_id:
             raise ValueError('user_id must be a nonempty string')
         assignments, created = {}, set()
@@ -468,6 +574,8 @@ class FaissAssigner:
         search_ms = 0
         persistence_ms = 0
         metadata_ms = 0
+        newly_assigned_faces = 0
+        already_owned_faces = 0
         with _LOCK, (self.lease(user_id) if _guard is None else nullcontext(_guard)) as guard:
             if not callable(getattr(guard, 'check', None)):
                 raise TypeError('lease must yield a guard with check()')
@@ -493,10 +601,13 @@ class FaissAssigner:
                 guard.check()
                 prefetched = _prefetched.pop(face_id, None) if _prefetched is not None else None
                 face = prefetched[0] if prefetched is not None else _point(self.face_table, user_id, face_id)
+                if _stage is not None and face_id in _stage['faces']:
+                    face = dict(_stage['faces'][face_id])
                 if face is None or _rejected(face):
                     continue
                 if face.get('personId'):
                     assignments[face_id] = face['personId']
+                    already_owned_faces += 1
                     continue
                 if not self._allowed(face):
                     continue
@@ -513,17 +624,21 @@ class FaissAssigner:
                                  int((time.monotonic() - rebuild_started) * 1000))
                     guard.check()
                 deterministic_id = self.person_id(user_id, face_id)
-                person = _point(self.person_table, user_id, deterministic_id)
+                person = (dict(_stage['persons'][deterministic_id])
+                          if _stage is not None and deterministic_id in _stage['persons']
+                          else _point(self.person_table, user_id, deterministic_id))
                 is_new = False
                 if person is None:
                     search_started = time.monotonic()
                     best, second, matched_id = runtime.best_two(
-                        vector, tier, version, self._validator(user_id, tier, version, stats))
+                        vector, tier, version, self._validator(user_id, tier, version, stats, _stage))
                     search_ms += int((time.monotonic() - search_started) * 1000)
                     if (matched_id is not None and best >= self.config.threshold
                             and best - second >= self.config.margin):
                         # Read the matched row directly, not a helper/summary cache.
-                        person = _point(self.person_table, user_id, matched_id)
+                        person = (dict(_stage['persons'][matched_id])
+                                  if _stage is not None and matched_id in _stage['persons']
+                                  else _point(self.person_table, user_id, matched_id))
                         if person is None:
                             raise RuntimeError('Matched person disappeared before persistence')
                     else:
@@ -549,6 +664,31 @@ class FaissAssigner:
                         raise TypeError('Checkpointing requires revision publication')
                     assignment_started = True
                 persistence_started = time.monotonic()
+                if _stage is not None:
+                    if len(_stage['faces']) >= 256:
+                        raise ValueError('Staged face batch exceeds bounded capacity (256)')
+                    # Keep the first point-read ETag even when several faces
+                    # add membership to this person in the same transaction.
+                    _stage['persons'][person_id] = dict(person)
+                    if is_new:
+                        _stage['new_people'].add((user_id, person_id))
+                    if self.member_table is not None:
+                        _stage['members'][person_id, face_id] = {
+                            'PartitionKey': person_id, 'RowKey': face_id, 'userId': user_id,
+                            'addedAt': datetime.now(timezone.utc).isoformat()}
+                    face['personId'] = person_id
+                    _stage['faces'][face_id] = dict(face)
+                    try:
+                        runtime.upsert(face_id, person_id, vector, tier, version)
+                    except RebuildNeeded:
+                        runtime.rebuild()
+                        guard.check()
+                        runtime.upsert(face_id, person_id, vector, tier, version)
+                    assignments[face_id] = person_id
+                    newly_assigned_faces += 1
+                    if is_new:
+                        created.add(person_id)
+                    continue
                 _persist(self.person_table, person, guard)
                 if self.member_table is not None:
                     member = {'PartitionKey': person_id, 'RowKey': face_id,
@@ -581,20 +721,26 @@ class FaissAssigner:
                         invalidate(user_id)
                 persistence_ms += int((time.monotonic() - persistence_started) * 1000)
                 assignments[face_id] = person_id
+                newly_assigned_faces += 1
                 if is_new:
                     created.add(person_id)
             if assignments:
                 guard.check()
                 metadata_started = time.monotonic()
-                self.metadata_callback(user_id, filename)
+                if _stage is None:
+                    self.metadata_callback(user_id, filename)
+                else:
+                    _stage['projections'].add(filename)
                 metadata_ms = int((time.monotonic() - metadata_started) * 1000)
             if runtime is not None and not _defer_checkpoint:
                 self._checkpoint(user_id, guard)
             _LOGGER.info('faiss assignment user=%s filename=%s assigned=%d created=%d '
                      'candidate_face_reads=%d candidate_person_reads=%d search_ms=%d '
-                     'persistence_ms=%d metadata_ms=%d total_ms=%d',
+                     'persistence_ms=%d metadata_ms=%d newly_assigned_faces=%d '
+                     'already_owned_faces=%d total_ms=%d',
                      user_id, filename, len(assignments), len(created),
                      stats['candidate_face_reads'], stats['candidate_person_reads'], search_ms,
                      persistence_ms, metadata_ms,
+                     newly_assigned_faces, already_owned_faces,
                      int((time.monotonic() - started) * 1000))
         return assignments, created

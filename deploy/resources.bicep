@@ -1295,6 +1295,12 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }
             { name: 'TMPDIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
+            // Opt-in microbatching (2026-10-02): adjacent same-library
+            // incremental-assign messages share one Blob lease/revision
+            // publication instead of paying that cost per message. Default
+            // off upstream (CLUSTERING_WORKER_BATCH_SIZE=1); enabled here
+            // after confirming correctness against the live backlog.
+            { name: 'CLUSTERING_WORKER_BATCH_SIZE', value: '8' }
             // Short lease, actively renewed by run_clustering_worker every
             // CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS via update_message()
             // while a message is being processed -- NOT a fixed 1800s

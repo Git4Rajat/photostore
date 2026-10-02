@@ -40,6 +40,7 @@ not silently fall back to library-wide linear scans.
 | `PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS` | `300`; `0` saves every completed nonempty assignment batch |
 | `CLUSTERING_WORKER_BATCH_SIZE` | `1` (opt-in; start with `8`, maximum `32`) |
 | `PEOPLE_FAISS_IO_CONCURRENCY` | `4` (maximum `16`) |
+| `PEOPLE_FAISS_COALESCE_WRITES` | `false`; experimental staged persistence/projection path requires explicit `true` |
 
 Existing assignment threshold/margin settings still apply. The backend/worker
 Docker image installs the separate pinned FAISS requirements. The lease and
@@ -47,6 +48,30 @@ revision blobs reuse the existing managed-identity Blob client and container;
 no resources or credentials are provisioned by the runtime.
 
 ## Throughput microbatches
+
+Measured production samples found metadata projection dominated real-assignment
+latency (~96%), while person/member/face persistence accounted for ~1.3%.
+The primary optimization now runs **inside** each metadata projection: fetch
+indexed face rows concurrently, then fetch each distinct person concurrently,
+using `PEOPLE_FAISS_IO_CONCURRENCY` (default 4). It applies to single-message
+processing, ordinary lease-sharing microbatches, and owned-face projection retries.
+It does not require staged writes. Face payloads retain RowKey order and named
+people retain first-face order; only missing entities are skipped, transport
+errors propagate before metadata is written. Pending reads use a worker-sized
+window, not one future per library entity. A missing filename index retains the
+bounded filename-query fallback. Logs break out `face_read_ms`, `person_read_ms`
+and `write_ms`, in addition to the assignment's total `metadata_ms`.
+Assignment logs also distinguish `newly_assigned_faces` from `already_owned_faces`;
+filter for the former greater than zero when assessing new-assignment latency.
+This count includes new face ownership assigned to an existing person, not just
+newly created person identities. Projection-only retries have projection logs
+but need no assignment call. In staged mode these counts are provisional until
+the batch-flush success log.
+
+Staged write coalescing described below remains experimental and **disabled by
+default** because measured persistence cost does not justify enabling that larger
+redesign yet. Re-measure with genuinely new assignments: throughput dominated by
+already-owned-face backlog does not establish the 10,000 new photos/hour target.
 
 Set `CLUSTERING_WORKER_BATCH_SIZE=8` to receive up to eight messages per queue
 request without waiting to fill a batch. Adjacent live incremental messages
@@ -56,25 +81,49 @@ exhausted retries retain the individual dispatch/dead-letter path. Default 1
 retains the original worker behavior for staged rollout.
 
 Per-photo metadata/face-ID preparation and source face/embedding point reads
-overlap with bounded I/O threads. Identity decisions, candidate validation,
-person/member/face writes and local delta updates stay ordered: later jobs see
-the previous job's committed exemplar. Duplicate source IDs consume prefetch
-once and re-read committed ownership on subsequent deliveries. ETags are retained
-on prefetched faces. Failed prefetch starts no Table writes. Each filename still
-projects its own metadata and acknowledges only on success; failures retain that
-message for retry. Pending messages renew visibility before handoff, and the
-original message processor renews the in-flight message using its latest receipt.
+overlap with bounded I/O threads. Source prefetch retains at most 128 faces;
+additional faces use fresh sequential reads. Identity decisions and local delta
+updates stay ordered. With coalescing enabled, later jobs see earlier **pending**
+exemplars in a private runtime protected by the process lock; the pending-face
+validator uses those staged records, while other candidates still get fresh
+cloud validation. No checkpoint publishes pending exemplars. Duplicate source
+IDs use staged ownership and unique entity operations. ETags are retained on
+prefetched faces and the original read of each person. Failed prefetch starts
+no Table writes.
+
+Flush order is person transactions, member transactions, then face transactions.
+Repeated person membership additions coalesce into one update per person.
+New people use conditional creates. Membership is grouped by person partition;
+person/face updates are grouped by library partition. Transactions contain at
+most 100 unique entities with a conservative 2 MiB estimated payload cap, below
+the 4 MiB service limit. The tables/partitions are NOT one atomic transaction.
+Any persistence/local-index failure invalidates speculative runtime state and
+retains the entire group's messages, even if some cloud writes committed.
+Deterministic IDs and membership/face retries recover those partial outcomes.
+Groups over 256 unique input faces fall back to the original sequential path;
+staging itself rejects overflow rather than growing without bound.
+
+After persistence, distinct filenames project metadata with up to
+`PEOPLE_FAISS_IO_CONCURRENCY` concurrent calls. Duplicate filenames project once.
+A projection failure retains only that filename's messages; its durable face
+ownership remains available for retry. Owned-face retries project metadata even
+without opening an index. A group acknowledges nothing before all transactions,
+projections and lease checks finish. The pending-message renewer covers the whole
+staged group and acknowledgement uses the newest receipt. With coalescing disabled,
+the original per-message processor still handles renewal and acknowledgement.
 The priority library-ops queue is checked between microbatches, not between
 every photo in a batch; shutdown drains the already-received bounded group.
 
 Logs include batch `lease_ms`, `prefetch_ms`, face count and elapsed time.
+The `faiss batch flush` record reports entity counts, transaction count,
+`persistence_ms`, `metadata_ms` and metadata failure count; staged per-photo
+assignment logs measure decisions, not deferred flush latency.
 Measure jobs/hour with a sustained backlog and compare against batch size 1.
 Single-message intake or trickling arrivals cannot amortize the lease cost.
-This does not yet coalesce Table writes or parallelize metadata projection.
-Those need a staged persistence protocol: Azure transactions cannot span tables,
-membership partitions differ by person, and repeated person updates must be
-coalesced without losing ETag/retry safeguards. No throughput multiplier is
-certified by unit tests.
+Membership for eight different people still needs eight partition transactions;
+do not expect one member transaction for every group. No throughput multiplier
+or million-face capacity is certified by unit tests. No deployment is performed
+by changing these defaults; batch size remains opt-in unless configured externally.
 
 External person/face mutations publish source revisions; ownership transfer or
 revision changes invalidate the local snapshot. New unowned upload faces do
