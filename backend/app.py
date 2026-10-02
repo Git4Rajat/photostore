@@ -11959,6 +11959,7 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
     renewal_thread = threading.Thread(target=_renew_lease, daemon=True)
     renewal_thread.start()
     start_time = time.monotonic()
+    succeeded = False
     try:
         payload = json.loads(message.content or '{}')
         if isinstance(payload, dict):
@@ -11983,6 +11984,7 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
                 job_type or 'people_incremental_assign', payload.get('filename') or '', user_id,
                 int((time.monotonic() - start_time) * 1000),
             )
+        succeeded = True
     except Exception as exc:
         worker_logger.info(
             'clustering message failed job_type=%s filename=%s user=%s elapsed_ms=%d',
@@ -11998,12 +12000,32 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
     finally:
         stop_renewal.set()
         renewal_thread.join(timeout=5)
-        with message_lock:
-            final_message = message_holder[0]
-        try:
-            queue_client.delete_message(final_message)
-        except Exception:
-            worker_logger.exception('Failed to delete %s queue message', queue_name)
+        # Only ack (delete) on success. An uncaught exception here used to
+        # delete the message anyway -- for most job types (people_cluster,
+        # people_recluster, people_propagate*) that share one try block with
+        # no per-branch exception handling, that meant ANY uncaught bug
+        # permanently dropped the job on its first attempt, marked 'failed',
+        # with zero retries -- making the dequeue_count/max_retries ceiling
+        # at the top of this function dead code in practice (a message can
+        # only accumulate dequeue_count by actually being redelivered, which
+        # never happened). Leaving a failed message in place lets Azure
+        # Queue Storage's own visibility-timeout expiry redeliver it
+        # naturally, up to max_retries, before that ceiling check finally
+        # drops it for real. people_incremental_assign is unaffected --
+        # it already catches its own exceptions internally and always
+        # reaches here via the success path.
+        if succeeded:
+            with message_lock:
+                final_message = message_holder[0]
+            try:
+                queue_client.delete_message(final_message)
+            except Exception:
+                worker_logger.exception('Failed to delete %s queue message', queue_name)
+        else:
+            worker_logger.info(
+                'Leaving %s queue message visible for retry (dequeue_count=%s, max_retries=%s)',
+                queue_name, dequeue_count, max_retries,
+            )
     return True
 
 
