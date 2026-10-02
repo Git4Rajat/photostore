@@ -246,9 +246,10 @@ def test_face_curation_marks_revision_before_and_after_upsert(mutation_hook, pol
 
 
 @pytest.mark.parametrize('method', ['upsert_entity', 'create_entity'])
-def test_new_unowned_face_insert_does_not_mark_revision(mutation_hook, method):
+@pytest.mark.parametrize('review_status', ['', 'suspicious'])
+def test_new_unowned_face_insert_does_not_mark_revision(mutation_hook, method, review_status):
     h = mutation_hook
-    row = dict(PartitionKey='lib-live', RowKey='new-face', personId='')
+    row = dict(PartitionKey='lib-live', RowKey='new-face', personId='', reviewStatus=review_status)
     assert getattr(h.client, method)(row) == 'mutation-result'
     assert not h.markers
     assert h.events == [('invalidate', 'lib-live'), 'mutation']

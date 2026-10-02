@@ -184,6 +184,21 @@ def test_warm_no_scans_and_source_faces_not_person_representatives(monkeypatch):
     assert writes == ['person', 'member', 'face', 'metadata'] * 2
 
 
+def test_candidate_cloud_reads_bounded_by_valid_top_two(caplog):
+    h = Harness(config=AssignmentConfig(candidates=64))
+    for i in range(100):
+        h.person(str(i), [f'face-{i}'])
+        h.face(f'face-{i}', [1, i / 100], person=str(i))
+    h.face('new')
+    with caplog.at_level('INFO', logger='faiss_assignment'):
+        h.assign('new')
+    candidate_reads = sum(count for (user, face), count in h.faces.reads.items()
+                          if face.startswith('face-'))
+    assert candidate_reads == 2
+    assert 'candidate_face_reads=2 candidate_person_reads=2' in caplog.text
+    assert 'faiss cold build' in caplog.text
+
+
 @pytest.mark.parametrize('change', [dict(tier='2pt'), dict(version='v2'), dict(vector=[1, 0, 0])])
 def test_tier_version_dimension_separation(change):
     h = Harness()
@@ -454,6 +469,7 @@ def test_storage_errors_propagate_per_query(stage, monkeypatch):
         h.faces.fail_query = error
     elif stage == 'candidate-face':
         h.faces.fail_read['u', 'a'] = error
+        h.faces.fail_read['u', 'first'] = error
     elif stage == 'candidate-person':
         h.people.fail_read['u', 'alice'] = error
     else:

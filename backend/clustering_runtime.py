@@ -5,8 +5,10 @@ Python embedding lists. Compatibility groups have flat/IVF-PQ bases and a small
 exact mutable delta. Only one process/runtime may own a directory. Operations
 are serialized; validator callbacks must not mutate the runtime.
 
-There is deliberately NO FAISS checkpoint: opening performs an explicit cold
-rebuild from durable SQLite, once, before serving queries. No TTL/query training.
+Normal opening performs an explicit cold rebuild from durable SQLite. Explicit
+save_checkpoint/restore_checkpoint preserve native base and live delta slots
+without training; see clustering_checkpoint for publication/freshness contracts.
+The caller must place active directories on LOCAL disk, never Azure Files/SMB.
 SQLite transactions atomically publish builds and writes. Memory accounting is
 conservative working-set accounting, NOT an RSS guarantee; caller input and
 other process allocations are excluded. Cache only one library per process.
@@ -46,13 +48,36 @@ class LiveFaceIndex:
 
     def __init__(self, directory, *, config=None, candidates=64, nprobe=64,
                  delta_limit=10000, threads=2):
+        self._initialize(config=config, candidates=candidates, nprobe=nprobe,
+                         delta_limit=delta_limit, threads=threads)
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        self._directory = directory.resolve()
+        self._db = sqlite3.connect(directory / 'faces.sqlite3', isolation_level=None,
+                                   check_same_thread=False)
+        try:
+            self._initialize_database()
+            self.rebuild()
+        except BaseException:
+            self._db.close()
+            raise
+
+    def _initialize(self, *, config=None, candidates=64, nprobe=64,
+                    delta_limit=10000, threads=2):
+        """Initialize state without opening SQLite or invoking native training."""
         ci._require_faiss()
         for name, value in (('candidates', candidates), ('nprobe', nprobe),
                             ('delta_limit', delta_limit), ('threads', threads)):
             if type(value) is not int or value <= 0:
                 raise ValueError(f'{name} must be a positive integer')
         self.config = config or ci.IndexConfig()
-        ci.build_face_index('validation', (), config=self.config, batch_size=1)
+        c = self.config
+        if (c.training_sample_size <= 0 or c.training_points_per_centroid <= 0 or
+                c.training_iterations <= 0 or not 1 <= c.pq_bits <= 8 or
+                c.pq_subquantizers <= 0 or c.nlist_min <= 0 or
+                c.nlist_max < c.nlist_min or c.flat_max_vectors < 0 or
+                not 0 < c.memory_budget_bytes < 4 * 1024 ** 3):
+            raise ValueError('Invalid index configuration/count')
         self.candidates = min(candidates, self._MAX_K)
         self.nprobe = nprobe
         self.delta_limit = delta_limit
@@ -68,12 +93,9 @@ class LiveFaceIndex:
         self._requested_rebuild = False
         self._closed = False
         self._check_budget(self._SQLITE_BYTES)
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(directory / 'faces.sqlite3', isolation_level=None,
-                                   check_same_thread=False)
-        try:
-            self._db.executescript('''
+
+    def _initialize_database(self):
+        self._db.executescript('''
                 PRAGMA journal_mode=DELETE;
                 PRAGMA synchronous=FULL;
                 PRAGMA cache_size=-512;
@@ -102,15 +124,35 @@ class LiveFaceIndex:
                     PRIMARY KEY(tier, version, dimension, slot)
                 ) WITHOUT ROWID;
             ''')
-            # Older directories have no delta revision. Cold rebuild below
-            # discards their mappings; the default must never match a live row.
-            columns = {row[1] for row in self._db.execute('PRAGMA table_info(delta_slots)')}
-            if 'revision' not in columns:
-                self._db.execute('ALTER TABLE delta_slots ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
-            self.rebuild()
-        except BaseException:
-            self._db.close()
-            raise
+        # Older directories have no delta revision. Cold rebuild below
+        # discards their mappings; the default must never match a live row.
+        columns = {row[1] for row in self._db.execute('PRAGMA table_info(delta_slots)')}
+        if 'revision' not in columns:
+            self._db.execute('ALTER TABLE delta_slots ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
+
+    def save_checkpoint(self, directory, *, source_revision):
+        """Explicit, locked snapshot; returns the published generation name.
+
+        source_revision MUST cover the latest completed durable assignment batch,
+        not just external edits or the current lease/ownership token. Schedule
+        after durable publication; this API cannot verify the adapter's journal.
+        """
+        from clustering_checkpoint import save_checkpoint
+        return save_checkpoint(self, directory, source_revision=source_revision)
+
+    @classmethod
+    def restore_checkpoint(cls, checkpointdir, workdir, *, source_revision,
+                           config=None, **kwargs):
+        """Restore into a unique LOCAL workdir child, without rebuilding/training.
+
+        Missing/stale/corrupt returns None; filesystem/SQLite I/O errors propagate.
+        Caller owns workdir and must ensure it is local disk (not an SMB mount).
+        No active SQLite file is opened on checkpointdir. New owners may restore
+        current data. Caller must close the runtime before removing its directory.
+        """
+        from clustering_checkpoint import restore_checkpoint
+        return restore_checkpoint(cls, checkpointdir, workdir,
+                                  source_revision=source_revision, config=config, **kwargs)
 
     def _ready(self):
         if self._closed:
@@ -339,6 +381,7 @@ class LiveFaceIndex:
             k = self.candidates
             while True:
                 exhausted = True
+                candidates = []
                 for index, delta in sources:
                     limit = min(k, int(index.ntotal))
                     exhausted &= limit == index.ntotal
@@ -364,10 +407,21 @@ class LiveFaceIndex:
                         if row is None:
                             continue
                         face_id, person_id, blob = row
-                        if candidate_validator is not None and not candidate_validator(face_id, person_id):
-                            continue
                         score = float(np.clip(np.dot(vector, np.frombuffer(blob, dtype='float32')), -1, 1))
-                        people[person_id] = max(score, people.get(person_id, -float('inf')))
+                        candidates.append((score, face_id, person_id))
+                # Exact-score order permits stopping once the two best VALID
+                # distinct identities are known. Validating every ANN hit first
+                # turns a fast local search into 64..1024 serial cloud reads.
+                for score, face_id, person_id in sorted(candidates, reverse=True):
+                    if person_id in people and score <= people[person_id]:
+                        continue
+                    if len(people) >= 2:
+                        runner_up = sorted(people.values(), reverse=True)[1]
+                        if score <= runner_up:
+                            break
+                    if candidate_validator is not None and not candidate_validator(face_id, person_id):
+                        continue
+                    people[person_id] = max(score, people.get(person_id, -float('inf')))
                 if len(people) >= 2 or exhausted or k >= self._MAX_K:
                     break
                 k = min(k * 2, self._MAX_K)

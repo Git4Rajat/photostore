@@ -112,7 +112,39 @@ def test_adaptive_bound_is_1024(runtime):
                    row('bob', 'bob', [.8, .6])])
     visited = []
     assert runtime.best_two([1, 0], '5pt', 'v1', lambda f, p: visited.append(f) or True) == (1, 1, 'alice')
-    assert len(visited) == 1024
+    assert len(visited) == 1
+
+
+def test_remote_validation_only_reads_top_distinct_people(tmp_path):
+    with_index = LiveFaceIndex(tmp_path, candidates=64)
+    try:
+        with_index.build(row(str(i), str(i), [1, i / 100]) for i in range(100))
+        reads = []
+        result = with_index.best_two([1, 0], '5pt', 'v1',
+                                     lambda face, person: reads.append(face) or True)
+        assert result[2] == '0'
+        assert len(reads) == 2
+    finally:
+        with_index.close()
+
+
+def test_invalid_top_hit_does_not_hide_lower_valid_exemplar(tmp_path):
+    index = LiveFaceIndex(tmp_path, candidates=64)
+    try:
+        index.build([row('rejected', 'alice', [1, 0]),
+                     row('valid', 'alice', [.99, .01]),
+                     row('bob', 'bob', [.8, .6]),
+                     row('carol', 'carol', [0, 1])])
+        reads = []
+        def validate(face, person):
+            reads.append(face)
+            return face != 'rejected'
+        best, second, pid = index.best_two([1, 0], '5pt', 'v1', validate)
+        assert pid == 'alice' and second == pytest.approx(.8)
+        assert best > .99
+        assert reads == ['rejected', 'valid', 'bob']
+    finally:
+        index.close()
 
 
 def test_global_delta_cap_precedes_mutation_and_retry(tmp_path):

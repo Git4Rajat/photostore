@@ -22,8 +22,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
+import logging
 import tempfile
 import threading
+import time
 import uuid
 
 from azure.core.exceptions import ResourceNotFoundError
@@ -68,6 +70,7 @@ class _ActiveLibrary:
 _LOCK = threading.RLock()
 _ACTIVE = None
 _LEGACY_MEMBERSHIP_BYTES = 60 * 1024
+_LOGGER = logging.getLogger(__name__)
 
 
 def invalidate(user_id=None):
@@ -244,6 +247,7 @@ class FaissAssigner:
                 or _ACTIVE.user_id != user_id or _ACTIVE.generation != generation)):
             invalidate()
         if _ACTIVE is None:
+            started = time.monotonic()
             directory = tempfile.TemporaryDirectory(prefix='photostore-faiss-')
             runtime = None
             ready = False
@@ -254,6 +258,8 @@ class FaissAssigner:
                                         delta_limit=self.config.delta_limit,
                                         threads=self.config.threads)
                 runtime.build(self._cold_rows(user_id))
+                _LOGGER.info('faiss cold build user=%s elapsed_ms=%d', user_id,
+                             int((time.monotonic() - started) * 1000))
                 _ACTIVE = _ActiveLibrary(self, user_id, directory, runtime, generation)
                 ready = True
             finally:
@@ -265,17 +271,21 @@ class FaissAssigner:
                         directory.cleanup()
         return _ACTIVE.runtime
 
-    def _validator(self, user_id, tier, version):
+    def _validator(self, user_id, tier, version, stats=None):
         # Bounded LRU belongs to ONE best_two query, never the library/adapter.
         people = OrderedDict()
 
         def validate(face_id, person_id):
+            if stats is not None:
+                stats['candidate_face_reads'] += 1
             face = _point(self.face_table, user_id, face_id)
             if (face is None or face.get('personId') != person_id
                     or not self._allowed(face) or self.tier(face) != tier
                     or self.version(face) != version):
                 return False
             if person_id not in people:
+                if stats is not None:
+                    stats['candidate_person_reads'] += 1
                 people[person_id] = _point(self.person_table, user_id, person_id) is not None
                 if len(people) > self.config.person_cache_size:
                     people.popitem(last=False)
@@ -301,6 +311,9 @@ class FaissAssigner:
         if not isinstance(user_id, str) or not user_id:
             raise ValueError('user_id must be a nonempty string')
         assignments, created = {}, set()
+        started = time.monotonic()
+        stats = {'candidate_face_reads': 0, 'candidate_person_reads': 0}
+        search_ms = 0
         with _LOCK, self.lease(user_id) as guard:
             if not callable(getattr(guard, 'check', None)):
                 raise TypeError('lease must yield a guard with check()')
@@ -308,6 +321,10 @@ class FaissAssigner:
             generation = getattr(guard, 'cache_generation', None)
             if (_ACTIVE is not None and (_ACTIVE.owner is not self
                     or _ACTIVE.user_id != user_id or _ACTIVE.generation != generation)):
+                _LOGGER.info('faiss cache invalidated user=%s adapter_changed=%s '
+                             'library_changed=%s generation_changed=%s', user_id,
+                             _ACTIVE.owner is not self, _ACTIVE.user_id != user_id,
+                             _ACTIVE.generation != generation)
                 invalidate()
             runtime = None
             for face_id in face_ids:
@@ -327,14 +344,19 @@ class FaissAssigner:
                 if runtime is None:
                     runtime = self._runtime(user_id, guard)
                 if runtime.needs_rebuild:
+                    rebuild_started = time.monotonic()
                     runtime.rebuild()
+                    _LOGGER.info('faiss delta compaction user=%s elapsed_ms=%d', user_id,
+                                 int((time.monotonic() - rebuild_started) * 1000))
                     guard.check()
                 deterministic_id = self.person_id(user_id, face_id)
                 person = _point(self.person_table, user_id, deterministic_id)
                 is_new = False
                 if person is None:
+                    search_started = time.monotonic()
                     best, second, matched_id = runtime.best_two(
-                        vector, tier, version, self._validator(user_id, tier, version))
+                        vector, tier, version, self._validator(user_id, tier, version, stats))
+                    search_ms += int((time.monotonic() - search_started) * 1000)
                     if (matched_id is not None and best >= self.config.threshold
                             and best - second >= self.config.margin):
                         # Read the matched row directly, not a helper/summary cache.
@@ -390,4 +412,9 @@ class FaissAssigner:
             if assignments:
                 guard.check()
                 self.metadata_callback(user_id, filename)
+            _LOGGER.info('faiss assignment user=%s filename=%s assigned=%d created=%d '
+                     'candidate_face_reads=%d candidate_person_reads=%d search_ms=%d total_ms=%d',
+                     user_id, filename, len(assignments), len(created),
+                     stats['candidate_face_reads'], stats['candidate_person_reads'], search_ms,
+                     int((time.monotonic() - started) * 1000))
         return assignments, created

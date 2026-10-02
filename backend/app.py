@@ -1238,7 +1238,9 @@ class _InvalidatingTableClient:
                 entity = args[0] if args else kwargs.get('entity', {})
                 unowned_insert = (isinstance(entity, dict) and not entity.get('personId')
                                   and not entity.get('rejected')
-                                  and not entity.get('reviewStatus'))
+                                  and str(entity.get('reviewStatus') or '').lower() in ('', 'suspicious')
+                                  and not entity.get('confirmedByUser')
+                                  and not entity.get('assignedByPropagation'))
             revision_required = (PEOPLE_ASSIGNMENT_ENGINE == 'faiss' and partition
                                  and blob_service_client is not None and not unowned_insert)
             if revision_required:
