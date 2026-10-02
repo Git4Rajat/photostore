@@ -158,6 +158,89 @@ def test_matches_using_embedding_from_dedicated_table_when_row_has_no_inline_emb
     assert len(person_table.rows) == 1
 
 
+class _EtagEntity(dict):
+    """Minimal stand-in for azure.data.tables.TableEntity: exposes
+    .metadata['etag'], which _update_person_entity_with_retry reads before
+    calling update_entity(..., match_condition=IfNotModified). Plain
+    FakeTable.get_entity returns a bare dict (no .metadata), so that read
+    raises AttributeError and _update_person_entity_with_retry silently
+    returns None in every test using it as-is -- the write never happens,
+    so it never invalidates anything either, which would hide exactly the
+    regression this test exists to catch."""
+
+    @property
+    def metadata(self):
+        return {'etag': 'v1', 'timestamp': None}
+
+
+class _EtagAwareFakeTable(FakeTable):
+    def get_entity(self, partition_key, row_key):
+        return _EtagEntity(super().get_entity(partition_key, row_key))
+
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        self.upsert_entity(entity)
+
+
+def test_incremental_assign_patches_face_summary_cache_instead_of_forcing_a_rescan():
+    """Regression test: _assign_faces_to_people_incrementally's own
+    face_table_client.upsert_entity (stamping personId) and _add_face_to_person's
+    person-table update both go through the real _InvalidatingTableClient in
+    production, which blanket-invalidates _face_summary_scan_cache on every
+    write regardless of which table changed. _add_face_to_person already
+    refreshes the matched person's rep embedding (reading the face summary)
+    BEFORE this call's own face-table write lands, so that read's cache
+    refill is immediately invalidated again by the face write -- without
+    this call patching its own local face-summary snapshot and flushing it
+    back once at the end, the very next read would re-scan the whole face
+    partition from scratch. Confirmed live as a recurring ~20-35s stall on
+    microsvcpoc-dev once the other synchronous-scan fixes landed.
+
+    Uses _EtagAwareFakeTable for person_table specifically so
+    _add_face_to_person's person-row update actually succeeds (see
+    _EtagEntity) -- with the autouse fixture's plain FakeTable, that update
+    silently no-ops, which masks this exact bug (see that fixture's own
+    comment on why it bypasses _InvalidatingTableClient entirely)."""
+    face_table = FakeTable()
+    person_table = _EtagAwareFakeTable()
+    app.face_table_client = app._InvalidatingTableClient(face_table, app._invalidate_people_scan_cache)
+    app.person_table_client = app._InvalidatingTableClient(person_table, app._invalidate_people_scan_cache)
+    app._person_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._face_summary_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._people_embedding_index_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+
+    user_id = 'lib-A'
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    # confidence must clear SUSPICIOUS_FACE_CONFIDENCE (default 0.60) --
+    # otherwise _add_face_to_person's suspicious-face guard bails out before
+    # ever reaching the person-row update, silently hiding this regression.
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE, confidence=0.95)
+
+    query_calls = {'count': 0}
+    original_query = face_table.query_entities
+
+    def _counting_query(*args, **kwargs):
+        query_calls['count'] += 1
+        return original_query(*args, **kwargs)
+
+    face_table.query_entities = _counting_query
+
+    assignments, _created = app._assign_faces_to_people_incrementally(user_id, 'photo.jpg', ['new-face'])
+    assert assignments == {'new-face': 'person-1'}
+    # Sanity: the person row really was updated (not silently skipped).
+    assert 'new-face' in json.loads(person_table.get_entity(user_id, 'person-1')['faceIds'])
+
+    calls_during_call = query_calls['count']
+    # The cache this call just flushed back must already reflect the new
+    # personId stamp without needing another table scan.
+    summary = app._load_user_face_summary_by_id(user_id)
+    assert summary['new-face']['personId'] == 'person-1'
+    assert query_calls['count'] == calls_during_call, (
+        "reading the face summary right after the call should hit the "
+        "patched cache, not trigger a fresh full-partition scan"
+    )
+
+
 def test_load_people_embedding_index_uses_blob_instead_of_scanning_tables(
     clustering_tables, monkeypatch,
 ):

@@ -4867,6 +4867,19 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
         return {}, set()
 
     session_embedding_index = [dict(entry) for entry in _load_people_embedding_index(user_id)]
+    # Local, mutable snapshot of the face-summary cache for this call's
+    # duration -- patched in place as faces get assigned below and flushed
+    # back via _face_summary_scan_cache.set() once at the end, the same
+    # shape session_embedding_index/_people_embedding_index_cache already
+    # use. Reading through _load_user_face_summary_by_id again inside the
+    # loop (instead of keeping this local copy) wouldn't actually avoid a
+    # rescan: the person-table writes below (_create_person_entity/
+    # _add_face_to_person) invalidate this same cache via the shared
+    # _invalidate_people_scan_cache, moments before this loop's own face
+    # write would otherwise re-read it. Keeping one local copy and writing
+    # it back once sidesteps that regardless of how many times the shared
+    # cache was invalidated out from under it in between.
+    face_summary = _load_user_face_summary_by_id(user_id)
     # Keyed view of the same entries session_embedding_index holds, so the
     # people_to_refresh loop below can patch a person's repEmbedding back
     # into its entry in O(1) instead of re-scanning the list. Entries are the
@@ -4999,6 +5012,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
             face_table_client.upsert_entity(face_ent)
             if not rep_already_refreshed:
                 people_to_refresh.add(person_id)
+            face_summary[str(face_id)] = {col: face_ent.get(col) for col in FACE_SUMMARY_COLUMNS}
         except Exception:
             pass
         assignments[face_id] = person_id
@@ -5040,6 +5054,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     # -- all Table Storage round-trips this process already has the answer
     # to in memory.
     _people_embedding_index_cache.set(user_id, session_embedding_index)
+    _face_summary_scan_cache.set(user_id, list(face_summary.values()))
     if assignments:
         # Cheap dirty-mark only (deduped by _manifest_already_marked_dirty) --
         # the durable blob's actual rebuild happens lazily on the next read
