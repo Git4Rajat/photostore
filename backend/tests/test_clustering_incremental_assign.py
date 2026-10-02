@@ -58,6 +58,7 @@ class _FakeBlobServiceClient:
 PERSON_A_EMBEDDING = [1.0, 0.2, 0.1, 0.05, 0.0, 0.0, 0.0, 0.0]
 PERSON_A_EMBEDDING_CLOSE = [0.98, 0.22, 0.11, 0.04, 0.01, 0.0, 0.0, 0.0]
 PERSON_B_EMBEDDING = [0.0, 0.0, 0.0, 0.0, 1.0, 0.2, 0.1, 0.05]
+PERSON_B_EMBEDDING_CLOSE = [0.0, 0.0, 0.0, 0.01, 0.98, 0.22, 0.11, 0.04]
 
 
 @pytest.fixture(autouse=True)
@@ -598,3 +599,67 @@ def test_incremental_assign_job_skips_deleted_photo(clustering_tables, monkeypat
     )
 
     assert assign_calls == []
+
+
+def test_multi_face_message_does_not_rescan_partitions_per_face(monkeypatch):
+    """Regression test: a group photo with N faces that each match a
+    DIFFERENT existing person used to pay for a fresh full-partition scan
+    of both the person and face tables on every face after the first --
+    _add_face_to_person's internal _remove_face_from_other_people and
+    _compute_rep_embedding_for_face_ids calls read the global
+    _person_scan_cache/_face_summary_scan_cache directly, which this same
+    loop's own prior-face writes had just invalidated via
+    _InvalidatingTableClient's blanket invalidate-on-write. Both helpers
+    now take this call's own local snapshots instead, so the per-face
+    query count must stay flat regardless of how many faces are in the
+    message."""
+    face_table = FakeTable()
+    person_table = _EtagAwareFakeTable()
+    app.face_table_client = app._InvalidatingTableClient(face_table, app._invalidate_people_scan_cache)
+    app.person_table_client = app._InvalidatingTableClient(person_table, app._invalidate_people_scan_cache)
+    app._person_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._face_summary_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._people_embedding_index_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    face_embeddings_table = _FaceEmbeddingsFakeTable()
+    monkeypatch.setitem(storage_utils._CTX, 'face_embeddings_table_client', face_embeddings_table)
+
+    user_id = 'lib-A'
+    _seed_person(person_table, user_id, 'person-1', ['old-face-1'], PERSON_A_EMBEDDING, name='Alice')
+    _seed_person(person_table, user_id, 'person-2', ['old-face-2'], PERSON_B_EMBEDDING, name='Bob')
+    _seed_face(face_table, user_id, 'old-face-1', 'earlier1.jpg', PERSON_A_EMBEDDING, personId='person-1', confidence=0.95)
+    _seed_face(face_table, user_id, 'old-face-2', 'earlier2.jpg', PERSON_B_EMBEDDING, personId='person-2', confidence=0.95)
+    _seed_face(face_table, user_id, 'new-face-1', 'group.jpg', PERSON_A_EMBEDDING_CLOSE, confidence=0.95)
+    _seed_face(face_table, user_id, 'new-face-2', 'group.jpg', PERSON_B_EMBEDDING_CLOSE, confidence=0.95)
+    for row_key, emb in (('old-face-1', PERSON_A_EMBEDDING), ('old-face-2', PERSON_B_EMBEDDING)):
+        face_embeddings_table.upsert_entity({'PartitionKey': user_id, 'RowKey': row_key, 'embedding': json.dumps(emb)})
+
+    face_query_calls = {'count': 0}
+    person_query_calls = {'count': 0}
+    original_face_query = face_table.query_entities
+    original_person_query = person_table.query_entities
+
+    def _counting_face_query(*args, **kwargs):
+        face_query_calls['count'] += 1
+        return original_face_query(*args, **kwargs)
+
+    def _counting_person_query(*args, **kwargs):
+        person_query_calls['count'] += 1
+        return original_person_query(*args, **kwargs)
+
+    face_table.query_entities = _counting_face_query
+    person_table.query_entities = _counting_person_query
+
+    assignments, _created = app._assign_faces_to_people_incrementally(
+        user_id, 'group.jpg', ['new-face-1', 'new-face-2'],
+    )
+
+    assert assignments == {'new-face-1': 'person-1', 'new-face-2': 'person-2'}
+    # One face-partition scan (the top-of-function face-summary snapshot)
+    # and one person-partition scan (the top-of-function person-rows
+    # snapshot) regardless of face count -- not one of each per face.
+    assert face_query_calls['count'] == 1, (
+        f"expected exactly 1 face-partition scan for a 2-face message, got {face_query_calls['count']}"
+    )
+    assert person_query_calls['count'] == 1, (
+        f"expected exactly 1 person-partition scan for a 2-face message, got {person_query_calls['count']}"
+    )

@@ -4120,7 +4120,9 @@ def _face_is_owned_by_person(face: Optional[Dict], person_id: str) -> bool:
     return str(face.get('personId') or '') == str(person_id)
 
 
-def _compute_rep_embedding_for_face_ids(user_id: str, face_ids: List[str], person_id: str) -> List[float]:
+def _compute_rep_embedding_for_face_ids(
+    user_id: str, face_ids: List[str], person_id: str, face_summary: Optional[Dict[str, Dict]] = None,
+) -> List[float]:
     """Embedding-computation half of what _update_person_rep_embedding does,
     factored out so _add_face_to_person's merged person-row write (below)
     can reuse it without duplicating the logic.
@@ -4132,8 +4134,17 @@ def _compute_rep_embedding_for_face_ids(user_id: str, face_ids: List[str], perso
     synchronous Table round trips on every single new assignment to them,
     in the clustering worker's hot path. Embeddings still come from the
     dedicated table via the existing batched fetch below, since the
-    summary projection deliberately excludes that column."""
-    summary = _load_user_face_summary_by_id(user_id)
+    summary projection deliberately excludes that column.
+
+    face_summary: pass _assign_faces_to_people_incrementally's own local,
+    continuously-patched snapshot to use it directly instead of this
+    function re-reading _load_user_face_summary_by_id -- that shared cache
+    gets invalidated by this very call's own person/face-table writes (see
+    _invalidate_people_scan_cache), so on a message with more than one
+    face, every face after the first would otherwise force a fresh
+    full-partition rescan here. Falls back to the shared cache when
+    omitted, for any other caller."""
+    summary = face_summary if face_summary is not None else _load_user_face_summary_by_id(user_id)
     embeddings_by_id = get_face_embeddings_batch(user_id, face_ids)
     face_entities = []
     for face_id in face_ids:
@@ -4153,7 +4164,9 @@ def _compute_rep_embedding_for_face_ids(user_id: str, face_ids: List[str], perso
         return []
 
 
-def _update_person_rep_embedding(user_id: str, person_id: str) -> List[float]:
+def _update_person_rep_embedding(
+    user_id: str, person_id: str, face_summary: Optional[Dict[str, Dict]] = None,
+) -> List[float]:
     if face_table_client is None or person_table_client is None:
         return []
     try:
@@ -4162,7 +4175,7 @@ def _update_person_rep_embedding(user_id: str, person_id: str) -> List[float]:
     except Exception:
         return []
 
-    rep = _compute_rep_embedding_for_face_ids(user_id, face_ids, person_id)
+    rep = _compute_rep_embedding_for_face_ids(user_id, face_ids, person_id, face_summary)
     _update_person_entity(user_id, person_id, {'repEmbedding': json.dumps(rep)})
     return rep
 
@@ -4322,15 +4335,24 @@ def _next_unnamed_person_name(user_id: str) -> str:
     return f'Unnamed {max_suffix + 1}'
 
 
-def _make_unnamed_person_name_allocator(user_id: str):
+def _make_unnamed_person_name_allocator(user_id: str, person_rows: Optional[List[Dict]] = None):
+    """person_rows: pass an already-fetched full person-row list (e.g.
+    _assign_faces_to_people_incrementally's own local snapshot) to skip
+    this function's own uncached person_table_client.query_entities call --
+    it bypassed _cached_person_rows_for_user entirely, duplicating a scan
+    callers typically just did moments earlier for the exact same data.
+    Falls back to fetching it itself when omitted."""
     next_suffix = 0
-    try:
-        if person_table_client is not None:
-            rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-        else:
+    if person_rows is not None:
+        rows = person_rows
+    else:
+        try:
+            if person_table_client is not None:
+                rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+            else:
+                rows = []
+        except Exception:
             rows = []
-    except Exception:
-        rows = []
     for row in rows:
         candidate = str(row.get('name') or '').strip()
         match = re.match(r'^unnamed\s*(\d+)$', candidate, re.IGNORECASE)
@@ -4548,7 +4570,9 @@ def _remove_face_from_person_with_retry(
     return None
 
 
-def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: str) -> Dict:
+def _remove_face_from_other_people(
+    user_id: str, face_id: str, keep_person_id: str, person_rows: Optional[List[Dict]] = None,
+) -> Dict:
     if person_table_client is None or not face_id:
         return {'removed': 0, 'deletedPeople': 0, 'touchedPeople': []}
     # Was an always-live person_table_client.query_entities call, bypassing
@@ -4558,16 +4582,24 @@ def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: s
     # (_assign_faces_to_people_incrementally) only ever passes face_ids
     # already confirmed ownerless by _face_ids_awaiting_person_assignment, so
     # in the common case every row here has to be examined just to find
-    # nothing to remove. Reading through the cache costs nothing when a
-    # concurrent read already warmed it (e.g. the same call's own
-    # _load_people_embedding_index at the top of _assign_faces_to_people_incrementally),
-    # and still self-heals within PEOPLE_SCAN_CACHE_TTL_SECONDS otherwise --
-    # same staleness tolerance every other reader of this cache already
-    # accepts; the removal below still re-reads fresh state per-candidate via
-    # _remove_face_from_person_with_retry before writing, so a stale
+    # nothing to remove.
+    #
+    # person_rows: pass _assign_faces_to_people_incrementally's own
+    # snapshot (captured once, before this message's writes) to use it
+    # directly instead of this function re-reading _cached_person_rows_for_user
+    # -- that shared cache gets invalidated by this same call's own
+    # person/face-table writes, so on a message with more than one face,
+    # every face after the first would otherwise force a fresh
+    # full-partition rescan here. A face_id this message is processing is
+    # never touched by another iteration of the same loop, so this
+    # snapshot's staleness for that specific lookup is no different from
+    # the TTL-window tolerance every other reader of this cache already
+    # accepts -- the removal below still re-reads fresh state per-candidate
+    # via _remove_face_from_person_with_retry before writing, so a stale
     # candidate list can only cost a wasted no-op retry, never a missed
-    # removal it would have caught anyway.
-    rows = _cached_person_rows_for_user(user_id)
+    # removal it would have caught anyway. Falls back to the shared cache
+    # when omitted, for any other caller.
+    rows = person_rows if person_rows is not None else _cached_person_rows_for_user(user_id)
 
     removed = 0
     deleted_people = 0
@@ -4598,7 +4630,15 @@ def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: s
     return {'removed': removed, 'deletedPeople': deleted_people, 'touchedPeople': touched_people}
 
 
-def _add_face_to_person(user_id: str, person_id: str, face_id: str, face_ent: Optional[Dict] = None) -> bool:
+def _add_face_to_person(
+    user_id: str,
+    person_id: str,
+    face_id: str,
+    face_ent: Optional[Dict] = None,
+    *,
+    face_summary: Optional[Dict[str, Dict]] = None,
+    person_rows: Optional[List[Dict]] = None,
+) -> bool:
     """Returns whether the person's faceIds actually changed AND its
     repEmbedding was refreshed as a result -- callers that need a refreshed
     rep embedding (e.g. _assign_faces_to_people_incrementally) use this to
@@ -4608,7 +4648,12 @@ def _add_face_to_person(user_id: str, person_id: str, face_id: str, face_ent: Op
     face_ent: pass the caller's already-fetched face row to skip this
     function's own point-read -- _assign_faces_to_people_incrementally's
     hot loop already has it from matching this face in the first place.
-    Falls back to fetching it itself when omitted, for any other caller."""
+    Falls back to fetching it itself when omitted, for any other caller.
+
+    face_summary/person_rows: forwarded as-is to
+    _compute_rep_embedding_for_face_ids/_remove_face_from_other_people --
+    see their own docstrings for why a hot-loop caller should pass its own
+    local snapshots here instead of leaving these as None."""
     if person_table_client is None or not person_id or not face_id:
         return False
     if face_ent is None and face_table_client is not None:
@@ -4619,7 +4664,7 @@ def _add_face_to_person(user_id: str, person_id: str, face_id: str, face_ent: Op
     if face_ent is not None:
         if _face_is_rejected(face_ent) or (_face_is_suspicious(face_ent) and not _face_is_confirmed(face_ent)):
             return False
-    _remove_face_from_other_people(user_id, face_id, person_id)
+    _remove_face_from_other_people(user_id, face_id, person_id, person_rows)
 
     def _mutate(person: Dict) -> Optional[Dict]:
         try:
@@ -4637,7 +4682,7 @@ def _add_face_to_person(user_id: str, person_id: str, face_id: str, face_ent: Op
         # assignment, the dominant case once a library has any established
         # people at all.
         person['repEmbedding'] = json.dumps(
-            _compute_rep_embedding_for_face_ids(user_id, next_face_ids, person_id),
+            _compute_rep_embedding_for_face_ids(user_id, next_face_ids, person_id, face_summary),
         )
         return person
 
@@ -4927,8 +4972,13 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     # recognize "a person already claims this face, just finish the stamp"
     # instead of re-matching/re-creating. Confirmed live: 450k+ person rows
     # against ~100k faces on this account before this fix.
+    # Kept as a local variable (not just iterated inline) so it can be
+    # threaded into _add_face_to_person -> _remove_face_from_other_people
+    # below instead of that helper re-reading _cached_person_rows_for_user
+    # itself -- see that function's docstring for why.
+    person_rows = _cached_person_rows_for_user(user_id)
     face_already_claimed_by: Dict[str, Tuple[str, Dict]] = {}
-    for row in _cached_person_rows_for_user(user_id):
+    for row in person_rows:
         claimant_id = str(row.get('RowKey') or '')
         if not claimant_id:
             continue
@@ -4942,7 +4992,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     assignments: Dict[str, str] = {}
     created_person_ids: set = set()
     people_to_refresh = set()
-    next_unnamed_person_name = _make_unnamed_person_name_allocator(user_id)
+    next_unnamed_person_name = _make_unnamed_person_name_allocator(user_id, person_rows)
 
     for face_id in face_ids:
         try:
@@ -5006,7 +5056,9 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
                 and (best_score - second_best_score) >= PEOPLE_CLUSTER_ASSIGN_MARGIN
             ):
                 person_id = str(best_person.get('personId') or '')
-                rep_already_refreshed = _add_face_to_person(user_id, person_id, face_id, face_ent)
+                rep_already_refreshed = _add_face_to_person(
+                    user_id, person_id, face_id, face_ent, face_summary=face_summary, person_rows=person_rows,
+                )
                 if rep_already_refreshed:
                     best_person['faceIds'] = [*best_person.get('faceIds', []), face_id]
             else:
@@ -5038,7 +5090,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
         assignments[face_id] = person_id
 
     for person_id in people_to_refresh:
-        new_rep = _update_person_rep_embedding(user_id, person_id)
+        new_rep = _update_person_rep_embedding(user_id, person_id, face_summary)
         entry = index_by_person_id.get(person_id)
         if entry is not None and new_rep:
             entry['repEmbedding'] = new_rep
@@ -5059,7 +5111,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
             if entry.get('name') and not _is_unnamed_name(str(entry.get('name') or ''))
         }
         _rebuild_metadata_faces_for_filename(
-            user_id, filename, searchable_person_index=searchable_person_index,
+            user_id, filename, searchable_person_index=searchable_person_index, face_summary=face_summary,
         )
 
     # session_embedding_index now reflects every write this call just made
@@ -6007,6 +6059,7 @@ def _rebuild_metadata_faces_for_filename(
     *,
     searchable_person_index: Optional[Dict[str, str]] = None,
     dry_run: bool = False,
+    face_summary: Optional[Dict[str, Dict]] = None,
 ) -> Dict:
     if metadata_table_client is None or face_table_client is None:
         return {'updated': False, 'missingMetadata': True}
@@ -6025,7 +6078,16 @@ def _rebuild_metadata_faces_for_filename(
     # live 2026-10-01 on microsvcpoc-dev, with a 99k-row face partition.
     # _load_user_face_summary_by_id is the same cached per-user face scan
     # those other two fixes use, filtered here in-memory by filename.
-    summary = _load_user_face_summary_by_id(user_id)
+    #
+    # face_summary: pass _assign_faces_to_people_incrementally's own local,
+    # continuously-patched snapshot instead of letting this function
+    # re-read the shared cache -- that cache was just invalidated by this
+    # same call's own person/face-table writes (this function runs right
+    # after the per-face loop, before that loop's own cache flush), so
+    # every assignment-producing message -- not just multi-face ones --
+    # would otherwise force a fresh full-partition rescan here. Falls back
+    # to the shared cache when omitted, for any other caller.
+    summary = face_summary if face_summary is not None else _load_user_face_summary_by_id(user_id)
     rows = [row for row in summary.values() if str(row.get('filename') or '') == filename]
     if searchable_person_index is None:
         searchable_person_index = _load_searchable_person_name_index(user_id)
