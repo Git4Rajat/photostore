@@ -936,9 +936,27 @@ def get_face_ids_for_filename(user_id: str, filename: str) -> Optional[List[str]
     """
     table = _CTX.get('face_by_filename_table_client')
     if table is None:
+        _LOGGER.info('face filename lookup fallback user=%s filename=%s reason=client_unavailable',
+                                user_id, filename)
         return None
     entity = _face_filename_row(table, user_id, filename)
-    return _validated_face_filename_ids(entity) if entity is not None else None
+    ids = _validated_face_filename_ids(entity) if entity is not None else None
+    if ids is None:
+        if entity is None:
+            reason = 'missing_row'
+        elif type(entity.get('schemaVersion')) is not int or entity.get('schemaVersion') != _FACE_FILENAME_SCHEMA_VERSION:
+            reason = 'schema_mismatch'
+        elif entity.get('state') != 'complete':
+            reason = 'state_' + str(entity.get('state') or 'missing')
+        elif not isinstance(entity.get('generation'), str) or not re.fullmatch(r'[0-9a-f]{32}', entity['generation']):
+            reason = 'invalid_generation'
+        elif entity.get('leaseExpiresAt') != '':
+            reason = 'lease_not_cleared'
+        else:
+            reason = 'invalid_face_ids'
+        _LOGGER.info('face filename lookup fallback user=%s filename=%s reason=%s',
+                                user_id, filename, reason)
+    return ids
 
 
 def _begin_face_filename_write(user_id: str, filename: str):

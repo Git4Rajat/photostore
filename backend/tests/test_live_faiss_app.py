@@ -488,7 +488,7 @@ def test_metadata_parallel_transport_failure_does_not_write_partial_projection(l
     assert not live.metadata.writes
 
 
-def test_metadata_missing_filename_index_keeps_filtered_query_fallback(live, monkeypatch):
+def test_metadata_missing_filename_index_keeps_filtered_query_fallback(live, monkeypatch, caplog):
     live.face('a', personId='alice')
     live.people.seed(dict(PartitionKey='lib-live', RowKey='alice', name='Alice'))
     monkeypatch.setattr(app, 'get_face_ids_for_filename', lambda *args: None)
@@ -498,8 +498,23 @@ def test_metadata_missing_filename_index_keeps_filtered_query_fallback(live, mon
         yield live.faces.rows['lib-live', 'a']
 
     monkeypatch.setattr(live.faces, 'query_entities', query)
-    app._live_faiss_metadata_update('lib-live', 'photo.jpg')
+    with caplog.at_level('INFO'):
+        app._live_faiss_metadata_update('lib-live', 'photo.jpg')
     assert json.loads(live.metadata.rows['lib-live', 'photo.jpg']['peopleIds']) == ['alice']
+    assert 'path=filename_query' in caplog.text
+    assert 'lookup_ms=' in caplog.text
+    assert 'fallback_query_ms=' in caplog.text
+    assert 'face_point_reads_ms=0 lookup_ids=-1' in caplog.text
+
+
+def test_metadata_indexed_path_logs_distinct_retrieval_phases(live, caplog):
+    live.face('a')
+    with caplog.at_level('INFO'):
+        app._live_faiss_metadata_update('lib-live', 'photo.jpg')
+    assert 'path=indexed_point_reads' in caplog.text
+    assert 'fallback_query_ms=0' in caplog.text
+    assert 'face_point_reads_ms=' in caplog.text
+    assert 'lookup_ids=1' in caplog.text
 
 
 @pytest.mark.parametrize('value', ['0', '17', 'not-an-int'])

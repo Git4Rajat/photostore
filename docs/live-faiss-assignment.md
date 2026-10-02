@@ -61,6 +61,19 @@ errors propagate before metadata is written. Pending reads use a worker-sized
 window, not one future per library entity. A missing filename index retains the
 bounded filename-query fallback. Logs break out `face_read_ms`, `person_read_ms`
 and `write_ms`, in addition to the assignment's total `metadata_ms`.
+`face_read_ms` includes filename-index lookup, so it is not proof of slow face
+point reads. The additional `faiss metadata face retrieval` log separates
+`lookup_ms`, `fallback_query_ms` (full iterator enumeration), and
+`face_point_reads_ms`, with `path=filename_query|indexed_point_reads` and
+`lookup_ids` (-1 means unavailable). Storage lookup logs explain fallback:
+`missing_row`, `client_unavailable`, `schema_mismatch`, `state_writing|state_dirty`,
+`invalid_generation`, `lease_not_cleared`, or `invalid_face_ids`.
+These diagnostics do not weaken completeness checks or repair rows.
+An Azure Table filename property filter is not a secondary index; missing lookup
+coverage can require scanning the library partition even for a one-face photo.
+Check coverage before increasing thread count. Backfills must use the existing
+generation/lease/CAS protocol, not publish a query result as complete while
+uploads or curation can change the filename's faces.
 Assignment logs also distinguish `newly_assigned_faces` from `already_owned_faces`;
 filter for the former greater than zero when assessing new-assignment latency.
 This count includes new face ownership assigned to an existing person, not just

@@ -5195,6 +5195,9 @@ def _live_faiss_metadata_update(user_id: str, filename: str) -> None:
         raise ValueError('PEOPLE_FAISS_IO_CONCURRENCY must be between 1 and 16')
     started = time.monotonic()
     ids = get_face_ids_for_filename(user_id, filename)
+    lookup_finished = time.monotonic()
+    path = 'filename_query' if ids is None else 'indexed_point_reads'
+    face_retrieval_started = time.monotonic()
 
     def read_face(face_id):
         try:
@@ -5243,6 +5246,12 @@ def _live_faiss_metadata_update(user_id: str, filename: str) -> None:
                        int((people_finished - faces_finished) * 1000),
                        int((time.monotonic() - people_finished) * 1000),
                        int((time.monotonic() - started) * 1000))
+    worker_logger.info('faiss metadata face retrieval user=%s filename=%s path=%s '
+                       'lookup_ms=%d fallback_query_ms=%d face_point_reads_ms=%d lookup_ids=%d',
+                       user_id, filename, path, int((lookup_finished - started) * 1000),
+                       int((faces_finished - face_retrieval_started) * 1000) if ids is None else 0,
+                       int((faces_finished - face_retrieval_started) * 1000) if ids is not None else 0,
+                       len(ids) if ids is not None else -1)
 
 
 def _get_live_faiss_assigner():
