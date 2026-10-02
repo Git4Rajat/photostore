@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 
 import pytest
 
@@ -173,12 +174,87 @@ class _EtagEntity(dict):
         return {'etag': 'v1', 'timestamp': None}
 
 
+class _FaceEmbeddingsFakeTable:
+    """Minimal fake for FACE_EMBEDDINGS_TABLE supporting the parenthesized
+    OR-filter query get_face_embeddings_batch issues -- mirrors
+    test_face_embeddings_table.py's dedicated fake, since tests/fakes.py's
+    generic FakeTable only parses a single unparenthesized 'and' clause."""
+
+    def __init__(self) -> None:
+        self.rows: dict = {}
+
+    def upsert_entity(self, entity):
+        self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
+
+    def get_entity(self, partition_key, row_key):
+        key = (partition_key, row_key)
+        if key not in self.rows:
+            raise Exception('not found')
+        return dict(self.rows[key])
+
+    def query_entities(self, filter_str, select=None):
+        m = re.match(r"PartitionKey eq '([^']*)' and \((.*)\)$", filter_str)
+        if m:
+            pk = m.group(1)
+            row_keys = set(re.findall(r"RowKey eq '([^']*)'", m.group(2)))
+            return [
+                dict(row) for (p, rk), row in self.rows.items()
+                if p == pk and rk in row_keys
+            ]
+        m = re.match(r"PartitionKey eq '([^']*)'$", filter_str)
+        assert m, f'unexpected filter: {filter_str}'
+        pk = m.group(1)
+        return [dict(row) for (p, _), row in self.rows.items() if p == pk]
+
+
 class _EtagAwareFakeTable(FakeTable):
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_calls: list = []
+
     def get_entity(self, partition_key, row_key):
         return _EtagEntity(super().get_entity(partition_key, row_key))
 
     def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        self.update_calls.append((entity['PartitionKey'], entity['RowKey']))
         self.upsert_entity(entity)
+
+
+def test_add_face_to_person_writes_faceids_and_rep_embedding_in_one_round_trip(monkeypatch):
+    """_add_face_to_person used to call _update_person_rep_embedding as a
+    separate step right after its own faceIds update -- a second full
+    get_entity+update_entity cycle on the exact same person row for every
+    matched-face assignment. Both fields must now land via a single
+    update_entity call."""
+    face_table = FakeTable()
+    person_table = _EtagAwareFakeTable()
+    app.face_table_client = face_table
+    app.person_table_client = person_table
+    app._person_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._face_summary_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    # _compute_rep_embedding_for_face_ids reads embeddings via
+    # get_face_embeddings_batch, a parenthesized OR-filter query that
+    # tests/fakes.py's FakeTable can't parse -- reuse
+    # test_face_embeddings_table.py's dedicated fake, which already handles
+    # that exact shape.
+    face_embeddings_table = _FaceEmbeddingsFakeTable()
+    monkeypatch.setitem(storage_utils._CTX, 'face_embeddings_table_client', face_embeddings_table)
+
+    user_id = 'lib-A'
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1', confidence=0.95)
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE, confidence=0.95)
+    face_embeddings_table.upsert_entity({
+        'PartitionKey': user_id, 'RowKey': 'old-face', 'embedding': json.dumps(PERSON_A_EMBEDDING),
+    })
+
+    result = app._add_face_to_person(user_id, 'person-1', 'new-face')
+
+    assert result is True
+    assert person_table.update_calls == [(user_id, 'person-1')]  # exactly one write
+    stored = person_table.get_entity(user_id, 'person-1')
+    assert json.loads(stored['faceIds']) == ['old-face', 'new-face']
+    assert json.loads(stored['repEmbedding'])  # non-empty: computed, not left stale
 
 
 def test_incremental_assign_patches_face_summary_cache_instead_of_forcing_a_rescan():

@@ -4120,23 +4120,19 @@ def _face_is_owned_by_person(face: Optional[Dict], person_id: str) -> bool:
     return str(face.get('personId') or '') == str(person_id)
 
 
-def _update_person_rep_embedding(user_id: str, person_id: str) -> List[float]:
-    if face_table_client is None or person_table_client is None:
-        return []
-    try:
-        person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
-        face_ids = json.loads(person.get('faceIds', '[]') or '[]')
-    except Exception:
-        return []
+def _compute_rep_embedding_for_face_ids(user_id: str, face_ids: List[str], person_id: str) -> List[float]:
+    """Embedding-computation half of what _update_person_rep_embedding does,
+    factored out so _add_face_to_person's merged person-row write (below)
+    can reuse it without duplicating the logic.
 
-    # Pull face metadata from the already-cached, shared face-summary scan
-    # (_load_user_face_summary_by_id) instead of one face_table_client.get_entity()
-    # point-read per face_id -- for a person with hundreds/thousands of faces
-    # (exactly the popular-person case), that was hundreds/thousands of
-    # synchronous Table round trips on every single new assignment to them,
-    # in the clustering worker's hot path. Embeddings still come from the
-    # dedicated table via the existing batched fetch below, since the
-    # summary projection deliberately excludes that column.
+    Pulls face metadata from the already-cached, shared face-summary scan
+    (_load_user_face_summary_by_id) instead of one face_table_client.get_entity()
+    point-read per face_id -- for a person with hundreds/thousands of faces
+    (exactly the popular-person case), that was hundreds/thousands of
+    synchronous Table round trips on every single new assignment to them,
+    in the clustering worker's hot path. Embeddings still come from the
+    dedicated table via the existing batched fetch below, since the
+    summary projection deliberately excludes that column."""
     summary = _load_user_face_summary_by_id(user_id)
     embeddings_by_id = get_face_embeddings_batch(user_id, face_ids)
     face_entities = []
@@ -4152,9 +4148,21 @@ def _update_person_rep_embedding(user_id: str, person_id: str) -> List[float]:
 
     try:
         import numpy as np
-        rep = _compute_rep_embedding(face_entities, np)
+        return _compute_rep_embedding(face_entities, np)
     except Exception:
-        rep = []
+        return []
+
+
+def _update_person_rep_embedding(user_id: str, person_id: str) -> List[float]:
+    if face_table_client is None or person_table_client is None:
+        return []
+    try:
+        person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+        face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+    except Exception:
+        return []
+
+    rep = _compute_rep_embedding_for_face_ids(user_id, face_ids, person_id)
     _update_person_entity(user_id, person_id, {'repEmbedding': json.dumps(rep)})
     return rep
 
@@ -4590,21 +4598,27 @@ def _remove_face_from_other_people(user_id: str, face_id: str, keep_person_id: s
     return {'removed': removed, 'deletedPeople': deleted_people, 'touchedPeople': touched_people}
 
 
-def _add_face_to_person(user_id: str, person_id: str, face_id: str) -> bool:
+def _add_face_to_person(user_id: str, person_id: str, face_id: str, face_ent: Optional[Dict] = None) -> bool:
     """Returns whether the person's faceIds actually changed AND its
     repEmbedding was refreshed as a result -- callers that need a refreshed
     rep embedding (e.g. _assign_faces_to_people_incrementally) use this to
     avoid a redundant second _update_person_rep_embedding call for a person
-    this function already just refreshed."""
+    this function already just refreshed.
+
+    face_ent: pass the caller's already-fetched face row to skip this
+    function's own point-read -- _assign_faces_to_people_incrementally's
+    hot loop already has it from matching this face in the first place.
+    Falls back to fetching it itself when omitted, for any other caller."""
     if person_table_client is None or not person_id or not face_id:
         return False
-    if face_table_client is not None:
+    if face_ent is None and face_table_client is not None:
         try:
-            face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-            if _face_is_rejected(face) or (_face_is_suspicious(face) and not _face_is_confirmed(face)):
-                return False
+            face_ent = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
         except Exception:
-            pass
+            face_ent = None
+    if face_ent is not None:
+        if _face_is_rejected(face_ent) or (_face_is_suspicious(face_ent) and not _face_is_confirmed(face_ent)):
+            return False
     _remove_face_from_other_people(user_id, face_id, person_id)
 
     def _mutate(person: Dict) -> Optional[Dict]:
@@ -4616,13 +4630,19 @@ def _add_face_to_person(user_id: str, person_id: str, face_id: str) -> bool:
         if next_face_ids == face_ids:
             return None
         person['faceIds'] = json.dumps(next_face_ids)
+        # Set repEmbedding in this same read-modify-write instead of calling
+        # _update_person_rep_embedding as a separate step right after --
+        # that was a second full read-modify-write cycle on the exact same
+        # row (its own get_entity + update_entity) for every matched-face
+        # assignment, the dominant case once a library has any established
+        # people at all.
+        person['repEmbedding'] = json.dumps(
+            _compute_rep_embedding_for_face_ids(user_id, next_face_ids, person_id),
+        )
         return person
 
     result = _update_person_entity_with_retry(user_id, person_id, _mutate)
-    if result is not None:
-        _update_person_rep_embedding(user_id, person_id)
-        return True
-    return False
+    return result is not None
 
 
 def _remove_faces_for_filename(user_id: str, filename: str) -> None:
@@ -4986,7 +5006,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
                 and (best_score - second_best_score) >= PEOPLE_CLUSTER_ASSIGN_MARGIN
             ):
                 person_id = str(best_person.get('personId') or '')
-                rep_already_refreshed = _add_face_to_person(user_id, person_id, face_id)
+                rep_already_refreshed = _add_face_to_person(user_id, person_id, face_id, face_ent)
                 if rep_already_refreshed:
                     best_person['faceIds'] = [*best_person.get('faceIds', []), face_id]
             else:
