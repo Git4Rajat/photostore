@@ -38,11 +38,43 @@ not silently fall back to library-wide linear scans.
 | `PEOPLE_FAISS_WORK_DIR` | system temporary directory; worker deployment uses local EmptyDir |
 | `PEOPLE_FAISS_CHECKPOINT_DIR` | disabled unless set; worker deployment uses the Azure Files mount |
 | `PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS` | `300`; `0` saves every completed nonempty assignment batch |
+| `CLUSTERING_WORKER_BATCH_SIZE` | `1` (opt-in; start with `8`, maximum `32`) |
+| `PEOPLE_FAISS_IO_CONCURRENCY` | `4` (maximum `16`) |
 
 Existing assignment threshold/margin settings still apply. The backend/worker
 Docker image installs the separate pinned FAISS requirements. The lease and
 revision blobs reuse the existing managed-identity Blob client and container;
 no resources or credentials are provisioned by the runtime.
+
+## Throughput microbatches
+
+Set `CLUSTERING_WORKER_BATCH_SIZE=8` to receive up to eight messages per queue
+request without waiting to fill a batch. Adjacent live incremental messages
+for the same library share one assignment Blob lease and one pre-write durable
+revision publication. Other libraries, maintenance, malformed messages and
+exhausted retries retain the individual dispatch/dead-letter path. Default 1
+retains the original worker behavior for staged rollout.
+
+Per-photo metadata/face-ID preparation and source face/embedding point reads
+overlap with bounded I/O threads. Identity decisions, candidate validation,
+person/member/face writes and local delta updates stay ordered: later jobs see
+the previous job's committed exemplar. Duplicate source IDs consume prefetch
+once and re-read committed ownership on subsequent deliveries. ETags are retained
+on prefetched faces. Failed prefetch starts no Table writes. Each filename still
+projects its own metadata and acknowledges only on success; failures retain that
+message for retry. Pending messages renew visibility before handoff, and the
+original message processor renews the in-flight message using its latest receipt.
+The priority library-ops queue is checked between microbatches, not between
+every photo in a batch; shutdown drains the already-received bounded group.
+
+Logs include batch `lease_ms`, `prefetch_ms`, face count and elapsed time.
+Measure jobs/hour with a sustained backlog and compare against batch size 1.
+Single-message intake or trickling arrivals cannot amortize the lease cost.
+This does not yet coalesce Table writes or parallelize metadata projection.
+Those need a staged persistence protocol: Azure transactions cannot span tables,
+membership partitions differ by person, and repeated person updates must be
+coalesced without losing ETag/retry safeguards. No throughput multiplier is
+certified by unit tests.
 
 External person/face mutations publish source revisions; ownership transfer or
 revision changes invalidate the local snapshot. New unowned upload faces do

@@ -5258,6 +5258,7 @@ def _get_live_faiss_assigner():
                 delta_limit=int(os.getenv('PEOPLE_FAISS_DELTA_LIMIT', '10000')),
                 threads=int(os.getenv('PEOPLE_FAISS_THREADS', '2')),
                 cold_stream_embeddings=True,
+                io_concurrency=int(os.getenv('PEOPLE_FAISS_IO_CONCURRENCY', '4')),
                 work_dir=os.getenv('PEOPLE_FAISS_WORK_DIR') or None,
                 checkpoint_dir=os.getenv('PEOPLE_FAISS_CHECKPOINT_DIR') or None,
                 checkpoint_interval_seconds=float(os.getenv('PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS', '300')),
@@ -12027,7 +12028,8 @@ def _maybe_enqueue_coalesced_rerun(job_id: Optional[str], user_id: str) -> None:
     _enqueue_clustering_job(user_id, job_type='people_cluster', payload={'trigger': 'coalesced_rerun'})
 
 
-def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, job_type: str) -> None:
+def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, job_type: str,
+                                     *, incremental_assign=None, prepared=None) -> None:
     if not user_id:
         return
     if job_type == PREVIEW_JOB_TYPE:
@@ -12150,22 +12152,17 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         # face_ids fresh from storage rather than trusting anything from the
         # enqueue-time request, since this may run long after that request
         # returned.
-        if not _people_features_available():
-            return
-        filename = _validate_media_filename(str(payload.get('filename') or ''))
+        if prepared is None:
+            prepared = _prepare_incremental_assignment(payload, user_id)
+        filename, face_ids = prepared
         if not filename:
             return
-        metadata = _get_metadata_entity(user_id, filename)
-        if not isinstance(metadata, dict):
-            return
-        if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
-            return
-        if str(metadata.get('face_status') or '').strip().lower() != 'done':
-            return
         try:
-            face_ids = _face_ids_awaiting_person_assignment(user_id, filename)
             if face_ids:
-                _assign_faces_to_people_incrementally(user_id, filename, face_ids)
+                if incremental_assign is None:
+                    _assign_faces_to_people_incrementally(user_id, filename, face_ids)
+                else:
+                    incremental_assign(filename, face_ids)
             elif PEOPLE_ASSIGNMENT_ENGINE == 'faiss':
                 # A prior attempt may have stamped all faces then failed its
                 # projection. Redelivery must finish that remaining work.
@@ -12398,6 +12395,21 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         _maybe_enqueue_coalesced_rerun(job_id, user_id)
 
 
+def _prepare_incremental_assignment(payload, user_id):
+    """Fresh per-photo preparation; independent reads may overlap in a batch."""
+    if not _people_features_available():
+        return '', []
+    filename = _validate_media_filename(str(payload.get('filename') or ''))
+    if not filename:
+        return '', []
+    metadata = _get_metadata_entity(user_id, filename)
+    if (not isinstance(metadata, dict)
+            or str(metadata.get('processing_state') or '').strip().lower() == 'deleted'
+            or str(metadata.get('face_status') or '').strip().lower() != 'done'):
+        return '', []
+    return filename, _face_ids_awaiting_person_assignment(user_id, filename)
+
+
 def _poll_clustering_queue_once(
     queue_client, queue_name: str, max_retries: int, deadletter_queue_client=None,
 ) -> bool:
@@ -12426,7 +12438,13 @@ def _poll_clustering_queue_once(
     ))
     if not messages:
         return False
-    message = messages[0]
+    return _process_clustering_queue_message(
+        messages[0], queue_client, queue_name, max_retries, deadletter_queue_client)
+
+
+def _process_clustering_queue_message(message, queue_client, queue_name, max_retries,
+                                      deadletter_queue_client=None, *, dispatch=None):
+    """Existing per-message retry, renewal and success-only ack contract."""
     payload: Dict = {}
     job_id = ''
     user_id = ''
@@ -12560,7 +12578,7 @@ def _poll_clustering_queue_once(
                 job_type or 'people_incremental_assign', payload.get('filename') or '', user_id, dequeue_count,
                 backlog_age_s,
             )
-            _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
+            (dispatch or _handle_clustering_queue_payload)(payload, job_id, user_id, job_type)
             worker_logger.info(
                 'clustering message done job_type=%s filename=%s user=%s elapsed_ms=%d',
                 job_type or 'people_incremental_assign', payload.get('filename') or '', user_id,
@@ -12611,6 +12629,105 @@ def _poll_clustering_queue_once(
     return True
 
 
+def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
+                                      deadletter_queue_client=None, *, batch_size=8):
+    """Bounded intake; renew queued messages until handed to the single handler.
+
+    Only adjacent incremental jobs for the same library share a Blob lease.
+    Maintenance, malformed and exhausted jobs retain the original dispatcher.
+    """
+    if not 1 <= batch_size <= 32:
+        raise ValueError('batch_size must be between 1 and 32')
+    messages = list(queue_client.receive_messages(
+        messages_per_page=batch_size, max_messages=batch_size,
+        visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS))
+    if not messages:
+        return False
+    holders = [[message, True] for message in messages]
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def renew_pending():
+        while not stop.wait(CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS):
+            for holder in holders:
+                # Hold through renewal/handoff so the handler always gets the
+                # newest receipt and never competes with this pending renewer.
+                with lock:
+                    if not holder[1]:
+                        continue
+                    try:
+                        holder[0] = queue_client.update_message(
+                            holder[0], visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS)
+                    except Exception:
+                        worker_logger.exception('Failed to renew pending %s batch message', queue_name)
+
+    thread = threading.Thread(target=renew_pending, daemon=True)
+    thread.start()
+
+    def take(index):
+        with lock:
+            holders[index][1] = False
+            return holders[index][0]
+
+    def identity(message):
+        try:
+            payload = json.loads(message.content or '{}')
+            if (not isinstance(payload, dict) or payload.get('type') != 'people_incremental_assign'
+                    or int(getattr(message, 'dequeue_count', 0) or 0) > max_retries):
+                return None
+            return str(payload.get('user_id') or payload.get('userId') or '').strip() or None
+        except (ValueError, TypeError):
+            return None
+
+    try:
+        index = 0
+        while index < len(messages):
+            user = identity(messages[index]) if PEOPLE_ASSIGNMENT_ENGINE == 'faiss' else None
+            end = index + 1
+            if user:
+                while end < len(messages) and identity(messages[end]) == user:
+                    end += 1
+            if not user or end - index == 1:
+                _process_clustering_queue_message(take(index), queue_client, queue_name,
+                                                  max_retries, deadletter_queue_client)
+                index = end
+                continue
+
+            group = list(range(index, end))
+
+            def prepare(i):
+                try:
+                    return _prepare_incremental_assignment(json.loads(messages[i].content), user)
+                except Exception as error:
+                    return error
+
+            concurrency = _get_live_faiss_assigner().config.io_concurrency
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                preparations = list(pool.map(prepare, group))
+            all_ids = [fid for item in preparations if not isinstance(item, Exception)
+                       for fid in item[1]]
+            try:
+                with _get_live_faiss_assigner().batch(user, all_ids) as assign:
+                    for i, prepared in zip(group, preparations):
+                        def dispatch(payload, job_id, user_id, job_type, prepared=prepared):
+                            if isinstance(prepared, Exception):
+                                raise prepared
+                            _handle_clustering_queue_payload(payload, job_id, user_id, job_type,
+                                                             incremental_assign=assign, prepared=prepared)
+                        _process_clustering_queue_message(take(i), queue_client, queue_name,
+                                                          max_retries, deadletter_queue_client,
+                                                          dispatch=dispatch)
+            except Exception:
+                # Setup/lease/prefetch failures acknowledge nothing not already
+                # completed. Visibility expiry redelivers the remaining jobs.
+                worker_logger.exception('FAISS microbatch failed user=%s messages=%d', user, len(group))
+            index = end
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    return True
+
+
 def run_clustering_worker() -> None:
     """Poll clustering queue jobs in a standalone container."""
     logging.basicConfig(
@@ -12618,6 +12735,9 @@ def run_clustering_worker() -> None:
         format='%(asctime)s %(levelname)s %(name)s %(message)s',
     )
     poll_seconds = float(os.getenv('CLUSTERING_WORKER_POLL_SECONDS', '2'))
+    batch_size = int(os.getenv('CLUSTERING_WORKER_BATCH_SIZE', '1'))
+    if not 1 <= batch_size <= 32:
+        raise ValueError('CLUSTERING_WORKER_BATCH_SIZE must be between 1 and 32')
     queue_service_client_local = queue_service_client
     if queue_service_client_local is None:
         _init_storage_clients()
@@ -12684,10 +12804,14 @@ def run_clustering_worker() -> None:
                 library_ops_deadletter_client,
             )
             if not processed_any:
-                processed_any = _poll_clustering_queue_once(
-                    queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
-                    clustering_deadletter_client,
-                )
+                if batch_size == 1:
+                    processed_any = _poll_clustering_queue_once(
+                        queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
+                        clustering_deadletter_client)
+                else:
+                    processed_any = _poll_clustering_queue_batch_once(
+                        queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
+                        clustering_deadletter_client, batch_size=batch_size)
             if not processed_any:
                 time.sleep(poll_seconds)
         except Exception:

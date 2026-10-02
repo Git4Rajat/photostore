@@ -18,6 +18,8 @@ recall beyond LiveFaceIndex's bounded retrieval and exact candidate reranking.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -53,6 +55,7 @@ class AssignmentConfig:
     work_dir: str | None = None
     checkpoint_dir: str | None = None
     checkpoint_interval_seconds: float = 300
+    io_concurrency: int = 4
 
     def __post_init__(self):
         if (not math.isfinite(self.threshold) or not -1 <= self.threshold <= 1
@@ -62,6 +65,8 @@ class AssignmentConfig:
             raise ValueError('person_cache_size must be a positive integer')
         if type(self.cold_stream_embeddings) is not bool:
             raise ValueError('cold_stream_embeddings must be a bool')
+        if type(self.io_concurrency) is not int or not 1 <= self.io_concurrency <= 16:
+            raise ValueError('io_concurrency must be between 1 and 16')
         if (not math.isfinite(self.checkpoint_interval_seconds)
                 or self.checkpoint_interval_seconds < 0):
             raise ValueError('Invalid checkpoint interval')
@@ -191,6 +196,76 @@ class FaissAssigner:
 
     def invalidate(self, user_id=None):
         invalidate(user_id)
+
+    @contextmanager
+    def batch(self, user_id, face_ids=()):
+        """One library lease/revision for a bounded group; ordered decisions.
+
+        Prefetch only input faces/embeddings. Candidate validation remains fresh.
+        A prefetched ID is consumed once, so duplicate deliveries re-read ownership.
+        Checkpoint only after all calls succeed; queue callers retain failed jobs.
+        """
+        started = time.monotonic()
+        with _LOCK, self.lease(user_id) as guard:
+            lease_ms = int((time.monotonic() - started) * 1000)
+            guard.check()
+            prefetch_started = time.monotonic()
+            faces = {}
+            # Cap retained entities/vectors even for unusually face-dense photos.
+            # Remaining IDs use the normal fresh sequential read path.
+            ids = list(dict.fromkeys(face_ids))[:128]
+
+            def read(face_id):
+                face = _point(self.face_table, user_id, face_id)
+                vector = (self._embedding(user_id, face) if face is not None
+                          and not face.get('personId') and self._allowed(face) else None)
+                return face_id, (face, vector)
+
+            # Bound submitted work as well as active threads: queue batches are
+            # bounded, but an individual photo can contain many faces.
+            with ThreadPoolExecutor(max_workers=self.config.io_concurrency) as pool:
+                for offset in range(0, len(ids), self.config.io_concurrency):
+                    faces.update(pool.map(read, ids[offset:offset + self.config.io_concurrency]))
+            guard.check()
+            prefetch_ms = int((time.monotonic() - prefetch_started) * 1000)
+            begun, failed = False, False
+            assigner = self
+
+            class BatchGuard:
+                cache_generation = getattr(guard, 'cache_generation', None)
+
+                @property
+                def checkpoint_revision(self):
+                    return getattr(guard, 'checkpoint_revision', None)
+
+                def check(self):
+                    guard.check()
+
+                def begin_assignment(self):
+                    nonlocal begun
+                    if not begun:
+                        begin = getattr(guard, 'begin_assignment', None)
+                        if callable(begin):
+                            begin()
+                        elif assigner.config.checkpoint_dir:
+                            raise TypeError('Checkpointing requires revision publication')
+                        begun = True
+
+            def assign(filename, ids):
+                nonlocal failed
+                try:
+                    return self.assign(user_id, filename, ids, _guard=BatchGuard(),
+                                       _prefetched=faces, _defer_checkpoint=True)
+                except Exception:
+                    failed = True
+                    raise
+
+            yield assign
+            if not failed and _ACTIVE is not None and _ACTIVE.user_id == user_id and _ACTIVE.owner is self:
+                self._checkpoint(user_id, guard)
+            _LOGGER.info('faiss batch user=%s prefetched_faces=%d failed=%s lease_ms=%d '
+                         'prefetch_ms=%d elapsed_ms=%d', user_id, len(ids), failed,
+                         lease_ms, prefetch_ms, int((time.monotonic() - started) * 1000))
 
     def _allowed(self, face):
         return not _rejected(face) and self.clusterable(face) and self.eligible(face)
@@ -383,14 +458,17 @@ class FaissAssigner:
             raise ValueError('Legacy person faceIds exceeds 60 KiB; refusing truncation')
         return encoded
 
-    def assign(self, user_id, filename, face_ids):
+    def assign(self, user_id, filename, face_ids, *, _guard=None,
+               _prefetched=None, _defer_checkpoint=False):
         if not isinstance(user_id, str) or not user_id:
             raise ValueError('user_id must be a nonempty string')
         assignments, created = {}, set()
         started = time.monotonic()
         stats = {'candidate_face_reads': 0, 'candidate_person_reads': 0}
         search_ms = 0
-        with _LOCK, self.lease(user_id) as guard:
+        persistence_ms = 0
+        metadata_ms = 0
+        with _LOCK, (self.lease(user_id) if _guard is None else nullcontext(_guard)) as guard:
             if not callable(getattr(guard, 'check', None)):
                 raise TypeError('lease must yield a guard with check()')
             guard.check()
@@ -413,7 +491,8 @@ class FaissAssigner:
             assignment_started = False
             for face_id in face_ids:
                 guard.check()
-                face = _point(self.face_table, user_id, face_id)
+                prefetched = _prefetched.pop(face_id, None) if _prefetched is not None else None
+                face = prefetched[0] if prefetched is not None else _point(self.face_table, user_id, face_id)
                 if face is None or _rejected(face):
                     continue
                 if face.get('personId'):
@@ -421,7 +500,7 @@ class FaissAssigner:
                     continue
                 if not self._allowed(face):
                     continue
-                vector = self._embedding(user_id, face)
+                vector = prefetched[1] if prefetched is not None else self._embedding(user_id, face)
                 if vector is None:
                     continue
                 tier, version = self.tier(face), self.version(face)
@@ -469,6 +548,7 @@ class FaissAssigner:
                     elif self.config.checkpoint_dir:
                         raise TypeError('Checkpointing requires revision publication')
                     assignment_started = True
+                persistence_started = time.monotonic()
                 _persist(self.person_table, person, guard)
                 if self.member_table is not None:
                     member = {'PartitionKey': person_id, 'RowKey': face_id,
@@ -499,17 +579,22 @@ class FaissAssigner:
                 finally:
                     if not updated:
                         invalidate(user_id)
+                persistence_ms += int((time.monotonic() - persistence_started) * 1000)
                 assignments[face_id] = person_id
                 if is_new:
                     created.add(person_id)
             if assignments:
                 guard.check()
+                metadata_started = time.monotonic()
                 self.metadata_callback(user_id, filename)
-            if runtime is not None:
+                metadata_ms = int((time.monotonic() - metadata_started) * 1000)
+            if runtime is not None and not _defer_checkpoint:
                 self._checkpoint(user_id, guard)
             _LOGGER.info('faiss assignment user=%s filename=%s assigned=%d created=%d '
-                     'candidate_face_reads=%d candidate_person_reads=%d search_ms=%d total_ms=%d',
+                     'candidate_face_reads=%d candidate_person_reads=%d search_ms=%d '
+                     'persistence_ms=%d metadata_ms=%d total_ms=%d',
                      user_id, filename, len(assignments), len(created),
                      stats['candidate_face_reads'], stats['candidate_person_reads'], search_ms,
+                     persistence_ms, metadata_ms,
                      int((time.monotonic() - started) * 1000))
         return assignments, created

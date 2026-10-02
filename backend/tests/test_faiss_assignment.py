@@ -347,6 +347,59 @@ def test_corrupt_checkpoint_falls_back_to_cold_build(tmp_path):
     assert len(h.faces.queries) == 2
 
 
+def test_microbatch_one_lease_revision_and_ordered_new_exemplars():
+    h = Harness()
+    h.face('first')
+    h.face('second')
+    with h.assigner.batch('u', ['first', 'second']) as assign:
+        first, _ = assign('first.jpg', ['first'])
+        second, created = assign('second.jpg', ['second'])
+    assert first['first'] == second['second']
+    assert not created
+    assert h.assignment_revision == 1
+    assert sum(event == ('lease', 'u') for event in h.events) == 1
+    assert h.metadata == [('u', 'first.jpg'), ('u', 'second.jpg')]
+
+
+def test_microbatch_duplicate_face_reads_committed_owner():
+    h = Harness()
+    h.face('first')
+    with h.assigner.batch('u', ['first', 'first']) as assign:
+        first = assign('first.jpg', ['first'])
+        second = assign('first.jpg', ['first'])
+    assert first[0] == second[0]
+    assert not second[1]
+    assert h.faces.reads['u', 'first'] >= 2
+
+
+def test_microbatch_source_reads_overlap_with_bounded_threads(monkeypatch):
+    h = Harness(config=AssignmentConfig(io_concurrency=2))
+    h.face('first')
+    h.face('second')
+    barrier = threading.Barrier(2)
+    original = h.faces.get_entity
+
+    def read(**kwargs):
+        barrier.wait(timeout=5)
+        return original(**kwargs)
+
+    monkeypatch.setattr(h.faces, 'get_entity', read)
+    with h.assigner.batch('u', ['first', 'second']):
+        pass
+
+
+def test_microbatch_prefetch_transport_failure_never_writes():
+    h = Harness()
+    h.face('first')
+    h.face('second')
+    h.faces.fail_read['u', 'second'] = HttpResponseError('unavailable')
+    with pytest.raises(HttpResponseError):
+        with h.assigner.batch('u', ['first', 'second']):
+            pytest.fail('failed preparation yielded')
+    assert not h.people.rows
+    assert not h.assignment_revision
+
+
 @pytest.mark.parametrize('change', [dict(tier='2pt'), dict(version='v2'), dict(vector=[1, 0, 0])])
 def test_tier_version_dimension_separation(change):
     h = Harness()
