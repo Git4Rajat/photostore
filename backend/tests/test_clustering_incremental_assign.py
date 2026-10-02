@@ -63,6 +63,9 @@ PERSON_B_EMBEDDING_CLOSE = [0.0, 0.0, 0.0, 0.01, 0.98, 0.22, 0.11, 0.04]
 
 @pytest.fixture(autouse=True)
 def clustering_tables(monkeypatch):
+    # These tests intentionally cover the legacy scan/cache architecture;
+    # production and unrelated tests retain the live FAISS default.
+    monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'legacy')
     face_table = FakeTable()
     person_table = FakeTable()
     monkeypatch.setattr(app, 'face_table_client', face_table)
@@ -111,6 +114,33 @@ def test_empty_face_ids_is_a_no_op(clustering_tables):
     assert (assignments, created) == ({}, set())
     assert face_table.rows == {}
     assert person_table.rows == {}
+
+
+def test_face_ownership_write_failure_propagates_and_replay_recovers(clustering_tables, monkeypatch):
+    face_table, person_table = clustering_tables
+    _seed_face(face_table, 'lib-A', 'face-1', 'photo.jpg', PERSON_A_EMBEDDING)
+    original_upsert = face_table.upsert_entity
+    def fail(entity):
+        raise RuntimeError('face ownership write unavailable')
+    monkeypatch.setattr(face_table, 'upsert_entity', fail)
+    with pytest.raises(RuntimeError, match='face ownership write unavailable'):
+        app._assign_faces_to_people_incrementally('lib-A', 'photo.jpg', ['face-1'])
+    assert len(person_table.rows) == 1
+    person_id = next(iter(person_table.rows))[1]
+    monkeypatch.setattr(face_table, 'upsert_entity', original_upsert)
+    assignments, created = app._assign_faces_to_people_incrementally('lib-A', 'photo.jpg', ['face-1'])
+    assert assignments == {'face-1': person_id}
+    assert created == set()
+    assert len(person_table.rows) == 1
+
+
+def test_face_read_transport_failure_propagates(clustering_tables, monkeypatch):
+    face_table, _ = clustering_tables
+    def fail(*args, **kwargs):
+        raise RuntimeError('face read unavailable')
+    monkeypatch.setattr(face_table, 'get_entity', fail)
+    with pytest.raises(RuntimeError, match='face read unavailable'):
+        app._assign_faces_to_people_incrementally('lib-A', 'photo.jpg', ['face-1'])
 
 
 def test_confident_match_assigns_to_existing_person_without_creating_new_one(clustering_tables):

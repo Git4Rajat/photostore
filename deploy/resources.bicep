@@ -9,6 +9,7 @@
 // Deploys (into the resource group created by main.bicep):
 //   - a Storage account with blob containers (images/thumbnails/covers);
 //     metadata tables are created automatically by the app on first use
+//   - dedicated Azure Files storage for worker FAISS checkpoints
 //   - a Container Apps environment (+ Log Analytics workspace)
 //   - backend, frontend, and worker container apps
 //   - role assignments so the apps reach storage via managed identity
@@ -59,6 +60,11 @@ param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 @description('Public ipworker image. Only pulled/deployed when processingMode is "backend" or "both". Separate from backendImage (unlike the clustering `worker` role, which reuses it) because ipworker needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every backend/worker cold start if bundled into their shared image. Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment.')
 param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 
+@description('Quota in GiB for the dedicated worker FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
+@minValue(1)
+@maxValue(5120)
+param workerFileShareQuotaGiB int = 100
+
 @description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
 @secure()
 param sessionSecretParam string = '${newGuid()}${newGuid()}'
@@ -81,6 +87,8 @@ var suffix = uniqueString(resourceGroup().id)
 // which is deterministic and predictable from public resource metadata.
 var sessionSecret = sessionSecretParam
 var storageAccountName = take(toLower(replace('${appName}${suffix}', '-', '')), 24)
+// Preserve the full unique suffix within the 24-character account-name limit.
+var workerCacheStorageAccountName = 'workercache${uniqueString(resourceGroup().id, appName)}'
 
 var environmentName = '${appName}-env'
 var backendAppName = '${appName}-backend'
@@ -178,6 +186,38 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     // user-delegation SAS, so account/shared keys are never needed. Disabling
     // them removes an entire class of credential-leak risk.
     allowSharedKeyAccess: false
+  }
+}
+
+resource workerCacheStorage 'Microsoft.Storage/storageAccounts@2025-06-01' = {
+  name: workerCacheStorageAccountName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+    allowBlobPublicAccess: false
+    // ACA's AzureFile SMB mount requires an account key. Isolate this explicit
+    // exception from photo/metadata storage, which keeps shared keys disabled.
+    allowSharedKeyAccess: true
+  }
+}
+
+resource workerFileService 'Microsoft.Storage/storageAccounts/fileServices@2025-06-01' = {
+  parent: workerCacheStorage
+  name: 'default'
+  properties: {}
+}
+
+resource workerCheckpointShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2025-06-01' = {
+  parent: workerFileService
+  name: 'faiss-checkpoints'
+  properties: {
+    enabledProtocols: 'SMB'
+    shareQuota: workerFileShareQuotaGiB
   }
 }
 
@@ -299,6 +339,21 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
         customerId: logAnalyticsWorkspace.properties.customerId
         sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
       }
+    }
+  }
+}
+
+resource workerCheckpointStorage 'Microsoft.App/managedEnvironments/storages@2025-01-01' = {
+  parent: managedEnvironment
+  name: 'faiss-checkpoints'
+  properties: {
+    azureFile: {
+      accessMode: 'ReadWrite'
+      accountName: workerCacheStorage.name
+      // Resolve only during deployment, directly into the mount resource:
+      // never expose the account key in outputs or container environment.
+      accountKey: workerCacheStorage.listKeys().keys[0].value
+      shareName: workerCheckpointShare.name
     }
   }
 }
@@ -1219,47 +1274,21 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
         {
           name: 'worker'
           image: backendImage
-          // 2026-08-10: live was manually bumped from 0.5vCPU/1Gi to 2/4Gi
-          // (same incident/session as the backend cpu/memory fix above) --
-          // unprojected full-table scans in worker job handlers (see the
-          // library_clean OOM writeup) can pull large partitions into memory
-          // in one pass.
-          //
-          // 2026-09-21: cpu halved to 1.0 based on real forenkla-qa platform
-          // metrics (max 59% of the 2.0vCPU allocation, i.e. ~1.18 cores
-          // peak, over the one 3-day window with real activity) -- accepted
-          // knowingly without re-testing the library_clean/full-DBSCAN burst
-          // path this app exists for, since worker is an async queue
-          // consumer, not a live HTTP path: CPU throttling here slows a
-          // background job, it doesn't 502 a user request the way backend
-          // throttling does. Memory kept at 2Gi (not reverted to the old
-          // 1Gi that caused the OOM crash-loop) specifically because that
-          // incident was memory-driven, not CPU-driven -- observed peak
-          // memory in the same window was only 14% of 4Gi (~560MB), so 2Gi
-          // still leaves real headroom.
-          //
-          // 2026-09-29: cut further to 0.5vCPU/1Gi on forenkla-ppe based on a
-          // 2-hour Azure Monitor window (including a real 713-file upload
-          // burst) showing peak 0.32vCPU (32%) and peak 580MB (28% of 2Gi).
-          // A follow-up 15-minute watch at the new size measured a peak of
-          // 782MB (76% of the new 1Gi ceiling) under ordinary background
-          // load, with 0 restarts -- notably close to the exact 1Gi ceiling
-          // that caused the 2026-08-12 OOM crash-loop (see that incident's
-          // notes above and library-clean-worker-oom memory). That incident's
-          // root cause (an unprojected Table Storage query pulling 1.3GB+
-          // into memory in _execute_library_clean) was fixed the same day
-          // (commit 36ff8ed) and this resize was made with that fix in place
-          // and the risk knowingly accepted -- but this app has NOT been
-          // re-tested against a real library_clean or full-reclustering burst
-          // at this size. Watch WorkingSetBytes/OOMKilled/restartCount
-          // closely the next time either job runs; raise back to 1.0/2Gi (or
-          // higher) immediately if either recurs.
+          // Restore headroom for live FAISS builds and clustering bursts.
+          // SQLite and temporary files stay local; SMB holds checkpoints only.
           resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
+          volumeMounts: [
+            { volumeName: 'faiss-work', mountPath: '/var/lib/photostore/faiss-work' }
+            { volumeName: 'faiss-checkpoints', mountPath: '/mnt/photostore/faiss-checkpoints' }
+          ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'worker' }
+            { name: 'PEOPLE_FAISS_WORK_DIR', value: '/var/lib/photostore/faiss-work' }
+            { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }
+            { name: 'TMPDIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
             // Short lease, actively renewed by run_clustering_worker every
             // CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS via update_message()
@@ -1304,6 +1333,10 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
           ])
         }
+      ]
+      volumes: [
+        { name: 'faiss-work', storageType: 'EmptyDir' }
+        { name: 'faiss-checkpoints', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
         minReplicas: 0
@@ -1356,6 +1389,10 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
       }
     }
   }
+  // storageName is a literal, so explicitly wait for the SMB registration.
+  dependsOn: [
+    workerCheckpointStorage
+  ]
 }
 
 // ipworker mirrors the browser's OCR/face/vision/geo pipeline server-side

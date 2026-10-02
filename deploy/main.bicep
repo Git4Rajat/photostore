@@ -56,6 +56,11 @@ param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 @description('Public ipworker image. Only pulled/deployed when processingMode is "backend" or "both". Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment.')
 param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 
+@description('Quota in GiB for the dedicated worker FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
+@minValue(1)
+@maxValue(5120)
+param workerFileShareQuotaGiB int = 100
+
 // Create the resource group that will hold everything.
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: resourceGroupName
@@ -76,6 +81,7 @@ module app 'resources.bicep' = {
     backendImage: backendImage
     frontendImage: frontendImage
     ipworkerImage: ipworkerImage
+    workerFileShareQuotaGiB: workerFileShareQuotaGiB
   }
 }
 

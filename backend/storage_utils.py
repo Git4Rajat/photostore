@@ -397,6 +397,8 @@ def configure_storage(
     filename_owners_table_client=None,
     embeddings_table_client=None,
     face_embeddings_table_client=None,
+    face_by_filename_table_client=None,
+    person_members_table_client=None,
     search_index_dirty_table_client=None,
     queue_map_on_upload: bool = False,
     face_summary_lookup=None,
@@ -418,16 +420,13 @@ def configure_storage(
     _CTX['filename_owners_table_client'] = filename_owners_table_client
     _CTX['embeddings_table_client'] = embeddings_table_client
     _CTX['face_embeddings_table_client'] = face_embeddings_table_client
+    _CTX['face_by_filename_table_client'] = face_by_filename_table_client
+    _CTX['person_members_table_client'] = person_members_table_client
     _CTX['search_index_dirty_table_client'] = search_index_dirty_table_client
     _CTX['queue_map_on_upload'] = bool(queue_map_on_upload)
-    # user_id -> {face_id: face_row_dict}, cached (PEOPLE_SCAN_CACHE_TTL_SECONDS,
-    # invalidated on every face-table write via _InvalidatingTableClient) --
-    # see _store_client_face_entities for why this matters.
+    # Retained for caller compatibility. Face ingestion deliberately does not
+    # read or republish whole-user summaries; writes invalidate via the client.
     _CTX['face_summary_lookup'] = face_summary_lookup
-    # (user_id, rows) -> None. Lets _store_client_face_entities patch the
-    # cache above with its own writes instead of leaving it for
-    # _InvalidatingTableClient to invalidate -- see that function's
-    # cache_writer call for why.
     _CTX['face_summary_cache_writer'] = face_summary_cache_writer
 
 
@@ -875,19 +874,189 @@ def _client_face_passes_quality_gate(face: Dict) -> bool:
     return area_ratio <= FACE_LOW_CONFIDENCE_MAX_AREA_RATIO and side_ratio <= FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO
 
 
-# Mirrors app.py's FACE_SUMMARY_COLUMNS (the server-side `select=` projection
-# _load_user_face_summary_by_id uses) -- kept in sync by hand since the two
-# modules don't share a constant. _store_client_face_entities uses this to
-# patch the per-user face-summary cache (see its cache_writer call near the
-# end) with rows in the exact shape a real cached scan would produce.
-_FACE_SUMMARY_PROJECTION_FIELDS = (
-    'RowKey', 'filename', 'bbox', 'imageWidth', 'imageHeight', 'confidence',
-    'reviewStatus', 'suspiciousReason', 'personId', 'rejected',
-    'confirmedByUser', 'assignedByPropagation',
-)
+_FACE_FILENAME_SCHEMA_VERSION = 1
+_FACE_FILENAME_LEASE_SECONDS = 120
+_FACE_FILENAME_CAS_ATTEMPTS = 5
+
+
+class FaceFilenameLookupRetryableError(RuntimeError):
+    """A filename writer is active or its generation/lease was lost; retry."""
+
+
+def _validated_face_filename_ids(entity) -> Optional[List[str]]:
+    """Only this protocol's complete generations are authoritative."""
+    if (type(entity.get('schemaVersion')) is not int
+            or entity['schemaVersion'] != _FACE_FILENAME_SCHEMA_VERSION
+            or entity.get('state') != 'complete'
+            or not isinstance(entity.get('generation'), str)
+            or not re.fullmatch(r'[0-9a-f]{32}', entity['generation'])
+            or entity.get('leaseExpiresAt') != ''):
+        return None
+    try:
+        ids = json.loads(entity['faceIds'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (not isinstance(ids, list)
+            or any(not isinstance(fid, str) or not fid.strip() for fid in ids)
+            or len(ids) != len(set(ids))):
+        return None
+    return ids
+
+
+def _face_filename_row(table, user_id: str, filename: str):
+    try:
+        return table.get_entity(partition_key=user_id, row_key=filename)
+    except ResourceNotFoundError:
+        return None
+
+
+def _face_filename_etag(entity):
+    etag = getattr(entity, 'metadata', {}).get('etag')
+    if not etag:
+        raise FaceFilenameLookupRetryableError('Filename lookup has no ETag')
+    return etag
+
+
+def _face_filename_lease_active(entity) -> bool:
+    value = entity.get('leaseExpiresAt')
+    if not value:
+        return False
+    try:
+        expires = datetime.fromisoformat(value)
+        return expires > datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        # Malformed nonempty leases fail closed rather than stealing a writer.
+        return True
+
+
+def get_face_ids_for_filename(user_id: str, filename: str) -> Optional[List[str]]:
+    """Return validated complete IDs (including []); unknown/dirty => None.
+
+    Storage transport failures propagate, unlike a genuinely missing row.
+    """
+    table = _CTX.get('face_by_filename_table_client')
+    if table is None:
+        return None
+    entity = _face_filename_row(table, user_id, filename)
+    return _validated_face_filename_ids(entity) if entity is not None else None
+
+
+def _begin_face_filename_write(user_id: str, filename: str):
+    """Durably invalidate before mutation; return (generation, prior IDs).
+
+    Missing/legacy/dirty/expired generations require a fresh filename query.
+    CAS retries are bounded; no local locks or wildcard ETags are sufficient.
+    """
+    table = _CTX.get('face_by_filename_table_client')
+    if table is None:
+        return None, None
+    generation = uuid.uuid4().hex
+    for _ in range(_FACE_FILENAME_CAS_ATTEMPTS):
+        previous = _face_filename_row(table, user_id, filename)
+        if previous is not None and _face_filename_lease_active(previous):
+            raise FaceFilenameLookupRetryableError('Filename face writer is active')
+        entity = {
+            'PartitionKey': user_id, 'RowKey': filename,
+            'schemaVersion': _FACE_FILENAME_SCHEMA_VERSION,
+            'generation': generation, 'state': 'writing', 'faceIds': '[]',
+            'leaseExpiresAt': (datetime.now(timezone.utc) + timedelta(
+                seconds=_FACE_FILENAME_LEASE_SECONDS)).isoformat(),
+        }
+        try:
+            if previous is None:
+                table.create_entity(entity)
+            else:
+                table.update_entity(entity, mode=UpdateMode.REPLACE,
+                                    etag=_face_filename_etag(previous),
+                                    match_condition=MatchConditions.IfNotModified)
+            return generation, (_validated_face_filename_ids(previous)
+                                if previous is not None else None)
+        except (ResourceExistsError, ResourceModifiedError, ResourceNotFoundError):
+            continue
+    raise FaceFilenameLookupRetryableError('Filename lookup acquisition conflict')
+
+
+def _finish_face_filename_write(user_id: str, filename: str, generation: str,
+                                face_ids: Optional[List[str]]) -> None:
+    """CAS publish complete IDs or release as dirty, never another writer's row."""
+    if generation is None:
+        return
+    table = _CTX['face_by_filename_table_client']
+    current = _face_filename_row(table, user_id, filename)
+    allowed_states = {'writing', 'complete'} if face_ids is None else {'writing'}
+    if (current is None or current.get('generation') != generation
+            or current.get('state') not in allowed_states):
+        raise FaceFilenameLookupRetryableError('Filename lookup generation lost')
+    if face_ids is not None and not _face_filename_lease_active(current):
+        raise FaceFilenameLookupRetryableError('Filename lookup lease expired')
+    entity = dict(current)
+    entity.update(state='dirty' if face_ids is None else 'complete',
+                  faceIds=json.dumps(sorted(set(face_ids or []))), leaseExpiresAt='')
+    table.update_entity(entity, mode=UpdateMode.REPLACE,
+                        etag=_face_filename_etag(current),
+                        match_condition=MatchConditions.IfNotModified)
+
+
+def _renew_face_filename_write(user_id: str, filename: str, generation: str) -> None:
+    """Fence/renew before each mutation, including embedding/member writes."""
+    if generation is None:
+        return
+    table = _CTX['face_by_filename_table_client']
+    current = _face_filename_row(table, user_id, filename)
+    if (current is None or current.get('generation') != generation
+            or current.get('state') != 'writing'
+            or not _face_filename_lease_active(current)):
+        raise FaceFilenameLookupRetryableError('Filename face writer lost its lease')
+    entity = dict(current)
+    entity['leaseExpiresAt'] = (datetime.now(timezone.utc) + timedelta(
+        seconds=_FACE_FILENAME_LEASE_SECONDS)).isoformat()
+    table.update_entity(entity, mode=UpdateMode.REPLACE,
+                        etag=_face_filename_etag(current),
+                        match_condition=MatchConditions.IfNotModified)
+
+
+def _set_face_ids_for_filename(user_id: str, filename: str, face_ids: List[str]) -> None:
+    """Publish caller's authoritative IDs, including a complete zero row.
+
+    Deletes/dedupe callers must handle propagated storage/CAS failures.
+    """
+    if any(not isinstance(fid, str) or not fid.strip() for fid in face_ids):
+        raise ValueError('Face IDs must be nonempty strings')
+    generation, _ = _begin_face_filename_write(user_id, filename)
+    try:
+        _finish_face_filename_write(user_id, filename, generation, face_ids)
+    except Exception:
+        _release_failed_face_filename_write(user_id, filename, generation)
+        raise
+
+
+def _release_failed_face_filename_write(user_id: str, filename: str, generation) -> None:
+    try:
+        # A transport error can follow a committed completion. The same
+        # generation may be complete already; conditionally dirty it too.
+        _finish_face_filename_write(user_id, filename, generation, None)
+    except Exception:
+        # Original error still propagates. A failed release leaves 'writing'
+        # discoverably incomplete; expiry permits a fresh authoritative query.
+        _LOGGER.exception('Failed to release filename face lease for %s/%s', user_id, filename)
 
 
 def _store_client_face_entities(user_id: str, filename: str, faces, *, force_reconcile: bool = False) -> List[str]:
+    if _CTX.get('face_table_client') is None or not isinstance(faces, list):
+        return []
+    generation, previous_ids = _begin_face_filename_write(user_id, filename)
+    try:
+        return _store_client_face_generation(user_id, filename, faces,
+                                            force_reconcile=force_reconcile,
+                                            generation=generation, previous_ids=previous_ids)
+    except Exception:
+        _release_failed_face_filename_write(user_id, filename, generation)
+        raise
+
+
+def _store_client_face_generation(user_id: str, filename: str, faces, *,
+                                  force_reconcile: bool, generation,
+                                  previous_ids: Optional[List[str]]) -> List[str]:
     face_table_client = _CTX.get('face_table_client')
     if face_table_client is None or not isinstance(faces, list):
         return []
@@ -905,40 +1074,23 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
         candidate_faces.append(face)
         candidate_bboxes.append(bbox)
 
-    # Was an uncached query_entities("PartitionKey eq user and filename eq X")
-    # -- Table Storage has no secondary index on filename, so that scanned
-    # every face row the account has EVER stored, on every single photo's
-    # face-result submission (same bug class as the already-fixed
-    # _load_people_embedding_index and _active_library_cleanup_job: invisible
-    # at small scale, ruinous once the table is large). face_summary_lookup
-    # is the same cached, invalidate-on-write per-user face scan
-    # _load_user_face_summary_by_id already uses elsewhere (PEOPLE_SCAN_CACHE_
-    # TTL_SECONDS, shared across every call in a burst instead of one scan
-    # per photo), filtered here in-memory by filename instead of server-side.
-    # summary/summary_lookup_ok are threaded through to the cache_writer
-    # call near the end of this function, so a successful lookup here can be
-    # patched in place with this call's own writes afterwards instead of
-    # left for _InvalidatingTableClient to simply blow away -- see that call
-    # site for why. summary_lookup_ok stays False on a failed lookup so a
-    # transient exception's empty {} never gets mistaken for "this user
-    # genuinely has zero faces" and written back as the new cache state.
-    summary: Dict[str, Dict] = {}
-    summary_lookup_ok = False
-    face_summary_lookup = _CTX.get('face_summary_lookup')
-    if callable(face_summary_lookup):
-        try:
-            summary = face_summary_lookup(user_id)
-            summary_lookup_ok = True
-        except Exception:
-            summary = {}
-        existing_rows = [row for row in summary.values() if str(row.get('filename') or '') == filename]
+    # Only IDs from the complete generation acquired above can bound reads.
+    # Never consult or publish a whole-user summary: curation must be fresh,
+    # and a filename result is not a full cache snapshot.
+    if previous_ids is not None:
+        existing_rows = []
+        for fid in previous_ids:
+            try:
+                row = face_table_client.get_entity(partition_key=user_id, row_key=fid)
+            except ResourceNotFoundError:
+                continue
+            if row.get('filename') != filename:
+                raise FaceFilenameLookupRetryableError('Filename lookup references another photo')
+            existing_rows.append(row)
     else:
-        try:
-            existing_rows = list(face_table_client.query_entities(
-                f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
-            ))
-        except Exception:
-            existing_rows = []
+        existing_rows = list(face_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
+        ))
     existing_bboxes = [_normalize_face_bbox(row) for row in existing_rows]
 
     # Match by bbox overlap rather than exact pixels, so re-processing under a
@@ -949,9 +1101,6 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
     matches = _match_faces_by_iou(candidate_bboxes, existing_bboxes)
 
     stored_ids: List[str] = []
-    # Populated alongside the writes below, then merged into `summary` for
-    # the cache_writer call near the end of this function.
-    updated_summary_rows: Dict[str, Dict] = {}
     deleted_face_ids: List[str] = []
     for new_idx, face in enumerate(candidate_faces):
         bbox = candidate_bboxes[new_idx]
@@ -1018,7 +1167,7 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
                 or str(existing.get('reviewStatus') or '').lower() == 'confirmed'
             )
             existing_propagated = bool(existing.get('assignedByPropagation', False))
-            if existing_person_id and not entity.get('personId'):
+            if existing_person_id:
                 entity['personId'] = existing_person_id
             if existing_confirmed:
                 entity['confirmedByUser'] = True
@@ -1038,15 +1187,11 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
         # must run before upsert_entity below so the large array never lands
         # on the photofaces row. No-op (puts the field back) if the table
         # isn't configured, so older deploys keep today's inline behavior.
-        _extract_and_store_face_embedding(user_id, face_id, entity)
-        try:
-            face_table_client.upsert_entity(entity)
-            stored_ids.append(face_id)
-            updated_summary_rows[face_id] = {
-                key: entity[key] for key in _FACE_SUMMARY_PROJECTION_FIELDS if key in entity
-            }
-        except Exception:
-            continue
+        _renew_face_filename_write(user_id, filename, generation)
+        _extract_and_store_face_embedding(user_id, face_id, entity, strict=True)
+        _renew_face_filename_write(user_id, filename, generation)
+        face_table_client.upsert_entity(entity)
+        stored_ids.append(face_id)
 
     # A forced full re-run (Tools > Backfill all photos) is the browser's
     # authoritative statement of every face in this photo right now. Any
@@ -1067,60 +1212,69 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
             face_id = str(row.get('RowKey') or '')
             if not face_id:
                 continue
+            person_id = str(row.get('personId') or '')
+            person = None
+            if person_id and person_table_client is not None:
+                try:
+                    person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+                except ResourceNotFoundError:
+                    pass
+            # Named/confirmed/propagated identities are curated, not stale.
+            if (bool(row.get('confirmedByUser')) or bool(row.get('assignedByPropagation'))
+                    or str(row.get('reviewStatus') or '').lower() == 'confirmed'
+                    or (person is not None and str(person.get('name') or '').strip())):
+                continue
+            _renew_face_filename_write(user_id, filename, generation)
+            _remove_face_person_member(person_id, face_id)
+            _renew_face_filename_write(user_id, filename, generation)
+            delete_face_embeddings_entry(user_id, face_id, strict=True)
+            if person is not None:
+                person_face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+                next_face_ids = [fid for fid in person_face_ids if str(fid) != face_id]
+                if next_face_ids != person_face_ids:
+                    _renew_face_filename_write(user_id, filename, generation)
+                    if next_face_ids:
+                        person['faceIds'] = json.dumps(next_face_ids)
+                        person_table_client.upsert_entity(person)
+                    else:
+                        try:
+                            person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+                        except ResourceNotFoundError:
+                            pass
+            # Delete the source last: any earlier failure keeps it discoverable
+            # by the next fresh filename query so retry can repair all shadows.
+            _renew_face_filename_write(user_id, filename, generation)
             try:
                 face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
-                deleted_face_ids.append(face_id)
-                updated_summary_rows.pop(face_id, None)
-            except Exception:
-                continue
-            person_id = str(row.get('personId') or '')
-            if not person_id or person_table_client is None:
-                continue
-            try:
-                person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
-                person_face_ids = json.loads(person.get('faceIds', '[]') or '[]')
-            except Exception:
-                continue
-            next_face_ids = [fid for fid in person_face_ids if str(fid) != face_id]
-            if next_face_ids == person_face_ids:
-                continue
-            try:
-                if next_face_ids:
-                    person['faceIds'] = json.dumps(next_face_ids)
-                    person_table_client.upsert_entity(person)
-                else:
-                    person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
-            except Exception:
+            except ResourceNotFoundError:
                 pass
+            deleted_face_ids.append(face_id)
 
-    # Patch the per-user face-summary cache with this call's own writes
-    # instead of leaving it for _InvalidatingTableClient's blanket
-    # invalidate-on-write to clear. Without this, every photo that both
-    # reads (via face_summary_lookup above) and writes (via upsert_entity
-    # above) this cache invalidates the very entry it just populated, so the
-    # next photo's read always misses and re-scans the whole (growing)
-    # face partition from scratch -- the TTL never gets a chance to do
-    # anything under this read-then-write-every-call workload (confirmed
-    # live 2026-10-01 on microsvcpoc-dev: QueryEntities calls dominated
-    # Table Storage traffic, ~100-200 per photo, tracking the size of the
-    # face partition at the time -- same bug class already fixed for
-    # _assign_faces_to_people_incrementally's embedding-index cache, see
-    # _UserScanCache.set()'s docstring). Only runs when the lookup above
-    # actually succeeded (summary_lookup_ok) -- patching a cache entry from
-    # a failed/partial lookup would silently drop this user's other photos'
-    # faces from the next reader's view until the next invalidation.
-    cache_writer = _CTX.get('face_summary_cache_writer')
-    if callable(cache_writer) and summary_lookup_ok:
-        merged = dict(summary)
-        merged.update(updated_summary_rows)
-        for stale_id in deleted_face_ids:
-            merged.pop(stale_id, None)
-        try:
-            cache_writer(user_id, list(merged.values()))
-        except Exception:
-            pass
+    # Keep the keyed photofacebyfilename lookup in sync with whatever rows
+    # this call actually leaves behind for this filename -- every existing
+    # row not deleted above, plus every row just written (new detections and
+    # IoU-matched re-detections, which reuse an existing RowKey). Mirrors
+    # exactly what a `filename eq X` query would return.
+    _finish_face_filename_write(
+        user_id, filename, generation,
+        sorted({
+            str(row.get('RowKey') or '') for row in existing_rows
+            if str(row.get('RowKey') or '') not in deleted_face_ids
+        } | set(stored_ids)),
+    )
 
     return stored_ids
+
+
+def _remove_face_person_member(person_id: str, face_id: str) -> None:
+    """Remove the membership shadow; only genuine not-found is a no-op."""
+    table = _CTX.get('person_members_table_client')
+    if table is None or not person_id or not face_id:
+        return
+    try:
+        table.delete_entity(partition_key=person_id, row_key=face_id)
+    except ResourceNotFoundError:
+        pass
 
 
 def _face_cover_blob_name(user_id: str, face_id: str) -> str:
@@ -7894,7 +8048,7 @@ def get_photo_embeddings(user_id: str, filename: str) -> Dict[str, object]:
 _FACE_EMBEDDING_FIELDS = ('embedding',)
 
 
-def _extract_and_store_face_embedding(user_id: str, face_id: str, entity: Dict) -> None:
+def _extract_and_store_face_embedding(user_id: str, face_id: str, entity: Dict, *, strict: bool = False) -> None:
     """Pop the embedding array off a face ``entity`` (in place) and persist
     it to FACE_EMBEDDINGS_TABLE instead, so it never lands on the photofaces
     row. Call this immediately before every face_table_client.upsert_entity(entity)
@@ -7915,10 +8069,12 @@ def _extract_and_store_face_embedding(user_id: str, face_id: str, entity: Dict) 
             **{k: v for k, v in values.items() if v is not None},
         })
     except Exception:
+        if strict:
+            raise
         pass
 
 
-def delete_face_embeddings_entry(user_id: str, face_id: str) -> None:
+def delete_face_embeddings_entry(user_id: str, face_id: str, *, strict: bool = False) -> None:
     """Drop a deleted/merged-away face's row from FACE_EMBEDDINGS_TABLE.
     Mirrors delete_embeddings_entry."""
     face_embeddings_table_client = _CTX.get('face_embeddings_table_client')
@@ -7926,7 +8082,11 @@ def delete_face_embeddings_entry(user_id: str, face_id: str) -> None:
         return
     try:
         face_embeddings_table_client.delete_entity(partition_key=user_id, row_key=face_id)
+    except ResourceNotFoundError:
+        pass
     except Exception:
+        if strict:
+            raise
         pass
 
 

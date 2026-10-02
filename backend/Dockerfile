@@ -24,7 +24,8 @@ WORKDIR /app
 
 # Copy requirements and install
 COPY requirements.txt ./
-RUN pip install -r requirements.txt
+COPY requirements-clustering.txt ./
+RUN pip install -r requirements.txt -r requirements-clustering.txt
 
 # Copy runtime Python modules used by app.py
 COPY *.py ./

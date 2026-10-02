@@ -42,6 +42,9 @@ class _FakeQueueClient:
     def create_queue(self):
         pass
 
+    def send_message(self, content):
+        pass
+
     def receive_messages(self, **kwargs):
         if self._batches:
             return self._batches.pop(0)

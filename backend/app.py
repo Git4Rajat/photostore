@@ -76,6 +76,8 @@ from storage_utils import (
     get_face_embedding,
     get_face_embeddings_batch,
     delete_face_embeddings_entry,
+    get_face_ids_for_filename,
+    _set_face_ids_for_filename,
     PHOTO_LIST_SELECT_FIELDS,
     get_user_listing_index,
     download_media_bytes,
@@ -420,6 +422,26 @@ ALBUMS_TABLE = os.getenv('ALBUMS_TABLE', 'photoalbums')
 ALBUM_TOKEN_INDEX_TABLE = os.getenv('ALBUM_TOKEN_INDEX_TABLE', 'photoalbumtokens')
 PEOPLE_TABLE = os.getenv('PEOPLE_TABLE', 'photopeople')
 FACE_TABLE = os.getenv('FACE_TABLE', 'photofaces')
+# Keyed photo -> face-id lookup (PartitionKey=userId, RowKey=filename,
+# faceIds=json array of photofaces RowKeys for that filename). Dual-written
+# alongside every photofaces create/update/delete-by-filename so upload-side
+# persistence and incremental-assignment lookups can do a bounded point read
+# instead of filtering (or querying) the whole face partition by filename --
+# see _store_client_face_entities and _face_ids_awaiting_person_assignment.
+FACE_BY_FILENAME_TABLE = os.getenv('FACE_BY_FILENAME_TABLE', 'photofacebyfilename')
+# One row per person-membership (PartitionKey=personId, RowKey=faceId,
+# userId, addedAt), dual-written alongside every photopeople.faceIds mutation.
+# photopeople.faceIds is a single JSON-encoded array on the person row --
+# Azure Table strings cap at 64 KiB, so a sufficiently popular person's row
+# can hard-fail outright, long before the library itself is especially large,
+# and every read/write of it (merge, undo, repair, rep-embedding refresh,
+# listing) re-serializes the whole thing regardless of how much of it
+# actually changed. This table is additive/dual-write only for now --
+# faceIds stays the source of truth every current reader uses; this just
+# gives a future paginated reader (and bounded-exemplar rep refresh) an
+# access path that doesn't require materializing a popular person's entire
+# membership as one string.
+PERSON_MEMBERS_TABLE = os.getenv('PERSON_MEMBERS_TABLE', 'photopersonmembers')
 MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
 # Job status/progress rows: PartitionKey=userId (or libraryId for
 # library_clean/library_download, which any member of a shared library must
@@ -641,6 +663,16 @@ LIBRARY_OPS_QUEUE_NAME = os.getenv('LIBRARY_OPS_QUEUE_NAME', 'photostore-library
 # throws immediately) still eventually stops instead of burning compute
 # forever.
 LIBRARY_CLEAN_MAX_RETRIES = int(os.getenv('LIBRARY_CLEAN_MAX_RETRIES', '30'))
+# Exceeding CLUSTERING_WORKER_MAX_RETRIES/LIBRARY_CLEAN_MAX_RETRIES used to
+# just delete the message and mark the job 'failed' -- a genuinely poisoned
+# payload (or a bug that makes every attempt throw) was gone for good with no
+# way to inspect what it actually contained, only the job-status row's
+# generic error string. These two queues hold the exhausted message's
+# original body plus failure context instead, so an operator can inspect or
+# manually replay it. Separate per source queue (not one shared dead-letter)
+# so a replay knows which original queue/consumer to re-enqueue onto.
+CLUSTERING_DEADLETTER_QUEUE_NAME = os.getenv('CLUSTERING_DEADLETTER_QUEUE_NAME', 'photostore-clustering-deadletter')
+LIBRARY_OPS_DEADLETTER_QUEUE_NAME = os.getenv('LIBRARY_OPS_DEADLETTER_QUEUE_NAME', 'photostore-library-ops-deadletter')
 IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
 # ipworker's job: thumbnail, exif, ocr, geo (map_detection), vision (ai_vision),
 # face -- the full set the browser can do client-side. Thumbnail used to be a
@@ -744,6 +776,11 @@ PEOPLE_MATCH_THRESHOLD = max(float(_PEOPLE_CLUSTER_CONFIG['match_threshold']), M
 PEOPLE_MATCH_MARGIN = float(_PEOPLE_CLUSTER_CONFIG['match_margin'])
 PEOPLE_CLUSTER_ASSIGN_THRESHOLD = max(float(_PEOPLE_CLUSTER_CONFIG['assign_threshold']), MIN_AUTO_FACE_MERGE_SIMILARITY)
 PEOPLE_CLUSTER_ASSIGN_MARGIN = float(_PEOPLE_CLUSTER_CONFIG['assign_margin'])
+PEOPLE_ASSIGNMENT_ENGINE = os.getenv('PEOPLE_ASSIGNMENT_ENGINE', 'faiss').strip().lower()
+if PEOPLE_ASSIGNMENT_ENGINE not in ('faiss', 'legacy'):
+    raise ValueError('PEOPLE_ASSIGNMENT_ENGINE must be faiss or legacy')
+_live_faiss_assigner = None
+_live_faiss_clients = None
 # Hard floor for merge suggestions shown to users. Suggestions are user-reviewed
 # (not auto-applied), so this can sit a touch below the auto-merge floor to
 # surface plausible same-person candidates for confirmation.
@@ -784,6 +821,17 @@ PEOPLE_PROPAGATE_MAX_SUGGESTIONS = int(os.getenv('PEOPLE_PROPAGATE_MAX_SUGGESTIO
 # replica on a large library. Stream the scan and score the embeddings in bounded
 # chunks so peak memory is one batch, not the entire table.
 PEOPLE_PROPAGATE_SCAN_BATCH = int(os.getenv('PEOPLE_PROPAGATE_SCAN_BATCH', '1024'))
+# _compute_rep_embedding_for_face_ids re-reads and re-averages EVERY face a
+# person currently owns on every single new-face assignment to them -- the
+# "popular person" cost: O(all their faces) embedding fetches/weighting per
+# touch, not O(1). When enabled, caps that to a bounded, confidence/confirmed-
+# prioritized sample instead of the full membership. Defaults off: this
+# changes what embedding every future match compares against, so it needs to
+# be validated against a real library's cosine-similarity drift (not
+# synthetic vectors) before enabling in production -- see
+# scripts/compare_bounded_exemplars.py.
+PEOPLE_REP_BOUNDED_EXEMPLARS = os.getenv('PEOPLE_REP_BOUNDED_EXEMPLARS', 'false').lower() in ('1', 'true', 'yes')
+PEOPLE_REP_BOUNDED_EXEMPLARS_CAP = int(os.getenv('PEOPLE_REP_BOUNDED_EXEMPLARS_CAP', '50'))
 SUSPICIOUS_FACE_CONFIDENCE = float(os.getenv('SUSPICIOUS_FACE_CONFIDENCE', '0.60'))
 FACE_MIN_STORE_CONFIDENCE = float(os.getenv('FACE_MIN_STORE_CONFIDENCE', '0.24'))
 FACE_LOW_CONFIDENCE_REJECT_BELOW = float(os.getenv('FACE_LOW_CONFIDENCE_REJECT_BELOW', '0.32'))
@@ -960,6 +1008,8 @@ credential = None
 metadata_table_client = None
 embeddings_table_client = None
 face_embeddings_table_client = None
+face_by_filename_table_client = None
+person_members_table_client = None
 search_index_dirty_table_client = None
 blob_service_client = None
 albums_table_client = None
@@ -984,6 +1034,8 @@ clustering_queue_client = None
 queue_service_client = None
 ipwork_queue_client = None
 library_ops_queue_client = None
+clustering_deadletter_queue_client = None
+library_ops_deadletter_queue_client = None
 
 
 class _UserScanCache:
@@ -1178,11 +1230,29 @@ class _InvalidatingTableClient:
             return attr
 
         def _wrapped(*args, **kwargs):
+            partition = _partition_key_from_write_call(name, args, kwargs)
+            # New unowned upload faces aren't in the live index yet. Do not
+            # force a million-face rebuild for every such insertion.
+            unowned_insert = False
+            if self is face_table_client and name in ('upsert_entity', 'create_entity'):
+                entity = args[0] if args else kwargs.get('entity', {})
+                unowned_insert = (isinstance(entity, dict) and not entity.get('personId')
+                                  and not entity.get('rejected')
+                                  and not entity.get('reviewStatus'))
+            revision_required = (PEOPLE_ASSIGNMENT_ENGINE == 'faiss' and partition
+                                 and blob_service_client is not None and not unowned_insert)
+            if revision_required:
+                from clustering_lease import mark_library_changed
+                mark_library_changed(blob_service_client, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, partition)
             try:
-                self._on_write(_partition_key_from_write_call(name, args, kwargs))
+                self._on_write(partition)
             except Exception:
                 pass
-            return attr(*args, **kwargs)
+            try:
+                return attr(*args, **kwargs)
+            finally:
+                if revision_required:
+                    mark_library_changed(blob_service_client, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, partition)
 
         return _wrapped
 
@@ -1245,6 +1315,7 @@ def _init_storage_clients():
     global account_name, credential
     global metadata_table_client
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
+    global face_by_filename_table_client, person_members_table_client
     global album_token_index_table_client
     global jobs_table_client
     global workbench_actions_table_client
@@ -1257,6 +1328,7 @@ def _init_storage_clients():
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
     global clustering_queue_client, queue_service_client, ipwork_queue_client, library_ops_queue_client
+    global clustering_deadletter_queue_client, library_ops_deadletter_queue_client
 
     account_name = STORAGE_ACCOUNT_NAME or os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
 
@@ -1271,6 +1343,8 @@ def _init_storage_clients():
         album_token_index_table_client_local = tbl_svc.get_table_client(ALBUM_TOKEN_INDEX_TABLE)
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
+        face_by_filename_table_client_local = tbl_svc.get_table_client(FACE_BY_FILENAME_TABLE)
+        person_members_table_client_local = tbl_svc.get_table_client(PERSON_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
@@ -1293,6 +1367,8 @@ def _init_storage_clients():
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
         library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
+        clustering_deadletter_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
+        library_ops_deadletter_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_DEADLETTER_QUEUE_NAME)
     else:
         # Managed identity mode (Azure)
         credential = DefaultAzureCredential()
@@ -1316,6 +1392,8 @@ def _init_storage_clients():
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
         library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
+        clustering_deadletter_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
+        library_ops_deadletter_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_DEADLETTER_QUEUE_NAME)
 
         # Table clients
         tbl_svc = TableServiceClient(
@@ -1331,6 +1409,8 @@ def _init_storage_clients():
         album_token_index_table_client_local = tbl_svc.get_table_client(ALBUM_TOKEN_INDEX_TABLE)
         face_table_client_local = tbl_svc.get_table_client(FACE_TABLE)
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
+        face_by_filename_table_client_local = tbl_svc.get_table_client(FACE_BY_FILENAME_TABLE)
+        person_members_table_client_local = tbl_svc.get_table_client(PERSON_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
@@ -1358,6 +1438,8 @@ def _init_storage_clients():
     # the people/faces scan cache -- see _InvalidatingTableClient.
     face_table_client = _InvalidatingTableClient(face_table_client_local, _invalidate_people_scan_cache)
     person_table_client = _InvalidatingTableClient(person_table_client_local, _invalidate_people_scan_cache)
+    face_by_filename_table_client = face_by_filename_table_client_local
+    person_members_table_client = person_members_table_client_local
     merge_table_client = merge_table_client_local
     jobs_table_client = jobs_table_client_local
     workbench_actions_table_client = workbench_actions_table_client_local
@@ -1373,6 +1455,8 @@ def _init_storage_clients():
     clustering_queue_client = clustering_queue_client_local
     ipwork_queue_client = ipwork_queue_client_local
     library_ops_queue_client = library_ops_queue_client_local
+    clustering_deadletter_queue_client = clustering_deadletter_queue_client_local
+    library_ops_deadletter_queue_client = library_ops_deadletter_queue_client_local
     queue_service_client = queue_service_client_local
 
     # Ensure the multi-tenant tables/queues exist. Each create call is an
@@ -1386,11 +1470,14 @@ def _init_storage_clients():
     _ensure_fns = [
         lambda t=tbl: t.create_table()
         for tbl in (users_table_client, libraries_table_client, memberships_table_client,
-                    invites_table_client, audit_table_client, clean_requests_table_client)
+                    invites_table_client, audit_table_client, clean_requests_table_client,
+                    face_by_filename_table_client, person_members_table_client)
     ] + [
         lambda q=clustering_queue_client: q.create_queue(),
         lambda q=ipwork_queue_client: q.create_queue(),
         lambda q=library_ops_queue_client: q.create_queue(),
+        lambda q=clustering_deadletter_queue_client: q.create_queue(),
+        lambda q=library_ops_deadletter_queue_client: q.create_queue(),
     ]
     if AUTH_MODE == 'password':
         _ensure_fns.append(lambda: config_table_client.create_table())
@@ -1444,6 +1531,8 @@ def _init_storage_clients():
         filename_owners_table_client=filename_owners_table_client,
         embeddings_table_client=embeddings_table_client,
         face_embeddings_table_client=face_embeddings_table_client,
+        face_by_filename_table_client=face_by_filename_table_client,
+        person_members_table_client=person_members_table_client,
         search_index_dirty_table_client=search_index_dirty_table_client,
         queue_map_on_upload=(MAPS_QUEUE_ON_UPLOAD and not MAPS_ON_UPLOAD),
         # Lambdas, not direct references: both targets are defined later in
@@ -3666,6 +3755,144 @@ def _face_payload_for_metadata(face_id: str, face: Dict) -> Dict:
     return payload
 
 
+def _add_person_member(user_id: str, person_id: str, face_id: str) -> None:
+    """Dual-write a single row into photopersonmembers alongside a face being
+    added to a person's faceIds array. Additive only for now -- faceIds stays
+    the source of truth every current reader uses (see PERSON_MEMBERS_TABLE's
+    comment) -- so a failure here is logged but must never block the faceIds
+    write it's shadowing."""
+    if person_members_table_client is None or not person_id or not face_id:
+        return
+    try:
+        person_members_table_client.upsert_entity({
+            'PartitionKey': person_id,
+            'RowKey': face_id,
+            'userId': user_id,
+            'addedAt': datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        app.logger.exception('Failed to add person-membership row for %s/%s', person_id, face_id)
+
+
+def _remove_person_member(person_id: str, face_id: str) -> None:
+    if person_members_table_client is None or not person_id or not face_id:
+        return
+    try:
+        person_members_table_client.delete_entity(partition_key=person_id, row_key=face_id)
+    except ResourceNotFoundError:
+        pass
+    except Exception:
+        app.logger.exception('Failed to remove person-membership row for %s/%s', person_id, face_id)
+
+
+def _person_member_ids(person_id: str) -> set:
+    """Current photopersonmembers rows for one person -- cheap, since the
+    table is partitioned by person_id (one partition scan per person, not per
+    library). Used by _repair_face_memberships to reconcile this table
+    against faceIds after bulk, overwrite-style writers (cluster_user_faces,
+    _build_people_recluster_plan) that recompute a person's whole faceIds
+    list at once instead of calling _add_person_member/_remove_person_member
+    incrementally -- those don't track which individual faces moved, so
+    reconciling here after the fact closes the gap instead of threading exact
+    diffs through DBSCAN's cluster-assignment logic."""
+    if person_members_table_client is None or not person_id:
+        return set()
+    try:
+        rows = person_members_table_client.query_entities(f"PartitionKey eq '{_escape_odata(person_id)}'")
+        return {str(row.get('RowKey') or '') for row in rows if row.get('RowKey')}
+    except Exception:
+        app.logger.exception('Failed to read person-membership rows for %s', person_id)
+        return set()
+
+
+def _bounded_io_map(executor, function, items):
+    """Unlike Executor.map, keep only a worker-sized window of pending work."""
+    iterator = iter(items)
+    pending = set()
+    exhausted = False
+    while pending or not exhausted:
+        while not exhausted and len(pending) < executor._max_workers * 2:
+            try:
+                item = next(iterator)
+            except StopIteration:
+                exhausted = True
+                break
+            pending.add(executor.submit(function, item))
+        if pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                yield future.result()
+
+
+def _table_operation_chunks(operations, chunk_size=100):
+    """Stream single-partition transactions with conservative wire-size headroom.
+
+    JSON body size alone misses multipart headers and OData annotations. Reserve
+    2 KiB per operation and limit batches to 3 MiB, below Azure's 4 MiB limit.
+    """
+    limit = max(1, min(100, int(chunk_size)))
+    chunk, size, partition = [], 0, None
+    for operation in operations:
+        entity = operation[1]
+        estimate = len(json.dumps(entity, default=str, ensure_ascii=True).encode('utf-8')) + 2048
+        if estimate >= 3 * 1024 * 1024:
+            raise ValueError('Entity exceeds the safe Table transaction payload limit')
+        key = entity['PartitionKey']
+        if chunk and (len(chunk) >= limit or size + estimate >= 3 * 1024 * 1024 or key != partition):
+            yield chunk
+            chunk, size = [], 0
+        partition = key
+        chunk.append(operation)
+        size += estimate
+    if chunk:
+        yield chunk
+
+
+def _sync_person_members(entity: Dict) -> None:
+    """Best-effort shadow delta, only after an authoritative person commit.
+
+    Compare actual shadow rows, not the prior faceIds: retrying an interrupted
+    shadow write must repair missing rows even when faceIds is unchanged. Reads
+    and temporary sets are limited to this person's partition, never a library.
+    """
+    if person_members_table_client is None or 'faceIds' not in entity:
+        return
+    person_id = entity['RowKey']
+    try:
+        raw = entity['faceIds']
+        desired = set(json.loads(raw) if isinstance(raw, str) else raw)
+        existing = {
+            row['RowKey'] for row in person_members_table_client.query_entities(
+                f"PartitionKey eq '{_escape_odata(person_id)}'", select=['RowKey'])
+        }
+        added_at = datetime.now(timezone.utc).isoformat()
+
+        def operations():
+            for face_id in desired:
+                if face_id and face_id not in existing:
+                    yield ('upsert', {'PartitionKey': person_id, 'RowKey': face_id,
+                                      'userId': entity['PartitionKey'], 'addedAt': added_at})
+            for face_id in existing:
+                if face_id not in desired:
+                    yield ('delete', {'PartitionKey': person_id, 'RowKey': face_id})
+
+        for chunk in _table_operation_chunks(operations()):
+            try:
+                person_members_table_client.submit_transaction(chunk)
+            except Exception:
+                # Transactions are atomic. A repeated upsert/delete is safe;
+                # fallback also supports clients without transaction support.
+                for action, row in chunk:
+                    if action == 'upsert':
+                        _add_person_member(entity['PartitionKey'], person_id, row['RowKey'])
+                    else:
+                        _remove_person_member(person_id, row['RowKey'])
+    except Exception:
+        # Membership remains additive, not authoritative. Repair can retry a
+        # partial shadow failure; never hide failures of the actual person row.
+        app.logger.exception('Failed to synchronize person-membership rows for %s', person_id)
+
+
 def _create_person_entity(
     user_id: str,
     face_ids: List[str],
@@ -3698,7 +3925,9 @@ def _create_person_entity(
     try:
         person_table_client.upsert_entity(entity)
     except Exception:
-        pass
+        app.logger.exception('Failed to persist person %s/%s', user_id, person_id)
+        raise
+    _sync_person_members(entity)
     return person_id
 
 
@@ -4120,6 +4349,27 @@ def _face_is_owned_by_person(face: Optional[Dict], person_id: str) -> bool:
     return str(face.get('personId') or '') == str(person_id)
 
 
+def _select_bounded_exemplar_ids(face_ids: List[str], summary: Dict[str, Dict], cap: int) -> List[str]:
+    if cap <= 0:
+        raise ValueError('Exemplar cap must be positive')
+    """Rank candidates confirmed-by-user first, then by confidence
+    descending, and return at most `cap` of them -- used by
+    _compute_rep_embedding_for_face_ids when PEOPLE_REP_BOUNDED_EXEMPLARS is
+    enabled. Pure in-memory ranking over already-fetched summary metadata
+    (no extra I/O): the expensive part this bounds is the embedding fetch
+    and weighted-average that follow, not this selection itself."""
+    def _rank_key(face_id: str):
+        face = summary.get(str(face_id)) or {}
+        confirmed = bool(face.get('confirmedByUser', False))
+        try:
+            confidence = float(face.get('confidence', 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+        return (0 if confirmed else 1, -confidence)
+
+    return sorted(face_ids, key=_rank_key)[:cap]
+
+
 def _compute_rep_embedding_for_face_ids(
     user_id: str, face_ids: List[str], person_id: str, face_summary: Optional[Dict[str, Dict]] = None,
 ) -> List[float]:
@@ -4145,9 +4395,18 @@ def _compute_rep_embedding_for_face_ids(
     full-partition rescan here. Falls back to the shared cache when
     omitted, for any other caller."""
     summary = face_summary if face_summary is not None else _load_user_face_summary_by_id(user_id)
-    embeddings_by_id = get_face_embeddings_batch(user_id, face_ids)
+    candidate_ids = [
+        str(fid) for fid in face_ids
+        if (summary.get(str(fid)) is not None
+            and _face_is_owned_by_person(summary[str(fid)], person_id)
+            and _face_is_clusterable(summary[str(fid)])
+            and _face_embedding_allowed_for_clustering(summary[str(fid)]))
+    ]
+    if PEOPLE_REP_BOUNDED_EXEMPLARS and len(candidate_ids) > PEOPLE_REP_BOUNDED_EXEMPLARS_CAP:
+        candidate_ids = _select_bounded_exemplar_ids(candidate_ids, summary, PEOPLE_REP_BOUNDED_EXEMPLARS_CAP)
+    embeddings_by_id = get_face_embeddings_batch(user_id, candidate_ids)
     face_entities = []
-    for face_id in face_ids:
+    for face_id in candidate_ids:
         face = summary.get(str(face_id))
         if face is not None and _face_is_owned_by_person(face, person_id):
             if not face.get('embedding'):
@@ -4412,27 +4671,40 @@ def _update_person_entity(user_id: str, person_id: str, updates: Dict) -> bool:
     return result is not None
 
 
-def _batch_upsert_entities(table_client, entities: List[Dict], *, chunk_size: int = 100) -> None:
+def _batch_upsert_entities(table_client, entities, *, chunk_size: int = 100) -> None:
     """Upsert entities in transactional batches instead of one round-trip each.
 
-    Azure Table transactions require every entity in a batch to share the same
-    PartitionKey and cap out at 100 operations, so callers must pass entities that
-    all live in one partition. Uses the same MERGE semantics as ``upsert_entity``
-    and falls back to per-entity upserts if a batch is rejected, so a single bad
-    row can never drop the rest.
+    Stream partition-local, count- and payload-bounded batches with the same
+    MERGE semantics as ``upsert_entity``. Fall back to individual writes when
+    a transaction fails. Preserve best-effort behavior for other tables, but
+    propagate actual person write failures and synchronize only committed rows.
     """
-    if table_client is None or not entities:
+    if table_client is None:
         return
-    for start in range(0, len(entities), chunk_size):
-        chunk = entities[start:start + chunk_size]
-        try:
-            table_client.submit_transaction([('upsert', entity) for entity in chunk])
-        except Exception:
-            for entity in chunk:
-                try:
-                    table_client.upsert_entity(entity)
-                except Exception:
+    is_people = person_table_client is not None and table_client is person_table_client
+    # Different people are different membership partitions: bounded parallel
+    # I/O, not cross-partition transactions or a library-sized futures list.
+    with ThreadPoolExecutor(max_workers=min(32, max(2, 2 * (os.cpu_count() or 1)))) as executor:
+        for chunk in _table_operation_chunks((('upsert', entity) for entity in entities), chunk_size):
+            committed = []
+            failure = None
+            try:
+                table_client.submit_transaction(chunk)
+                committed = [entity for _, entity in chunk]
+            except Exception:
+                for _, entity in chunk:
+                    try:
+                        table_client.upsert_entity(entity)
+                        committed.append(entity)
+                    except Exception as exc:
+                        app.logger.exception('Failed to persist table row %s/%s', entity['PartitionKey'], entity['RowKey'])
+                        if is_people:
+                            failure = exc
+            if is_people:
+                for _ in _bounded_io_map(executor, _sync_person_members, committed):
                     pass
+            if failure is not None:
+                raise failure
 
 
 def _load_searchable_person_name_index(user_id: str) -> Dict[str, str]:
@@ -4492,12 +4764,14 @@ def _remove_face_from_person(user_id: str, person_id: str, face_id: str) -> None
                 person_table_client.upsert_entity(person)
             else:
                 person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+            _remove_person_member(person_id, face_id)
         except Exception:
             pass
         return
     person['faceIds'] = json.dumps(face_ids)
     try:
         person_table_client.upsert_entity(person)
+        _remove_person_member(person_id, face_id)
         _update_person_rep_embedding(user_id, person_id)
     except Exception:
         pass
@@ -4531,14 +4805,17 @@ def _remove_face_from_person_with_retry(
             if next_face_ids:
                 person['faceIds'] = json.dumps(next_face_ids)
                 person_table_client.update_entity(person, etag=etag, match_condition=MatchConditions.IfNotModified)
+                _remove_person_member(person_id, face_id)
                 return 'updated'
             if _person_entity_is_named(person):
                 # Preserve a user-named cluster that loses its last face to this
                 # reassignment; keep it empty rather than silently deleting it.
                 person['faceIds'] = json.dumps([])
                 person_table_client.update_entity(person, etag=etag, match_condition=MatchConditions.IfNotModified)
+                _remove_person_member(person_id, face_id)
                 return 'kept_empty'
             person_table_client.delete_entity(partition_key=user_id, row_key=person_id, etag=etag, match_condition=MatchConditions.IfNotModified)
+            _remove_person_member(person_id, face_id)
             return 'deleted'
         except ResourceModifiedError:
             continue  # someone else wrote first -- re-read and retry
@@ -4665,6 +4942,8 @@ def _add_face_to_person(
         return person
 
     result = _update_person_entity_with_retry(user_id, person_id, _mutate)
+    if result is not None:
+        _add_person_member(user_id, person_id, face_id)
     return result is not None
 
 
@@ -4715,8 +4994,14 @@ def _remove_faces_for_filename(user_id: str, filename: str) -> None:
                     _update_person_rep_embedding(user_id, person_id)
                 else:
                     person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+                for removed_fid in set(face_ids) & removed_face_ids_set:
+                    _remove_person_member(person_id, removed_fid)
             except Exception:
                 pass
+    # Every face row this filename had was just deleted above -- clear its
+    # keyed photofacebyfilename lookup row too, so a later re-upload of the
+    # same filename doesn't see stale face_ids that no longer exist.
+    _set_face_ids_for_filename(user_id, filename, [])
     _rebuild_metadata_faces_for_filename(user_id, filename)
 
 
@@ -4901,7 +5186,93 @@ def _match_existing_person(
     return None, ''
 
 
+def _live_faiss_metadata_update(user_id: str, filename: str) -> None:
+    """Bounded, fresh per-photo projection; never scan all people/faces."""
+    ids = get_face_ids_for_filename(user_id, filename)
+    if ids is None:
+        rows = face_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'")
+    else:
+        def keyed_rows():
+            for face_id in ids:
+                try:
+                    row = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+                except ResourceNotFoundError:
+                    continue
+                if row.get('filename') != filename:
+                    raise ValueError('Filename index references another photo')
+                yield row
+        rows = keyed_rows()
+    rows = sorted((row for row in rows if not _face_is_rejected(row)),
+                  key=lambda row: row['RowKey'])
+    people_ids = []
+    for row in rows:
+        pid = row.get('personId')
+        if not pid or pid in people_ids:
+            continue
+        try:
+            person = person_table_client.get_entity(partition_key=user_id, row_key=pid)
+        except ResourceNotFoundError:
+            continue
+        if person.get('name') and not _is_unnamed_name(person['name']):
+            people_ids.append(pid)
+    if metadata_table_client is not None:
+        _update_metadata_entity_fields(user_id, filename, {
+            'faces': json.dumps([_face_payload_for_metadata(row['RowKey'], row) for row in rows]),
+            'faceCount': len(rows), 'peopleIds': json.dumps(people_ids),
+        })
+    # Drop legacy/UI snapshots, without scheduling a giant representative build.
+    _person_scan_cache.invalidate(user_id)
+    _face_summary_scan_cache.invalidate(user_id)
+    _people_embedding_index_cache.invalidate(user_id)
+
+
+def _get_live_faiss_assigner():
+    global _live_faiss_assigner, _live_faiss_clients
+    from faiss_assignment import AssignmentConfig, FaissAssigner
+    from clustering_index import IndexConfig
+    from clustering_lease import BlobLibraryLeaseFactory
+    if blob_service_client is None:
+        raise RuntimeError('FAISS assignment requires Blob Storage for library ownership')
+    clients = (face_table_client, person_table_client, face_embeddings_table_client,
+               person_members_table_client, blob_service_client)
+    if _live_faiss_assigner is None or _live_faiss_clients != clients:
+        if _live_faiss_assigner is not None:
+            _live_faiss_assigner.invalidate()
+        def raw(client):
+            return client._table_client if isinstance(client, _InvalidatingTableClient) else client
+        _live_faiss_assigner = FaissAssigner(
+            face_table=raw(face_table_client), person_table=raw(person_table_client),
+            embedding_table=raw(face_embeddings_table_client),
+            member_table=raw(person_members_table_client),
+            metadata_callback=_live_faiss_metadata_update,
+            clusterable=_face_is_clusterable, eligible=_face_embedding_allowed_for_clustering,
+            tier=_face_alignment_tier, version=_face_embedding_version,
+            lease=BlobLibraryLeaseFactory(blob_service_client, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER),
+            config=AssignmentConfig(
+                threshold=PEOPLE_CLUSTER_ASSIGN_THRESHOLD, margin=PEOPLE_CLUSTER_ASSIGN_MARGIN,
+                candidates=int(os.getenv('PEOPLE_FAISS_CANDIDATES', '64')),
+                nprobe=int(os.getenv('PEOPLE_FAISS_NPROBE', '64')),
+                delta_limit=int(os.getenv('PEOPLE_FAISS_DELTA_LIMIT', '10000')),
+                threads=int(os.getenv('PEOPLE_FAISS_THREADS', '2')),
+                cold_stream_embeddings=True,
+                index_config=IndexConfig(memory_budget_bytes=int(
+                    os.getenv('PEOPLE_FAISS_MEMORY_BUDGET_BYTES', str(2 * 1024 ** 3)))),
+            ),
+        )
+        _live_faiss_clients = clients
+    return _live_faiss_assigner
+
+
 def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids: List[str]) -> Tuple[Dict[str, str], set]:
+    if PEOPLE_ASSIGNMENT_ENGINE == 'faiss':
+        if not face_ids:
+            return {}, set()
+        return _get_live_faiss_assigner().assign(user_id, filename, face_ids)
+    return _assign_faces_to_people_incrementally_legacy(user_id, filename, face_ids)
+
+
+def _assign_faces_to_people_incrementally_legacy(user_id: str, filename: str, face_ids: List[str]) -> Tuple[Dict[str, str], set]:
     if not face_ids or face_table_client is None or person_table_client is None:
         return {}, set()
     try:
@@ -4975,7 +5346,7 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     for face_id in face_ids:
         try:
             face_ent = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-        except Exception:
+        except ResourceNotFoundError:
             continue
         if not _face_is_clusterable(face_ent):
             continue
@@ -5064,7 +5435,10 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
                 people_to_refresh.add(person_id)
             face_summary[str(face_id)] = {col: face_ent.get(col) for col in FACE_SUMMARY_COLUMNS}
         except Exception:
-            pass
+            _person_scan_cache.invalidate(user_id)
+            _face_summary_scan_cache.invalidate(user_id)
+            _people_embedding_index_cache.invalidate(user_id)
+            raise
         assignments[face_id] = person_id
 
     for person_id in people_to_refresh:
@@ -5105,6 +5479,13 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     # to in memory.
     _people_embedding_index_cache.set(user_id, session_embedding_index)
     _face_summary_scan_cache.set(user_id, list(face_summary.values()))
+    worker_logger.info(
+        'incremental assign summary user=%s filename=%s total=%d assigned=%d matched_existing=%d '
+        'created_new=%d skipped=%d',
+        user_id, filename, len(face_ids), len(assignments),
+        len(assignments) - len(created_person_ids), len(created_person_ids),
+        len(face_ids) - len(assignments),
+    )
     if assignments:
         # Cheap dirty-mark only (deduped by _manifest_already_marked_dirty) --
         # the durable blob's actual rebuild happens lazily on the next read
@@ -5421,7 +5802,7 @@ def cluster_user_faces(
     # Flush every cluster's staged person entity now, deduped by person_id,
     # in real Table Storage transactional batches instead of the sequential
     # upsert-per-cluster this used to be.
-    _batch_upsert_entities(person_table_client, list(person_entities_to_write.values()))
+    _batch_upsert_entities(person_table_client, person_entities_to_write.values())
 
     # Batch update faces -- was a sequential upsert-per-face loop despite the
     # comment; see _batch_upsert_entities for why this is now a real batch.
@@ -6321,10 +6702,19 @@ def _dedupe_duplicate_faces(user_id: str, *, dry_run: bool = True) -> Dict:
             affected_people.add(person_id)
 
     deleted_faces = 0
+    # Per filename: the canonical id this dedupe pass settles on (may be a
+    # fresh id distinct from every original group member's RowKey -- see
+    # canonical_entities above) and every group-member id actually deleted
+    # below. Used to patch the keyed photofacebyfilename lookup afterward
+    # instead of leaving it holding now-deleted ids or missing a freshly
+    # created canonical one.
+    filename_adjustments: Dict[str, Dict[str, set]] = {}
     for group in duplicate_groups:
         canonical = _choose_canonical_face_row(group)
         filename = str(canonical.get('filename') or '').strip()
         canonical_id = _deterministic_face_id(user_id, filename, canonical)
+        adjustment = filename_adjustments.setdefault(filename, {'added': set(), 'removed': set()})
+        adjustment['added'].add(canonical_id)
         for row in group:
             face_id = str(row.get('RowKey') or '')
             if not face_id or face_id == canonical_id:
@@ -6332,8 +6722,16 @@ def _dedupe_duplicate_faces(user_id: str, *, dry_run: bool = True) -> Dict:
             try:
                 face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
                 deleted_faces += 1
+                adjustment['removed'].add(face_id)
             except Exception:
                 pass
+
+    for filename, adjustment in filename_adjustments.items():
+        remaining = get_face_ids_for_filename(user_id, filename)
+        if remaining is None:
+            continue
+        next_ids = (set(remaining) - adjustment['removed']) | adjustment['added']
+        _set_face_ids_for_filename(user_id, filename, sorted(next_ids))
 
     rebuild = _rebuild_metadata_faces_for_filenames(user_id, affected_files)
     for person_id in affected_people:
@@ -6456,11 +6854,13 @@ def _suppress_suspicious_faces(user_id: str, *, dry_run: bool = True) -> Dict:
                 next_face_ids = [fid for fid in face_ids if fid != face_id]
                 if item.get('deleteSingletonCluster'):
                     person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+                    _remove_person_member(person_id, face_id)
                     deleted_people += 1
                     unassigned += 1
                 elif len(next_face_ids) != len(face_ids):
                     person['faceIds'] = json.dumps(next_face_ids)
                     person_table_client.upsert_entity(person)
+                    _remove_person_member(person_id, face_id)
                     unassigned += 1
             except Exception:
                 pass
@@ -6751,7 +7151,34 @@ def _repair_face_memberships(user_id: str, *, dry_run: bool = True) -> Dict:
         removed_duplicate_references,
         added_missing_owner_references,
     ])
-    if dry_run or not has_changes:
+    if dry_run:
+        return result
+
+    # Reconcile photopersonmembers against planned_face_ids -- the
+    # authoritative final state this function just computed -- independent of
+    # whether faceIds itself needed any change. cluster_user_faces and
+    # _build_people_recluster_plan keep faceIds and actual face ownership
+    # consistent with each other by construction, so the has_changes check
+    # above (which only compares those two) can be False even when
+    # photopersonmembers has drifted from both: that table is dual-written by
+    # overwrite-style bulk writers that recompute a person's whole faceIds
+    # list at once rather than calling _add_person_member/_remove_person_member
+    # incrementally (see _person_member_ids' docstring). Runs on every
+    # non-dry-run call once the table is configured, using data this function
+    # already scanned -- no extra full-table scan, just one cheap
+    # partition-scoped query per person.
+    if person_members_table_client is not None:
+        for person_id, face_ids in planned_face_ids.items():
+            if person_id not in people_by_id:
+                continue
+            target_ids = set(face_ids)
+            current_ids = _person_member_ids(person_id)
+            for stale_fid in current_ids - target_ids:
+                _remove_person_member(person_id, stale_fid)
+            for new_fid in target_ids - current_ids:
+                _add_person_member(user_id, person_id, new_fid)
+
+    if not has_changes:
         return result
 
     snapshot_id = _create_people_repair_snapshot(
@@ -6786,9 +7213,15 @@ def _repair_face_memberships(user_id: str, *, dry_run: bool = True) -> Dict:
     for face_id in faces_to_clear_owner:
         try:
             face = faces_by_id[face_id]
+            stale_owner_id = str(face.get('personId') or '')
             face.pop('personId', None)
             face.pop('confirmedByUser', None)
             face_table_client.upsert_entity(face)
+            # stale_owner_id isn't in people_by_id at all (that's exactly why
+            # this face was orphaned), so the reconciliation loop above never
+            # visits it -- clear any stray membership row directly.
+            if stale_owner_id:
+                _remove_person_member(stale_owner_id, face_id)
             cleared_owners += 1
         except Exception:
             pass
@@ -8095,6 +8528,61 @@ def _member_view(library_id: str, account_id: str) -> List[Dict]:
     return out
 
 
+def _cleanup_row_batches(rows, size=100):
+    """Consume paged table results without retaining a library-wide list."""
+    batch = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _cleanup_delete_row(client, row) -> None:
+    """Retry idempotent deletes; do not report a successful incomplete wipe."""
+    for attempt in range(3):
+        try:
+            client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+            return
+        except ResourceNotFoundError:
+            return
+        except Exception:
+            if attempt == 2:
+                app.logger.exception('Library cleanup failed deleting %s/%s', row['PartitionKey'], row['RowKey'])
+                raise
+
+
+def _cleanup_library_shadow_rows(library_id: str) -> None:
+    """Delete derived lookups before the authoritative people are removed.
+
+    The final userId query is deliberately a cleanup-only table scan: it also
+    finds orphan membership partitions whose person was already deleted. Normal
+    membership writes/reads must never use this library-wide fallback.
+    """
+    pk = _escape_odata(library_id)
+    try:
+        if face_by_filename_table_client is not None:
+            for row in face_by_filename_table_client.query_entities(
+                    f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey']):
+                _cleanup_delete_row(face_by_filename_table_client, row)
+        if person_members_table_client is not None:
+            if person_table_client is not None:
+                for person in person_table_client.query_entities(
+                        f"PartitionKey eq '{pk}'", select=['RowKey']):
+                    for row in person_members_table_client.query_entities(
+                            f"PartitionKey eq '{_escape_odata(person['RowKey'])}'",
+                            select=['PartitionKey', 'RowKey']):
+                        _cleanup_delete_row(person_members_table_client, row)
+            for row in person_members_table_client.query_entities(
+                    f"userId eq '{pk}'", select=['PartitionKey', 'RowKey']):
+                _cleanup_delete_row(person_members_table_client, row)
+    except Exception:
+        app.logger.exception('Library shadow cleanup failed for %s; retry required', library_id)
+        raise
+
+
 def _purge_library_data(library_id: str) -> None:
     """Best-effort delete of every data row in a library's partition across the
     photo tables. Image/thumbnail blobs are content-addressed (and may be shared
@@ -8103,16 +8591,14 @@ def _purge_library_data(library_id: str) -> None:
     The image_names table is included so no anonymous_id -> original_filename
     mapping (which still holds the plaintext filename) outlives the library."""
     pk = _escape_odata(library_id)
+    _cleanup_library_shadow_rows(library_id)
     for client in (metadata_table_client, face_table_client, person_table_client,
                    albums_table_client, merge_table_client, image_names_table_client):
         if client is None:
             continue
         try:
-            for row in list(client.query_entities(f"PartitionKey eq '{pk}'")):
-                try:
-                    client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
-                except Exception:
-                    pass
+            for row in client.query_entities(f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey']):
+                _cleanup_delete_row(client, row)
         except Exception as exc:
             app.logger.warning('Purge skipped a table for %s: %s', library_id, exc)
     try:
@@ -8380,11 +8866,12 @@ def _execute_library_clean(library_id: str) -> Dict:
         # _clean_one_photo below only reads RowKey/anonymousImageId per row --
         # narrow select= avoids pulling every photo's full metadata (tags,
         # embeddings, OCR text, etc.) just to delete it.
-        metadata_rows = list(metadata_table_client.query_entities(
+        metadata_rows = metadata_table_client.query_entities(
             f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey', 'anonymousImageId'],
-        )) if metadata_table_client else []
+        ) if metadata_table_client else []
     except Exception:
-        metadata_rows = []
+        app.logger.exception('Library cleanup metadata query failed for %s', library_id)
+        raise
 
     # Was a per-photo call to _is_filename_shared, an *unscoped* `RowKey eq X`
     # query -- no PartitionKey means Table Storage can't restrict it to this
@@ -8394,8 +8881,7 @@ def _execute_library_clean(library_id: str) -> Dict:
     # see its docstring) answers the same question from the filename_owners
     # index with one partition-scoped point query per name, run concurrently
     # -- reusing it here instead of re-deriving the same fix twice.
-    filenames = {str(row.get('RowKey') or '') for row in metadata_rows if row.get('RowKey')}
-    shared_names = _shared_names_in_batch(filenames, library_id)
+    shared_names = set()
 
     def _clean_one_photo(row: Dict) -> Tuple[int, int]:
         filename = str(row.get('RowKey') or '')
@@ -8429,15 +8915,20 @@ def _execute_library_clean(library_id: str) -> Dict:
 
     blobs_deleted = 0
     blob_errors = 0
-    if metadata_rows:
+    photos_deleted = 0
+    for photo_batch in _cleanup_row_batches(metadata_rows):
+        photos_deleted += len(photo_batch)
+        filenames = {str(row.get('RowKey') or '') for row in photo_batch if row.get('RowKey')}
+        shared_names = _shared_names_in_batch(filenames, library_id)
         # Each photo's cleanup is independent, pure network I/O wait (temp
         # files, a table delete, blob deletes) -- same reasoning as every
         # other DELETE_IO_CONCURRENCY call site in the delete path.
         with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
-            for errors, deleted in executor.map(_clean_one_photo, metadata_rows):
+            for errors, deleted in _bounded_io_map(executor, _clean_one_photo, photo_batch):
                 blob_errors += errors
                 blobs_deleted += deleted
 
+    _cleanup_library_shadow_rows(library_id)
     for client in (metadata_table_client, face_table_client, person_table_client,
                    albums_table_client, merge_table_client, image_names_table_client,
                    hash_index_table_client, embeddings_table_client, jobs_table_client):
@@ -8456,10 +8947,10 @@ def _execute_library_clean(library_id: str) -> Dict:
         elif client is jobs_table_client:
             select_fields.append('jobType')
         try:
-            rows_to_delete = list(client.query_entities(f"PartitionKey eq '{pk}'", select=select_fields))
+            rows_to_delete = client.query_entities(f"PartitionKey eq '{pk}'", select=select_fields)
         except Exception as exc:
             app.logger.warning('Library clean skipped a table for %s: %s', library_id, exc)
-            continue
+            raise
 
         if client is jobs_table_client:
             # Leave library_clean's own job-history rows alone -- this run's
@@ -8467,21 +8958,18 @@ def _execute_library_clean(library_id: str) -> Dict:
             # function returns, and past library_clean rows are the audit
             # trail for prior cleanups. Only ipwork/clustering job records are
             # stale noise once their photos are gone.
-            rows_to_delete = [row for row in rows_to_delete if row.get('jobType') != 'library_clean']
+            rows_to_delete = (row for row in rows_to_delete if row.get('jobType') != 'library_clean')
 
         def _delete_row(row: Dict, client=client) -> None:
             if client is merge_table_client:
                 blob_name = str(row.get('payloadBlobName') or '')
                 if blob_name:
                     _delete_blob_if_present(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
-            try:
-                client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
-            except Exception:
-                pass
+            _cleanup_delete_row(client, row)
 
-        if rows_to_delete:
-            with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
-                list(executor.map(_delete_row, rows_to_delete))
+        with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+            for _ in _bounded_io_map(executor, _delete_row, rows_to_delete):
+                pass
 
     try:
         invalidate_image_names_cache(library_id)
@@ -8497,7 +8985,7 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_people_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
-    return {'photosDeleted': len(metadata_rows), 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}
+    return {'photosDeleted': photos_deleted, 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}
 
 
 def _enqueue_library_clean_job(library_id: str, actor_user_id: str, request_id: str) -> Dict[str, str]:
@@ -9403,6 +9891,8 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
             continue
     try:
         person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+        for face_id in face_ids:
+            _remove_person_member(person_id, face_id)
     except Exception:
         pass
     if rebuild_metadata:
@@ -9510,6 +10000,11 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
                 continue
             owner_face_ids_by_person.setdefault(owner, set()).add(fid)
 
+    # Captured per source person before its row is deleted below, so the old
+    # (mid, faceId) membership rows can be cleared once the merge actually
+    # commits -- not just the faces that ended up in face_updates, since a
+    # face already rejected/unmatched by the loop below is still leaving mid.
+    mid_face_ids_before_delete: Dict[str, List[str]] = {}
     for mid in merge_ids:
         try:
             merged = person_table_client.get_entity(partition_key=user_id, row_key=mid)
@@ -9526,6 +10021,7 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
             *[str(fid) for fid in merged_face_ids if fid],
             *sorted(owner_face_ids_by_person.get(str(mid), set())),
         ]))
+        mid_face_ids_before_delete[str(mid)] = merged_face_ids
         for fid in merged_face_ids:
             fid = str(fid)
             if fid in face_updates:
@@ -9558,10 +10054,14 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
         _remove_face_from_person(user_id, owner_id, fid)
 
     _batch_upsert_entities(face_table_client, list(face_updates.values()))
+    for fid in face_updates:
+        _add_person_member(user_id, person_id, fid)
 
     for mid in merge_ids:
         try:
             person_table_client.delete_entity(partition_key=user_id, row_key=mid)
+            for fid in mid_face_ids_before_delete.get(str(mid), []):
+                _remove_person_member(str(mid), fid)
         except Exception:
             pass
 
@@ -9654,6 +10154,7 @@ def _mark_face_not_a_face(user_id: str, person_id: str, face_id: str) -> Dict:
     else:
         person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
         person_deleted = True
+    _remove_person_member(person_id, face_id)
 
     if filename:
         _rebuild_metadata_faces_for_filename(user_id, filename)
@@ -9952,16 +10453,35 @@ def _face_ids_awaiting_person_assignment(user_id: str, filename: str) -> List[st
     is large: confirmed live 2026-10-01 on microsvcpoc-dev, clustering
     throughput regressed from ~10k/hr to under 1k/hr as this account's face
     partition grew to 99k+ rows -- this single query was the dominant cost
-    of every incremental-assign message. _load_user_face_summary_by_id is
-    the same cached, invalidate-on-write-patched per-user face scan
-    _store_client_face_entities already uses, filtered here in-memory by
-    filename instead of server-side."""
+    of every incremental-assign message.
+
+    Complete filename lookups use fresh point reads for ownership. Legacy,
+    missing or dirty lookups use a fresh filename-filtered query instead of
+    a potentially stale whole-library cache. Transport failures propagate
+    so queue work is retried rather than acknowledged with missing faces.
+    """
     if face_table_client is None:
         return []
-    summary = _load_user_face_summary_by_id(user_id)
+    filename_face_ids = get_face_ids_for_filename(user_id, filename)
+    if filename_face_ids is not None:
+        awaiting = []
+        for fid in filename_face_ids:
+            try:
+                face = face_table_client.get_entity(partition_key=user_id, row_key=fid)
+            except ResourceNotFoundError:
+                continue
+            if str(face.get('filename') or '') != filename:
+                raise RuntimeError('Filename lookup references another photo')
+            if not face.get('personId'):
+                awaiting.append(fid)
+        return awaiting
+    user_filter = str(user_id).replace("'", "''")
+    filename_filter = str(filename).replace("'", "''")
     return [
-        str(face_id) for face_id, row in summary.items()
-        if str(row.get('filename') or '') == filename and not row.get('personId')
+        str(row['RowKey']) for row in face_table_client.query_entities(
+            f"PartitionKey eq '{user_filter}' and filename eq '{filename_filter}'",
+            select=['RowKey', 'personId'],
+        ) if not row.get('personId')
     ]
 
 
@@ -10011,6 +10531,8 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
     except Exception:
         app.logger.exception('Failed to queue incremental face-to-person assignment for %s/%s', user_id, filename)
 
+    if PEOPLE_ASSIGNMENT_ENGINE == 'faiss':
+        return {'status': 'incremental_only'}
     if not _clustering_maintenance_due(user_id):
         return {'status': 'cooldown_skipped'}
 
@@ -11220,6 +11742,11 @@ def _batch_remove_faces_for_filenames(user_id: str, names_set: set) -> set:
         with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
             list(executor.map(_delete_face, matched_face_ids))
         removed_face_ids.update(matched_face_ids)
+    # Every face row for each of these filenames was just deleted -- clear
+    # their keyed photofacebyfilename lookup rows too, same reasoning as
+    # _remove_faces_for_filename's single-file equivalent.
+    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+        list(executor.map(lambda name: _set_face_ids_for_filename(user_id, name, []), names_set))
     if not removed_face_ids or person_table_client is None:
         return deleted_person_ids
     try:
@@ -11245,6 +11772,8 @@ def _batch_remove_faces_for_filenames(user_id: str, names_set: set) -> set:
             else:
                 person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
                 deleted_person_ids.add(person_id)
+            for removed_fid in set(face_ids) & removed_face_ids:
+                _remove_person_member(person_id, removed_fid)
         except Exception:
             pass
     return deleted_person_ids
@@ -11600,6 +12129,14 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 _upsert_job_status(job_id, user_id, 'library_download', 'failed', error='Library download failed', libraryId=target_library_id)
         return
 
+    if (PEOPLE_ASSIGNMENT_ENGINE == 'faiss' and job_type == 'people_cluster'
+            and payload.get('trigger') == 'upload_face_ready'):
+        # Drain old upload-maintenance messages without restarting DBSCAN.
+        if job_id:
+            _upsert_job_status(job_id, user_id, job_type, 'done',
+                               result={'skipped': 'live_faiss_assignment'})
+        return
+
     if job_type == 'people_incremental_assign':
         # Handled here (before the _clustering_job_types() gate below, and
         # its shared per-job-type 'running' status upsert + coalesced-rerun
@@ -11624,8 +12161,13 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             face_ids = _face_ids_awaiting_person_assignment(user_id, filename)
             if face_ids:
                 _assign_faces_to_people_incrementally(user_id, filename, face_ids)
+            elif PEOPLE_ASSIGNMENT_ENGINE == 'faiss':
+                # A prior attempt may have stamped all faces then failed its
+                # projection. Redelivery must finish that remaining work.
+                _live_faiss_metadata_update(user_id, filename)
         except Exception:
             worker_logger.exception('Incremental face-to-person assignment failed for %s/%s', user_id, filename)
+            raise
         return
 
     if job_type == 'library_delete_purge':
@@ -11851,17 +12393,26 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         _maybe_enqueue_coalesced_rerun(job_id, user_id)
 
 
-def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int) -> bool:
+def _poll_clustering_queue_once(
+    queue_client, queue_name: str, max_retries: int, deadletter_queue_client=None,
+) -> bool:
     """Receive and fully process at most one message from ``queue_client``.
 
     Factored out of run_clustering_worker so the same dequeue-count ceiling +
     lease-renewal + dispatch + delete logic can run against either the
     priority library-ops queue or the general clustering queue. Returns
     whether a message was found at all (whether it completed, errored, or was
-    dropped for exceeding max_retries) -- callers use this to distinguish
+    retained or dead-lettered for exceeding max_retries) -- callers use this to distinguish
     "this queue is empty, fall through to the next one" from "this queue had
     work", so the priority queue gets drained before the general one is ever
     touched in a given poll cycle.
+
+    deadletter_queue_client: where an exhausted-retry message's body gets
+    published before being deleted from ``queue_client`` -- each source queue
+    gets its own dead-letter queue (passed explicitly by the caller, not
+    derived from queue_name) so a human replaying one later knows which
+    consumer it came from. Missing clients and publication failures retain
+    the source message for retry instead of discarding the only copy.
     """
     messages = list(queue_client.receive_messages(
         messages_per_page=1,
@@ -11920,9 +12471,29 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
                 except Exception:
                     pass
         worker_logger.warning(
-            'Dropping %s queue message after %s dequeues (max %s), job_id=%s',
+            'Dead-lettering %s queue message after %s dequeues (max %s), job_id=%s',
             queue_name, dequeue_count, max_retries, job_id,
         )
+        if deadletter_queue_client is None:
+            worker_logger.error('Preserving exhausted %s message: dead-letter client unavailable', queue_name)
+            return True
+        if deadletter_queue_client is not None:
+            try:
+                deadletter_queue_client.send_message(json.dumps({
+                    'sourceQueue': queue_name,
+                    'dequeueCount': dequeue_count,
+                    'maxRetries': max_retries,
+                    'reason': reason,
+                    'deadLetteredAt': datetime.now(timezone.utc).isoformat(),
+                    'jobId': job_id,
+                    'userId': user_id,
+                    'jobType': job_type,
+                    'originalPayload': payload,
+                    'originalBody': message.content,
+                }, separators=(',', ':')))
+            except Exception:
+                worker_logger.exception('Failed to dead-letter %s queue message', queue_name)
+                return True  # Preserve source until durable publication succeeds.
         try:
             queue_client.delete_message(message)
         except Exception:
@@ -11974,9 +12545,15 @@ def _poll_clustering_queue_once(queue_client, queue_name: str, max_retries: int)
             # state) to even guess what was running. Confirmed live
             # 2026-10-01 on microsvcpoc-dev: this worker had zero per-message
             # visibility at all, unlike ipworker's equivalent timing logs.
+            insertion_time = getattr(message, 'insertion_time', None)
+            backlog_age_s = (
+                (datetime.now(timezone.utc) - insertion_time).total_seconds()
+                if insertion_time is not None else -1
+            )
             worker_logger.info(
-                'clustering message started job_type=%s filename=%s user=%s dequeue_count=%s',
+                'clustering message started job_type=%s filename=%s user=%s dequeue_count=%s backlog_age_s=%.1f',
                 job_type or 'people_incremental_assign', payload.get('filename') or '', user_id, dequeue_count,
+                backlog_age_s,
             )
             _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
             worker_logger.info(
@@ -12049,7 +12626,9 @@ def run_clustering_worker() -> None:
     # LIBRARY_OPS_QUEUE_NAME's comment. One extra empty-queue receive_messages
     # call per idle poll cycle is a negligible transaction cost next to that.
     library_ops_client = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
-    for ensure_client in (queue_client, library_ops_client):
+    clustering_deadletter_client = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
+    library_ops_deadletter_client = queue_service_client_local.get_queue_client(LIBRARY_OPS_DEADLETTER_QUEUE_NAME)
+    for ensure_client in (queue_client, library_ops_client, clustering_deadletter_client, library_ops_deadletter_client):
         try:
             ensure_client.create_queue()
         except Exception:
@@ -12097,10 +12676,12 @@ def run_clustering_worker() -> None:
             # spinner" actions and the whole point is that they win.
             processed_any = _poll_clustering_queue_once(
                 library_ops_client, LIBRARY_OPS_QUEUE_NAME, LIBRARY_CLEAN_MAX_RETRIES,
+                library_ops_deadletter_client,
             )
             if not processed_any:
                 processed_any = _poll_clustering_queue_once(
                     queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
+                    clustering_deadletter_client,
                 )
             if not processed_any:
                 time.sleep(poll_seconds)

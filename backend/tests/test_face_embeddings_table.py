@@ -32,6 +32,10 @@ class _FakeTable:
 
     def query_entities(self, filter_str, select=None):
         import re
+        match = re.fullmatch(r"PartitionKey eq '([^']*)' and filename eq '([^']*)'", filter_str)
+        if match:
+            return [dict(row) for (pk, _), row in self.rows.items()
+                    if pk == match[1] and row.get('filename') == match[2]]
         m = re.match(r"PartitionKey eq '([^']*)' and \((.*)\)$", filter_str)
         if m:
             pk = m.group(1)

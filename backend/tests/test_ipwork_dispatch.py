@@ -53,6 +53,7 @@ def dispatch_ctx(monkeypatch):
 
 
 def test_face_step_success_triggers_clustering(monkeypatch, dispatch_ctx):
+    monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'legacy')
     monkeypatch.setattr(app, '_run_ipwork_steps', lambda user_id, filename, steps: {'face': {'faces': [{}]}})
     monkeypatch.setattr(
         app, 'apply_client_processing_results_for_file',

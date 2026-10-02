@@ -905,6 +905,24 @@ def undo_merge(merge_id: str):
             except Exception:
                 pass
 
+    # Repopulate photopersonmembers to match the just-restored faceIds arrays
+    # -- _merge_persons_core's own dual-write moved these rows onto the merge
+    # target; undo must move them back, or a future paginated membership
+    # reader would disagree with the faceIds just restored above.
+    for entity in ([base] if base.get('RowKey') else []) + [m for m in merged if m.get('RowKey')]:
+        restored_person_id = str(entity['RowKey'])
+        try:
+            restored_face_ids = app.json.loads(entity.get('faceIds', '[]') or '[]')
+        except Exception:
+            restored_face_ids = []
+        for fid in restored_face_ids:
+            app._add_person_member(user_id, restored_person_id, str(fid))
+    base_person_id = str(base.get('RowKey') or '')
+    if base_person_id:
+        for fid, original_pid in face_map.items():
+            if str(original_pid or '') != base_person_id:
+                app._remove_person_member(base_person_id, str(fid))
+
     for fid, original_pid in face_map.items():
         try:
             face_ent = app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
