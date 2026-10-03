@@ -102,11 +102,11 @@
     },
     "workerMinReplicas": {
       "type": "int",
-      "defaultValue": 1,
+      "defaultValue": 0,
       "minValue": 0,
       "maxValue": 1,
       "metadata": {
-        "description": "Keep the live FAISS clustering worker warm across empty-queue gaps. Default 1 incurs continuous cost; 0 opts into repeated cold-start latency."
+        "description": "Minimum clustering worker replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild."
       }
     }
   },
@@ -259,11 +259,11 @@
             },
             "workerMinReplicas": {
               "type": "int",
-              "defaultValue": 1,
+              "defaultValue": 0,
               "minValue": 0,
               "maxValue": 1,
               "metadata": {
-                "description": "Minimum clustering worker replicas. Keep 1 for live FAISS to preserve the warm index across empty-queue gaps. Set 0 only to accept repeated cold builds and scale-to-zero latency; 1 incurs continuous worker cost."
+                "description": "Minimum clustering worker replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild."
               }
             },
             "sessionSecretParam": {

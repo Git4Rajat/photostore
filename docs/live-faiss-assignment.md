@@ -212,12 +212,16 @@ mix old and checkpoint-aware writers or roll back the image without a migration.
 
 ### Worker lifetime and rebuild diagnosis
 
-The deployment defaults `workerMinReplicas` to **1**, with maximum replicas 1.
-This intentionally keeps the 2-vCPU/4-GiB worker allocated during queue lulls;
-it incurs continuous cost. Setting the parameter to 0 explicitly opts back into
-scale-to-zero and recurrent cold-build latency. The 300-second cooldown is not
-a substitute for the replica floor. Restarts for deployments, platform events
-and OOMs remain possible. No live resources are updated by changing the template.
+The deployment defaults `workerMinReplicas` to **0**, with maximum replicas 1.
+This lets the 2-vCPU/4-GiB worker scale to zero during queue lulls. Queue scaling
+wakes it for new work; a fresh matching checkpoint supports index recovery.
+Graceful shutdown attempts a dirty-only final save, but missing/stale snapshots,
+failed saves or interrupted shutdown still require a cold rebuild. Set the
+parameter to 1 to preserve the warm index at continuous cost. The 300-second
+cooldown is not a shutdown-checkpoint guarantee. Restarts for deployments,
+platform events and OOMs remain possible. No live resources are updated by
+changing the template. Roll out the checkpoint-capable image with this setting
+and measure final-save duration and subsequent restore on the deployed mount.
 
 Use Container Apps system logs to establish why a replica terminated: SIGTERM
 alone does not prove autoscaler scale-down. Cold-build logs now contain `pid`,

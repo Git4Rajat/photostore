@@ -65,10 +65,10 @@ param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 @maxValue(5120)
 param workerFileShareQuotaGiB int = 100
 
-@description('Minimum clustering worker replicas. Keep 1 for live FAISS to preserve the warm index across empty-queue gaps. Set 0 only to accept repeated cold builds and scale-to-zero latency; 1 incurs continuous worker cost.')
+@description('Minimum clustering worker replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
 @minValue(0)
 @maxValue(1)
-param workerMinReplicas int = 1
+param workerMinReplicas int = 0
 
 @description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
 @secure()
