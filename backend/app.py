@@ -78,6 +78,11 @@ from storage_utils import (
     delete_face_embeddings_entry,
     get_face_ids_for_filename,
     _set_face_ids_for_filename,
+    _face_filename_mutations,
+    _renew_face_filename_mutations,
+    _renew_face_filename_write,
+    _finish_face_filename_write,
+    _remove_face_person_member,
     PHOTO_LIST_SELECT_FIELDS,
     get_user_listing_index,
     download_media_bytes,
@@ -4952,58 +4957,9 @@ def _add_face_to_person(
 def _remove_faces_for_filename(user_id: str, filename: str) -> None:
     if face_table_client is None:
         return
-    try:
-        query = f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
-        # select= excludes the large 'embedding' column -- only RowKey/personId
-        # are read below, and every row here is only ever delete_entity'd by
-        # key, never re-upserted, so dropping embedding from the read is safe.
-        rows = list(face_table_client.query_entities(query, select=FACE_SUMMARY_COLUMNS))
-    except Exception:
-        rows = []
-    removed_face_ids = []
-    for row in rows:
-        face_id = row.get('RowKey')
-        person_id = row.get('personId')
-        if face_id:
-            removed_face_ids.append(str(face_id))
-        try:
-            face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
-        except Exception:
-            pass
-        if person_id and face_id:
-            _remove_face_from_person(user_id, person_id, face_id)
-    if removed_face_ids and person_table_client is not None:
-        try:
-            people = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-        except Exception:
-            people = []
-        removed_face_ids_set = set(removed_face_ids)
-        for person in people:
-            person_id = str(person.get('RowKey') or '')
-            if not person_id:
-                continue
-            try:
-                face_ids = json.loads(person.get('faceIds', '[]') or '[]')
-            except Exception:
-                face_ids = []
-            next_face_ids = [face_id for face_id in face_ids if str(face_id) not in removed_face_ids_set]
-            if next_face_ids == face_ids:
-                continue
-            try:
-                if next_face_ids:
-                    person['faceIds'] = json.dumps(next_face_ids)
-                    person_table_client.upsert_entity(person)
-                    _update_person_rep_embedding(user_id, person_id)
-                else:
-                    person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
-                for removed_fid in set(face_ids) & removed_face_ids_set:
-                    _remove_person_member(person_id, removed_fid)
-            except Exception:
-                pass
-    # Every face row this filename had was just deleted above -- clear its
-    # keyed photofacebyfilename lookup row too, so a later re-upload of the
-    # same filename doesn't see stale face_ids that no longer exist.
-    _set_face_ids_for_filename(user_id, filename, [])
+    # Share the strict, leased cascade so single-file cleanup cannot publish
+    # a false zero after a failed scan/delete either.
+    _batch_remove_faces_for_filenames(user_id, {filename})
     _rebuild_metadata_faces_for_filename(user_id, filename)
 
 
@@ -6588,10 +6544,38 @@ def _rebuild_metadata_faces_for_filenames(
 def _dedupe_duplicate_faces(user_id: str, *, dry_run: bool = True) -> Dict:
     if face_table_client is None or person_table_client is None:
         return {'success': False, 'error': 'People features not configured'}
-    try:
-        rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
+    rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    if dry_run:
+        return _dedupe_duplicate_face_rows(user_id, rows, dry_run=True)
+    # The discovery scan is advisory only. Acquire leases, then rescan and
+    # recompute groups from fresh rows before ANY canonical/shadow mutation.
+    counts = {}
+    for row in rows:
+        if str(row.get('filename') or '').strip():
+            key = _face_duplicate_group_key(user_id, row)
+            counts[key] = counts.get(key, 0) + 1
+    filenames = {str(row['filename']).strip() for row in rows
+                 if str(row.get('filename') or '').strip()
+                 and counts[_face_duplicate_group_key(user_id, row)] > 1}
+    if not filenames:
+        return _dedupe_duplicate_face_rows(user_id, rows, dry_run=False)
+    with _face_filename_mutations(user_id, filenames) as generations:
+        rows = _face_rows_under_mutation(user_id, generations)
+        result = _dedupe_duplicate_face_rows(user_id, rows, dry_run=False, generations=generations)
+        # Publish the entire surviving set, not just dedupe's adjustments.
+        # This also establishes coverage for legacy/missing lookup rows.
+        remaining = _face_rows_under_mutation(user_id, generations, select=FACE_SUMMARY_COLUMNS)
+        ids_by_filename = {name: [] for name in generations}
+        for row in remaining:
+            ids_by_filename[str(row['filename'])].append(str(row['RowKey']))
+        for filename, generation in generations.items():
+            _renew_face_filename_write(user_id, filename, generation)
+            _finish_face_filename_write(user_id, filename, generation, ids_by_filename[filename])
+        return result
+
+
+def _dedupe_duplicate_face_rows(user_id: str, rows: List[Dict], *, dry_run: bool,
+                               generations=None) -> Dict:
 
     groups: Dict[str, List[Dict]] = {}
     for row in rows:
@@ -6695,15 +6679,13 @@ def _dedupe_duplicate_faces(user_id: str, *, dry_run: bool = True) -> Dict:
         canonical_entities[canonical_id] = entity
 
     for entity in canonical_entities.values():
-        try:
-            face_table_client.upsert_entity(entity)
-        except Exception:
-            pass
+        _renew_face_filename_mutations(user_id, generations)
+        filename = str(entity['filename'])
+        _renew_face_filename_write(user_id, filename, generations[filename])
+        face_table_client.upsert_entity(entity)
 
-    try:
-        people_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        people_rows = []
+    people_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    _renew_face_filename_mutations(user_id, generations)
     updated_people = 0
     for person in people_rows:
         person_id = str(person.get('RowKey') or '')
@@ -6726,44 +6708,29 @@ def _dedupe_duplicate_faces(user_id: str, *, dry_run: bool = True) -> Dict:
         next_face_ids = _dedupe_face_ids_preserving_order(next_face_ids)
         if changed or next_face_ids != face_ids:
             person['faceIds'] = json.dumps(next_face_ids)
-            try:
-                person_table_client.upsert_entity(person)
-                updated_people += 1
-            except Exception:
-                pass
+            _renew_face_filename_mutations(user_id, generations)
+            person_table_client.upsert_entity(person)
+            updated_people += 1
             affected_people.add(person_id)
 
     deleted_faces = 0
-    # Per filename: the canonical id this dedupe pass settles on (may be a
-    # fresh id distinct from every original group member's RowKey -- see
-    # canonical_entities above) and every group-member id actually deleted
-    # below. Used to patch the keyed photofacebyfilename lookup afterward
-    # instead of leaving it holding now-deleted ids or missing a freshly
-    # created canonical one.
-    filename_adjustments: Dict[str, Dict[str, set]] = {}
+    # Source deletes happen after canonical/person writes. Failures remain
+    # dirty and propagate; the caller publishes a fresh authoritative scan.
     for group in duplicate_groups:
         canonical = _choose_canonical_face_row(group)
         filename = str(canonical.get('filename') or '').strip()
         canonical_id = _deterministic_face_id(user_id, filename, canonical)
-        adjustment = filename_adjustments.setdefault(filename, {'added': set(), 'removed': set()})
-        adjustment['added'].add(canonical_id)
         for row in group:
             face_id = str(row.get('RowKey') or '')
             if not face_id or face_id == canonical_id:
                 continue
+            _renew_face_filename_mutations(user_id, generations)
+            _renew_face_filename_write(user_id, filename, generations[filename])
             try:
                 face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
                 deleted_faces += 1
-                adjustment['removed'].add(face_id)
-            except Exception:
+            except ResourceNotFoundError:
                 pass
-
-    for filename, adjustment in filename_adjustments.items():
-        remaining = get_face_ids_for_filename(user_id, filename)
-        if remaining is None:
-            continue
-        next_ids = (set(remaining) - adjustment['removed']) | adjustment['added']
-        _set_face_ids_for_filename(user_id, filename, sorted(next_ids))
 
     rebuild = _rebuild_metadata_faces_for_filenames(user_id, affected_files)
     for person_id in affected_people:
@@ -11293,7 +11260,11 @@ def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any
 
 def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[str], List[str]]:
     """Permanently remove photos: blob + metadata row + dedup/collision index
-    rows, then the faces/people, job-row, and album-membership cascades.
+    rows and the faces/people, job-row, and album-membership cascades.
+
+    Keep metadata/ownership until the strict face cascade succeeds, so a
+    failed cleanup remains discoverable and retryable instead of reporting
+    deletion success with hidden faces.
 
     This is the real, irreversible delete -- what /photos/delete used to do
     directly for every request. It now only runs for photos that are already
@@ -11328,16 +11299,8 @@ def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[st
                     delete_image_name_mapping(user_id, anonymous_id)
                 except Exception:
                     app.logger.debug('Failed to delete image-name mapping for %s', safe_name)
-        try:
-            metadata_table_client.delete_entity(partition_key=user_id, row_key=safe_name)
-        except Exception as exc:
-            app.logger.warning('Metadata delete failed for %s: %s', safe_name, exc)
-            file_errors.append('metadata: delete failed')
-        file_hash = str(metadata.get('fileHash') or '')
-        if file_hash:
-            delete_hash_index_entry(user_id, file_hash)
-        delete_filename_owner_entry(user_id, safe_name)
-        delete_embeddings_entry(user_id, safe_name)
+        # Do not remove the retry anchor or release ownership before the
+        # leased face cascade. Already-removed blobs are idempotent on retry.
         if file_errors:
             return safe_name, 'error', '; '.join(file_errors)
         return safe_name, 'deleted', ''
@@ -11353,12 +11316,42 @@ def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[st
         else:
             errors.append(f'{safe_name}: {detail}')
 
-    deleted_names_set = set(deleted)
+    ready_names_set = set(deleted)
+    deleted = []
+    deleted_person_ids = set()
     try:
-        deleted_person_ids = _batch_remove_faces_for_filenames(user_id, deleted_names_set)
+        deleted_person_ids = _batch_remove_faces_for_filenames(user_id, ready_names_set)
     except Exception as exc:
         app.logger.warning('Batch face removal failed for %s: %s', user_id, exc)
-        deleted_person_ids = set()
+        errors.extend(f'{name}: face cleanup failed' for name in sorted(ready_names_set))
+        ready_names_set = set()
+
+    def _finish_hard_delete(safe_name: str) -> Tuple[str, str]:
+        try:
+            metadata_table_client.delete_entity(partition_key=user_id, row_key=safe_name)
+        except ResourceNotFoundError:
+            pass
+        except Exception as exc:
+            app.logger.warning('Metadata delete failed for %s: %s', safe_name, exc)
+            return safe_name, 'metadata: delete failed'
+        metadata = own_rows_by_name[safe_name]
+        file_hash = str(metadata.get('fileHash') or '')
+        if file_hash:
+            delete_hash_index_entry(user_id, file_hash)
+        delete_embeddings_entry(user_id, safe_name)
+        # A complete-empty generation now exists. Retaining ownership on
+        # cascade/metadata failure helps retry; it is NOT an asset fence
+        # against same-content retries, trash reclaim, or late old results.
+        delete_filename_owner_entry(user_id, safe_name)
+        return safe_name, ''
+
+    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+        for name, error in executor.map(_finish_hard_delete, sorted(ready_names_set)):
+            if error:
+                errors.append(f'{name}: {error}')
+            else:
+                deleted.append(name)
+    deleted_names_set = set(deleted)
     try:
         _batch_remove_job_rows(user_id, deleted_names_set)
     except Exception as exc:
@@ -11752,6 +11745,29 @@ def _shared_names_in_batch(names_set: set, user_id: str) -> set:
     return shared
 
 
+def _face_rows_under_mutation(user_id: str, generations: Dict[str, str], *, select=None) -> List[Dict]:
+    """Exhaust the authoritative scan under leases; paging failures propagate.
+
+    Renew periodically, not per row, to keep a large scan bounded in Table
+    writes. If one page outlasts a lease, the final renewal fails before any
+    source mutation or complete-index publication can happen.
+    """
+    renewed_at = time.monotonic()
+    rows = []
+    query = f"PartitionKey eq '{_escape_odata(user_id)}'"
+    if len(generations) == 1:
+        filename = next(iter(generations))
+        query += f" and filename eq '{_escape_odata(filename)}'"
+    for row in face_table_client.query_entities(query, select=select):
+        if time.monotonic() - renewed_at >= 30:
+            _renew_face_filename_mutations(user_id, generations)
+            renewed_at = time.monotonic()
+        if str(row.get('filename') or '') in generations:
+            rows.append(row)
+    _renew_face_filename_mutations(user_id, generations, force=True)
+    return rows
+
+
 def _batch_remove_faces_for_filenames(user_id: str, names_set: set) -> set:
     """Delete all face rows for ``names_set`` and reconcile affected people in a
     single pass. Returns the set of person_ids that were deleted (emptied),
@@ -11760,67 +11776,72 @@ def _batch_remove_faces_for_filenames(user_id: str, names_set: set) -> set:
     Replaces the per-file ``_remove_faces_for_filename`` (which scanned the whole
     face AND person tables for every file) with one scan of each."""
     deleted_person_ids: set = set()
-    if face_table_client is None or not names_set:
+    if not names_set:
         return deleted_person_ids
-    try:
-        # select= excludes 'embedding' -- only RowKey/filename are read below,
-        # and matched rows are only ever delete_entity'd by key, never
-        # re-upserted.
-        face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'", select=FACE_SUMMARY_COLUMNS))
-    except Exception:
-        face_rows = []
-    matched_face_ids = [
-        str(row.get('RowKey') or '')
-        for row in face_rows
-        if str(row.get('filename') or '') in names_set and row.get('RowKey')
-    ]
-    removed_face_ids: set = set()
-    if matched_face_ids:
-        def _delete_face(face_id: str) -> None:
-            try:
-                face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
-            except Exception:
-                pass
-        # A photo can carry several faces, so a big chunk can mean hundreds of
-        # these -- independent point deletes, so run them concurrently rather
-        # than one at a time (same reasoning as DELETE_IO_CONCURRENCY above).
+    if face_table_client is None:
+        raise RuntimeError('Face storage unavailable for cleanup')
+    with _face_filename_mutations(user_id, names_set) as generations:
+        face_rows = _face_rows_under_mutation(user_id, generations, select=FACE_SUMMARY_COLUMNS)
+        removed_face_ids = {str(row['RowKey']) for row in face_rows if row.get('RowKey')}
+        updated_people = set()
+        # Reconcile shadows BEFORE deleting source rows. A failed operation
+        # leaves source rows discoverable for a retry under a dirty generation.
+        if removed_face_ids and person_table_client is not None:
+            people = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+            _renew_face_filename_mutations(user_id, generations)
+            for person in people:
+                person_id = str(person.get('RowKey') or '')
+                if not person_id:
+                    continue
+                face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+                next_face_ids = [fid for fid in face_ids if str(fid) not in removed_face_ids]
+                if next_face_ids == face_ids:
+                    continue
+                _renew_face_filename_mutations(user_id, generations)
+                for removed_fid in set(face_ids) & removed_face_ids:
+                    _remove_face_person_member(person_id, str(removed_fid))
+                _renew_face_filename_mutations(user_id, generations)
+                if next_face_ids:
+                    person['faceIds'] = json.dumps(next_face_ids)
+                    person_table_client.upsert_entity(person)
+                    updated_people.add(person_id)
+                else:
+                    try:
+                        person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+                    except ResourceNotFoundError:
+                        pass
+                    deleted_person_ids.add(person_id)
+
+        rows_by_filename = {name: [] for name in generations}
+        for row in face_rows:
+            rows_by_filename[str(row.get('filename') or '')].append(row)
+
+        def _delete_filename_faces(filename: str) -> None:
+            generation = generations[filename]
+            # Parallelize filenames, never CAS-renew the SAME generation from
+            # competing threads. A partial delete failure propagates to scope.
+            for row in rows_by_filename[filename]:
+                face_id = str(row.get('RowKey') or '')
+                if not face_id:
+                    raise ValueError('Face row has no ID')
+                _renew_face_filename_write(user_id, filename, generation)
+                _remove_face_person_member(str(row.get('personId') or ''), face_id)
+                _renew_face_filename_write(user_id, filename, generation)
+                delete_face_embeddings_entry(user_id, face_id, strict=True)
+                _renew_face_filename_write(user_id, filename, generation)
+                try:
+                    face_table_client.delete_entity(partition_key=user_id, row_key=face_id)
+                except ResourceNotFoundError:
+                    pass
+
         with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
-            list(executor.map(_delete_face, matched_face_ids))
-        removed_face_ids.update(matched_face_ids)
-    # Every face row for each of these filenames was just deleted -- clear
-    # their keyed photofacebyfilename lookup rows too, same reasoning as
-    # _remove_faces_for_filename's single-file equivalent.
-    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
-        list(executor.map(lambda name: _set_face_ids_for_filename(user_id, name, []), names_set))
-    if not removed_face_ids or person_table_client is None:
-        return deleted_person_ids
-    try:
-        people = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        people = []
-    for person in people:
-        person_id = str(person.get('RowKey') or '')
-        if not person_id:
-            continue
-        try:
-            face_ids = json.loads(person.get('faceIds', '[]') or '[]')
-        except Exception:
-            face_ids = []
-        next_face_ids = [fid for fid in face_ids if str(fid) not in removed_face_ids]
-        if next_face_ids == face_ids:
-            continue
-        try:
-            if next_face_ids:
-                person['faceIds'] = json.dumps(next_face_ids)
-                person_table_client.upsert_entity(person)
-                _update_person_rep_embedding(user_id, person_id)
-            else:
-                person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
-                deleted_person_ids.add(person_id)
-            for removed_fid in set(face_ids) & removed_face_ids:
-                _remove_person_member(person_id, removed_fid)
-        except Exception:
-            pass
+            list(executor.map(_delete_filename_faces, generations))
+        for person_id in updated_people:
+            _renew_face_filename_mutations(user_id, generations)
+            _update_person_rep_embedding(user_id, person_id)
+        for filename, generation in generations.items():
+            _renew_face_filename_write(user_id, filename, generation)
+            _finish_face_filename_write(user_id, filename, generation, [])
     return deleted_person_ids
 
 

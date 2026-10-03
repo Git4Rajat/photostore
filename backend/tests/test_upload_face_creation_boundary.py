@@ -107,8 +107,7 @@ def test_new_metadata_and_successful_owner_create_do_not_exclude_orphan_faces(bo
     orphan = {'PartitionKey': 'u1', 'RowKey': 'orphan', 'filename': 'photo.jpg',
               'bbox': json.dumps(_face(0)['bbox']), 'reviewStatus': 'rejected'}
     faces.upsert_entity(orphan)
-    # A successful owner create can follow deletion/incomplete cleanup. Even
-    # genuinely new metadata publication does not establish a new face key.
+    # Owner/metadata creation does not prove index coverage for legacy faces.
     assert storage_utils._claim_filename_owner('u1', 'photo.jpg', 'hash')
     assert metadata.rows == {}
     metadata.upsert_entity(storage_utils.get_or_create_metadata('u1', 'photo.jpg'))
@@ -141,12 +140,12 @@ def test_duplicate_finalize_never_initializes_or_overwrites_face_lookup(boundary
 
 
 def test_released_owner_can_be_recreated_while_faces_still_exist(boundary_ctx):
+    """Historical incomplete cleanup must remain discoverable on reuse."""
     metadata, _, faces, _ = boundary_ctx
     assert storage_utils._claim_filename_owner('u1', 'photo.jpg', 'old-hash')
     metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'photo.jpg', 'fileHash': 'old-hash'})
     faces.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'old-face', 'filename': 'photo.jpg',
                          'bbox': json.dumps(_face(0)['bbox']), 'rejected': True})
-    # Hard-delete removes metadata/ownership before its separate face cascade.
     metadata.delete_entity(partition_key='u1', row_key='photo.jpg')
     storage_utils.delete_filename_owner_entry('u1', 'photo.jpg')
     assert storage_utils._claim_filename_owner('u1', 'photo.jpg', 'new-hash')
@@ -157,15 +156,29 @@ def test_released_owner_can_be_recreated_while_faces_still_exist(boundary_ctx):
 
 
 def test_complete_zero_is_query_free_but_missing_new_upload_is_not(boundary_ctx):
+    """Only authoritative reconciliation proves zero, not index absence."""
     _, _, faces, lookup = boundary_ctx
     _init_tracking('direct')
     assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') is None
     storage_utils._store_client_face_entities('u1', 'photo.jpg', [])
     assert len(faces.queries) == 1
     assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') == []
-    # Only a complete generation established by authoritative reconciliation
-    # proves zero under the current protocol, not init's timestamp/blob UUID.
     faces.queries.clear()
     storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0)])
     assert faces.queries == []
     assert lookup.rows[('u1', 'photo.jpg')]['state'] == 'complete'
+
+
+def test_missing_lookup_preserves_rejection_at_identical_deterministic_id(boundary_ctx):
+    _, _, faces, _ = boundary_ctx
+    detection = _face(0)
+    face_id = storage_utils._deterministic_face_id('u1', 'photo.jpg', detection)
+    rejected = {'PartitionKey': 'u1', 'RowKey': face_id, 'filename': 'photo.jpg',
+                'bbox': json.dumps(detection['bbox']), 'rejected': True,
+                'personId': 'curated', 'confirmedByUser': True}
+    faces.upsert_entity(rejected)
+    faces.writes.clear()
+    assert storage_utils._store_client_face_entities('u1', 'photo.jpg', [detection]) == []
+    assert faces.rows[('u1', face_id)] == rejected
+    assert faces.writes == []
+    assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') == [face_id]

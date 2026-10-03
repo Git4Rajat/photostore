@@ -41,11 +41,16 @@ reclassified as a fresh upload.
   only checks whether the current metadata is deleted: it does not validate an
   immutable asset generation against the upload/result sender. A delayed result
   from an old upload can therefore target a subsequently reused logical name.
-- Hard deletion removes metadata and filename ownership **before** a separate
-  face cascade. Failures can leave orphan faces. Incomplete-upload cancellation
-  removes tracking metadata without a face cascade. Ownership/metadata absence
-  therefore cannot prove no stale faces. Existing deletion-produced complete-zero
-  rows must not be overwritten or treated as fresh-allocation evidence either.
+- Hard deletion now retains metadata and filename ownership until its leased
+  face cascade succeeds. Query/page, source-delete, embedding, and membership
+  failures propagate and leave acquired lookup generations incomplete rather
+  than publishing a false complete-zero. This closes the normal hard-delete
+  release ordering gap, but does not repair legacy orphan faces or turn the
+  collision owner into an exclusive asset-generation fence. Incomplete-upload
+  cancellation removes tracking metadata without a face cascade. Ownership/
+  metadata absence therefore still cannot prove no stale faces. Existing
+  deletion-produced complete-zero rows must not be overwritten or treated as
+  fresh-allocation evidence either.
 
 Adding an initializer to initiation, metadata creation, or finalization using
 these signals would invent a proof the current protocol does not provide.
@@ -107,3 +112,28 @@ complete zero is query-free while missing-index upload initialization is not.
 Existing filename-lookup tests cover concurrent acquisition, old-writer CAS
 fencing, rejection/curation, transport failures, and dirty partial-write retry.
 No claim is made that fresh-upload first-face queries have been eliminated.
+
+## Cleanup hardening (2026-10-03)
+
+Single/batch face cleanup acquires the filename generations before authoritative
+enumeration and keeps them through shadow/source mutations and empty publication.
+Only genuine not-found deletes are idempotent success; other failures propagate.
+Metadata/ownership remain as a retry anchor if the hard-delete cascade fails,
+and the caller receives a cleanup error rather than deletion success. Group
+lease renewal is periodic with forced validation at scan boundaries; source
+mutations renew their own key, avoiding quadratic renewal IO across a batch.
+Cleanup fails closed if the lookup coordination table is unconfigured.
+
+Dedupe's discovery scan is advisory. It acquires affected filename generations,
+rescans under those leases, performs mutations with propagated failures, and
+publishes the full surviving face set from another authoritative scan. Missing
+legacy lookup rows are no longer skipped. Any failure leaves acquired generations
+dirty (or writing if release itself fails), requiring fresh reconciliation.
+
+`backend/tests/test_face_cleanup_safety.py` covers scan/page/delete/shadow failures,
+lease acquisition/expiry, ownership-release ordering and hard-delete retry,
+partial publication, bounded renewal IO, and missing-index dedupe recovery.
+This does not introduce immutable asset IDs, fence every curation/legacy writer,
+or claim cross-table transactional guarantees: the existing lease protocol and
+its limitations remain. Late results for reused names still require the full
+asset-identity change described above.

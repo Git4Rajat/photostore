@@ -989,6 +989,9 @@ def _begin_face_filename_write(user_id: str, filename: str):
                 table.update_entity(entity, mode=UpdateMode.REPLACE,
                                     etag=_face_filename_etag(previous),
                                     match_condition=MatchConditions.IfNotModified)
+            # Absence is not proof of freshness: legacy faces and degraded
+            # writers can predate the lookup. Only a valid complete generation
+            # supplies authoritative IDs, including an explicit empty set.
             return generation, (_validated_face_filename_ids(previous)
                                 if previous is not None else None)
         except (ResourceExistsError, ResourceModifiedError, ResourceNotFoundError):
@@ -1059,6 +1062,50 @@ def _release_failed_face_filename_write(user_id: str, filename: str, generation)
         # Original error still propagates. A failed release leaves 'writing'
         # discoverably incomplete; expiry permits a fresh authoritative query.
         _LOGGER.exception('Failed to release filename face lease for %s/%s', user_id, filename)
+
+
+class _FaceFilenameGenerations(dict):
+    """Per-scope renewal clock, never shared across requests or libraries."""
+    def __init__(self):
+        super().__init__()
+        self.renewed_at = time.monotonic()
+
+
+def _renew_face_filename_mutations(user_id: str, generations, *, force=False) -> None:
+    """Refresh a group periodically; individual face writes renew their key.
+
+    Avoid an O(filenames * faces/people) renewal storm in batch cleanup.
+    Force at authoritative scan boundaries to validate every held generation.
+    """
+    if not force and time.monotonic() - generations.renewed_at < 30:
+        return
+    for filename, generation in generations.items():
+        _renew_face_filename_write(user_id, filename, generation)
+    generations.renewed_at = time.monotonic()
+
+
+@contextlib.contextmanager
+def _face_filename_mutations(user_id: str, filenames):
+    """Invalidate all affected lookups BEFORE cleanup reads or mutations.
+
+    Callers renew before source/shadow writes and publish their authoritative
+    result with these same generations. Any failure (even after one filename
+    completed) leaves every acquired generation dirty for fresh reconciliation.
+    Cleanup fails closed if the durable coordination table is unavailable.
+    """
+    if _CTX.get('face_by_filename_table_client') is None:
+        raise FaceFilenameLookupRetryableError('Filename lookup unavailable for cleanup')
+    generations = _FaceFilenameGenerations()
+    try:
+        for filename in sorted(set(filenames)):
+            generation, _ = _begin_face_filename_write(user_id, filename)
+            generations[filename] = generation
+            _renew_face_filename_mutations(user_id, generations)
+        yield generations
+    except Exception:
+        for filename, generation in generations.items():
+            _release_failed_face_filename_write(user_id, filename, generation)
+        raise
 
 
 def _store_client_face_entities(user_id: str, filename: str, faces, *, force_reconcile: bool = False) -> List[str]:
