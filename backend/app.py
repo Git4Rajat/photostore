@@ -11060,6 +11060,18 @@ def _sweep_tag_embedding_indexes() -> Dict[str, int]:
     return stats
 
 
+def _timed_ipwork_sweep_phase(phase, function, *args, **kwargs):
+    started = time.monotonic()
+    outcome = 'error'
+    try:
+        result = function(*args, **kwargs)
+        outcome = 'done'
+        return result
+    finally:
+        worker_logger.info('ipwork sweep timings phase=%s outcome=%s duration_ms=%.3f',
+                           phase, outcome, (time.monotonic() - started) * 1000)
+
+
 def _ipwork_sweep_loop() -> None:
     """Runs for the lifetime of the ipworker process on its own daemon
     thread, independent of the queue-polling loop in run_ipworker, so a
@@ -11073,20 +11085,21 @@ def _ipwork_sweep_loop() -> None:
     time.sleep(min(60, IPWORK_SWEEP_INTERVAL_SECONDS))
     while True:
         try:
-            if _try_claim_ipwork_sweep_lock(owner_id, ttl_seconds=IPWORK_SWEEP_INTERVAL_SECONDS):
-                stats = _sweep_stale_processing_into_ipwork()
+            if _timed_ipwork_sweep_phase('claim_lock', _try_claim_ipwork_sweep_lock,
+                                         owner_id, ttl_seconds=IPWORK_SWEEP_INTERVAL_SECONDS):
+                stats = _timed_ipwork_sweep_phase('stale_processing', _sweep_stale_processing_into_ipwork)
                 if stats['photosQueued']:
                     worker_logger.info(
                         'ipwork sweep: released %d stale photo(s), %d step(s), across %d librar(y/ies)',
                         stats['photosQueued'], stats['stepsQueued'], stats['libraries'],
                     )
-                tag_embedding_stats = _sweep_tag_embedding_indexes()
+                tag_embedding_stats = _timed_ipwork_sweep_phase('tag_embedding_indexes', _sweep_tag_embedding_indexes)
                 if tag_embedding_stats['librariesChecked']:
                     worker_logger.info(
                         'tag-embedding sweep: %d/%d librar(y/ies) have a usable index',
                         tag_embedding_stats['indexesAvailable'], tag_embedding_stats['librariesChecked'],
                     )
-                trash_stats = _run_trash_purge_sweep()
+                trash_stats = _timed_ipwork_sweep_phase('trash_purge', _run_trash_purge_sweep)
                 if trash_stats['photosPurged'] or trash_stats['albumsPurged']:
                     worker_logger.info(
                         'trash sweep: purged %d photo(s) and %d album(s) past the %d-day retention window across %d librar(y/ies)',
@@ -13040,6 +13053,17 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
     return client_processing
 
 
+def _ipwork_result_face_count(client_processing) -> int:
+    """Count only array-shaped faces; diagnostics must not reject malformed results."""
+    if not isinstance(client_processing, dict):
+        return 0
+    face = client_processing.get('face')
+    if not isinstance(face, dict):
+        return 0
+    faces = face.get('faces')
+    return len(faces) if isinstance(faces, (list, tuple)) else 0
+
+
 def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> str:
     """Process one ipwork queue message. Returns 'done', 'noop', 'lease_busy',
     or 'not_found'.
@@ -13179,9 +13203,11 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
         # per-step split inside _run_ipwork_steps -- lease_claim_ms/apply_ms/
         # cluster_ms cover everything outside that per-step breakdown.
         worker_logger.info(
-            'ipwork message timings user=%s file=%s lease_claim_ms=%s steps_ms=%s apply_ms=%s cluster_ms=%s total_ms=%s',
+            'ipwork message timings user=%s file=%s lease_claim_ms=%s steps_ms=%s apply_ms=%s cluster_ms=%s total_ms=%s requested_steps=%s runnable_steps=%s face_count=%s',
             user_id, filename, lease_claim_ms, steps_ms, apply_ms, cluster_ms,
             round((time.monotonic() - message_started) * 1000),
+            ','.join(steps), ','.join(runnable_steps),
+            _ipwork_result_face_count(client_processing) if 'face' in runnable_steps else 0,
         )
     finally:
         # Only needed when apply_client_processing_results_for_file never
@@ -13285,8 +13311,8 @@ def _process_ipwork_message(message) -> str:
 
 
 def _log_ipwork_memory_sample(in_flight_after: int) -> None:
-    """Logs (peak RSS so far, remaining in-flight count) right after a
-    photo finishes, so IPWORKER_CONCURRENCY benchmark runs can correlate
+    """Logs (peak RSS so far, current in-flight count) with the 60-second
+    throughput window and final shutdown sample, so benchmark runs can correlate
     memory against how many photos were genuinely concurrent -- Azure
     Monitor's WorkingSetBytes is container-aggregate only and can't show
     whether N concurrent photos need ~N x one photo's memory or worse.
@@ -13311,6 +13337,40 @@ def _log_ipwork_memory_sample(in_flight_after: int) -> None:
 # large import keeps the derived indexes reasonably fresh mid-flight instead
 # of only at the very end.
 IPWORKER_INDEX_REBUILD_MILESTONE = int(os.getenv('IPWORKER_INDEX_REBUILD_MILESTONE', '10000'))
+
+
+class _IpworkThroughputWindow:
+    """Main-thread-only counters; outcomes are distinct from queue acknowledgements."""
+    def __init__(self):
+        self.started = self.last_logged = time.monotonic()
+        self.cumulative = {}
+        self.window = {}
+
+    def record(self, key, duration_ms=None, count=1):
+        self.cumulative[key] = self.cumulative.get(key, 0) + count
+        self.window[key] = self.window.get(key, 0) + count
+        if duration_ms is not None:
+            for counters in (self.cumulative, self.window):
+                counters[key + '_ms'] = counters.get(key + '_ms', 0) + duration_ms
+
+    def log(self, in_flight, *, force=False):
+        now = time.monotonic()
+        elapsed = now - self.last_logged
+        if not force and elapsed < 60:
+            return
+        keys = ('done', 'noop', 'lease_busy', 'error', 'not_found', 'receive',
+                'receive_failed', 'received', 'ack', 'ack_failed')
+        metrics = {'window_seconds': round(elapsed, 3),
+                   'elapsed_seconds': round(now - self.started, 3), 'in_flight': in_flight,
+                   'window': {key: self.window.get(key, 0) for key in keys},
+                   'cumulative': {key: self.cumulative.get(key, 0) for key in keys}}
+        for name, counters in (('window', self.window), ('cumulative', self.cumulative)):
+            metrics[name].update({k: round(v, 3) for k, v in counters.items() if k.endswith('_ms')})
+        metrics['done_per_hour'] = round(self.window.get('done', 0) * 3600 / elapsed, 3) if elapsed > 0 else 0
+        worker_logger.info('ipwork throughput metrics=%s', json.dumps(metrics, sort_keys=True))
+        _log_ipwork_memory_sample(in_flight)
+        self.window.clear()
+        self.last_logged = now
 
 
 def _ipwork_message_user_id(message) -> str:
@@ -13428,6 +13488,7 @@ def run_ipworker() -> None:
 
     executor = ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork')
     in_flight = {}  # future -> message
+    throughput = _IpworkThroughputWindow()
     # Files successfully processed per user since that user's last index
     # rebuild trigger. Drives the "every IPWORKER_INDEX_REBUILD_MILESTONE
     # files, plus once at full drain" rebuild cadence (see _trigger_tools_
@@ -13438,6 +13499,7 @@ def run_ipworker() -> None:
     try:
         while True:
             try:
+                throughput.log(len(in_flight))
                 if shutdown_requested.is_set() and shutdown_deadline is None:
                     shutdown_deadline = time.monotonic() + IPWORKER_SHUTDOWN_GRACE_SECONDS
                     worker_logger.info(
@@ -13456,11 +13518,18 @@ def run_ipworker() -> None:
                 # can't finish before the process exits.
                 free_slots = 0 if shutdown_requested.is_set() else min(IPWORKER_CONCURRENCY - len(in_flight), 32)
                 if free_slots > 0:
-                    messages = list(queue_client.receive_messages(
-                        messages_per_page=free_slots,
-                        max_messages=free_slots,
-                        visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
-                    ))
+                    receive_started = time.monotonic()
+                    try:
+                        messages = list(queue_client.receive_messages(
+                            messages_per_page=free_slots,
+                            max_messages=free_slots,
+                            visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
+                        ))
+                    except Exception:
+                        throughput.record('receive_failed', (time.monotonic() - receive_started) * 1000)
+                        raise
+                    throughput.record('receive', (time.monotonic() - receive_started) * 1000)
+                    throughput.record('received', count=len(messages))
                     for message in messages:
                         future = executor.submit(_process_ipwork_message, message)
                         in_flight[future] = message
@@ -13513,7 +13582,7 @@ def run_ipworker() -> None:
                         # inner try/except) drops its message with zero retry.
                         worker_logger.exception('ipwork worker task raised unexpectedly')
                         outcome = 'error'
-                    _log_ipwork_memory_sample(len(in_flight))
+                    throughput.record(outcome)
                     # Same lease_busy-vs-delete logic as before, just per
                     # completed future instead of per loop iteration; the
                     # actual delete_message call stays on the main thread
@@ -13540,10 +13609,14 @@ def run_ipworker() -> None:
                             if processed_by_user[uid] >= IPWORKER_INDEX_REBUILD_MILESTONE:
                                 _trigger_tools_index_rebuild(uid)
                                 processed_by_user[uid] = 0
+                    ack_started = time.monotonic()
                     try:
                         queue_client.delete_message(message)
                     except Exception:
+                        throughput.record('ack_failed', (time.monotonic() - ack_started) * 1000)
                         worker_logger.exception('Failed to delete ipwork queue message')
+                    else:
+                        throughput.record('ack', (time.monotonic() - ack_started) * 1000)
             except Exception:
                 worker_logger.exception('ipwork queue polling iteration failed')
                 if shutdown_requested.is_set():
@@ -13559,6 +13632,7 @@ def run_ipworker() -> None:
         # useful) and force-exit immediately after so those stragglers can't
         # hang process termination past what Container Apps allows.
         executor.shutdown(wait=not grace_exhausted, cancel_futures=grace_exhausted)
+        throughput.log(len(in_flight), force=True)
     if grace_exhausted:
         os._exit(0)
 

@@ -9,6 +9,7 @@ time, on first view).
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -124,3 +125,128 @@ def test_warm_is_noop_with_no_face_ids_or_no_face_table(monkeypatch):
     # Should return immediately without touching get_image_bytes.
     storage_utils._warm_face_crops_for_photo('u1', 'a.jpg', [], lambda: (_ for _ in ()).throw(AssertionError('unused')), rotation=0)
     storage_utils._warm_face_crops_for_photo('u1', 'a.jpg', ['face-1'], lambda: (_ for _ in ()).throw(AssertionError('unused')), rotation=0)
+
+
+def test_warm_admission_caps_concurrency_skips_busy_and_releases(monkeypatch):
+    slots = threading.BoundedSemaphore(2)
+    monkeypatch.setattr(storage_utils, '_FACE_CROP_WARM_SLOTS', slots)
+    entered = threading.Barrier(3)
+    release = threading.Event()
+    threads = []
+    real_thread = threading.Thread
+    active = [0]
+    peak = [0]
+    lock = threading.Lock()
+
+    def create_thread(**kwargs):
+        assert kwargs['daemon'] is True
+        thread = real_thread(**kwargs)
+        threads.append(thread)
+        return thread
+
+    def warm(*args):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            entered.wait(timeout=5)
+            assert release.wait(timeout=5)
+        finally:
+            with lock:
+                active[0] -= 1
+
+    monkeypatch.setattr(storage_utils.threading, 'Thread', create_thread)
+    monkeypatch.setattr(storage_utils, '_warm_face_crops_for_photo', warm)
+    source = lambda: pytest.fail('admission must not fetch image bytes')
+    try:
+        assert storage_utils._start_face_crop_warming('u', 'a.jpg', ['f'], source, 0)
+        assert storage_utils._start_face_crop_warming('u', 'b.jpg', ['f'], source, 0)
+        entered.wait(timeout=5)
+        for _ in range(20):
+            assert not storage_utils._start_face_crop_warming('u', 'busy.jpg', ['f'], source, 0)
+        assert len(threads) == peak[0] == 2
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+    assert slots.acquire(blocking=False)
+    assert slots.acquire(blocking=False)
+    assert not slots.acquire(blocking=False)
+    slots.release()
+    slots.release()
+    monkeypatch.setattr(storage_utils, '_warm_face_crops_for_photo', lambda *a: None)
+    assert storage_utils._start_face_crop_warming('u', 'next.jpg', ['f'], source, 0)
+    threads[-1].join(timeout=5)
+    assert not threads[-1].is_alive()
+
+
+@pytest.mark.parametrize('failure', ['construction', 'start', 'warming'])
+def test_warm_releases_slot_on_failures(monkeypatch, caplog, failure):
+    slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(storage_utils, '_FACE_CROP_WARM_SLOTS', slots)
+    entered = threading.Barrier(2)
+    release = threading.Event()
+    threads = []
+    real_thread = threading.Thread
+
+    def explode():
+        raise RuntimeError('optional warming failed')
+
+    class FailedStart:
+        def start(self):
+            explode()
+
+    def create_thread(**kwargs):
+        if failure == 'construction':
+            explode()
+        if failure == 'start':
+            return FailedStart()
+        # Capture the exception instead of leaking an unhandled-thread warning.
+        def run():
+            try:
+                kwargs['target']()
+            except RuntimeError:
+                pass
+        thread = real_thread(target=run, daemon=kwargs['daemon'])
+        threads.append(thread)
+        return thread
+
+    def warm(*args):
+        entered.wait(timeout=5)
+        assert release.wait(timeout=5)
+        explode()
+
+    monkeypatch.setattr(storage_utils.threading, 'Thread', create_thread)
+    monkeypatch.setattr(storage_utils, '_warm_face_crops_for_photo', warm)
+    try:
+        accepted = storage_utils._start_face_crop_warming('u', 'a.jpg', ['f'], lambda: b'x', 0)
+        assert accepted == (failure == 'warming')
+        if accepted:
+            entered.wait(timeout=5)
+            assert not slots.acquire(blocking=False)
+        else:
+            assert 'Failed to start optional face crop warming' in caplog.text
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+    assert slots.acquire(blocking=False)
+    assert not slots.acquire(blocking=False)
+    slots.release()
+
+
+@pytest.mark.parametrize('value,expected', [(None, 2), ('invalid', 2), ('0', 0), ('-1', 0), ('1', 1), ('99', 8)])
+def test_warm_concurrency_configuration(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv('FACE_CROP_WARM_CONCURRENCY', raising=False)
+    else:
+        monkeypatch.setenv('FACE_CROP_WARM_CONCURRENCY', value)
+    assert storage_utils._face_crop_warm_limit() == expected
+
+
+def test_warm_disabled_never_constructs_thread(monkeypatch):
+    monkeypatch.setattr(storage_utils, '_FACE_CROP_WARM_SLOTS', threading.BoundedSemaphore(0))
+    monkeypatch.setattr(storage_utils.threading, 'Thread', lambda **kw: pytest.fail('disabled warming'))
+    assert not storage_utils._start_face_crop_warming('u', 'a.jpg', ['f'], lambda: b'x', 0)

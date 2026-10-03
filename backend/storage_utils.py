@@ -10,6 +10,7 @@ import re
 import uuid
 import base64
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError, Re
 from azure.data.tables import UpdateMode
 from azure.storage.blob import ContentSettings as BlobContentSettings
 from werkzeug.utils import secure_filename
+from upload_diagnostics import timed_call, upload_phase
 
 # This module otherwise swallows failures silently (`except Exception: pass`)
 # because they happen inside a request a caller will retry or already
@@ -1062,19 +1064,56 @@ def _release_failed_face_filename_write(user_id: str, filename: str, generation)
 def _store_client_face_entities(user_id: str, filename: str, faces, *, force_reconcile: bool = False) -> List[str]:
     if _CTX.get('face_table_client') is None or not isinstance(faces, list):
         return []
-    generation, previous_ids = _begin_face_filename_write(user_id, filename)
+    started = time.monotonic()
+    diagnostics = {'phase': 'acquire', 'phase_started': started, 'path': 'unknown',
+                   'ids_count': None, 'existing_row_count': None, 'input_face_count': len(faces),
+                   'candidate_face_count': None, 'stored_face_count': 0, 'deleted_face_count': 0,
+                   'query_enumeration_ms': 0, 'existing_retrieval_complete': False}
+    generation = None
+    outcome = 'error'
     try:
-        return _store_client_face_generation(user_id, filename, faces,
-                                            force_reconcile=force_reconcile,
-                                            generation=generation, previous_ids=previous_ids)
+        generation, previous_ids = _begin_face_filename_write(user_id, filename)
+        _face_storage_phase(diagnostics, 'prepare')
+        diagnostics.update(path='indexed_point_reads' if previous_ids is not None else 'filename_query',
+                           ids_count=len(previous_ids) if previous_ids is not None else None)
+        result = _store_client_face_generation(user_id, filename, faces,
+                                              force_reconcile=force_reconcile,
+                                              generation=generation, previous_ids=previous_ids,
+                                              diagnostics=diagnostics)
+        outcome = 'done'
+        return result
     except Exception:
-        _release_failed_face_filename_write(user_id, filename, generation)
+        diagnostics['failure_phase'] = diagnostics['phase']
+        _face_storage_phase(diagnostics, 'failure_cleanup')
+        if generation is not None:
+            _release_failed_face_filename_write(user_id, filename, generation)
         raise
+    finally:
+        phase = diagnostics['phase']
+        finished = _face_storage_phase(diagnostics, phase)
+        diagnostics.pop('phase_started')
+        for name in ('acquire', 'prepare', 'existing_retrieval', 'mutation',
+                     'finish_publication', 'failure_cleanup'):
+            diagnostics.setdefault(name + '_ms', 0)
+        diagnostics.update(outcome=outcome, total_ms=round((finished - started) * 1000, 3),
+                           force_reconcile=force_reconcile)
+        _LOGGER.info('face storage timings user=%s file=%s metrics=%s',
+                     user_id, filename, json.dumps(diagnostics, sort_keys=True))
+
+
+def _face_storage_phase(diagnostics, phase):
+    if diagnostics is None:
+        return
+    now = time.monotonic()
+    key = diagnostics['phase'] + '_ms'
+    diagnostics[key] = round(diagnostics.get(key, 0) + (now - diagnostics['phase_started']) * 1000, 3)
+    diagnostics.update(phase=phase, phase_started=now)
+    return now
 
 
 def _store_client_face_generation(user_id: str, filename: str, faces, *,
                                   force_reconcile: bool, generation,
-                                  previous_ids: Optional[List[str]]) -> List[str]:
+                                  previous_ids: Optional[List[str]], diagnostics=None) -> List[str]:
     face_table_client = _CTX.get('face_table_client')
     if face_table_client is None or not isinstance(faces, list):
         return []
@@ -1095,6 +1134,9 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
     # Only IDs from the complete generation acquired above can bound reads.
     # Never consult or publish a whole-user summary: curation must be fresh,
     # and a filename result is not a full cache snapshot.
+    if diagnostics is not None:
+        diagnostics.update(candidate_face_count=len(candidate_faces), existing_row_count=0)
+    _face_storage_phase(diagnostics, 'existing_retrieval')
     if previous_ids is not None:
         existing_rows = []
         for fid in previous_ids:
@@ -1105,10 +1147,28 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
             if row.get('filename') != filename:
                 raise FaceFilenameLookupRetryableError('Filename lookup references another photo')
             existing_rows.append(row)
+            if diagnostics is not None:
+                diagnostics['existing_row_count'] = len(existing_rows)
     else:
-        existing_rows = list(face_table_client.query_entities(
+        rows = face_table_client.query_entities(
             f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
-        ))
+        )
+        # Azure returns a lazy paged iterable: time every page through exhaustion,
+        # not just query construction. Preserve partial progress on read failure.
+        existing_rows = []
+        enumeration_started = time.monotonic()
+        try:
+            for row in rows:
+                existing_rows.append(row)
+                if diagnostics is not None:
+                    diagnostics['existing_row_count'] = len(existing_rows)
+        finally:
+            if diagnostics is not None:
+                diagnostics['query_enumeration_ms'] = round(
+                    (time.monotonic() - enumeration_started) * 1000, 3)
+    _face_storage_phase(diagnostics, 'mutation')
+    if diagnostics is not None:
+        diagnostics['existing_retrieval_complete'] = True
     existing_bboxes = [_normalize_face_bbox(row) for row in existing_rows]
 
     # Match by bbox overlap rather than exact pixels, so re-processing under a
@@ -1210,6 +1270,8 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
         _renew_face_filename_write(user_id, filename, generation)
         face_table_client.upsert_entity(entity)
         stored_ids.append(face_id)
+        if diagnostics is not None:
+            diagnostics['stored_face_count'] = len(stored_ids)
 
     # A forced full re-run (Tools > Backfill all photos) is the browser's
     # authoritative statement of every face in this photo right now. Any
@@ -1267,12 +1329,17 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
             except ResourceNotFoundError:
                 pass
             deleted_face_ids.append(face_id)
+            if diagnostics is not None:
+                diagnostics['deleted_face_count'] = len(deleted_face_ids)
 
     # Keep the keyed photofacebyfilename lookup in sync with whatever rows
     # this call actually leaves behind for this filename -- every existing
     # row not deleted above, plus every row just written (new detections and
     # IoU-matched re-detections, which reuse an existing RowKey). Mirrors
     # exactly what a `filename eq X` query would return.
+    _face_storage_phase(diagnostics, 'finish_publication')
+    if diagnostics is not None:
+        diagnostics.update(stored_face_count=len(stored_ids), deleted_face_count=len(deleted_face_ids))
     _finish_face_filename_write(
         user_id, filename, generation,
         sorted({
@@ -1297,6 +1364,38 @@ def _remove_face_person_member(person_id: str, face_id: str) -> None:
 
 def _face_cover_blob_name(user_id: str, face_id: str) -> str:
     return f'{hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16]}/{secure_filename(face_id)}.jpg'
+
+
+def _face_crop_warm_limit() -> int:
+    try:
+        return max(0, min(8, int(os.getenv('FACE_CROP_WARM_CONCURRENCY', '2'))))
+    except ValueError:
+        return 2
+
+
+_FACE_CROP_WARM_CONCURRENCY = _face_crop_warm_limit()
+_FACE_CROP_WARM_SLOTS = threading.BoundedSemaphore(_FACE_CROP_WARM_CONCURRENCY)
+
+
+def _start_face_crop_warming(user_id, filename, face_ids, get_image_bytes, rotation) -> bool:
+    """Optional work: no waiting queue and no retained closures when saturated."""
+    slots = _FACE_CROP_WARM_SLOTS
+    if not slots.acquire(blocking=False):
+        return False
+
+    def warm():
+        try:
+            _warm_face_crops_for_photo(user_id, filename, face_ids, get_image_bytes, rotation)
+        finally:
+            slots.release()
+
+    try:
+        threading.Thread(target=warm, name='face-crop-warm', daemon=True).start()
+    except Exception:
+        slots.release()
+        _LOGGER.exception('Failed to start optional face crop warming')
+        return False
+    return True
 
 
 def _warm_face_crops_for_photo(
@@ -6997,11 +7096,7 @@ def _apply_client_processing_results(
             )
             if stored_face_ids:
                 rotation = int(metadata.get('rotation', 0) or 0) % 360
-                threading.Thread(
-                    target=_warm_face_crops_for_photo,
-                    args=(user_id, filename, list(stored_face_ids), get_image_bytes, rotation),
-                    name='face-crop-warm', daemon=True,
-                ).start()
+                _start_face_crop_warming(user_id, filename, list(stored_face_ids), get_image_bytes, rotation)
             if faces_with_embeddings:
                 faces_for_metadata = [{k: v for k, v in f.items() if k != 'embedding'} for f in faces_with_embeddings]
                 metadata['faces'] = json.dumps(faces_for_metadata, ensure_ascii=False, separators=(',', ':'))
@@ -7293,7 +7388,7 @@ def apply_client_processing_results_for_file(
     """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
-    metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+    metadata = timed_call('metadata_read', metadata_table_client.get_entity, partition_key=user_id, row_key=filename)
     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
         raise RuntimeError('Photo has been deleted.')
     # Anonymized photos are stored under the anonymous UUID; resolve it from the
@@ -7330,7 +7425,7 @@ def apply_client_processing_results_for_file(
     except Exception as exc:
         _unstick_claimed_steps_still_running(user_id, filename, claimed_steps, str(exc))
         raise
-    refresh_metadata_entity(user_id, filename, {
+    timed_call('persistence', refresh_metadata_entity, user_id, filename, {
         'processing_lease_owner': '',
         'processing_lease': '',
         'processing_lease_expires_at': '',
@@ -7385,13 +7480,13 @@ def finalize_uploaded_file(
     image_bytes: Optional[bytes] = None
     client_hash = str(client_sha256 or '')
     if is_video or not client_hash:
-        image_bytes = download_media_bytes('image', blob_to_read)
+        image_bytes = timed_call('source_read', download_media_bytes, 'image', blob_to_read)
         file_hash = hashlib.sha256(image_bytes).hexdigest()
     else:
         file_hash = client_hash
 
-    duplicates = detect_duplicates(user_id, file_hash, perceptual_hash=None)
-    final_filename = _resolve_filename_for_upload(user_id, filename, file_hash)
+    duplicates = timed_call('dedup', detect_duplicates, user_id, file_hash, perceptual_hash=None)
+    final_filename = timed_call('name_resolution', _resolve_filename_for_upload, user_id, filename, file_hash)
 
     if final_filename != filename and not anonymous_blob_name:
         # Rare: a cross-tenant filename clash forced a unique name, so place the
@@ -7410,7 +7505,7 @@ def finalize_uploaded_file(
         except Exception:
             pass
 
-    metadata = get_or_create_metadata(user_id, final_filename)
+    metadata = timed_call('metadata_read', get_or_create_metadata, user_id, final_filename)
     # The metadata row is usually pre-created at /upload/init (which records
     # upload_started_at but no uploadDate), so get_or_create_metadata returns it
     # without an uploadDate. Persist one here so the gallery has a stable
@@ -7460,7 +7555,8 @@ def finalize_uploaded_file(
     metadata['retry_count'] = 0
     metadata['last_processing_update'] = datetime.now(timezone.utc).isoformat()
 
-    metadata_table_client.upsert_entity(metadata)
+    with upload_phase('persistence'):
+        metadata_table_client.upsert_entity(metadata)
     # Mark the new row dirty for the search/listing indexes immediately --
     # without this, a brand-new photo is invisible to /api/photos (and
     # search) until something ELSE later writes one of the
@@ -7472,11 +7568,11 @@ def finalize_uploaded_file(
     # gallery. Same reasoning as the identical fix already applied to
     # _finalize_server_side_exif below (found live 2026-09-21: a video's
     # geocoded location never became searchable on its own either).
-    touch_user_search_indexes_state(user_id, filenames=final_filename)
+    timed_call('persistence', touch_user_search_indexes_state, user_id, filenames=final_filename)
     # Keep the O(1) dedup/collision indexes current for the next upload -- see
     # detect_duplicates() and _resolve_filename_for_upload().
-    _store_hash_index(user_id, file_hash, final_filename)
-    _store_filename_owner(user_id, final_filename, file_hash)
+    timed_call('persistence', _store_hash_index, user_id, file_hash, final_filename)
+    timed_call('persistence', _store_filename_owner, user_id, final_filename, file_hash)
 
     # Server-side thumbnail / metadata extraction, eagerly, here -- video only.
     # RAW used to get this treatment too, but it's redundant: ipworker's queued
@@ -7588,7 +7684,7 @@ def batched_processing_status_updates(user_id: str, filename: str):
         batch = _STEP_UPDATE_BATCH.get()
         _STEP_UPDATE_BATCH.reset(token)
         if batch:
-            _flush_processing_status_batch(user_id, filename, batch)
+            timed_call('persistence', _flush_processing_status_batch, user_id, filename, batch)
 
 
 def update_processing_status(

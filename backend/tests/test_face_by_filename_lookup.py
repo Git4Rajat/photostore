@@ -22,6 +22,7 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from azure.core import MatchConditions
@@ -167,6 +168,143 @@ def test_set_publishes_schema_generation_complete_zero(lookup_ctx):
 
 def _raise_outage(*args, **kwargs):
     raise OSError('storage outage')
+
+
+def _storage_metrics(caplog):
+    records = [record for record in caplog.records
+               if record.msg.startswith('face storage timings')]
+    assert len(records) == 1
+    return json.loads(records[0].args[2])
+
+
+@pytest.mark.parametrize('path', ['indexed', 'indexed_zero', 'query'])
+def test_storage_phase_timings_cover_full_lazy_enumeration(lookup_ctx, monkeypatch, caplog, path):
+    faces, _ = lookup_ctx
+    clock = [0.0]
+    monkeypatch.setattr(storage_utils, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    existing = {'PartitionKey': 'u1', 'RowKey': 'rejected', 'filename': 'photo.jpg',
+                'bbox': json.dumps(_face(0)['bbox']), 'rejected': True}
+
+    def begin(*args):
+        advance(.01)
+        return 'generation', None if path == 'query' else ([] if path == 'indexed_zero' else ['rejected'])
+
+    def get(**kwargs):
+        advance(.03)
+        return existing
+
+    def query(*args):
+        advance(.02)  # Creating the iterable is not its enumeration cost.
+
+        def pages():
+            advance(.03)
+            yield existing
+            advance(.04)
+            advance(.05)  # Last page/exhaustion must be included too.
+
+        return pages()
+
+    monkeypatch.setattr(storage_utils, '_begin_face_filename_write', begin)
+    monkeypatch.setattr(faces, 'get_entity', get)
+    monkeypatch.setattr(faces, 'query_entities', query)
+    monkeypatch.setattr(storage_utils, '_renew_face_filename_write', lambda *a: advance(.005))
+    monkeypatch.setattr(faces, 'upsert_entity', lambda entity: advance(.04))
+    published = []
+
+    def finish(*args):
+        advance(.06)
+        published.append(args[-1])
+
+    monkeypatch.setattr(storage_utils, '_finish_face_filename_write', finish)
+    with caplog.at_level('INFO', logger='storage_utils'):
+        result = storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(100)])
+    metrics = _storage_metrics(caplog)
+    retrieval_ms = {'indexed': 30, 'indexed_zero': 0, 'query': 140}[path]
+    assert metrics['path'] == ('filename_query' if path == 'query' else 'indexed_point_reads')
+    assert metrics['acquire_ms'] == 10
+    assert metrics['existing_retrieval_ms'] == retrieval_ms
+    assert metrics['query_enumeration_ms'] == (120 if path == 'query' else 0)
+    assert metrics['mutation_ms'] == 50  # Both renewals remain in the mutation phase.
+    assert metrics['finish_publication_ms'] == 60
+    assert metrics['total_ms'] == 120 + retrieval_ms
+    assert metrics['existing_retrieval_complete'] is True
+    assert metrics['existing_row_count'] == (0 if path == 'indexed_zero' else 1)
+    assert metrics['input_face_count'] == metrics['candidate_face_count'] == metrics['stored_face_count'] == 1
+    assert metrics['deleted_face_count'] == 0
+    assert metrics['outcome'] == 'done' and 'failure_phase' not in metrics
+    assert set(published[0]) == set(result) | (set() if path == 'indexed_zero' else {'rejected'})
+
+
+@pytest.mark.parametrize('failure', ['acquire', 'indexed', 'query_create', 'query_page', 'mutation', 'publication'])
+def test_storage_failure_diagnostics_and_dirty_release(lookup_ctx, monkeypatch, caplog, failure):
+    faces, lookup = lookup_ctx
+    clock = [0.0]
+    monkeypatch.setattr(storage_utils, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    original_release = storage_utils._release_failed_face_filename_write
+
+    def timed_release(*args):
+        clock[0] += .1
+        return original_release(*args)
+
+    monkeypatch.setattr(storage_utils, '_release_failed_face_filename_write', timed_release)
+
+    def fail(*args, **kwargs):
+        clock[0] += .25
+        raise OSError('timed outage')
+
+    if failure == 'acquire':
+        monkeypatch.setattr(lookup, 'create_entity', fail)
+    elif failure == 'indexed':
+        lookup.upsert_entity(_complete_row(['f']))
+        monkeypatch.setattr(faces, 'get_entity', fail)
+    elif failure == 'query_create':
+        monkeypatch.setattr(faces, 'query_entities', fail)
+    elif failure == 'query_page':
+        def pages(*args):
+            yield {'PartitionKey': 'u1', 'RowKey': 'partial', 'filename': 'photo.jpg'}
+            fail()
+        monkeypatch.setattr(faces, 'query_entities', pages)
+    elif failure == 'mutation':
+        original_upsert = faces.upsert_entity
+
+        def fail_second(entity):
+            if faces.writes:
+                fail()
+            original_upsert(entity)
+
+        monkeypatch.setattr(faces, 'upsert_entity', fail_second)
+    else:
+        original_update = lookup.update_entity
+
+        def fail_publication(entity, *args, **kwargs):
+            if entity['state'] == 'complete':
+                fail()
+            return original_update(entity, *args, **kwargs)
+
+        monkeypatch.setattr(lookup, 'update_entity', fail_publication)
+
+    with caplog.at_level('INFO', logger='storage_utils'), pytest.raises(OSError, match='timed outage'):
+        storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0), _face(100)])
+    metrics = _storage_metrics(caplog)
+    phase = {'acquire': 'acquire', 'indexed': 'existing_retrieval', 'query_create': 'existing_retrieval',
+             'query_page': 'existing_retrieval', 'mutation': 'mutation', 'publication': 'finish_publication'}[failure]
+    assert metrics['failure_phase'] == phase
+    assert metrics[phase + '_ms'] == 250
+    assert metrics['failure_cleanup_ms'] == (0 if failure == 'acquire' else 100)
+    assert metrics['total_ms'] == (250 if failure == 'acquire' else 350)
+    assert metrics['query_enumeration_ms'] == (250 if failure == 'query_page' else 0)
+    assert metrics['outcome'] == 'error'
+    assert metrics['existing_retrieval_complete'] == (failure in {'mutation', 'publication'})
+    assert metrics['existing_row_count'] == (None if failure == 'acquire' else (1 if failure == 'query_page' else 0))
+    assert metrics['stored_face_count'] == {'mutation': 1, 'publication': 2}.get(failure, 0)
+    if failure != 'acquire':
+        assert lookup.rows[('u1', 'photo.jpg')]['state'] == 'dirty'
+    if phase in {'acquire', 'existing_retrieval'}:
+        assert faces.writes == []
 
 
 @pytest.mark.parametrize('prior', ['missing', 'complete'])

@@ -12,6 +12,8 @@ call, and just asserting the clustering trigger fires (or doesn't) correctly.
 """
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 import app
@@ -119,7 +121,8 @@ def test_non_face_step_does_not_trigger_clustering(monkeypatch, dispatch_ctx, st
     assert ('ipwork', 'done') in dispatch_ctx.job_statuses
 
 
-def test_mixed_job_with_completed_face_only_runs_ocr_without_clustering(monkeypatch, dispatch_ctx):
+def test_mixed_job_with_completed_face_only_runs_ocr_without_clustering(monkeypatch, dispatch_ctx, caplog):
+    caplog.set_level(logging.INFO, logger=app.worker_logger.name)
     monkeypatch.setattr(app, 'claim_processing_lease', lambda *a, **k: {
         'statuses': {'faceStatus': 'done', 'ocrStatus': 'pending'},
     })
@@ -139,6 +142,39 @@ def test_mixed_job_with_completed_face_only_runs_ocr_without_clustering(monkeypa
     assert ran_steps == [['ocr']]
     assert dispatch_ctx.incremental_assign == []
     assert dispatch_ctx.enqueue_clustering == []
+    assert 'requested_steps=face,ocr runnable_steps=ocr face_count=0' in caplog.text
+
+
+@pytest.mark.parametrize('result, expected_count', [
+    (None, 0), ([], 0), ('invalid', 0), (123, 0), ({}, 0),
+    ({'face': None}, 0), ({'face': []}, 0), ({'face': 'invalid'}, 0),
+    ({'face': 123}, 0), ({'face': {}}, 0),
+    ({'face': {'faces': None}}, 0), ({'face': {'faces': 123}}, 0),
+    ({'face': {'faces': 'invalid'}}, 0), ({'face': {'faces': {'id': {}}}}, 0),
+    ({'face': {'faces': []}}, 0), ({'face': {'faces': [{}, {}]}}, 2),
+    ({'face': {'faces': ({},)}}, 1),
+])
+def test_face_count_diagnostics_do_not_fail_applied_job(
+        monkeypatch, dispatch_ctx, caplog, result, expected_count):
+    """Malformed processor output must not turn a completed apply into a retry."""
+    caplog.set_level(logging.INFO, logger=app.worker_logger.name)
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a: result)
+    applied = []
+    released = []
+
+    def apply(*args, **kwargs):
+        applied.append(kwargs['client_processing'])
+        return {'processing_state': 'active', 'face_status': 'no_data', 'faceCount': 0}
+
+    monkeypatch.setattr(app, 'apply_client_processing_results_for_file', apply)
+    monkeypatch.setattr(app, 'release_processing_lease', lambda *a, **k: released.append(a))
+    assert app._handle_ipwork_queue_payload(
+        {'filename': 'photo.jpg', 'steps': ['face']}, 'job-shape', 'lib-A',
+    ) == 'done'
+    assert applied == [result]
+    assert released == []
+    assert ('ipwork', 'done') in dispatch_ctx.job_statuses
+    assert f'requested_steps=face runnable_steps=face face_count={expected_count}' in caplog.text
 
 
 def test_mixed_job_with_runnable_face_still_queues_assignment(monkeypatch, dispatch_ctx):

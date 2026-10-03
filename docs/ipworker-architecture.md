@@ -508,3 +508,108 @@ from scratch.
 | Lease TTL / queue visibility timeout | 300s / 300s |
 | Lease retry limit | 3 attempts |
 | Sweep interval | 1200s (20min) |
+
+## 10. Face persistence diagnostics and bounded optional crop warming (2026-10-03)
+
+`_store_client_face_entities` emits one aggregate INFO record, `face storage
+timings user=... file=... metrics={...}`, on success or failure after acquisition
+starts. It uses monotonic wall time, in milliseconds (three decimal places),
+without additional storage requests or per-face log spam:
+
+- `acquire_ms`: filename-generation acquisition, including its bounded CAS retries.
+- `prepare_ms`: candidate validation and bbox preparation.
+- `path`: `indexed_point_reads` for a previously complete generation (including
+  authoritative empty IDs), `filename_query` otherwise, or `unknown` if
+  acquisition fails before determining the path. `ids_count` is null when unknown.
+- `existing_retrieval_ms`: fresh indexed point reads or query construction **and
+  full lazy paged enumeration**. `query_enumeration_ms` measures iteration through
+  exhaustion separately; it is a **subset**, not an extra additive phase, and is
+  zero for indexed reads or a failure constructing the query iterable.
+- `mutation_ms`: IoU matching, all unchanged lease fencing/renewals, embedding
+  writes, face upserts, and any forced-reconciliation shadow/person/source deletes.
+- `finish_publication_ms`: building and publishing the complete resulting ID set.
+- `failure_cleanup_ms`: conditional dirty release after a failure; `failure_phase`
+  retains the original failing phase even if cleanup also fails. Exceptions still
+  propagate. `total_ms` includes preparation and cleanup, excludes log emission,
+  and is not the whole message's inference/apply time.
+- Counts: `input_face_count`, `candidate_face_count`, `existing_row_count`,
+  `stored_face_count`, `deleted_face_count`. Existing rows count only rows actually
+  retrieved; mutations count completed operations, not attempts. Counts may be
+  partial on error; `existing_retrieval_complete` distinguishes full exhaustion
+  from a failed page/point read. Unstarted candidate/retrieval counts are null.
+  `outcome` is `done` or `error`; an error does not imply no writes committed.
+
+A **new photo has no prior complete filename index**, so persistence must still
+run a fresh filename query before mutation/publication. Azure Tables does not
+secondary-index `filename`; server-side work can grow with the library's face
+partition even when enumeration returns zero matching rows. No fresh query is
+bypassed and no lease renewal, completeness validation, rejected-face protection,
+or named/confirmed/propagated curation semantics are relaxed by these diagnostics.
+
+Optional per-photo cover-crop warming at the existing result-application call
+site now admits daemon threads via a process-local nonblocking bounded semaphore.
+`FACE_CROP_WARM_CONCURRENCY` defaults to **2**, is read at module import, is clamped
+to 0–8, and falls back to 2 for invalid integers; 0 disables warming. Busy calls
+are skipped immediately: no executor backlog or queued image-byte-retaining
+closures. At most the admitted photos retain their source closures for warming.
+Slots are released in `finally`, and also on thread construction/start failure.
+Skipped/failed warming leaves the People route's existing on-demand crop fallback
+unchanged. This is a per-process cap, not a cross-replica limit or byte-size cap.
+
+The observed decline from approximately **4400 to 2250 photos/hour over 1.3 hours**
+is not yet attributed: the growing fresh-query cost is a plausible mechanism,
+not proof of the live cause. Compare phase distributions by path, time window,
+face counts and library growth after deployment, alongside existing inference and
+message/apply timings. Historical measurements above are not current evidence.
+These changes and focused fake-storage tests make no live queries and do not
+establish a production throughput improvement before deployment/measurement.
+
+### Queue, message, and sweep instrumentation
+
+`run_ipworker` emits `ipwork throughput metrics={...}` at INFO on the first
+poll-loop iteration at least **60 monotonic seconds** after the previous sample,
+plus a **forced final sample** on exit (including grace exhaustion). Blocking
+queue calls can delay the periodic sample; it is not a separate timer thread.
+Counters are main-thread-only and per replica, not a cross-replica aggregate:
+
+- `window_seconds`, `elapsed_seconds`, and `in_flight` describe the sample.
+  `window` resets after each log; `cumulative` persists for the worker lifetime.
+- Outcome counters: `done`, `noop`, `lease_busy`, `error`, `not_found` count
+  completed futures. Outcomes remain distinct from queue acknowledgements:
+  processing errors and lease contention below the retry limit are not deleted;
+  `noop`, `not_found`, and retry-limit lease contention can be acknowledged.
+  Existing max-retry drops return `done`, so that counter is not proof of a newly
+  persisted photo. `done_per_hour` is the current window's `done` count scaled
+  by its elapsed time (zero for a zero-length final window), not queue drain rate.
+- `receive` counts successful receive calls, including empty polls; `received`
+  counts returned messages. `receive_failed` includes failures enumerating the
+  SDK's lazy iterator. `receive_ms`/`receive_failed_ms` sum call **and enumeration**
+  wall time, not inferred queue depth or server-only latency.
+- `ack`/`ack_failed` count successful/failed `delete_message` attempts, with
+  summed `ack_ms`/`ack_failed_ms`. A successful processing outcome with a failed
+  acknowledgement remains eligible for redelivery. Duration keys appear only
+  when observed; ordinary counters are emitted as zero when absent.
+
+`ipwork memory sample: peak_rss_mb=... in_flight=...` now accompanies each
+throughput sample (60-second cadence plus final), **not every completed photo**.
+It remains a best-effort process-wide peak-RSS measurement, not current memory
+or per-thread memory; sampling does not change concurrency, queue visibility,
+lease retry, or shutdown grace contracts.
+
+Existing `ipwork message timings` adds `requested_steps`, `runnable_steps`, and
+`face_count`. Requested-but-already-completed face work is excluded from runnable
+steps; its logged count is zero. Counts use only list/tuple-shaped `faces` in a
+dictionary-shaped face result; missing/malformed shapes yield zero without
+changing result application or causing a post-apply diagnostic failure. This is
+the processor's result count, not a count of accepted/persisted faces. Compare
+`steps_ms` and per-step inference times against `apply_ms` and the face-storage
+phase timings above; these nested durations must not be added twice.
+
+The independent sweep thread emits `ipwork sweep timings phase=... outcome=...
+duration_ms=...` for `claim_lock`, `stale_processing`, `tag_embedding_indexes`,
+and `trash_purge`. Each wrapper returns the original result and logs `done` on
+normal return (a denied lock is still a successful call); exceptions log `error`
+and propagate to the existing sweep-iteration handler. Lock denial skips scans,
+and a phase failure skips later phases in that iteration, unchanged. Sweep
+durations help distinguish maintenance work from queue processing and storage
+cost without introducing any extra storage requests.
