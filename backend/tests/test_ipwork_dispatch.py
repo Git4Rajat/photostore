@@ -101,22 +101,56 @@ def test_face_step_skips_enqueue_when_maintenance_cooldown_active(monkeypatch, d
     assert ('ipwork', 'done') in dispatch_ctx.job_statuses
 
 
-def test_non_face_step_does_not_trigger_clustering(monkeypatch, dispatch_ctx):
-    """An ipworker job covering only e.g. ocr/exif shouldn't touch clustering --
-    _queue_people_clustering_after_face_processing's own face_status=='done'
-    guard should no-op, not error."""
-    monkeypatch.setattr(app, '_run_ipwork_steps', lambda user_id, filename, steps: {'ocr': {'text': 'hi'}})
+@pytest.mark.parametrize('step', ['ocr', 'map_detection', 'thumbnail'])
+def test_non_face_step_does_not_trigger_clustering(monkeypatch, dispatch_ctx, step):
+    """Historical completed faces must not enqueue work for unrelated steps."""
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda user_id, filename, steps: {step: {}})
     monkeypatch.setattr(
         app, 'apply_client_processing_results_for_file',
-        lambda *a, **k: {'processing_state': 'active', 'ocr_status': 'done', 'face_status': 'pending'},
+        lambda *a, **k: {'processing_state': 'active', 'face_status': 'done', 'faceCount': 1},
     )
 
     app._handle_ipwork_queue_payload(
-        {'filename': 'photo.jpg', 'steps': ['ocr']}, 'job-2', 'lib-A',
+        {'filename': 'photo.jpg', 'steps': [step]}, 'job-2', 'lib-A',
     )
 
+    assert dispatch_ctx.incremental_assign == []
     assert dispatch_ctx.enqueue_clustering == []
     assert ('ipwork', 'done') in dispatch_ctx.job_statuses
+
+
+def test_mixed_job_with_completed_face_only_runs_ocr_without_clustering(monkeypatch, dispatch_ctx):
+    monkeypatch.setattr(app, 'claim_processing_lease', lambda *a, **k: {
+        'statuses': {'faceStatus': 'done', 'ocrStatus': 'pending'},
+    })
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *a: {})
+    monkeypatch.setattr(app, '_browser_processing_face_version_stale', lambda entity: False)
+    ran_steps = []
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda user_id, filename, steps:
+                        ran_steps.append(steps) or {'ocr': {'text': 'hi'}})
+    monkeypatch.setattr(app, 'apply_client_processing_results_for_file', lambda *a, **k: {
+        'processing_state': 'active', 'face_status': 'done', 'faceCount': 1,
+    })
+
+    assert app._handle_ipwork_queue_payload(
+        {'filename': 'photo.jpg', 'steps': ['face', 'ocr']}, 'job-mixed', 'lib-A',
+    ) == 'done'
+
+    assert ran_steps == [['ocr']]
+    assert dispatch_ctx.incremental_assign == []
+    assert dispatch_ctx.enqueue_clustering == []
+
+
+def test_mixed_job_with_runnable_face_still_queues_assignment(monkeypatch, dispatch_ctx):
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a: {'face': {'faces': [{}]}, 'ocr': {}})
+    monkeypatch.setattr(app, 'apply_client_processing_results_for_file', lambda *a, **k: {
+        'processing_state': 'active', 'face_status': 'done', 'faceCount': 1,
+    })
+
+    assert app._handle_ipwork_queue_payload(
+        {'filename': 'photo.jpg', 'steps': ['face', 'ocr']}, 'job-mixed-face', 'lib-A',
+    ) == 'done'
+    assert dispatch_ctx.incremental_assign == [('lib-A', 'photo.jpg')]
 
 
 def test_clustering_trigger_failure_does_not_fail_the_job(monkeypatch, dispatch_ctx):
@@ -259,6 +293,7 @@ def test_stale_face_embedding_version_forces_rerun_despite_done_lease_status(mon
 
     assert outcome == 'done'
     assert ran_steps == [['face']]
+    assert dispatch_ctx.incremental_assign == [('lib-A', 'photo.jpg')]
     assert ('ipwork', 'skipped') not in dispatch_ctx.job_statuses
 
 
