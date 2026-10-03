@@ -279,6 +279,175 @@ def test_checkpoint_rejects_unsnapshotted_committed_assignment(tmp_path):
     assert result['third'] == h.faces.rows['u', 'second']['personId']
 
 
+def test_checkpoint_default_is_thirty_minutes():
+    assert AssignmentConfig().checkpoint_interval_seconds == 1800
+
+
+def test_periodic_checkpoint_saves_dirty_only_after_thirty_minutes(tmp_path):
+    import time
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    pointer = next((tmp_path / 'share').glob('*/CURRENT'))
+    baseline = pointer.read_bytes()
+    assignment._ACTIVE.last_checkpoint = time.monotonic() - 1801
+    with h.assigner.batch('u') as assign:
+        assign('photo.jpg', ['first'])
+    assert pointer.read_bytes() == baseline
+    h.face('second')
+    h.assign('second')
+    assert pointer.read_bytes() != baseline
+    assert assignment._ACTIVE.saved_revision == assignment._ACTIVE.completed_revision
+
+
+def test_checkpoint_post_save_lease_loss_does_not_advance_baseline(tmp_path, monkeypatch):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    h.face('second')
+    h.assign('second')
+    active = assignment._ACTIVE
+    baseline = active.saved_revision
+    with h.lease('u') as guard:
+        h.fail_check = h.checks + 2  # initial safety check passes; post-save fails
+        with pytest.raises(RuntimeError, match='lost lease'):
+            h.assigner._checkpoint('u', guard, force=True)
+    assert active.saved_revision == baseline
+
+
+def test_checkpoint_unchanged_batch_and_restored_baseline_skip_save(tmp_path, monkeypatch):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share'),
+                                       checkpoint_interval_seconds=0))
+    h.face('first')
+    h.assign('first')
+    h.assigner.invalidate()
+    with h.lease('u') as guard:
+        h.assigner._runtime('u', guard)
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'save_checkpoint',
+                        lambda *a, **kw: pytest.fail('unchanged state must not be saved'))
+    with h.assigner.batch('u') as assign:
+        assign('photo.jpg', ['first'])
+    assert not h.assigner.final_checkpoint()
+
+
+def test_final_checkpoint_forces_dirty_save_past_interval(tmp_path):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    pointer = next((tmp_path / 'share').glob('*/CURRENT'))
+    baseline = pointer.read_bytes()
+    h.face('second')
+    h.assign('second')
+    assert pointer.read_bytes() == baseline
+    assert h.assigner.final_checkpoint()
+    assert pointer.read_bytes() != baseline
+    assert not h.assigner.final_checkpoint()
+    h.assigner.invalidate()
+    h.faces.fail_query = RuntimeError('final save must restore without scan')
+    h.face('third')
+    h.assign('third')
+
+
+@pytest.mark.parametrize('mismatch', ['owner', 'generation', 'external_revision', 'assignment_revision'])
+def test_final_checkpoint_refuses_mismatched_state(tmp_path, monkeypatch, mismatch):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    h.face('second')
+    h.assign('second')
+    if mismatch == 'owner':
+        assignment._ACTIVE.owner = object()
+    elif mismatch == 'generation':
+        assignment._ACTIVE.generation = 'different-owner'
+    elif mismatch == 'external_revision':
+        h.generation = 'new-curation'
+    else:
+        h.assignment_revision += 1
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'save_checkpoint',
+                        lambda *a, **kw: pytest.fail('mismatch must not save'))
+    assert not h.assigner.final_checkpoint()
+
+
+@pytest.mark.parametrize('failure', ['people', 'members', 'faces', 'metadata'])
+def test_final_checkpoint_does_not_bless_failed_assignment(tmp_path, monkeypatch, failure):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    h.face('second')
+    if failure == 'metadata':
+        h.metadata_error = RuntimeError('projection failed')
+    else:
+        getattr(h, failure).fail_write = RuntimeError('unknown commit outcome')
+    with pytest.raises(RuntimeError):
+        h.assign('second')
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'save_checkpoint',
+                        lambda *a, **kw: pytest.fail('failed assignment must not save'))
+    assert not h.assigner.final_checkpoint()
+
+
+def test_final_checkpoint_refuses_failed_owned_face_projection_on_dirty_runtime(tmp_path, monkeypatch):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    h.face('second')
+    h.assign('second')
+    h.metadata_error = RuntimeError('owned retry projection failed')
+    with pytest.raises(RuntimeError):
+        h.assign('first')
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'save_checkpoint',
+                        lambda *a, **kw: pytest.fail('failed projection must not save'))
+    assert not h.assigner.final_checkpoint()
+
+
+@pytest.mark.parametrize('staged', [False, True])
+def test_final_checkpoint_does_not_bless_swallowed_batch_failure(tmp_path, monkeypatch, staged):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.face('second')
+    h.metadata_error = RuntimeError('projection failed')
+    with h.assigner.batch('u', staged=staged) as assign:
+        if staged:
+            assign('photo.jpg', ['first', 'second'])
+        else:
+            with pytest.raises(RuntimeError):
+                assign('photo.jpg', ['first'])
+    assert assignment._ACTIVE is None
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'save_checkpoint',
+                        lambda *a, **kw: pytest.fail('failed batch must not save'))
+    assert not h.assigner.final_checkpoint()
+
+
+@pytest.mark.parametrize('error', [OSError('share offline'), RuntimeError('serialization failed')])
+def test_final_checkpoint_failure_remains_dirty_and_retries(tmp_path, monkeypatch, caplog, error):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    h.face('second')
+    h.assign('second')
+    original = assignment._ACTIVE.saved_revision
+    with monkeypatch.context() as patch:
+        def fail(*args, **kwargs):
+            raise error
+        patch.setattr(assignment.LiveFaceIndex, 'save_checkpoint', fail)
+        assert not h.assigner.final_checkpoint()
+    assert assignment._ACTIVE.saved_revision == original
+    assert 'checkpoint save unavailable' in caplog.text
+    assert h.assigner.final_checkpoint()
+
+
+def test_final_checkpoint_lease_failure_is_logged_without_save(tmp_path, monkeypatch, caplog):
+    h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share')))
+    h.face('first')
+    h.assign('first')
+    h.face('second')
+    h.assign('second')
+    h.fail_check = h.checks + 1
+    monkeypatch.setattr(assignment.LiveFaceIndex, 'save_checkpoint',
+                        lambda *a, **kw: pytest.fail('lost lease must not save'))
+    assert not h.assigner.final_checkpoint()
+    assert 'final checkpoint refused or failed' in caplog.text
+
+
 def test_checkpoint_rejects_commit_then_error(tmp_path):
     h = Harness(config=AssignmentConfig(checkpoint_dir=str(tmp_path / 'share'),
                                        checkpoint_interval_seconds=0))
@@ -500,7 +669,8 @@ def test_staged_metadata_projects_concurrently_and_reports_individual_failures()
         assign('b.jpg', ['b'])
         assign.project('a.jpg')
     assert set(assign.metadata_errors) == {'a.jpg'}
-    assert assignment._ACTIVE is not None
+    # Incomplete projection cannot become a graceful-shutdown checkpoint.
+    assert assignment._ACTIVE is None
 
 
 def test_transaction_partition_and_count_limits():

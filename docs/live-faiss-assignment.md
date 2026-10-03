@@ -37,7 +37,7 @@ not silently fall back to library-wide linear scans.
 | `PEOPLE_FAISS_MEMORY_BUDGET_BYTES` | `2147483648` |
 | `PEOPLE_FAISS_WORK_DIR` | system temporary directory; worker deployment uses local EmptyDir |
 | `PEOPLE_FAISS_CHECKPOINT_DIR` | disabled unless set; worker deployment uses the Azure Files mount |
-| `PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS` | `300`; `0` saves every completed nonempty assignment batch |
+| `PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS` | `1800` (30 minutes); `0` saves every completed dirty assignment batch |
 | `CLUSTERING_WORKER_BATCH_SIZE` | `1` (opt-in; start with `8`, maximum `32`) |
 | `PEOPLE_FAISS_IO_CONCURRENCY` | `4` (maximum `16`) |
 | `PEOPLE_FAISS_COALESCE_WRITES` | `false`; experimental staged persistence/projection path requires explicit `true` |
@@ -161,17 +161,50 @@ Lease loss prevents normal completion. Snapshots retain the acquired curation
 revision, never a newer token from an edit the local runtime has not applied.
 
 After successful persistence and metadata projection, the adapter saves the first
-snapshot and then rate-limits saves to the configured interval. **This is not a
-durable delta journal.** If assignments committed since the last snapshot, that
-snapshot is rejected on restart and cloud rebuild is required. Setting the
-interval to 0 removes the completed-batch window but copies the whole SQLite/base/
-delta snapshot after every batch; this is NOT suitable for the million-face,
-10,000-photos/hour target. Keep the warm replica floor while a durable incremental
-journal and measured recovery/throughput work remain outstanding.
+snapshot and then rate-limits full SQLite/base/delta snapshots to **1800 seconds
+(30 minutes)** by default. The interval is evaluated at successful batch boundaries,
+not by a background timer; idle unchanged state does not generate snapshots.
+Successfully saved/restored revision pairs form the unchanged-state baseline.
+Owned-face retries do not resave that baseline even when the interval has elapsed.
 
-Immutable generations are not automatically pruned: provision share capacity
-and monitor usage. Failed publication can leave an unused generation. Cleanup
-must preserve readers' generations; do not delete them during active restore.
+On SIGTERM/SIGINT the clustering worker stops polling, finishes the already-claimed
+bounded synchronous group (including persistence, projections and acknowledgements),
+then attempts a **dirty-only final checkpoint**, bypassing the interval. The final
+save reacquires the library lease under the process lock and requires the same
+adapter, library, cache ownership generation, external revision and completed
+assignment revision. Failed/partial assignments and failed metadata projections
+are not blessed by shutdown; unsafe caches are refused or invalidated. Share,
+serialization or lease errors are logged and recovery falls back to cold rebuild.
+
+**This is not a durable delta journal.** Abrupt termination, OOM, SIGKILL, share
+failure, lease contention/ownership transfer or an insufficient platform shutdown
+grace period can prevent the final save. A full snapshot can exceed that grace
+period. If assignments committed since the last usable snapshot, that snapshot
+is rejected on restart and cloud rebuild is required. Setting the interval to 0
+copies the full snapshot after every changed completed batch; this is NOT suitable
+for the million-face, 10,000-photos/hour target. No replica floor is changed here.
+
+Best-effort retention runs after successful publication. It protects CURRENT and
+the two newest complete generation directories (these sets may overlap), and
+only deletes other generated directories after a **24-hour age grace** measured
+from the newest directory/file modification time. Complete-but-unpublished
+generations are conservatively counted among the recent snapshots. Aged abandoned
+partial generations are eligible too. Only exact `gen-<32 lowercase hex>` names
+and flat regular `manifest.json`, `faces.sqlite3`, `index-<digits>.faiss` files are
+removed; unknown files, directories, symlinks and young staging data are untouched.
+Malformed/missing CURRENT or cleanup errors skip pruning, never undo publication.
+
+Restore holds a shared advisory `.checkpoint.lock` from pointer selection through
+local copying/loading; publication and retention hold an exclusive lock. Locks
+are nonblocking: contention or unavailable locking fails safely rather than deleting
+under a copying reader. The lock inode is never removed. **All participating
+readers/writers must use this protocol and the trusted Unix mounted share must
+honor cross-process/cross-client `flock`** (do not use mount options disabling
+remote byte-range locks). Older readers do not take the lock: quiesce them before
+enabling this version's pruning. The age grace alone is not a reader guarantee.
+Validate mount locking in the deployment environment before relying on retention;
+local tests cannot certify SMB locking. Retention is opportunistic, not a strict
+disk cap: provision capacity for 24 hours of full snapshots and monitor usage.
 Old worker images do not understand the extended lease-state schema: do not
 mix old and checkpoint-aware writers or roll back the image without a migration.
 

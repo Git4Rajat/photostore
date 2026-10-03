@@ -5287,7 +5287,7 @@ def _get_live_faiss_assigner():
                 coalesce_writes=os.getenv('PEOPLE_FAISS_COALESCE_WRITES', 'false').strip().lower() in ('true', '1', 'yes'),
                 work_dir=os.getenv('PEOPLE_FAISS_WORK_DIR') or None,
                 checkpoint_dir=os.getenv('PEOPLE_FAISS_CHECKPOINT_DIR') or None,
-                checkpoint_interval_seconds=float(os.getenv('PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS', '300')),
+                checkpoint_interval_seconds=float(os.getenv('PEOPLE_FAISS_CHECKPOINT_INTERVAL_SECONDS', '1800')),
                 index_config=IndexConfig(memory_budget_bytes=int(
                     os.getenv('PEOPLE_FAISS_MEMORY_BUDGET_BYTES', str(2 * 1024 ** 3)))),
             ),
@@ -12882,7 +12882,7 @@ def run_clustering_worker() -> None:
                 library_ops_client, LIBRARY_OPS_QUEUE_NAME, LIBRARY_CLEAN_MAX_RETRIES,
                 library_ops_deadletter_client,
             )
-            if not processed_any:
+            if not processed_any and not shutdown_requested.is_set():
                 if batch_size == 1:
                     processed_any = _poll_clustering_queue_once(
                         queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
@@ -12891,11 +12891,20 @@ def run_clustering_worker() -> None:
                     processed_any = _poll_clustering_queue_batch_once(
                         queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
                         clustering_deadletter_client, batch_size=batch_size)
-            if not processed_any:
+            if not processed_any and not shutdown_requested.is_set():
                 time.sleep(poll_seconds)
         except Exception:
             worker_logger.exception('Queue polling iteration failed')
-            time.sleep(poll_seconds)
+            if not shutdown_requested.is_set():
+                time.sleep(poll_seconds)
+
+    # Synchronous polling finishes the bounded in-flight group before reaching
+    # here. Do not initialize an adapter or rebuild an absent/unsafe runtime.
+    if _live_faiss_assigner is not None:
+        try:
+            _live_faiss_assigner.final_checkpoint()
+        except Exception:
+            worker_logger.exception('Final clustering checkpoint failed; restart may rebuild')
 
 
 # Populated by ipworker model-implementation modules (face detect/embed, OCR,

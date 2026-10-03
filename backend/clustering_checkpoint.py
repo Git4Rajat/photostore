@@ -8,9 +8,12 @@ revision covering EVERY latest completed durable assignment batch (including
 assignment publication/main journal), not merely curation or a lease token.
 Never save mid-publication. Equal revision must mean equal authoritative data.
 
-No generation is deleted here, even after failed publication: a concurrent
-reader may hold its name. Cleanup requires an externally enforced reader grace
-period/quiescence, not just writer ownership. Schedule saves/rebuild explicitly;
+Conservative retention keeps CURRENT and two recent complete generations, plus
+all files younger than 24 hours. Cooperative share locks protect readers while
+copying; cleanup never follows symlinks or removes unknown directory contents.
+The trusted mount must support cross-process flock (all writers/readers must use
+this protocol). Lock errors fail closed, never trigger unlocked cleanup.
+Schedule saves/rebuild explicitly;
 background rebuild is deferred because sibling training + replay have no proven
 aggregate memory/disk bound. Caller provisions enough local/share disk space.
 
@@ -25,9 +28,12 @@ never the transient owner token or workdir. Moving that directory invalidates it
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import contextmanager
 import errno
+import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -35,6 +41,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 import uuid
 
 import numpy as np
@@ -44,6 +51,79 @@ FORMAT_VERSION = 1
 CHUNK_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 _GENERATION = re.compile(r'gen-[0-9a-f]{32}\Z')
+_GENERATED_FILE = re.compile(r'(?:manifest\.json|faces\.sqlite3|index-[0-9]+\.faiss)\Z')
+RETENTION_GRACE_SECONDS = 24 * 60 * 60
+_LOGGER = logging.getLogger(__name__)
+
+
+@contextmanager
+def _share_lock(share, *, exclusive):
+    """Nonblocking cooperative lock; unsupported/disconnected mounts fail closed.
+
+    Never unlink the lock inode. Shared restore locks span pointer read through
+    local copying; exclusive save/cleanup locks eliminate reader selection races.
+    """
+    if share.is_symlink():
+        raise ValueError('Checkpoint directory must not be a symlink')
+    fd = os.open(share / '.checkpoint.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        import stat
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('Checkpoint lock must be a regular file')
+        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def cleanup_checkpoints(directory):
+    """Best-effort aged retention, safe only with the cooperative reader protocol."""
+    share = Path(directory)
+    try:
+        with _share_lock(share, exclusive=True):
+            return _cleanup_checkpoints(share)
+    except (OSError, ValueError, KeyError, TypeError):
+        _LOGGER.warning('faiss checkpoint retention skipped directory=%s', share, exc_info=True)
+        return []
+
+
+def _cleanup_checkpoints(share):
+    # An absent/corrupt CURRENT is not permission to delete anything.
+    pointer, _ = _read_json(share / 'CURRENT', 4096)
+    current = pointer['generation']
+    _require(type(current) is str and _GENERATION.fullmatch(current))
+    _require(not (share / current).is_symlink())
+    manifest, raw = _read_json(share / current / 'manifest.json', MAX_MANIFEST_BYTES)
+    _require(hashlib.sha256(raw).hexdigest() == pointer['sha256'])
+    _require(manifest['identity'] == _identity(share))
+    candidates = []
+    for path in share.iterdir():
+        if not _GENERATION.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
+            continue
+        files = list(path.iterdir())
+        if any(not _GENERATED_FILE.fullmatch(p.name) or p.is_symlink()
+               or not p.is_file() for p in files):
+            continue
+        # Include last file-write time: an old directory can be a live staging
+        # generation. Complete but unpublished generations are retained too.
+        modified = max([path.stat().st_mtime, *(p.stat().st_mtime for p in files)])
+        complete = any(p.name == 'manifest.json' for p in files)
+        candidates.append((modified, path, files, complete))
+    recent = sorted((item for item in candidates if item[3]),
+                    key=lambda item: (item[0], item[1].name), reverse=True)
+    protected = {current, *(item[1].name for item in recent[:2])}
+    cutoff = time.time() - RETENTION_GRACE_SECONDS
+    removed = []
+    for modified, path, files, _ in candidates:
+        if path.name in protected or modified >= cutoff:
+            continue
+        # No recursive removal: flat generated regular files only. All cooperating
+        # publishers/readers are excluded by the exclusive lock throughout.
+        for file in files:
+            file.unlink()
+        path.rmdir()
+        removed.append(path.name)
+    return removed
 
 
 class CorruptCheckpoint(ValueError):
@@ -156,6 +236,22 @@ def _description(runtime, key, index, kind, filename):
 
 
 def save_checkpoint(runtime, directory, *, source_revision):
+    share = Path(directory)
+    _separate(runtime._directory, share)
+    if share.is_symlink():
+        raise ValueError('Checkpoint directory must not be a symlink')
+    share.mkdir(parents=True, exist_ok=True)
+    with _share_lock(share, exclusive=True):
+        generation = _save_checkpoint(runtime, directory, source_revision=source_revision)
+        try:
+            _cleanup_checkpoints(share)
+        except (OSError, ValueError, KeyError, TypeError):
+            # Publication already succeeded. Cleanup failure must not undo it.
+            _LOGGER.warning('faiss checkpoint retention skipped directory=%s', share, exc_info=True)
+        return generation
+
+
+def _save_checkpoint(runtime, directory, *, source_revision):
     revision = _revision(source_revision)
     share = Path(directory)
     _separate(runtime._directory, share)
@@ -306,6 +402,20 @@ def _load_index(path, group, runtime):
 
 
 def restore_checkpoint(cls, checkpointdir, workdir, *, source_revision, config=None, **kwargs):
+    _separate(Path(workdir), Path(checkpointdir))
+    if Path(checkpointdir).is_symlink():
+        return None
+    try:
+        with _share_lock(Path(checkpointdir), exclusive=False):
+            return _restore_checkpoint(cls, checkpointdir, workdir, source_revision=source_revision,
+                                       config=config, **kwargs)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EISDIR):
+            return None
+        raise
+
+
+def _restore_checkpoint(cls, checkpointdir, workdir, *, source_revision, config=None, **kwargs):
     revision = _revision(source_revision)
     share, work = Path(checkpointdir), Path(workdir)
     _separate(work, share)

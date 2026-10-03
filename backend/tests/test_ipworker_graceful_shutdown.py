@@ -64,6 +64,10 @@ class _FakeQueueServiceClient:
 
 
 def _quiet_startup(monkeypatch) -> None:
+    # Registration imports optional heavy model dependencies before the signal
+    # handler is installed. These tests exercise drain mechanics, not models;
+    # cold imports can otherwise outlast the sender's two-second deadline.
+    monkeypatch.setattr(app, '_register_ipwork_processors', lambda: None)
     monkeypatch.setattr(app, '_prewarm_ipwork_models', lambda: None)
     monkeypatch.setattr(app, '_ipwork_sweep_loop', lambda: None)
     monkeypatch.setenv('IPWORKER_POLL_SECONDS', '0.05')
