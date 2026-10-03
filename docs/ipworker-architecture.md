@@ -1,3 +1,10 @@
+# Bounded face-index preparation
+
+The ipworker now supports bounded authoritative filename-index reconciliation
+before photo processing. See [ipworker-face-batch-reconciliation.md](ipworker-face-batch-reconciliation.md)
+for the generation safety contract, default batch size 8, rollback size 1,
+queue visibility/shutdown behavior, and batch/page diagnostics.
+
 # ipworker background-processing architecture (as of 2026-08-28)
 
 Scope: how server-side AI processing of uploaded photos actually works today —

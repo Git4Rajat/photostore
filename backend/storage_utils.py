@@ -1108,6 +1108,115 @@ def _face_filename_mutations(user_id: str, filenames):
         raise
 
 
+def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=None) -> Dict:
+    """Amortize UNKNOWN filename lookups with one streamed authoritative scan.
+
+    This is not a library cache or a freshness guess. Acquire every unknown
+    filename generation before scanning, exhaust every page, then CAS-publish
+    each actual ID set (including proven zeros). Existing complete generations
+    are untouched. Normal photo writers still point-read fresh face/curation
+    rows when applying results. Memory is bounded by batch names and retained
+    IDs, not library size; excessive IDs or any failure leave acquired rows
+    dirty. The caller may abandon preparation on shutdown/visibility deadline.
+    """
+    names = sorted(set(filenames))
+    if len(names) > 32 or any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError('Face reconciliation requires at most 32 nonempty filenames')
+    started = time.monotonic()
+    metrics = {'requested': len(names), 'indexed': 0, 'reconciled': 0,
+               'pages': 0, 'rows_returned': 0, 'ids_retained': 0, 'query_ms': 0,
+               'path': 'indexed', 'filter': 'none', 'outcome': 'error'}
+    generations = _FaceFilenameGenerations()
+
+    def check_cancelled():
+        if cancelled is not None and cancelled():
+            raise FaceFilenameLookupRetryableError('Batch reconciliation cancelled')
+
+    try:
+        face_table = _CTX.get('face_table_client')
+        lookup_table = _CTX.get('face_by_filename_table_client')
+        if face_table is None or lookup_table is None:
+            raise FaceFilenameLookupRetryableError('Face reconciliation storage unavailable')
+        for name in names:
+            check_cancelled()
+            row = _face_filename_row(lookup_table, user_id, name)
+            if row is not None and _validated_face_filename_ids(row) is not None:
+                metrics['indexed'] += 1
+                continue
+            generation, prior_ids = _begin_face_filename_write(user_id, name)
+            generations[name] = generation
+            _renew_face_filename_mutations(user_id, generations)
+            if prior_ids is not None:
+                # Another writer completed between our read and acquisition.
+                # Restore that authoritative set, never replace it from a
+                # scan that started before its generation was acquired.
+                _finish_face_filename_write(user_id, name, generation, prior_ids)
+                del generations[name]
+                metrics['indexed'] += 1
+        if generations:
+            metrics['path'] = 'partition_scan'
+            ids_by_name = {name: set() for name in generations}
+            query = f"PartitionKey eq '{_escape_odata(user_id)}'"
+            metrics['filter'] = 'partition'
+            if len(generations) == 1:
+                metrics['filter'] = 'filename'
+                query += f" and filename eq '{_escape_odata(next(iter(generations)))}'"
+            elif len(generations) <= 14:
+                metrics['filter'] = 'filename_or'
+                # Azure Table limits filters to 15 comparisons (one is PK).
+                # Still a library-scale SERVER scan, but return only this
+                # batch's IDs rather than transferring the entire library.
+                query += ' and (' + ' or '.join(
+                    f"filename eq '{_escape_odata(name)}'" for name in generations) + ')'
+            query_started = time.monotonic()
+            try:
+                rows = face_table.query_entities(query, select=['RowKey', 'filename'])
+                # Azure's paging API lets us measure and cancel even when a
+                # server-side filtered page is empty. Fakes may be flat lists.
+                pages = rows.by_page() if hasattr(rows, 'by_page') else iter([rows])
+                for page in pages:
+                    check_cancelled()
+                    _renew_face_filename_mutations(user_id, generations)
+                    metrics['pages'] += 1
+                    for row in page:
+                        check_cancelled()
+                        _renew_face_filename_mutations(user_id, generations)
+                        metrics['rows_returned'] += 1
+                        name = str(row.get('filename') or '')
+                        if name not in ids_by_name:
+                            continue
+                        face_id = row.get('RowKey')
+                        if not isinstance(face_id, str) or not face_id.strip():
+                            raise ValueError('Face row has invalid ID')
+                        ids = ids_by_name[name]
+                        if face_id not in ids:
+                            ids.add(face_id)
+                            metrics['ids_retained'] += 1
+                        if len(ids) > 4096 or metrics['ids_retained'] > 8192:
+                            raise FaceFilenameLookupRetryableError('Batch face ID bound exceeded')
+                check_cancelled()
+                # Validate all leases AFTER exhaustion; an expired scan must
+                # never be converted to a complete-empty answer.
+                _renew_face_filename_mutations(user_id, generations, force=True)
+            finally:
+                metrics['query_ms'] = round((time.monotonic() - query_started) * 1000, 3)
+            for name, generation in generations.items():
+                check_cancelled()
+                _renew_face_filename_write(user_id, name, generation)
+                _finish_face_filename_write(user_id, name, generation, sorted(ids_by_name[name]))
+                metrics['reconciled'] += 1
+        metrics['outcome'] = 'done'
+        return metrics
+    except Exception:
+        for name, generation in generations.items():
+            _release_failed_face_filename_write(user_id, name, generation)
+        raise
+    finally:
+        metrics['total_ms'] = round((time.monotonic() - started) * 1000, 3)
+        # No filenames, payloads or exception text in the aggregate record.
+        _LOGGER.info('face index batch timings metrics=%s', json.dumps(metrics, sort_keys=True))
+
+
 def _store_client_face_entities(user_id: str, filename: str, faces, *, force_reconcile: bool = False) -> List[str]:
     if _CTX.get('face_table_client') is None or not isinstance(faces, list):
         return []

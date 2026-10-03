@@ -71,6 +71,9 @@ def _run_until_idle(monkeypatch, queue_client) -> None:
     """Runs app.run_ipworker() until it drains all in-flight work and would
     otherwise block on time.sleep() waiting for new messages -- at that
     point it's fully idle, so raise out instead of actually sleeping."""
+    # These exercise the rollback (no preparation) queue path. Bounded batch
+    # visibility and inference limits have dedicated integration coverage.
+    monkeypatch.setattr(app, 'IPWORKER_FACE_RECONCILE_BATCH_SIZE', 1)
     monkeypatch.setattr(app, 'queue_service_client', _FakeQueueServiceClient(queue_client))
     # These are loop/pool-mechanics tests, not a check that real models
     # load -- skip _prewarm_ipwork_models's real CLIP/ONNX/MediaPipe/

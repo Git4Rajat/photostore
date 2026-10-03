@@ -124,6 +124,7 @@ class _ImmediateExecutor:
 
 
 def _prepare_queue(monkeypatch, queue):
+    monkeypatch.setattr(app, 'IPWORKER_FACE_RECONCILE_BATCH_SIZE', 1)
     monkeypatch.setattr(app, 'queue_service_client', SimpleNamespace(get_queue_client=lambda name: queue))
     monkeypatch.setattr(app, '_register_ipwork_processors', lambda: None)
     monkeypatch.setattr(app, '_prewarm_ipwork_models', lambda: None)

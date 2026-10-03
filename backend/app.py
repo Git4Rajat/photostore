@@ -21,6 +21,7 @@ except ImportError:
 import unicodedata
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
@@ -83,6 +84,7 @@ from storage_utils import (
     _renew_face_filename_write,
     _finish_face_filename_write,
     _remove_face_person_member,
+    reconcile_face_filename_indexes_batch,
     PHOTO_LIST_SELECT_FIELDS,
     get_user_listing_index,
     download_media_bytes,
@@ -742,6 +744,7 @@ IPWORKER_MAX_RETRIES = int(os.getenv('IPWORKER_MAX_RETRIES', '5'))
 # memory was already the tighter constraint at ~66-77% peak at
 # concurrency=1, so this isn't guessed higher without measurement).
 IPWORKER_CONCURRENCY = max(1, int(os.getenv('IPWORKER_CONCURRENCY', '1')))
+IPWORKER_FACE_RECONCILE_BATCH_SIZE = max(1, min(32, int(os.getenv('IPWORKER_FACE_RECONCILE_BATCH_SIZE', '8'))))
 # How long run_ipworker's SIGTERM handler waits for in-flight messages to
 # finish (and their queue messages to be deleted) before force-exiting. Azure
 # Container Apps' default terminationGracePeriodSeconds is 30s -- a replica
@@ -13460,6 +13463,49 @@ def _trigger_tools_index_rebuild(user_id: str) -> None:
     threading.Thread(target=_fire, name='index-rebuild-trigger', daemon=True).start()
 
 
+def _prepare_ipwork_face_indexes(messages, cancelled) -> None:
+    """Queue-free, model-free preparation for one bounded receive batch.
+
+    Skip invalid/poison/non-face/deleted/already-current messages. Metadata is
+    only an eligibility hint, not proof of an empty namespace. The normal
+    processor still claims its lease and recomputes runnable steps afterward.
+    """
+    started = time.monotonic()
+    by_user = {}
+    for message in messages:
+        if cancelled():
+            return
+        if int(getattr(message, 'dequeue_count', 0) or 0) > IPWORKER_MAX_RETRIES:
+            continue
+        try:
+            payload = json.loads(message.content or '{}')
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get('steps'), list) or 'face' not in payload['steps']:
+            continue
+        user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+        filename = str(payload.get('filename') or '').strip()
+        if not user_id or not filename:
+            continue
+        try:
+            metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except ResourceNotFoundError:
+            continue
+        if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
+            continue
+        if (str(metadata.get('face_status') or '').strip().lower() in {'done', 'no_data', 'skipped', 'unsupported'}
+                and not _browser_processing_face_version_stale(metadata)):
+            continue
+        by_user.setdefault(user_id, set()).add(filename)
+    for user_id, filenames in by_user.items():
+        if cancelled():
+            return
+        reconcile_face_filename_indexes_batch(user_id, filenames, cancelled=cancelled)
+    worker_logger.info('ipwork face batch prepared messages=%d libraries=%d filenames=%d duration_ms=%.3f',
+                       len(messages), len(by_user), sum(len(names) for names in by_user.values()),
+                       (time.monotonic() - started) * 1000)
+
+
 def run_ipworker() -> None:
     """Poll the ipwork queue for jobs in a standalone container."""
     logging.basicConfig(
@@ -13508,6 +13554,16 @@ def run_ipworker() -> None:
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
     executor = ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork')
+    batch_size = IPWORKER_FACE_RECONCILE_BATCH_SIZE
+    # One bounded wave at a time: at most batch_size queue messages held,
+    # regardless of inference concurrency. No images/embeddings are prefetched.
+    # Preparation runs off the queue thread so ACKs/signals stay responsive.
+    preparation_executor = (ThreadPoolExecutor(max_workers=1, thread_name_prefix='ipwork-index')
+                            if batch_size > 1 else None)
+    preparing = None
+    preparation_messages = []
+    ready = deque()
+    batch_received_at = None
     in_flight = {}  # future -> message
     throughput = _IpworkThroughputWindow()
     # Files successfully processed per user since that user's last index
@@ -13527,6 +13583,37 @@ def run_ipworker() -> None:
                         'ipworker shutting down: draining %d in-flight message(s), grace=%ss',
                         len(in_flight), IPWORKER_SHUTDOWN_GRACE_SECONDS,
                     )
+                    # Unstarted messages are never ACKed. They redeliver;
+                    # only already-running photo work is drained normally.
+                    if ready:
+                        worker_logger.info('ipwork face batch deferred messages=%d reason=shutdown', len(ready))
+                    ready.clear()
+
+                if preparing is not None and preparing.done():
+                    try:
+                        preparing.result()
+                    except Exception:
+                        # Preparation is an optimization, never an ACK or a
+                        # fabricated zero. The ordinary per-photo path retries
+                        # authoritative reconciliation after a dirty failure.
+                        worker_logger.exception('ipwork face index batch preparation failed; using per-photo recovery')
+                    if not shutdown_requested.is_set():
+                        ready.extend(preparation_messages)
+                    elif preparation_messages:
+                        worker_logger.info('ipwork face batch deferred messages=%d reason=shutdown', len(preparation_messages))
+                    preparation_messages = []
+                    preparing = None
+
+                if preparation_executor is not None and not shutdown_requested.is_set():
+                    while ready and len(in_flight) < IPWORKER_CONCURRENCY:
+                        message = ready.popleft()
+                        # Do not START work with an old visibility receipt.
+                        # Leave at least half the timeout for normal processing.
+                        if time.monotonic() - batch_received_at >= IPWORKER_VISIBILITY_TIMEOUT_SECONDS / 2:
+                            worker_logger.info('ipwork face batch deferred messages=1 reason=visibility_budget')
+                            continue
+                        future = executor.submit(_process_ipwork_message, message)
+                        in_flight[future] = message
 
                 # Only fetch as many new messages as there are free worker
                 # slots -- keeps the pool saturated by refilling one slot at
@@ -13538,6 +13625,8 @@ def run_ipworker() -> None:
                 # each claimed message costs a full visibility timeout if it
                 # can't finish before the process exits.
                 free_slots = 0 if shutdown_requested.is_set() else min(IPWORKER_CONCURRENCY - len(in_flight), 32)
+                if preparation_executor is not None:
+                    free_slots = batch_size if not (in_flight or ready or preparing is not None) and not shutdown_requested.is_set() else 0
                 if free_slots > 0:
                     receive_started = time.monotonic()
                     try:
@@ -13551,11 +13640,24 @@ def run_ipworker() -> None:
                         raise
                     throughput.record('receive', (time.monotonic() - receive_started) * 1000)
                     throughput.record('received', count=len(messages))
-                    for message in messages:
-                        future = executor.submit(_process_ipwork_message, message)
-                        in_flight[future] = message
+                    if preparation_executor is not None and messages:
+                        batch_received_at = receive_started
+                        preparation_messages = messages
+                        # A batch scan may consume at most one quarter of the
+                        # visibility window (also capped at 120s). Cancellation
+                        # is checked while paging/acquiring/publishing. A blocked
+                        # SDK call is handled by the main shutdown grace clock.
+                        prepare_deadline = batch_received_at + min(120, IPWORKER_VISIBILITY_TIMEOUT_SECONDS / 4)
+                        preparing = preparation_executor.submit(
+                            _prepare_ipwork_face_indexes, messages,
+                            lambda: shutdown_requested.is_set() or time.monotonic() >= prepare_deadline,
+                        )
+                    else:
+                        for message in messages:
+                            future = executor.submit(_process_ipwork_message, message)
+                            in_flight[future] = message
 
-                if not in_flight:
+                if not in_flight and preparing is None and not ready:
                     # Queue fully drained (no in-flight work AND the receive
                     # above returned nothing): fire a final rebuild for every
                     # user who had files processed since their last trigger --
@@ -13576,7 +13678,7 @@ def run_ipworker() -> None:
                     worker_logger.warning(
                         'ipworker shutdown grace period elapsed with %d message(s) still in flight -- '
                         'exiting now, they will be redelivered after the visibility timeout',
-                        len(in_flight),
+                        len(in_flight) + len(preparation_messages),
                     )
                     grace_exhausted = True
                     break
@@ -13589,8 +13691,13 @@ def run_ipworker() -> None:
                 wait_timeout = poll_seconds
                 if shutdown_deadline is not None:
                     wait_timeout = max(0.1, min(poll_seconds, shutdown_deadline - time.monotonic()))
-                done, _pending = wait(list(in_flight.keys()), timeout=wait_timeout, return_when=FIRST_COMPLETED)
+                waiting = list(in_flight.keys()) + ([preparing] if preparing is not None else [])
+                done, _pending = wait(waiting, timeout=wait_timeout, return_when=FIRST_COMPLETED)
                 for future in done:
+                    if future is preparing:
+                        # Consume preparation on the next iteration; it has
+                        # no processing outcome and must NEVER ACK its batch.
+                        continue
                     message = in_flight.pop(future)
                     try:
                         outcome = future.result()
@@ -13653,6 +13760,8 @@ def run_ipworker() -> None:
         # useful) and force-exit immediately after so those stragglers can't
         # hang process termination past what Container Apps allows.
         executor.shutdown(wait=not grace_exhausted, cancel_futures=grace_exhausted)
+        if preparation_executor is not None:
+            preparation_executor.shutdown(wait=not grace_exhausted, cancel_futures=grace_exhausted)
         throughput.log(len(in_flight), force=True)
     if grace_exhausted:
         os._exit(0)
