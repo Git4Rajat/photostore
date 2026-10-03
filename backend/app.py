@@ -12643,11 +12643,8 @@ def _process_clustering_queue_message(message, queue_client, queue_name, max_ret
         if succeeded:
             with message_lock:
                 final_message = message_holder[0]
-            delete_started = time.monotonic()
             try:
                 queue_client.delete_message(final_message)
-                worker_logger.info('clustering message delete queue=%s delete_ms=%d',
-                                   queue_name, int((time.monotonic() - delete_started) * 1000))
             except Exception:
                 worker_logger.exception('Failed to delete %s queue message', queue_name)
         else:
@@ -12667,16 +12664,11 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
     """
     if not 1 <= batch_size <= 32:
         raise ValueError('batch_size must be between 1 and 32')
-    whole_batch_started = time.monotonic()
-    receive_started = whole_batch_started
     messages = list(queue_client.receive_messages(
         messages_per_page=batch_size, max_messages=batch_size,
         visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS))
-    receive_ms = int((time.monotonic() - receive_started) * 1000)
     if not messages:
         return False
-    worker_logger.info('clustering batch receive queue=%s receive_ms=%d messages=%d',
-                       queue_name, receive_ms, len(messages))
     holders = [[message, True] for message in messages]
     lock = threading.Lock()
     stop = threading.Event()
@@ -12736,12 +12728,8 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
                     return error
 
             concurrency = _get_live_faiss_assigner().config.io_concurrency
-            prepare_started = time.monotonic()
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 preparations = list(pool.map(prepare, group))
-            prepare_ms = int((time.monotonic() - prepare_started) * 1000)
-            worker_logger.info('clustering batch prepare user=%s messages=%d prepare_ms=%d concurrency=%d',
-                               user, len(group), prepare_ms, concurrency)
             all_ids = [fid for item in preparations if not isinstance(item, Exception)
                        for fid in item[1]]
             assigner = _get_live_faiss_assigner()
@@ -12801,9 +12789,6 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
     finally:
         stop.set()
         thread.join(timeout=5)
-        worker_logger.info('clustering batch total queue=%s messages=%d receive_ms=%d total_ms=%d',
-                           queue_name, len(messages), receive_ms,
-                           int((time.monotonic() - whole_batch_started) * 1000))
     return True
 
 
@@ -13157,13 +13142,10 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
         # into people -- they'd just sit unassigned until someone manually
         # ran the admin recluster-repair flow.
         cluster_started = time.monotonic()
-        # Historical face_status='done' is not evidence this job changed faces.
-        # Gate on executed steps, not requested steps (face may have been skipped).
-        if 'face' in runnable_steps:
-            try:
-                _queue_people_clustering_after_face_processing(user_id, filename, metadata)
-            except Exception:
-                worker_logger.exception('Failed to auto-queue clustering for %s after ipwork', filename)
+        try:
+            _queue_people_clustering_after_face_processing(user_id, filename, metadata)
+        except Exception:
+            worker_logger.exception('Failed to auto-queue clustering for %s after ipwork', filename)
         cluster_ms = round((time.monotonic() - cluster_started) * 1000)
         _upsert_job_status(job_id, user_id, 'ipwork', 'done')
         # Total-vs-sum-of-parts breakdown for the whole message, not just the
