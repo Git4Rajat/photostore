@@ -37,8 +37,9 @@ it does not change the face data model or supply immutable upload identities.
   fresh face rows, preserving rejected/confirmed/propagated/named identities.
 - Acquired generations become dirty on scan, lease, cancellation, bounds or
   publication failure (or remain incomplete if the cleanup itself fails).
-  Preparation failure never ACKs a message and never fabricates a zero: normal
-  per-photo reconciliation handles recovery.
+  Preparation failure never ACKs a message and never fabricates a zero. The
+  entire wave is deferred for queue redelivery; it does **not** immediately fan
+  out per-photo recovery scans into all inference slots.
 
 ## Queue visibility and shutdown
 
@@ -50,8 +51,24 @@ Preparation has a cooperative deadline of the smaller of 120s or one quarter
 of the queue visibility timeout. It checks cancellation between acquisition,
 pages, returned rows and publications. Messages are not started after half
 their original visibility timeout; unstarted jobs are left unacknowledged and
-redeliver normally. A slow SDK request cannot be interrupted mid-call, so the
-main loop still applies the normal shutdown grace/force-exit policy.
+redeliver normally. Standalone batch reconciliation also has a 90s cooperative
+budget. Both batch and per-photo fallback queries use a 10s service timeout,
+5s connection timeout, 15s socket read timeout, and zero SDK retries. These are
+**per request/page**, not an absolute deadline spanning the whole query.
+Per-photo fallback enumeration checks a 90s overall budget on pages, rows and
+exhaustion, and renews the filename lease every 30s, including empty pages.
+Partial/expired enumeration cannot authorize source mutations or verified zero.
+
+A blocked SDK/native call cannot be killed safely as a Python thread. The main
+loop checks preparation against its cooperative deadline plus 20s, and photo
+tasks against `IPWORKER_TASK_TIMEOUT_SECONDS` (default 120s, clamped 1–240s and
+further limited to visibility timeout minus 30s). An overrun dumps thread stacks,
+shuts executors down without waiting, and exits the **process with status 1**.
+It never replaces the blocked thread or ACKs unfinished jobs. Container restart,
+queue redelivery and expired filename/processing leases provide recovery.
+Checks run at polling-loop boundaries; main-thread queue/rebuild IO and startup
+model warming are not covered by this background-task watchdog. Socket timeouts
+and cooperative budgets alone are not a universal hard wall-clock guarantee.
 
 On shutdown no new wave is received, ready messages are abandoned unacknowledged,
 preparation is cancelled cooperatively, and only active photo tasks are drained.
@@ -67,10 +84,24 @@ examined; page counts are not SDK HTTP retry counts. New aggregate records
 contain no filenames, payloads or credentials.
 
 `ipwork face batch prepared ...` reports preparation size and duration.
-`ipwork face batch deferred ...` distinguishes shutdown/visibility-budget
+`ipwork face batch deferred ...` distinguishes preparation-failure/shutdown/visibility-budget
 deferrals from processing failures. Existing throughput counters still count
 normal completion/ACK independently; `in_flight` represents photo tasks, not
 unstarted preparation messages.
+
+`ipwork watchdog timeout ...` identifies stuck preparation/tasks and pending
+counts. `face storage timings` includes `query_pages` for fallback enumeration.
+
+### Revision 0000025 stall investigation
+
+All four replicas reported preparation cancellation around 75s. They then
+launched per-photo fallback queries taking 162–250s and failed when their 120s
+filename leases expired. Throughput counters continued, and later messages
+started: this proves a severe scan-driven stall, not a permanent preparation
+future deadlock. The separate clustering worker was observed starting a FAISS
+cold build; that record does not establish the same failure there. These limits
+and deferrals prevent the fallback cascade, but do not make non-keyed partition
+scans fast or certify the 10,000-new-photos/hour target.
 
 After rollout compare:
 

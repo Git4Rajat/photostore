@@ -75,7 +75,7 @@ def test_bounded_wave_prepared_once_ack_only_after_processing(monkeypatch, prepa
             self.calls.append(kw)
             if len(self.calls) == 1:
                 return first
-            assert len(events) == 9  # one preparation and eight normal tasks
+            assert len(events) == (1 if prepare_failure else 9)
             return []
 
         def delete_message(self, msg):
@@ -102,7 +102,7 @@ def test_bounded_wave_prepared_once_ack_only_after_processing(monkeypatch, prepa
     with pytest.raises(_StopLoop):
         app.run_ipworker()
     assert events[0] == ('prepare', 8)
-    assert sorted(queue.deletes) == ['0', '1', '2', '4', '5', '6', '7']
+    assert sorted(queue.deletes) == ([] if prepare_failure else ['0', '1', '2', '4', '5', '6', '7'])
     assert all(c['max_messages'] == 8 for c in queue.calls)
 
 
@@ -245,3 +245,70 @@ def test_ready_wave_never_exceeds_inference_slots(monkeypatch):
     with pytest.raises(_StopLoop):
         app.run_ipworker()
     assert len(processed) == len(events) == 8
+
+
+@pytest.mark.parametrize('phase', ['preparation', 'photo', 'rollback_photo'])
+def test_watchdog_recycles_blocked_tasks_without_ack_or_thread_replacement(monkeypatch, phase, caplog):
+    import faulthandler
+    dumps = []
+    monkeypatch.setattr(faulthandler, 'dump_traceback', lambda **kw: dumps.append(kw))
+    now = SimpleNamespace(value=0)
+    executors, exits, deletes = [], [], []
+
+    class Executor:
+        def __init__(self, **kw):
+            self.preparation = kw.get('thread_name_prefix') == 'ipwork-index'
+            self.shutdown_calls = []
+            self.submitted = 0
+            executors.append(self)
+
+        def submit(self, function, *args):
+            self.submitted += 1
+            future = Future()
+            if self.preparation and phase != 'preparation':
+                future.set_result(None)
+            # All photo futures, or the preparation future itself, remain
+            # blocked as though a native/socket call ignored cancellation.
+            return future
+
+        def shutdown(self, **kw):
+            self.shutdown_calls.append(kw)
+
+    class Queue:
+        receives = 0
+
+        def create_queue(self):
+            pass
+
+        def receive_messages(self, **kw):
+            self.receives += 1
+            assert self.receives == 1
+            return [message(1), message(2)]
+
+        def delete_message(self, msg):
+            deletes.append(msg.id)
+
+    queue = Queue()
+    _prepare_queue(monkeypatch, queue)
+    monkeypatch.setattr(app, 'IPWORKER_FACE_RECONCILE_BATCH_SIZE', 1 if phase == 'rollback_photo' else 8)
+    monkeypatch.setattr(app, 'IPWORKER_CONCURRENCY', 2)
+    monkeypatch.setattr(app, 'IPWORKER_VISIBILITY_TIMEOUT_SECONDS', 300)
+    monkeypatch.setattr(app, 'IPWORKER_TASK_TIMEOUT_SECONDS', 120)
+    monkeypatch.setattr(app, 'ThreadPoolExecutor', Executor)
+    monkeypatch.setattr(app.time, 'monotonic', lambda: now.value)
+    monkeypatch.setattr(app.os, '_exit', exits.append)
+
+    def wait(futures, **kw):
+        done = {future for future in futures if future.done()}
+        if not done:
+            now.value += 121
+        return done, set(futures) - done
+
+    monkeypatch.setattr(app, 'wait', wait)
+    app.run_ipworker()
+    assert exits == [1]
+    assert dumps == [{'all_threads': True}]
+    assert deletes == [] and queue.receives == 1
+    assert len(executors) == (1 if phase == 'rollback_photo' else 2)
+    assert all(ex.shutdown_calls == [{'wait': False, 'cancel_futures': True}] for ex in executors)
+    assert 'ipwork watchdog timeout' in caplog.text

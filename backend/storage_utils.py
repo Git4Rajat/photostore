@@ -885,6 +885,17 @@ class FaceFilenameLookupRetryableError(RuntimeError):
     """A filename writer is active or its generation/lease was lost; retry."""
 
 
+def _face_query_request_options():
+    """Bound each SDK page request, not the entire multi-page enumeration.
+
+    The queue/application retries the operation. Do not multiply a stalled
+    partition scan with SDK retries/backoff. A process watchdog is still
+    required for calls that ignore socket timeouts (e.g. credential/native IO).
+    """
+    return dict(timeout=10, connection_timeout=5, read_timeout=15,
+                retry_total=0, retry_connect=0, retry_read=0, retry_status=0)
+
+
 def _validated_face_filename_ids(entity) -> Optional[List[str]]:
     """Only this protocol's complete generations are authoritative."""
     if (type(entity.get('schemaVersion')) is not int
@@ -1129,7 +1140,7 @@ def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=
     generations = _FaceFilenameGenerations()
 
     def check_cancelled():
-        if cancelled is not None and cancelled():
+        if time.monotonic() - started >= 90 or (cancelled is not None and cancelled()):
             raise FaceFilenameLookupRetryableError('Batch reconciliation cancelled')
 
     try:
@@ -1170,7 +1181,8 @@ def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=
                     f"filename eq '{_escape_odata(name)}'" for name in generations) + ')'
             query_started = time.monotonic()
             try:
-                rows = face_table.query_entities(query, select=['RowKey', 'filename'])
+                rows = face_table.query_entities(query, select=['RowKey', 'filename'],
+                                                **_face_query_request_options())
                 # Azure's paging API lets us measure and cancel even when a
                 # server-side filtered page is empty. Fakes may be flat lists.
                 pages = rows.by_page() if hasattr(rows, 'by_page') else iter([rows])
@@ -1307,17 +1319,38 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
                 diagnostics['existing_row_count'] = len(existing_rows)
     else:
         rows = face_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'"
+            f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'",
+            **_face_query_request_options(),
         )
         # Azure returns a lazy paged iterable: time every page through exhaustion,
         # not just query construction. Preserve partial progress on read failure.
         existing_rows = []
         enumeration_started = time.monotonic()
+        renewed_at = enumeration_started
+        deadline = enumeration_started + 90
+
+        def check_enumeration():
+            nonlocal renewed_at
+            now = time.monotonic()
+            if now >= deadline:
+                raise FaceFilenameLookupRetryableError('Filename query deadline exceeded')
+            if now - renewed_at >= 30:
+                _renew_face_filename_write(user_id, filename, generation)
+                renewed_at = now
+
         try:
-            for row in rows:
-                existing_rows.append(row)
+            pages = rows.by_page() if hasattr(rows, 'by_page') else iter([rows])
+            for page in pages:
+                check_enumeration()
                 if diagnostics is not None:
-                    diagnostics['existing_row_count'] = len(existing_rows)
+                    diagnostics['query_pages'] = diagnostics.get('query_pages', 0) + 1
+                for row in page:
+                    check_enumeration()
+                    existing_rows.append(row)
+                    if diagnostics is not None:
+                        diagnostics['existing_row_count'] = len(existing_rows)
+            # Even an empty terminal continuation can consume the budget.
+            check_enumeration()
         finally:
             if diagnostics is not None:
                 diagnostics['query_enumeration_ms'] = round(

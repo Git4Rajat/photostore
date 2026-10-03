@@ -42,7 +42,8 @@ class PagedFaceTable(AzureFaceTable):
         self.exhausted = False
         self.on_exhaustion = None
 
-    def query_entities(self, filter_str, select=None):
+    def query_entities(self, filter_str, select=None, **kwargs):
+        assert kwargs == storage_utils._face_query_request_options()
         self.queries.append(filter_str)
         self.selects.append(select)
         if self.construction_failure:

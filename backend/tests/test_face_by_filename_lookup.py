@@ -47,7 +47,7 @@ class AzureFaceTable(FakeTable):
         except ResourceNotFound as exc:
             raise ResourceNotFoundError(str(exc)) from exc
 
-    def query_entities(self, filter_str, select=None):
+    def query_entities(self, filter_str, select=None, **kwargs):
         self.queries.append(filter_str)
         return super().query_entities(filter_str, select)
 
@@ -197,7 +197,7 @@ def test_storage_phase_timings_cover_full_lazy_enumeration(lookup_ctx, monkeypat
         advance(.03)
         return existing
 
-    def query(*args):
+    def query(*args, **kwargs):
         advance(.02)  # Creating the iterable is not its enumeration cost.
 
         def pages():
@@ -264,7 +264,7 @@ def test_storage_failure_diagnostics_and_dirty_release(lookup_ctx, monkeypatch, 
     elif failure == 'query_create':
         monkeypatch.setattr(faces, 'query_entities', fail)
     elif failure == 'query_page':
-        def pages(*args):
+        def pages(*args, **kwargs):
             yield {'PartitionKey': 'u1', 'RowKey': 'partial', 'filename': 'photo.jpg'}
             fail()
         monkeypatch.setattr(faces, 'query_entities', pages)

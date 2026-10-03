@@ -30,7 +30,7 @@ class _FakeTable:
     def delete_entity(self, partition_key, row_key):
         self.rows.pop((partition_key, row_key), None)
 
-    def query_entities(self, filter_str, select=None):
+    def query_entities(self, filter_str, select=None, **kwargs):
         import re
         match = re.fullmatch(r"PartitionKey eq '([^']*)' and filename eq '([^']*)'", filter_str)
         if match:

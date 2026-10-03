@@ -56,7 +56,7 @@ class FakeTable:
     def delete_entity(self, partition_key, row_key):
         self.rows.pop((partition_key, row_key), None)
 
-    def query_entities(self, filter_str, select=None):
+    def query_entities(self, filter_str, select=None, **kwargs):
         # Compound clause checked first -- the plain-PartitionKey pattern's
         # greedy '(.*)' would otherwise swallow " and field eq ..." as part
         # of the partition key value itself. Second alternative covers
