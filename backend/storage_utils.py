@@ -48,6 +48,7 @@ from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
 from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
 import maps_utils
+import perf_instrumentation
 import vision_utils
 
 CLIENT_PROCESSING_SCHEMA_VERSION = 2
@@ -3059,19 +3060,28 @@ def invalidate_user_listing_index_cache(user_id: str) -> None:
         _LISTING_INDEX_CACHE.pop(key, None)
 
 
-def _load_listing_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
-    blob_client = _listing_index_blob_client(_listing_index_json_blob_name(user_id))
+def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['LexicalIndexSnapshot']:
+    """Shared, instrumented loader for the gzip+JSON index blobs (lexical,
+    listing, sort). Separate spans for download / gunzip / json-parse so the
+    PERF log shows which phase dominates and how much RSS each one adds."""
     if blob_client is None:
         return None
     try:
-        payload = blob_client.download_blob().readall()
+        with perf_instrumentation.span(f'index.{kind}.download', user=user_id) as _:
+            payload = blob_client.download_blob().readall()
     except Exception:
         return None
     try:
-        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        with perf_instrumentation.span(f'index.{kind}.gunzip', user=user_id, gz_mb=round(len(payload) / 1048576, 1)):
+            raw = gzip.decompress(payload)
+        del payload
+        with perf_instrumentation.span(f'index.{kind}.json_parse', user=user_id, raw_mb=round(len(raw) / 1048576, 1)):
+            parsed = json.loads(raw)
+        del raw
         rows = parsed.get('rows')
         if not isinstance(rows, list):
             return None
+        perf_instrumentation.log_event('index_loaded', kind=kind, user=user_id, rows=len(rows))
         return LexicalIndexSnapshot(
             user_id=str(user_id),
             source_version=str(parsed.get('sourceVersion') or ''),
@@ -3081,6 +3091,10 @@ def _load_listing_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
         )
     except Exception:
         return None
+
+
+def _load_listing_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    return _load_gz_json_index_blob('listing', user_id, _listing_index_blob_client(_listing_index_json_blob_name(user_id)))
 
 
 def _write_user_listing_index(user_id: str, lexical_snapshot: LexicalIndexSnapshot) -> None:
@@ -3437,27 +3451,7 @@ def _load_lexical_index_manifest(user_id: str) -> Dict[str, str]:
 
 
 def _load_lexical_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
-    blob_client = _lexical_index_blob_client(_lexical_index_json_blob_name(user_id))
-    if blob_client is None:
-        return None
-    try:
-        payload = blob_client.download_blob().readall()
-    except Exception:
-        return None
-    try:
-        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
-        rows = parsed.get('rows')
-        if not isinstance(rows, list):
-            return None
-        return LexicalIndexSnapshot(
-            user_id=str(user_id),
-            source_version=str(parsed.get('sourceVersion') or ''),
-            schema_version=str(parsed.get('schemaVersion') or ''),
-            updated_at=str(parsed.get('updatedAt') or ''),
-            rows=rows,
-        )
-    except Exception:
-        return None
+    return _load_gz_json_index_blob('lexical', user_id, _lexical_index_blob_client(_lexical_index_json_blob_name(user_id)))
 
 
 def _serialize_lexical_index(snapshot: LexicalIndexSnapshot) -> bytes:
@@ -3469,8 +3463,11 @@ def _serialize_lexical_index(snapshot: LexicalIndexSnapshot) -> bytes:
         'rowCount': len(snapshot.rows),
         'rows': snapshot.rows,
     }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
-    return gzip.compress(raw, compresslevel=6)
+    with perf_instrumentation.span('index.serialize', rows=len(snapshot.rows)):
+        raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+        out = gzip.compress(raw, compresslevel=6)
+    perf_instrumentation.log_event('index_serialized', rows=len(snapshot.rows), raw_mb=round(len(raw) / 1048576, 1), gz_mb=round(len(out) / 1048576, 1))
+    return out
 
 
 def _build_user_lexical_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
@@ -3485,9 +3482,10 @@ def _build_user_lexical_index_snapshot(user_id: str, source_version: str) -> Opt
         # re-fetched) the moment each remaining step lands. Skipping it here
         # also means fewer entities come back over the wire during an active
         # upload burst, instead of paying to fetch-then-discard them below.
-        rows = list(metadata_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}' and processing_complete eq true"
-        ))
+        with perf_instrumentation.span('index.lexical.table_scan', user=user_id):
+            rows = list(metadata_table_client.query_entities(
+                f"PartitionKey eq '{_escape_odata(user_id)}' and processing_complete eq true"
+            ))
     except Exception:
         # Unlike _build_user_vector_index_snapshot, a transient query failure
         # must not be treated as "empty library" -- refresh_user_lexical_index
@@ -3926,27 +3924,7 @@ def _load_sort_index_manifest(user_id: str) -> Dict[str, str]:
 
 
 def _load_sort_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
-    blob_client = _sort_index_blob_client(_sort_index_json_blob_name(user_id))
-    if blob_client is None:
-        return None
-    try:
-        payload = blob_client.download_blob().readall()
-    except Exception:
-        return None
-    try:
-        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
-        rows = parsed.get('rows')
-        if not isinstance(rows, list):
-            return None
-        return LexicalIndexSnapshot(
-            user_id=str(user_id),
-            source_version=str(parsed.get('sourceVersion') or ''),
-            schema_version=str(parsed.get('schemaVersion') or ''),
-            updated_at=str(parsed.get('updatedAt') or ''),
-            rows=rows,
-        )
-    except Exception:
-        return None
+    return _load_gz_json_index_blob('sort', user_id, _sort_index_blob_client(_sort_index_json_blob_name(user_id)))
 
 
 def _serialize_sort_index(snapshot: LexicalIndexSnapshot) -> bytes:
@@ -3958,8 +3936,11 @@ def _serialize_sort_index(snapshot: LexicalIndexSnapshot) -> bytes:
         'rowCount': len(snapshot.rows),
         'rows': snapshot.rows,
     }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
-    return gzip.compress(raw, compresslevel=6)
+    with perf_instrumentation.span('index.serialize', rows=len(snapshot.rows)):
+        raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+        out = gzip.compress(raw, compresslevel=6)
+    perf_instrumentation.log_event('index_serialized', rows=len(snapshot.rows), raw_mb=round(len(raw) / 1048576, 1), gz_mb=round(len(out) / 1048576, 1))
+    return out
 
 
 def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
@@ -3983,10 +3964,11 @@ def _build_user_sort_index_snapshot(user_id: str, source_version: str) -> Option
     try:
         # select= keeps this full-library scan from pulling the large
         # embedding/OCR/tag columns it never uses -- see _SORT_INDEX_SOURCE_FIELDS.
-        rows = list(metadata_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}'",
-            select=_SORT_INDEX_SOURCE_FIELDS,
-        ))
+        with perf_instrumentation.span('index.sort.table_scan', user=user_id):
+            rows = list(metadata_table_client.query_entities(
+                f"PartitionKey eq '{_escape_odata(user_id)}'",
+                select=_SORT_INDEX_SOURCE_FIELDS,
+            ))
     except Exception:
         # A transient query failure must not be treated as "empty library" --
         # refresh_user_sort_index persists whatever this returns as the new
@@ -4390,8 +4372,11 @@ def _serialize_access_index(snapshot: LexicalIndexSnapshot) -> bytes:
         'rowCount': len(snapshot.rows),
         'rows': snapshot.rows,
     }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
-    return gzip.compress(raw, compresslevel=6)
+    with perf_instrumentation.span('index.serialize', rows=len(snapshot.rows)):
+        raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+        out = gzip.compress(raw, compresslevel=6)
+    perf_instrumentation.log_event('index_serialized', rows=len(snapshot.rows), raw_mb=round(len(raw) / 1048576, 1), gz_mb=round(len(out) / 1048576, 1))
+    return out
 
 
 def _access_index_row(entity: Dict) -> Optional[Dict[str, object]]:
@@ -4813,8 +4798,11 @@ def _serialize_albums_index(snapshot: LexicalIndexSnapshot) -> bytes:
         'rowCount': len(snapshot.rows),
         'rows': snapshot.rows,
     }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
-    return gzip.compress(raw, compresslevel=6)
+    with perf_instrumentation.span('index.serialize', rows=len(snapshot.rows)):
+        raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+        out = gzip.compress(raw, compresslevel=6)
+    perf_instrumentation.log_event('index_serialized', rows=len(snapshot.rows), raw_mb=round(len(raw) / 1048576, 1), gz_mb=round(len(out) / 1048576, 1))
+    return out
 
 
 def _pick_album_cover_filename(filenames: List[str], sort_rows_by_filename: Dict[str, Dict[str, object]]) -> str:
@@ -5263,8 +5251,11 @@ def _serialize_people_index(snapshot: LexicalIndexSnapshot) -> bytes:
         'rowCount': len(snapshot.rows),
         'rows': snapshot.rows,
     }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
-    return gzip.compress(raw, compresslevel=6)
+    with perf_instrumentation.span('index.serialize', rows=len(snapshot.rows)):
+        raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
+        out = gzip.compress(raw, compresslevel=6)
+    perf_instrumentation.log_event('index_serialized', rows=len(snapshot.rows), raw_mb=round(len(raw) / 1048576, 1), gz_mb=round(len(out) / 1048576, 1))
+    return out
 
 
 def _people_index_is_unnamed_name(name: str) -> bool:
