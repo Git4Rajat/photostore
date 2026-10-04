@@ -5,45 +5,13 @@ memory. Two routes did:
   PRECOMPUTED summary (built on the 4Gi tools role, stored as a small blob);
   the backend route only reads that blob.
 - GET /photos/search loaded the lexical index + ran an inline CLIP encode. It
-  is now FROZEN by default (SERVER_SEARCH_ENABLED); the browser does the same
-  search client-side against the index it already downloads.
+  now queries a per-library SQLite search database on local disk instead (see
+  test_search_db.py).
 """
 from __future__ import annotations
 
 import app
 from routes.explore import explore_summary
-from routes.photos import search_photos
-
-
-# --- /photos/search freeze ----------------------------------------------------
-
-def test_search_frozen_by_default_returns_empty_without_touching_lexical(monkeypatch):
-    monkeypatch.setattr(app, 'SERVER_SEARCH_ENABLED', False)
-    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-
-    def _boom(*a, **k):
-        raise AssertionError('frozen server search must not load the lexical index')
-
-    monkeypatch.setattr(app, 'get_user_lexical_index', _boom)
-    monkeypatch.setattr(app, '_cached_metadata_rows_for_user', _boom)
-
-    with app.app.test_request_context('/api/photos/search?q=beach'):
-        response = search_photos()
-
-    body = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
-    assert body == {'photos': [], 'total': 0, 'serverSearchDisabled': True}
-
-
-def test_search_freeze_short_circuits_before_reading_the_query(monkeypatch):
-    # The freeze check must come first -- even a well-formed query returns the
-    # frozen result, never reaching the scoring path.
-    monkeypatch.setattr(app, 'SERVER_SEARCH_ENABLED', False)
-    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-
-    with app.app.test_request_context('/api/photos/search?q=red%20car&offset=0&limit=24'):
-        response = search_photos()
-
-    assert response.get_json()['serverSearchDisabled'] is True
 
 
 # --- /explore serves the precomputed summary ---------------------------------

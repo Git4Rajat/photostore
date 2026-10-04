@@ -1,11 +1,13 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
-import { getLocalSortIndex, patchLocalSortIndexRow } from '../../services/localSortIndex';
+import { getLocalSortIndex, patchLocalSortIndexRow, type SortIndexRow } from '../../services/localSortIndex';
+import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import { getLocalPeopleIndex, invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
+import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/gridCapacity';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
@@ -30,7 +32,9 @@ import type {
 // ---- backend <-> prototype photo mapping -------------------------------------
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const PAGE_SIZE = 100;
+const PAGE_SIZE = 100; // legacy /photos fallback page size
+// lookup-batch accepts <=200 filenames; enrich in parallel chunks of this size.
+const ENRICH_CHUNK = 100;
 
 // The sort/albums/people local indexes all report "unavailable" immediately
 // on a cold account instead of blocking (their backend routes kick a
@@ -61,7 +65,7 @@ const swatchFor = (filename: string): SwatchKey => {
     return `s${n}` as SwatchKey;
 };
 
-const mapPhoto = (b: BackendPhoto): Photo => {
+const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMediaToken()): Photo => {
     const iso = b.captureDate || b.uploadDate || b.lastModified || null;
     const date = iso ? new Date(iso) : null;
     const valid = date && !Number.isNaN(date.getTime()) ? date : null;
@@ -77,11 +81,38 @@ const mapPhoto = (b: BackendPhoto): Photo => {
         placeId: null,
         personIds: (b.people ?? []).map((p) => p.personId),
         tags: b.tags ?? [],
-        thumbnailUrl: b.thumbnailUrl,
+        // Token mode: the backend sends a blob name and the browser builds the
+        // direct URL; otherwise (or for proxy fallbacks) the backend's URL.
+        thumbnailUrl: (b.thumbnailBlob && token ? thumbnailUrlForBlob(b.thumbnailBlob, token) : '') || b.thumbnailUrl,
         rotation: b.rotation,
         thumbnailRotation: b.thumbnailRotation,
         captureDate: iso,
         processing: b.processing,
+    };
+};
+
+// Backend-free first paint: a Photo built from nothing but a sort-index row and
+// the media token. Metadata the index doesn't carry (people, tags, per-user
+// "liked", processing status, thumbnail rotation) arrives with the background
+// lookup-batch enrichment and replaces this entry by id.
+const provisionalPhoto = (row: SortIndexRow, token: MediaToken | null): Photo => {
+    const iso = row.captureDate || row.uploadDate || null;
+    const date = iso ? new Date(iso) : null;
+    const valid = date && !Number.isNaN(date.getTime()) ? date : null;
+    return {
+        id: row.filename,
+        filename: row.filename,
+        swatch: swatchFor(row.filename),
+        dateLabel: valid ? `${MONTHS[valid.getMonth()]} ${valid.getDate()}, ${valid.getFullYear()}` : 'Undated',
+        year: valid ? valid.getFullYear() : 0,
+        rating: row.rating,
+        liked: false,
+        likes: row.likes,
+        placeId: null,
+        personIds: [],
+        tags: [],
+        thumbnailUrl: thumbnailUrlForBlob(row.thumb, token) || undefined,
+        captureDate: iso,
     };
 };
 
@@ -420,9 +451,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const range = captureRangeRef.current;
         const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
         const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
-            `/photos?sort=capture&offset=${offset}&limit=${PAGE_SIZE}${rangeQuery}`,
+            `/photos?sort=capture&offset=${offset}&limit=${PAGE_SIZE}${rangeQuery}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
         );
-        const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
+        const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
         photoOffsetRef.current = offset + list.length;
         photoHasMoreRef.current = list.length === PAGE_SIZE;
         setHasMorePhotos(photoHasMoreRef.current);
@@ -445,7 +476,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setPhotosLoading(true);
         const offset = reset ? 0 : photoOffsetRef.current;
         try {
-            const sortIndex = await withIndexRetry(getLocalSortIndex);
+            // Token and sort index load in parallel (both are normally already warm
+            // from the session-start preload).
+            const [sortIndex, token] = await Promise.all([
+                withIndexRetry(getLocalSortIndex),
+                getMediaToken().catch(() => null),
+            ]);
             if (!sortIndex) {
                 throw new Error('sort index unavailable');
             }
@@ -471,23 +507,52 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
             });
             const total = sorted.length;
-            const pageFilenames = sorted.slice(offset, offset + PAGE_SIZE).map((row) => row.filename);
-            const lookupRes = pageFilenames.length
-                ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames })
-                : { photos: [] };
-            const byFilename = new Map((lookupRes?.photos ?? []).map((p) => [p.filename, p]));
-            // Re-order to match the sort-index's order -- lookup-batch may
-            // silently drop a filename deleted between the index build and
-            // this page fetch, so don't assume a 1:1 positional response.
-            const list = pageFilenames
-                .map((f) => byFilename.get(f))
-                .filter((p): p is BackendPhoto => Boolean(p))
-                .map(mapPhoto);
+            // With the media token, thumbnails cost no backend calls, so load as
+            // many tiles as the screen needs (a few viewports' worth) per step.
+            const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
+            const pageRows = sorted.slice(offset, offset + pageSize);
+            const pageFilenames = pageRows.map((row) => row.filename);
             photoOffsetRef.current = offset + pageFilenames.length;
             photoHasMoreRef.current = offset + pageFilenames.length < total;
             setHasMorePhotos(photoHasMoreRef.current);
             setTotalPhotos(total);
-            setPhotos((prev) => (reset ? list : [...prev, ...list]));
+            if (token && pageRows.length) {
+                // 1) Backend-free paint of the whole window.
+                const provisional = pageRows.map((row) => provisionalPhoto(row, token));
+                setPhotos((prev) => (reset ? provisional : [...prev, ...provisional]));
+                // 2) Enrich with full metadata in parallel chunks (first chunk =
+                //    the top of the window, which is what's on screen). directMedia
+                //    skips URL signing; each chunk lands as soon as it returns.
+                await Promise.all(chunk(pageFilenames, ENRICH_CHUNK).map(async (names) => {
+                    // A failed chunk is non-fatal: its tiles are already on screen
+                    // from the sort index; they just keep the provisional metadata.
+                    const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: true })
+                        .catch(() => null);
+                    if (!res) return;
+                    const byFilename = new Map((res?.photos ?? []).map((p) => [p.filename, p]));
+                    const enriched = new Map<string, Photo>();
+                    for (const f of names) {
+                        const b = byFilename.get(f);
+                        if (b) enriched.set(f, mapPhoto(b, token));
+                    }
+                    const nameSet = new Set(names);
+                    // lookup-batch may drop a filename deleted since the index build.
+                    setPhotos((prev) => prev
+                        .filter((p) => !nameSet.has(p.id) || enriched.has(p.id))
+                        .map((p) => enriched.get(p.id) ?? p));
+                }));
+            } else {
+                // No token (proxy mode): same as before -- wait for lookup-batch.
+                const lookupRes = pageFilenames.length
+                    ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames })
+                    : { photos: [] };
+                const byFilename = new Map((lookupRes?.photos ?? []).map((p) => [p.filename, p]));
+                const list = pageFilenames
+                    .map((f) => byFilename.get(f))
+                    .filter((p): p is BackendPhoto => Boolean(p))
+                    .map((p) => mapPhoto(p, null));
+                setPhotos((prev) => (reset ? list : [...prev, ...list]));
+            }
         } catch {
             try {
                 await fetchPhotosViaLegacyEndpoint(offset, reset);
@@ -974,7 +1039,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         return filenames
             .map((f) => byFilename.get(f))
             .filter((p): p is BackendPhoto => Boolean(p))
-            .map(mapPhoto);
+            .map((p) => mapPhoto(p));
     }, []);
 
     // Legacy path: the sequential per-photo point-read GET /albums/<id> does
@@ -983,7 +1048,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // never breaks.
     const openAlbumViaLegacyEndpoint = useCallback(async (id: string) => {
         const res = await get<{ album?: Album; photos?: BackendPhoto[] }>(`/albums/${encodeURIComponent(id)}`);
-        const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
+        const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
         setAlbumPhotos((prev) => ({ ...prev, [id]: list }));
         if (res?.album) {
             setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));

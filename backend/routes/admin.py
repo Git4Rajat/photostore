@@ -191,8 +191,12 @@ def admin_backfill_photos():
             return app.jsonify({'error': f'invalid steps: {invalid_steps}', 'code': 'invalid_steps'}), 400
         steps_to_run = requested_steps
 
+    # Streamed with a two-column projection: this only needs each filename and
+    # whether it is trashed, never the whole library in memory.
     try:
-        metadata_rows = app._cached_metadata_rows_for_user(user_id, purpose='admin.backfill')
+        metadata_rows = app._iter_metadata_rows_for_user(
+            user_id, select=['RowKey', 'processing_state'], include_deleted=True, purpose='admin.backfill',
+        )
     except Exception as exc:
         app.app.logger.exception('Backfill: failed to load metadata for %s', user_id)
         return app.jsonify({'error': 'Failed to load photo metadata'}), 503

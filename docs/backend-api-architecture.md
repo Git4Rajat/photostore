@@ -299,8 +299,78 @@ measured vs. only located:
 - `event=span name=index.<kind>.{download,gunzip,json_parse,table_scan}` / `index.serialize` / `index.search_slim.build` — which phase of an index load/build dominates and how much RSS it adds. `index_disk_cache_hit|store` shows disk-cache behaviour.
 - `PERF_INSTRUMENTATION=false` disables all of it.
 
-**Slim search index.** `refresh_user_lexical_index` now also writes `<key>-search.json.gz` (+ manifest): only the fields `localLexicalSearch.ts` reads, with `exifData` cut to the keys search uses, `processing_metadata` to AI labels scoring >= 0.2, and `ocrText` capped at `SEARCH_INDEX_OCR_MAX_CHARS` (1500). `/api/photos/search-index` hands out the slim blob when its `sourceVersion` matches the lexical manifest, else the full blob. The full lexical blob stays the server-side source of truth.
+**Search.** There is no browser-side search or search index any more (the 709 MB lexical blob could never load in a tab, and with server search frozen every query came back empty). See section 13.
 
-**Disk cache.** `INDEX_DISK_CACHE_DIR` (set on `backend` and `tools` to `/mnt/photostore/shared/index-cache`, the existing `faiss-checkpoints` Azure Files share) caches gzipped index blobs keyed by blob ETag; a hit costs one `get_blob_properties`. Atomic writes; any failure falls back to a normal download. `deploy/azuredeploy.json` is compiled from the bicep and must be regenerated (`az bicep build`) before a one-click deploy picks this up.
+**Indexes on the shared volume.** With `INDEX_DISK_CACHE_DIR` set (backend, tools, extras: `/mnt/photostore/shared/index-cache`; worker: `/mnt/photostore/faiss-checkpoints/index-cache` -- the same `faiss-checkpoints` Azure Files share), `_get_blob_client` returns a `_ShareBackedBlob` for the four index containers, covering every index kind (sort, lexical, listing, access, albums, people, vector, people/tag embeddings, explore, timeline); the SQLite search database is deliberately excluded (section 13). Uploads write through to the share; downloads are served from it when the blob's ETag sidecar matches (one `get_blob_properties`), else fall back to Blob and refill. Blobs under `INDEX_DISK_CACHE_MIN_BYTES` (manifests) bypass it. Blob Storage stays the source of truth and any share error falls back to it. **Session start:** `/api/photos/index-status` (called once per session) kicks `warm_user_index_files_async`, which streams every index blob for the user onto the share (single-flight, `INDEX_WARM_COOLDOWN_SECONDS`=300), without holding any in memory. Browsers cannot mount SMB, so they still download via SAS URLs from Blob (now of the slim blobs) and keep them in IndexedDB.
 
-**Client.** `preloadLocalIndexes()` starts the sort and search index downloads concurrently once `/api/photos/index-status` reports ready; the search index is now persisted in IndexedDB by `sourceVersion` like the sort index.
+**Timeline.** `/photos/timeline` serves a summary precomputed on tools (`refresh_user_timeline_summary`) instead of loading the listing index into the backend.
+
+**Client.** `preloadLocalIndexes()` starts the media token and the sort, albums and people index downloads concurrently once `/api/photos/index-status` reports ready; the search index is now persisted in IndexedDB by `sourceVersion` like the sort index.
+
+## 12. Token-based media: thumbnails with no backend per page
+
+**Before** (HAR, microsvcpoc-dev): every `lookup-batch` page of 100 photos signed 3 SAS URLs per photo on the backend (full image, thumbnail, thumbnail again) -- 300 distinct signatures and a ~160 KB response, and the thumbnail URLs were only available after that call.
+
+**Now.**
+- `GET /api/photos/media-token` returns ONE container-scoped, read-only, day-aligned token for the thumbnails container (`_stable_container_read_sas`); previews are in the same container under `preview/`, so it covers both. No list permission: blobs are reachable only by their unguessable UUID names. Same exposure class as the per-blob SAS URLs it replaces, but note it is a bearer token for the whole container -- rotate by rotating the user-delegation key / shortening the day-aligned window if that ever matters.
+- The sort index (schema v2) carries `thumb` (physical thumbnail blob name, once the thumbnail exists) per photo.
+- The browser (`services/mediaToken.ts`) caches the token in memory + localStorage until 30 min before expiry and builds `{baseUrl}/{blob}?{sas}` itself. The grid (`mockups/prototype/store.tsx` `fetchPhotos`) paints each page straight from sort-index rows + token -- no backend call -- then enriches in the background with `lookup-batch {directMedia: true}`, which skips all URL signing and returns `thumbnailBlob` instead. Proxy/preview fallbacks (thumbnail not ready, RAW/HEIC) keep their normal URLs.
+- `tools` upgrades existing libraries: `/api/tools/indexes/build` runs `ensure_user_sort_index_current` (full sort-index rebuild when the stored schema is older). Until then rows lack `thumb` and the grid simply waits for the enrichment call, as before.
+
+Known gaps: provisional tiles lack per-user `liked`, people, tags and `thumbnailRotation` until enrichment lands (normally well under a second); a tab left open past the token's expiry needs a reload to refresh already-built URLs; Albums/People/Explore/Search result grids still use their own URL sources. The Gallery now sizes each step to the screen: `measureGridCapacity()` reads the live `.pt-grid` column count / tile width and loads ~3 viewports of tiles (60-600) per step, painted straight from the sort index; only the metadata enrichment is chunked (100 per `lookup-batch`, in parallel).
+
+## 13. Search: per-library SQLite (FTS5) database on ephemeral disk
+
+**Why.** Search was returning nothing: the browser could not load the 709 MB index and `/photos/search` was frozen because the old implementation loaded the whole lexical index into the 1Gi backend and scored every row per query.
+
+**Now** (`backend/search_db.py`):
+- **Build (tools).** After every lexical build (`refresh_user_lexical_index`) -- and on demand via `/api/tools/indexes/build` -> `ensure_user_search_db` for libraries that predate this deploy -- tools writes `<key>-searchdb.sqlite.gz` + manifest to Blob. The DB holds a compact scorer-compatible row per photo (deduped, confidence-filtered tags; see `reduced_row` and `SEARCH_INDEX_*` env vars), an FTS5 index over the exact texts `lexical_search_score` matches against (filename, effective tags, semantic text incl. OCR, location, camera model), a `person -> photos` table, a capture-day column and the library's place-name vocabulary. ~100 MB / ~40 s for 130k synthetic photos.
+- **Query (backend).** `open_database` copies the current DB to **local ephemeral disk** (`SEARCH_DB_DIR`, an EmptyDir mount; streamed, once per replica per version, oldest files evicted past `SEARCH_DB_MAX_CACHE_MB`) and queries it read-only. `/photos/search` takes the top `SEARCH_DB_CANDIDATE_LIMIT` (4000) bm25-ranked candidates (OR of query terms, their singular/plural variants, expansions, 4+ char prefixes; plus rows of named people), then runs the unchanged hard filters + `_score_search_row` on just those rows and point-reads full metadata for the returned page. Nothing library-sized is held in memory.
+- **Not on the share.** SQLite needs a real local filesystem; `-searchdb` blobs bypass the Azure Files layer. `/api/photos/index-status` (session start) kicks `search_db.warm_async` so the first search doesn't pay for the download.
+- **Cold library.** No current DB -> `/photos/search` returns `{photos: [], total: 0, searchIndexBuilding: true}` and nudges tools; Ask shows a "preparing" notice and retries for ~2 minutes.
+
+**Behaviour changes to know about.** Semantic (CLIP) scoring is gone from search -- it needed an embedding model in the browser or backend; ranking is lexical + tag-embedding query expansion. Result totals are over the candidate set (capped at the limit above). The `/api/photos/search-index` route is a retired stub.
+
+## 14. Index builds run on the worker, not inside a tools HTTP request
+
+**The failure.** "Library index build failed — Job did not finish (worker restarted or timed out)" is the `index_build` job (one row per library, `index-build-<libraryId>`). `/api/jobs/status` rewrites any queued/running job whose row hasn't been updated for `CLUSTERING_ACTIVE_JOB_STALE_MINUTES` (15) as failed with that text. The build used to run inside `POST /api/tools/indexes/build` on the scale-to-zero `tools` app: ingress cuts requests at ~240 s, after which nothing counted as in-flight, so a scale-down (or an OOM restart of the 4Gi replica while holding the whole library in memory) killed it mid-step; and the job row was only touched *between* indexes, so one long step (full-table scan, search-database build) could trip the 15-minute sweep even while alive.
+
+**Now.**
+- `tools_build_indexes` only decides whether a build is needed (`index_build_needed`: any index missing/dirty, old sort-index schema, stale search DB) and `enqueue_index_build`s a `{type: 'index_build'}` message on the library-ops queue; it returns immediately. `_trigger_tools_index_rebuild` (backend/ipworker nudges) enqueues the same message. Status (`/api/tools/indexes/status`) reads the shared job row, not a per-process lock.
+- The always-on `worker` consumes it (`_run_index_build_job`): same lease renewal, bounded retries, dead-letter queue and SIGTERM handling as library clean/download; a failed or killed build is redelivered. A heartbeat thread rewrites the job row every `INDEX_BUILD_HEARTBEAT_SECONDS` (30), so a live build is never declared dead, and a truly dead one is. The worker mounts the same Azure Files share and `INDEX_DISK_CACHE_DIR`, so indexes it builds are written through for every other role; consumers still locate them by deterministic blob name (no path hand-off needed).
+
+**To verify after deploy:** `PERF event=span name=index.build.job` / `index.<kind>.table_scan` / `searchdb.*` show where time goes and `rss_mb` shows memory per step; if the worker still restarts mid-build, the usual cause is memory (the lexical snapshot holds every metadata column in Python objects) -- look for `event=mem` climbing toward 4Gi before the restart. No replica floors are assumed: the worker scales from the library-ops queue rule, and the outstanding (in-flight) message keeps it up.
+
+### 14.1 Bounded-memory build (the OOM fix)
+
+The old 'lexical' step built a full in-memory snapshot of the library (`list(query_entities)` of every column incl. the ~10 KB/photo embedding columns, a trimmed copy, a serialized 700 MB JSON, a gzip copy, a listing copy) and then Explore, timeline and the search DB each reloaded it. That is several GB of Python objects at ~130k photos.
+
+Now `storage_utils.stream_library_artifacts` makes **one paged pass** with a server-side column projection (`_STREAM_SELECT_FIELDS` -- embeddings are never downloaded) and offers each row to small sinks, then drops it:
+- `ListingSink` -- gzip-streams the listing blob to a temp file;
+- `search_db.SearchDbSink` -- streams into SQLite (2000-row batches), gzips and uploads;
+- `_ExploreSink` -- `ExploreAccumulator` keeps only counts + first filename per group; full metadata is point-read for the <= 2x`EXPLORE_MAX_GROUPS` winners;
+- `_TimelineSink` -- `TimelineAccumulator` keeps day counters.
+Sort and access scans also iterate instead of `list()`. The 700 MB full lexical blob is **no longer built** (nothing reads it any more; `get_user_listing_index` no longer falls back to building it on the backend either). Nothing is published unless the whole scan succeeds; the lexical manifest (readiness / freshness / dirty flag) is written last.
+
+Measured on identical synthetic data (8,000 photos with 12 KB of heavy columns each): old build peak 288 MB (grows linearly with library size), streaming build peak 2.7 MB. `tests/test_library_stream.py` pins this (peak < 25 MB). Builds are a full scan, so `enqueue_index_build` delays a rebuild that follows a finished one by `INDEX_BUILD_MIN_INTERVAL_SECONDS` (120) instead of letting upload bursts trigger back-to-back builds.
+
+### 14.2 No request path loads the library
+
+The backend (1Gi) used to hold library-sized data in memory for several endpoints. Each now uses a bounded technique:
+
+| Endpoint / helper | Before | Now |
+|---|---|---|
+| `GET /photos` (list), `GET /photos/filter` | whole listing blob (130k rows) loaded + sorted in Python | SQL `ORDER BY/LIMIT/OFFSET` on the per-library SQLite DB (`SearchDatabase.list_page` / `filter_page`); page metadata re-read fresh (parallel point reads). Ordering/filter parity with the old in-memory logic is pinned in `tests/test_library_db_routes.py` |
+| `/api/suggestions` (on this day) | pass over the listing | `GROUP BY capture_year WHERE capture_md = ?` |
+| `/api/search/suggest` (places) | pass over the listing | place vocabulary stored in the DB |
+| album covers (`_album_cover_thumbnail_url`) | full unprojected, sorted scan of every row | `SearchDatabase.top_rated(album filenames)` (chunked `IN`, O(limit)) + <=12 point reads |
+| `access-batch` | whole access index copied (130k rows) and re-indexed **per call** | one compact filename map per index version (`lookup_access_entries`), no copies; the backend never builds the index |
+| trash list / restore-all | all columns of all rows, filtered in Python | server-side `processing_state eq 'deleted'` + projection |
+| corrupted-uploads page | whole-library scan | server-side `verification_status eq 'failed' or corrupted eq true` + projection |
+| smart-album creation, admin backfill, browser-processing pending, ipwork sweep | list of all rows | `_iter_metadata_rows_for_user` streaming with narrow projections |
+
+`_cached_metadata_rows_for_user`, `_cached_sorted_metadata_rows_for_user`, `_cached_metadata_list_rows_for_user` and `_cached_sorted_metadata_list_rows_for_user` now **raise** (`tests/test_bounded_scans.py` also fails the build if any route module references them), so a future caller cannot silently reintroduce a whole-library load. `_invalidate_metadata_scan_cache` remains as a no-op for the many write paths that call it.
+
+Behaviour notes: rating/like changes reach list/filter/cover ranking on the next index build (minutes); the photos returned are always fresh. With a location filter active, photos without coordinates are excluded (the old code compared them as 0,0). A library with no current database yet gets `indexBuilding: true` from list/filter and a worker build is requested. The database schema is `sqlite-v2`; existing databases are rebuilt by the next build.
+
+Remaining library-proportional memory on the backend: the compact access map (~tens of MB per worker, loaded once per index version) and the albums/people indexes (sized by album/person count, not photo count).

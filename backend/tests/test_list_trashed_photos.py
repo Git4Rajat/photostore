@@ -11,7 +11,15 @@ from routes.photos import list_trashed_photos
 
 def _patch_common(monkeypatch, rows):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', lambda *a, **k: rows)
+    calls = []
+
+    def _fake_scan(user_id, select=None, include_deleted=False, extra_filter='', purpose=''):
+        # emulate the server-side filter the routes now push down
+        calls.append(extra_filter)
+        return iter([r for r in rows if r.get('processing_state') == 'deleted'] if 'deleted' in extra_filter else rows)
+
+    monkeypatch.setattr(app, '_iter_metadata_rows_for_user', _fake_scan)
+    monkeypatch.setattr(app, '_scan_filters_seen', calls, raising=False)
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
     monkeypatch.setattr(app, '_build_photo_summaries_page', lambda uid, items, pid_to_name: [{'filename': name} for name, _ in items])
 

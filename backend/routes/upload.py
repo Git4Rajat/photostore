@@ -609,20 +609,20 @@ def upload_processing_pending():
         return app.jsonify({'error': 'Invalid limit'}), 400
 
     try:
-        entities = app._query_metadata_rows_for_user(
+        # Streamed: only the (few) pending items are ever retained.
+        pending = []
+        for entity in app._iter_metadata_rows_for_user(
             user_id,
             select=app.BROWSER_PROCESSING_PENDING_SELECT,
             purpose='browser_processing_pending',
-        )
+        ):
+            item = app._browser_processing_pending_item(entity)
+            if item:
+                pending.append(item)
     except Exception as exc:
         app.app.logger.warning('Browser processing pending scan failed for %s: %s', user_id, exc, exc_info=True)
         return app.jsonify({'pending': []})
 
-    pending = []
-    for entity in entities:
-        item = app._browser_processing_pending_item(entity)
-        if item:
-            pending.append(item)
     pending.sort(key=lambda item: str(item.get('lastProcessingUpdate') or ''))
     bounded = pending[:limit]
     for item in bounded:
@@ -783,7 +783,12 @@ def list_corrupted_uploads():
     if error:
         return error
     try:
-        rows = app._cached_metadata_rows_for_user(user_id, purpose='uploads.corrupted')
+        # Server-side filter: only rows already flagged failed/corrupted are
+        # transferred (positive match, so rows lacking the fields are skipped).
+        rows = list(app._iter_metadata_rows_for_user(
+            user_id, select=app.CORRUPTED_UPLOAD_SELECT,
+            extra_filter="verification_status eq 'failed' or corrupted eq true", purpose='uploads.corrupted',
+        ))  # materialized inside the try: bounded by the number of flagged uploads
     except Exception as exc:
         app.app.logger.exception('Corrupted uploads metadata read failed')
         return app.jsonify({'error': 'Unable to read photo metadata.'}), 503

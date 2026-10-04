@@ -28,8 +28,6 @@ import PhotoTile, { shouldFetchScopedThumbnail } from './shared/PhotoTile';
 import { useDragSelect } from '../services/useDragSelect';
 import { isAuthEnabled } from '../services/authClient';
 import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
-import { getLocalSearchIndex, invalidateLocalSearchIndex } from '../services/localSearchIndex';
-import { runLocalSearch, type SemanticSearchContext } from '../services/localLexicalSearch';
 import { useWindowedGrid } from '../services/useWindowedGrid';
 import type { FileSystemFileHandle } from '../services/fileSystemAccess';
 import {
@@ -3955,98 +3953,6 @@ interface AlbumSummary {
 
 const noopAddNotification = () => '';
 
-// Lazily loads a dedicated CLIP session just for encoding search-query text
-// (Phase B semantic search) -- deliberately independent of whatever
-// browser-AI model state the upload/tools-processing pipeline manages
-// (AppServicesProvider's useAppServices context, which PhotoGallery.tsx
-// doesn't otherwise depend on): search should work standalone regardless of
-// whether the user has ever enabled on-device AI for uploads. Cached at
-// module scope so only the FIRST semantic search in a tab session pays the
-// model-load cost -- acquireBrowserAiModel's own browser-cache use
-// (env.useBrowserCache=true, browserAiWorker.ts) means even that first cost
-// is a WASM warm-up, not a re-download, if the upload pipeline already
-// loaded the same model this session.
-const SEMANTIC_QUERY_ENCODE_TIMEOUT_MS = 15000;
-let semanticQueryEncoderPromise: Promise<{ worker: BrowserAiWorkerHandle; modelState: BrowserAiModelState } | null> | null = null;
-
-const getSemanticQueryEncoder = (): Promise<{ worker: BrowserAiWorkerHandle; modelState: BrowserAiModelState } | null> => {
-    if (!semanticQueryEncoderPromise) {
-        semanticQueryEncoderPromise = acquireBrowserAiModel()
-            .then((modelState) => {
-                if (modelState.status !== 'available' || !modelState.manifest) {
-                    return null;
-                }
-                return { worker: createPersistentBrowserAiWorker(), modelState };
-            })
-            .catch(() => null);
-    }
-    return semanticQueryEncoderPromise;
-};
-
-// Tries to answer a search query entirely from the locally-cached lexical +
-// vector index (see localSearchIndex.ts/localLexicalSearch.ts) instead of
-// /photos/search. Returns null to signal "fall back to the real endpoint" --
-// either the index isn't available yet, or local scoring found nothing at
-// all for this query (letting the server's fallback-bucket widening have a
-// shot instead of confidently reporting zero results). Semantic scoring is
-// a bonus layered on top of lexical, never a requirement: any failure
-// acquiring the CLIP model or encoding the query just falls back to
-// lexical-only local search rather than the real /photos/search endpoint.
-const tryLocalSearch = async (
-    query: string,
-    offset: number,
-    limit: number,
-    captureStartDate: string,
-    captureEndDate: string,
-): Promise<{ photos: Photo[]; total: number } | null> => {
-    const index = await getLocalSearchIndex();
-    if (!index) {
-        return null;
-    }
-    const captureStart = captureStartDate ? new Date(`${captureStartDate}T00:00:00Z`) : null;
-    const captureEnd = captureEndDate ? new Date(`${captureEndDate}T00:00:00Z`) : null;
-
-    let semantic: SemanticSearchContext | undefined;
-    if (index.vectorIndex) {
-        try {
-            const encoder = await getSemanticQueryEncoder();
-            if (encoder) {
-                const queryEmbedding = await encoder.worker.encodeText(query, encoder.modelState, SEMANTIC_QUERY_ENCODE_TIMEOUT_MS);
-                if (queryEmbedding.length > 0) {
-                    const vectorIndex = index.vectorIndex;
-                    semantic = {
-                        queryEmbedding,
-                        getEmbedding: (filename: string) => vectorIndex.embeddingsByFilename.get(filename),
-                    };
-                }
-            }
-        } catch {
-            // Semantic is a bonus tier -- fall through to lexical-only.
-        }
-    }
-
-    const { filenames, total } = runLocalSearch(index.rows, index.peopleNameIndex, query, offset, limit, captureStart, captureEnd, semantic);
-    if (total === 0) {
-        return null;
-    }
-    if (filenames.length === 0) {
-        // A real result set exists, this page is just past the end of it --
-        // a legitimate empty page, not a reason to fall back to the server.
-        return { photos: [], total };
-    }
-    try {
-        const response = await post('/api/photos/lookup-batch', { filenames });
-        const byFilename = new Map<string, Photo>((response.photos || []).map((p: Photo) => [p.filename, p]));
-        // lookup-batch can drop a filename it can't resolve (e.g. deleted
-        // between scoring and lookup); preserve local's rank order for
-        // whatever did resolve rather than trusting lookup-batch's own order.
-        const photos = filenames.map((f) => byFilename.get(f)).filter((p): p is Photo => Boolean(p));
-        return { photos, total };
-    } catch {
-        return null;
-    }
-};
-
 const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     addNotification = noopAddNotification,
     registerUploadCompletionHandler,
@@ -4603,11 +4509,6 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
             return undefined;
         }
         return registerUploadCompletionHandler(() => {
-            // Newly-uploaded photos wouldn't be in the locally-cached lexical
-            // index yet (it's only refreshed on demand); drop it so the next
-            // search re-fetches instead of silently missing them for the
-            // rest of the tab session.
-            invalidateLocalSearchIndex();
             return fetchPhotos(sortBy, 0, false, searchQuery);
         });
     }, [fetchPhotos, registerUploadCompletionHandler, searchQuery, sortBy]);

@@ -4,8 +4,6 @@ import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { get, post } from '../../../services/apiClient';
-import { runLocalSemanticSearch } from '../../../services/localSemanticSearch';
-import { getLocalSearchIndex } from '../../../services/localSearchIndex';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 import type { Photo } from '../types';
@@ -36,6 +34,9 @@ const mapResult = (b: BackendPhoto): Photo => {
 };
 
 const SEARCH_PAGE_LIMIT = 200;
+// A new library's search database is built on the server; poll for up to ~2 minutes.
+const SEARCH_BUILD_RETRIES = 12;
+const SEARCH_BUILD_RETRY_MS = 10000;
 
 // The local search scores filenames; turn them back into full photo records
 // (thumbnails, ratings, dates, ...) via a point-lookup, preserving the local
@@ -52,63 +53,23 @@ const resolvePhotos = async (filenames: string[]): Promise<Photo[]> => {
 };
 
 /**
- * Ask — one search box fused across people / places / things / years. Results
- * come from the full client-side search the legacy gallery built (lexical +
- * semantic CLIP tier over a locally-cached index; see localSemanticSearch.ts),
- * which avoids the slow server-side /photos/search full-scan for the common
- * case. When the local index isn't available (e.g. never built server-side, or
- * a brand-new library) it falls back to that server endpoint and tells the user
- * the search is running on the server and will take longer. Matched people and
- * places surface as cards, live typeahead disambiguates the trailing term, and
- * a search can be saved as an album.
+ * Ask — one search box fused across people / places / things / years. Search
+ * runs entirely on the backend (/photos/search over a per-library SQLite
+ * full-text database on the server's local disk); the browser downloads no
+ * search index. A brand-new library whose database is still being built gets a
+ * "preparing" notice and is retried automatically. Matched people and places
+ * surface as cards, live typeahead disambiguates the trailing term, and a
+ * search can be saved as an album.
  */
 export const AskPage: React.FC = () => {
     const { people, places, route, createAlbum, addPhotosToAlbum, registerPhotos, navigate } = useStore();
     const [query, setQuery] = useState(route.params.query ?? '');
     const [results, setResults] = useState<Photo[]>([]);
     const [searching, setSearching] = useState(false);
-    // True once a search has been routed to the slower server endpoint (the
-    // local index couldn't answer it) -- surfaced in the UI so the user knows
-    // why this particular search is taking longer.
-    const [usingBackend, setUsingBackend] = useState(false);
+    // True while the server is still building this library's search database
+    // (new library / first search after an upgrade); searches retry automatically.
+    const [indexBuilding, setIndexBuilding] = useState(false);
     const seqRef = useRef(0);
-
-    // Starts downloading the client-side lexical/vector search index as soon
-    // as this page mounts, instead of only on the user's first keystroke --
-    // that blob can be very large (hundreds of MB compressed on a big
-    // library) and takes real time to fetch + gunzip, so the trade favors
-    // eating that cost while the user is reading/typing their query instead
-    // of freezing the first search on it. Used to start unconditionally the
-    // moment ANY session signed in (racing five other fetches in the same
-    // mount tick) regardless of whether Ask was ever opened -- now scoped to
-    // this page, so a session that never opens Ask never pays for it. See
-    // the 2026-10-01 boot-request audit.
-    //
-    // On a cold account the server-side index itself hasn't finished
-    // building yet, so /api/photos/search-index responds with
-    // available:false (by design -- it never blocks the request on the
-    // rebuild). Retry on a timer so the download still happens in the
-    // background, once the server-side rebuild it kicked off finishes.
-    // Each attempt (not the whole retry span) goes through the shared
-    // background queue, so it takes its turn alongside other tab prefetches
-    // instead of either blocking them for the full ~5min retry budget or
-    // jumping the line in front of them.
-    useEffect(() => {
-        let cancelled = false;
-        const controller = new AbortController();
-        const warm = async () => {
-            for (let attempt = 0; attempt < 20 && !cancelled; attempt += 1) {
-                const result = await enqueueBackgroundRequest(() => getLocalSearchIndex(), { signal: controller.signal }).catch(() => null);
-                if (result || cancelled) return;
-                await new Promise((resolve) => setTimeout(resolve, 15000));
-            }
-        };
-        void warm();
-        return () => {
-            cancelled = true;
-            controller.abort();
-        };
-    }, []);
 
     // Search results aren't part of the gallery's paginated photo list, so the
     // viewer can't resolve them by id unless they're registered here too --
@@ -127,7 +88,7 @@ export const AskPage: React.FC = () => {
             seqRef.current += 1;
             setResults([]);
             setSearching(false);
-            setUsingBackend(false);
+            setIndexBuilding(false);
         }
     }, [query]);
 
@@ -143,49 +104,35 @@ export const AskPage: React.FC = () => {
         if (!trimmed) {
             setResults([]);
             setSearching(false);
-            setUsingBackend(false);
+            setIndexBuilding(false);
             return;
         }
         setSearching(true);
-        setUsingBackend(false);
+        setIndexBuilding(false);
         void (async () => {
-            // Primary path: the full client-side search (lexical + semantic
-            // CLIP tier) over the locally-cached index. Returns null when the
-            // local index can't answer -- either it isn't available yet or it
-            // scored nothing, both of which fall through to the server below.
-            let local: Awaited<ReturnType<typeof runLocalSemanticSearch>>;
-            try {
-                local = await runLocalSemanticSearch(trimmed, 0, SEARCH_PAGE_LIMIT, null, null);
-            } catch {
-                local = null;
-            }
-            if (seq !== seqRef.current) return;
-
-            if (local) {
+            // Backend search. If the library's search database is still being
+            // built the server says so (searchIndexBuilding) and we retry for a
+            // while instead of showing a misleading empty result.
+            for (let attempt = 0; attempt < SEARCH_BUILD_RETRIES; attempt += 1) {
                 try {
-                    const photos = await resolvePhotos(local.filenames);
+                    const res = await get<{ photos?: BackendPhoto[]; searchIndexBuilding?: boolean }>(
+                        `/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=${SEARCH_PAGE_LIMIT}`,
+                    );
                     if (seq !== seqRef.current) return;
-                    setResults(photos);
+                    if (res?.searchIndexBuilding && attempt < SEARCH_BUILD_RETRIES - 1) {
+                        setIndexBuilding(true);
+                        await new Promise((resolve) => setTimeout(resolve, SEARCH_BUILD_RETRY_MS));
+                        if (seq !== seqRef.current) return;
+                        continue;
+                    }
+                    setIndexBuilding(Boolean(res?.searchIndexBuilding));
+                    setResults(Array.isArray(res?.photos) ? res.photos.map(mapResult) : []);
                 } catch {
                     if (seq === seqRef.current) setResults([]);
-                } finally {
-                    if (seq === seqRef.current) setSearching(false);
                 }
-                return;
+                break;
             }
-
-            // Fallback: the slower server-side full-scan search. Flag it so the
-            // UI can tell the user this search is running on the server.
-            setUsingBackend(true);
-            try {
-                const res = await get<{ photos?: BackendPhoto[] }>(`/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=${SEARCH_PAGE_LIMIT}`);
-                if (seq !== seqRef.current) return;
-                setResults(Array.isArray(res?.photos) ? res.photos.map(mapResult) : []);
-            } catch {
-                if (seq === seqRef.current) setResults([]);
-            } finally {
-                if (seq === seqRef.current) setSearching(false);
-            }
+            if (seq === seqRef.current) setSearching(false);
         })();
     };
 
@@ -307,11 +254,11 @@ export const AskPage: React.FC = () => {
                     )}
                     <div className="pt-menu-label">
                         {searching
-                            ? (usingBackend ? 'Searching on the server (this can take longer)…' : 'Searching…')
+                            ? (indexBuilding ? 'Preparing your library for search — this can take a minute…' : 'Searching…')
                             : `${results.length} result${results.length === 1 ? '' : 's'}`}
                     </div>
-                    {usingBackend && !searching && (
-                        <p className="pt-page-sub">Searched on the server — the fast on-device index wasn’t available for this query.</p>
+                    {indexBuilding && !searching && (
+                        <p className="pt-page-sub">Your library’s search is still being prepared — try again in a minute.</p>
                     )}
                     <PhotoGrid photos={results} emptyHint={searching ? '' : 'No photos match that search.'} />
                 </>

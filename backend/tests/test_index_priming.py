@@ -21,8 +21,12 @@ while backend's index-status never builds.
 """
 from __future__ import annotations
 
-import threading
+import json
 import time
+
+import threading
+
+import pytest
 
 import pytest
 
@@ -30,6 +34,13 @@ import app
 from routes.photos import photos_index_status
 from routes.tools import tools_build_indexes, tools_indexes_status
 import storage_utils
+
+
+@pytest.fixture(autouse=True)
+def _no_streaming_hook(monkeypatch):
+    # app registers the streaming build as storage_utils.LEXICAL_BUILD_HOOK on import;
+    # these tests exercise the primer's ordering/locking with patched refreshers.
+    monkeypatch.setattr(storage_utils, 'LEXICAL_BUILD_HOOK', None)
 
 
 # --- prime_all_user_indexes_sequentially -------------------------------------
@@ -309,100 +320,83 @@ def _build_state(indexes, needs_rebuild):
 def test_tools_build_does_not_prime_when_all_built_and_clean(monkeypatch, route_ctx):
     monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
         {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=False))
-    primed = []
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(uid))
+    monkeypatch.setattr(app, 'index_build_needed', lambda uid: False)
+    queued = []
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': queued.append(uid) or 'queued')
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
         response = tools_build_indexes()
 
-    assert primed == []
+    assert queued == []
     payload = response.get_json()
     assert payload['ok'] is True
     assert payload['ready'] is True
-    assert payload['building'] is False
+    assert payload['building'] is False and payload['queued'] == 'not_needed'
 
 
-def test_tools_build_kicks_primer_when_any_index_missing(monkeypatch, route_ctx):
+def test_tools_build_enqueues_when_any_index_missing(monkeypatch, route_ctx):
     monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
         {'sort': True, 'lexical': False, 'albums': True, 'people': True}, needs_rebuild=True))
-    primed = []
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(uid))
+    monkeypatch.setattr(app, 'index_build_needed', lambda uid: True)
+    queued = []
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': queued.append((uid, reason)) or 'queued')
+    # The route must NOT build inline any more (that is what orphaned jobs on the scale-to-zero tools app).
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda *a, **k: (_ for _ in ()).throw(AssertionError('no inline build')))
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
         response = tools_build_indexes()
 
-    assert primed == ['owner']
+    assert queued == [('owner', 'client')]
     payload = response.get_json()
-    assert payload['ok'] is True
-    assert payload['ready'] is False
-    assert payload['building'] is False  # build is synchronous now, so it's done by the time this returns
+    assert payload['ok'] is True and payload['ready'] is False
+    assert payload['building'] is True and payload['queued'] == 'queued'
     assert payload['indexes']['lexical'] is False
 
 
-def test_tools_build_kicks_primer_when_built_but_dirty(monkeypatch, route_ctx):
-    # All four built (ready=True) but one dirty -> still rebuild, and the gate
-    # is already satisfied (ready stays True) so the frontend won't block.
+def test_tools_build_enqueues_when_built_but_dirty_without_blocking_the_gate(monkeypatch, route_ctx):
+    # All built (ready=True) but one dirty -> still queue a rebuild; ready stays
+    # True so the frontend gate is not held.
     monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
         {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=True))
-    primed = []
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(uid))
+    monkeypatch.setattr(app, 'index_build_needed', lambda uid: True)
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': 'already_active')
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
-        response = tools_build_indexes()
+        payload = tools_build_indexes().get_json()
 
-    assert primed == ['owner']
-    payload = response.get_json()
-    assert payload['ready'] is True
-    assert payload['building'] is False  # build is synchronous now, so it's done by the time this returns
+    assert payload['ready'] is True and payload['building'] is True and payload['queued'] == 'already_active'
 
 
-def test_tools_build_survives_primer_exception(monkeypatch, route_ctx):
+def test_tools_build_reports_not_building_when_queue_unavailable(monkeypatch, route_ctx):
     monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
         {'sort': False, 'lexical': False, 'albums': False, 'people': False}, needs_rebuild=True))
-
-    def _boom(uid, **k):
-        raise RuntimeError('thread pool exhausted')
-
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', _boom)
+    monkeypatch.setattr(app, 'index_build_needed', lambda uid: True)
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': 'unavailable')
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
-        response = tools_build_indexes()  # must not raise
+        payload = tools_build_indexes().get_json()
 
-    payload = response.get_json()
-    assert payload['ready'] is False
-    assert payload['building'] is False  # kick failed, so not reported as building
+    assert payload['ok'] is True and payload['building'] is False and payload['queued'] == 'unavailable'
 
 
-def test_tools_build_passes_progress_callback_that_writes_job_row(monkeypatch, route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
-        {'sort': False, 'lexical': False, 'albums': False, 'people': False}, needs_rebuild=True))
-    captured = {}
-
-    def _fake_prime(uid, *, on_progress=None, wait=False):
-        captured['on_progress'] = on_progress
-
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', _fake_prime)
+def test_progress_callback_writes_running_then_done(monkeypatch):
     job_rows = []
     monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: job_rows.append((job_id, uid, jt, status, f)))
-    explore_refreshed = []
-    monkeypatch.setattr(app, 'refresh_user_explore_summary', lambda uid: explore_refreshed.append(uid))
+    cb = app._index_build_progress_callback('owner')
+    cb({'sort': True, 'lexical': False, 'albums': False, 'people': False}, True)
+    cb({'sort': True, 'lexical': True, 'albums': True, 'people': True}, False)
+    # Explore/timeline/search-db are produced inside the streaming 'lexical' step
+    # now, so the callback only mirrors status.
+    assert [r[3] for r in job_rows] == ['running', 'done'] and job_rows[0][2] == app.INDEX_BUILD_JOB_TYPE
+    assert job_rows[-1][0] == app._index_build_job_id('owner')
 
-    with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
-        tools_build_indexes()
 
-    # The route must hand the primer a progress callback; invoking it should
-    # mirror progress into an index_build jobs-table row.
-    assert callable(captured.get('on_progress'))
-    captured['on_progress']({'sort': True, 'lexical': False, 'albums': False, 'people': False}, True)
-    assert explore_refreshed == []  # not yet: build still running
-    captured['on_progress']({'sort': True, 'lexical': True, 'albums': True, 'people': True}, False)
-    assert len(job_rows) == 2
-    assert job_rows[0][2] == app.INDEX_BUILD_JOB_TYPE
-    # On completion (building=False) with lexical built, the callback recomputes
-    # the Explore summary here on tools so backend never has to.
-    assert explore_refreshed == ['owner']
-    assert job_rows[0][3] == 'running'
-    assert job_rows[1][3] == 'done'  # building=False + all ready
+def test_progress_callback_marks_failed_when_not_ready(monkeypatch):
+    rows = []
+    monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: rows.append(status))
+    monkeypatch.setattr(app, 'refresh_user_explore_summary', lambda uid: None)
+    app._index_build_progress_callback('owner')({'sort': True, 'lexical': False, 'albums': True, 'people': True}, False)
+    assert rows == ['failed']
 
 
 # --- GET /api/tools/indexes/status --------------------------------------------
@@ -411,7 +405,7 @@ def test_tools_status_reports_ready_without_building(monkeypatch, route_ctx):
     monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
         'sort': True, 'lexical': True, 'albums': True, 'people': True,
     })
-    monkeypatch.setattr(app, 'index_prime_in_progress', lambda uid: False)
+    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
 
     with app.app.test_request_context('/api/tools/indexes/status'):
         response = tools_indexes_status()
@@ -421,11 +415,11 @@ def test_tools_status_reports_ready_without_building(monkeypatch, route_ctx):
     assert payload['building'] is False
 
 
-def test_tools_status_reports_building_when_incomplete_and_prime_running(monkeypatch, route_ctx):
+def test_tools_status_reports_building_from_the_shared_job_row(monkeypatch, route_ctx):
     monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
         'sort': True, 'lexical': False, 'albums': False, 'people': False,
     })
-    monkeypatch.setattr(app, 'index_prime_in_progress', lambda uid: True)
+    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: True)
 
     with app.app.test_request_context('/api/tools/indexes/status'):
         response = tools_indexes_status()
@@ -497,3 +491,173 @@ def test_trigger_tools_index_rebuild_posts_with_bearer_token(monkeypatch):
     assert len(posts) == 1
     assert posts[0]['url'] == 'https://tools.example.invalid/api/tools/indexes/build'
     assert posts[0]['headers']['Authorization'] == 'Bearer token-for-u1'
+
+
+# --- queue-based builds (worker) ------------------------------------------------
+
+class _FakeQueue:
+    def __init__(self):
+        self.sent = []
+        self.delays = []
+
+    def send_message(self, body, visibility_timeout=None):
+        self.sent.append(json.loads(body))
+        self.delays.append(visibility_timeout)
+
+
+def test_enqueue_index_build_queues_once_and_marks_the_job(monkeypatch):
+    queue = _FakeQueue()
+    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
+    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
+    rows = []
+    monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: rows.append((job_id, status)))
+
+    assert app.enqueue_index_build('lib-1', reason='x') == 'queued'
+    assert queue.sent == [{'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1', 'reason': 'x'}]
+    assert rows == [('index-build-lib-1', 'queued')]
+
+
+def test_enqueue_index_build_dedupes_against_an_active_job(monkeypatch):
+    queue = _FakeQueue()
+    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
+    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: True)
+    assert app.enqueue_index_build('lib-1') == 'already_active' and queue.sent == []
+
+
+def test_enqueue_index_build_unavailable_without_queue_or_on_send_failure(monkeypatch):
+    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
+    monkeypatch.setattr(app, 'library_ops_queue_client', None)
+    assert app.enqueue_index_build('lib-1') == 'unavailable'
+
+    class _Boom:
+        def send_message(self, body, visibility_timeout=None):
+            raise RuntimeError('queue down')
+
+    rows = []
+    monkeypatch.setattr(app, 'library_ops_queue_client', _Boom())
+    monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: rows.append(status))
+    assert app.enqueue_index_build('lib-1') == 'unavailable' and rows == ['queued', 'failed']
+    assert app.enqueue_index_build('') == 'unavailable'
+
+
+def test_index_build_job_active_requires_fresh_queued_or_running_row(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    monkeypatch.setattr(app, 'jobs_table_client', object())
+    fresh = datetime.now(timezone.utc).isoformat()
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=app.CLUSTERING_ACTIVE_JOB_STALE_MINUTES + 1)).isoformat()
+    for status, updated, expected in (('running', fresh, True), ('queued', fresh, True), ('done', fresh, False), ('running', stale, False)):
+        monkeypatch.setattr(app, '_get_job_row', lambda pk, jid, s=status, u=updated: {'status': s, 'updatedAt': u})
+        assert app._index_build_job_active('lib-1') is expected
+    monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: None)
+    assert app._index_build_job_active('lib-1') is False
+
+
+def test_run_index_build_job_heartbeats_while_a_long_step_runs(monkeypatch):
+    import threading as _t
+    monkeypatch.setattr(app, 'INDEX_BUILD_HEARTBEAT_SECONDS', 0.02)
+    rows = []
+    lock = _t.Lock()
+
+    def upsert(job_id, uid, jt, status, **f):
+        with lock:
+            rows.append(status)
+
+    monkeypatch.setattr(app, '_upsert_job_status', upsert)
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {'sort': True})
+    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda uid: False)
+
+    def slow_prime(uid, *, on_progress=None, wait=False):
+        assert wait is True
+        time.sleep(0.2)  # one long single step with no progress callbacks
+
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', slow_prime)
+    app._run_index_build_job('lib-1', 'index-build-lib-1')
+    assert rows[0] == 'running' and rows.count('running') >= 3  # initial + several heartbeats
+
+
+def test_run_index_build_job_marks_failed_and_reraises_for_queue_retry(monkeypatch):
+    rows = []
+    monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: rows.append(status))
+    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda uid: False)
+
+    def boom(uid, **k):
+        raise RuntimeError('oom-ish')
+
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', boom)
+    with pytest.raises(RuntimeError):
+        app._run_index_build_job('lib-1', 'index-build-lib-1')
+    assert rows[0] == 'running' and rows[-1] == 'failed'
+
+
+def test_trigger_prefers_the_queue_over_the_tools_http_path(monkeypatch):
+    monkeypatch.setattr(app, 'library_ops_queue_client', _FakeQueue())
+    monkeypatch.setattr(app, '_TOOLS_REBUILD_TRIGGER_LAST', {})
+    monkeypatch.setenv('TOOLS_INTERNAL_URL', 'https://tools.example')
+    seen = []
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': seen.append(uid) or 'queued')
+    posted = []
+    monkeypatch.setattr('requests.post', lambda *a, **k: posted.append(a))
+    app._trigger_tools_index_rebuild('lib-9')
+    assert seen == ['lib-9'] and posted == []
+
+
+def test_worker_processes_an_index_build_message_and_acks_it(monkeypatch):
+    """End to end through the real message processor: an index_build message from
+    the library-ops queue runs the build job and is deleted only on success."""
+    ran, deleted = [], []
+    monkeypatch.setattr(app, '_run_index_build_job', lambda uid, jid: ran.append((uid, jid)))
+
+    class _Msg:
+        content = json.dumps({'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1'})
+        dequeue_count = 1
+        id = 'm1'
+        pop_receipt = 'r'
+
+    class _Q:
+        def update_message(self, msg, visibility_timeout=0):
+            return msg
+
+        def delete_message(self, msg):
+            deleted.append(msg)
+
+    app._process_clustering_queue_message(_Msg(), _Q(), 'photostore-library-ops', 3)
+    assert ran == [('lib-1', 'index-build-lib-1')] and len(deleted) == 1
+
+
+def test_worker_leaves_the_message_for_redelivery_when_the_build_raises(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(app, '_run_index_build_job', lambda uid, jid: (_ for _ in ()).throw(RuntimeError('killed')))
+
+    class _Msg:
+        content = json.dumps({'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1'})
+        dequeue_count = 1
+        id = 'm1'
+        pop_receipt = 'r'
+
+    class _Q:
+        def update_message(self, msg, visibility_timeout=0):
+            return msg
+
+        def delete_message(self, msg):
+            deleted.append(msg)
+
+    app._process_clustering_queue_message(_Msg(), _Q(), 'photostore-library-ops', 3)
+    assert deleted == []  # not acked -> becomes visible again and is retried (bounded by max_retries)
+
+
+def test_enqueue_delays_a_rebuild_that_follows_a_finished_one(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    queue = _FakeQueue()
+    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
+    monkeypatch.setattr(app, 'jobs_table_client', object())
+    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
+    monkeypatch.setattr(app, 'INDEX_BUILD_MIN_INTERVAL_SECONDS', 120)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
+    finished = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': finished})
+    assert app.enqueue_index_build('lib-1') == 'queued'
+    assert 80 <= queue.delays[-1] <= 90  # ~120s minus the 30s already elapsed
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': long_ago})
+    assert app.enqueue_index_build('lib-1') == 'queued' and queue.delays[-1] is None  # immediate

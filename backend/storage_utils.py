@@ -1646,6 +1646,147 @@ def _warm_face_crops_for_photo(
             continue
 
 
+# --- Index files on the shared Azure Files volume -----------------------------
+# INDEX_DISK_CACHE_DIR points at the mounted share (backend/tools/...). Every
+# index blob (lexical, listing, slim search, sort, access, albums, people,
+# vector, people/tag embeddings, explore, timeline) lives in one of four index
+# containers, all of which are handed out by _get_blob_client -- so wrapping
+# the client there covers every index kind at once:
+#   * write-through: each upload also lands on the share (tools builds -> every
+#     replica/role sees the file immediately);
+#   * read-through: a download is served from the share when its ETag sidecar
+#     matches the blob's current ETag (one tiny get_blob_properties), else it
+#     downloads once and fills the share;
+#   * warm_index_file(): streams a blob to the share without holding it in
+#     memory (used at session start).
+# Small blobs (manifests) bypass it: they must always be read fresh. Blob
+# storage stays the source of truth; every share failure falls back to it.
+INDEX_DISK_CACHE_DIR = os.getenv('INDEX_DISK_CACHE_DIR', '').strip()
+INDEX_DISK_CACHE_MIN_BYTES = int(os.getenv('INDEX_DISK_CACHE_MIN_BYTES', '65536'))
+
+
+def _index_container_names() -> Set[str]:
+    return {
+        _lexical_index_container_name(), _vector_index_container_name(),
+        _people_embedding_index_container_name(), _tag_embedding_index_container_name(),
+    } - {''}
+
+
+class _Bytes:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def readall(self) -> bytes:
+        return self._data
+
+
+class _ShareBackedBlob:
+    def __init__(self, inner, container: str, blob: str) -> None:
+        self._inner = inner
+        safe = lambda v: re.sub(r'[^A-Za-z0-9._-]', '_', v)
+        self._path = os.path.join(INDEX_DISK_CACHE_DIR, safe(container), safe(blob))
+        self._kind = f'{container}/{blob}'
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def _write(self, data: bytes, etag: Optional[str]) -> None:
+        try:
+            if not etag or len(data) < INDEX_DISK_CACHE_MIN_BYTES:
+                self._forget()
+                return
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            tag = f'.{os.getpid()}.{threading.get_ident()}.tmp'
+            with open(self._path + tag, 'wb') as fh:
+                fh.write(data)
+            os.replace(self._path + tag, self._path)
+            with open(self._path + '.etag' + tag, 'w') as fh:
+                fh.write(etag)
+            os.replace(self._path + '.etag' + tag, self._path + '.etag')
+            perf_instrumentation.log_event('index_share_store', blob=self._kind, mb=round(len(data) / 1048576, 1))
+        except OSError:
+            _LOGGER.warning('Index share write failed for %s', self._path, exc_info=True)
+
+    def _forget(self) -> None:
+        for suffix in ('', '.etag'):
+            try:
+                os.remove(self._path + suffix)
+            except OSError:
+                pass
+
+    def _cached_bytes(self) -> Optional[bytes]:
+        try:
+            with open(self._path + '.etag') as fh:
+                cached = fh.read().strip()
+            if not cached or str(self._inner.get_blob_properties().etag or '') != cached:
+                return None
+            with open(self._path, 'rb') as fh:
+                return fh.read()
+        except Exception:
+            return None
+
+    def upload_blob(self, data, *args, **kwargs):
+        result = self._inner.upload_blob(data, *args, **kwargs)
+        if isinstance(data, (bytes, bytearray)):
+            etag = result.get('etag') if isinstance(result, dict) else getattr(result, 'etag', None)
+            self._write(bytes(data), str(etag) if etag else None)
+        else:
+            self._forget()
+        return result
+
+    def download_blob(self, *args, **kwargs):
+        if args or kwargs:
+            return self._inner.download_blob(*args, **kwargs)
+        with perf_instrumentation.span('index.share.read', blob=self._kind):
+            cached = self._cached_bytes()
+        if cached is not None:
+            perf_instrumentation.log_event('index_share_hit', blob=self._kind, mb=round(len(cached) / 1048576, 1))
+            return _Bytes(cached)
+        downloader = self._inner.download_blob()
+        payload = downloader.readall()
+        etag = getattr(getattr(downloader, 'properties', None), 'etag', None)
+        self._write(payload, str(etag) if etag else None)
+        return _Bytes(payload)
+
+    def delete_blob(self, *args, **kwargs):
+        self._forget()
+        return self._inner.delete_blob(*args, **kwargs)
+
+    def warm(self) -> str:
+        """Ensure the share holds the blob's current version, streaming to disk
+        (never the whole blob in memory). Returns 'hit' | 'filled' | 'skipped'."""
+        try:
+            etag = str(self._inner.get_blob_properties().etag or '')
+        except Exception:
+            return 'skipped'
+        try:
+            with open(self._path + '.etag') as fh:
+                if etag and fh.read().strip() == etag:
+                    return 'hit'
+        except OSError:
+            pass
+        try:
+            size = int(self._inner.get_blob_properties().size or 0)
+            if size < INDEX_DISK_CACHE_MIN_BYTES:
+                return 'skipped'
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            tmp = f'{self._path}.{os.getpid()}.{threading.get_ident()}.warm'
+            downloader = self._inner.download_blob()
+            with open(tmp, 'wb') as fh:
+                downloader.readinto(fh)
+            got = str(getattr(getattr(downloader, 'properties', None), 'etag', '') or '')
+            if not got:
+                os.remove(tmp)
+                return 'skipped'
+            os.replace(tmp, self._path)
+            with open(self._path + '.etag', 'w') as fh:
+                fh.write(got)
+            return 'filled'
+        except Exception:
+            _LOGGER.warning('Index share warm failed for %s', self._kind, exc_info=True)
+            return 'skipped'
+
+
 def _get_blob_client(container_name: str, filename: str):
     blob_service_client = _CTX.get('blob_service_client')
     if not blob_service_client or not container_name:
@@ -1653,9 +1794,79 @@ def _get_blob_client(container_name: str, filename: str):
     if not hasattr(blob_service_client, 'get_blob_client'):
         return None
     try:
-        return blob_service_client.get_blob_client(container=container_name, blob=filename)
+        client = blob_service_client.get_blob_client(container=container_name, blob=filename)
     except Exception:
         return None
+    # The SQLite search DB must live on LOCAL EPHEMERAL disk (search_db.py), never
+    # on the SMB share -- so it bypasses the share-backed client.
+    if INDEX_DISK_CACHE_DIR and container_name in _index_container_names() and '-searchdb' not in filename:
+        return _ShareBackedBlob(client, container_name, filename)
+    return client
+
+
+def _user_index_blob_locations(user_id: str) -> List[Tuple[str, str]]:
+    key = str(user_id or '').strip()
+    lexical = _lexical_index_container_name()
+    return [
+        (lexical, _sort_index_json_blob_name(key)),
+        (lexical, _listing_index_json_blob_name(key)),
+        (lexical, _access_index_json_blob_name(key)),
+        (lexical, _albums_index_json_blob_name(key)),
+        (lexical, _people_index_json_blob_name(key)),
+        (lexical, _lexical_index_json_blob_name(key)),
+        (_vector_index_container_name(), _vector_index_npz_blob_name(key)),
+        (_people_embedding_index_container_name(), _people_embedding_index_npz_blob_name(key)),
+        (_tag_embedding_index_container_name(), _tag_embedding_index_npz_blob_name(key)),
+    ]
+
+
+_WARM_LOCK = threading.Lock()
+_WARM_LAST: Dict[str, float] = {}
+INDEX_WARM_COOLDOWN_SECONDS = float(os.getenv('INDEX_WARM_COOLDOWN_SECONDS', '300'))
+
+
+def warm_user_index_files(user_id: str) -> Dict[str, str]:
+    """Make sure the shared volume holds the current version of every index
+    blob for this user (streamed to disk, nothing held in memory). Called in the
+    background at session start so later loads -- on any replica or role -- read
+    local disk instead of Blob Storage. No-op without INDEX_DISK_CACHE_DIR."""
+    key = str(user_id or '').strip()
+    if not key or not INDEX_DISK_CACHE_DIR:
+        return {}
+    results: Dict[str, str] = {}
+    with perf_instrumentation.span('index.share.warm', user=key):
+        for container, blob in _user_index_blob_locations(key):
+            client = _get_blob_client(container, blob)
+            if isinstance(client, _ShareBackedBlob):
+                results[f'{container}/{blob}'] = client.warm()
+    perf_instrumentation.log_event(
+        'index_share_warm', user=key,
+        filled=sum(v == 'filled' for v in results.values()), hit=sum(v == 'hit' for v in results.values()),
+        skipped=sum(v == 'skipped' for v in results.values()),
+    )
+    return results
+
+
+def warm_user_index_files_async(user_id: str) -> bool:
+    """Single-flight, cooled-down background warm. True if one was started."""
+    key = str(user_id or '').strip()
+    if not key or not INDEX_DISK_CACHE_DIR:
+        return False
+    now = time.monotonic()
+    with _WARM_LOCK:
+        last = _WARM_LAST.get(key)
+        if last is not None and now - last < INDEX_WARM_COOLDOWN_SECONDS:
+            return False
+        _WARM_LAST[key] = now
+
+    def _run() -> None:
+        try:
+            warm_user_index_files(key)
+        except Exception:
+            _LOGGER.exception('Index share warm failed for user %s', key)
+
+    threading.Thread(target=_run, name='index-share-warm', daemon=True).start()
+    return True
 
 
 def upload_file_to_blob(container_name: str, filename: str, content: Union[bytes, BinaryIO], content_type: str) -> None:
@@ -3060,57 +3271,6 @@ def invalidate_user_listing_index_cache(user_id: str) -> None:
         _LISTING_INDEX_CACHE.pop(key, None)
 
 
-# Optional on-disk cache for index blobs (INDEX_DISK_CACHE_DIR, e.g. the shared
-# Azure Files volume mounted on backend/tools). Keyed by blob ETag, so a hit
-# costs one cheap get_blob_properties instead of re-downloading hundreds of MB
-# after every replica restart/scale-out. Every failure falls through to a
-# normal download; writes are atomic (tmp + os.replace) since replicas share it.
-INDEX_DISK_CACHE_DIR = os.getenv('INDEX_DISK_CACHE_DIR', '').strip()
-
-
-def _disk_cache_path(kind: str, user_id: str) -> Optional[str]:
-    if not INDEX_DISK_CACHE_DIR:
-        return None
-    safe = re.sub(r'[^A-Za-z0-9._-]', '_', str(user_id))
-    return os.path.join(INDEX_DISK_CACHE_DIR, f'{safe}-{kind}.json.gz')
-
-
-def _download_with_disk_cache(kind: str, user_id: str, blob_client) -> bytes:
-    path = _disk_cache_path(kind, user_id)
-    etag = None
-    if path:
-        try:
-            etag = str(blob_client.get_blob_properties().etag or '')
-        except Exception:
-            etag = None
-        if etag:
-            try:
-                with open(path + '.etag') as fh:
-                    cached_etag = fh.read().strip()
-                if cached_etag == etag:
-                    with open(path, 'rb') as fh:
-                        data = fh.read()
-                    perf_instrumentation.log_event('index_disk_cache_hit', kind=kind, user=user_id, mb=round(len(data) / 1048576, 1))
-                    return data
-            except OSError:
-                pass
-    payload = blob_client.download_blob().readall()
-    if path and etag:
-        try:
-            os.makedirs(INDEX_DISK_CACHE_DIR, exist_ok=True)
-            tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
-            with open(tmp, 'wb') as fh:
-                fh.write(payload)
-            os.replace(tmp, path)
-            with open(tmp, 'w') as fh:
-                fh.write(etag)
-            os.replace(tmp, path + '.etag')
-            perf_instrumentation.log_event('index_disk_cache_store', kind=kind, user=user_id, mb=round(len(payload) / 1048576, 1))
-        except OSError:
-            _LOGGER.warning('Index disk cache write failed for %s', path, exc_info=True)
-    return payload
-
-
 def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['LexicalIndexSnapshot']:
     """Shared, instrumented loader for the gzip+JSON index blobs (lexical,
     listing, sort). Separate spans for download / gunzip / json-parse so the
@@ -3119,7 +3279,7 @@ def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['
         return None
     try:
         with perf_instrumentation.span(f'index.{kind}.download', user=user_id):
-            payload = _download_with_disk_cache(kind, user_id, blob_client)
+            payload = blob_client.download_blob().readall()
     except Exception:
         return None
     try:
@@ -3246,55 +3406,50 @@ def get_user_listing_index(
                 _LISTING_INDEX_CACHE[key] = data
             return data
 
-    if not allow_refresh:
-        return None
-    lexical = get_user_lexical_index(key, allow_refresh=True, allow_sync_build=allow_sync_build)
-    if lexical is None:
-        return None
-    # refresh_user_lexical_index already wrote/cached the listing blob as a
-    # side effect of the refresh get_user_lexical_index just triggered.
-    with _LISTING_INDEX_CACHE_LOCK:
-        cached = _LISTING_INDEX_CACHE.get(key)
-    if cached:
-        return cached
-    # Fell back to an already-fresh cached lexical snapshot that predates this
-    # feature (no listing blob ever written) -- derive it in-process once.
-    return {
-        'source_version': lexical.get('source_version'),
-        'schema_version': lexical.get('schema_version'),
-        'updated_at': lexical.get('updated_at'),
-        'rows': [
-            {k: v for k, v in row.items() if k in PHOTO_LIST_SELECT_FIELDS}
-            for row in (lexical.get('rows') or [])
-        ],
-    }
+    # Not current (or never built). Deliberately NO fallback to building the
+    # full lexical snapshot here: that is a multi-GB allocation, and this runs on
+    # the 1Gi backend. The index build (worker) writes this blob; until then
+    # callers fall back to their own bounded paths.
+    return None
 
 
-# --- "Search" slim projection of the lexical index ----------------------------
-# What the BROWSER downloads for client-side search (localLexicalSearch.ts).
-# The full lexical blob carries every metadata column (hundreds of MB gzipped
-# -> 700MB+ of JSON at ~130k photos, enough to blow V8's string limit and the
-# backend's memory). The client only reads a fixed set of fields, so this blob
-# keeps exactly those, and shrinks the three bulky ones: exifData is reduced to
-# the keys search reads, processing_metadata to the >=0.2-score AI-vision labels
-# predictionTags() uses, and ocrText is capped. Written in the same pass as the
-# lexical/listing blobs (no extra Table reads). The full lexical blob stays the
-# server-side source of truth; search-index falls back to it if this one is
-# missing or stale.
-_SEARCH_INDEX_SCHEMA_VERSION = 'v1'
-SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '1500'))
+# --- Search-database row reduction helpers -------------------------------------
+# Used by search_db.reduced_row to keep the SQLite search database small: tags
+# are de-duplicated and confidence-filtered, AI predictions cut to a few labels,
+# EXIF to the keys search reads, and OCR capped.
+# Browser-index size knobs. Everything here only affects the slim BROWSER blob;
+# the full lexical blob (server-side fallback search) is untouched.
+SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '400'))
+# AI tags are already curated at write time (AI_TAG_MIN_CONFIDENCE, 0.24); the
+# browser index keeps only the confident ones. User-added/stored tags always stay.
+SEARCH_INDEX_TAG_MIN_CONFIDENCE = float(os.getenv('SEARCH_INDEX_TAG_MIN_CONFIDENCE', '0.45'))
+SEARCH_INDEX_MAX_TAGS = int(os.getenv('SEARCH_INDEX_MAX_TAGS', '20'))
+# Raw AI-vision predictions (up to 160 per photo, >=0.2) used to be shipped
+# verbatim; now only the top few confident labels, as bare strings.
+SEARCH_INDEX_PREDICTION_MIN_SCORE = float(os.getenv('SEARCH_INDEX_PREDICTION_MIN_SCORE', '0.5'))
+SEARCH_INDEX_MAX_PREDICTIONS = int(os.getenv('SEARCH_INDEX_MAX_PREDICTIONS', '8'))
 _SEARCH_SLIM_PASSTHROUGH_FIELDS = (
-    'RowKey', 'subjectTags', 'peopleNames', 'peopleIds', 'tags', 'objects', 'backgroundTags',
-    'locationCity', 'locationRegion', 'locationCountry', 'address', 'latitude', 'longitude',
-    'faceCount', 'aiPersonLabel', 'caption', 'uploadDate', 'upload_started_at',
-    'last_processing_update', 'clientLastModified',
+    'peopleIds', 'locationCity', 'locationRegion', 'locationCountry', 'address',
+    'faceCount', 'aiPersonLabel', 'caption', 'clientLastModified',
 )
 _SEARCH_SLIM_EXIF_KEYS = (
     'Model', 'DateTimeOriginal', 'DateTime', 'CreationDate', 'CreateDate',
     'MediaCreateDate', 'TrackCreateDate',
 )
-_SEARCH_PREDICTION_MIN_SCORE = 0.2
-_SEARCH_PREDICTION_MAX = 160
+_PROTECTED_TAG_SOURCES = {'user', 'stored'}
+
+
+def _json_list(raw) -> List[str]:
+    if isinstance(raw, list):
+        return [str(v) for v in raw if str(v).strip()]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        if isinstance(parsed, list):
+            return [str(v) for v in parsed if str(v).strip()]
+    return []
 
 
 def _slim_exif_for_search(raw) -> str:
@@ -3311,106 +3466,267 @@ def _slim_exif_for_search(raw) -> str:
     return json.dumps(slim, ensure_ascii=False, separators=(',', ':'))
 
 
-def _slim_processing_metadata_for_search(raw) -> str:
+def _confident_tag_filter(row: Dict):
+    """Predicate over tag strings: True for user/stored tags, tags with no
+    recorded confidence, and AI tags at/above SEARCH_INDEX_TAG_MIN_CONFIDENCE."""
+    meta: Dict[str, Tuple[float, str]] = {}
+    for item in _json_list_of_objects(row.get('tagMetadata')):
+        tag = str(item.get('tag') or '').strip()
+        if tag:
+            try:
+                conf = float(item.get('confidence'))
+            except Exception:
+                conf = 1.0
+            meta[tag] = (conf, str(item.get('source') or ''))
+
+    def keep(tag: str) -> bool:
+        found = meta.get(tag)
+        if found is None:
+            return True
+        conf, source = found
+        return source in _PROTECTED_TAG_SOURCES or conf >= SEARCH_INDEX_TAG_MIN_CONFIDENCE
+    return keep
+
+
+def _json_list_of_objects(raw) -> List[Dict]:
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    return [x for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
+
+
+def _search_slim_tags(row: Dict) -> Tuple[List[str], List[str]]:
+    """(subjectTags, tags). effective_tags unions tags/objects/backgroundTags/
+    subjectTags into one set, so the browser only needs subjectTags (kept
+    separate: semantic text uses them) plus ONE deduped list of the rest --
+    lossless de-duplication, then the confidence filter and per-photo cap."""
+    keep = _confident_tag_filter(row)
+    subject: List[str] = []
+    seen = set()
+    for tag in _json_list(row.get('subjectTags')):
+        if tag not in seen and keep(tag):
+            seen.add(tag)
+            subject.append(tag)
+    subject = subject[:SEARCH_INDEX_MAX_TAGS]
+    others: List[str] = []
+    budget = max(0, SEARCH_INDEX_MAX_TAGS - len(subject))
+    for source in ('tags', 'objects', 'backgroundTags'):
+        for tag in _json_list(row.get(source)):
+            if len(others) >= budget:
+                break
+            if tag not in seen and keep(tag):
+                seen.add(tag)
+                others.append(tag)
+    return subject, others
+
+
+def _search_prediction_labels(raw, already: set) -> List[str]:
     try:
         pm = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
         predictions = ((pm or {}).get('client_ai_vision') or {}).get('predictions')
-        if not isinstance(predictions, list):
-            return '{}'
-        kept = []
-        for item in predictions[:_SEARCH_PREDICTION_MAX]:
-            if not isinstance(item, dict):
-                continue
-            try:
-                score = float(item.get('score') or 0)
-            except Exception:
-                continue
-            if score >= _SEARCH_PREDICTION_MIN_SCORE:
-                kept.append({'label': item.get('label'), 'score': round(score, 3)})
-        if not kept:
-            return '{}'
-        return json.dumps({'client_ai_vision': {'predictions': kept}}, ensure_ascii=False, separators=(',', ':'))
     except Exception:
-        return '{}'
-
-
-def _search_slim_row(row: Dict) -> Dict:
-    out = {k: row[k] for k in _SEARCH_SLIM_PASSTHROUGH_FIELDS if row.get(k) not in (None, '', '[]')}
-    out['RowKey'] = row.get('RowKey')
-    if row.get('exifData'):
-        out['exifData'] = _slim_exif_for_search(row.get('exifData'))
-    if row.get('processing_metadata'):
-        pm = _slim_processing_metadata_for_search(row.get('processing_metadata'))
-        if pm != '{}':
-            out['processing_metadata'] = pm
-    ocr = str(row.get('ocrText') or '')
-    if ocr:
-        out['ocrText'] = ocr[:SEARCH_INDEX_OCR_MAX_CHARS]
+        return []
+    if not isinstance(predictions, list):
+        return []
+    scored = []
+    for item in predictions[:160]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            score = float(item.get('score') or 0)
+        except Exception:
+            continue
+        label = str(item.get('label') or '').strip()
+        if label and score >= SEARCH_INDEX_PREDICTION_MIN_SCORE and label not in already:
+            scored.append((score, label))
+    scored.sort(key=lambda x: -x[0])
+    out: List[str] = []
+    for _, label in scored:
+        if label not in out:
+            out.append(label)
+        if len(out) >= SEARCH_INDEX_MAX_PREDICTIONS:
+            break
     return out
 
 
-def _search_index_json_blob_name(user_id: str) -> str:
-    return f'{_vector_index_blob_key(user_id)}-search.json.gz'
 
 
-def _search_index_manifest_blob_name(user_id: str) -> str:
-    return f'{_vector_index_blob_key(user_id)}-search.json'
+# --- Streaming library build ---------------------------------------------------
+# ONE paged pass over the metadata partition feeds every derived artifact that
+# used to be built from a full in-memory snapshot of the library (the lexical
+# blob alone was ~700MB of JSON at ~130k photos -- several GB as Python objects,
+# plus a serialized copy, a listing copy and per-consumer reloads: the OOM that
+# killed index builds). Rows are offered to small "sinks" (listing blob, SQLite
+# search database, Explore and timeline aggregators) and then dropped, so memory
+# stays flat no matter how big the library is.
+#
+# Server-side projection (select=) matters as much as streaming: the old scan
+# downloaded the ~10KB-per-photo embedding columns just to discard them.
+_STREAM_SELECT_FIELDS = sorted(set(PHOTO_LIST_SELECT_FIELDS) | {
+    'subjectTags', 'peopleNames', 'tags', 'objects', 'backgroundTags', 'tagMetadata',
+    'ocrText', 'caption', 'aiPersonLabel', 'locationRegion', 'processing_complete',
+    'faceCount', 'peopleIds', 'latitude', 'longitude', 'address', 'locationCity',
+    'locationCountry', 'exifData', 'processing_metadata',
+})
+
+# Set by app.py at import: callable(user_id, source_version=None) running the
+# streaming build with the app-level sinks (Explore needs app helpers).
+LEXICAL_BUILD_HOOK: Optional[Callable[..., object]] = None
 
 
-def get_search_index_blob_location(user_id: str) -> Tuple[str, str]:
-    return _lexical_index_container_name(), _search_index_json_blob_name(user_id)
+def iter_library_rows(user_id: str):
+    """Yield the library's finished, non-deleted metadata rows one at a time
+    (projected columns only). Raises if the scan fails, so callers never
+    persist a partial result as if it were the whole library."""
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        raise RuntimeError('metadata table not configured')
+    for row in metadata_table_client.query_entities(
+        f"PartitionKey eq '{_escape_odata(user_id)}' and processing_complete eq true",
+        select=_STREAM_SELECT_FIELDS,
+    ):
+        if not str(row.get('RowKey') or '').strip():
+            continue
+        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+            continue
+        yield row
 
 
-def load_search_index_manifest(user_id: str) -> Dict[str, str]:
-    client = _lexical_index_blob_client(_search_index_manifest_blob_name(user_id))
-    if client is None:
-        return {}
-    try:
-        parsed = json.loads(client.download_blob().readall().decode('utf-8'))
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
+class ListingSink:
+    """Writes the narrow listing projection (PHOTO_LIST_SELECT_FIELDS) as a
+    gzip JSON file incrementally, then uploads it on finish()."""
 
+    def __init__(self, user_id: str, source_version: str, workdir: str) -> None:
+        self.user_id = user_id
+        self.source_version = source_version
+        self.path = os.path.join(workdir, 'listing.json.gz')
+        self._fh = gzip.open(self.path, 'wb', compresslevel=5)
+        header = {
+            'userId': user_id, 'sourceVersion': source_version,
+            'schemaVersion': _LEXICAL_INDEX_SCHEMA_VERSION, 'updatedAt': source_version,
+        }
+        self._fh.write((json.dumps(header, separators=(',', ':'))[:-1] + ',"rows":[').encode('utf-8'))
+        self.count = 0
 
-def _write_user_search_index(user_id: str, lexical_snapshot: 'LexicalIndexSnapshot') -> None:
-    """Best-effort, non-fatal -- see the block comment above."""
-    container_name = _lexical_index_container_name()
-    if not container_name:
-        return
-    try:
-        with perf_instrumentation.span('index.search_slim.build', rows=len(lexical_snapshot.rows)):
-            slim = LexicalIndexSnapshot(
-                user_id=lexical_snapshot.user_id,
-                source_version=lexical_snapshot.source_version,
-                schema_version=_SEARCH_INDEX_SCHEMA_VERSION,
-                updated_at=lexical_snapshot.updated_at,
-                rows=[_search_slim_row(row) for row in lexical_snapshot.rows],
-            )
-            payload = _serialize_lexical_index(slim)
-        perf_instrumentation.log_event(
-            'search_slim_written', user=user_id, rows=len(slim.rows), gz_mb=round(len(payload) / 1048576, 1),
-        )
-        blob_client = _get_blob_client(container_name, _search_index_json_blob_name(user_id))
-        manifest_client = _get_blob_client(container_name, _search_index_manifest_blob_name(user_id))
+    def add(self, row: Dict) -> None:
+        projected = {k: v for k, v in row.items() if k in PHOTO_LIST_SELECT_FIELDS}
+        self._fh.write((',' if self.count else '').encode('utf-8'))
+        self._fh.write(json.dumps(projected, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8'))
+        self.count += 1
+
+    def abort(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def finish(self) -> None:
+        self._fh.write(b']}')
+        self._fh.close()
+        container_name = _lexical_index_container_name()
+        if not container_name:
+            return
+        blob_client = _get_blob_client(container_name, _listing_index_json_blob_name(self.user_id))
+        manifest_client = _get_blob_client(container_name, _listing_index_manifest_blob_name(self.user_id))
         if blob_client is None or manifest_client is None:
             return
-        blob_client.upload_blob(
-            payload, overwrite=True,
-            content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
-        )
+        with open(self.path, 'rb') as fh:
+            blob_client.upload_blob(
+                fh, overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+            )
         manifest_client.upload_blob(
             json.dumps({
-                'userId': user_id,
-                'sourceVersion': slim.source_version,
-                'schemaVersion': slim.schema_version,
-                'rowCount': len(slim.rows),
-                'updatedAt': slim.updated_at,
+                'userId': self.user_id, 'sourceVersion': self.source_version,
+                'schemaVersion': _LEXICAL_INDEX_SCHEMA_VERSION, 'rowCount': self.count, 'updatedAt': self.source_version,
             }, separators=(',', ':')).encode('utf-8'),
-            overwrite=True,
-            content_settings=BlobContentSettings(content_type='application/json'),
+            overwrite=True, content_settings=BlobContentSettings(content_type='application/json'),
         )
+        invalidate_user_listing_index_cache(self.user_id)
+
+
+def stream_library_artifacts(user_id: str, source_version: Optional[str], sinks_factory) -> Optional[int]:
+    """Run the single streaming pass. ``sinks_factory(source_version, workdir)``
+    returns the sinks (objects with add(row) / finish() / abort()). Nothing is
+    published unless the whole scan succeeds. Returns the photo count, or None
+    on failure (an empty-looking partial result must never replace a good one)."""
+    import shutil
+    import tempfile
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    version = str(source_version or datetime.now(timezone.utc).isoformat())
+    dirty_before = _get_dirty_search_index_filenames(key, 'lexical') or set()
+    workdir = tempfile.mkdtemp(prefix='library-build-')
+    sinks = []
+    count = 0
+    try:
+        sinks = list(sinks_factory(version, workdir))
+        with perf_instrumentation.span('index.stream.scan', user=key):
+            for row in iter_library_rows(key):
+                for sink in sinks:
+                    sink.add(row)
+                count += 1
+        for sink in sinks:
+            with perf_instrumentation.span(f'index.stream.finish.{type(sink).__name__}', user=key):
+                sink.finish()
     except Exception:
-        _LOGGER.exception('Slim search index write failed for user %s', user_id)
+        _LOGGER.exception('Streaming library build failed for user %s', key)
+        for sink in sinks:
+            try:
+                sink.abort()
+            except Exception:
+                pass
+        return None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    # Same manifest the full lexical refresh used to write: readiness, listing
+    # freshness and the dirty flag all key off it.
+    container_name = _lexical_index_container_name()
+    if container_name:
+        _clear_manifest_dirty_flag(key, 'lexical')
+        manifest_client = _get_blob_client(container_name, _lexical_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            manifest_client.upload_blob(
+                json.dumps({
+                    'userId': key, 'sourceVersion': version, 'schemaVersion': _LEXICAL_INDEX_SCHEMA_VERSION,
+                    'rowCount': count, 'dirty': False, 'updatedAt': version,
+                }, separators=(',', ':')).encode('utf-8'),
+                overwrite=True, content_settings=BlobContentSettings(content_type='application/json'),
+            )
+    invalidate_user_lexical_index_cache(key)
+    if dirty_before:
+        _clear_dirty_search_index_filenames(key, 'lexical', dirty_before)
+    perf_instrumentation.log_event('library_stream_built', user=key, rows=count)
+    return count
+
+
+def refresh_user_lexical_artifacts(user_id: str, source_version: Optional[str] = None):
+    """What the index primer runs for the 'lexical' kind: the app-level streaming
+    build when registered, else the legacy full-snapshot refresh (tests only)."""
+    hook = LEXICAL_BUILD_HOOK
+    if hook is not None:
+        return hook(user_id, source_version=source_version)
+    return refresh_user_lexical_index(user_id, source_version=source_version)
+
+
+def ensure_user_search_db(user_id: str) -> bool:
+    """Make sure a current SQLite search database exists, running the streaming
+    library build if it does not (heavy: a full table scan, so only the worker
+    role calls this). True when a current DB exists."""
+    import search_db
+    key = str(user_id or '').strip()
+    if not key:
+        return False
+    lexical_version = str(_load_lexical_index_manifest(key).get('sourceVersion') or '')
+    if lexical_version and search_db.is_current(key, lexical_version):
+        return True
+    if refresh_user_lexical_artifacts(key) is None:
+        return False
+    new_version = str(_load_lexical_index_manifest(key).get('sourceVersion') or '')
+    return bool(new_version) and search_db.is_current(key, new_version)
 
 
 def delete_user_lexical_index_data(user_id: str) -> None:
@@ -3423,7 +3739,6 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     for blob_name in (
         _lexical_index_json_blob_name(key), _lexical_index_manifest_blob_name(key),
         _listing_index_json_blob_name(key), _listing_index_manifest_blob_name(key),
-        _search_index_json_blob_name(key), _search_index_manifest_blob_name(key),
     ):
         blob_client = _lexical_index_blob_client(blob_name)
         if blob_client is None:
@@ -3435,6 +3750,14 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     # The Explore summary is derived from the lexical index, so it's cleaned
     # on the same purge (defined below; safe to call regardless of order).
     delete_user_explore_summary_data(key)
+    import search_db
+    search_db.delete_for_user(key)
+    _tl = _timeline_summary_blob_client(key)
+    if _tl is not None:
+        try:
+            _tl.delete_blob()
+        except Exception:
+            pass
     invalidate_user_lexical_index_cache(key)
     invalidate_user_listing_index_cache(key)
 
@@ -3819,7 +4142,8 @@ def refresh_user_lexical_index(
             'rows': snapshot.rows,
         }
     _write_user_listing_index(key, snapshot)
-    _write_user_search_index(key, snapshot)
+    import search_db
+    search_db.write_for_snapshot(key, snapshot)
     if dirty_to_clear:
         _clear_dirty_search_index_filenames(key, 'lexical', dirty_to_clear)
     return snapshot
@@ -3971,7 +4295,7 @@ def get_user_lexical_index(
 # _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
 # tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
 # lexical rebuild -- so this index tracks its own staleness end to end.
-_SORT_INDEX_SCHEMA_VERSION = 'v1'
+_SORT_INDEX_SCHEMA_VERSION = 'v2'
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -3990,6 +4314,7 @@ _SORT_INDEX_SOURCE_FIELDS = [
     'PartitionKey', 'RowKey', 'processing_state',
     'rating', 'likes', 'uploadDate',
     'exifData', 'clientLastModified', 'upload_started_at', 'last_processing_update',
+    'anonymousImageId', 'thumbnail_status',
 ]
 
 
@@ -4150,6 +4475,12 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         'rating': entity.get('rating') or 0,
         'likes': entity.get('likes') or 0,
         'uploadDate': entity.get('uploadDate') or None,
+        # Physical thumbnail blob name, only once the thumbnail exists: lets the
+        # browser build the thumbnail URL itself from the media token with no
+        # backend call (see GET /api/photos/media-token). Absent -> the client
+        # falls back to the URL lookup-batch returns.
+        **({'thumb': str(entity.get('anonymousImageId') or filename)}
+           if str(entity.get('thumbnail_status') or '').strip().lower() == 'done' else {}),
     }
 
 
@@ -4161,23 +4492,23 @@ def _build_user_sort_index_snapshot(user_id: str, source_version: str) -> Option
         # select= keeps this full-library scan from pulling the large
         # embedding/OCR/tag columns it never uses -- see _SORT_INDEX_SOURCE_FIELDS.
         with perf_instrumentation.span('index.sort.table_scan', user=user_id):
-            rows = list(metadata_table_client.query_entities(
+            trimmed_rows: List[Dict[str, object]] = []
+            # lazily paged and trimmed row by row -- never list()ed: the raw rows
+            # carry whole EXIF JSON strings, which add up at 130k photos.
+            for row in metadata_table_client.query_entities(
                 f"PartitionKey eq '{_escape_odata(user_id)}'",
                 select=_SORT_INDEX_SOURCE_FIELDS,
-            ))
+            ):
+                if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+                    continue
+                trimmed = _sort_index_row(dict(row))
+                if trimmed is not None:
+                    trimmed_rows.append(trimmed)
     except Exception:
         # A transient query failure must not be treated as "empty library" --
         # refresh_user_sort_index persists whatever this returns as the new
         # dirty:false state (see refresh_user_lexical_index's identical note).
         return None
-
-    trimmed_rows: List[Dict[str, object]] = []
-    for row in rows:
-        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
-            continue
-        trimmed = _sort_index_row(dict(row))
-        if trimmed is not None:
-            trimmed_rows.append(trimmed)
 
     return LexicalIndexSnapshot(
         user_id=str(user_id),
@@ -4293,6 +4624,17 @@ def refresh_user_sort_index(
     if dirty_to_clear:
         _clear_dirty_search_index_filenames(key, 'sort', dirty_to_clear)
     return snapshot
+
+
+def ensure_user_sort_index_current(user_id: str) -> bool:
+    """Full-rebuild the sort index if its stored schema predates this deploy
+    (v2 added per-photo thumbnail blob names). True if a rebuild ran."""
+    key = str(user_id or '').strip()
+    manifest = _load_sort_index_manifest(key) if key else {}
+    if not manifest.get('sourceVersion') or manifest.get('schemaVersion') == _SORT_INDEX_SCHEMA_VERSION:
+        return False
+    refresh_user_sort_index(key, force_full=True)
+    return True
 
 
 def _sort_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:
@@ -4596,21 +4938,20 @@ def _build_user_access_index_snapshot(user_id: str, source_version: str) -> Opti
         # _ACCESS_INDEX_SOURCE_FIELDS. Deliberately no processing_state filter:
         # trashed rows belong in this index same as active ones, see the
         # module comment above.
-        rows = list(metadata_table_client.query_entities(
+        rows = metadata_table_client.query_entities(  # lazily paged -- not list()ed
             f"PartitionKey eq '{_escape_odata(user_id)}'",
             select=_ACCESS_INDEX_SOURCE_FIELDS,
-        ))
+        )
+        trimmed_rows: List[Dict[str, object]] = []
+        for row in rows:
+            trimmed = _access_index_row(dict(row))
+            if trimmed is not None:
+                trimmed_rows.append(trimmed)
     except Exception:
         # A transient query failure must not be treated as "empty library" --
         # refresh_user_access_index persists whatever this returns as the new
         # dirty:false state (see refresh_user_sort_index's identical note).
         return None
-
-    trimmed_rows: List[Dict[str, object]] = []
-    for row in rows:
-        trimmed = _access_index_row(dict(row))
-        if trimmed is not None:
-            trimmed_rows.append(trimmed)
 
     return LexicalIndexSnapshot(
         user_id=str(user_id),
@@ -4834,6 +5175,55 @@ def get_user_access_index(
     if fresh is None:
         return None
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
+
+
+# --- Access lookup (what access-batch actually needs) -----------------------------
+# access-batch resolves at most 2000 filenames per call, but used to fetch the
+# whole access index, copy all ~130k rows, and build a 130k-entry dict -- on every
+# grid page. Now: one compact filename -> (blob, thumbnail status, preview status)
+# map per index version (cached, never copied), and each call only reads the
+# names it was asked about. The backend never builds this index (the worker does).
+_ACCESS_LOOKUP_CACHE_LOCK = threading.Lock()
+_ACCESS_LOOKUP_CACHE: Dict[str, Tuple[str, Dict[str, Tuple[str, str, str]]]] = {}
+
+
+def lookup_access_entries(user_id: str, filenames) -> Optional[Dict[str, Dict[str, object]]]:
+    """{filename: {anonymousImageId, thumbnail_status, preview_status}} for the
+    requested filenames the access index knows about, or None when no access
+    index exists yet (callers fall back to point reads). A dirty/stale index is
+    still served -- same as before -- and ``None`` never triggers a backend build."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    manifest = _load_access_index_manifest(key)
+    version = str(manifest.get('sourceVersion') or '')
+    if not version:
+        return None
+    with _ACCESS_LOOKUP_CACHE_LOCK:
+        cached = _ACCESS_LOOKUP_CACHE.get(key)
+    if cached is None or cached[0] != version:
+        snapshot = _load_access_index_blob(key)
+        if snapshot is None:
+            return None
+        compact = {
+            str(row['RowKey']): (str(row.get('blobName') or ''), str(row.get('thumbnailStatus') or ''), str(row.get('previewStatus') or ''))
+            for row in snapshot.rows if row.get('RowKey')
+        }
+        del snapshot
+        cached = (version, compact)
+        with _ACCESS_LOOKUP_CACHE_LOCK:
+            _ACCESS_LOOKUP_CACHE[key] = cached
+    table = cached[1]
+    out: Dict[str, Dict[str, object]] = {}
+    for name in filenames:
+        entry = table.get(name)
+        if entry is not None:
+            out[name] = {'anonymousImageId': entry[0], 'thumbnail_status': entry[1], 'preview_status': entry[2]}
+    return out
+
+
+def access_index_is_dirty(user_id: str) -> bool:
+    return bool(_load_access_index_manifest(str(user_id or '').strip()).get('dirty'))
 
 
 # --- Albums index --------------------------------------------------------------
@@ -5846,7 +6236,7 @@ def prime_all_user_indexes_sequentially(
             for kind, refresh_fn, kind_locks in (
                 ('sort', refresh_user_sort_index, _SORT_INDEX_REBUILD_LOCKS),
                 ('access', refresh_user_access_index, _ACCESS_INDEX_REBUILD_LOCKS),
-                ('lexical', refresh_user_lexical_index, _LEXICAL_INDEX_REBUILD_LOCKS),
+                ('lexical', lambda key, source_version=None: refresh_user_lexical_artifacts(key, source_version), _LEXICAL_INDEX_REBUILD_LOCKS),
                 ('albums', refresh_user_albums_index, _ALBUMS_INDEX_REBUILD_LOCKS),
                 ('people', refresh_user_people_index, _PEOPLE_INDEX_REBUILD_LOCKS),
             ):
@@ -6042,6 +6432,46 @@ def load_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
         return None
     try:
         parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+# --- Precomputed timeline summary --------------------------------------------
+# /photos/timeline only needs per-day counts, but it used to get them by loading
+# the whole listing index (every photo row) into the 1Gi backend -- at ~130k
+# photos that is the largest single allocation on a gallery load. The tools role
+# computes the tiny summary right after it rebuilds the indexes (same pattern as
+# the Explore summary above) and the backend just serves this blob.
+def _timeline_summary_blob_client(user_id: str):
+    container_name = _lexical_index_container_name()
+    if not container_name:
+        return None
+    return _get_blob_client(container_name, f'{_vector_index_blob_key(user_id)}-timeline.json')
+
+
+def store_timeline_summary(user_id: str, payload: Dict[str, object]) -> None:
+    key = str(user_id or '').strip()
+    client = _timeline_summary_blob_client(key) if key else None
+    if client is None:
+        return
+    try:
+        client.upload_blob(
+            json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+            overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json'),
+        )
+    except Exception:
+        _LOGGER.exception('Failed to store timeline summary for user %s', key)
+
+
+def load_timeline_summary(user_id: str) -> Optional[Dict[str, object]]:
+    key = str(user_id or '').strip()
+    client = _timeline_summary_blob_client(key) if key else None
+    if client is None:
+        return None
+    try:
+        parsed = json.loads(client.download_blob().readall().decode('utf-8'))
         return parsed if isinstance(parsed, dict) else None
     except Exception:
         return None

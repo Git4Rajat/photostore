@@ -22,8 +22,14 @@ def _patch_common(monkeypatch, access_index_rows, entities_by_name):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'blob_service_client', object())
     monkeypatch.setattr(app, 'account_name', 'anystorageaccount')
-    access_index = {'rows': access_index_rows} if access_index_rows is not None else None
-    monkeypatch.setattr(app, 'get_user_access_index', lambda *a, **k: access_index)
+    table = None if access_index_rows is None else {
+        row['RowKey']: {'anonymousImageId': row.get('blobName'), 'thumbnail_status': row.get('thumbnailStatus'),
+                        'preview_status': row.get('previewStatus')}
+        for row in access_index_rows
+    }
+    monkeypatch.setattr(app, 'lookup_access_entries',
+                        lambda uid, names: None if table is None else {n: table[n] for n in names if n in table})
+    monkeypatch.setattr(app, 'access_index_is_dirty', lambda uid: False)
     monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *a, **k: None)
     monkeypatch.setattr(app, '_get_metadata_entity', lambda uid, name: entities_by_name.get(name))
 

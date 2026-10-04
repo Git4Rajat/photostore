@@ -103,93 +103,47 @@ def get_workbench_action(action_id: str):
     return app.jsonify({'filenames': app.json.loads(row.get('filenames', '[]') or '[]')})
 
 
-def _index_build_progress_callback(user_id: str):
-    # Mirrors prime_all_user_indexes_sequentially's live progress into a single
-    # per-user index_build jobs-table row (updated in place, deterministic
-    # RowKey) so the build is visible cross-replica and to the notification
-    # bell -- storage_utils can't write this itself without importing app
-    # (circular), so it hands each step out through this callback instead.
-    def _cb(indexes: dict, building: bool) -> None:
-        ready = all(indexes.values())
-        status = 'running' if building else ('done' if ready else 'failed')
-        app._upsert_job_status(
-            app._index_build_job_id(user_id),
-            user_id,
-            app.INDEX_BUILD_JOB_TYPE,
-            status,
-            result={'indexes': indexes, 'ready': ready},
-        )
-        # When the build finishes (building=False) and the lexical index is
-        # built, recompute the Explore summary here on tools (4Gi) from the
-        # freshly-built, still-cached lexical snapshot and store it as a small
-        # blob. The backend's /explore route then serves that blob without ever
-        # loading the lexical index into its 1Gi memory. Best-effort: a failure
-        # here never fails the index build itself.
-        if not building and indexes.get('lexical'):
-            try:
-                app.refresh_user_explore_summary(user_id)
-            except Exception:
-                app.app.logger.exception('Explore summary refresh failed for %s', user_id)
-    return _cb
-
-
 @tools_bp.route('/api/tools/indexes/build', methods=['POST'])
 def tools_build_indexes():
-    # THE index builder. Moved off the `backend` role (1Gi, serves the gallery
-    # hot path) onto `tools` (2vCPU/4Gi) precisely because building the lexical
-    # index scans a user's full metadata partition (OCR/tags/faces per row) and
-    # was OOM-ing backend. Kicks the existing single-flighted sequential
-    # builder; a build already in flight (or one triggered by a second tab / an
-    # ipworker milestone) no-ops against the prime lock.
-    #
-    # Blocking, not fire-and-forget: tools runs minReplicas=0, and Container
-    # Apps' autoscaler counts in-flight HTTP requests to decide when to scale
-    # back to 0. A build that returned immediately and kept running on a
-    # background thread left nothing holding the replica open, so a routine
-    # scale-down could (and did, live on microsvcpoc-dev 2026-10-01) kill the
-    # build mid-run -- the orphaned job row then surfaced to the user as
-    # "Library index build failed: Job did not finish (worker restarted or
-    # timed out)". wait=True (see prime_all_user_indexes_sequentially) makes
-    # this request span the whole build so the replica stays alive for it.
-    # gunicorn's gthread workers (--threads 4) mean this doesn't stall other
-    # requests on the same replica, and --timeout 600 / the frontend's 600s
-    # client timeout both already cover a full cold-account build.
+    # Kicks the library's index build and returns immediately. The build itself
+    # runs on the always-awake `worker` role from the library-ops queue (see
+    # app.enqueue_index_build): it used to run inline in this request on the
+    # scale-to-zero tools app, where ingress cut the request at ~240s and
+    # nothing then held the replica open, so a scale-down or restart mid-build
+    # orphaned the job ("Job did not finish (worker restarted or timed out)").
+    # Idempotent: a build already queued/running for this library is reported,
+    # not duplicated. Clients poll /api/tools/indexes/status.
     user_id, error = app._require_user_id()
     if error:
         return error
-    # Kick a build when any index is MISSING or DIRTY (needs_rebuild) -- the
-    # dirty case is what preserves the freshness the backend's per-GET-route
-    # background rebuild used to provide before that was moved off the 1Gi
-    # container. prime runs a cheap incremental merge for a dirty index and a
-    # full build only for a missing one, all here on the 4Gi tools role.
-    # `ready` (all built) is what the frontend gate waits on -- a built-but-
-    # dirty index is still usable, so it doesn't hold the gate.
     state = app.get_user_index_build_state(user_id)
-    if state['needs_rebuild']:
-        try:
-            app.prime_all_user_indexes_sequentially(
-                user_id, on_progress=_index_build_progress_callback(user_id), wait=True,
-            )
-        except Exception:
-            app.app.logger.exception('Index build failed for %s', user_id)
-        state = app.get_user_index_build_state(user_id)
-    return app.jsonify({'ok': True, 'ready': state['ready'], 'building': False, 'indexes': state['indexes']})
+    outcome = 'not_needed'
+    if app.index_build_needed(user_id):
+        outcome = app.enqueue_index_build(user_id, reason='client')
+    return app.jsonify({
+        'ok': True,
+        'ready': state['ready'],
+        'building': outcome in ('queued', 'already_active'),
+        'queued': outcome,
+        'indexes': state['indexes'],
+    })
 
 
 @tools_bp.route('/api/tools/indexes/status', methods=['GET'])
 def tools_indexes_status():
-    # Read-only poll target for the frontend's "Building your library index"
-    # gate. Readiness is sourced from the manifest blobs (the source of truth
-    # for "is this index built"); `building` additionally reflects an in-process
-    # prime on this replica, so a just-kicked build reports building=true even
-    # in the instant before the first index lands.
+    # Read-only poll target. Readiness comes from the manifest blobs; `building`
+    # from the shared index_build job row (cross-replica, unlike the old
+    # per-process prime lock).
     user_id, error = app._require_user_id()
     if error:
         return error
     indexes = app.get_user_index_readiness(user_id)
     ready = all(indexes.values())
-    building = (not ready) and app.index_prime_in_progress(user_id)
-    return app.jsonify({'ready': ready, 'building': building, 'indexes': indexes})
+    return jsonify_status(ready, indexes, app._index_build_job_active(user_id))
+
+
+def jsonify_status(ready, indexes, building):
+    return app.jsonify({'ready': ready, 'building': bool(building), 'indexes': indexes})
 
 
 # Moved from routes/system.py (APP_ROLE=backend) 2026-10-01: polled

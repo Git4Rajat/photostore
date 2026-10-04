@@ -372,7 +372,10 @@ def autocreate_albums():
         }), 400
 
     try:
-        metadata_rows = app._cached_metadata_rows_for_user(user_id, purpose='albums.smart_create')
+        # Streamed, narrow projection: the rules loop over the rows once.
+        metadata_rows = app._iter_metadata_rows_for_user(
+            user_id, select=app.SMART_ALBUM_SELECT, purpose='albums.smart_create',
+        )
     except Exception as exc:
         app.app.logger.exception('Smart album metadata read failed')
         return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
@@ -383,7 +386,12 @@ def autocreate_albums():
         existing_rows = []
 
     existing_names = {row.get('name') for row in existing_rows if row.get('name')}
-    candidates = app._smart_album_candidates(user_id, rule, metadata_rows)
+    try:
+        candidates = app._smart_album_candidates(user_id, rule, metadata_rows)
+    except Exception:
+        # The scan is lazy, so a storage failure surfaces here, not at the query.
+        app.app.logger.exception('Smart album metadata read failed')
+        return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
 
     for candidate in candidates:
         name = candidate.get('name') or ''
