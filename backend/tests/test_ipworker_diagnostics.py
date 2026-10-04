@@ -728,16 +728,20 @@ def test_exact_receipt_task_ack_and_wave_boundaries(monkeypatch, clock, memory_s
         app.run_ipworker()
     summary, = _metrics(caplog)
     hist = summary['histograms']['window']
-    assert hist['receive']['sum'] == 20
+    # 3 receives, not 2: once this single-message batch's `ready` drains into
+    # in_flight, the batch is fully assigned (preparing is None) and the next
+    # wave's fetch fires immediately, overlapping the still-running task --
+    # one extra 10ms receive, costed below same as the old idle gap was.
+    assert hist['receive']['sum'] == 30
     assert hist['receipt_to_start']['sum'] == hist['preparation']['sum'] == 100
     assert hist['task']['sum'] == 200
     assert hist['ack']['sum'] == 40
-    assert hist['receipt_to_ack']['sum'] == 340
-    assert hist['wave']['sum'] == 350
+    assert hist['receipt_to_ack']['sum'] == 350
+    assert hist['wave']['sum'] == 360
     utilization = summary['utilization']['window']
     assert utilization['slot_seconds'] == 0.2
     assert utilization['preparation_only_seconds'] == 0.1
-    assert utilization['idle_seconds'] == 0.06  # queue receive and ACK, not inference
+    assert utilization['idle_seconds'] == 0.07  # queue receive (x2) and ACK, not inference
     assert summary['loop'] == {'active_tasks': 0, 'preparing': 0, 'ready': 0,
                                'oldest_task_seconds': 0, 'preparation_seconds': 0}
 

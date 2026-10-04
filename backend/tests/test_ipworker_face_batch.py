@@ -216,8 +216,13 @@ def test_ready_wave_never_exceeds_inference_slots(monkeypatch):
             self.receives += 1
             if self.receives == 1:
                 return [message(i) for i in range(8)]
+            # The next wave's fetch+scan now starts once `ready` is drained
+            # (every message handed to the executor), not once the previous
+            # wave's futures are also done -- preparation for wave 2 should
+            # overlap wave 1's last 1-2 still-finishing tasks instead of
+            # waiting for them, bounded by IPWORKER_CONCURRENCY (2).
             assert len(processed) == 8
-            assert sum(not f.done() for f in futures) == 0
+            assert 0 < sum(not f.done() for f in futures) <= 2
             return []
 
         def delete_message(self, msg):
@@ -282,8 +287,13 @@ def test_watchdog_recycles_blocked_tasks_without_ack_or_thread_replacement(monke
 
         def receive_messages(self, **kw):
             self.receives += 1
-            assert self.receives == 1
-            return [message(1), message(2)]
+            if self.receives == 1:
+                return [message(1), message(2)]
+            # Once this batch's `ready` drains into the (now permanently
+            # stuck, phase != 'preparation') in_flight slots, preparation may
+            # legitimately prefetch again before the watchdog notices nothing
+            # is progressing -- a real queue just has nothing new to offer.
+            return []
 
         def delete_message(self, msg):
             deletes.append(msg.id)
@@ -308,7 +318,7 @@ def test_watchdog_recycles_blocked_tasks_without_ack_or_thread_replacement(monke
     app.run_ipworker()
     assert exits == [1]
     assert dumps == [{'all_threads': True}]
-    assert deletes == [] and queue.receives == 1
+    assert deletes == [] and queue.receives >= 1
     assert len(executors) == (1 if phase == 'rollback_photo' else 2)
     assert all(ex.shutdown_calls == [{'wait': False, 'cancel_futures': True}] for ex in executors)
     assert 'ipwork watchdog timeout' in caplog.text

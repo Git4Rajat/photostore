@@ -13709,6 +13709,11 @@ def run_ipworker() -> None:
         return max(0, time.monotonic() - min(task_started.values())) if task_started else 0
 
     def close_wave_if_drained():
+        # With preparation now overlapping the previous batch's in_flight tail
+        # (see the free_slots gate below), back-to-back batches rarely let
+        # in_flight/ready/preparing all go empty at once -- 'wave' now mostly
+        # measures one continuous busy run across many batches, closing only
+        # when the queue genuinely empties, not one batch's receive-to-drain.
         nonlocal wave_started
         if wave_started is not None and not (in_flight or ready or preparing is not None):
             collector.observe('wave', (time.monotonic() - wave_started) * 1000)
@@ -13813,7 +13818,17 @@ def run_ipworker() -> None:
                 # can't finish before the process exits.
                 free_slots = 0 if shutdown_requested.is_set() else min(IPWORKER_CONCURRENCY - len(in_flight), 32)
                 if preparation_executor is not None:
-                    free_slots = batch_size if not (in_flight or ready or preparing is not None) and not shutdown_requested.is_set() else 0
+                    # Only wait on `ready` and `preparing`, not `in_flight`: once
+                    # every message from the current batch has been handed to the
+                    # executor (ready drained), the next batch's partition scan
+                    # (preparation, ~5s measured) can run on the single prep
+                    # thread while this batch's last 1-2 futures are still being
+                    # processed by the (much smaller, concurrency-bound) in_flight
+                    # set. Previously this also required in_flight to be empty,
+                    # fully serializing "scan next 8" after "finish processing
+                    # these 8" instead of overlapping them -- measured as ~50% of
+                    # wall time spent with zero in-flight inference.
+                    free_slots = batch_size if not ready and preparing is None and not shutdown_requested.is_set() else 0
                 if free_slots > 0:
                     close_wave_if_drained()
                     receive_started = time.monotonic()
