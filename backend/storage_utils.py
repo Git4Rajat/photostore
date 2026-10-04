@@ -1011,8 +1011,12 @@ def _begin_face_filename_write(user_id: str, filename: str):
 
 
 def _finish_face_filename_write(user_id: str, filename: str, generation: str,
-                                face_ids: Optional[List[str]]) -> None:
-    """CAS publish complete IDs or release as dirty, never another writer's row."""
+                                face_ids: Optional[List[str]], *, extra: Optional[Dict] = None) -> None:
+    """CAS publish complete IDs or release as dirty, never another writer's row.
+
+    extra: additional fields merged into the published row (e.g. marking an
+    asserted-not-scanned origin) -- never applied on the dirty/release path.
+    """
     if generation is None:
         return
     table = _CTX['face_by_filename_table_client']
@@ -1026,6 +1030,8 @@ def _finish_face_filename_write(user_id: str, filename: str, generation: str,
     entity = dict(current)
     entity.update(state='dirty' if face_ids is None else 'complete',
                   faceIds=json.dumps(sorted(set(face_ids or []))), leaseExpiresAt='')
+    if face_ids is not None and extra:
+        entity.update(extra)
     table.update_entity(entity, mode=UpdateMode.REPLACE,
                         etag=_face_filename_etag(current),
                         match_condition=MatchConditions.IfNotModified)
@@ -1049,7 +1055,8 @@ def _renew_face_filename_write(user_id: str, filename: str, generation: str) -> 
                         match_condition=MatchConditions.IfNotModified)
 
 
-def _set_face_ids_for_filename(user_id: str, filename: str, face_ids: List[str]) -> None:
+def _set_face_ids_for_filename(user_id: str, filename: str, face_ids: List[str],
+                               *, extra: Optional[Dict] = None) -> None:
     """Publish caller's authoritative IDs, including a complete zero row.
 
     Deletes/dedupe callers must handle propagated storage/CAS failures.
@@ -1058,7 +1065,7 @@ def _set_face_ids_for_filename(user_id: str, filename: str, face_ids: List[str])
         raise ValueError('Face IDs must be nonempty strings')
     generation, _ = _begin_face_filename_write(user_id, filename)
     try:
-        _finish_face_filename_write(user_id, filename, generation, face_ids)
+        _finish_face_filename_write(user_id, filename, generation, face_ids, extra=extra)
     except Exception:
         _release_failed_face_filename_write(user_id, filename, generation)
         raise
@@ -8271,6 +8278,38 @@ def _claim_filename_owner(user_id: str, filename: str, file_hash: str) -> bool:
             'RowKey': user_id,
             'fileHash': file_hash,
         })
+        # This create_entity winning means (user_id, filename) has never been
+        # claimed before. That's an ASSERTION that no faces exist for it yet,
+        # not a scan-verified fact -- real production has exactly one caller
+        # that frees a filename (_hard_delete_photos_now, after its face
+        # cascade tombstones this exact row first), so the assertion holds
+        # today, but nothing stops a future write path from breaking that
+        # link. Tagged trustedClaim=True (not a plain scan result) so Tools >
+        # Verify/repair face index, or any future scheduled audit, can find
+        # and re-verify specifically these asserted-not-scanned rows rather
+        # than the whole library.
+        #
+        # Never blind-overwrite: if a real scan already published a validated
+        # answer here (however that happened), preserve it exactly rather
+        # than replacing content with an assumption just because THIS table
+        # never saw the filename before -- the two tables are written by
+        # different code paths and aren't guaranteed to agree on history.
+        try:
+            lookup_table = _CTX.get('face_by_filename_table_client')
+            current = _face_filename_row(lookup_table, user_id, filename) if lookup_table is not None else None
+            if current is None or _validated_face_filename_ids(current) is None:
+                generation, prior_ids = _begin_face_filename_write(user_id, filename)
+                try:
+                    _finish_face_filename_write(
+                        user_id, filename, generation,
+                        prior_ids if prior_ids is not None else [],
+                        extra=None if prior_ids is not None else {'trustedClaim': True},
+                    )
+                except Exception:
+                    _release_failed_face_filename_write(user_id, filename, generation)
+                    raise
+        except Exception:
+            _LOGGER.warning('Failed to pre-stamp empty face index for new claim %s/%s', user_id, filename)
         return True
     except ResourceExistsError:
         try:

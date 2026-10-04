@@ -1,8 +1,13 @@
-"""Upload bookkeeping/owner claims are NOT proof of an empty face namespace.
+"""Upload bookkeeping/owner claims are a narrow, tagged ASSERTION of an empty
+face namespace -- not a scan-verified fact, and never allowed to overwrite
+one that already exists (see _claim_filename_owner's pre-check).
 
-These are safety guards, not tests of an implemented fresh-upload fast path.
-The existing upload protocol reuses logical filenames even when physical blob
-IDs change. Keep the fallback until an immutable asset allocation exists.
+The remaining tests here are safety guards for everything the assertion does
+NOT cover: a face row that exists via some path that never went through
+filename_owners at all (bypassed/legacy data, no immutable asset allocation
+exists to rule this out structurally). Those rows are tagged trustedClaim so
+Tools > Verify/repair face index (or a future scheduled audit) can find and
+re-check them -- see admin_verify_face_index / _verify_face_filename_indexes.
 """
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ import re
 
 import pytest
 
+import app
 import storage_utils
 from test_face_by_filename_lookup import (
     AzureFaceTable, FilenameLookupTable, _complete_row, _face,
@@ -102,23 +108,46 @@ def test_recent_upload_init_preserves_reused_names_and_face_generations(boundary
     assert faces.rows[('u1', 'curated')] == rejected
 
 
-def test_new_metadata_and_successful_owner_create_do_not_exclude_orphan_faces(boundary_ctx):
-    metadata, _, faces, _ = boundary_ctx
+def test_new_owner_claim_stamps_trusted_empty_but_cannot_see_bypassed_orphans(boundary_ctx):
+    """A face row written via some path that never touched filename_owners
+    (this test's direct faces.upsert_entity bypass, standing in for legacy
+    data or a future bug) is exactly what the accepted assertion can't see --
+    _claim_filename_owner has no way to know it's there, so it tags the
+    lookup row trustedClaim and moves on. That's the known, accepted gap
+    the verify/repair tool exists to catch; it is not silent forever."""
+    metadata, _, faces, lookup = boundary_ctx
     orphan = {'PartitionKey': 'u1', 'RowKey': 'orphan', 'filename': 'photo.jpg',
               'bbox': json.dumps(_face(0)['bbox']), 'reviewStatus': 'rejected'}
     faces.upsert_entity(orphan)
-    # Owner/metadata creation does not prove index coverage for legacy faces.
     assert storage_utils._claim_filename_owner('u1', 'photo.jpg', 'hash')
     assert metadata.rows == {}
+    assert lookup.rows[('u1', 'photo.jpg')]['trustedClaim'] is True
+    assert storage_utils._validated_face_filename_ids(lookup.rows[('u1', 'photo.jpg')]) == []
     metadata.upsert_entity(storage_utils.get_or_create_metadata('u1', 'photo.jpg'))
     _init_tracking('direct')
-    assert storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0)]) == []
-    assert len(faces.queries) == 1
+    # Trusts the (wrong) stamp: the new face is stored as if it's the only
+    # one, and the bypassed orphan is never discovered by this call.
+    assert storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0)]) != []
+    assert faces.queries == []
     assert faces.rows[('u1', 'orphan')] == orphan
+    # This is exactly what Tools > Verify/repair face index is for.
+    result = app._verify_face_filename_indexes('u1', ['photo.jpg'])
+    assert result['mismatches'] == 1
+    assert sorted(storage_utils.get_face_ids_for_filename('u1', 'photo.jpg')) == sorted(
+        [storage_utils._deterministic_face_id('u1', 'photo.jpg', _face(0)), 'orphan'])
 
 
 @pytest.mark.parametrize('state', ['missing', 'dirty', 'complete', 'writing'])
 def test_duplicate_finalize_never_initializes_or_overwrites_face_lookup(boundary_ctx, state):
+    """finalize_uploaded_file (via _claim_filename_owner, since filename_owners
+    is never seeded here -- every call below is a 'fresh' claim by that
+    table's own history) must never destroy an existing validated answer
+    ('complete') and must never touch an actively-held lease ('writing').
+    For 'missing'/'dirty' -- states where filename_owners and the lookup
+    plainly disagree on this filename's history, same as the orphan test
+    above -- the claim-time assertion fires and stamps a trusted-empty row;
+    that's the accepted, tagged, verify-tool-covered gap, not silent data
+    loss of real content (there is none to lose in those two states)."""
     metadata, _, faces, lookup = boundary_ctx
     metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'photo.jpg', 'fileHash': 'hash'})
     faces.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'existing', 'filename': 'photo.jpg',
@@ -134,13 +163,25 @@ def test_duplicate_finalize_never_initializes_or_overwrites_face_lookup(boundary
             anonymous_blob_name='new-physical-blob',
         )
         assert name == 'photo.jpg'
-        assert lookup.rows == before
+        if state in ('complete', 'writing'):
+            assert lookup.rows == before
+        else:
+            row = lookup.rows[('u1', 'photo.jpg')]
+            assert row['trustedClaim'] is True
+            assert storage_utils._validated_face_filename_ids(row) == []
     assert faces.queries == []
     assert faces.rows[('u1', 'existing')]['rejected'] is True
 
 
 def test_released_owner_can_be_recreated_while_faces_still_exist(boundary_ctx):
-    """Historical incomplete cleanup must remain discoverable on reuse."""
+    """Historical incomplete cleanup (here: a face added directly to `faces`
+    after the first claim already stamped this filename trusted-empty, then
+    ownership released and reclaimed without going through the real
+    cascade-respecting hard-delete flow) stays invisible to the second
+    claim's pre-check too -- it only protects against blind-overwriting an
+    already-validated row, not against a bypass that invalidates a stamp
+    after the fact. Same accepted gap as the orphan tests above; same fix
+    (Tools > Verify/repair face index), not a new failure mode."""
     metadata, _, faces, _ = boundary_ctx
     assert storage_utils._claim_filename_owner('u1', 'photo.jpg', 'old-hash')
     metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'photo.jpg', 'fileHash': 'old-hash'})
@@ -150,9 +191,12 @@ def test_released_owner_can_be_recreated_while_faces_still_exist(boundary_ctx):
     storage_utils.delete_filename_owner_entry('u1', 'photo.jpg')
     assert storage_utils._claim_filename_owner('u1', 'photo.jpg', 'new-hash')
     _init_tracking('direct')
-    assert storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0)]) == []
-    assert len(faces.queries) == 1
+    assert storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0)]) != []
+    assert faces.queries == []
     assert faces.rows[('u1', 'old-face')]['rejected'] is True
+    result = app._verify_face_filename_indexes('u1', ['photo.jpg'])
+    assert result['mismatches'] == 1
+    assert 'old-face' in storage_utils.get_face_ids_for_filename('u1', 'photo.jpg')
 
 
 def test_complete_zero_is_query_free_but_missing_new_upload_is_not(boundary_ctx):
