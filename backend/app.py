@@ -1232,6 +1232,7 @@ def _invalidate_people_scan_cache(user_id: str) -> None:
     if not user_id:
         return
     _person_scan_cache.invalidate(user_id)
+    _person_light_scan_cache.invalidate(user_id)
     _face_summary_scan_cache.invalidate(user_id)
     _people_embedding_index_cache.invalidate(user_id)
     # This is the one choke point _InvalidatingTableClient calls on every
@@ -2678,15 +2679,39 @@ def _semantic_embedding_for_row(
     return vision_utils.encode_text_embedding(semantic_text), semantic_text
 
 
-def _cached_person_rows_for_user(user_id: str) -> List[Dict]:
+# Every person column EXCEPT repEmbedding. A repEmbedding is a 512-float JSON string
+# (~5-8KB); holding it for tens of thousands of clusters is hundreds of MB per
+# cached copy, and the People list/roster/name-lookup routes never read it.
+PERSON_LIGHT_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds', 'createdAt', 'declinedFaceSuggestions']
+_person_light_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
+
+
+def _cached_person_rows_for_user(user_id: str, *, with_embeddings: bool = True) -> List[Dict]:
     """Every person row for user_id, from the short-TTL cache when fresh.
 
     Shared by every caller that needs the full person partition (name index,
     People/Faces page listings, ...) so they scan Azure Table Storage once per
     TTL window instead of once per call. See _UserScanCache / _person_scan_cache.
+
+    with_embeddings=False (list/roster/name lookups) returns rows WITHOUT
+    repEmbedding, from a separate light cache; only code that reads
+    repEmbedding (clustering, assignment, the embedding index) needs True.
     """
     if person_table_client is None:
         return []
+
+    if not with_embeddings:
+        def _fetch_light() -> List[Dict]:
+            try:
+                try:
+                    rows = person_table_client.query_entities(
+                        f"PartitionKey eq '{_escape_odata(user_id)}'", select=PERSON_LIGHT_COLUMNS)
+                except TypeError:
+                    rows = person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
+                return [{k: v for k, v in row.items() if k != 'repEmbedding'} for row in rows]
+            except Exception:
+                return []
+        return _person_light_scan_cache.get(user_id, _fetch_light)
 
     def _fetch() -> List[Dict]:
         try:
@@ -2702,7 +2727,7 @@ def _load_people_name_index(user_id: str) -> Tuple[Dict[str, str], Dict[str, Lis
     name_to_ids: Dict[str, List[str]] = {}
     if person_table_client is None:
         return pid_to_name, name_to_ids
-    rows = _cached_person_rows_for_user(user_id)
+    rows = _cached_person_rows_for_user(user_id, with_embeddings=False)
     for row in rows:
         person_id = str(row.get('RowKey') or '')
         name = str(row.get('name') or '').strip()
@@ -4607,6 +4632,15 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
                     _attach_normalized_embeddings_batched(index, raw_reps, np)
                 return index
 
+        if not storage_utils_module.index_build_allowed():
+            # Serving process (upload/backend/extras/...) with no durable blob yet:
+            # do NOT scan every person row incl. its repEmbedding here -- at tens of
+            # thousands of clusters that is what OOM-killed `extras`. Ask the worker
+            # to build the blob and carry on with no index for now (callers treat an
+            # empty index as "nothing to match against yet").
+            storage_utils_module.request_index_build(user_id)
+            return []
+
         rows = _cached_person_rows_for_user(user_id)
 
         index = []
@@ -4652,10 +4686,15 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
         # it via the allow_refresh=False read above, instead of every cold
         # start always paying this same scan. Never blocks/fails this call
         # on a storage hiccup.
-        try:
-            refresh_user_people_embedding_index(user_id)
-        except Exception:
-            pass
+        # Only on the build roles: a serving process (upload/backend/extras) must
+        # not re-scan the person + face tables here -- it asks the worker instead.
+        if storage_utils_module.index_build_allowed():
+            try:
+                refresh_user_people_embedding_index(user_id)
+            except Exception:
+                pass
+        else:
+            storage_utils_module.request_index_build(user_id)
         return index
 
     return _people_embedding_index_cache.get(user_id, _build)
@@ -7407,7 +7446,7 @@ def _scan_person_and_face_rows(user_id: str) -> Tuple[List[Dict], Dict[str, Dict
     (SAS minting, individual face lookups) -- callers do that only for the page
     they're about to return.
     """
-    rows = sorted(_cached_person_rows_for_user(user_id), key=lambda r: str(r.get('RowKey', '')))
+    rows = sorted(_cached_person_rows_for_user(user_id, with_embeddings=False), key=lambda r: str(r.get('RowKey', '')))
     face_by_id = _load_user_face_summary_by_id(user_id)
     return rows, face_by_id
 
@@ -8295,6 +8334,7 @@ def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None)
 
 
 storage_utils_module.LEXICAL_BUILD_HOOK = _streaming_lexical_build
+storage_utils_module.INDEX_BUILD_REQUEST_HOOK = lambda user_id: enqueue_index_build(user_id, reason='serving-process')
 
 
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))

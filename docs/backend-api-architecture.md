@@ -381,3 +381,28 @@ Accounts have tens of thousands of clusters. The primary People path (the people
 - `GET /api/persons?namesOnly=1&covers=1` returns **every** cluster in one request -- name, `isNamed`, `faceCount` and a `coverFaceId` chosen (confirmed > confidence, never rejected) from the in-memory bulk face map: no per-person lookups and no thumbnail signing, which is the per-page work the paged endpoint does and why it pages. 30,000 clusters build in <1 s in `tests/test_person_roster.py`. Without `covers=1` the response shape is unchanged.
 - `faceService.listAllPersons()` replaces the capped call in the store's fallback; covers load lazily via `/api/faces/crop/<id>`.
 - People grid is windowed (`useWindowedGrid`) so only on-screen cards render and only their covers are requested (it used to request every cover); selection lookups use a Set; the merge picker on a person page is searchable and renders at most 200 options (a `<select>` with 30k options freezes the tab).
+
+### 14.4 Index builds never run in a serving process (the `extras` OOM)
+
+**Incident (microsvcpoc-dev-extras, 0.5 vCPU / 1Gi):** RSS climbed 289 -> 1007 MB within ~2 min of a rollout with `inflight` 1-2, was OOM-killed, and repeated until `Persistent Failure to start container`. Cause: the first People request ran the **people-index build in-process** (`get_user_people_index` -> `_rebuild_people_index_in_background`). `_build_user_people_index_snapshot` did `list(query_entities(...))` of every column of every person **and every face**, including each face's `embedding` and each person's `repEmbedding` (512-float JSON, ~6-8 KB each). Measured on identical synthetic data (distinct 6 KB embedding strings per row): old build **180.6 MB peak at 4,000 persons / 20,000 faces** (~1.35 GB extrapolated to 30,000 / 150,000), new build **12.9 MB**.
+
+**Structural guard.** Only `worker` and `ipworker` may build indexes (`INDEX_BUILD_ROLES`, default `worker,ipworker`; `storage_utils.index_build_allowed()`). In every other process -- backend, extras, admin, upload, tools:
+- the six `_rebuild_*_in_background` kickers are decorated with `_builds_only_where_allowed` and become *"request a worker build"* (`INDEX_BUILD_REQUEST_HOOK` -> `enqueue_index_build`, deduped/throttled);
+- the synchronous branches of every `get_user_*_index` (sort, access, albums, people, vector, tag-embedding, people-embedding) return `None`/stale data and request a build instead of scanning;
+- `_load_people_embedding_index` no longer falls back to scanning person rows (with embeddings) when the durable blob is absent.
+`tests/test_index_build_guard.py` makes the person/face/metadata/embeddings tables explode on any scan in a serving process and asserts a build is requested instead.
+
+**Builders are bounded too** (they run on the 4Gi worker, but 4Gi is also finite):
+| Builder | Fix |
+|---|---|
+| people index | server-side column projection (no embeddings), streamed, compact face map; no thread pool per person |
+| people-embedding index | projected + streamed; reps go straight to float32 arrays (not Python float lists, ~28 B/number) |
+| vector index | streams the embeddings table into one normalized float32 vector per photo instead of holding every ~8 KB row JSON; narrow metadata projection; ~63 MB -> ~25 MB at 6,000 photos, result array ~2.2x |
+| tag-embedding index | streams only the tag-related columns into a set |
+| lexical / listing / search DB / explore / timeline | already one streamed pass (14.1) |
+| sort / access | iterate instead of `list()` (14.1) |
+A scan failure now aborts the build (vector/tag-embedding) instead of being persisted as an empty index.
+
+**Light person rows.** `_cached_person_rows_for_user(user_id, with_embeddings=False)` (separate `_person_light_scan_cache`, invalidated with the others) drops `repEmbedding`; the People list/roster and the name index use it. Embedding readers keep the default.
+
+**Remaining library-proportional memory on serving roles:** the assignment index loaded from the durable blob on the upload role (`repEmbedding` as Python lists, roughly 0.5 GB at 30k clusters -- moving per-photo assignment to the worker via `PEOPLE_ASSIGNMENT_ENGINE=faiss` removes it) and the compact access map (14.2).

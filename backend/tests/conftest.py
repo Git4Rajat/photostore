@@ -65,3 +65,12 @@ def _reset_search_index_dirty_marking_state():
     storage_utils._DIRTY_FILENAME_BUFFER.clear()
     storage_utils._INDEX_MANIFEST_DIRTY_FLAGS.clear()
     storage_utils._INDEX_REBUILD_LAST_COMPLETED_AT.clear()
+
+
+@pytest.fixture(autouse=True)
+def _tests_run_as_an_index_build_role(monkeypatch):
+    """Index builds are restricted to the worker/ipworker roles in production
+    (storage_utils.index_build_allowed). The bare test process has no APP_ROLE, so
+    pretend to be a build role by default; tests/test_index_build_guard.py flips
+    it off to pin the serving-process behaviour."""
+    monkeypatch.setattr(storage_utils, '_ROLE_MAY_BUILD_INDEXES', True)

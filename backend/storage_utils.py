@@ -316,6 +316,47 @@ def _cache_image_name(library_id: str, anonymous_id: str, original_filename: str
             _ANONYMOUS_IMAGE_REVERSE_CACHE.setdefault(library_id, {})[_reverse_cache_key(kind, original_filename)] = anonymous_id
 
 
+
+# --- Where index builds may run ------------------------------------------------------
+# Index builds scan whole partitions and hold embeddings; one OOM-crash-looped the
+# 1Gi `extras` replica (and would any serving process). Only the build roles
+# (worker, ipworker) may run them. Every other process -- backend, extras, admin,
+# upload, tools -- serves whatever index blob already exists and, when one is
+# missing or stale, ASKS the worker to build it (INDEX_BUILD_REQUEST_HOOK, set by
+# app.py to enqueue an index_build job) instead of scanning in-process.
+_INDEX_BUILD_ROLES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'worker,ipworker').split(',') if r.strip()}
+_ROLE_MAY_BUILD_INDEXES = os.getenv('APP_ROLE', 'backend').strip().lower() in _INDEX_BUILD_ROLES
+INDEX_BUILD_REQUEST_HOOK: Optional[Callable[[str], object]] = None
+
+
+def index_build_allowed() -> bool:
+    return _ROLE_MAY_BUILD_INDEXES
+
+
+def request_index_build(user_id: str) -> None:
+    """Best-effort: ask the worker to (re)build this library's indexes."""
+    hook = INDEX_BUILD_REQUEST_HOOK
+    if hook is None or not user_id:
+        return
+    try:
+        hook(str(user_id))
+    except Exception:
+        _LOGGER.warning('Index build request failed for user %s', user_id, exc_info=True)
+
+
+def _builds_only_where_allowed(fn):
+    """Decorator for the `_rebuild_*_in_background(key, manifest)` kickers: in a
+    serving process they become "request a worker build" instead."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(key, *args, **kwargs):
+        if not index_build_allowed():
+            request_index_build(key)
+            return None
+        return fn(key, *args, **kwargs)
+    return wrapper
+
 @dataclass
 class VectorIndexSnapshot:
     user_id: str
@@ -2176,29 +2217,40 @@ def _serialize_vector_index(snapshot: VectorIndexSnapshot) -> bytes:
     return buffer.getvalue()
 
 
-def _compute_photo_vector(
-    filename: str, row: Dict, embedding_row: Dict, photo_embeddings_compatible: bool,
-) -> Optional[np.ndarray]:
-    """Shared per-photo vector computation for both the full vector-index
-    build and the incremental merge below, so the two paths can never drift
-    apart on what counts as "this photo's embedding". Returns a normalized
-    unit vector, or None if no usable embedding could be found/computed."""
-    # Prefer the browser-computed CLIP image embedding (real visual signal) over
-    # a text embedding of the tag list, so search isn't purely a function of
-    # (possibly wrong) tags. Falls back to the tag-text embedding for photos
-    # that haven't been reprocessed with the image-embedding pipeline yet.
-    embedding: List[float] = []
-    if photo_embeddings_compatible and str(embedding_row.get('photoEmbeddingVersion') or '').strip() == PHOTO_EMBEDDING_MODEL_VERSION:
-        try:
-            candidate = json.loads(embedding_row.get('photoEmbedding', '[]') or '[]')
-        except Exception:
-            candidate = []
-        if isinstance(candidate, list) and len(candidate) == PHOTO_EMBEDDING_DIMENSION:
-            embedding = [float(v) for v in candidate if isinstance(v, (int, float))]
-    if not embedding:
-        embedding = vision_utils.encode_text_embedding(
-            build_semantic_text(filename, row),
-        )
+def _query_projected(table, query: str, select: List[str]):
+    """query_entities with a server-side column projection; tolerates clients
+    that do not accept ``select`` by returning the unprojected (still lazy) query."""
+    try:
+        return table.query_entities(query, select=select)
+    except TypeError:
+        return table.query_entities(query)
+
+
+def _stored_photo_vector(embedding_row: Dict, photo_embeddings_compatible: bool) -> Optional[np.ndarray]:
+    """The browser-computed CLIP image embedding stored on an embeddings-table
+    (or legacy inline) row as a normalized float32 unit vector, or None when the
+    row has no usable one (wrong model version/dimension, malformed, zero norm)."""
+    if not photo_embeddings_compatible or str(embedding_row.get('photoEmbeddingVersion') or '').strip() != PHOTO_EMBEDDING_MODEL_VERSION:
+        return None
+    try:
+        candidate = json.loads(embedding_row.get('photoEmbedding', '[]') or '[]')
+    except Exception:
+        return None
+    if not isinstance(candidate, list) or len(candidate) != PHOTO_EMBEDDING_DIMENSION:
+        return None
+    vector = np.asarray([v for v in candidate if isinstance(v, (int, float))], dtype=np.float32)
+    if vector.ndim != 1 or vector.size == 0:
+        return None
+    norm = float(np.linalg.norm(vector))
+    if norm <= 0:
+        return None
+    return (vector / norm).astype(np.float32, copy=False)
+
+
+def _text_photo_vector(filename: str, row: Dict) -> Optional[np.ndarray]:
+    """Fallback for photos without an image embedding: a text embedding of the
+    photo's tag/semantic text."""
+    embedding = vision_utils.encode_text_embedding(build_semantic_text(filename, row))
     if not embedding:
         return None
     vector = np.asarray(embedding, dtype=np.float32)
@@ -2210,50 +2262,92 @@ def _compute_photo_vector(
     return (vector / norm).astype(np.float32, copy=False)
 
 
+def _compute_photo_vector(
+    filename: str, row: Dict, embedding_row: Dict, photo_embeddings_compatible: bool,
+) -> Optional[np.ndarray]:
+    """Shared per-photo vector computation for both the full vector-index
+    build and the incremental merge below, so the two paths can never drift
+    apart on what counts as "this photo's embedding". Returns a normalized
+    unit vector, or None if no usable embedding could be found/computed.
+
+    Prefers the browser-computed CLIP image embedding (real visual signal) over
+    a text embedding of the tag list, so search isn't purely a function of
+    (possibly wrong) tags; falls back to the tag-text embedding for photos that
+    haven't been reprocessed with the image-embedding pipeline yet."""
+    stored = _stored_photo_vector(embedding_row, photo_embeddings_compatible)
+    return stored if stored is not None else _text_photo_vector(filename, row)
+
+
+# Columns the vector build reads from a photo's metadata row: the text-fallback
+# inputs (see build_semantic_text / effective_tags) plus a legacy inline embedding.
+_VECTOR_META_COLUMNS = [
+    'PartitionKey', 'RowKey', 'processing_state', 'photoEmbedding', 'photoEmbeddingVersion',
+    'subjectTags', 'peopleNames', 'tags', 'objects', 'backgroundTags', 'processing_metadata',
+    'locationCity', 'locationRegion', 'locationCountry', 'address', 'latitude', 'longitude',
+    'exifData', 'faceCount', 'aiPersonLabel', 'caption', 'ocrText',
+]
+
+
 def _build_user_vector_index_snapshot(user_id: str, source_version: str) -> Optional[VectorIndexSnapshot]:
     metadata_table_client = _CTX.get('metadata_table_client')
     if metadata_table_client is None:
         return None
-    try:
-        rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
-
-    # Embeddings live in EMBEDDINGS_TABLE now (see _extract_and_store_embeddings),
-    # not on the photometadata row -- one extra partition-scoped scan of the
-    # (much smaller: 2 float-array columns vs. the full row) embeddings table,
-    # joined by filename below. Rows written before this table existed still
-    # carry their embedding inline, so the per-row fallback below covers those.
-    embeddings_table_client = _CTX.get('embeddings_table_client')
-    embeddings_by_filename: Dict[str, Dict] = {}
-    if embeddings_table_client is not None:
-        try:
-            embeddings_by_filename = {
-                str(row.get('RowKey') or ''): row
-                for row in embeddings_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
-            }
-        except Exception:
-            embeddings_by_filename = {}
-
     embedding_version = vision_utils.get_text_embedding_version()
     # Photo embeddings only share a vector space with query text embeddings when the
     # server is actually running CLIP (not the hashing fallback, which uses a
     # different dimension/space entirely).
     photo_embeddings_compatible = vision_utils.get_text_embedding_dimension() == PHOTO_EMBEDDING_DIMENSION
+
+    # Embeddings live in EMBEDDINGS_TABLE (see _extract_and_store_embeddings), not
+    # on the photometadata row. Stream that table once and keep ONLY a compact
+    # normalized float32 vector per photo -- the old code held every full
+    # embeddings row (an ~8KB JSON string each) in a dict, ~1GB at 130k photos
+    # before the index (itself ~266MB) was even assembled. ``None`` records "a
+    # table row exists but holds no usable embedding" (-> text fallback, as before).
+    stored_vectors: Dict[str, Optional[np.ndarray]] = {}
+    embeddings_table_client = _CTX.get('embeddings_table_client')
+    if embeddings_table_client is not None:
+        try:
+            for emb_row in _query_projected(
+                embeddings_table_client, f"PartitionKey eq '{_escape_odata(user_id)}'",
+                ['RowKey', 'photoEmbedding', 'photoEmbeddingVersion'],
+            ):
+                key = str(emb_row.get('RowKey') or '')
+                if key:
+                    stored_vectors[key] = _stored_photo_vector(emb_row, photo_embeddings_compatible)
+        except Exception:
+            stored_vectors = {}
+
     row_keys: List[str] = []
     vectors: List[np.ndarray] = []
-    for row in rows:
-        filename = str(row.get('RowKey') or '').strip()
-        if not filename:
-            continue
-        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
-            continue
-        embedding_row = embeddings_by_filename.get(filename) or row
-        vector = _compute_photo_vector(filename, row, embedding_row, photo_embeddings_compatible)
-        if vector is None:
-            continue
-        row_keys.append(filename)
-        vectors.append(vector)
+    try:
+        # Streamed metadata scan with a narrow projection (no embedding columns
+        # beyond a legacy inline one, no faces/tagMetadata/...).
+        for row in _query_projected(
+            metadata_table_client, f"PartitionKey eq '{_escape_odata(user_id)}'", _VECTOR_META_COLUMNS,
+        ):
+            filename = str(row.get('RowKey') or '').strip()
+            if not filename:
+                continue
+            if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+                continue
+            if filename in stored_vectors:
+                vector = stored_vectors.pop(filename)
+                if vector is None:
+                    vector = _text_photo_vector(filename, row)
+            else:
+                vector = _compute_photo_vector(filename, row, row, photo_embeddings_compatible)
+            if vector is None:
+                continue
+            row_keys.append(filename)
+            vectors.append(vector)
+    except Exception:
+        # A failed scan must not be persisted as "an empty library" (that would
+        # overwrite a good index with a dirty:false empty one) -- abort the build.
+        _LOGGER.exception('Vector index scan failed for user %s', user_id)
+        return None
+    finally:
+        stored_vectors.clear()
 
     if not row_keys:
         return VectorIndexSnapshot(
@@ -2435,6 +2529,10 @@ def get_user_vector_index(user_id: str, *, allow_refresh: bool = True) -> Option
         return data
 
     if not allow_refresh:
+        return None
+    if not index_build_allowed():
+        # Serving process: never scan the library here. The worker builds it.
+        request_index_build(key)
         return None
 
     source_version = manifest_source_version or datetime.now(timezone.utc).isoformat()
@@ -2634,11 +2732,14 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
     if person_table_client is None or face_table_client is None:
         return None
     try:
-        person_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        # Projected to the four columns used (name/faceIds/repEmbedding + key) and
+        # consumed lazily below -- never list()ed with every column.
+        person_rows = person_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'",
+            select=['RowKey', 'name', 'faceIds', 'repEmbedding'],
+        )
     except Exception:
         person_rows = []
-    if not person_rows:
-        return empty
 
     # Active-face cross-verification, same shape as app.py's
     # _active_face_ids_for_person: a person's faceIds list is only trusted
@@ -2663,7 +2764,7 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
 
     person_ids: List[str] = []
     people_meta: List[Dict[str, object]] = []
-    raw_reps: List[List[float]] = []
+    raw_reps: List[np.ndarray] = []   # float32 arrays, not Python float lists (~28B per number)
     for row in person_rows:
         person_id = str(row.get('RowKey') or '')
         if not person_id:
@@ -2683,21 +2784,17 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
             continue
         person_ids.append(person_id)
         people_meta.append({'name': row.get('name', ''), 'faceIds': active_face_ids})
-        raw_reps.append([float(v) for v in rep if isinstance(v, (int, float))])
+        raw_reps.append(np.asarray([v for v in rep if isinstance(v, (int, float))], dtype=np.float32))
 
     if not person_ids:
         return empty
 
-    target_dim = max(len(rep) for rep in raw_reps)
-
-    def _aligned(rep: List[float]) -> List[float]:
-        if len(rep) == target_dim:
-            return rep
-        if len(rep) > target_dim:
-            return rep[:target_dim]
-        return rep + [0.0] * (target_dim - len(rep))
-
-    embeddings = np.asarray([_aligned(rep) for rep in raw_reps], dtype=np.float32)
+    target_dim = max(rep.size for rep in raw_reps)
+    embeddings = np.zeros((len(raw_reps), target_dim), dtype=np.float32)
+    for index, rep in enumerate(raw_reps):
+        width = min(rep.size, target_dim)   # longer reps truncate, shorter ones zero-pad
+        embeddings[index, :width] = rep[:width]
+    del raw_reps
     return PeopleEmbeddingIndexSnapshot(
         user_id=str(user_id),
         source_version=source_version,
@@ -2762,6 +2859,7 @@ def refresh_user_people_embedding_index(
     return snapshot
 
 
+@_builds_only_where_allowed
 def _rebuild_people_embedding_index_in_background(key: str, manifest: Dict[str, object]) -> None:
     """Mirrors _rebuild_people_index_in_background: kicks off a rebuild off
     the request thread if one isn't already running for this user, gated by
@@ -2844,6 +2942,10 @@ def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True)
         return data
 
     if not allow_refresh:
+        return None
+    if not index_build_allowed():
+        # Serving process: never scan the library here. The worker builds it.
+        request_index_build(key)
         return None
 
     source_version = manifest_source_version or datetime.now(timezone.utc).isoformat()
@@ -3014,6 +3116,13 @@ def _serialize_tag_embedding_index(snapshot: TagEmbeddingIndexSnapshot) -> bytes
     return buffer.getvalue()
 
 
+_TAG_META_COLUMNS = [
+    'PartitionKey', 'RowKey', 'subjectTags', 'peopleNames', 'tags', 'objects', 'backgroundTags',
+    'processing_metadata', 'locationCity', 'locationRegion', 'locationCountry', 'address',
+    'latitude', 'longitude', 'exifData', 'faceCount', 'aiPersonLabel',
+]
+
+
 def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str) -> Optional[TagEmbeddingIndexSnapshot]:
     # The one guard that matters: only ever build where real CLIP is loaded.
     # Building this from the backend role would silently produce hash-
@@ -3024,15 +3133,19 @@ def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str) 
     metadata_table_client = _CTX.get('metadata_table_client')
     if metadata_table_client is None:
         return None
-    try:
-        rows = list(metadata_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
-
     embedding_version = vision_utils.get_text_embedding_version()
+    # Only the distinct tag strings matter: stream the rows with just the columns
+    # effective_tags reads (previously every column -- embeddings, OCR, ... -- of
+    # every photo was loaded into one list first).
     tag_set = set()
-    for row in rows:
-        tag_set.update(effective_tags(row))
+    try:
+        for row in _query_projected(
+            metadata_table_client, f"PartitionKey eq '{_escape_odata(user_id)}'", _TAG_META_COLUMNS,
+        ):
+            tag_set.update(effective_tags(row))
+    except Exception:
+        _LOGGER.exception('Tag embedding index scan failed for user %s', user_id)
+        return None   # never persist "no tags" because a scan failed
     tags = sorted(tag_set)
     if not tags:
         return TagEmbeddingIndexSnapshot(
@@ -3137,6 +3250,10 @@ def get_user_tag_embedding_index(user_id: str, *, allow_refresh: bool = True) ->
         return data
 
     if not allow_refresh:
+        return None
+    if not index_build_allowed():
+        # Serving process: never scan the library here. The worker builds it.
+        request_index_build(key)
         return None
 
     source_version = manifest_source_version or datetime.now(timezone.utc).isoformat()
@@ -4185,6 +4302,7 @@ def _lexical_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Opti
     return None
 
 
+@_builds_only_where_allowed
 def _rebuild_lexical_index_in_background(key: str, manifest: Dict[str, str]) -> None:
     """Kicks off a rebuild off the request thread if one isn't already running
     for this user; no-ops otherwise (the in-flight rebuild will refresh the
@@ -4253,7 +4371,7 @@ def get_user_lexical_index(
                 'rows': stale.rows,
             }
             _rebuild_lexical_index_in_background(key, manifest)
-        elif allow_sync_build:
+        elif allow_sync_build and index_build_allowed():
             with _LEXICAL_INDEX_REBUILD_LOCKS.lock_for(key):
                 # Re-check after acquiring: another thread may have just
                 # finished rebuilding while this one waited for the lock.
@@ -4673,6 +4791,7 @@ def _sort_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optiona
     return None
 
 
+@_builds_only_where_allowed
 def _rebuild_sort_index_in_background(key: str, manifest: Dict[str, str]) -> None:
     """Mirrors _rebuild_lexical_index_in_background: kicks off a rebuild off
     the request thread if one isn't already running for this user, gated by
@@ -4730,7 +4849,7 @@ def get_user_sort_index(
                 'rows': stale.rows,
             }
             _rebuild_sort_index_in_background(key, manifest)
-        elif allow_sync_build:
+        elif allow_sync_build and index_build_allowed():
             with _SORT_INDEX_REBUILD_LOCKS.lock_for(key):
                 fresh = _sort_index_fresh_cache_entry(key, _load_sort_index_manifest(key))
                 if fresh is None:
@@ -5106,6 +5225,7 @@ def _access_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optio
     return None
 
 
+@_builds_only_where_allowed
 def _rebuild_access_index_in_background(key: str, manifest: Dict[str, str]) -> None:
     """Mirrors _rebuild_sort_index_in_background: kicks off a rebuild off the
     request thread if one isn't already running for this user, gated by the
@@ -5154,7 +5274,7 @@ def get_user_access_index(
                 'rows': stale.rows,
             }
             _rebuild_access_index_in_background(key, manifest)
-        elif allow_sync_build:
+        elif allow_sync_build and index_build_allowed():
             with _ACCESS_INDEX_REBUILD_LOCKS.lock_for(key):
                 fresh = _access_index_fresh_cache_entry(key, _load_access_index_manifest(key))
                 if fresh is None:
@@ -5608,6 +5728,7 @@ def _albums_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optio
     return None
 
 
+@_builds_only_where_allowed
 def _rebuild_albums_index_in_background(key: str, manifest: Dict[str, str]) -> None:
     """Mirrors _rebuild_sort_index_in_background: kicks off a rebuild off the
     request thread if one isn't already running for this user, gated by the
@@ -5654,7 +5775,7 @@ def get_user_albums_index(
                 'rows': stale.rows,
             }
             _rebuild_albums_index_in_background(key, manifest)
-        elif allow_sync_build:
+        elif allow_sync_build and index_build_allowed():
             with _ALBUMS_INDEX_REBUILD_LOCKS.lock_for(key):
                 fresh = _albums_index_fresh_cache_entry(key, _load_albums_index_manifest(key))
                 if fresh is None:
@@ -5891,28 +6012,48 @@ def _people_index_face_bbox(face: Dict) -> Dict[str, object]:
     return bbox_value if isinstance(bbox_value, dict) else {}
 
 
+# Columns the people index actually reads. Selecting them server-side is the
+# difference between ~100 bytes and ~8KB per row: a person's repEmbedding and a
+# face's embedding are 512-float JSON strings, and downloading them for every
+# cluster/face (tens of thousands / hundreds of thousands) is what OOM-ed the
+# 1Gi replica running this build.
+_PEOPLE_INDEX_PERSON_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds']
+_PEOPLE_INDEX_FACE_COLUMNS = [
+    'PartitionKey', 'RowKey', 'personId', 'rejected', 'reviewStatus', 'confidence',
+    'confirmedByUser', 'filename', 'bbox',
+]
+
+
 def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
     person_table_client = _CTX.get('person_table_client')
     face_table_client = _CTX.get('face_table_client')
     if person_table_client is None or face_table_client is None:
         return None
     try:
-        person_rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        # Streamed + projected: only light person columns are ever held.
+        person_rows = [
+            {k: row.get(k) for k in _PEOPLE_INDEX_PERSON_COLUMNS if k in row}
+            for row in person_table_client.query_entities(
+                f"PartitionKey eq '{_escape_odata(user_id)}'", select=_PEOPLE_INDEX_PERSON_COLUMNS,
+            )
+        ]
     except Exception:
         # A transient query failure must not be treated as "no people" --
         # refresh_user_people_index persists whatever this returns as the new
         # dirty:false state (see refresh_user_sort_index's identical note).
         return None
     try:
-        face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        face_by_id: Dict[str, Dict[str, object]] = {}
+        for row in face_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'", select=_PEOPLE_INDEX_FACE_COLUMNS,
+        ):
+            row_key = str(row.get('RowKey') or '')
+            if row_key:
+                face_by_id[row_key] = {k: row.get(k) for k in _PEOPLE_INDEX_FACE_COLUMNS if k in row}
     except Exception:
         return None
-    face_by_id: Dict[str, Dict[str, object]] = {str(row.get('RowKey') or ''): row for row in face_rows if row.get('RowKey')}
 
-    def _resolve_face(face_id: str) -> Tuple[str, Optional[Dict[str, object]]]:
-        face = face_by_id.get(face_id)
-        if face is not None:
-            return face_id, face
+    def _resolve_missing_face(face_id: str) -> Tuple[str, Optional[Dict[str, object]]]:
         try:
             return face_id, face_table_client.get_entity(partition_key=user_id, row_key=face_id)
         except Exception:
@@ -5944,8 +6085,14 @@ def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Opti
         indeterminate = False
 
         if face_ids:
-            with ThreadPoolExecutor(max_workers=min(_PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY, max(1, len(face_ids)))) as executor:
-                resolved = dict(executor.map(_resolve_face, face_ids))
+            # Known faces resolve from the bulk map with no pool at all; only the
+            # (rare) misses need point reads -- creating a thread pool per person
+            # for dict lookups was pure overhead at tens of thousands of clusters.
+            resolved = {fid: face_by_id[fid] for fid in face_ids if fid in face_by_id}
+            missing = [fid for fid in face_ids if fid not in resolved]
+            if missing:
+                with ThreadPoolExecutor(max_workers=min(_PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY, len(missing))) as executor:
+                    resolved.update(dict(executor.map(_resolve_missing_face, missing)))
             for face_id in face_ids:
                 face = resolved.get(face_id)
                 if face is None:
@@ -6085,6 +6232,7 @@ def _people_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optio
     return None
 
 
+@_builds_only_where_allowed
 def _rebuild_people_index_in_background(key: str, manifest: Dict[str, str]) -> None:
     """Mirrors _rebuild_albums_index_in_background: kicks off a rebuild off
     the request thread if one isn't already running for this user, gated by
@@ -6131,7 +6279,7 @@ def get_user_people_index(
                 'rows': stale.rows,
             }
             _rebuild_people_index_in_background(key, manifest)
-        elif allow_sync_build:
+        elif allow_sync_build and index_build_allowed():
             with _PEOPLE_INDEX_REBUILD_LOCKS.lock_for(key):
                 fresh = _people_index_fresh_cache_entry(key, _load_people_index_manifest(key))
                 if fresh is None:
