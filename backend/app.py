@@ -4058,9 +4058,7 @@ def _compute_rep_embedding(face_entities: List[Dict], np) -> List[float]:
     if not face_entities:
         return []
 
-    embeddings = []
-    weights = []
-    expected_dim = 0
+    by_tier: Dict[str, List[Tuple[List[float], float]]] = {}
     for face in face_entities:
         if _face_is_rejected(face):
             continue
@@ -4077,11 +4075,28 @@ def _compute_rep_embedding(face_entities: List[Dict], np) -> List[float]:
             confidence = max(confidence, 1.0)
         elif _face_is_suspicious(face):
             confidence = min(confidence, 0.35)
-        embeddings.append(emb)
-        weights.append(max(0.05, confidence))
+        by_tier.setdefault(_face_alignment_tier(face), []).append((emb, max(0.05, confidence)))
 
-    if not embeddings:
+    if not by_tier:
         return []
+
+    # A person can accumulate faces from more than one alignment tier (e.g. a
+    # manual merge of a landmark-5pt-mp cluster and a landmark-2pt-mp cluster
+    # for the same real individual). Averaging across tiers would blend
+    # embeddings this project's own calibration already measured as
+    # incomparable -- see PEOPLE_CLUSTER_EPS_2PT_MP's comment (same-person
+    # cross-tier similarity lands at 0.09-0.56, indistinguishable from noise).
+    # Restrict the representative embedding to that person's single dominant
+    # (most-faces) tier instead, same principle the live FAISS assigner
+    # already follows by keeping one tier's first exemplar
+    # (faiss_assignment.py's "never mix/average tiers"). Faces from other
+    # tiers still belong to this person (faceIds/live matching are untouched
+    # by this) -- they just don't contribute to this one scalar rep vector,
+    # which only feeds the periodic recluster's existing-person matching and
+    # people-similarity search, not live incremental assignment.
+    dominant_tier = max(by_tier, key=lambda tier: (len(by_tier[tier]), sum(w for _, w in by_tier[tier]), tier))
+    embeddings = [emb for emb, _ in by_tier[dominant_tier]]
+    weights = [w for _, w in by_tier[dominant_tier]]
 
     expected_dim = max(len(emb) for emb in embeddings)
     X = np.vstack([
