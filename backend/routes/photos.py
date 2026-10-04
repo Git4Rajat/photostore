@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Blueprint
 
 import app
+import storage_utils
 
 photos_bp = Blueprint('photos', __name__)
 
@@ -584,12 +585,21 @@ def lookup_photos_batch():
     if len(raw) > 200:
         return app.jsonify({'error': 'Too many filenames', 'code': 'too_many_filenames'}), 400
     pid_to_name, _ = app._load_people_name_index(user_id)
-    photos = []
+    safe_names = []
     for raw_name in raw:
         safe_name = app._validate_media_filename(str(raw_name or ''))
-        if not safe_name:
-            continue
-        metadata = app._get_metadata_entity(user_id, safe_name)
+        if safe_name:
+            safe_names.append(safe_name)
+    # Point reads are independent network round trips -- run them in parallel
+    # (bounded) instead of one after another; executor.map preserves order.
+    with app.perf_instrumentation.span('lookup_batch.metadata_reads', n=len(safe_names)):
+        if len(safe_names) > 1:
+            with ThreadPoolExecutor(max_workers=min(8, len(safe_names))) as executor:
+                entities = list(executor.map(lambda n: app._get_metadata_entity(user_id, n), safe_names))
+        else:
+            entities = [app._get_metadata_entity(user_id, n) for n in safe_names]
+    photos = []
+    for safe_name, metadata in zip(safe_names, entities):
         if not metadata or metadata.get('processing_state') == 'deleted':
             continue
         photos.append(app._build_photo_summary(user_id, safe_name, metadata, include_props=False, pid_to_name=pid_to_name))
@@ -850,6 +860,15 @@ def photos_search_index():
         app._trigger_tools_index_rebuild(user_id)
     try:
         container_name, blob_name = app.get_lexical_index_blob_location(user_id)
+        # Prefer the slim browser projection (only the fields client search
+        # reads, capped OCR/EXIF) when it's in lockstep with the lexical
+        # index; otherwise fall back to the full blob so search never breaks.
+        slim_manifest = storage_utils.load_search_index_manifest(user_id)
+        if (
+            slim_manifest.get('sourceVersion')
+            and slim_manifest.get('sourceVersion') == lexical_summary.get('source_version')
+        ):
+            container_name, blob_name = storage_utils.get_search_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
     except Exception:
         app.app.logger.exception('Failed to mint lexical index SAS URL for %s', user_id)

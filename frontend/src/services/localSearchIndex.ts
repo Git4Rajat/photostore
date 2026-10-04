@@ -151,6 +151,57 @@ const downloadVectorIndex = async (vectorIndexUrl: string, embeddingVersion: str
 // automatically once the server produces a new sourceVersion (a rebuild).
 let unavailableVersionKey: string | null = null;
 
+
+// --- IndexedDB persistence -------------------------------------------------
+// Same idea as localSortIndex.ts: the slim search rows are keyed by the
+// server's sourceVersion, so an unchanged library skips the blob download
+// entirely on the next session. Best-effort everywhere.
+const DB_NAME = 'photostore-search-index';
+const DB_STORE = 'indexes';
+
+interface StoredSearchIndex {
+    sourceVersion: string;
+    rows: Record<string, unknown>[];
+}
+
+const openDb = (): Promise<IDBDatabase> => new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(DB_STORE)) {
+            request.result.createObjectStore(DB_STORE);
+        }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Failed to open search-index database.'));
+});
+
+const idbGetRows = async (key: string): Promise<StoredSearchIndex | null> => {
+    const db = await openDb();
+    try {
+        return await new Promise<StoredSearchIndex | null>((resolve, reject) => {
+            const req = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).get(key);
+            req.onsuccess = () => resolve((req.result as StoredSearchIndex | undefined) || null);
+            req.onerror = () => reject(req.error);
+        });
+    } finally {
+        db.close();
+    }
+};
+
+const idbPutRows = async (key: string, value: StoredSearchIndex): Promise<void> => {
+    const db = await openDb();
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction(DB_STORE, 'readwrite');
+            tx.objectStore(DB_STORE).put(value, key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+    } finally {
+        db.close();
+    }
+};
+
 const fetchLocalSearchIndex = async (key: string): Promise<LocalSearchIndex | null> => {
     const response: SearchIndexResponse = await get('/api/photos/search-index');
     if (!response?.available || !response.indexUrl) {
@@ -161,13 +212,21 @@ const fetchLocalSearchIndex = async (key: string): Promise<LocalSearchIndex | nu
         return null;
     }
     let rows: Record<string, unknown>[];
-    try {
-        rows = await downloadIndexBlob(response.indexUrl);
-    } catch (err) {
-        if (err instanceof IndexTooLargeError) {
-            unavailableVersionKey = versionKey;
+    const stored = response.sourceVersion ? await idbGetRows(key).catch(() => null) : null;
+    if (stored && stored.sourceVersion === response.sourceVersion) {
+        rows = stored.rows;
+    } else {
+        try {
+            rows = await downloadIndexBlob(response.indexUrl);
+        } catch (err) {
+            if (err instanceof IndexTooLargeError) {
+                unavailableVersionKey = versionKey;
+            }
+            throw err;
         }
-        throw err;
+        if (response.sourceVersion) {
+            void idbPutRows(key, { sourceVersion: response.sourceVersion, rows }).catch(() => undefined);
+        }
     }
     const vectorIndex = response.vectorIndexUrl
         ? await downloadVectorIndex(response.vectorIndexUrl, response.embeddingVersion || '')

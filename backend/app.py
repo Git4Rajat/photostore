@@ -217,6 +217,8 @@ app.logger.setLevel(os.getenv('LOG_LEVEL', 'INFO').upper())
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 worker_logger = logging.getLogger(__name__)
+import perf_instrumentation
+perf_instrumentation.install(app)
 placeholder_bytes = create_placeholder_thumbnail()
 
 # Face embeddings are unit-normalized before clustering. Browser-generated
