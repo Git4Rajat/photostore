@@ -3060,6 +3060,57 @@ def invalidate_user_listing_index_cache(user_id: str) -> None:
         _LISTING_INDEX_CACHE.pop(key, None)
 
 
+# Optional on-disk cache for index blobs (INDEX_DISK_CACHE_DIR, e.g. the shared
+# Azure Files volume mounted on backend/tools). Keyed by blob ETag, so a hit
+# costs one cheap get_blob_properties instead of re-downloading hundreds of MB
+# after every replica restart/scale-out. Every failure falls through to a
+# normal download; writes are atomic (tmp + os.replace) since replicas share it.
+INDEX_DISK_CACHE_DIR = os.getenv('INDEX_DISK_CACHE_DIR', '').strip()
+
+
+def _disk_cache_path(kind: str, user_id: str) -> Optional[str]:
+    if not INDEX_DISK_CACHE_DIR:
+        return None
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', str(user_id))
+    return os.path.join(INDEX_DISK_CACHE_DIR, f'{safe}-{kind}.json.gz')
+
+
+def _download_with_disk_cache(kind: str, user_id: str, blob_client) -> bytes:
+    path = _disk_cache_path(kind, user_id)
+    etag = None
+    if path:
+        try:
+            etag = str(blob_client.get_blob_properties().etag or '')
+        except Exception:
+            etag = None
+        if etag:
+            try:
+                with open(path + '.etag') as fh:
+                    cached_etag = fh.read().strip()
+                if cached_etag == etag:
+                    with open(path, 'rb') as fh:
+                        data = fh.read()
+                    perf_instrumentation.log_event('index_disk_cache_hit', kind=kind, user=user_id, mb=round(len(data) / 1048576, 1))
+                    return data
+            except OSError:
+                pass
+    payload = blob_client.download_blob().readall()
+    if path and etag:
+        try:
+            os.makedirs(INDEX_DISK_CACHE_DIR, exist_ok=True)
+            tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+            with open(tmp, 'wb') as fh:
+                fh.write(payload)
+            os.replace(tmp, path)
+            with open(tmp, 'w') as fh:
+                fh.write(etag)
+            os.replace(tmp, path + '.etag')
+            perf_instrumentation.log_event('index_disk_cache_store', kind=kind, user=user_id, mb=round(len(payload) / 1048576, 1))
+        except OSError:
+            _LOGGER.warning('Index disk cache write failed for %s', path, exc_info=True)
+    return payload
+
+
 def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['LexicalIndexSnapshot']:
     """Shared, instrumented loader for the gzip+JSON index blobs (lexical,
     listing, sort). Separate spans for download / gunzip / json-parse so the
@@ -3067,8 +3118,8 @@ def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['
     if blob_client is None:
         return None
     try:
-        with perf_instrumentation.span(f'index.{kind}.download', user=user_id) as _:
-            payload = blob_client.download_blob().readall()
+        with perf_instrumentation.span(f'index.{kind}.download', user=user_id):
+            payload = _download_with_disk_cache(kind, user_id, blob_client)
     except Exception:
         return None
     try:
@@ -3219,6 +3270,149 @@ def get_user_listing_index(
     }
 
 
+# --- "Search" slim projection of the lexical index ----------------------------
+# What the BROWSER downloads for client-side search (localLexicalSearch.ts).
+# The full lexical blob carries every metadata column (hundreds of MB gzipped
+# -> 700MB+ of JSON at ~130k photos, enough to blow V8's string limit and the
+# backend's memory). The client only reads a fixed set of fields, so this blob
+# keeps exactly those, and shrinks the three bulky ones: exifData is reduced to
+# the keys search reads, processing_metadata to the >=0.2-score AI-vision labels
+# predictionTags() uses, and ocrText is capped. Written in the same pass as the
+# lexical/listing blobs (no extra Table reads). The full lexical blob stays the
+# server-side source of truth; search-index falls back to it if this one is
+# missing or stale.
+_SEARCH_INDEX_SCHEMA_VERSION = 'v1'
+SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '1500'))
+_SEARCH_SLIM_PASSTHROUGH_FIELDS = (
+    'RowKey', 'subjectTags', 'peopleNames', 'peopleIds', 'tags', 'objects', 'backgroundTags',
+    'locationCity', 'locationRegion', 'locationCountry', 'address', 'latitude', 'longitude',
+    'faceCount', 'aiPersonLabel', 'caption', 'uploadDate', 'upload_started_at',
+    'last_processing_update', 'clientLastModified',
+)
+_SEARCH_SLIM_EXIF_KEYS = (
+    'Model', 'DateTimeOriginal', 'DateTime', 'CreationDate', 'CreateDate',
+    'MediaCreateDate', 'TrackCreateDate',
+)
+_SEARCH_PREDICTION_MIN_SCORE = 0.2
+_SEARCH_PREDICTION_MAX = 160
+
+
+def _slim_exif_for_search(raw) -> str:
+    try:
+        exif = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    except Exception:
+        return '{}'
+    if not isinstance(exif, dict):
+        return '{}'
+    slim = {k: exif[k] for k in _SEARCH_SLIM_EXIF_KEYS if k in exif}
+    # gpsPresenceTags only tests for presence of GPSInfo / GPS.* keys.
+    if 'GPSInfo' in exif or any(str(k).startswith('GPS.') for k in exif):
+        slim['GPSInfo'] = '1'
+    return json.dumps(slim, ensure_ascii=False, separators=(',', ':'))
+
+
+def _slim_processing_metadata_for_search(raw) -> str:
+    try:
+        pm = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        predictions = ((pm or {}).get('client_ai_vision') or {}).get('predictions')
+        if not isinstance(predictions, list):
+            return '{}'
+        kept = []
+        for item in predictions[:_SEARCH_PREDICTION_MAX]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                score = float(item.get('score') or 0)
+            except Exception:
+                continue
+            if score >= _SEARCH_PREDICTION_MIN_SCORE:
+                kept.append({'label': item.get('label'), 'score': round(score, 3)})
+        if not kept:
+            return '{}'
+        return json.dumps({'client_ai_vision': {'predictions': kept}}, ensure_ascii=False, separators=(',', ':'))
+    except Exception:
+        return '{}'
+
+
+def _search_slim_row(row: Dict) -> Dict:
+    out = {k: row[k] for k in _SEARCH_SLIM_PASSTHROUGH_FIELDS if row.get(k) not in (None, '', '[]')}
+    out['RowKey'] = row.get('RowKey')
+    if row.get('exifData'):
+        out['exifData'] = _slim_exif_for_search(row.get('exifData'))
+    if row.get('processing_metadata'):
+        pm = _slim_processing_metadata_for_search(row.get('processing_metadata'))
+        if pm != '{}':
+            out['processing_metadata'] = pm
+    ocr = str(row.get('ocrText') or '')
+    if ocr:
+        out['ocrText'] = ocr[:SEARCH_INDEX_OCR_MAX_CHARS]
+    return out
+
+
+def _search_index_json_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-search.json.gz'
+
+
+def _search_index_manifest_blob_name(user_id: str) -> str:
+    return f'{_vector_index_blob_key(user_id)}-search.json'
+
+
+def get_search_index_blob_location(user_id: str) -> Tuple[str, str]:
+    return _lexical_index_container_name(), _search_index_json_blob_name(user_id)
+
+
+def load_search_index_manifest(user_id: str) -> Dict[str, str]:
+    client = _lexical_index_blob_client(_search_index_manifest_blob_name(user_id))
+    if client is None:
+        return {}
+    try:
+        parsed = json.loads(client.download_blob().readall().decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_user_search_index(user_id: str, lexical_snapshot: 'LexicalIndexSnapshot') -> None:
+    """Best-effort, non-fatal -- see the block comment above."""
+    container_name = _lexical_index_container_name()
+    if not container_name:
+        return
+    try:
+        with perf_instrumentation.span('index.search_slim.build', rows=len(lexical_snapshot.rows)):
+            slim = LexicalIndexSnapshot(
+                user_id=lexical_snapshot.user_id,
+                source_version=lexical_snapshot.source_version,
+                schema_version=_SEARCH_INDEX_SCHEMA_VERSION,
+                updated_at=lexical_snapshot.updated_at,
+                rows=[_search_slim_row(row) for row in lexical_snapshot.rows],
+            )
+            payload = _serialize_lexical_index(slim)
+        perf_instrumentation.log_event(
+            'search_slim_written', user=user_id, rows=len(slim.rows), gz_mb=round(len(payload) / 1048576, 1),
+        )
+        blob_client = _get_blob_client(container_name, _search_index_json_blob_name(user_id))
+        manifest_client = _get_blob_client(container_name, _search_index_manifest_blob_name(user_id))
+        if blob_client is None or manifest_client is None:
+            return
+        blob_client.upload_blob(
+            payload, overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+        )
+        manifest_client.upload_blob(
+            json.dumps({
+                'userId': user_id,
+                'sourceVersion': slim.source_version,
+                'schemaVersion': slim.schema_version,
+                'rowCount': len(slim.rows),
+                'updatedAt': slim.updated_at,
+            }, separators=(',', ':')).encode('utf-8'),
+            overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json'),
+        )
+    except Exception:
+        _LOGGER.exception('Slim search index write failed for user %s', user_id)
+
+
 def delete_user_lexical_index_data(user_id: str) -> None:
     """Delete a library's cached lexical-index blobs (data + manifest) and
     drop it from the in-memory cache. Best-effort: a missing blob is not an
@@ -3229,6 +3423,7 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     for blob_name in (
         _lexical_index_json_blob_name(key), _lexical_index_manifest_blob_name(key),
         _listing_index_json_blob_name(key), _listing_index_manifest_blob_name(key),
+        _search_index_json_blob_name(key), _search_index_manifest_blob_name(key),
     ):
         blob_client = _lexical_index_blob_client(blob_name)
         if blob_client is None:
@@ -3624,6 +3819,7 @@ def refresh_user_lexical_index(
             'rows': snapshot.rows,
         }
     _write_user_listing_index(key, snapshot)
+    _write_user_search_index(key, snapshot)
     if dirty_to_clear:
         _clear_dirty_search_index_filenames(key, 'lexical', dirty_to_clear)
     return snapshot
