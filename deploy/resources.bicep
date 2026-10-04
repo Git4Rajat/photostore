@@ -628,6 +628,9 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'backend'
           image: backendImage
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+          ]
           resources: {
             // 2026-09-03: raised from 1.25vCPU/2.5Gi live on photostore-test
             // after a sustained OOM crash-loop (working-set pinned at the
@@ -691,6 +694,9 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
+            // Shared Azure Files volume: index blobs are cached here by ETag so a
+            // restart/scale-out re-reads from disk instead of re-downloading them.
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             // Gunicorn workers are separate processes and the app is imported
             // AFTER fork (no --preload), so every worker loads its own copy of
             // numpy/scipy/scikit-learn/Pillow + the Azure SDKs (~250-350 MB
@@ -819,6 +825,9 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           ]
         }
       ]
+      volumes: [
+        { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
+      ]
       scale: {
         minReplicas: 0
         // Was 3. Raised to 5 after a real HAR capture showed the client-side
@@ -858,6 +867,10 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
       }
     }
   }
+  // storageName is a literal, so explicitly wait for the SMB registration.
+  dependsOn: [
+    workerCheckpointStorage
+  ]
 }
 
 // 2026-09-15: first real service split (see backend-cpu-optimization-2026-09
@@ -898,6 +911,9 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'tools'
           image: backendImage
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+          ]
           // 2vCPU/4Gi (was 0.5/1Gi): tools is now the derived-index builder
           // (POST /api/tools/indexes/build). Building the lexical index scans
           // a user's full metadata partition (OCR/tags/faces per row) -- the
@@ -909,6 +925,9 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'tools' }
+            // Shared Azure Files volume: index blobs are cached here by ETag so a
+            // restart/scale-out re-reads from disk instead of re-downloading them.
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
@@ -917,6 +936,9 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
           ])
         }
+      ]
+      volumes: [
+        { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
         minReplicas: 0
@@ -934,6 +956,10 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
       }
     }
   }
+  // storageName is a literal, so explicitly wait for the SMB registration.
+  dependsOn: [
+    workerCheckpointStorage
+  ]
 }
 
 // 2026-09-16: third service split -- admin (Tools/Workbench recovery actions:

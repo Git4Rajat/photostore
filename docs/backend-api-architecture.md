@@ -290,3 +290,17 @@ measured vs. only located:
    1 during normal (not just burst) load — the existing table-backed
    delegation-key pattern (§3) is the precedent for making a cache
    cross-replica without introducing a new dependency like Redis.
+
+## 11. Large-library index path (130k photos) — instrumentation, slim index, disk cache
+
+**Reading the logs.** Every line starting `PERF` is key=value (`perf_instrumentation.py`):
+- `event=request` — `ms`, `inflight`, `rss_delta_mb`, and the top spans for that request; WARNING when `ms >= PERF_SLOW_REQUEST_MS` (1000).
+- `event=mem` — every 15s: `rss_mb`, `threads`, `inflight`, `inflight_peak`. `PERF_MEMORY_WARN_MB` adds an `mem_high` warning.
+- `event=span name=index.<kind>.{download,gunzip,json_parse,table_scan}` / `index.serialize` / `index.search_slim.build` — which phase of an index load/build dominates and how much RSS it adds. `index_disk_cache_hit|store` shows disk-cache behaviour.
+- `PERF_INSTRUMENTATION=false` disables all of it.
+
+**Slim search index.** `refresh_user_lexical_index` now also writes `<key>-search.json.gz` (+ manifest): only the fields `localLexicalSearch.ts` reads, with `exifData` cut to the keys search uses, `processing_metadata` to AI labels scoring >= 0.2, and `ocrText` capped at `SEARCH_INDEX_OCR_MAX_CHARS` (1500). `/api/photos/search-index` hands out the slim blob when its `sourceVersion` matches the lexical manifest, else the full blob. The full lexical blob stays the server-side source of truth.
+
+**Disk cache.** `INDEX_DISK_CACHE_DIR` (set on `backend` and `tools` to `/mnt/photostore/shared/index-cache`, the existing `faiss-checkpoints` Azure Files share) caches gzipped index blobs keyed by blob ETag; a hit costs one `get_blob_properties`. Atomic writes; any failure falls back to a normal download. `deploy/azuredeploy.json` is compiled from the bicep and must be regenerated (`az bicep build`) before a one-click deploy picks this up.
+
+**Client.** `preloadLocalIndexes()` starts the sort and search index downloads concurrently once `/api/photos/index-status` reports ready; the search index is now persisted in IndexedDB by `sourceVersion` like the sort index.

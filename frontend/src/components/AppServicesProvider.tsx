@@ -1,3 +1,4 @@
+import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
@@ -927,6 +928,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             setLibraryIndexReady(true);
             if (status && !status.ready) {
                 void postTools('/api/tools/indexes/build', {}).catch(() => null);
+            } else if (status?.ready) {
+                // Prebuilt indexes exist: start both downloads now, in parallel,
+                // so they are warm (and in IndexedDB) before the gallery or
+                // search ask for them. Fire-and-forget -- each loader already
+                // dedupes in-flight work and swallows its own failures.
+                void preloadLocalIndexes();
             }
         })();
         return () => {
