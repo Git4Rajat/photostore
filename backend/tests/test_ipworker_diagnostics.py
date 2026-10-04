@@ -1,5 +1,5 @@
 """Local-only diagnostics contracts: fake clocks, queues, and sweep phases."""
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import logging
 from types import SimpleNamespace
@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import app
+import ipworker_metrics as metrics_module
 
 
 class _StopLoop(BaseException):
@@ -150,6 +151,7 @@ def _run_queue(monkeypatch, queue):
     ('done', 1, False, 1),
     ('noop', 1, False, 1),
     ('not_found', 1, False, 1),
+    ('retry_exhausted', app.IPWORKER_MAX_RETRIES + 1, False, 1),
     ('error', 1, False, 0),
     ('raises', 1, False, 0),
     ('lease_busy', 1, False, 0),
@@ -286,6 +288,7 @@ def test_shutdown_final_sample_precedes_force_exit_and_keeps_in_flight_count(
     assert metrics['in_flight'] == int(stuck)
     assert metrics['window']['received'] == 1
     assert metrics['window']['done'] == metrics['window']['ack'] == int(not stuck)
+    assert metrics['window']['shutdown_grace_exhausted'] == int(stuck)
     assert memory_samples == [int(stuck)]
     assert queue.receives == 1
     assert queue.deletes == ([] if stuck else ['shutdown'])
@@ -372,3 +375,434 @@ def test_sweep_loop_consumes_outcomes_without_changing_control_flow(
         assert 'trash sweep: purged 1 photo(s) and 0 album(s)' in caplog.text
     assert ('ipwork sweep iteration failed' in caplog.text) == bool(failure_phase)
     assert sleep_calls == [min(60, app.IPWORK_SWEEP_INTERVAL_SECONDS), app.IPWORK_SWEEP_INTERVAL_SECONDS]
+
+
+def test_histogram_upper_bounds_overflow_and_fixed_size():
+    histogram = metrics_module.Histogram()
+    for _ in range(10000):
+        histogram.observe(501)
+    histogram.observe(600001)
+    for invalid in (-1, float('nan'), float('inf')):
+        histogram.observe(invalid)
+    summary = histogram.snapshot()
+    assert summary['count'] == 10001
+    assert summary['p50_upper_bound'] == summary['p95_upper_bound'] == summary['p99_upper_bound'] == 750
+    assert len(histogram.counts) == len(metrics_module.LATENCY_MS) + 1
+    assert summary['bucket_counts'][-1] == 1
+    assert summary['bucket_upper_bounds'][-1] is None
+    tail = metrics_module.Histogram()
+    tail.observe(600001)
+    assert tail.snapshot()['p99_upper_bound'] is None
+    assert metrics_module.Histogram().snapshot()['p50_upper_bound'] is None
+
+
+def test_concurrent_records_and_atomic_window_reset(clock):
+    collector = metrics_module.Metrics(2, clock=lambda: clock.seconds)
+
+    def record_many(_):
+        for _ in range(1000):
+            collector.record('done')
+            collector.observe('task', 123)
+            collector.record('filename-untrusted')
+            collector.observe('unbounded-label', 10)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(record_many, range(4)))
+    clock.seconds += 60
+    first = collector.snapshot(60, 60)
+    second = collector.snapshot(0, 60)
+    assert first['window']['done'] == first['cumulative']['done'] == 4000
+    assert first['histograms']['window']['task']['count'] == 4000
+    assert second['window']['done'] == 0
+    assert second['histograms']['window'] == {}
+    assert second['histograms']['cumulative']['task']['count'] == 4000
+    assert 'filename-untrusted' not in collector.cumulative
+    assert len(collector.histograms[0]) == len(metrics_module.TIMINGS) + 1
+
+
+def test_slot_integration_preparation_idle_and_windows(clock):
+    collector = metrics_module.Metrics(2, clock=lambda: clock.seconds)
+    clock.seconds += 2  # idle
+    collector.state(preparing=8)
+    clock.seconds += 3  # prep only
+    collector.state(preparing=0, ready=8, active_delta=1)
+    clock.seconds += 4  # one slot
+    collector.state(active_delta=1)
+    clock.seconds += 5  # both slots
+    first = collector.snapshot(14, 14)
+    window = first['utilization']['window']
+    assert window['slot_seconds'] == 14
+    assert window['slot_utilization'] == 0.5
+    assert window['idle_seconds'] == 2
+    assert window['preparation_only_seconds'] == window['preparing_seconds'] == 3
+    assert window['ready_seconds'] == 9
+    clock.seconds += 2
+    collector.state(active_delta=-2, ready=0)
+    clock.seconds += 1
+    second = collector.snapshot(3, 17)
+    assert second['utilization']['window']['slot_seconds'] == 4
+    assert second['utilization']['cumulative']['slot_seconds'] == 18
+    assert second['utilization']['window']['idle_seconds'] == 1
+    assert second['loop'] == {'active_tasks': 0, 'preparing': 0, 'ready': 0}
+
+
+@pytest.mark.parametrize('platform, peak, expected_peak', [('linux', 4096, 4194304), ('darwin', 4194304, 4194304)])
+def test_resource_units_current_peak_and_cpu(monkeypatch, platform, peak, expected_peak):
+    from io import StringIO
+    monkeypatch.setattr(metrics_module.sys, 'platform', platform)
+    monkeypatch.setattr(metrics_module, 'resource', SimpleNamespace(
+        RUSAGE_SELF=0, getrusage=lambda _: SimpleNamespace(ru_maxrss=peak)))
+    monkeypatch.setattr(metrics_module.time, 'process_time', lambda: 3.25)
+    monkeypatch.setattr('builtins.open', lambda *a, **kw: StringIO('100 20 0 0'))
+    monkeypatch.setattr(metrics_module.os, 'sysconf', lambda _: 4096)
+    calls = []
+
+    def mach_rss():
+        calls.append(True)
+        return 81920
+
+    monkeypatch.setattr(metrics_module, '_darwin_current_rss_bytes', mach_rss)
+    sample = metrics_module.resource_sample()
+    assert sample == {'process_cpu_seconds': 3.25, 'current_rss_bytes': 81920,
+                      'peak_rss_bytes': expected_peak}
+    assert bool(calls) == (platform == 'darwin')
+
+
+def test_resource_failure_is_null_and_cpu_delta_is_process_wide(monkeypatch, clock):
+    monkeypatch.setattr(metrics_module, 'resource', None)
+    monkeypatch.setattr(metrics_module.sys, 'platform', 'linux')
+    monkeypatch.setattr('builtins.open', lambda *a, **kw: (_ for _ in ()).throw(OSError()))
+    cpu = SimpleNamespace(seconds=10)
+    monkeypatch.setattr(metrics_module.time, 'process_time', lambda: cpu.seconds)
+    collector = metrics_module.Metrics(2, clock=lambda: clock.seconds)
+    cpu.seconds += 90
+    clock.seconds += 60
+    sample = collector.snapshot(60, 60)['resources']
+    assert sample['window_cpu_seconds'] == 90
+    assert sample['window_cpu_cores'] == 1.5
+    assert sample['current_rss_bytes'] is sample['peak_rss_bytes'] is None
+
+
+def test_identity_is_allowlisted_bounded_and_contains_no_secret(monkeypatch):
+    monkeypatch.setenv('SESSION_SECRET', 'must-not-log-this')
+    monkeypatch.setenv('BLOB_CONNECTION_STRING', 'must-not-log-this-either')
+    monkeypatch.setenv('CONTAINER_APP_REVISION', 'r' * 1000)
+    identity = metrics_module.replica_identity()
+    assert len(identity['container_app_revision']) == 128
+    assert 'must-not-log' not in json.dumps(identity)
+    assert set(identity) == {'container_app_name', 'container_app_revision', 'container_app_replica_name', 'hostname'}
+
+
+def test_step_and_failed_download_timing_without_storage_changes(monkeypatch, clock):
+    collector = metrics_module.Metrics(2, clock=lambda: clock.seconds)
+    monkeypatch.setattr(app._ipwork_metrics_context, 'collector', collector, raising=False)
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *a: {})
+    downloads = []
+
+    def download(*args):
+        downloads.append(args)
+        clock.seconds += 0.02
+        return b'photo'
+
+    def step(*args):
+        clock.seconds += 0.03
+        return {'hasData': False}
+
+    monkeypatch.setattr(app, 'download_media_bytes', download)
+    monkeypatch.setattr(app, 'IPWORK_STEP_PROCESSORS', {'ocr': step, 'face': step})
+    results = app._run_ipwork_steps('u', 'f', ['ocr', 'face'])
+    assert results == {'ocr': {'hasData': False}, 'face': {'hasData': False}}
+    assert len(downloads) == 1
+    summary = collector.snapshot(1, 1)['histograms']['window']
+    assert summary['download']['count'] == 1
+    assert summary['download']['sum'] == 20
+    assert summary['step_ocr']['sum'] == summary['step_face']['sum'] == 30
+
+    def failed_download(*args):
+        clock.seconds += 0.04
+        raise OSError('download failure')
+
+    monkeypatch.setattr(app, 'download_media_bytes', failed_download)
+    assert app._run_ipwork_steps('u', 'f', ['face'])['face']['error'] == 'download_failed'
+    summary = collector.snapshot(1, 2)['histograms']['window']
+    assert summary['download']['sum'] == 40
+    assert 'step_face' not in summary
+
+
+@pytest.mark.parametrize('kind, expected', [
+    ('good', 'productive_completed'), ('error', 'completed_with_step_error'),
+    ('failure_stage', 'completed_with_step_error'), ('malformed', 'completed_result_unknown'),
+    ('already', 'already_processed'), ('stale', 'productive_completed'),
+    ('backend_failed', 'completed_with_step_error'),
+])
+def test_completion_semantics_do_not_guess_new_uploads(monkeypatch, clock, kind, expected):
+    collector = metrics_module.Metrics(2, clock=lambda: clock.seconds)
+    monkeypatch.setattr(app._ipwork_metrics_context, 'collector', collector, raising=False)
+    status = 'done' if kind in {'already', 'stale'} else 'pending'
+    monkeypatch.setattr(app, 'claim_processing_lease', lambda *a, **kw: {'statuses': {'faceStatus': status}})
+    monkeypatch.setattr(app, 'release_processing_lease', lambda *a, **kw: None)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *a: {})
+    monkeypatch.setattr(app, '_browser_processing_face_version_stale', lambda _: kind == 'stale')
+    monkeypatch.setattr(app, '_queue_people_clustering_after_face_processing', lambda *a: None)
+    face = {'hasData': False, 'faces': []}
+    if kind == 'error':
+        face['error'] = 'detector_failed'
+    elif kind == 'failure_stage':
+        face['faceFailureStage'] = 'detect'
+    elif kind == 'malformed':
+        face = None
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a: {'face': face})
+    # Historical successful face status cannot override an executed face error.
+    monkeypatch.setattr(app, 'apply_client_processing_results_for_file', lambda *a, **kw: {'face_status': 'failed' if kind == 'backend_failed' else 'done'})
+    outcome = app._handle_ipwork_queue_payload({'filename': 'f', 'steps': ['face']}, 'j', 'u')
+    counters = collector.snapshot(1, 1)['window']
+    assert outcome == ('noop' if kind == 'already' else 'done')
+    assert counters[expected] == 1
+    assert counters['productive_completed'] == int(kind in {'good', 'stale'})
+    assert counters['eligibility_reprocessing'] == int(kind == 'stale')
+    assert counters['eligibility_unknown'] == int(kind not in {'already', 'stale'})
+
+
+def test_real_retry_exhaustion_acks_without_completion_or_milestone(monkeypatch, clock, memory_samples, caplog):
+    caplog.set_level(logging.INFO, logger=app.worker_logger.name)
+    message = SimpleNamespace(id='exhausted', dequeue_count=app.IPWORKER_MAX_RETRIES + 1,
+                              content=json.dumps({'user_id': 'u', 'jobId': 'j', 'filename': 'f', 'steps': ['face']}))
+    statuses, triggers = [], []
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: statuses.append((a, kw)))
+    monkeypatch.setattr(app, '_handle_ipwork_queue_payload', lambda *a: pytest.fail('must not dispatch exhausted job'))
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', triggers.append)
+    monkeypatch.setattr(app, 'IPWORKER_INDEX_REBUILD_MILESTONE', 1)
+
+    class Queue:
+        receives = 0
+        deletes = []
+
+        def create_queue(self):
+            pass
+
+        def receive_messages(self, **kw):
+            self.receives += 1
+            return [message] if self.receives == 1 else []
+
+        def delete_message(self, msg):
+            self.deletes.append(msg.id)
+
+    queue = Queue()
+    _run_queue(monkeypatch, queue)
+    summary, = _metrics(caplog)
+    counters = summary['window']
+    assert counters['retry_exhausted'] == counters['ack'] == 1
+    assert counters['done'] == counters['productive_completed'] == 0
+    assert queue.deletes == ['exhausted'] and triggers == []
+    assert statuses[0][0][-1] == 'failed'
+    histograms = summary['histograms']['window']
+    assert histograms['retry_depth']['count'] == histograms['task']['count'] == 1
+    assert histograms['receipt_to_start']['count'] == histograms['receipt_to_ack']['count'] == 1
+
+
+@pytest.mark.parametrize('reason', ['preparation_failed', 'visibility_budget'])
+def test_deferred_wave_metrics_leave_receipts_unacked(monkeypatch, clock, memory_samples, caplog, reason):
+    caplog.set_level(logging.INFO, logger=app.worker_logger.name)
+    messages = [SimpleNamespace(id=str(i), content='{}', dequeue_count=1000) for i in range(2)]
+
+    class Queue:
+        receives = 0
+
+        def create_queue(self):
+            pass
+
+        def receive_messages(self, **kw):
+            self.receives += 1
+            return messages if self.receives == 1 else []
+
+        def delete_message(self, message):
+            pytest.fail('deferred message ACKed')
+
+    _prepare_queue(monkeypatch, Queue())
+    monkeypatch.setattr(app, 'IPWORKER_FACE_RECONCILE_BATCH_SIZE', 8)
+
+    def prepare(*args):
+        if reason == 'preparation_failed':
+            clock.seconds += 0.1
+            raise OSError('scan failed')
+        clock.seconds += app.IPWORKER_VISIBILITY_TIMEOUT_SECONDS / 2 + 1
+
+    monkeypatch.setattr(app, '_prepare_ipwork_face_indexes', prepare)
+    monkeypatch.setattr(app, '_process_ipwork_message', lambda *a: pytest.fail('deferred message processed'))
+    monkeypatch.setattr(app.time, 'sleep', lambda _: (_ for _ in ()).throw(_StopLoop()))
+    with pytest.raises(_StopLoop):
+        app.run_ipworker()
+    summary = _metrics(caplog)[-1]
+    assert summary['cumulative']['defer_' + reason] == 2
+    assert summary['cumulative']['ack'] == 0
+    assert summary['histograms']['cumulative']['retry_depth']['bucket_counts'][-1] == 2
+    assert summary['histograms']['cumulative']['wave']['count'] == 1
+    assert summary['histograms']['cumulative']['preparation']['count'] == 1
+
+
+@pytest.mark.parametrize('preparation', [False, True])
+def test_watchdog_counters_oldest_task_and_no_invented_latency(
+        monkeypatch, clock, memory_samples, caplog, preparation):
+    import faulthandler
+    caplog.set_level(logging.INFO, logger=app.worker_logger.name)
+    monkeypatch.setattr(faulthandler, 'dump_traceback', lambda **kw: None)
+    messages = [SimpleNamespace(id=str(i), content='{}', dequeue_count=1) for i in range(2)]
+
+    class Queue:
+        def create_queue(self):
+            pass
+
+        def receive_messages(self, **kw):
+            return messages
+
+        def delete_message(self, message):
+            pytest.fail('watchdog must never ACK incomplete work')
+
+    class BlockedExecutor:
+        def __init__(self, **kw):
+            pass
+
+        def submit(self, *args):
+            return Future()
+
+        def shutdown(self, **kw):
+            assert kw == {'wait': False, 'cancel_futures': True}
+
+    _prepare_queue(monkeypatch, Queue())
+    monkeypatch.setattr(app, 'IPWORKER_CONCURRENCY', 2)
+    monkeypatch.setattr(app, 'IPWORKER_FACE_RECONCILE_BATCH_SIZE', 8 if preparation else 1)
+    monkeypatch.setattr(app, 'IPWORKER_TASK_TIMEOUT_SECONDS', 120)
+    monkeypatch.setattr(app, 'IPWORKER_VISIBILITY_TIMEOUT_SECONDS', 300)
+    monkeypatch.setattr(app, 'ThreadPoolExecutor', BlockedExecutor)
+    exits = []
+    monkeypatch.setattr(app.os, '_exit', exits.append)
+
+    def wait(futures, **kw):
+        clock.seconds += 121
+        return set(), set(futures)
+
+    monkeypatch.setattr(app, 'wait', wait)
+    app.run_ipworker()
+    summary = _metrics(caplog)[-1]
+    assert exits == [1]
+    assert summary['cumulative']['watchdog_preparation'] == int(preparation)
+    assert summary['cumulative']['watchdog_tasks'] == (0 if preparation else 2)
+    assert summary['loop']['preparing'] == (2 if preparation else 0)
+    assert summary['loop']['oldest_task_seconds'] == (0 if preparation else 121)
+    assert 'task' not in summary['histograms']['cumulative']
+    assert 'wave' not in summary['histograms']['cumulative']
+    assert summary['cumulative']['ack'] == summary['cumulative']['done'] == 0
+
+
+def test_exact_receipt_task_ack_and_wave_boundaries(monkeypatch, clock, memory_samples, caplog):
+    caplog.set_level(logging.INFO, logger=app.worker_logger.name)
+    message = SimpleNamespace(id='bounded', content='{}', dequeue_count=2)
+
+    class Queue:
+        receives = 0
+
+        def create_queue(self):
+            pass
+
+        def receive_messages(self, **kw):
+            self.receives += 1
+            clock.seconds += 0.01
+            return [message] if self.receives == 1 else []
+
+        def delete_message(self, message):
+            clock.seconds += 0.04
+
+    _prepare_queue(monkeypatch, Queue())
+    monkeypatch.setattr(app, 'IPWORKER_FACE_RECONCILE_BATCH_SIZE', 8)
+    monkeypatch.setattr(app, 'IPWORKER_CONCURRENCY', 2)
+    monkeypatch.setattr(app, '_prepare_ipwork_face_indexes', lambda *a: setattr(clock, 'seconds', clock.seconds + 0.1))
+
+    def process(message):
+        clock.seconds += 0.2
+        return 'done'
+
+    monkeypatch.setattr(app, '_process_ipwork_message', process)
+    monkeypatch.setattr(app.time, 'sleep', lambda _: (_ for _ in ()).throw(_StopLoop()))
+    with pytest.raises(_StopLoop):
+        app.run_ipworker()
+    summary, = _metrics(caplog)
+    hist = summary['histograms']['window']
+    assert hist['receive']['sum'] == 20
+    assert hist['receipt_to_start']['sum'] == hist['preparation']['sum'] == 100
+    assert hist['task']['sum'] == 200
+    assert hist['ack']['sum'] == 40
+    assert hist['receipt_to_ack']['sum'] == 340
+    assert hist['wave']['sum'] == 350
+    utilization = summary['utilization']['window']
+    assert utilization['slot_seconds'] == 0.2
+    assert utilization['preparation_only_seconds'] == 0.1
+    assert utilization['idle_seconds'] == 0.06  # queue receive and ACK, not inference
+    assert summary['loop'] == {'active_tasks': 0, 'preparing': 0, 'ready': 0,
+                               'oldest_task_seconds': 0, 'preparation_seconds': 0}
+
+
+def test_unsupported_payload_is_noop_not_completion():
+    assert app._process_ipwork_message(SimpleNamespace(content='[]', dequeue_count=1)) == 'noop'
+
+
+def test_window_resets_concurrently_without_losing_observations(clock):
+    collector = metrics_module.Metrics(2, clock=lambda: clock.seconds)
+
+    def record(_):
+        for _ in range(1000):
+            collector.observe('task', 1)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(record, i) for i in range(4)]
+        first = collector.snapshot(1, 1)
+        for future in futures:
+            future.result()
+    second = collector.snapshot(1, 2)
+    observed = sum(summary['histograms']['window'].get('task', {}).get('count', 0)
+                   for summary in (first, second))
+    assert observed == second['histograms']['cumulative']['task']['count'] == 4000
+
+
+def test_apply_exception_records_latency_but_not_productive_completion(monkeypatch, clock):
+    collector = metrics_module.Metrics(2, clock=lambda: clock.seconds)
+    monkeypatch.setattr(app._ipwork_metrics_context, 'collector', collector, raising=False)
+    monkeypatch.setattr(app, 'claim_processing_lease', lambda *a, **kw: {'statuses': {}})
+    releases = []
+    monkeypatch.setattr(app, 'release_processing_lease', lambda *a, **kw: releases.append(a))
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a: {'face': {'hasData': True, 'faces': []}})
+
+    def failed_apply(*a, **kw):
+        clock.seconds += 0.25
+        raise OSError('transient persistence failure')
+
+    monkeypatch.setattr(app, 'apply_client_processing_results_for_file', failed_apply)
+    message = SimpleNamespace(content=json.dumps({'filename': 'f', 'user_id': 'u', 'jobId': 'j', 'steps': ['face']}),
+                              dequeue_count=1)
+    assert app._process_ipwork_message(message) == 'error'
+    summary = collector.snapshot(1, 1)
+    assert summary['histograms']['window']['apply']['sum'] == 250
+    assert summary['window']['productive_completed'] == 0
+    assert releases == [('u', 'f', 'ipworker-j')]
+
+
+def test_populated_histogram_transport_records_stay_bounded(clock, memory_samples, caplog):
+    caplog.set_level(logging.INFO, logger=app.worker_logger.name)
+    window = app._IpworkThroughputWindow()
+    for name in metrics_module.TIMINGS:
+        window.collector.observe(name, 1234)
+    clock.seconds += 60
+    window.log(0)
+    metrics, = _metrics(caplog)
+    assert metrics['histograms']['window']['task']['p95_upper_bound'] == 2000
+    assert 'bucket_counts' not in metrics['histograms']['window']['task']
+    details = [r.getMessage() for r in caplog.records if r.getMessage().startswith('ipwork latency histogram metrics=')]
+    assert len(details) == len(metrics_module.TIMINGS)
+    assert all(len(r.getMessage().encode()) < 12000 for r in caplog.records)
+
+
+def test_missing_metrics_scope_is_safe_and_does_not_capture_api_calls(monkeypatch):
+    monkeypatch.setattr(app._ipwork_metrics_context, 'collector', None, raising=False)
+    app._ipwork_metric('done')
+    assert app._ipwork_timed_call('apply', lambda: 'same-result') == 'same-result'

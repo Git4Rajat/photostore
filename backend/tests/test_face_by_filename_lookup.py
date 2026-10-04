@@ -787,6 +787,68 @@ def test_lookup_row_complete_zero_when_all_faces_removed(lookup_ctx):
     assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') == []
 
 
+@pytest.mark.parametrize('partial', [False, True])
+def test_failed_forced_result_preserves_real_source_curation_and_lookup(lookup_ctx, monkeypatch, partial):
+    """Exercise the real filename generation writer, not just a reconcile spy."""
+    faces, lookup = lookup_ctx
+    original_ids = storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0), _face(100)])
+    curated = faces.get_entity('u1', original_ids[1])
+    curated.update(personId='named-person', confirmedByUser=True, reviewStatus='confirmed')
+    faces.upsert_entity(curated)
+    people = AzureFaceTable()
+    people.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'named-person',
+                          'name': 'Saved name', 'faceIds': json.dumps([original_ids[1]])})
+    monkeypatch.setitem(storage_utils._CTX, 'person_table_client', people)
+    metadata_table = AzureFaceTable()
+    monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', metadata_table)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a, **k: None)
+    monkeypatch.setattr(storage_utils, '_start_face_crop_warming', lambda *a, **k: None)
+    monkeypatch.setattr(storage_utils, 'touch_user_search_indexes_state', lambda *a, **k: None)
+    previous_faces = json.dumps([_face(0), _face(100)])
+    metadata = {'PartitionKey': 'u1', 'RowKey': 'photo.jpg', 'face_status': 'running',
+                'faceCount': 2, 'faces': previous_faces,
+                'processing_metadata': json.dumps({'face': {'forced': True}})}
+    prior_lookup = dict(lookup.get_entity('u1', 'photo.jpg'))
+    writes_before = len(lookup.writes)
+    storage_utils._apply_client_processing_results(
+        'u1', 'photo.jpg', metadata, lambda: b'',
+        {'face': {'faces': [_face(0)] if partial else [], 'rawFaceCount': 2,
+                  'faceFailureStage': 'postprocessing_failed', 'filteredFaceCount': 1 if partial else 2}},
+        [], 'ipworker:failed-job', origin='ipworker', claimed_steps=['face'])
+    assert metadata['face_status'] == 'failed'
+    assert metadata['faceCount'] == 2
+    assert len(json.loads(metadata['faces'])) == 2
+    assert faces.get_entity('u1', original_ids[1]) == curated
+    assert people.get_entity('u1', 'named-person')['name'] == 'Saved name'
+    assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') == original_ids
+    assert faces.get_entity('u1', original_ids[0])['embedding']
+    if not partial:
+        assert metadata['faces'] == previous_faces
+        assert lookup.get_entity('u1', 'photo.jpg') == prior_lookup
+        assert len(lookup.writes) == writes_before
+
+
+def test_partial_failure_preserves_unmatched_uncurated_source(lookup_ctx, monkeypatch):
+    """Uncurated source rows must survive too: curation guards alone aren't enough."""
+    faces, lookup = lookup_ctx
+    ids = storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0), _face(100)])
+    untouched = faces.get_entity('u1', ids[1])
+    metadata_table = AzureFaceTable()
+    monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', metadata_table)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a, **k: None)
+    monkeypatch.setattr(storage_utils, '_start_face_crop_warming', lambda *a, **k: None)
+    monkeypatch.setattr(storage_utils, 'touch_user_search_indexes_state', lambda *a, **k: None)
+    metadata = {'PartitionKey': 'u1', 'RowKey': 'photo.jpg', 'face_status': 'running',
+                'faceCount': 2, 'faces': json.dumps([_face(0), _face(100)]),
+                'processing_metadata': json.dumps({'face': {'forced': True}})}
+    storage_utils._apply_client_processing_results(
+        'u1', 'photo.jpg', metadata, lambda: b'',
+        {'face': {'faces': [_face(0)], 'rawFaceCount': 2}}, [], 'ipworker:partial-job', origin='ipworker')
+    assert faces.get_entity('u1', ids[1]) == untouched
+    assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') == ids
+    assert lookup.get_entity('u1', 'photo.jpg')['state'] == 'complete'
+
+
 def test_falls_back_to_scan_when_lookup_table_not_configured(monkeypatch):
     """An unconfigured lookup still uses authoritative filename queries."""
     face_table = AzureFaceTable()

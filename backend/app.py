@@ -41,6 +41,7 @@ from auth_utils import validate_bearer_token as validate_entra_bearer_token
 import password_auth
 import email_utils
 import library_utils
+from ipworker_metrics import Metrics as IpworkerMetrics, replica_identity, resource_sample
 from ordering_utils import (
     order_photo_entries,
     metadata_capture_datetime,
@@ -10511,7 +10512,19 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
         return None
     if str(metadata.get('face_status') or '').strip().lower() != 'done':
-        return None
+        # A partial pass is failed (not a verified complete set), but its
+        # validated/persisted embeddings can still take the normal assignment
+        # path. The worker reads canonical faces, never failed candidates.
+        try:
+            processing = json.loads(metadata.get('processing_metadata') or '{}')
+            accepted = processing.get('client_face') or {}
+            ids = accepted.get('storedFaceIds')
+            if (str(metadata.get('face_status') or '').lower() != 'failed'
+                    or not isinstance(ids, list) or not ids
+                    or not accepted.get('embeddingsReady')):
+                return None
+        except (ValueError, TypeError, AttributeError):
+            return None
 
     try:
         face_count = int(metadata.get('faceCount') or 0)
@@ -12955,6 +12968,26 @@ def run_clustering_worker() -> None:
 # ipworker's model coverage ships incrementally rather than all at once.
 IPWORK_STEP_PROCESSORS: Dict[str, Callable[[str, str, bytes], Optional[Dict]]] = {}
 
+# Scoped to the task's thread: browser/API calls do not enter worker metrics.
+_ipwork_metrics_context = threading.local()
+
+
+def _ipwork_metric(key, *, duration_ms=None, count=1, observation=False):
+    collector = getattr(_ipwork_metrics_context, 'collector', None)
+    if collector is not None:
+        if observation:
+            collector.observe(key, duration_ms)
+        else:
+            collector.record(key, duration_ms, count)
+
+
+def _ipwork_timed_call(name, function, *args, **kwargs):
+    started = time.monotonic()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        _ipwork_metric(name, duration_ms=(time.monotonic() - started) * 1000, observation=True)
+
 
 def _register_ipwork_processors() -> None:
     """Import and register ipworker's model-implementation modules.
@@ -13017,10 +13050,14 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
         nonlocal download_ms
         if not image_bytes_cache:
             started = time.monotonic()
-            entity = _get_metadata_entity(user_id, filename) or {}
-            source_blob = str(entity.get('anonymousImageId') or '').strip() or filename
-            image_bytes_cache.append(download_media_bytes('image', source_blob))
-            download_ms = round((time.monotonic() - started) * 1000)
+            try:
+                entity = _get_metadata_entity(user_id, filename) or {}
+                source_blob = str(entity.get('anonymousImageId') or '').strip() or filename
+                image_bytes_cache.append(download_media_bytes('image', source_blob))
+            finally:
+                elapsed_ms = (time.monotonic() - started) * 1000
+                download_ms = round(elapsed_ms)
+                _ipwork_metric('download', duration_ms=elapsed_ms, observation=True)
         return image_bytes_cache[0]
 
     def _failure_shape(step: str, error: str) -> Dict:
@@ -13060,7 +13097,9 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             worker_logger.exception('ipworker step %r failed for %s/%s', step, user_id, filename)
             client_processing[step] = _failure_shape(step, 'processing_failed')
         finally:
-            step_ms[step] = round((time.monotonic() - step_started) * 1000)
+            elapsed_ms = (time.monotonic() - step_started) * 1000
+            step_ms[step] = round(elapsed_ms)
+            _ipwork_metric('step_' + step, duration_ms=elapsed_ms, observation=True)
         # 'preview' is meant to run first (see IPWORK_STEPS/callers): once it
         # succeeds, swap the ~2048px shrunk bytes into the shared cache so
         # every later step this call (thumbnail/face/ocr/ai_vision) decodes
@@ -13130,7 +13169,8 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     lease_owner = f'ipworker-{job_id}'
     try:
         lease_started = time.monotonic()
-        lease = claim_processing_lease(user_id, filename, lease_owner, lease_seconds=IPWORKER_LEASE_SECONDS, steps=steps)
+        lease = _ipwork_timed_call('lease', claim_processing_lease, user_id, filename, lease_owner,
+                      lease_seconds=IPWORKER_LEASE_SECONDS, steps=steps)
         lease_claim_ms = round((time.monotonic() - lease_started) * 1000)
     except PhotoNotFoundError as exc:
         # Row was deleted (or soft-deleted) out from under this queued
@@ -13176,22 +13216,28 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     # get marked 'skipped' -- silently discarding the whole point of
     # queueing them (this is exactly what happened the first time the sweep
     # ran against a real stale-embedding-version backlog).
+    reprocessing = False
     if 'face' in steps and 'face' not in runnable_steps:
         entity = _get_metadata_entity(user_id, filename) or {}
         if _browser_processing_face_version_stale(entity):
             runnable_steps.append('face')
+            reprocessing = True
     if not runnable_steps:
         release_processing_lease(user_id, filename, lease_owner)
         _upsert_job_status(job_id, user_id, 'ipwork', 'skipped', reason='already_done')
+        _ipwork_metric('already_processed')
         return 'noop'
+    # Only stale-terminal-face reruns have positive reprocessing evidence here.
+    # Nonterminal lease status is NOT proof of a genuinely new upload.
+    _ipwork_metric('eligibility_reprocessing' if reprocessing else 'eligibility_unknown')
     _upsert_job_status(job_id, user_id, 'ipwork', 'running')
     lease_cleared_by_apply = False
     try:
         steps_started = time.monotonic()
-        client_processing = _run_ipwork_steps(user_id, filename, runnable_steps)
+        client_processing = _ipwork_timed_call('steps', _run_ipwork_steps, user_id, filename, runnable_steps)
         steps_ms = round((time.monotonic() - steps_started) * 1000)
         apply_started = time.monotonic()
-        metadata = apply_client_processing_results_for_file(
+        metadata = _ipwork_timed_call('apply', apply_client_processing_results_for_file,
             user_id,
             filename,
             client_processing=client_processing,
@@ -13223,7 +13269,51 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
             except Exception:
                 worker_logger.exception('Failed to auto-queue clustering for %s after ipwork', filename)
         cluster_ms = round((time.monotonic() - cluster_started) * 1000)
+        _ipwork_metric('cluster', duration_ms=(time.monotonic() - cluster_started) * 1000, observation=True)
         _upsert_job_status(job_id, user_id, 'ipwork', 'done')
+        # Queue 'done' intentionally retains its historical apply-returned
+        # semantics. Productive is stricter and never infers success from a
+        # historical face status while the executed processor reported error.
+        results_ok = isinstance(client_processing, dict) and all(
+            isinstance(client_processing.get(step), dict)
+            and isinstance(client_processing[step].get('hasData'), bool)
+            and not client_processing[step].get('error')
+            and not client_processing[step].get('faceFailureStage')
+            and str(metadata.get(step + '_status') or '').lower() not in {'failed', 'pending', 'running'}
+            for step in runnable_steps)
+        # Apply updates this mutable snapshot with status_updates before its
+        # successful write. A failed/pending status vetoes the proxy; a prior
+        # successful status alone still cannot prove a new durable completion.
+        explicit_error = isinstance(client_processing, dict) and any(
+            isinstance(client_processing.get(step), dict)
+              and (client_processing[step].get('error') or client_processing[step].get('faceFailureStage')
+                  or str(metadata.get(step + '_status') or '').lower() == 'failed')
+            for step in runnable_steps)
+        _ipwork_metric('productive_completed' if results_ok else
+                       'completed_with_step_error' if explicit_error else 'completed_result_unknown')
+        if 'face' in runnable_steps and isinstance(client_processing, dict) and isinstance(client_processing.get('face'), dict):
+            face_result = client_processing['face']
+            diagnostic = face_result.get('faceDiagnostics')
+            if isinstance(diagnostic, dict):
+                timings = diagnostic.get('stageTimingsMs')
+                if isinstance(timings, dict):
+                    for phase in ('decode', 'detect', 'landmarkWait', 'landmark', 'align', 'embed'):
+                        value = timings.get(phase)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            _ipwork_metric('face_' + phase, duration_ms=value, observation=True)
+            # Source result alone cannot see backend quality rejection.
+            try:
+                applied_face = json.loads(metadata.get('processing_metadata') or '{}').get('client_face') or {}
+            except (ValueError, TypeError, AttributeError):
+                applied_face = {}
+            failure_stage = str(applied_face.get('faceFailureStage') or face_result.get('faceFailureStage') or '')
+            if failure_stage:
+                _ipwork_metric('face_quality_rejected' if failure_stage == 'quality_filter_rejected'
+                               else 'face_postprocessing_failed')
+            elif face_result.get('hasData'):
+                _ipwork_metric('face_embedded')
+            elif face_result.get('rawFaceCount') == 0 and face_result.get('faceModelReady') is True:
+                _ipwork_metric('face_no_detection')
         # Total-vs-sum-of-parts breakdown for the whole message, not just the
         # per-step split inside _run_ipwork_steps -- lease_claim_ms/apply_ms/
         # cluster_ms cover everything outside that per-step breakdown.
@@ -13283,14 +13373,14 @@ def _prewarm_ipwork_models() -> None:
 def _process_ipwork_message(message) -> str:
     """Runs on a worker thread. Parses one queue message and dispatches it
     through _handle_ipwork_queue_payload, returning the outcome string
-    ('done'/'noop'/'lease_busy'/'not_found'). Never raises -- any exception here is
+    ('done'/'noop'/'lease_busy'/'not_found'/'error'/'retry_exhausted'). Never raises -- any exception here is
     caught and reported via _upsert_job_status, the same as the old
     single-message loop body did inline, so a bug in one worker thread
     can't escape into the main thread's future.result() call."""
     payload = {}
     job_id = ''
     user_id = ''
-    outcome = 'done'
+    outcome = 'noop'
     dequeue_count = int(getattr(message, 'dequeue_count', 0) or 0)
     try:
         payload = json.loads(message.content or '{}')
@@ -13314,7 +13404,7 @@ def _process_ipwork_message(message) -> str:
                     'Dropping ipwork queue message after %s dequeues (max %s), job_id=%s',
                     dequeue_count, IPWORKER_MAX_RETRIES, job_id,
                 )
-                return 'done'  # exceeded retries, not a race -- don't retry-loop it
+                return 'retry_exhausted'  # terminal ACK, not a productive completion/milestone
             outcome = _handle_ipwork_queue_payload(payload, job_id, user_id)
     except Exception as exc:
         if job_id and user_id:
@@ -13345,12 +13435,10 @@ def _log_ipwork_memory_sample(in_flight_after: int) -> None:
     process address space), so this is a process-wide sample, not a
     per-worker one -- correlate the *sequence* of samples against
     IPWORKER_CONCURRENCY across benchmark runs instead."""
-    if resource is None:
+    peak_bytes = resource_sample()['peak_rss_bytes']
+    if peak_bytes is None:
         return
-    try:
-        peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    except Exception:
-        return
+    peak_rss_mb = peak_bytes / (1024 * 1024)
     worker_logger.info('ipwork memory sample: peak_rss_mb=%.1f in_flight=%s', peak_rss_mb, in_flight_after)
 
 
@@ -13365,36 +13453,59 @@ IPWORKER_INDEX_REBUILD_MILESTONE = int(os.getenv('IPWORKER_INDEX_REBUILD_MILESTO
 
 
 class _IpworkThroughputWindow:
-    """Main-thread-only counters; outcomes are distinct from queue acknowledgements."""
+    """Thread-safe bounded metrics; queue outcomes remain distinct from ACKs."""
     def __init__(self):
         self.started = self.last_logged = time.monotonic()
-        self.cumulative = {}
-        self.window = {}
+        self.collector = IpworkerMetrics(IPWORKER_CONCURRENCY, clock=lambda: time.monotonic())
+        self.cumulative = self.collector.cumulative
+        self.window = self.collector.window
+        self.identity = replica_identity()
+        self.config = {'concurrency': IPWORKER_CONCURRENCY,
+                       'face_reconcile_batch_size': IPWORKER_FACE_RECONCILE_BATCH_SIZE,
+                       'visibility_timeout_seconds': IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
+                       'task_timeout_seconds': IPWORKER_TASK_TIMEOUT_SECONDS,
+                       'lease_seconds': IPWORKER_LEASE_SECONDS,
+                       'max_retries': IPWORKER_MAX_RETRIES,
+                       'lease_retry_limit': IPWORK_LEASE_RETRY_LIMIT,
+                       'shutdown_grace_seconds': IPWORKER_SHUTDOWN_GRACE_SECONDS,
+                       'poll_seconds': float(os.getenv('IPWORKER_POLL_SECONDS', '2')),
+                       'registered_steps': [step for step in IPWORK_STEPS if step in IPWORK_STEP_PROCESSORS],
+                       'face_embedding_version': str(IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION)[:128]}
 
     def record(self, key, duration_ms=None, count=1):
-        self.cumulative[key] = self.cumulative.get(key, 0) + count
-        self.window[key] = self.window.get(key, 0) + count
-        if duration_ms is not None:
-            for counters in (self.cumulative, self.window):
-                counters[key + '_ms'] = counters.get(key + '_ms', 0) + duration_ms
+        self.collector.record(key, duration_ms, count)
 
-    def log(self, in_flight, *, force=False):
+    def log(self, in_flight, *, force=False, oldest_task_seconds=0, preparation_seconds=0):
         now = time.monotonic()
         elapsed = now - self.last_logged
         if not force and elapsed < 60:
             return
-        keys = ('done', 'noop', 'lease_busy', 'error', 'not_found', 'receive',
-                'receive_failed', 'received', 'ack', 'ack_failed')
-        metrics = {'window_seconds': round(elapsed, 3),
-                   'elapsed_seconds': round(now - self.started, 3), 'in_flight': in_flight,
-                   'window': {key: self.window.get(key, 0) for key in keys},
-                   'cumulative': {key: self.cumulative.get(key, 0) for key in keys}}
-        for name, counters in (('window', self.window), ('cumulative', self.cumulative)):
-            metrics[name].update({k: round(v, 3) for k, v in counters.items() if k.endswith('_ms')})
-        metrics['done_per_hour'] = round(self.window.get('done', 0) * 3600 / elapsed, 3) if elapsed > 0 else 0
-        worker_logger.info('ipwork throughput metrics=%s', json.dumps(metrics, sort_keys=True))
+        metrics = self.collector.snapshot(elapsed, now - self.started)
+        metrics.update({'window_seconds': round(elapsed, 3),
+                'elapsed_seconds': round(now - self.started, 3), 'in_flight': in_flight,
+                'identity': self.identity, 'config': self.config})
+        metrics['loop']['oldest_task_seconds'] = round(oldest_task_seconds, 3)
+        metrics['loop']['preparation_seconds'] = round(preparation_seconds, 3)
+        metrics['done_per_hour'] = round(metrics['window']['done'] * 3600 / elapsed, 3) if elapsed > 0 else 0
+        metrics['productive_per_hour'] = round(metrics['window']['productive_completed'] * 3600 / elapsed, 3) if elapsed > 0 else 0
+        # Keep each console record small; a fully populated pair of histograms
+        # can exceed log transport line limits. Main record retains quantiles,
+        # counts and sums; full bucket arrays get fixed-label phase records.
+        for timing in sorted(set(metrics['histograms']['window']) | set(metrics['histograms']['cumulative'])):
+            if timing == 'retry_depth':
+                continue
+            detail = {'identity': self.identity, 'timing': timing,
+                      'window_seconds': metrics['window_seconds'],
+                      'elapsed_seconds': metrics['elapsed_seconds']}
+            for period in ('window', 'cumulative'):
+                histogram = metrics['histograms'][period].get(timing)
+                if histogram is not None:
+                    detail[period] = dict(histogram)
+                    histogram.pop('bucket_counts', None)
+                    histogram.pop('bucket_upper_bounds', None)
+            worker_logger.info('ipwork latency histogram metrics=%s', json.dumps(detail, sort_keys=True, separators=(',', ':')))
+        worker_logger.info('ipwork throughput metrics=%s', json.dumps(metrics, sort_keys=True, separators=(',', ':')))
         _log_ipwork_memory_sample(in_flight)
-        self.window.clear()
         self.last_logged = now
 
 
@@ -13568,7 +13679,41 @@ def run_ipworker() -> None:
     batch_received_at = None
     in_flight = {}  # future -> message
     task_started = {}
+    task_receipts = {}  # bounded by executor slots, monotonic timestamps only
     throughput = _IpworkThroughputWindow()
+    collector = throughput.collector
+    wave_started = None
+    wave_receipt_at = None
+
+    def process_measured(message, received_at):
+        started = time.monotonic()
+        collector.observe('receipt_to_start', max(0, started - received_at) * 1000)
+        collector.state(active_delta=1)
+        previous = getattr(_ipwork_metrics_context, 'collector', None)
+        _ipwork_metrics_context.collector = collector
+        try:
+            return _process_ipwork_message(message)
+        finally:
+            collector.observe('task', (time.monotonic() - started) * 1000)
+            collector.state(active_delta=-1)
+            _ipwork_metrics_context.collector = previous
+
+    def prepare_measured(messages, cancelled):
+        started = time.monotonic()
+        try:
+            return _prepare_ipwork_face_indexes(messages, cancelled)
+        finally:
+            collector.observe('preparation', (time.monotonic() - started) * 1000)
+
+    def oldest_task_seconds():
+        return max(0, time.monotonic() - min(task_started.values())) if task_started else 0
+
+    def close_wave_if_drained():
+        nonlocal wave_started
+        if wave_started is not None and not (in_flight or ready or preparing is not None):
+            collector.observe('wave', (time.monotonic() - wave_started) * 1000)
+            wave_started = None
+
     # Files successfully processed per user since that user's last index
     # rebuild trigger. Drives the "every IPWORKER_INDEX_REBUILD_MILESTONE
     # files, plus once at full drain" rebuild cadence (see _trigger_tools_
@@ -13580,7 +13725,9 @@ def run_ipworker() -> None:
     try:
         while True:
             try:
-                throughput.log(len(in_flight))
+                close_wave_if_drained()
+                throughput.log(len(in_flight), oldest_task_seconds=oldest_task_seconds(),
+                               preparation_seconds=max(0, time.monotonic() - batch_received_at) if preparing is not None else 0)
                 if shutdown_requested.is_set() and shutdown_deadline is None:
                     shutdown_deadline = time.monotonic() + IPWORKER_SHUTDOWN_GRACE_SECONDS
                     worker_logger.info(
@@ -13591,7 +13738,9 @@ def run_ipworker() -> None:
                     # only already-running photo work is drained normally.
                     if ready:
                         worker_logger.info('ipwork face batch deferred messages=%d reason=shutdown', len(ready))
+                        throughput.record('defer_shutdown', count=len(ready))
                     ready.clear()
+                    collector.state(ready=0)
 
                 if preparing is not None and preparing.done():
                     preparation_succeeded = True
@@ -13608,8 +13757,11 @@ def run_ipworker() -> None:
                     elif preparation_messages:
                         worker_logger.info('ipwork face batch deferred messages=%d reason=%s', len(preparation_messages),
                                            'shutdown' if shutdown_requested.is_set() else 'preparation_failed')
+                        throughput.record('defer_shutdown' if shutdown_requested.is_set() else 'defer_preparation_failed',
+                                          count=len(preparation_messages))
                     preparation_messages = []
                     preparing = None
+                    collector.state(preparing=0, ready=len(ready))
 
                 # Threads cannot be safely killed or replaced while they may
                 # still mutate storage. Recycle the PROCESS on a hard overrun,
@@ -13621,6 +13773,8 @@ def run_ipworker() -> None:
                 stuck_tasks = sum(not future.done() and now - started >= task_limit
                                   for future, started in task_started.items())
                 if stuck_preparation or stuck_tasks:
+                    throughput.record('watchdog_preparation', count=int(stuck_preparation))
+                    throughput.record('watchdog_tasks', count=stuck_tasks)
                     worker_logger.critical('ipwork watchdog timeout preparation=%s stuck_tasks=%d in_flight=%d ready=%d; exiting for safe redelivery',
                                            stuck_preparation, stuck_tasks, len(in_flight), len(ready))
                     try:
@@ -13635,14 +13789,18 @@ def run_ipworker() -> None:
                 if preparation_executor is not None and not shutdown_requested.is_set():
                     while ready and len(in_flight) < IPWORKER_CONCURRENCY:
                         message = ready.popleft()
+                        collector.state(ready=len(ready))
                         # Do not START work with an old visibility receipt.
                         # Leave at least half the timeout for normal processing.
                         if time.monotonic() - batch_received_at >= IPWORKER_VISIBILITY_TIMEOUT_SECONDS / 2:
                             worker_logger.info('ipwork face batch deferred messages=1 reason=visibility_budget')
+                            throughput.record('defer_visibility_budget')
                             continue
-                        future = executor.submit(_process_ipwork_message, message)
+                        submitted_at = time.monotonic()
+                        future = executor.submit(process_measured, message, wave_receipt_at)
                         in_flight[future] = message
-                        task_started[future] = time.monotonic()
+                        task_started[future] = submitted_at
+                        task_receipts[future] = wave_receipt_at
 
                 # Only fetch as many new messages as there are free worker
                 # slots -- keeps the pool saturated by refilling one slot at
@@ -13657,6 +13815,7 @@ def run_ipworker() -> None:
                 if preparation_executor is not None:
                     free_slots = batch_size if not (in_flight or ready or preparing is not None) and not shutdown_requested.is_set() else 0
                 if free_slots > 0:
+                    close_wave_if_drained()
                     receive_started = time.monotonic()
                     try:
                         messages = list(queue_client.receive_messages(
@@ -13669,9 +13828,19 @@ def run_ipworker() -> None:
                         raise
                     throughput.record('receive', (time.monotonic() - receive_started) * 1000)
                     throughput.record('received', count=len(messages))
+                    received_at = time.monotonic()
+                    for message in messages:
+                        try:
+                            collector.observe('retry_depth', int(getattr(message, 'dequeue_count', 0) or 0))
+                        except (TypeError, ValueError, OverflowError):
+                            pass  # diagnostics never reject a malformed attempt count
+                    if messages and wave_started is None:
+                        wave_started = receive_started
                     if preparation_executor is not None and messages:
                         batch_received_at = receive_started
+                        wave_receipt_at = received_at
                         preparation_messages = messages
+                        collector.state(preparing=len(messages))
                         # A batch scan may consume at most one quarter of the
                         # visibility window (also capped at 120s). Cancellation
                         # is checked while paging/acquiring/publishing. A blocked
@@ -13679,14 +13848,16 @@ def run_ipworker() -> None:
                         # the shutdown grace clock during SIGTERM).
                         prepare_deadline = batch_received_at + min(120, IPWORKER_VISIBILITY_TIMEOUT_SECONDS / 4)
                         preparing = preparation_executor.submit(
-                            _prepare_ipwork_face_indexes, messages,
+                            prepare_measured, messages,
                             lambda: shutdown_requested.is_set() or time.monotonic() >= prepare_deadline,
                         )
                     else:
                         for message in messages:
-                            future = executor.submit(_process_ipwork_message, message)
+                            submitted_at = time.monotonic()
+                            future = executor.submit(process_measured, message, received_at)
                             in_flight[future] = message
-                            task_started[future] = time.monotonic()
+                            task_started[future] = submitted_at
+                            task_receipts[future] = received_at
 
                 if not in_flight and preparing is None and not ready:
                     # Queue fully drained (no in-flight work AND the receive
@@ -13711,6 +13882,7 @@ def run_ipworker() -> None:
                         'exiting now, they will be redelivered after the visibility timeout',
                         len(in_flight) + len(preparation_messages),
                     )
+                    throughput.record('shutdown_grace_exhausted')
                     grace_exhausted = True
                     break
 
@@ -13731,6 +13903,7 @@ def run_ipworker() -> None:
                         continue
                     message = in_flight.pop(future)
                     task_started.pop(future, None)
+                    received_at = task_receipts.pop(future)
                     try:
                         outcome = future.result()
                     except Exception:
@@ -13777,6 +13950,7 @@ def run_ipworker() -> None:
                         worker_logger.exception('Failed to delete ipwork queue message')
                     else:
                         throughput.record('ack', (time.monotonic() - ack_started) * 1000)
+                        collector.observe('receipt_to_ack', (time.monotonic() - received_at) * 1000)
             except Exception:
                 worker_logger.exception('ipwork queue polling iteration failed')
                 if shutdown_requested.is_set():
@@ -13794,7 +13968,10 @@ def run_ipworker() -> None:
         executor.shutdown(wait=not grace_exhausted, cancel_futures=grace_exhausted)
         if preparation_executor is not None:
             preparation_executor.shutdown(wait=not grace_exhausted, cancel_futures=grace_exhausted)
-        throughput.log(len(in_flight), force=True)
+        # Only finished waves enter the histogram; interrupted waves are not
+        # silently represented as successful/complete latency observations.
+        close_wave_if_drained()
+        throughput.log(len(in_flight), force=True, oldest_task_seconds=oldest_task_seconds())
     if grace_exhausted:
         os._exit(exit_code)
 

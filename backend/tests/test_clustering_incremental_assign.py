@@ -556,6 +556,19 @@ def test_batched_normalize_agrees_with_per_entry_reference_including_mixed_dimen
 # cover the worker-side 'people_incremental_assign' dispatch that now does
 # the work _queue_people_clustering_after_face_processing used to do itself.
 
+@pytest.mark.parametrize('stored_ids, ready, expected', [(['accepted-face'], True, 1), ([], True, 0), (['accepted-face'], False, 0)])
+def test_partial_failed_pass_queues_only_persisted_embeddings(monkeypatch, stored_ids, ready, expected):
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'faiss')
+    queued = []
+    monkeypatch.setattr(app, '_enqueue_incremental_assign_job', lambda *args: queued.append(args))
+    app._queue_people_clustering_after_face_processing('lib-A', 'photo.jpg', {
+        'face_status': 'failed', 'faceCount': 1,
+        'processing_metadata': json.dumps({'client_face': {'storedFaceIds': stored_ids, 'embeddingsReady': ready}}),
+    })
+    assert len(queued) == expected
+
+
 def test_incremental_assign_job_matches_awaiting_face_to_existing_person(clustering_tables, monkeypatch):
     face_table, person_table = clustering_tables
     user_id = 'lib-A'

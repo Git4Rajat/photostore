@@ -52,7 +52,7 @@ def test_exceeding_max_retries_skips_dispatch_and_marks_job_failed(metadata_tabl
 
     outcome = app._process_ipwork_message(message)
 
-    assert outcome == 'done'
+    assert outcome == 'retry_exhausted'
     assert dispatch_spy == []  # never reached the real pipeline
     row = metadata_table.get_entity('u1', 'ipwork:u1:f1')
     assert row['status'] == 'failed'
@@ -126,4 +126,4 @@ def test_dispatch_exception_past_max_retries_still_drops(metadata_table, monkeyp
 
     outcome = app._process_ipwork_message(message)
 
-    assert outcome == 'done'
+    assert outcome == 'retry_exhausted'

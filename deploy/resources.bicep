@@ -512,7 +512,7 @@ var backendEnv = [
   { name: 'FACE_CLUSTER_EMBEDDING_VERSION', value: 'browser-adaface-ir101-v1-fixed' }
   { name: 'PEOPLE_CLUSTER_EPS_2PT', value: '0.60' }
   { name: 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', value: '512' }
-  { name: 'SUSPICIOUS_FACE_CONFIDENCE', value: '0.75' }
+  { name: 'SUSPICIOUS_FACE_CONFIDENCE', value: '0.55' }
   // Lowered from 0.55 (2026-08-01): this was a hard reject floor calibrated for
   // the pre-YOLOv8n-face detector, never revisited after the swap. YOLO's own
   // detection threshold is 0.35 (yoloFaceDetectionRuntime.ts) and its real-world

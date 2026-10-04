@@ -135,7 +135,7 @@ def test_reconcile_disabled_when_forced_but_face_failure_stage_set(reconcile_ctx
         'faceFailureDetail': 'ipworker_decode_failed: bad bytes',
     })
 
-    assert calls.force_reconcile_calls == [False]
+    assert calls.force_reconcile_calls == []
     assert metadata.get_entity(user_id, filename)['face_status'] == 'failed'
 
 
@@ -149,7 +149,7 @@ def test_reconcile_disabled_when_forced_but_background_throttled(reconcile_ctx):
         'deferredReason': 'background_throttled',
     })
 
-    assert calls.force_reconcile_calls == [False]
+    assert calls.force_reconcile_calls == []
     assert metadata.get_entity(user_id, filename)['face_status'] == 'pending'
 
 
@@ -163,7 +163,7 @@ def test_reconcile_disabled_when_forced_but_transient_timeout(reconcile_ctx):
         'faceFailureStage': 'timeout',
     })
 
-    assert calls.force_reconcile_calls == [False]
+    assert calls.force_reconcile_calls == []
     assert metadata.get_entity(user_id, filename)['face_status'] == 'pending'
 
 
@@ -177,3 +177,118 @@ def test_reconcile_always_disabled_when_not_forced(reconcile_ctx):
     _apply_face_result(user_id, filename, {'hasData': False, 'faces': [], 'rawFaceCount': 0})
 
     assert calls.force_reconcile_calls == [False]
+
+
+def _valid_face(left=0):
+    return {'bbox': {'left': left, 'top': 0, 'width': 10, 'height': 10},
+            'confidence': 0.9, 'imageWidth': 200, 'imageHeight': 200, 'embedding': [0.1] * 8}
+
+
+@pytest.mark.parametrize('extra,expected_stage', [
+    ({}, 'postprocessing_failed'),
+    ({'filteredReason': 'quality_filter_rejected', 'filteredFaceCount': 2}, 'quality_filter_rejected'),
+    ({'faceFailureStage': 'postprocessing_failed'}, 'postprocessing_failed'),
+])
+def test_detected_empty_failure_preserves_previous_photo_faces(reconcile_ctx, extra, expected_stage):
+    metadata, calls = reconcile_ctx
+    prior_faces = json.dumps([{'bbox': _valid_face()['bbox'], 'personId': 'curated-person'}])
+    _seed_row(metadata, 'lib-A', 'photo.jpg', forced=True, faces=prior_faces, faceCount=1,
+              processing_lease_owner='worker', processing_lease='lease', processing_lease_expires_at='later')
+    _apply_face_result('lib-A', 'photo.jpg', {'faces': [], 'rawFaceCount': 2, 'hasData': False, **extra})
+    row = metadata.get_entity('lib-A', 'photo.jpg')
+    assert row['faces'] == prior_faces
+    assert row['faceCount'] == 1
+    assert row['face_status'] == 'failed'
+    assert row['processing_lease_owner'] == row['processing_lease'] == row['processing_lease_expires_at'] == ''
+    assert calls.force_reconcile_calls == []
+    summary = json.loads(row['processing_metadata'])['client_face']
+    assert summary['faceFailureStage'] == expected_stage
+    assert summary['rawFaceCount'] == 2
+    assert summary['embeddingMissing'] is True
+
+
+@pytest.mark.parametrize('extra', [
+    {'faceFailureStage': 'postprocessing_failed'},
+    {'filteredFaceCount': 1},
+    {'faceDiagnostics': {'failureCount': 1}},
+    {},
+])
+def test_partial_outcome_never_forced_deletes_and_preserves_metadata(reconcile_ctx, extra):
+    metadata, calls = reconcile_ctx
+    previous = [{'bbox': _valid_face()['bbox'], 'personId': 'matched'},
+                {'bbox': _valid_face(100)['bbox'], 'personId': 'absent-curated'}]
+    _seed_row(metadata, 'lib-A', 'photo.jpg', forced=True, faces=json.dumps(previous), faceCount=2)
+    _apply_face_result('lib-A', 'photo.jpg', {'faces': [_valid_face()], 'rawFaceCount': 2, 'hasData': True, **extra})
+    row = metadata.get_entity('lib-A', 'photo.jpg')
+    assert calls.force_reconcile_calls == [False]
+    assert row['face_status'] == 'failed'
+    assert row['faceCount'] == 2
+    assert len(json.loads(row['faces'])) == 2
+    assert json.loads(row['faces'])[1]['personId'] == 'absent-curated'
+
+
+@pytest.mark.parametrize('face', [
+    _valid_face() | {'embedding': None},
+    _valid_face() | {'embedding': [float('nan')]},
+    _valid_face() | {'embedding': [float('inf')]},
+    _valid_face() | {'embedding': [0, 0]},
+    _valid_face() | {'confidence': 0.1},
+])
+def test_backend_rejected_candidates_are_failed_not_zero(reconcile_ctx, face):
+    metadata, calls = reconcile_ctx
+    _seed_row(metadata, 'lib-A', 'photo.jpg', forced=True, faceCount=3, faces='[{"personId":"prior"}]')
+    _apply_face_result('lib-A', 'photo.jpg', {'faces': [face], 'rawFaceCount': 1})
+    row = metadata.get_entity('lib-A', 'photo.jpg')
+    assert calls.force_reconcile_calls == []
+    assert row['face_status'] == 'failed'
+    assert row['faceCount'] == 3
+    assert row['faces'] == '[{"personId":"prior"}]'
+    summary = json.loads(row['processing_metadata'])['client_face']
+    assert summary['faceFailureStage'] == ('quality_filter_rejected' if face['confidence'] == 0.1 else 'postprocessing_failed')
+    assert summary['backendRejectDiagnostic']
+    assert summary['faceDiagnostics']['backendAcceptedCount'] == 0
+
+
+def test_diagnostics_persist_only_bounded_allowlist(reconcile_ctx):
+    metadata, calls = reconcile_ctx
+    _seed_row(metadata, 'lib-A', 'photo.jpg', forced=True)
+    _apply_face_result('lib-A', 'photo.jpg', {
+        'faces': [], 'rawFaceCount': 1,
+        'faceDiagnostics': {
+            'failureCount': 10**100, 'embeddedCount': -10, 'imageWidth': 64,
+            'detectorModelReady': True, 'embeddingModelReady': False,
+            'detectorOutputShape': [1, 5, 8400, 7, 8],
+            'reasonCounts': {'embedding_exception': 2, 'arbitrary-secret': 999},
+            'stageTimingsMs': {'total': 10**20, 'embed': float('nan'), 'decode': 1.23456, 'arbitrary': 2},
+            'vectors': [[1] * 512], 'perFace': ['unbounded'] * 5000,
+        },
+        'debugStages': ['x' * 100] * 100,
+        'faceFailureDetail': 'detail' * 1000,
+    })
+    summary = json.loads(metadata.get_entity('lib-A', 'photo.jpg')['processing_metadata'])['client_face']
+    metrics = summary['faceDiagnostics']
+    assert metrics['failureCount'] == 1000000
+    assert metrics['embeddedCount'] == 0
+    assert metrics['detectorOutputShape'] == [1, 5, 8400, 7]
+    assert metrics['reasonCounts'] == {'embedding_exception': 2}
+    assert metrics['stageTimingsMs'] == {'total': 86400000, 'decode': 1.235}
+    assert 'vectors' not in metrics and 'perFace' not in metrics
+    assert len(summary['faceFailureDetail']) <= 512
+    assert len(summary['debugStages']) == 16
+    assert all(len(v) <= 64 for v in summary['debugStages'])
+
+
+@pytest.mark.parametrize('result', [
+    {'rawFaceCount': 2, 'hasData': False},
+    {'faces': None, 'rawFaceCount': 2},
+    {'faces': [], 'rawFaceCount': 0, 'faceModelReady': False},
+])
+def test_missing_face_list_or_unready_detector_cannot_confirm_zero(reconcile_ctx, result):
+    metadata, calls = reconcile_ctx
+    _seed_row(metadata, 'lib-A', 'photo.jpg', forced=True, faceCount=1, faces='[{"personId":"saved"}]')
+    _apply_face_result('lib-A', 'photo.jpg', result)
+    row = metadata.get_entity('lib-A', 'photo.jpg')
+    assert row['face_status'] == 'failed'
+    assert row['faceCount'] == 1
+    assert row['faces'] == '[{"personId":"saved"}]'
+    assert calls.force_reconcile_calls == []

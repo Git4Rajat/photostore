@@ -6848,6 +6848,56 @@ def _try_get_image_bytes(get_image_bytes: Callable[[], bytes]) -> Optional[bytes
         return None
 
 
+def _bounded_face_count(value, default=0):
+    try:
+        return max(0, min(int(value), 1000000))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _bounded_face_diagnostics(value):
+    """Persist only bounded aggregate metrics, never arbitrary client payloads."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in ('anchorCount', 'scorePassedCount', 'validBoxCount', 'invalidBoxCount',
+                'nmsKeptCount', 'nmsRemovedCount', 'failureCount', 'qualityRejectedCount',
+                'landmarkCount', 'alignedCount', 'embeddedCount', 'imageWidth', 'imageHeight', 'detectorInputSize'):
+        if key in value:
+            result[key] = _bounded_face_count(value[key])
+    for key in ('detectorMaxScore', 'detectorScoreThreshold'):
+        try:
+            score = float(value[key])
+            if np.isfinite(score) and 0 <= score <= 1:
+                result[key] = round(score, 6)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
+    for key in ('detectorModelReady', 'landmarkModelReady', 'embeddingModelReady'):
+        if isinstance(value.get(key), bool):
+            result[key] = value[key]
+    for key in ('detectorOutputShape', 'embeddingOutputShape'):
+        shape = value.get(key)
+        if isinstance(shape, list):
+            result[key] = [_bounded_face_count(v) for v in shape[:4]]
+    reasons = value.get('reasonCounts')
+    if isinstance(reasons, dict):
+        allowed = ('landmark_exception', 'landmark_detection_failed', 'landmark_invalid',
+                   'alignment_exception', 'alignment_transform_rejected',
+                   'embedding_exception', 'embedding_computation_failed', 'invalid_detection_boxes')
+        result['reasonCounts'] = {key: _bounded_face_count(reasons[key]) for key in allowed if key in reasons}
+    timings = value.get('stageTimingsMs')
+    if isinstance(timings, dict):
+        result['stageTimingsMs'] = {}
+        for key in ('decode', 'detect', 'landmarkWait', 'landmark', 'align', 'embed', 'total'):
+            try:
+                number = float(timings[key])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if np.isfinite(number):
+                result['stageTimingsMs'][key] = round(max(0, min(number, 86400000)), 3)
+    return result
+
+
 def _apply_client_processing_results(
     user_id: str,
     filename: str,
@@ -7210,14 +7260,20 @@ def _apply_client_processing_results(
         prior_processing = _safe_json_load(metadata.get('processing_metadata'))
         prior_face_meta = prior_processing.get('face') if isinstance(prior_processing, dict) else None
         face_was_forced = isinstance(prior_face_meta, dict) and bool(prior_face_meta.get('forced'))
+        prior_faces = _safe_json_load(metadata.get('faces'), [])
+        prior_faces = [f for f in prior_faces if isinstance(f, dict)] if isinstance(prior_faces, list) else []
         faces = face_result.get('faces')
         face_count = len(faces) if isinstance(faces, list) else 0
-        try:
-            reported_raw_face_count = max(0, int(face_result.get('rawFaceCount', face_result.get('detectedFaceCount', face_count)) or 0))
-        except Exception:
-            reported_raw_face_count = face_count
+        reported_raw_face_count = _bounded_face_count(
+            face_result.get('rawFaceCount', face_result.get('detectedFaceCount', face_count)), face_count)
+        face_diagnostics = _bounded_face_diagnostics(face_result.get('faceDiagnostics'))
         face_deferred_reason = str(face_result.get('deferredReason') or '').strip().lower()
         face_failure_stage = str(face_result.get('faceFailureStage') or '').strip().lower()
+        if not isinstance(faces, list):
+            faces = []
+            face_failure_stage = face_failure_stage or 'postprocessing_failed'
+        if face_result.get('faceModelReady') is False and not face_failure_stage:
+            face_failure_stage = 'detection_failed'
         face_background_throttled = face_deferred_reason == 'background_throttled' or face_report_background_throttled
         face_model_provenance = _client_model_provenance(face_result)
         faces_with_embeddings = []
@@ -7229,13 +7285,17 @@ def _apply_client_processing_results(
         # ended up empty). Capture *why* the first rejection happened so the next
         # occurrence is diagnosable from stored data instead of a guess.
         face_reject_diagnostic = None
+        backend_quality_rejected = 0
+        backend_invalid = 0
         if isinstance(faces, list):
             for face in faces:
                 if not isinstance(face, dict):
+                    backend_invalid += 1
                     if face_reject_diagnostic is None:
                         face_reject_diagnostic = f'not_a_dict: type={type(face).__name__}'
                     continue
                 if not _client_face_passes_quality_gate(face):
+                    backend_quality_rejected += 1
                     if face_reject_diagnostic is None:
                         bbox = _normalize_face_bbox(face)
                         try:
@@ -7248,7 +7308,9 @@ def _apply_client_processing_results(
                         )
                     continue
                 embedding = face.get('embedding', [])
-                if isinstance(embedding, list) and any(isinstance(v, (int, float)) for v in embedding):
+                if (isinstance(embedding, list) and embedding
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v) for v in embedding)
+                    and any(v != 0 for v in embedding)):
                     face_payload = dict(face)
                     for key in ('model', 'modelVersion', 'modelTaxonomyVersion', 'runtime'):
                         if face_model_provenance.get(key) and not face_payload.get(key):
@@ -7256,13 +7318,35 @@ def _apply_client_processing_results(
                     if face_payload.get('modelTaxonomyVersion') and not face_payload.get('embeddingVersion'):
                         face_payload['embeddingVersion'] = face_payload['modelTaxonomyVersion']
                     faces_with_embeddings.append(face_payload)
-                elif face_reject_diagnostic is None:
-                    is_list = isinstance(embedding, list)
-                    face_reject_diagnostic = (
-                        f'embedding_invalid: type={type(embedding).__name__}_isList={is_list}_'
-                        f'length={len(embedding) if is_list else None}'
-                    )
+                else:
+                    backend_invalid += 1
+                    if face_reject_diagnostic is None:
+                        is_list = isinstance(embedding, list)
+                        face_reject_diagnostic = (
+                            f'embedding_invalid: type={type(embedding).__name__}_isList={is_list}_'
+                            f'length={len(embedding) if is_list else None}'
+                        )
         if isinstance(faces, list):
+            face_diagnostics.update(backendQualityRejectedCount=_bounded_face_count(backend_quality_rejected),
+                                    backendInvalidCount=_bounded_face_count(backend_invalid),
+                                    backendAcceptedCount=_bounded_face_count(len(faces_with_embeddings)))
+            # Detected-but-lost candidates (including quality-only rejections)
+            # are not a genuine zero and are not a complete replacement set.
+            incomplete_candidates = (
+                reported_raw_face_count > len(faces_with_embeddings)
+                or face_count > len(faces_with_embeddings)
+                or _bounded_face_count(face_result.get('filteredFaceCount')) > 0
+                or face_diagnostics.get('failureCount', 0) > 0
+                or face_diagnostics.get('qualityRejectedCount', 0) > 0
+                or bool(face_result.get('filteredReason'))
+            )
+            if incomplete_candidates and not face_failure_stage:
+                quality_only = not backend_invalid and not face_diagnostics.get('failureCount', 0) and (
+                    str(face_result.get('filteredReason') or '') in {
+                        'quality_filter_rejected', 'alignment_transform_rejected', 'invalid_detection_boxes',
+                    } or (backend_quality_rejected > 0 and reported_raw_face_count <= face_count
+                          and not _bounded_face_count(face_result.get('filteredFaceCount'))))
+                face_failure_stage = 'quality_filter_rejected' if quality_only else 'postprocessing_failed'
             # A forced backfill's reconcile step (_store_client_face_entities,
             # force_reconcile=True) deletes any previously-stored face for this
             # photo that this pass didn't re-detect -- correct when detection
@@ -7273,26 +7357,36 @@ def _apply_client_processing_results(
             # shapes). Without this, one bad pass during Tools > Backfill could
             # silently wipe out previously-detected/curated faces for a photo
             # that the detector never actually got to examine this time.
-            detection_genuinely_ran = bool(faces_with_embeddings) or not (
+            detection_genuinely_ran = not (
                 face_background_throttled
-                or face_deferred_reason == 'inference_timeout'
-                or face_failure_stage in _TRANSIENT_FACE_FAILURE_STAGES
+                or face_deferred_reason
                 or face_failure_stage
+                or incomplete_candidates
+                or face_result.get('faceModelReady') is False
             )
+            # Empty failures have nothing to publish and must not acquire a
+            # filename-write lease or enumerate old rows just to preserve them.
             stored_face_ids = _store_client_face_entities(
                 user_id, filename, faces_with_embeddings,
                 force_reconcile=face_was_forced and detection_genuinely_ran,
-            )
+            ) if faces_with_embeddings or detection_genuinely_ran else []
             if stored_face_ids:
                 rotation = int(metadata.get('rotation', 0) or 0) % 360
                 _start_face_crop_warming(user_id, filename, list(stored_face_ids), get_image_bytes, rotation)
             if faces_with_embeddings:
                 faces_for_metadata = [{k: v for k, v in f.items() if k != 'embedding'} for f in faces_with_embeddings]
+                if not detection_genuinely_ran:
+                    matches = _match_faces_by_iou(
+                        [_normalize_face_bbox(f) for f in faces_for_metadata],
+                        [_normalize_face_bbox(f) for f in prior_faces])
+                    for new_idx, old_idx in matches.items():
+                        faces_for_metadata[new_idx] = {**prior_faces[old_idx], **faces_for_metadata[new_idx]}
+                    matched_indices = set(matches.values())
+                    faces_for_metadata.extend(f for i, f in enumerate(prior_faces) if i not in matched_indices)
                 metadata['faces'] = json.dumps(faces_for_metadata, ensure_ascii=False, separators=(',', ':'))
-                status_updates['faceCount'] = len(faces_with_embeddings)
-                status_updates['face_status'] = 'done'
+                status_updates['faceCount'] = max(len(faces_for_metadata), _bounded_face_count(metadata.get('faceCount'))) if not detection_genuinely_ran else len(faces_with_embeddings)
+                status_updates['face_status'] = 'failed' if not detection_genuinely_ran else 'done'
             elif face_background_throttled:
-                status_updates['faceCount'] = 0
                 status_updates['face_status'] = 'pending'
             elif face_deferred_reason == 'inference_timeout' or face_failure_stage in _TRANSIENT_FACE_FAILURE_STAGES:
                 # The detector/embedder model was not ready in time (cold-cache load
@@ -7301,14 +7395,17 @@ def _apply_client_processing_results(
                 # once the models are warm, instead of a hard 'failed' that forces
                 # the user to manually re-run face detection. Mirrors the
                 # background-throttled handling above.
-                status_updates['faceCount'] = 0
                 status_updates['face_status'] = 'pending'
             elif face_failure_stage:
-                status_updates['faceCount'] = 0
+                status_updates['face_status'] = 'failed'
+            elif not detection_genuinely_ran:
                 status_updates['face_status'] = 'failed'
             else:
+                metadata['faces'] = '[]'
                 status_updates['faceCount'] = 0
                 status_updates['face_status'] = 'no_data'
+            if 'faceCount' not in status_updates and 'faceCount' not in metadata:
+                status_updates['faceCount'] = len(prior_faces)
             _merge_processing_metadata(metadata, 'client_face', {
                 'source': origin,
                 'acceptedAt': _utc_now(),
@@ -7320,24 +7417,18 @@ def _apply_client_processing_results(
                 'embeddingMissing': (bool(faces) or reported_raw_face_count > 0) and not bool(faces_with_embeddings),
                 'storedFaceIds': stored_face_ids,
                 'rawFaceCount': reported_raw_face_count,
-                **({'detectedFaceCount': face_result.get('detectedFaceCount')} if face_result.get('detectedFaceCount') is not None else {}),
-                **({'candidateFaceCount': face_result.get('candidateFaceCount')} if face_result.get('candidateFaceCount') is not None else {}),
-                **({'filteredFaceCount': face_result.get('filteredFaceCount')} if face_result.get('filteredFaceCount') is not None else {}),
-                **({'filteredReason': face_result.get('filteredReason')} if face_result.get('filteredReason') is not None else {}),
-                **({'debugStages': face_result.get('debugStages')} if face_result.get('debugStages') is not None else {}),
+                **{key: _bounded_face_count(face_result[key]) for key in ('detectedFaceCount', 'candidateFaceCount', 'filteredFaceCount') if key in face_result},
+                **({'filteredReason': _sanitize_client_text(face_result.get('filteredReason'), 100)} if face_result.get('filteredReason') else {}),
+                **({'faceDiagnostics': face_diagnostics} if face_diagnostics else {}),
+                **({'noDetectionReason': _sanitize_client_text(face_result.get('noDetectionReason'), 100)} if face_result.get('noDetectionReason') else {}),
+                **({'debugStages': [_sanitize_client_text(v, 64) for v in face_result['debugStages'][:16] if isinstance(v, str)]} if isinstance(face_result.get('debugStages'), list) else {}),
                 **({'deferredReason': 'background_throttled'} if face_background_throttled else ({'deferredReason': face_deferred_reason} if face_deferred_reason else {})),
-                **({'faceFailureStage': face_result.get('faceFailureStage')} if face_result.get('faceFailureStage') is not None else {}),
-                **({'faceFailureDetail': face_result.get('faceFailureDetail')} if face_result.get('faceFailureDetail') is not None else {}),
-                **({'backendRejectDiagnostic': face_reject_diagnostic} if (not faces_with_embeddings and faces and face_reject_diagnostic) else {}),
+                **({'faceFailureStage': face_failure_stage[:100]} if face_failure_stage else {}),
+                **({'faceFailureDetail': _sanitize_client_text(face_result.get('faceFailureDetail'), 512)} if face_result.get('faceFailureDetail') is not None else {}),
+                **({'backendRejectDiagnostic': _sanitize_client_text(face_reject_diagnostic, 512)} if face_reject_diagnostic else {}),
                 **_client_source_provenance(face_result),
                 **_client_model_provenance(face_result),
             })
-        elif face_result.get('hasData') is False:
-            status_updates['faceCount'] = 0
-            status_updates['face_status'] = 'pending' if face_background_throttled else 'no_data'
-        else:
-            status_updates['faceCount'] = 0
-            status_updates['face_status'] = 'pending' if face_background_throttled else 'no_data'
     elif face_result is not None:
         status_updates['face_status'] = 'failed'
 
