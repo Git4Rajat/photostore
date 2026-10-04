@@ -141,6 +141,8 @@ from storage_utils import (
     index_prime_in_progress,
     store_explore_summary,
     load_explore_summary,
+    store_timeline_summary,
+    load_timeline_summary,
     delete_user_explore_summary_data,
     get_user_tag_embedding_index,
     delete_user_tag_embedding_index_data,
@@ -8183,6 +8185,21 @@ def refresh_user_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
     }
     store_explore_summary(key, payload)
     return payload
+
+
+def refresh_user_timeline_summary(user_id: str) -> Optional[Dict[str, object]]:
+    """Compute the year/month/day timeline summary and persist it as a small
+    blob. Runs on the `tools` role after an index build (see routes/tools.py)
+    so the 1Gi backend's /photos/timeline never has to load the listing index
+    into memory -- it serves load_timeline_summary instead."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    with perf_instrumentation.span('timeline.refresh', user=key):
+        rows = _cached_metadata_list_rows_for_user(key, purpose='photos.timeline.build')
+        summary = build_timeline_summary(rows)
+    store_timeline_summary(key, summary)
+    return summary
 
 
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))

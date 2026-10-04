@@ -627,12 +627,17 @@ def photos_timeline():
     user_id, error = app._require_user_id()
     if error:
         return error
-    try:
-        metadata_rows = app._cached_metadata_list_rows_for_user(user_id, purpose='photos.timeline', allow_sync_build=False)
-    except Exception as exc:
-        app.app.logger.exception('Timeline metadata read failed')
-        return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
-    return app.jsonify(app.build_timeline_summary(metadata_rows))
+    # Serve the PRECOMPUTED summary (built on tools after each index build, see
+    # refresh_user_timeline_summary) -- never load the listing index into this
+    # process. Cold account: empty timeline now, nudge tools to build it.
+    summary = storage_utils.load_timeline_summary(user_id)
+    if summary is None:
+        try:
+            app._trigger_tools_index_rebuild(user_id)
+        except Exception:
+            pass
+        return app.jsonify(app.build_timeline_summary([]))
+    return app.jsonify(summary)
 
 @photos_bp.route('/photos/search', methods=['GET'])
 @photos_bp.route('/photos/search/', methods=['GET'])

@@ -130,6 +130,10 @@ def _index_build_progress_callback(user_id: str):
                 app.refresh_user_explore_summary(user_id)
             except Exception:
                 app.app.logger.exception('Explore summary refresh failed for %s', user_id)
+            try:
+                app.refresh_user_timeline_summary(user_id)
+            except Exception:
+                app.app.logger.exception('Timeline summary refresh failed for %s', user_id)
     return _cb
 
 

@@ -3435,6 +3435,12 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     # The Explore summary is derived from the lexical index, so it's cleaned
     # on the same purge (defined below; safe to call regardless of order).
     delete_user_explore_summary_data(key)
+    _tl = _timeline_summary_blob_client(key)
+    if _tl is not None:
+        try:
+            _tl.delete_blob()
+        except Exception:
+            pass
     invalidate_user_lexical_index_cache(key)
     invalidate_user_listing_index_cache(key)
 
@@ -6042,6 +6048,46 @@ def load_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
         return None
     try:
         parsed = json.loads(payload.decode('utf-8'))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+# --- Precomputed timeline summary --------------------------------------------
+# /photos/timeline only needs per-day counts, but it used to get them by loading
+# the whole listing index (every photo row) into the 1Gi backend -- at ~130k
+# photos that is the largest single allocation on a gallery load. The tools role
+# computes the tiny summary right after it rebuilds the indexes (same pattern as
+# the Explore summary above) and the backend just serves this blob.
+def _timeline_summary_blob_client(user_id: str):
+    container_name = _lexical_index_container_name()
+    if not container_name:
+        return None
+    return _get_blob_client(container_name, f'{_vector_index_blob_key(user_id)}-timeline.json')
+
+
+def store_timeline_summary(user_id: str, payload: Dict[str, object]) -> None:
+    key = str(user_id or '').strip()
+    client = _timeline_summary_blob_client(key) if key else None
+    if client is None:
+        return
+    try:
+        client.upload_blob(
+            json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+            overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json'),
+        )
+    except Exception:
+        _LOGGER.exception('Failed to store timeline summary for user %s', key)
+
+
+def load_timeline_summary(user_id: str) -> Optional[Dict[str, object]]:
+    key = str(user_id or '').strip()
+    client = _timeline_summary_blob_client(key) if key else None
+    if client is None:
+        return None
+    try:
+        parsed = json.loads(client.download_blob().readall().decode('utf-8'))
         return parsed if isinstance(parsed, dict) else None
     except Exception:
         return None

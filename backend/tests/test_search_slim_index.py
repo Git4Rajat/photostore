@@ -119,3 +119,33 @@ def test_disk_cache_disabled_by_default(monkeypatch):
     storage_utils._download_with_disk_cache('sort', 'lib', blob)
     storage_utils._download_with_disk_cache('sort', 'lib', blob)
     assert blob.downloads == 2
+
+
+def test_timeline_route_serves_precomputed_blob_without_touching_listing_index(monkeypatch):
+    from routes.photos import photos_timeline
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_cached_metadata_list_rows_for_user',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('must not load listing rows')))
+    monkeypatch.setattr(storage_utils, 'load_timeline_summary', lambda uid: {'totalCount': 7, 'years': {}})
+    with app.app.test_request_context('/api/photos/timeline'):
+        assert photos_timeline().get_json()['totalCount'] == 7
+
+
+def test_timeline_route_cold_returns_empty_and_nudges_tools(monkeypatch):
+    from routes.photos import photos_timeline
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(storage_utils, 'load_timeline_summary', lambda uid: None)
+    nudged = []
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: nudged.append(uid))
+    with app.app.test_request_context('/api/photos/timeline'):
+        body = photos_timeline().get_json()
+    assert body['totalCount'] == 0 and nudged == ['owner']
+
+
+def test_refresh_timeline_summary_stores_blob(ctx, monkeypatch):
+    table, _ = ctx
+    table.upsert_entity({**_big_row(), 'processing_complete': True, 'uploadDate': '2020-01-01T00:00:00+00:00'})
+    monkeypatch.setattr(app, '_cached_metadata_list_rows_for_user',
+                        lambda uid, purpose, **k: [{'RowKey': 'a.jpg', 'uploadDate': '2020-01-01T00:00:00+00:00'}])
+    app.refresh_user_timeline_summary('lib')
+    assert storage_utils.load_timeline_summary('lib')['totalCount'] == 1
