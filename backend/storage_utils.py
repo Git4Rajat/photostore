@@ -1646,6 +1646,147 @@ def _warm_face_crops_for_photo(
             continue
 
 
+# --- Index files on the shared Azure Files volume -----------------------------
+# INDEX_DISK_CACHE_DIR points at the mounted share (backend/tools/...). Every
+# index blob (lexical, listing, slim search, sort, access, albums, people,
+# vector, people/tag embeddings, explore, timeline) lives in one of four index
+# containers, all of which are handed out by _get_blob_client -- so wrapping
+# the client there covers every index kind at once:
+#   * write-through: each upload also lands on the share (tools builds -> every
+#     replica/role sees the file immediately);
+#   * read-through: a download is served from the share when its ETag sidecar
+#     matches the blob's current ETag (one tiny get_blob_properties), else it
+#     downloads once and fills the share;
+#   * warm_index_file(): streams a blob to the share without holding it in
+#     memory (used at session start).
+# Small blobs (manifests) bypass it: they must always be read fresh. Blob
+# storage stays the source of truth; every share failure falls back to it.
+INDEX_DISK_CACHE_DIR = os.getenv('INDEX_DISK_CACHE_DIR', '').strip()
+INDEX_DISK_CACHE_MIN_BYTES = int(os.getenv('INDEX_DISK_CACHE_MIN_BYTES', '65536'))
+
+
+def _index_container_names() -> Set[str]:
+    return {
+        _lexical_index_container_name(), _vector_index_container_name(),
+        _people_embedding_index_container_name(), _tag_embedding_index_container_name(),
+    } - {''}
+
+
+class _Bytes:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def readall(self) -> bytes:
+        return self._data
+
+
+class _ShareBackedBlob:
+    def __init__(self, inner, container: str, blob: str) -> None:
+        self._inner = inner
+        safe = lambda v: re.sub(r'[^A-Za-z0-9._-]', '_', v)
+        self._path = os.path.join(INDEX_DISK_CACHE_DIR, safe(container), safe(blob))
+        self._kind = f'{container}/{blob}'
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def _write(self, data: bytes, etag: Optional[str]) -> None:
+        try:
+            if not etag or len(data) < INDEX_DISK_CACHE_MIN_BYTES:
+                self._forget()
+                return
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            tag = f'.{os.getpid()}.{threading.get_ident()}.tmp'
+            with open(self._path + tag, 'wb') as fh:
+                fh.write(data)
+            os.replace(self._path + tag, self._path)
+            with open(self._path + '.etag' + tag, 'w') as fh:
+                fh.write(etag)
+            os.replace(self._path + '.etag' + tag, self._path + '.etag')
+            perf_instrumentation.log_event('index_share_store', blob=self._kind, mb=round(len(data) / 1048576, 1))
+        except OSError:
+            _LOGGER.warning('Index share write failed for %s', self._path, exc_info=True)
+
+    def _forget(self) -> None:
+        for suffix in ('', '.etag'):
+            try:
+                os.remove(self._path + suffix)
+            except OSError:
+                pass
+
+    def _cached_bytes(self) -> Optional[bytes]:
+        try:
+            with open(self._path + '.etag') as fh:
+                cached = fh.read().strip()
+            if not cached or str(self._inner.get_blob_properties().etag or '') != cached:
+                return None
+            with open(self._path, 'rb') as fh:
+                return fh.read()
+        except Exception:
+            return None
+
+    def upload_blob(self, data, *args, **kwargs):
+        result = self._inner.upload_blob(data, *args, **kwargs)
+        if isinstance(data, (bytes, bytearray)):
+            etag = result.get('etag') if isinstance(result, dict) else getattr(result, 'etag', None)
+            self._write(bytes(data), str(etag) if etag else None)
+        else:
+            self._forget()
+        return result
+
+    def download_blob(self, *args, **kwargs):
+        if args or kwargs:
+            return self._inner.download_blob(*args, **kwargs)
+        with perf_instrumentation.span('index.share.read', blob=self._kind):
+            cached = self._cached_bytes()
+        if cached is not None:
+            perf_instrumentation.log_event('index_share_hit', blob=self._kind, mb=round(len(cached) / 1048576, 1))
+            return _Bytes(cached)
+        downloader = self._inner.download_blob()
+        payload = downloader.readall()
+        etag = getattr(getattr(downloader, 'properties', None), 'etag', None)
+        self._write(payload, str(etag) if etag else None)
+        return _Bytes(payload)
+
+    def delete_blob(self, *args, **kwargs):
+        self._forget()
+        return self._inner.delete_blob(*args, **kwargs)
+
+    def warm(self) -> str:
+        """Ensure the share holds the blob's current version, streaming to disk
+        (never the whole blob in memory). Returns 'hit' | 'filled' | 'skipped'."""
+        try:
+            etag = str(self._inner.get_blob_properties().etag or '')
+        except Exception:
+            return 'skipped'
+        try:
+            with open(self._path + '.etag') as fh:
+                if etag and fh.read().strip() == etag:
+                    return 'hit'
+        except OSError:
+            pass
+        try:
+            size = int(self._inner.get_blob_properties().size or 0)
+            if size < INDEX_DISK_CACHE_MIN_BYTES:
+                return 'skipped'
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            tmp = f'{self._path}.{os.getpid()}.{threading.get_ident()}.warm'
+            downloader = self._inner.download_blob()
+            with open(tmp, 'wb') as fh:
+                downloader.readinto(fh)
+            got = str(getattr(getattr(downloader, 'properties', None), 'etag', '') or '')
+            if not got:
+                os.remove(tmp)
+                return 'skipped'
+            os.replace(tmp, self._path)
+            with open(self._path + '.etag', 'w') as fh:
+                fh.write(got)
+            return 'filled'
+        except Exception:
+            _LOGGER.warning('Index share warm failed for %s', self._kind, exc_info=True)
+            return 'skipped'
+
+
 def _get_blob_client(container_name: str, filename: str):
     blob_service_client = _CTX.get('blob_service_client')
     if not blob_service_client or not container_name:
@@ -1653,9 +1794,78 @@ def _get_blob_client(container_name: str, filename: str):
     if not hasattr(blob_service_client, 'get_blob_client'):
         return None
     try:
-        return blob_service_client.get_blob_client(container=container_name, blob=filename)
+        client = blob_service_client.get_blob_client(container=container_name, blob=filename)
     except Exception:
         return None
+    if INDEX_DISK_CACHE_DIR and container_name in _index_container_names():
+        return _ShareBackedBlob(client, container_name, filename)
+    return client
+
+
+def _user_index_blob_locations(user_id: str) -> List[Tuple[str, str]]:
+    key = str(user_id or '').strip()
+    lexical = _lexical_index_container_name()
+    return [
+        (lexical, _sort_index_json_blob_name(key)),
+        (lexical, _search_index_json_blob_name(key)),
+        (lexical, _listing_index_json_blob_name(key)),
+        (lexical, _access_index_json_blob_name(key)),
+        (lexical, _albums_index_json_blob_name(key)),
+        (lexical, _people_index_json_blob_name(key)),
+        (lexical, _lexical_index_json_blob_name(key)),
+        (_vector_index_container_name(), _vector_index_npz_blob_name(key)),
+        (_people_embedding_index_container_name(), _people_embedding_index_npz_blob_name(key)),
+        (_tag_embedding_index_container_name(), _tag_embedding_index_npz_blob_name(key)),
+    ]
+
+
+_WARM_LOCK = threading.Lock()
+_WARM_LAST: Dict[str, float] = {}
+INDEX_WARM_COOLDOWN_SECONDS = float(os.getenv('INDEX_WARM_COOLDOWN_SECONDS', '300'))
+
+
+def warm_user_index_files(user_id: str) -> Dict[str, str]:
+    """Make sure the shared volume holds the current version of every index
+    blob for this user (streamed to disk, nothing held in memory). Called in the
+    background at session start so later loads -- on any replica or role -- read
+    local disk instead of Blob Storage. No-op without INDEX_DISK_CACHE_DIR."""
+    key = str(user_id or '').strip()
+    if not key or not INDEX_DISK_CACHE_DIR:
+        return {}
+    results: Dict[str, str] = {}
+    with perf_instrumentation.span('index.share.warm', user=key):
+        for container, blob in _user_index_blob_locations(key):
+            client = _get_blob_client(container, blob)
+            if isinstance(client, _ShareBackedBlob):
+                results[f'{container}/{blob}'] = client.warm()
+    perf_instrumentation.log_event(
+        'index_share_warm', user=key,
+        filled=sum(v == 'filled' for v in results.values()), hit=sum(v == 'hit' for v in results.values()),
+        skipped=sum(v == 'skipped' for v in results.values()),
+    )
+    return results
+
+
+def warm_user_index_files_async(user_id: str) -> bool:
+    """Single-flight, cooled-down background warm. True if one was started."""
+    key = str(user_id or '').strip()
+    if not key or not INDEX_DISK_CACHE_DIR:
+        return False
+    now = time.monotonic()
+    with _WARM_LOCK:
+        last = _WARM_LAST.get(key)
+        if last is not None and now - last < INDEX_WARM_COOLDOWN_SECONDS:
+            return False
+        _WARM_LAST[key] = now
+
+    def _run() -> None:
+        try:
+            warm_user_index_files(key)
+        except Exception:
+            _LOGGER.exception('Index share warm failed for user %s', key)
+
+    threading.Thread(target=_run, name='index-share-warm', daemon=True).start()
+    return True
 
 
 def upload_file_to_blob(container_name: str, filename: str, content: Union[bytes, BinaryIO], content_type: str) -> None:
@@ -3060,57 +3270,6 @@ def invalidate_user_listing_index_cache(user_id: str) -> None:
         _LISTING_INDEX_CACHE.pop(key, None)
 
 
-# Optional on-disk cache for index blobs (INDEX_DISK_CACHE_DIR, e.g. the shared
-# Azure Files volume mounted on backend/tools). Keyed by blob ETag, so a hit
-# costs one cheap get_blob_properties instead of re-downloading hundreds of MB
-# after every replica restart/scale-out. Every failure falls through to a
-# normal download; writes are atomic (tmp + os.replace) since replicas share it.
-INDEX_DISK_CACHE_DIR = os.getenv('INDEX_DISK_CACHE_DIR', '').strip()
-
-
-def _disk_cache_path(kind: str, user_id: str) -> Optional[str]:
-    if not INDEX_DISK_CACHE_DIR:
-        return None
-    safe = re.sub(r'[^A-Za-z0-9._-]', '_', str(user_id))
-    return os.path.join(INDEX_DISK_CACHE_DIR, f'{safe}-{kind}.json.gz')
-
-
-def _download_with_disk_cache(kind: str, user_id: str, blob_client) -> bytes:
-    path = _disk_cache_path(kind, user_id)
-    etag = None
-    if path:
-        try:
-            etag = str(blob_client.get_blob_properties().etag or '')
-        except Exception:
-            etag = None
-        if etag:
-            try:
-                with open(path + '.etag') as fh:
-                    cached_etag = fh.read().strip()
-                if cached_etag == etag:
-                    with open(path, 'rb') as fh:
-                        data = fh.read()
-                    perf_instrumentation.log_event('index_disk_cache_hit', kind=kind, user=user_id, mb=round(len(data) / 1048576, 1))
-                    return data
-            except OSError:
-                pass
-    payload = blob_client.download_blob().readall()
-    if path and etag:
-        try:
-            os.makedirs(INDEX_DISK_CACHE_DIR, exist_ok=True)
-            tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
-            with open(tmp, 'wb') as fh:
-                fh.write(payload)
-            os.replace(tmp, path)
-            with open(tmp, 'w') as fh:
-                fh.write(etag)
-            os.replace(tmp, path + '.etag')
-            perf_instrumentation.log_event('index_disk_cache_store', kind=kind, user=user_id, mb=round(len(payload) / 1048576, 1))
-        except OSError:
-            _LOGGER.warning('Index disk cache write failed for %s', path, exc_info=True)
-    return payload
-
-
 def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['LexicalIndexSnapshot']:
     """Shared, instrumented loader for the gzip+JSON index blobs (lexical,
     listing, sort). Separate spans for download / gunzip / json-parse so the
@@ -3119,7 +3278,7 @@ def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['
         return None
     try:
         with perf_instrumentation.span(f'index.{kind}.download', user=user_id):
-            payload = _download_with_disk_cache(kind, user_id, blob_client)
+            payload = blob_client.download_blob().readall()
     except Exception:
         return None
     try:

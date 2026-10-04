@@ -142,6 +142,7 @@ from storage_utils import (
     store_explore_summary,
     load_explore_summary,
     store_timeline_summary,
+    warm_user_index_files_async,
     ensure_user_search_slim_index as storage_utils_ensure_slim,
     load_timeline_summary,
     delete_user_explore_summary_data,

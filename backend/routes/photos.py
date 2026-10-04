@@ -971,7 +971,13 @@ def photos_index_status():
     if error:
         return error
     indexes = app.get_user_index_readiness(user_id)
-    return app.jsonify({'ready': all(indexes.values()), 'indexes': indexes})
+    ready = all(indexes.values())
+    if ready:
+        # Session start: fill the shared volume with every index's current
+        # version in the background (single-flight, cooled down) so this
+        # session's loads -- on any replica/role -- come off local disk.
+        app.warm_user_index_files_async(user_id)
+    return app.jsonify({'ready': ready, 'indexes': indexes})
 
 @photos_bp.route('/photos/metadata', methods=['POST'])
 @photos_bp.route('/photos/metadata/', methods=['POST'])

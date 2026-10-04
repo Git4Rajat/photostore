@@ -1078,6 +1078,9 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'extras'
           image: backendImage
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+          ]
           // 2026-09-21: halved from 1.0vCPU/2Gi based on real forenkla-qa
           // platform metrics (max 40% CPU / 13% memory over the one 3-day
           // window with real activity). The library_export executor.map()
@@ -1093,6 +1096,7 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'extras' }
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
@@ -1101,6 +1105,9 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
           ])
         }
+      ]
+      volumes: [
+        { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
         minReplicas: 0
@@ -1118,6 +1125,10 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
       }
     }
   }
+  // storageName is a literal, so explicitly wait for the SMB registration.
+  dependsOn: [
+    workerCheckpointStorage
+  ]
 }
 
 // 2026-09-15: second service split -- upload (init/finalize/processing-lease/
@@ -1319,6 +1330,9 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'APP_ROLE', value: 'worker' }
             { name: 'PEOPLE_FAISS_WORK_DIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }
+            // Same share the backend/tools mount at /mnt/photostore/shared -- worker builds the
+            // vector/people-embedding indexes, so write-through here feeds every other role.
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/faiss-checkpoints/index-cache' }
             { name: 'TMPDIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
             // Opt-in microbatching (2026-10-02): adjacent same-library
