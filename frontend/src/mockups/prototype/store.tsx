@@ -7,6 +7,7 @@ import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/
 import { getLocalPeopleIndex, invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
+import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/gridCapacity';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
@@ -31,7 +32,9 @@ import type {
 // ---- backend <-> prototype photo mapping -------------------------------------
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const PAGE_SIZE = 100;
+const PAGE_SIZE = 100; // legacy /photos fallback page size
+// lookup-batch accepts <=200 filenames; enrich in parallel chunks of this size.
+const ENRICH_CHUNK = 100;
 
 // The sort/albums/people local indexes all report "unavailable" immediately
 // on a cold account instead of blocking (their backend routes kick a
@@ -504,38 +507,50 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
             });
             const total = sorted.length;
-            const pageRows = sorted.slice(offset, offset + PAGE_SIZE);
+            // With the media token, thumbnails cost no backend calls, so load as
+            // many tiles as the screen needs (a few viewports' worth) per step.
+            const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
+            const pageRows = sorted.slice(offset, offset + pageSize);
             const pageFilenames = pageRows.map((row) => row.filename);
             photoOffsetRef.current = offset + pageFilenames.length;
             photoHasMoreRef.current = offset + pageFilenames.length < total;
             setHasMorePhotos(photoHasMoreRef.current);
             setTotalPhotos(total);
-            // 1) Backend-free paint. Only possible with a media token; without
-            //    one we wait for lookup-batch exactly as before.
             if (token && pageRows.length) {
+                // 1) Backend-free paint of the whole window.
                 const provisional = pageRows.map((row) => provisionalPhoto(row, token));
                 setPhotos((prev) => (reset ? provisional : [...prev, ...provisional]));
-            }
-            // 2) Enrich in the background with full metadata. directMedia asks
-            //    the backend to skip signing a URL per photo (we build them).
-            const lookupRes = pageFilenames.length
-                ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames, ...(token ? { directMedia: true } : {}) })
-                : { photos: [] };
-            const byFilename = new Map((lookupRes?.photos ?? []).map((p) => [p.filename, p]));
-            // lookup-batch may silently drop a filename deleted between the
-            // index build and this page fetch -- don't assume a 1:1 response.
-            const enriched = new Map<string, Photo>();
-            for (const f of pageFilenames) {
-                const b = byFilename.get(f);
-                if (b) enriched.set(f, mapPhoto(b, token));
-            }
-            if (token) {
-                const pageSet = new Set(pageFilenames);
-                setPhotos((prev) => prev
-                    .filter((p) => !pageSet.has(p.id) || enriched.has(p.id))
-                    .map((p) => enriched.get(p.id) ?? p));
+                // 2) Enrich with full metadata in parallel chunks (first chunk =
+                //    the top of the window, which is what's on screen). directMedia
+                //    skips URL signing; each chunk lands as soon as it returns.
+                await Promise.all(chunk(pageFilenames, ENRICH_CHUNK).map(async (names) => {
+                    // A failed chunk is non-fatal: its tiles are already on screen
+                    // from the sort index; they just keep the provisional metadata.
+                    const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: true })
+                        .catch(() => null);
+                    if (!res) return;
+                    const byFilename = new Map((res?.photos ?? []).map((p) => [p.filename, p]));
+                    const enriched = new Map<string, Photo>();
+                    for (const f of names) {
+                        const b = byFilename.get(f);
+                        if (b) enriched.set(f, mapPhoto(b, token));
+                    }
+                    const nameSet = new Set(names);
+                    // lookup-batch may drop a filename deleted since the index build.
+                    setPhotos((prev) => prev
+                        .filter((p) => !nameSet.has(p.id) || enriched.has(p.id))
+                        .map((p) => enriched.get(p.id) ?? p));
+                }));
             } else {
-                const list = pageFilenames.map((f) => enriched.get(f)).filter((p): p is Photo => Boolean(p));
+                // No token (proxy mode): same as before -- wait for lookup-batch.
+                const lookupRes = pageFilenames.length
+                    ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames })
+                    : { photos: [] };
+                const byFilename = new Map((lookupRes?.photos ?? []).map((p) => [p.filename, p]));
+                const list = pageFilenames
+                    .map((f) => byFilename.get(f))
+                    .filter((p): p is BackendPhoto => Boolean(p))
+                    .map((p) => mapPhoto(p, null));
                 setPhotos((prev) => (reset ? list : [...prev, ...list]));
             }
         } catch {
