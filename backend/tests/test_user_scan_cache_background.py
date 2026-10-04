@@ -76,24 +76,3 @@ def test_get_or_kick_background_dedupes_concurrent_kicks():
         time.sleep(0.05)
 
     assert len(calls) == 1
-
-
-def test_cached_metadata_list_rows_for_user_non_blocking_on_cold_account(monkeypatch):
-    monkeypatch.setattr(app, 'get_user_listing_index', lambda user_id, allow_refresh=True: None)
-    fresh_cache = app._UserScanCache(app.METADATA_SCAN_CACHE_TTL_SECONDS)
-    monkeypatch.setattr(app, '_metadata_list_scan_cache', fresh_cache)
-
-    entered = threading.Event()
-    release = threading.Event()
-
-    def fake_query(user_id, select=None, purpose='metadata'):
-        entered.set()
-        release.wait(timeout=5)
-        return [{'RowKey': 'z'}]
-
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', fake_query)
-
-    rows = app._cached_metadata_list_rows_for_user('user-4', purpose='photos.timeline', allow_sync_build=False)
-    assert rows == []
-    assert entered.wait(timeout=5), 'expected the scan to be kicked off in the background'
-    release.set()

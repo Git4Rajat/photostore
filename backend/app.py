@@ -143,6 +143,8 @@ from storage_utils import (
     load_explore_summary,
     store_timeline_summary,
     warm_user_index_files_async,
+    lookup_access_entries,
+    access_index_is_dirty,
     iter_library_rows,
     stream_library_artifacts,
     ListingSink,
@@ -1866,6 +1868,36 @@ def _parse_capture_range_args() -> Tuple[Optional[datetime], Optional[datetime]]
     )
 
 
+def _get_metadata_entities(user_id: str, filenames: List[str], workers: int = 8) -> Dict[str, Optional[Dict]]:
+    """Fresh full metadata rows for one page of filenames, point-read in
+    parallel. The library-sized queries (search, list, filter) run against the
+    local SQLite database and only ever need this for the page they return."""
+    names = list(dict.fromkeys(filenames))
+    if not names:
+        return {}
+    if len(names) == 1:
+        return {names[0]: _get_metadata_entity(user_id, names[0])}
+    with ThreadPoolExecutor(max_workers=min(workers, len(names))) as executor:
+        return dict(zip(names, executor.map(lambda name: _get_metadata_entity(user_id, name), names)))
+
+
+def _open_library_db(user_id: str):
+    """The library's SQLite read model on this replica's ephemeral disk, or None
+    when no current one exists yet (then tools is asked to build it)."""
+    import search_db
+    db = search_db.open_database(user_id)
+    if db is None:
+        try:
+            _trigger_tools_index_rebuild(user_id)
+        except Exception:
+            pass
+    return db
+
+
+def _day_ordinal(value: Optional[datetime]) -> Optional[int]:
+    return value.date().toordinal() if value else None
+
+
 def _build_photo_summaries_page(
     user_id: str,
     filename_row_pairs: List[Tuple[str, Dict]],
@@ -1993,23 +2025,27 @@ def _album_access_code_gate(entity: Dict, token: str, provided: str):
 def _album_cover_thumbnail_url(user_id: str, filenames: List[str]) -> str:
     """Picks the album's cover: the highest-rated (then most-liked) photo it
     contains, so an album with any curated favorites shows one instead of a
-    blank placeholder. Reuses the same rating/likes-sorted, per-user cached
-    scan _cached_sorted_metadata_rows_for_user already maintains for
-    /photos/filter's pagination -- filtering that cached list to this album's
-    filenames costs no extra table reads."""
+    blank placeholder. The ranking is a SQL lookup over the library's local
+    SQLite database (flat memory, however big the album or the library) and only
+    the few top candidates are point-read to find one with a usable thumbnail."""
     if not filenames:
         return ''
-    name_set = set(filenames)
+    import search_db
     try:
-        rows = _cached_sorted_metadata_rows_for_user(user_id, purpose='albums.cover')
+        db = search_db.open_database(user_id)
+        if db is None:
+            return ''
+        candidates = db.top_rated(filenames, limit=12)
+        fetched = _get_metadata_entities(user_id, candidates)
     except Exception:
         return ''
-    for row in rows:
-        name = row.get('RowKey')
-        if name in name_set:
-            url = _thumbnail_url_from_metadata(row, name)
-            if url:
-                return url
+    for name in candidates:
+        row = fetched.get(name)
+        if not row or row.get('processing_state') == 'deleted':
+            continue
+        url = _thumbnail_url_from_metadata(row, name)
+        if url:
+            return url
     return ''
 
 
@@ -3509,135 +3545,75 @@ def _count_processing_statuses(user_id: str, steps: List[str]) -> Dict[str, Dict
 # this cache exists to prevent. Same fix already applied once for ipwork's
 # people-scan cache (20s TTL < 77s/photo cadence -> 120s).
 METADATA_SCAN_CACHE_TTL_SECONDS = float(os.getenv('METADATA_SCAN_CACHE_TTL_SECONDS', '120'))
-_metadata_scan_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
-# /photos/filter's default sort order (rating/likes -> recency -> filename) never
-# depends on the request's minRating/minLikes/capture-range/location filter values
-# -- those only decide which rows are *included*, not how included rows are
-# ordered relative to each other. Without this, every single pagination page
-# (offset=0, 24, 48, ...) of an infinite-scroll session re-sorted the user's
-# entire library 3x from scratch even though 23 of that request's 24 results
-# were already correctly ordered by the previous page's work. Cached and
-# invalidated the same way/at the same time as _metadata_scan_cache below so it
-# can't go stale relative to it.
-_photo_default_sort_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
-
-# Narrow-column counterpart of the scans above, for the highest-traffic
-# gallery-loading purposes (list/access_batch/timeline/filter). Found live
-# 2026-09-16: a 36,633-row account's full-column scan (every field, including
-# large ones like photoEmbedding/semanticEmbedding/tagMetadata/weakTags/
-# objects/ocrText/faces that these four purposes never read) took 60-80s --
-# far longer than METADATA_SCAN_CACHE_TTL_SECONDS, so the cache could never
-# actually stay warm: each scan was stale before the next request needed it,
-# collapsing into back-to-back full scans and making scrolling/loading feel
-# broken. select= cuts the transferred/parsed payload to just what
-# _build_photo_summary, order_photo_entries, and filter_photos's own
-# criteria actually read. Kept as a SEPARATE cache (not a select= parameter
-# on the caches above) deliberately: photos.search's fallback path (lexical/
-# semantic scoring over tags/ocrText/caption/objects/embeddings) and the
-# rarer albums.smart_create/admin.backfill/uploads.corrupted purposes
-# genuinely need the wider field set, and sharing one cache/select between
-# them and the hot path would either re-bloat the hot path or silently drop
-# fields those purposes rely on. PHOTO_LIST_SELECT_FIELDS itself now lives in
-# storage_utils.py so the "listing" search-index projection can share the
-# exact same field list (see get_user_listing_index).
-_metadata_list_scan_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
-_photo_list_default_sort_cache = _UserScanCache(METADATA_SCAN_CACHE_TTL_SECONDS)
-
-
 def _invalidate_metadata_scan_cache(user_id: str) -> None:
-    _metadata_scan_cache.invalidate(user_id)
-    _photo_default_sort_cache.invalidate(user_id)
-    _metadata_list_scan_cache.invalidate(user_id)
-    _photo_list_default_sort_cache.invalidate(user_id)
+    """Kept as a no-op: write paths call this after mutating metadata. There is no
+    longer any in-process cache of the whole library to invalidate -- library-
+    sized reads come from the per-library SQLite database (search_db.py), which
+    is refreshed by the index build, and the pages those endpoints return are
+    always re-read fresh from the table."""
+    return None
+
+
+_LIBRARY_LOAD_REMOVED = (
+    'Loading the whole library into memory was removed (it OOM-ed the 1Gi backend at ~130k photos). '
+    'Use _iter_metadata_rows_for_user() to stream, or the per-library SQLite database in search_db.py '
+    '(list/filter/search/on-this-day/typeahead/covers) for indexed queries.'
+)
 
 
 def _cached_metadata_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
-    """Full metadata scan for a user, served from the short-TTL cache when fresh.
-
-    Each caller gets its own shallow copy of the rows (via _UserScanCache) so
-    request handlers can annotate them (e.g. the uploadDate backfill) without
-    mutating shared state.
-    """
-    return _metadata_scan_cache.get(user_id, lambda: _query_metadata_rows_for_user(user_id, purpose=purpose))
+    raise RuntimeError(_LIBRARY_LOAD_REMOVED)
 
 
 def _cached_sorted_metadata_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
-    """Same rows as _cached_metadata_rows_for_user, pre-sorted once in the
-    canonical rating/likes -> recency -> filename order and cached separately
-    (see _photo_default_sort_cache above) so /photos/filter's pagination
-    doesn't pay for a fresh triple-sort of the whole library on every page."""
-    def _compute() -> List[Dict]:
-        rows = list(_cached_metadata_rows_for_user(user_id, purpose=purpose))
-        rows.sort(key=lambda p: p.get('RowKey', ''))
-        rows.sort(key=lambda p: _metadata_upload_date(p), reverse=True)
-        rows.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
-        return rows
-    return _photo_default_sort_cache.get(user_id, _compute)
+    raise RuntimeError(_LIBRARY_LOAD_REMOVED)
 
 
 def _cached_metadata_list_rows_for_user(user_id: str, purpose: str, *, allow_sync_build: bool = True) -> List[Dict]:
-    """Narrow-column counterpart of _cached_metadata_rows_for_user -- see
-    PHOTO_LIST_SELECT_FIELDS above for which purposes this is safe for.
-
-    allow_sync_build=False (photos_timeline's caller only -- see that route)
-    swaps the live-scan fallback's blocking _metadata_list_scan_cache.get()
-    for its non-blocking get_or_kick_background() counterpart: a genuinely
-    cold account (no listing-index blob ever built) gets [] back immediately
-    instead of blocking ~47-80s on a full Table scan, with the scan kicked
-    off-thread so the next request picks up a warm cache. Other callers
-    (list/access_batch/filter/suggestions) keep the default True since they
-    have no graceful empty-result fallback the way an empty timeline rail
-    does -- see the 2026-09-29 forenkla-qa HAR investigation that also fixed
-    /explore's equivalent blocking gap.
-
-    Tries the "listing" search-index projection (get_user_listing_index) --
-    the same PHOTO_LIST_SELECT_FIELDS columns, sourced from a small blob
-    derived alongside the full lexical index instead of a live Table scan.
-    Unlike the full lexical index (which /photos/search relies on and which
-    still carries ocrText/tagMetadata/weakTags/objects/faces for every row),
-    this blob never makes plain gallery/timeline browsing pay for search-only
-    fields it doesn't render. Its staleness/rebuild state lives in a blob
-    manifest rather than this process's own memory -- so unlike
-    _metadata_list_scan_cache below, it stays correctly invalidated even when
-    the write (upload/admin) and read (backend/tools) paths run in different
-    container-app processes after the tools/upload/admin service split (see
-    backend-cpu-optimization-2026-09 memory). This also removes the ~20s
-    synchronous full-partition scan that a cold _metadata_list_scan_cache used
-    to force onto every first gallery request after a replica restart --
-    observed live to be the trigger for a ContainerBackOff crash loop under
-    sustained upload traffic (2026-09-17). Only a genuinely cold account (no
-    index has ever been built) still pays the live-scan cost here, matching
-    search_photos's own fallback.
-    """
-    try:
-        listing_index = get_user_listing_index(user_id, allow_refresh=True, allow_sync_build=allow_sync_build)
-    except Exception:
-        listing_index = None
-        app.logger.exception('Listing index lookup failed purpose=%s user=%s, falling back to full scan', purpose, user_id)
-    if listing_index is not None:
-        # The listing-index blob isn't sourced through _query_metadata_rows_for_user,
-        # so it doesn't get that function's include_deleted=False filtering for
-        # free -- and nothing stamps it as dirty/rebuilds it when a photo is
-        # trashed, so a soft-deleted row can linger in it until the next
-        # natural rebuild. Filter defensively here rather than trust staleness
-        # timing.
-        return [row for row in (listing_index.get('rows') or []) if row.get('processing_state') != 'deleted']
-    fetch_fn = lambda: _query_metadata_rows_for_user(user_id, select=list(PHOTO_LIST_SELECT_FIELDS), purpose=purpose)
-    if allow_sync_build:
-        return _metadata_list_scan_cache.get(user_id, fetch_fn)
-    return _metadata_list_scan_cache.get_or_kick_background(user_id, fetch_fn) or []
+    raise RuntimeError(_LIBRARY_LOAD_REMOVED)
 
 
 def _cached_sorted_metadata_list_rows_for_user(user_id: str, purpose: str) -> List[Dict]:
-    """Narrow-column counterpart of _cached_sorted_metadata_rows_for_user, for
-    /photos/filter (see PHOTO_LIST_SELECT_FIELDS above)."""
-    def _compute() -> List[Dict]:
-        rows = list(_cached_metadata_list_rows_for_user(user_id, purpose=purpose))
-        rows.sort(key=lambda p: p.get('RowKey', ''))
-        rows.sort(key=lambda p: _metadata_upload_date(p), reverse=True)
-        rows.sort(key=lambda p: (p.get('rating', 0), p.get('likes', 0)), reverse=True)
-        return rows
-    return _photo_list_default_sort_cache.get(user_id, _compute)
+    raise RuntimeError(_LIBRARY_LOAD_REMOVED)
+
+
+def _iter_metadata_rows_for_user(
+    user_id: str, select: Optional[List[str]] = None, include_deleted: bool = False,
+    extra_filter: str = '', purpose: str = 'metadata',
+):
+    """Stream a library's metadata rows one at a time (lazily paged -- the table
+    pager never holds more than a page). Use this, never a list, for anything
+    that only needs to look at each row once; ``extra_filter`` pushes positive
+    conditions (e.g. "processing_state eq 'deleted'") to the server so only the
+    matching rows are transferred. Trashed rows are skipped unless
+    ``include_deleted``; if ``select`` is given, callers needing deleted rows
+    must include 'processing_state' in it (it is added when they do not)."""
+    if metadata_table_client is None:
+        raise RuntimeError('Metadata table is not configured.')
+    query = f"PartitionKey eq '{_escape_odata(user_id)}'"
+    if extra_filter:
+        query += f' and ({extra_filter})'
+    kwargs = {}
+    if select:
+        kwargs['select'] = select if include_deleted or 'processing_state' in select else [*select, 'processing_state']
+    if PHOTO_TABLE_SCAN_PAGE_SIZE > 0:
+        kwargs['results_per_page'] = PHOTO_TABLE_SCAN_PAGE_SIZE
+    try:
+        rows_iter = metadata_table_client.query_entities(query, **kwargs)
+    except TypeError:
+        kwargs.pop('results_per_page', None)
+        try:
+            rows_iter = metadata_table_client.query_entities(query, **kwargs)
+        except TypeError:
+            rows_iter = metadata_table_client.query_entities(query)
+    scanned = 0
+    for row in rows_iter:
+        scanned += 1
+        if scanned > PHOTO_TABLE_SCAN_MAX_ROWS:
+            raise RuntimeError(f'Metadata scan exceeded {PHOTO_TABLE_SCAN_MAX_ROWS} rows.')
+        if not include_deleted and row.get('processing_state') == 'deleted':
+            continue
+        yield dict(row)
 
 
 def _query_metadata_rows_for_user(
@@ -8130,6 +8106,16 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
 
 EXPLORE_MAX_GROUPS = 24
 
+# Columns the smart-album rules (and the date helpers they call) actually read.
+SMART_ALBUM_SELECT = [
+    'RowKey', 'locationCity', 'locationCountry', 'address', 'latitude', 'longitude', 'tags', 'objects',
+    'peopleIds', 'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified', 'exifData',
+]
+TRASH_SELECT = sorted(set(PHOTO_LIST_SELECT_FIELDS) | {'deletedAt', 'preDeleteStatuses', 'processing_state'})
+CORRUPTED_UPLOAD_SELECT = sorted(set(PHOTO_LIST_SELECT_FIELDS) | {
+    'verification_status', 'verification_error', 'last_error', 'upload_sha256_match', 'mimeType', 'corrupted',
+})
+
 
 class ExploreAccumulator:
     """Streaming Places + Things grouping for the Explore page. Grouping and
@@ -8357,23 +8343,18 @@ def _compute_unnamed_person_suggestion(user_id: str) -> Optional[Dict]:
 
 
 def _compute_on_this_day_suggestion(user_id: str) -> Optional[Dict]:
-    """No day-of-year index exists -- this is a plain filter over the same
-    already-cached listing used by /photos (_cached_metadata_list_rows_for_user),
-    reusing _metadata_capture_date (already used by _smart_album_candidates
-    and default sort ordering). Picks whichever past year has the most
-    matches for today's month/day."""
+    """Picks whichever past year has the most photos captured on today's
+    month/day -- a GROUP BY over the library's local SQLite database (flat
+    memory), not a pass over a loaded listing."""
+    import search_db
     try:
-        rows = _cached_metadata_list_rows_for_user(user_id, purpose='suggestions.on_this_day')
+        db = search_db.open_database(user_id)
     except Exception:
         return None
+    if db is None:
+        return None
     today = datetime.now(timezone.utc)
-    matches_by_year: Dict[int, int] = {}
-    for row in rows:
-        capture_dt = _metadata_capture_date(row)
-        if capture_dt == datetime.min.replace(tzinfo=timezone.utc):
-            continue
-        if capture_dt.month == today.month and capture_dt.day == today.day and capture_dt.year != today.year:
-            matches_by_year[capture_dt.year] = matches_by_year.get(capture_dt.year, 0) + 1
+    matches_by_year: Dict[int, int] = db.on_this_day(today.month, today.day, today.year)
     if not matches_by_year:
         return None
     best_year = max(matches_by_year, key=lambda y: matches_by_year[y])
@@ -8413,11 +8394,15 @@ def _search_typeahead_suggestions(user_id: str, partial: str, limit: int = 5) ->
             seen_labels.add(name)
 
     if len(results) < limit:
+        # Place vocabulary lives in the library's SQLite database (built once per
+        # index build) -- no loaded listing, so this stays cheap per keystroke.
         try:
-            rows = _cached_metadata_list_rows_for_user(user_id, purpose='search.typeahead')
+            import search_db
+            db = search_db.open_database(user_id)
+            location_terms = db.location_terms() if db is not None else []
         except Exception:
-            rows = []
-        for term in _known_location_terms(rows):
+            location_terms = []
+        for term in location_terms:
             if len(results) >= limit:
                 break
             if len(term) < 3 or not term.startswith(partial_norm):
@@ -11272,7 +11257,7 @@ def _sweep_stale_processing_into_ipwork() -> Dict[str, int]:
     for library_id in library_ids:
         stats['libraries'] += 1
         try:
-            rows = _query_metadata_rows_for_user(library_id, select=BROWSER_PROCESSING_PENDING_SELECT, purpose='ipwork_sweep')
+            rows = _iter_metadata_rows_for_user(library_id, select=BROWSER_PROCESSING_PENDING_SELECT, purpose='ipwork_sweep')
         except Exception:
             worker_logger.warning('ipwork sweep: metadata scan failed for library %s', library_id, exc_info=True)
             continue

@@ -125,33 +125,34 @@ def photo_access_url_batch():
     # block this request on a full-library scan -- fall back to the
     # per-filename path below for this one call, same as /photos/timeline's
     # identical allow_sync_build=False use of the listing index.
-    access_index = app.get_user_access_index(user_id, allow_refresh=True, allow_sync_build=False)
-    metadata_map: app.Dict[str, app.Dict] = {}
-    if access_index is not None:
-        for row in access_index.get('rows') or []:
-            row_name = row.get('RowKey')
-            if row_name:
-                metadata_map[row_name] = {
-                    'anonymousImageId': row.get('blobName'),
-                    'thumbnail_status': row.get('thumbnailStatus'),
-                    'preview_status': row.get('previewStatus'),
-                }
-    else:
-        # Missing/dirty and this request didn't wait for a sync build --
-        # nudge the tools role to build it in the background (same pattern
-        # the search-index/sort-index SAS-mint routes already use) so the
-        # NEXT access-batch call for this account is fast instead of every
-        # call paying the per-filename fallback below forever.
-        try:
-            app._trigger_tools_index_rebuild(user_id)
-        except Exception:
-            pass
-
     safe_names = []
     for raw_name in filenames:
         safe_name = app._validate_media_filename(str(raw_name or ''))
         if safe_name:
             safe_names.append(safe_name)
+
+    # Only the requested names are read from a cached compact map -- never the
+    # whole index copied per call (see storage_utils.lookup_access_entries).
+    metadata_map: app.Dict[str, app.Dict] = {}
+    try:
+        found = app.lookup_access_entries(user_id, safe_names)
+    except Exception:
+        app.app.logger.exception('Access index lookup failed for %s', user_id)
+        found = None
+    if found is not None:
+        metadata_map.update(found)
+        try:
+            if app.access_index_is_dirty(user_id):
+                app._trigger_tools_index_rebuild(user_id)  # the worker rebuilds; never this process
+        except Exception:
+            pass
+    else:
+        # No access index yet: have the worker build it; this call uses the
+        # per-filename fallback below.
+        try:
+            app._trigger_tools_index_rebuild(user_id)
+        except Exception:
+            pass
 
     # Remaining misses are now the rare case (a brand-new upload not yet
     # merged into the access index, or a genuinely cold/unbuilt index) rather
@@ -442,23 +443,33 @@ def list_photos():
     user_id, error = app._require_user_id()
     if error:
         return error
+    # Ordering, date range and paging run as SQL over the library's local SQLite
+    # database (flat memory); only the returned page is read fresh from the table.
+    db = app._open_library_db(user_id)
+    if db is None:
+        return app.jsonify({'photos': [], 'total': 0, 'indexBuilding': True})
     try:
-        metadata_rows = app._cached_metadata_list_rows_for_user(user_id, purpose='photos.list')
-        entries = [row['RowKey'] for row in metadata_rows if row.get('RowKey')]
-        metadata_map = {row['RowKey']: row for row in metadata_rows if row.get('RowKey')}
-    except Exception as exc:
-        app.app.logger.exception('Photo list metadata read failed')
+        filenames, total = db.list_page(
+            sort=sort, offset=offset, limit=limit,
+            capture_start_day=app._day_ordinal(capture_start), capture_end_day=app._day_ordinal(capture_end),
+        )
+    except Exception:
+        app.app.logger.exception('Photo list query failed')
         return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
+
+    fetched = app._get_metadata_entities(user_id, filenames)
+    metadata_map = {name: row for name, row in fetched.items() if row and row.get('processing_state') != 'deleted'}
+    selected = [name for name in filenames if name in metadata_map]
 
     # Backfill: rows uploaded before finalize persisted uploadDate sort via the
     # volatile last_processing_update fallback. Stamp the derived value as their
-    # permanent uploadDate (best-effort, capped per request) so their position
-    # can never shift again — e.g. when a legacy photo gets reprocessed.
+    # permanent uploadDate (best-effort, capped per request, page rows only) so
+    # their position can never shift again.
     backfilled = 0
-    for name in entries:
+    for name in selected:
         if backfilled >= app.UPLOAD_DATE_BACKFILL_MAX_PER_REQUEST:
             break
-        row = metadata_map.get(name) or {}
+        row = metadata_map[name]
         if row.get('uploadDate'):
             continue
         derived = str(row.get('upload_started_at') or row.get('last_processing_update') or '')
@@ -471,19 +482,9 @@ def list_photos():
         except Exception:
             break  # storage hiccup: stop backfilling, listing still works
 
-    # Deterministic ordering with a filename tie-break so the gallery returns an
-    # identical sequence on every load (see ordering_utils.order_photo_entries).
-    entries = app.order_photo_entries(entries, metadata_map, sort)
-
-    if capture_start or capture_end:
-        entries = [name for name in entries if app._capture_in_range(metadata_map.get(name, {}), capture_start, capture_end)]
-
-    selected = entries[offset:offset + limit]
-
     # Persist blob size for legacy rows that predate finalize-time stamping, so the
     # gallery stops doing a blob HEAD per tile. Capped per request (converges over
-    # a few page views); after that _build_photo_summary reads size from metadata
-    # with head_missing=False and never HEADs.
+    # a few page views).
     props_backfilled = 0
     for name in selected:
         if props_backfilled >= app.PHOTO_PROPS_BACKFILL_MAX_PER_REQUEST:
@@ -512,11 +513,11 @@ def list_photos():
     pid_to_name, _ = app._load_people_name_index(user_id)
     photos = app._build_photo_summaries_page(
         user_id,
-        [(filename, metadata_map.get(filename, {})) for filename in selected],
+        [(filename, metadata_map[filename]) for filename in selected],
         pid_to_name,
     )
 
-    return app.jsonify({'photos': photos, 'total': len(entries)})
+    return app.jsonify({'photos': photos, 'total': total})
 
 @photos_bp.route('/photos/processing-status', methods=['GET'])
 @photos_bp.route('/photos/processing-status/', methods=['GET'])
@@ -790,16 +791,9 @@ def search_photos():
     # The stored rows are intentionally reduced (search fields only); the page
     # being returned needs the full metadata (rating, likes, rotation, status...),
     # so point-read just these few photos, in parallel.
-    def _full(item):
-        _, filename, reduced = item
-        return filename, (app._get_metadata_entity(user_id, filename) or None)
-
     with app.perf_instrumentation.span('search.page_metadata', n=len(selected)):
-        if len(selected) > 1:
-            with ThreadPoolExecutor(max_workers=min(8, len(selected))) as executor:
-                full_rows = list(executor.map(_full, selected))
-        else:
-            full_rows = [_full(item) for item in selected]
+        fetched = app._get_metadata_entities(user_id, [filename for _, filename, _ in selected])
+    full_rows = [(filename, fetched.get(filename)) for _, filename, _ in selected]
     page_pairs = [
         (filename, metadata) for filename, metadata in full_rows
         if metadata and metadata.get('processing_state') != 'deleted'
@@ -1069,8 +1063,12 @@ def list_trashed_photos():
     except (TypeError, ValueError):
         limit = 50
 
-    rows = app._query_metadata_rows_for_user(user_id, include_deleted=True, purpose='photos.list_trash')
-    trashed = [row for row in rows if row.get('processing_state') == 'deleted']
+    # Only the trashed rows are transferred (positive server-side filter), so this
+    # is bounded by the size of the trash, not the library.
+    trashed = list(app._iter_metadata_rows_for_user(
+        user_id, select=app.TRASH_SELECT, include_deleted=True,
+        extra_filter="processing_state eq 'deleted'", purpose='photos.list_trash',
+    ))
     trashed.sort(key=lambda row: str(row.get('deletedAt') or ''), reverse=True)
 
     retention_days = app.TRASH_RETENTION_DAYS
@@ -1138,8 +1136,12 @@ def restore_all_trashed_photos():
     if error:
         return error
 
-    rows = app._query_metadata_rows_for_user(user_id, include_deleted=True, purpose='photos.restore_all_trash')
-    trashed_names = [str(row.get('RowKey') or '') for row in rows if row.get('processing_state') == 'deleted']
+    trashed_names = [
+        str(row.get('RowKey') or '') for row in app._iter_metadata_rows_for_user(
+            user_id, select=['RowKey', 'processing_state'], include_deleted=True,
+            extra_filter="processing_state eq 'deleted'", purpose='photos.restore_all_trash',
+        )
+    ]
     trashed_names = [name for name in trashed_names if name]
 
     restored = []
@@ -1392,51 +1394,31 @@ def filter_photos():
 
     capture_start, capture_end = app._parse_capture_range_args()
 
-    try:
-        # Already sorted (rating/likes -> recency -> filename, stable across
-        # loads) -- see _cached_sorted_metadata_rows_for_user. Filtering below
-        # preserves that order, so no per-request re-sort is needed.
-        all_photos = app._cached_sorted_metadata_list_rows_for_user(user_id, purpose='photos.filter')
-    except Exception as exc:
-        app.app.logger.exception('Photo filter metadata read failed')
-        return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
+    db = app._open_library_db(user_id)
+    if db is None:
+        return app.jsonify({'photos': [], 'total': 0, 'offset': offset, 'limit': limit, 'indexBuilding': True})
 
     try:
-        filtered = []
-
-        for photo in all_photos:
-            if photo.get('rating', 0) < min_rating:
-                continue
-            if photo.get('likes', 0) < min_likes:
-                continue
-
-            if capture_start or capture_end:
-                if not app._capture_in_range(photo, capture_start, capture_end):
-                    continue
-
-            if latitude and longitude:
-                try:
-                    photo_lat = float(photo.get('latitude', 0))
-                    photo_lon = float(photo.get('longitude', 0))
-                    user_lat = float(latitude)
-                    user_lon = float(longitude)
-                    distance = ((photo_lat - user_lat) ** 2 + (photo_lon - user_lon) ** 2) ** 0.5
-                    if distance > radius_km * 0.01:
-                        continue
-                except Exception:
-                    pass
-
-            filtered.append(photo)
-
-        selected = filtered[offset:offset + limit]
-        pid_to_name, _ = app._load_people_name_index(user_id)
-        photos = app._build_photo_summaries_page(
-            user_id,
-            [(photo['RowKey'], photo) for photo in selected],
-            pid_to_name,
+        # Rating/likes/date/location filtering + ordering (rating -> likes ->
+        # recency -> filename, stable across loads) run as SQL over the local
+        # database; photos with unusable coordinates pass the location filter.
+        user_lat = user_lon = None
+        if latitude and longitude:
+            try:
+                user_lat, user_lon = float(latitude), float(longitude)
+            except ValueError:
+                user_lat = user_lon = None
+        filenames, total = db.filter_page(
+            min_rating=min_rating, min_likes=min_likes, offset=offset, limit=limit,
+            capture_start_day=app._day_ordinal(capture_start), capture_end_day=app._day_ordinal(capture_end),
+            latitude=user_lat, longitude=user_lon, radius_degrees=radius_km * 0.01,
         )
+        fetched = app._get_metadata_entities(user_id, filenames)
+        pairs = [(name, fetched[name]) for name in filenames if fetched.get(name) and fetched[name].get('processing_state') != 'deleted']
+        pid_to_name, _ = app._load_people_name_index(user_id)
+        photos = app._build_photo_summaries_page(user_id, pairs, pid_to_name)
 
-        return app.jsonify({'photos': photos, 'total': len(filtered), 'offset': offset, 'limit': limit})
+        return app.jsonify({'photos': photos, 'total': total, 'offset': offset, 'limit': limit})
     except Exception as e:
         app.app.logger.exception('filter_photos failed')
         return app.jsonify({'error': 'Internal server error'}), 500

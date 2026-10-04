@@ -1,4 +1,4 @@
-"""Per-library SQLite (FTS5) search database.
+"""Per-library SQLite (FTS5) search + gallery database.
 
 Why this exists: server-side search used to load the whole lexical index (every
 metadata column of every photo -- ~700MB of JSON at ~130k photos) into the
@@ -16,6 +16,13 @@ download the index either). Instead:
   library version and queries it read-only: bm25-ranked candidate selection in
   SQLite, then the unchanged scoring code runs on a few thousand candidate rows
   instead of the whole library. Memory stays flat; no index lives in RAM.
+
+The same file is the backend's read model for every other library-sized query
+(gallery list/filter, "on this day" suggestions, place typeahead): `rows` carries
+the gallery columns, so those endpoints are SQL with LIMIT/OFFSET and flat
+memory instead of loading the listing blob (130k rows) into the 1Gi backend.
+Rating/like edits show up here on the next index build (a few minutes); the
+photos actually returned are always re-read fresh from the table.
 
 SQLite wants a real local filesystem (mmap/locking/random reads); SMB shares are
 slow and unsafe for that, hence ephemeral disk (SEARCH_DB_DIR, an EmptyDir mount
@@ -39,11 +46,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import perf_instrumentation
 import search_utils
-from ordering_utils import metadata_capture_datetime
+from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 'sqlite-v1'
+SCHEMA_VERSION = 'sqlite-v2'  # v2: gallery columns (capture/upload time, rating, likes, coordinates, month-day)
 SEARCH_DB_DIR = os.getenv('SEARCH_DB_DIR', '').strip() or os.path.join(tempfile.gettempdir(), 'photostore-search')
 # Cap on candidates pulled per query (bm25-ranked); the scorer then ranks them.
 CANDIDATE_LIMIT = int(os.getenv('SEARCH_DB_CANDIDATE_LIMIT', '4000'))
@@ -116,6 +123,21 @@ def document_text(filename: str, row: Dict) -> str:
     ) if part)
 
 
+def _as_int(value) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_float(value) -> Optional[float]:
+    try:
+        text = str(value if value is not None else '').strip()
+        return float(text) if text else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _collect_location_terms(into: set, row: Dict) -> None:
     for field in ('locationCity', 'locationRegion', 'locationCountry', 'address'):
         phrase = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(row.get(field) or '').lower())).strip()
@@ -150,7 +172,11 @@ class DatabaseBuilder:
         self._conn.executescript(
             '''
             PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA page_size=8192;
-            CREATE TABLE rows(id INTEGER PRIMARY KEY, filename TEXT NOT NULL, capture_day INTEGER, row_json TEXT NOT NULL);
+            CREATE TABLE rows(
+                id INTEGER PRIMARY KEY, filename TEXT NOT NULL, capture_day INTEGER, row_json TEXT NOT NULL,
+                capture_ts REAL, upload_ts REAL, capture_year INTEGER, capture_md INTEGER,
+                rating INTEGER NOT NULL DEFAULT 0, likes INTEGER NOT NULL DEFAULT 0, lat REAL, lon REAL
+            );
             CREATE TABLE row_people(person_id TEXT NOT NULL, id INTEGER NOT NULL);
             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
             CREATE VIRTUAL TABLE fts USING fts5(doc, content='',
@@ -166,7 +192,16 @@ class DatabaseBuilder:
         slim = reduced_row(row)
         captured = metadata_capture_datetime(row)
         day = captured.astimezone(timezone.utc).date().toordinal() if captured else None
-        self._rows.append((self.count, filename, day, json.dumps(slim, ensure_ascii=False, separators=(',', ':'))))
+        uploaded = metadata_upload_datetime(row)
+        self._rows.append((
+            self.count, filename, day, json.dumps(slim, ensure_ascii=False, separators=(',', ':')),
+            captured.timestamp() if captured else None,
+            uploaded.timestamp() if uploaded else None,
+            captured.year if captured else None,
+            captured.month * 100 + captured.day if captured else None,
+            _as_int(row.get('rating')), _as_int(row.get('likes')),
+            _as_float(row.get('latitude')), _as_float(row.get('longitude')),
+        ))
         self._fts.append((self.count, document_text(filename, slim)))
         try:
             for pid in json.loads(row.get('peopleIds') or '[]'):
@@ -179,7 +214,9 @@ class DatabaseBuilder:
 
     def _flush(self) -> None:
         if self._rows:
-            self._conn.executemany('INSERT INTO rows(id, filename, capture_day, row_json) VALUES(?,?,?,?)', self._rows)
+            self._conn.executemany(
+                'INSERT INTO rows(id, filename, capture_day, row_json, capture_ts, upload_ts, capture_year, capture_md, rating, likes, lat, lon) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', self._rows)
             self._conn.executemany('INSERT INTO fts(rowid, doc) VALUES(?,?)', self._fts)
         if self._people:
             self._conn.executemany('INSERT INTO row_people(person_id, id) VALUES(?,?)', self._people)
@@ -190,6 +227,9 @@ class DatabaseBuilder:
         conn = self._conn
         conn.execute('CREATE INDEX rows_capture ON rows(capture_day)')
         conn.execute('CREATE INDEX rows_filename ON rows(filename)')
+        conn.execute('CREATE INDEX rows_capture_md ON rows(capture_md)')
+        conn.execute('CREATE INDEX rows_capture_ts ON rows(capture_ts)')
+        conn.execute('CREATE INDEX rows_rating ON rows(rating, likes)')
         conn.execute('CREATE INDEX row_people_pid ON row_people(person_id)')
         conn.execute('INSERT INTO meta VALUES(?, ?)', (
             'location_terms', json.dumps(sorted(self._terms, key=len, reverse=True))))
@@ -237,6 +277,17 @@ def match_terms(tokens: Dict[str, List[str]]) -> List[str]:
 def fts_expression(terms: Sequence[str]) -> str:
     # _contains_related_term allows `token[a-z0-9]*` for tokens of 4+ chars.
     return ' OR '.join(f'"{t}"*' if len(t) >= 4 else f'"{t}"' for t in terms)
+
+
+def _range_clause(start_day: Optional[int], end_day: Optional[int]) -> Tuple[str, List[object]]:
+    clauses, args = [], []
+    if start_day is not None:
+        clauses.append('capture_day >= ?')
+        args.append(start_day)
+    if end_day is not None:
+        clauses.append('capture_day <= ?')
+        args.append(end_day)
+    return (' WHERE ' + ' AND '.join(clauses), args) if clauses else ('', args)
 
 
 class SearchDatabase:
@@ -303,6 +354,81 @@ class SearchDatabase:
             ):
                 out.append((filename, json.loads(row_json)))
         return out
+
+    # --- gallery queries (flat memory: SQL ORDER BY / LIMIT, never a loaded list) ---
+
+    _MIN = -1e18  # sorts photos with no known date last, like DATE_MIN
+
+    _LIST_ORDER = {
+        'capture': f'COALESCE(capture_ts, {_MIN}) DESC, filename ASC',
+        'rating': 'rating DESC, filename ASC',
+        'likes': 'likes DESC, filename ASC',
+        'location': 'LOWER(filename) ASC, filename ASC',
+        'date': f'COALESCE(upload_ts, {_MIN}) DESC, filename ASC',  # also the default for unknown sorts
+    }
+
+    def list_page(
+        self, *, sort: str = 'capture', offset: int = 0, limit: int = 24,
+        capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,
+    ) -> Tuple[List[str], int]:
+        """(filenames for one page, total matching) in the gallery's deterministic
+        order -- same semantics as ordering_utils.order_photo_entries."""
+        where, args = _range_clause(capture_start_day, capture_end_day)
+        order = self._LIST_ORDER.get(sort, self._LIST_ORDER['date'])
+        conn = self._conn()
+        total = conn.execute(f'SELECT COUNT(*) FROM rows{where}', args).fetchone()[0]
+        names = [r[0] for r in conn.execute(
+            f'SELECT filename FROM rows{where} ORDER BY {order} LIMIT ? OFFSET ?', [*args, int(limit), max(0, int(offset))])]
+        return names, int(total)
+
+    def filter_page(
+        self, *, min_rating: int = 0, min_likes: int = 0, offset: int = 0, limit: int = 24,
+        capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,
+        latitude: Optional[float] = None, longitude: Optional[float] = None, radius_degrees: float = 0.0,
+    ) -> Tuple[List[str], int]:
+        """Rating/likes/date/location filter, ordered rating -> likes -> recency
+        -> filename (what /photos/filter always returned). With a location
+        filter active, photos without coordinates are excluded (the old code
+        compared them as latitude/longitude 0, so they only matched by accident)."""
+        where, args = _range_clause(capture_start_day, capture_end_day)
+        clauses = ['rating >= ?', 'likes >= ?']
+        clause_args: List[object] = [int(min_rating), int(min_likes)]
+        if latitude is not None and longitude is not None:
+            clauses.append('(lat IS NOT NULL AND lon IS NOT NULL AND ((lat - ?) * (lat - ?) + (lon - ?) * (lon - ?)) <= ?)')
+            clause_args += [latitude, latitude, longitude, longitude, radius_degrees * radius_degrees]
+        sql_where = (where + ' AND ' if where else ' WHERE ') + ' AND '.join(clauses)
+        all_args = [*args, *clause_args]
+        conn = self._conn()
+        total = conn.execute(f'SELECT COUNT(*) FROM rows{sql_where}', all_args).fetchone()[0]
+        names = [r[0] for r in conn.execute(
+            f'SELECT filename FROM rows{sql_where} ORDER BY rating DESC, likes DESC, '
+            f'COALESCE(upload_ts, {self._MIN}) DESC, filename ASC LIMIT ? OFFSET ?',
+            [*all_args, int(limit), max(0, int(offset))])]
+        return names, int(total)
+
+    def on_this_day(self, month: int, day: int, exclude_year: int) -> Dict[int, int]:
+        """{year: photo count} for photos captured on this month/day in other years."""
+        return {int(y): int(c) for y, c in self._conn().execute(
+            'SELECT capture_year, COUNT(*) FROM rows WHERE capture_md = ? AND capture_year != ? GROUP BY capture_year',
+            (month * 100 + day, exclude_year))}
+
+    def top_rated(self, filenames: Sequence[str], limit: int = 12) -> List[str]:
+        """The best `limit` of these filenames by rating -> likes -> recency ->
+        filename (album-cover order). Chunked IN() queries keep the SQL variable
+        count small and memory O(limit) however large the album is."""
+        best: List[Tuple] = []
+        conn = self._conn()
+        names = list(dict.fromkeys(filenames))
+        for start in range(0, len(names), 500):
+            chunk = names[start:start + 500]
+            marks = ','.join('?' * len(chunk))
+            for filename, rating, likes, upload in conn.execute(
+                f'SELECT filename, rating, likes, COALESCE(upload_ts, {self._MIN}) FROM rows WHERE filename IN ({marks})', chunk,
+            ):
+                best.append((-rating, -likes, -upload, filename))
+            best.sort()
+            del best[limit:]
+        return [filename for *_, filename in best]
 
     def row_count(self) -> int:
         return int(self._conn().execute('SELECT COUNT(*) FROM rows').fetchone()[0])

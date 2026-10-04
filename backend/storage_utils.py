@@ -5177,6 +5177,55 @@ def get_user_access_index(
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
 
 
+# --- Access lookup (what access-batch actually needs) -----------------------------
+# access-batch resolves at most 2000 filenames per call, but used to fetch the
+# whole access index, copy all ~130k rows, and build a 130k-entry dict -- on every
+# grid page. Now: one compact filename -> (blob, thumbnail status, preview status)
+# map per index version (cached, never copied), and each call only reads the
+# names it was asked about. The backend never builds this index (the worker does).
+_ACCESS_LOOKUP_CACHE_LOCK = threading.Lock()
+_ACCESS_LOOKUP_CACHE: Dict[str, Tuple[str, Dict[str, Tuple[str, str, str]]]] = {}
+
+
+def lookup_access_entries(user_id: str, filenames) -> Optional[Dict[str, Dict[str, object]]]:
+    """{filename: {anonymousImageId, thumbnail_status, preview_status}} for the
+    requested filenames the access index knows about, or None when no access
+    index exists yet (callers fall back to point reads). A dirty/stale index is
+    still served -- same as before -- and ``None`` never triggers a backend build."""
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    manifest = _load_access_index_manifest(key)
+    version = str(manifest.get('sourceVersion') or '')
+    if not version:
+        return None
+    with _ACCESS_LOOKUP_CACHE_LOCK:
+        cached = _ACCESS_LOOKUP_CACHE.get(key)
+    if cached is None or cached[0] != version:
+        snapshot = _load_access_index_blob(key)
+        if snapshot is None:
+            return None
+        compact = {
+            str(row['RowKey']): (str(row.get('blobName') or ''), str(row.get('thumbnailStatus') or ''), str(row.get('previewStatus') or ''))
+            for row in snapshot.rows if row.get('RowKey')
+        }
+        del snapshot
+        cached = (version, compact)
+        with _ACCESS_LOOKUP_CACHE_LOCK:
+            _ACCESS_LOOKUP_CACHE[key] = cached
+    table = cached[1]
+    out: Dict[str, Dict[str, object]] = {}
+    for name in filenames:
+        entry = table.get(name)
+        if entry is not None:
+            out[name] = {'anonymousImageId': entry[0], 'thumbnail_status': entry[1], 'preview_status': entry[2]}
+    return out
+
+
+def access_index_is_dirty(user_id: str) -> bool:
+    return bool(_load_access_index_manifest(str(user_id or '').strip()).get('dirty'))
+
+
 # --- Albums index --------------------------------------------------------------
 # Same "own blob + own manifest, downloaded once per session" architecture as
 # the sort index above, applied to Albums: {albumId, name, photoCount,

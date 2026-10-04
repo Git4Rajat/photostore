@@ -354,4 +354,23 @@ Sort and access scans also iterate instead of `list()`. The 700 MB full lexical 
 
 Measured on identical synthetic data (8,000 photos with 12 KB of heavy columns each): old build peak 288 MB (grows linearly with library size), streaming build peak 2.7 MB. `tests/test_library_stream.py` pins this (peak < 25 MB). Builds are a full scan, so `enqueue_index_build` delays a rebuild that follows a finished one by `INDEX_BUILD_MIN_INTERVAL_SECONDS` (120) instead of letting upload bursts trigger back-to-back builds.
 
-**Known remaining memory risk (backend, not the build):** routes that still read the listing blob (`/photos` legacy fallback, `/photos/filter`, suggestions, typeahead) load it into the 1Gi backend; the gallery itself no longer does (sort index + lookup-batch).
+### 14.2 No request path loads the library
+
+The backend (1Gi) used to hold library-sized data in memory for several endpoints. Each now uses a bounded technique:
+
+| Endpoint / helper | Before | Now |
+|---|---|---|
+| `GET /photos` (list), `GET /photos/filter` | whole listing blob (130k rows) loaded + sorted in Python | SQL `ORDER BY/LIMIT/OFFSET` on the per-library SQLite DB (`SearchDatabase.list_page` / `filter_page`); page metadata re-read fresh (parallel point reads). Ordering/filter parity with the old in-memory logic is pinned in `tests/test_library_db_routes.py` |
+| `/api/suggestions` (on this day) | pass over the listing | `GROUP BY capture_year WHERE capture_md = ?` |
+| `/api/search/suggest` (places) | pass over the listing | place vocabulary stored in the DB |
+| album covers (`_album_cover_thumbnail_url`) | full unprojected, sorted scan of every row | `SearchDatabase.top_rated(album filenames)` (chunked `IN`, O(limit)) + <=12 point reads |
+| `access-batch` | whole access index copied (130k rows) and re-indexed **per call** | one compact filename map per index version (`lookup_access_entries`), no copies; the backend never builds the index |
+| trash list / restore-all | all columns of all rows, filtered in Python | server-side `processing_state eq 'deleted'` + projection |
+| corrupted-uploads page | whole-library scan | server-side `verification_status eq 'failed' or corrupted eq true` + projection |
+| smart-album creation, admin backfill, browser-processing pending, ipwork sweep | list of all rows | `_iter_metadata_rows_for_user` streaming with narrow projections |
+
+`_cached_metadata_rows_for_user`, `_cached_sorted_metadata_rows_for_user`, `_cached_metadata_list_rows_for_user` and `_cached_sorted_metadata_list_rows_for_user` now **raise** (`tests/test_bounded_scans.py` also fails the build if any route module references them), so a future caller cannot silently reintroduce a whole-library load. `_invalidate_metadata_scan_cache` remains as a no-op for the many write paths that call it.
+
+Behaviour notes: rating/like changes reach list/filter/cover ranking on the next index build (minutes); the photos returned are always fresh. With a location filter active, photos without coordinates are excluded (the old code compared them as 0,0). A library with no current database yet gets `indexBuilding: true` from list/filter and a worker build is requested. The database schema is `sqlite-v2`; existing databases are rebuilt by the next build.
+
+Remaining library-proportional memory on the backend: the compact access map (~tens of MB per worker, loaded once per index version) and the albums/people indexes (sized by album/person count, not photo count).

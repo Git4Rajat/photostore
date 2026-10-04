@@ -422,39 +422,3 @@ def search_route_ctx(monkeypatch):
 # paid that cost on its first gallery request, which was implicated in a
 # ContainerBackOff crash loop during a sustained overnight upload. This mirrors
 # search_photos's existing lexical-index-first pattern above.
-
-def test_cached_metadata_list_rows_uses_lexical_index_when_available(monkeypatch):
-    monkeypatch.setattr(app, 'get_user_listing_index', lambda *a, **k: {'rows': [{'RowKey': 'a.jpg'}]})
-
-    def _boom(*a, **k):
-        raise AssertionError('should not fall back to the live Table scan when the lexical index is available')
-
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', _boom)
-    app._metadata_list_scan_cache.invalidate('owner')
-
-    rows = app._cached_metadata_list_rows_for_user('owner', purpose='photos.list')
-
-    assert [r['RowKey'] for r in rows] == ['a.jpg']
-
-
-def test_cached_metadata_list_rows_falls_back_to_scan_when_index_unavailable(monkeypatch):
-    monkeypatch.setattr(app, 'get_user_listing_index', lambda *a, **k: None)
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', lambda *a, **k: [{'RowKey': 'fallback.jpg'}])
-    app._metadata_list_scan_cache.invalidate('owner')
-
-    rows = app._cached_metadata_list_rows_for_user('owner', purpose='photos.list')
-
-    assert [r['RowKey'] for r in rows] == ['fallback.jpg']
-
-
-def test_cached_metadata_list_rows_falls_back_to_scan_when_index_lookup_raises(monkeypatch):
-    def _boom(*a, **k):
-        raise RuntimeError('blob storage hiccup')
-
-    monkeypatch.setattr(app, 'get_user_listing_index', _boom)
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', lambda *a, **k: [{'RowKey': 'fallback.jpg'}])
-    app._metadata_list_scan_cache.invalidate('owner')
-
-    rows = app._cached_metadata_list_rows_for_user('owner', purpose='photos.list')
-
-    assert [r['RowKey'] for r in rows] == ['fallback.jpg']
