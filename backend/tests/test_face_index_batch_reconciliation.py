@@ -9,6 +9,7 @@ import re
 import pytest
 from azure.core.exceptions import ResourceNotFoundError
 
+import app
 import storage_utils
 from test_face_by_filename_lookup import (
     AzureFaceTable,
@@ -505,3 +506,75 @@ def test_escaped_or_filters_respect_fifteen_comparisons_and_large_batches_scan_p
                for index, name in enumerate(names))
     assert faces.rows == before and faces.writes == faces.gets == []
     assert _batch_metrics(caplog, names, 'done') == result
+
+
+def test_force_rescans_an_already_complete_row_instead_of_trusting_it(batch_ctx):
+    """force=True is the operator-invoked verify/repair path (admin_verify_
+    face_index): it must re-derive IDs from a real scan even when the lookup
+    already claims a validated complete row, so it can catch and correct a
+    row that was published without ever actually being scanned."""
+    faces, lookup = batch_ctx
+    name = 'wrongly-stamped.jpg'
+    # A real face row exists, but the lookup was (hypothetically) stamped
+    # complete-empty without ever having scanned for it.
+    _seed(faces, name, 'real-face', bbox=json.dumps(_face(0)['bbox']))
+    lookup.upsert_entity(_complete_row([], RowKey=name))
+    assert _ids(lookup, name) == []
+
+    result = storage_utils.reconcile_face_filename_indexes_batch('u1', [name], force=True)
+
+    assert result['path'] == 'partition_scan'
+    assert result['indexed'] == 0  # the shortcut that would have trusted it was skipped
+    assert _ids(lookup, name) == ['real-face']
+
+
+def test_force_confirms_an_already_correct_row_with_no_changes(batch_ctx):
+    faces, lookup = batch_ctx
+    name = 'correctly-stamped.jpg'
+    _seed(faces, name, 'real-face', bbox=json.dumps(_face(0)['bbox']))
+    lookup.upsert_entity(_complete_row(['real-face'], RowKey=name))
+
+    result = storage_utils.reconcile_face_filename_indexes_batch('u1', [name], force=True)
+
+    assert result['path'] == 'partition_scan'
+    assert _ids(lookup, name) == ['real-face']
+
+
+def test_verify_face_filename_indexes_reports_and_fixes_a_wrong_stamp(batch_ctx):
+    faces, lookup = batch_ctx
+    good_name, bad_name = 'already-correct.jpg', 'wrongly-stamped.jpg'
+    _seed(faces, good_name, 'good-face', bbox=json.dumps(_face(0)['bbox']))
+    lookup.upsert_entity(_complete_row(['good-face'], RowKey=good_name))
+    _seed(faces, bad_name, 'hidden-face', bbox=json.dumps(_face(0)['bbox']))
+    lookup.upsert_entity(_complete_row([], RowKey=bad_name))
+
+    result = app._verify_face_filename_indexes('u1', [good_name, bad_name])
+
+    assert result == {
+        'success': True, 'checked': 2, 'mismatches': 1, 'errors': 0,
+        'results': [
+            {'filename': good_name, 'beforeFaceIds': ['good-face'],
+             'afterFaceIds': ['good-face'], 'mismatch': False},
+            {'filename': bad_name, 'beforeFaceIds': [],
+             'afterFaceIds': ['hidden-face'], 'mismatch': True},
+        ],
+    }
+    assert _ids(lookup, bad_name) == ['hidden-face']
+
+
+def test_verify_face_filename_indexes_batches_over_32_names(batch_ctx, monkeypatch):
+    _, lookup = batch_ctx
+    names = [f'photo-{i}.jpg' for i in range(40)]
+    calls = []
+    real = storage_utils.reconcile_face_filename_indexes_batch
+
+    def spy(user_id, filenames, **kwargs):
+        calls.append(list(filenames))
+        return real(user_id, filenames, **kwargs)
+
+    monkeypatch.setattr(app, 'reconcile_face_filename_indexes_batch', spy)
+    result = app._verify_face_filename_indexes('u1', names)
+
+    assert [len(c) for c in calls] == [32, 8]
+    assert result['checked'] == 40
+    assert result['mismatches'] == 0

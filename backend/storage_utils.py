@@ -1119,7 +1119,7 @@ def _face_filename_mutations(user_id: str, filenames):
         raise
 
 
-def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=None) -> Dict:
+def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=None, force=False) -> Dict:
     """Amortize UNKNOWN filename lookups with one streamed authoritative scan.
 
     This is not a library cache or a freshness guess. Acquire every unknown
@@ -1129,6 +1129,11 @@ def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=
     rows when applying results. Memory is bounded by batch names and retained
     IDs, not library size; excessive IDs or any failure leave acquired rows
     dirty. The caller may abandon preparation on shutdown/visibility deadline.
+
+    force=True skips both "trust what's already there" shortcuts below and
+    always re-scans every requested name, even ones the lookup already
+    claims are complete -- an explicit operator-invoked verification pass
+    (see admin_verify_face_index), not the normal amortization path.
     """
     names = sorted(set(filenames))
     if len(names) > 32 or any(not isinstance(name, str) or not name.strip() for name in names):
@@ -1150,14 +1155,15 @@ def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=
             raise FaceFilenameLookupRetryableError('Face reconciliation storage unavailable')
         for name in names:
             check_cancelled()
-            row = _face_filename_row(lookup_table, user_id, name)
-            if row is not None and _validated_face_filename_ids(row) is not None:
-                metrics['indexed'] += 1
-                continue
+            if not force:
+                row = _face_filename_row(lookup_table, user_id, name)
+                if row is not None and _validated_face_filename_ids(row) is not None:
+                    metrics['indexed'] += 1
+                    continue
             generation, prior_ids = _begin_face_filename_write(user_id, name)
             generations[name] = generation
             _renew_face_filename_mutations(user_id, generations)
-            if prior_ids is not None:
+            if prior_ids is not None and not force:
                 # Another writer completed between our read and acquisition.
                 # Restore that authoritative set, never replace it from a
                 # scan that started before its generation was acquired.

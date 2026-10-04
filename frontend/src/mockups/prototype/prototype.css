@@ -382,6 +382,16 @@
 .pt-recover-card { padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .pt-recover-card strong { font-size: 0.95rem; }
 .pt-recover-card span { color: var(--muted); font-size: 0.82rem; }
+.pt-verify-input {
+    width: 100%; resize: vertical; font-family: inherit; font-size: 0.82rem;
+    padding: 8px 10px; border-radius: 8px; border: 1px solid var(--lg-edge);
+    background: var(--bg-1); color: inherit;
+}
+.pt-verify-results { width: 100%; font-size: 0.8rem; display: flex; flex-direction: column; gap: 2px; }
+.pt-verify-row { color: var(--muted); }
+.pt-verify-row.fixed { color: var(--warn, #c77); }
+.pt-verify-row.error { color: var(--danger, #c33); }
+
 .pt-history { padding: 4px 16px; }
 .pt-history-row { padding: 12px 0; border-bottom: 1px solid var(--lg-edge); font-size: 0.84rem; }
 .pt-history-row:last-child { border-bottom: 0; }

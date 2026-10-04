@@ -30,6 +30,19 @@ const AI_STEPS = new Set<BrowserProcessingAction>(['ocr', 'vision', 'faces']);
 
 interface HistoryEntry { actionId?: string; action?: string; steps?: string[]; scope?: string; filenameCount?: number; createdAt?: string; }
 
+interface VerifyFaceIndexResult {
+    checked: number;
+    mismatches: number;
+    errors: number;
+    results: Array<{
+        filename: string;
+        beforeFaceIds?: string[] | null;
+        afterFaceIds?: string[] | null;
+        mismatch?: boolean;
+        error?: string;
+    }>;
+}
+
 interface PeopleDiagnostic {
     totalFaces: number;
     acceptedForClustering: number;
@@ -67,6 +80,9 @@ export const ToolsPage: React.FC = () => {
     const [reselectingId, setReselectingId] = useState<string | null>(null);
     const [diagnostic, setDiagnostic] = useState<PeopleDiagnostic | null>(null);
     const [diagnosticLoading, setDiagnosticLoading] = useState(false);
+    const [verifyInput, setVerifyInput] = useState('');
+    const [verifyResult, setVerifyResult] = useState<VerifyFaceIndexResult | null>(null);
+    const [verifyLoading, setVerifyLoading] = useState(false);
 
     // A deep link ("Open in Workbench" from the gallery) pre-selects those
     // photos, but any photo in the loaded library can be searched for and
@@ -220,6 +236,24 @@ export const ToolsPage: React.FC = () => {
         }
     };
 
+    const runVerifyFaceIndex = async () => {
+        const filenames = verifyInput.split(/[\n,]/).map((f) => f.trim()).filter(Boolean);
+        if (!filenames.length) return;
+        setVerifyLoading(true);
+        setVerifyResult(null);
+        try {
+            const result = await postAdmin<VerifyFaceIndexResult>('/api/admin/people/verify-face-index', { filenames });
+            setVerifyResult(result);
+            toast(result.mismatches > 0
+                ? `Fixed ${result.mismatches} of ${result.checked} photo${result.checked === 1 ? '' : 's'}`
+                : `All ${result.checked} photo${result.checked === 1 ? '' : 's'} already correct`);
+        } catch {
+            toast('Couldn’t verify face index', undefined, undefined, 'error');
+        } finally {
+            setVerifyLoading(false);
+        }
+    };
+
     return (
         <div>
             <div className="pt-toolbar">
@@ -347,6 +381,36 @@ export const ToolsPage: React.FC = () => {
                         <strong>Purge orphaned photo data</strong>
                         <span>Remove leftover rows/blobs for photos that no longer exist in the library.</span>
                         <button type="button" className="btn btn-danger" disabled={busy} onClick={() => void runAdmin('Purge orphaned photo data', '/api/admin/photos/purge-orphaned-data', { repair: true, confirm: 'PURGE_ORPHANED_PHOTO_DATA' })}>Purge</button>
+                    </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Verify/repair face index</strong>
+                        <span>Enter specific filenames (one per line, or comma-separated) to force a real re-check of their face data — fixes the ones that were wrong, confirms the rest.</span>
+                        <textarea
+                            className="pt-verify-input"
+                            rows={3}
+                            placeholder={'IMG_1234.jpg\nIMG_1235.heic'}
+                            value={verifyInput}
+                            onChange={(e) => setVerifyInput(e.target.value)}
+                            disabled={verifyLoading}
+                        />
+                        <button type="button" className="btn" disabled={verifyLoading || !verifyInput.trim()} onClick={() => void runVerifyFaceIndex()}>
+                            {verifyLoading ? <Spinner /> : 'Verify & repair'}
+                        </button>
+                        {verifyResult && (
+                            <div className="pt-verify-results">
+                                <div>{verifyResult.checked} checked · {verifyResult.mismatches} fixed · {verifyResult.errors} error{verifyResult.errors === 1 ? '' : 's'}</div>
+                                {verifyResult.results.map((r) => (
+                                    <div key={r.filename} className={`pt-verify-row${r.mismatch ? ' fixed' : ''}${r.error ? ' error' : ''}`}>
+                                        {r.filename}
+                                        {r.error
+                                            ? ` — error: ${r.error}`
+                                            : r.mismatch
+                                                ? ` — was ${(r.beforeFaceIds ?? []).length}, now ${(r.afterFaceIds ?? []).length} face(s)`
+                                                : ` — OK (${(r.afterFaceIds ?? []).length} face(s))`}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
                 </div>
             )}

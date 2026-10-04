@@ -10442,6 +10442,51 @@ def _queue_upload_processing(user_id: str, final_name: str) -> None:
     _queue_ipwork_processing(user_id, final_name)
 
 
+def _verify_face_filename_indexes(user_id: str, filenames: List[str]) -> Dict:
+    """Force a real partition-scan re-check of specific filenames' lookup
+    rows, bypassing the normal "trust what's already complete" shortcut.
+
+    Operator-invoked safety net (Tools > Verify/repair face index): run this
+    against filenames you suspect may have a stale or wrongly-empty
+    photofacebyfilename row (e.g. a person's photos that should show a face
+    but don't). Reports a mismatch wherever the real scan disagrees with
+    what the lookup claimed before this call -- those are the ones that
+    were actually broken; everything else is confirmed already correct.
+    """
+    results = []
+    mismatches = 0
+    errors = 0
+    for start in range(0, len(filenames), 32):
+        chunk = filenames[start:start + 32]
+        before = {name: get_face_ids_for_filename(user_id, name) for name in chunk}
+        try:
+            reconcile_face_filename_indexes_batch(user_id, chunk, force=True)
+        except Exception as exc:
+            for name in chunk:
+                results.append({'filename': name, 'error': str(exc)})
+                errors += 1
+            continue
+        for name in chunk:
+            before_ids = before.get(name)
+            after_ids = get_face_ids_for_filename(user_id, name)
+            mismatch = sorted(before_ids or []) != sorted(after_ids or [])
+            if mismatch:
+                mismatches += 1
+            results.append({
+                'filename': name,
+                'beforeFaceIds': before_ids,
+                'afterFaceIds': after_ids,
+                'mismatch': mismatch,
+            })
+    return {
+        'success': True,
+        'checked': len(filenames),
+        'mismatches': mismatches,
+        'errors': errors,
+        'results': results,
+    }
+
+
 def _face_ids_awaiting_person_assignment(user_id: str, filename: str) -> List[str]:
     """Face rows for one photo that don't have a personId yet. metadata's own
     'faces' list never carries the server-assigned Table RowKey (it's built

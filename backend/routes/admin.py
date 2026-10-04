@@ -297,6 +297,37 @@ def admin_enqueue_ipwork():
         'steps': steps_to_run,
     })
 
+@admin_bp.route('/api/admin/people/verify-face-index', methods=['POST'])
+@admin_bp.route('/admin/people/verify-face-index', methods=['POST'])
+def admin_verify_face_index():
+    """Force a real re-scan of specific filenames' face lookup rows and report
+    any mismatch against what they claimed before -- a bounded, caller-
+    selected safety net for the keyed photofacebyfilename index, not a
+    library-wide action. No confirm gate: read-mostly, and any correction it
+    makes is strictly fixing the lookup to match what the face table already
+    says, the same thing the normal amortized path does for unknown rows.
+    """
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._people_features_available():
+        return app.jsonify({'error': 'People features not configured'}), 503
+    data = app.request.get_json(silent=True) or {}
+    raw_filenames = data.get('filenames')
+    if not isinstance(raw_filenames, list) or not raw_filenames:
+        return app.jsonify({'error': 'filenames must be a non-empty list', 'code': 'invalid_filenames'}), 400
+    if len(raw_filenames) > 500:
+        return app.jsonify({'error': 'Too many filenames (max 500)', 'code': 'too_many_filenames'}), 400
+    filenames = []
+    for raw_name in raw_filenames:
+        filename = app._validate_media_filename(str(raw_name or ''))
+        if filename:
+            filenames.append(filename)
+    if not filenames:
+        return app.jsonify({'error': 'No valid filenames provided', 'code': 'invalid_filenames'}), 400
+    result = app._verify_face_filename_indexes(user_id, filenames)
+    return app.jsonify(result)
+
 @admin_bp.route('/api/admin/photos/purge-orphaned-data', methods=['POST'])
 @admin_bp.route('/admin/photos/purge-orphaned-data', methods=['POST'])
 def admin_purge_orphaned_photo_data():
