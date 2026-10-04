@@ -3406,41 +3406,17 @@ def get_user_listing_index(
                 _LISTING_INDEX_CACHE[key] = data
             return data
 
-    if not allow_refresh:
-        return None
-    lexical = get_user_lexical_index(key, allow_refresh=True, allow_sync_build=allow_sync_build)
-    if lexical is None:
-        return None
-    # refresh_user_lexical_index already wrote/cached the listing blob as a
-    # side effect of the refresh get_user_lexical_index just triggered.
-    with _LISTING_INDEX_CACHE_LOCK:
-        cached = _LISTING_INDEX_CACHE.get(key)
-    if cached:
-        return cached
-    # Fell back to an already-fresh cached lexical snapshot that predates this
-    # feature (no listing blob ever written) -- derive it in-process once.
-    return {
-        'source_version': lexical.get('source_version'),
-        'schema_version': lexical.get('schema_version'),
-        'updated_at': lexical.get('updated_at'),
-        'rows': [
-            {k: v for k, v in row.items() if k in PHOTO_LIST_SELECT_FIELDS}
-            for row in (lexical.get('rows') or [])
-        ],
-    }
+    # Not current (or never built). Deliberately NO fallback to building the
+    # full lexical snapshot here: that is a multi-GB allocation, and this runs on
+    # the 1Gi backend. The index build (worker) writes this blob; until then
+    # callers fall back to their own bounded paths.
+    return None
 
 
 # --- Search-database row reduction helpers -------------------------------------
-# What the BROWSER downloads for client-side search (localLexicalSearch.ts).
-# The full lexical blob carries every metadata column (hundreds of MB gzipped
-# -> 700MB+ of JSON at ~130k photos, enough to blow V8's string limit and the
-# backend's memory). The client only reads a fixed set of fields, so this blob
-# keeps exactly those, and shrinks the three bulky ones: exifData is reduced to
-# the keys search reads, processing_metadata to the >=0.2-score AI-vision labels
-# predictionTags() uses, and ocrText is capped. Written in the same pass as the
-# lexical/listing blobs (no extra Table reads). The full lexical blob stays the
-# server-side source of truth; search-index falls back to it if this one is
-# missing or stale.
+# Used by search_db.reduced_row to keep the SQLite search database small: tags
+# are de-duplicated and confidence-filtered, AI predictions cut to a few labels,
+# EXIF to the keys search reads, and OCR capped.
 # Browser-index size knobs. Everything here only affects the slim BROWSER blob;
 # the full lexical blob (server-side fallback search) is untouched.
 SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '400'))
@@ -3577,24 +3553,180 @@ def _search_prediction_labels(raw, already: set) -> List[str]:
 
 
 
+# --- Streaming library build ---------------------------------------------------
+# ONE paged pass over the metadata partition feeds every derived artifact that
+# used to be built from a full in-memory snapshot of the library (the lexical
+# blob alone was ~700MB of JSON at ~130k photos -- several GB as Python objects,
+# plus a serialized copy, a listing copy and per-consumer reloads: the OOM that
+# killed index builds). Rows are offered to small "sinks" (listing blob, SQLite
+# search database, Explore and timeline aggregators) and then dropped, so memory
+# stays flat no matter how big the library is.
+#
+# Server-side projection (select=) matters as much as streaming: the old scan
+# downloaded the ~10KB-per-photo embedding columns just to discard them.
+_STREAM_SELECT_FIELDS = sorted(set(PHOTO_LIST_SELECT_FIELDS) | {
+    'subjectTags', 'peopleNames', 'tags', 'objects', 'backgroundTags', 'tagMetadata',
+    'ocrText', 'caption', 'aiPersonLabel', 'locationRegion', 'processing_complete',
+    'faceCount', 'peopleIds', 'latitude', 'longitude', 'address', 'locationCity',
+    'locationCountry', 'exifData', 'processing_metadata',
+})
+
+# Set by app.py at import: callable(user_id, source_version=None) running the
+# streaming build with the app-level sinks (Explore needs app helpers).
+LEXICAL_BUILD_HOOK: Optional[Callable[..., object]] = None
+
+
+def iter_library_rows(user_id: str):
+    """Yield the library's finished, non-deleted metadata rows one at a time
+    (projected columns only). Raises if the scan fails, so callers never
+    persist a partial result as if it were the whole library."""
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        raise RuntimeError('metadata table not configured')
+    for row in metadata_table_client.query_entities(
+        f"PartitionKey eq '{_escape_odata(user_id)}' and processing_complete eq true",
+        select=_STREAM_SELECT_FIELDS,
+    ):
+        if not str(row.get('RowKey') or '').strip():
+            continue
+        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+            continue
+        yield row
+
+
+class ListingSink:
+    """Writes the narrow listing projection (PHOTO_LIST_SELECT_FIELDS) as a
+    gzip JSON file incrementally, then uploads it on finish()."""
+
+    def __init__(self, user_id: str, source_version: str, workdir: str) -> None:
+        self.user_id = user_id
+        self.source_version = source_version
+        self.path = os.path.join(workdir, 'listing.json.gz')
+        self._fh = gzip.open(self.path, 'wb', compresslevel=5)
+        header = {
+            'userId': user_id, 'sourceVersion': source_version,
+            'schemaVersion': _LEXICAL_INDEX_SCHEMA_VERSION, 'updatedAt': source_version,
+        }
+        self._fh.write((json.dumps(header, separators=(',', ':'))[:-1] + ',"rows":[').encode('utf-8'))
+        self.count = 0
+
+    def add(self, row: Dict) -> None:
+        projected = {k: v for k, v in row.items() if k in PHOTO_LIST_SELECT_FIELDS}
+        self._fh.write((',' if self.count else '').encode('utf-8'))
+        self._fh.write(json.dumps(projected, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8'))
+        self.count += 1
+
+    def abort(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def finish(self) -> None:
+        self._fh.write(b']}')
+        self._fh.close()
+        container_name = _lexical_index_container_name()
+        if not container_name:
+            return
+        blob_client = _get_blob_client(container_name, _listing_index_json_blob_name(self.user_id))
+        manifest_client = _get_blob_client(container_name, _listing_index_manifest_blob_name(self.user_id))
+        if blob_client is None or manifest_client is None:
+            return
+        with open(self.path, 'rb') as fh:
+            blob_client.upload_blob(
+                fh, overwrite=True,
+                content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+            )
+        manifest_client.upload_blob(
+            json.dumps({
+                'userId': self.user_id, 'sourceVersion': self.source_version,
+                'schemaVersion': _LEXICAL_INDEX_SCHEMA_VERSION, 'rowCount': self.count, 'updatedAt': self.source_version,
+            }, separators=(',', ':')).encode('utf-8'),
+            overwrite=True, content_settings=BlobContentSettings(content_type='application/json'),
+        )
+        invalidate_user_listing_index_cache(self.user_id)
+
+
+def stream_library_artifacts(user_id: str, source_version: Optional[str], sinks_factory) -> Optional[int]:
+    """Run the single streaming pass. ``sinks_factory(source_version, workdir)``
+    returns the sinks (objects with add(row) / finish() / abort()). Nothing is
+    published unless the whole scan succeeds. Returns the photo count, or None
+    on failure (an empty-looking partial result must never replace a good one)."""
+    import shutil
+    import tempfile
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    version = str(source_version or datetime.now(timezone.utc).isoformat())
+    dirty_before = _get_dirty_search_index_filenames(key, 'lexical') or set()
+    workdir = tempfile.mkdtemp(prefix='library-build-')
+    sinks = []
+    count = 0
+    try:
+        sinks = list(sinks_factory(version, workdir))
+        with perf_instrumentation.span('index.stream.scan', user=key):
+            for row in iter_library_rows(key):
+                for sink in sinks:
+                    sink.add(row)
+                count += 1
+        for sink in sinks:
+            with perf_instrumentation.span(f'index.stream.finish.{type(sink).__name__}', user=key):
+                sink.finish()
+    except Exception:
+        _LOGGER.exception('Streaming library build failed for user %s', key)
+        for sink in sinks:
+            try:
+                sink.abort()
+            except Exception:
+                pass
+        return None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    # Same manifest the full lexical refresh used to write: readiness, listing
+    # freshness and the dirty flag all key off it.
+    container_name = _lexical_index_container_name()
+    if container_name:
+        _clear_manifest_dirty_flag(key, 'lexical')
+        manifest_client = _get_blob_client(container_name, _lexical_index_manifest_blob_name(key))
+        if manifest_client is not None:
+            manifest_client.upload_blob(
+                json.dumps({
+                    'userId': key, 'sourceVersion': version, 'schemaVersion': _LEXICAL_INDEX_SCHEMA_VERSION,
+                    'rowCount': count, 'dirty': False, 'updatedAt': version,
+                }, separators=(',', ':')).encode('utf-8'),
+                overwrite=True, content_settings=BlobContentSettings(content_type='application/json'),
+            )
+    invalidate_user_lexical_index_cache(key)
+    if dirty_before:
+        _clear_dirty_search_index_filenames(key, 'lexical', dirty_before)
+    perf_instrumentation.log_event('library_stream_built', user=key, rows=count)
+    return count
+
+
+def refresh_user_lexical_artifacts(user_id: str, source_version: Optional[str] = None):
+    """What the index primer runs for the 'lexical' kind: the app-level streaming
+    build when registered, else the legacy full-snapshot refresh (tests only)."""
+    hook = LEXICAL_BUILD_HOOK
+    if hook is not None:
+        return hook(user_id, source_version=source_version)
+    return refresh_user_lexical_index(user_id, source_version=source_version)
+
+
 def ensure_user_search_db(user_id: str) -> bool:
-    """(Re)build the library's SQLite search database (see search_db.py) from the
-    already-built lexical blob when it is missing or stale -- e.g. right after a
-    deploy, before any new lexical rebuild would write it. Heavy (loads the full
-    lexical blob), so only the `tools` role calls this. True when a current DB
-    exists."""
+    """Make sure a current SQLite search database exists, running the streaming
+    library build if it does not (heavy: a full table scan, so only the worker
+    role calls this). True when a current DB exists."""
     import search_db
     key = str(user_id or '').strip()
-    lexical_manifest = _load_lexical_index_manifest(key) if key else {}
-    version = str(lexical_manifest.get('sourceVersion') or '')
-    if not version:
+    if not key:
         return False
-    if search_db.is_current(key, version):
+    lexical_version = str(_load_lexical_index_manifest(key).get('sourceVersion') or '')
+    if lexical_version and search_db.is_current(key, lexical_version):
         return True
-    snapshot = _load_lexical_index_blob(key)
-    if snapshot is None:
+    if refresh_user_lexical_artifacts(key) is None:
         return False
-    return search_db.write_for_snapshot(key, snapshot)
+    new_version = str(_load_lexical_index_manifest(key).get('sourceVersion') or '')
+    return bool(new_version) and search_db.is_current(key, new_version)
 
 
 def delete_user_lexical_index_data(user_id: str) -> None:
@@ -4360,23 +4492,23 @@ def _build_user_sort_index_snapshot(user_id: str, source_version: str) -> Option
         # select= keeps this full-library scan from pulling the large
         # embedding/OCR/tag columns it never uses -- see _SORT_INDEX_SOURCE_FIELDS.
         with perf_instrumentation.span('index.sort.table_scan', user=user_id):
-            rows = list(metadata_table_client.query_entities(
+            trimmed_rows: List[Dict[str, object]] = []
+            # lazily paged and trimmed row by row -- never list()ed: the raw rows
+            # carry whole EXIF JSON strings, which add up at 130k photos.
+            for row in metadata_table_client.query_entities(
                 f"PartitionKey eq '{_escape_odata(user_id)}'",
                 select=_SORT_INDEX_SOURCE_FIELDS,
-            ))
+            ):
+                if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+                    continue
+                trimmed = _sort_index_row(dict(row))
+                if trimmed is not None:
+                    trimmed_rows.append(trimmed)
     except Exception:
         # A transient query failure must not be treated as "empty library" --
         # refresh_user_sort_index persists whatever this returns as the new
         # dirty:false state (see refresh_user_lexical_index's identical note).
         return None
-
-    trimmed_rows: List[Dict[str, object]] = []
-    for row in rows:
-        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
-            continue
-        trimmed = _sort_index_row(dict(row))
-        if trimmed is not None:
-            trimmed_rows.append(trimmed)
 
     return LexicalIndexSnapshot(
         user_id=str(user_id),
@@ -4806,21 +4938,20 @@ def _build_user_access_index_snapshot(user_id: str, source_version: str) -> Opti
         # _ACCESS_INDEX_SOURCE_FIELDS. Deliberately no processing_state filter:
         # trashed rows belong in this index same as active ones, see the
         # module comment above.
-        rows = list(metadata_table_client.query_entities(
+        rows = metadata_table_client.query_entities(  # lazily paged -- not list()ed
             f"PartitionKey eq '{_escape_odata(user_id)}'",
             select=_ACCESS_INDEX_SOURCE_FIELDS,
-        ))
+        )
+        trimmed_rows: List[Dict[str, object]] = []
+        for row in rows:
+            trimmed = _access_index_row(dict(row))
+            if trimmed is not None:
+                trimmed_rows.append(trimmed)
     except Exception:
         # A transient query failure must not be treated as "empty library" --
         # refresh_user_access_index persists whatever this returns as the new
         # dirty:false state (see refresh_user_sort_index's identical note).
         return None
-
-    trimmed_rows: List[Dict[str, object]] = []
-    for row in rows:
-        trimmed = _access_index_row(dict(row))
-        if trimmed is not None:
-            trimmed_rows.append(trimmed)
 
     return LexicalIndexSnapshot(
         user_id=str(user_id),
@@ -6056,7 +6187,7 @@ def prime_all_user_indexes_sequentially(
             for kind, refresh_fn, kind_locks in (
                 ('sort', refresh_user_sort_index, _SORT_INDEX_REBUILD_LOCKS),
                 ('access', refresh_user_access_index, _ACCESS_INDEX_REBUILD_LOCKS),
-                ('lexical', refresh_user_lexical_index, _LEXICAL_INDEX_REBUILD_LOCKS),
+                ('lexical', lambda key, source_version=None: refresh_user_lexical_artifacts(key, source_version), _LEXICAL_INDEX_REBUILD_LOCKS),
                 ('albums', refresh_user_albums_index, _ALBUMS_INDEX_REBUILD_LOCKS),
                 ('people', refresh_user_people_index, _PEOPLE_INDEX_REBUILD_LOCKS),
             ):

@@ -116,30 +116,38 @@ def document_text(filename: str, row: Dict) -> str:
     ) if part)
 
 
-def _location_terms(rows: Iterable[Dict]) -> List[str]:
-    terms = set()
-    for row in rows:
-        for field in ('locationCity', 'locationRegion', 'locationCountry', 'address'):
-            phrase = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(row.get(field) or '').lower())).strip()
-            if not phrase:
-                continue
-            for part in phrase.split(' '):
-                if len(part) >= 3:
-                    terms.add(part)
-            if field != 'address':  # full street addresses are per-photo noise
-                terms.add(phrase)
-    return sorted(terms, key=len, reverse=True)
+def _collect_location_terms(into: set, row: Dict) -> None:
+    for field in ('locationCity', 'locationRegion', 'locationCountry', 'address'):
+        phrase = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(row.get(field) or '').lower())).strip()
+        if not phrase:
+            continue
+        for part in phrase.split(' '):
+            if len(part) >= 3:
+                into.add(part)
+        if field != 'address':  # full street addresses are per-photo noise
+            into.add(phrase)
 
 
 # --- build --------------------------------------------------------------------
 
-def build_database(rows: Iterable[Dict], path: str) -> int:
-    """Write the SQLite file at ``path``. Returns the number of photos indexed."""
-    if os.path.exists(path):
-        os.remove(path)
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript(
+class DatabaseBuilder:
+    """Streaming SQLite writer: add(row) per photo, finish() once. Holds one
+    2000-row batch and a set of place-name terms -- nothing else -- so building
+    the database never needs the library in memory."""
+
+    BATCH = 2000
+
+    def __init__(self, path: str) -> None:
+        if os.path.exists(path):
+            os.remove(path)
+        self.path = path
+        self.count = 0
+        self._terms: set = set()
+        self._rows: List[Tuple] = []
+        self._fts: List[Tuple] = []
+        self._people: List[Tuple] = []
+        self._conn = sqlite3.connect(path)
+        self._conn.executescript(
             '''
             PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA page_size=8192;
             CREATE TABLE rows(id INTEGER PRIMARY KEY, filename TEXT NOT NULL, capture_day INTEGER, row_json TEXT NOT NULL);
@@ -149,51 +157,65 @@ def build_database(rows: Iterable[Dict], path: str) -> int:
                 tokenize='unicode61 remove_diacritics 2', prefix='3 4');
             '''
         )
-        count = 0
-        location_rows: List[Dict] = []
-        batch_rows: List[Tuple] = []
-        batch_fts: List[Tuple] = []
-        batch_people: List[Tuple] = []
-        for row in rows:
-            filename = str(row.get('RowKey') or '').strip()
-            if not filename:
-                continue
-            count += 1
-            slim = reduced_row(row)
-            captured = metadata_capture_datetime(row)
-            day = captured.astimezone(timezone.utc).date().toordinal() if captured else None
-            batch_rows.append((count, filename, day, json.dumps(slim, ensure_ascii=False, separators=(',', ':'))))
-            batch_fts.append((count, document_text(filename, slim)))
-            try:
-                for pid in json.loads(row.get('peopleIds') or '[]'):
-                    batch_people.append((str(pid), count))
-            except Exception:
-                pass
-            location_rows.append({k: slim.get(k) for k in ('locationCity', 'locationRegion', 'locationCountry', 'address')})
-            if len(batch_rows) >= 2000:
-                _flush(conn, batch_rows, batch_fts, batch_people)
-        _flush(conn, batch_rows, batch_fts, batch_people)
+
+    def add(self, row: Dict) -> None:
+        filename = str(row.get('RowKey') or '').strip()
+        if not filename:
+            return
+        self.count += 1
+        slim = reduced_row(row)
+        captured = metadata_capture_datetime(row)
+        day = captured.astimezone(timezone.utc).date().toordinal() if captured else None
+        self._rows.append((self.count, filename, day, json.dumps(slim, ensure_ascii=False, separators=(',', ':'))))
+        self._fts.append((self.count, document_text(filename, slim)))
+        try:
+            for pid in json.loads(row.get('peopleIds') or '[]'):
+                self._people.append((str(pid), self.count))
+        except Exception:
+            pass
+        _collect_location_terms(self._terms, slim)
+        if len(self._rows) >= self.BATCH:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._rows:
+            self._conn.executemany('INSERT INTO rows(id, filename, capture_day, row_json) VALUES(?,?,?,?)', self._rows)
+            self._conn.executemany('INSERT INTO fts(rowid, doc) VALUES(?,?)', self._fts)
+        if self._people:
+            self._conn.executemany('INSERT INTO row_people(person_id, id) VALUES(?,?)', self._people)
+        self._rows, self._fts, self._people = [], [], []
+
+    def finish(self) -> int:
+        self._flush()
+        conn = self._conn
         conn.execute('CREATE INDEX rows_capture ON rows(capture_day)')
         conn.execute('CREATE INDEX rows_filename ON rows(filename)')
         conn.execute('CREATE INDEX row_people_pid ON row_people(person_id)')
-        conn.execute('INSERT INTO meta VALUES(?, ?)', ('location_terms', json.dumps(_location_terms(location_rows))))
+        conn.execute('INSERT INTO meta VALUES(?, ?)', (
+            'location_terms', json.dumps(sorted(self._terms, key=len, reverse=True))))
         conn.execute('INSERT INTO meta VALUES(?, ?)', ('schema', SCHEMA_VERSION))
         conn.execute("INSERT INTO fts(fts) VALUES('optimize')")
         conn.commit()
-        return count
-    finally:
         conn.close()
+        return self.count
+
+    def abort(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
 
-def _flush(conn, batch_rows, batch_fts, batch_people) -> None:
-    if batch_rows:
-        conn.executemany('INSERT INTO rows(id, filename, capture_day, row_json) VALUES(?,?,?,?)', batch_rows)
-        conn.executemany('INSERT INTO fts(rowid, doc) VALUES(?,?)', batch_fts)
-    if batch_people:
-        conn.executemany('INSERT INTO row_people(person_id, id) VALUES(?,?)', batch_people)
-    batch_rows.clear()
-    batch_fts.clear()
-    batch_people.clear()
+def build_database(rows: Iterable[Dict], path: str) -> int:
+    """Write the SQLite file at ``path`` from any iterable of rows."""
+    builder = DatabaseBuilder(path)
+    try:
+        for row in rows:
+            builder.add(row)
+        return builder.finish()
+    except Exception:
+        builder.abort()
+        raise
 
 
 # --- query --------------------------------------------------------------------
@@ -320,25 +342,38 @@ def is_current(user_id: str, lexical_source_version: str) -> bool:
     )
 
 
-def write_for_snapshot(user_id: str, snapshot) -> bool:
-    """Build the DB from an in-memory lexical snapshot (tools role) and upload
-    it. Best-effort: a failure only means search keeps reporting 'building'."""
-    data_name, manifest_name = _blob_names(user_id)
-    data_client, manifest_client = _blob_client(data_name), _blob_client(manifest_name)
-    if data_client is None or manifest_client is None:
-        return False
-    workdir = tempfile.mkdtemp(prefix='searchdb-build-')
-    try:
-        db_path = os.path.join(workdir, 'search.sqlite')
-        with perf_instrumentation.span('searchdb.build', user=user_id, rows=len(snapshot.rows)):
-            count = build_database(snapshot.rows, db_path)
-        gz_path = db_path + '.gz'
+class SearchDbSink:
+    """Stream-build sink: add(row) per photo, finish() builds, gzips and uploads
+    the database + manifest (publishing only on success)."""
+
+    def __init__(self, user_id: str, source_version: str, workdir: str, updated_at: Optional[str] = None) -> None:
+        self.user_id = user_id
+        self.source_version = source_version
+        self.updated_at = updated_at or source_version
+        self.db_path = os.path.join(workdir, 'search.sqlite')
+        self._builder = DatabaseBuilder(self.db_path)
+
+    def add(self, row: Dict) -> None:
+        self._builder.add(row)
+
+    def abort(self) -> None:
+        self._builder.abort()
+
+    def finish(self) -> None:
+        user_id = self.user_id
+        data_name, manifest_name = _blob_names(user_id)
+        data_client, manifest_client = _blob_client(data_name), _blob_client(manifest_name)
+        with perf_instrumentation.span('searchdb.build', user=user_id, rows=self._builder.count):
+            count = self._builder.finish()
+        if data_client is None or manifest_client is None:
+            raise RuntimeError('search database blob storage is not configured')
+        gz_path = self.db_path + '.gz'
         with perf_instrumentation.span('searchdb.gzip', user=user_id):
-            with open(db_path, 'rb') as src, gzip.open(gz_path, 'wb', compresslevel=5) as dst:
+            with open(self.db_path, 'rb') as src, gzip.open(gz_path, 'wb', compresslevel=5) as dst:
                 shutil.copyfileobj(src, dst, 1024 * 1024)
         perf_instrumentation.log_event(
             'searchdb_built', user=user_id, rows=count,
-            sqlite_mb=round(os.path.getsize(db_path) / 1048576, 1), gz_mb=round(os.path.getsize(gz_path) / 1048576, 1),
+            sqlite_mb=round(os.path.getsize(self.db_path) / 1048576, 1), gz_mb=round(os.path.getsize(gz_path) / 1048576, 1),
         )
         from azure.storage.blob import ContentSettings
         with perf_instrumentation.span('searchdb.upload', user=user_id):
@@ -346,11 +381,26 @@ def write_for_snapshot(user_id: str, snapshot) -> bool:
                 data_client.upload_blob(fh, overwrite=True, content_settings=ContentSettings(content_type='application/gzip'))
         manifest_client.upload_blob(
             json.dumps({
-                'userId': user_id, 'sourceVersion': snapshot.source_version, 'schemaVersion': SCHEMA_VERSION,
-                'rowCount': count, 'updatedAt': snapshot.updated_at,
+                'userId': user_id, 'sourceVersion': self.source_version, 'schemaVersion': SCHEMA_VERSION,
+                'rowCount': count, 'updatedAt': self.updated_at,
             }, separators=(',', ':')).encode('utf-8'),
             overwrite=True, content_settings=ContentSettings(content_type='application/json'),
         )
+
+
+def write_for_snapshot(user_id: str, snapshot) -> bool:
+    """Build + upload the database from an in-memory snapshot (legacy/tests; the
+    index build streams rows through SearchDbSink instead). Best-effort."""
+    workdir = tempfile.mkdtemp(prefix='searchdb-build-')
+    try:
+        sink = SearchDbSink(user_id, snapshot.source_version, workdir, snapshot.updated_at)
+        try:
+            for row in snapshot.rows:
+                sink.add(row)
+            sink.finish()
+        except Exception:
+            sink.abort()
+            raise
         return True
     except Exception:
         _LOGGER.exception('Search DB build/upload failed for user %s', user_id)

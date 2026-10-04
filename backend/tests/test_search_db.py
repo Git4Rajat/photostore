@@ -163,16 +163,28 @@ def test_searchdb_blobs_bypass_the_azure_files_share(blobs, monkeypatch, tmp_pat
     assert isinstance(storage_utils._get_blob_client('lexical-index', 'k-sort.json.gz'), storage_utils._ShareBackedBlob)
 
 
-def test_ensure_user_search_db_derives_from_existing_lexical_blob(blobs, monkeypatch):
-    table = FakeTable()
-    monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', table)
-    table.upsert_entity({**_big_row(), 'processing_complete': True})
-    storage_utils.refresh_user_lexical_index('lib', source_version='v7')  # writes DB as a side effect
-    assert search_db.is_current('lib', 'v7')
-    blobs.blobs = {k: v for k, v in blobs.blobs.items() if 'searchdb' not in k}  # pre-deploy library
-    assert not search_db.is_current('lib', 'v7')
-    assert storage_utils.ensure_user_search_db('lib') is True
-    assert search_db.is_current('lib', 'v7')
+def test_ensure_user_search_db_runs_the_streaming_build_only_when_stale(blobs, monkeypatch):
+    cls = blobs.get_blob_client('x', 'y').__class__
+    original = cls.upload_blob
+    monkeypatch.setattr(cls, 'upload_blob', lambda self, data, overwrite=True, content_settings=None:
+                        original(self, data.read() if hasattr(data, 'read') else data, overwrite, content_settings))
+    calls = []
+
+    class _V7(_Snap):
+        source_version = 'v7'
+        updated_at = 'v7'
+
+    def hook(user_id, source_version=None):
+        calls.append(user_id)
+        blobs.blobs['lexical-index/' + storage_utils._lexical_index_manifest_blob_name(user_id)] = json.dumps(
+            {'sourceVersion': 'v7'}).encode()
+        search_db.write_for_snapshot(user_id, _V7([_big_row()]))
+        return 1
+
+    monkeypatch.setattr(storage_utils, 'LEXICAL_BUILD_HOOK', hook)
+    assert storage_utils.ensure_user_search_db('lib') is True and calls == ['lib']   # stale -> built
+    assert storage_utils.ensure_user_search_db('lib') is True and calls == ['lib']   # current -> no rebuild
+    assert storage_utils.ensure_user_search_db('') is False
 
 
 # --- the route ---------------------------------------------------------------------

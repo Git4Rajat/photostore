@@ -48,7 +48,7 @@ from ordering_utils import (
     metadata_upload_datetime,
     epoch_millis_to_iso,
 )
-from timeline_metadata import build_timeline_summary
+from timeline_metadata import TimelineAccumulator, build_timeline_summary
 from image_utils import (
     BROWSER_UNVIEWABLE_EXTENSIONS,
     RAW_EXTENSIONS_CINEMA,
@@ -143,6 +143,9 @@ from storage_utils import (
     load_explore_summary,
     store_timeline_summary,
     warm_user_index_files_async,
+    iter_library_rows,
+    stream_library_artifacts,
+    ListingSink,
     ensure_user_search_db as storage_utils_ensure_search_db,
     ensure_user_sort_index_current as storage_utils_ensure_sort_current,
     _SORT_INDEX_SCHEMA_VERSION as SORT_INDEX_SCHEMA_VERSION,
@@ -226,6 +229,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 worker_logger = logging.getLogger(__name__)
 import perf_instrumentation
+import storage_utils as storage_utils_module
 perf_instrumentation.install(app)
 placeholder_bytes = create_placeholder_thumbnail()
 
@@ -8127,37 +8131,27 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
 EXPLORE_MAX_GROUPS = 24
 
 
-def _explore_places_and_things(user_id: str) -> Dict[str, List[Dict]]:
-    """Groups a library into Places (by location) and Things (by tag/object)
-    for the Explore page. Sourced from the already-cached lexical index blob
-    (get_user_lexical_index) rather than a fresh table scan -- the scan cost
-    is already paid for by search, so this groupBy is just an in-process
-    iteration over rows already sitting in memory. Grouping/normalization
-    mirrors _smart_album_candidates's 'location' and 'tag-object' rules
-    exactly, so the same city spelled two ways or the same tag in different
-    case collapses into one group here too.
+class ExploreAccumulator:
+    """Streaming Places + Things grouping for the Explore page. Grouping and
+    normalization mirror _smart_album_candidates's 'location' and 'tag-object'
+    rules exactly, so the same city spelled two ways or the same tag in
+    different case collapses into one group.
 
-    allow_sync_build=False -- like photos_sort_index/photos_search_index --
-    means a user whose lexical index has never been built gets empty
-    places/things back immediately (background build kicked off, deduped
-    with any concurrent build from the tools role's index builder) instead of
-    blocking ~60-75s on a full Table scan. Explore is fetched unconditionally on every
-    session start (store.tsx's fetchExplore), so without this it was one of
-    two calls (alongside /photos/timeline) that could occupy both of this
-    backend's gunicorn threads for the entire scan, queuing every other
-    request behind it -- see the 2026-09-29 forenkla-qa HAR investigation."""
-    lexical = get_user_lexical_index(user_id, allow_refresh=True, allow_sync_build=False)
-    rows = (lexical or {}).get('rows') or []
-    pid_to_name, _ = _load_people_name_index(user_id)
+    Memory is bounded by the number of distinct places/tags, NOT by library
+    size or row size: a group keeps only its count, label, coordinates and the
+    first filename seen. Full metadata is point-read for just the winning
+    groups at the end (<= 2 * EXPLORE_MAX_GROUPS photos) -- the old version kept
+    a whole metadata row per group, which for thousands of distinct tags was
+    thousands of full rows."""
 
-    place_groups: Dict[str, Dict] = {}
-    thing_groups: Dict[str, Dict] = {}
+    def __init__(self) -> None:
+        self.place_groups: Dict[str, Dict] = {}
+        self.thing_groups: Dict[str, Dict] = {}
 
-    for row in rows:
+    def add(self, row: Dict) -> None:
         filename = row.get('RowKey')
         if not filename:
-            continue
-
+            return
         city = str(row.get('locationCity') or '').strip()
         country = str(row.get('locationCountry') or '').strip()
         address = str(row.get('address') or '').strip()
@@ -8168,37 +8162,58 @@ def _explore_places_and_things(user_id: str) -> Dict[str, List[Dict]]:
             label = f'{latitude[:8]}, {longitude[:8]}'
         place_key = _normalize_search_phrase(label)
         if place_key:
-            group = place_groups.setdefault(place_key, {
-                'label': _smart_album_title(label), 'count': 0, 'row': row, 'filename': filename,
+            group = self.place_groups.setdefault(place_key, {
+                'label': _smart_album_title(label), 'count': 0, 'filename': filename,
                 'latitude': latitude, 'longitude': longitude,
             })
             group['count'] += 1
-
         terms = parse_tags(row.get('tags', '[]')) + parse_json_list(row.get('objects', '[]'))
         for term in dict.fromkeys(terms):
             term_key = _normalize_search_phrase(term)
             if not term_key:
                 continue
-            group = thing_groups.setdefault(term_key, {
-                'label': _smart_album_title(term), 'count': 0, 'row': row, 'filename': filename,
+            group = self.thing_groups.setdefault(term_key, {
+                'label': _smart_album_title(term), 'count': 0, 'filename': filename,
             })
             group['count'] += 1
 
-    def _finalize(groups: Dict[str, Dict], include_coords: bool) -> List[Dict]:
-        items = sorted(groups.values(), key=lambda g: g['count'], reverse=True)[:EXPLORE_MAX_GROUPS]
-        results = []
-        for item in items:
-            photo = _build_photo_summary(
-                user_id, item['filename'], item['row'], include_props=False, pid_to_name=pid_to_name,
-            )
-            entry: Dict[str, object] = {'label': item['label'], 'count': item['count'], 'photo': photo}
-            if include_coords:
-                entry['latitude'] = item['latitude']
-                entry['longitude'] = item['longitude']
-            results.append(entry)
-        return results
+    def finalize(self, user_id: str) -> Dict[str, List[Dict]]:
+        pid_to_name, _ = _load_people_name_index(user_id)
 
-    return {'places': _finalize(place_groups, True), 'things': _finalize(thing_groups, False)}
+        def _top(groups: Dict[str, Dict]) -> List[Dict]:
+            return sorted(groups.values(), key=lambda g: g['count'], reverse=True)[:EXPLORE_MAX_GROUPS]
+
+        places, things = _top(self.place_groups), _top(self.thing_groups)
+        filenames = list(dict.fromkeys(item['filename'] for item in places + things))
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(filenames)))) as executor:
+            fetched = dict(zip(filenames, executor.map(lambda name: _get_metadata_entity(user_id, name), filenames)))
+
+        def _build(items: List[Dict], include_coords: bool) -> List[Dict]:
+            results = []
+            for item in items:
+                metadata = fetched.get(item['filename'])
+                if not metadata:
+                    continue
+                photo = _build_photo_summary(
+                    user_id, item['filename'], metadata, include_props=False, pid_to_name=pid_to_name,
+                )
+                entry: Dict[str, object] = {'label': item['label'], 'count': item['count'], 'photo': photo}
+                if include_coords:
+                    entry['latitude'] = item['latitude']
+                    entry['longitude'] = item['longitude']
+                results.append(entry)
+            return results
+
+        return {'places': _build(places, True), 'things': _build(things, False)}
+
+
+def _explore_places_and_things(user_id: str, rows=None) -> Dict[str, List[Dict]]:
+    """Places + Things for the Explore page, streamed: ``rows`` is any iterable
+    (default: a fresh bounded-memory pass over the library)."""
+    accumulator = ExploreAccumulator()
+    for row in (rows if rows is not None else iter_library_rows(user_id)):
+        accumulator.add(row)
+    return accumulator.finalize(user_id)
 
 
 def refresh_user_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
@@ -8228,18 +8243,72 @@ def refresh_user_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
 
 
 def refresh_user_timeline_summary(user_id: str) -> Optional[Dict[str, object]]:
-    """Compute the year/month/day timeline summary and persist it as a small
-    blob. Runs on the `tools` role after an index build (see routes/tools.py)
-    so the 1Gi backend's /photos/timeline never has to load the listing index
-    into memory -- it serves load_timeline_summary instead."""
+    """Standalone timeline refresh (a bounded-memory pass over the library). The
+    index build normally feeds the same accumulator in its single streaming
+    pass (see _streaming_lexical_build) instead of calling this."""
     key = str(user_id or '').strip()
     if not key:
         return None
     with perf_instrumentation.span('timeline.refresh', user=key):
-        rows = _cached_metadata_list_rows_for_user(key, purpose='photos.timeline.build')
-        summary = build_timeline_summary(rows)
+        summary = build_timeline_summary(iter_library_rows(key))
     store_timeline_summary(key, summary)
     return summary
+
+
+class _ExploreSink:
+    def __init__(self, user_id: str, source_version: str) -> None:
+        self.user_id, self.source_version = user_id, source_version
+        self.accumulator = ExploreAccumulator()
+
+    def add(self, row: Dict) -> None:
+        self.accumulator.add(row)
+
+    def abort(self) -> None:
+        pass
+
+    def finish(self) -> None:
+        summary = self.accumulator.finalize(self.user_id)
+        store_explore_summary(self.user_id, {
+            'sourceVersion': self.source_version,
+            'updatedAt': datetime.now(timezone.utc).isoformat(),
+            'places': summary.get('places', []),
+            'things': summary.get('things', []),
+        })
+
+
+class _TimelineSink:
+    def __init__(self, user_id: str) -> None:
+        self.user_id = user_id
+        self.accumulator = TimelineAccumulator()
+
+    def add(self, row: Dict) -> None:
+        self.accumulator.add(row)
+
+    def abort(self) -> None:
+        pass
+
+    def finish(self) -> None:
+        store_timeline_summary(self.user_id, self.accumulator.summary())
+
+
+def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None):
+    """The 'lexical' step of the index build, replacing the old full-snapshot
+    refresh: ONE streaming pass over the table feeding the listing blob, the
+    SQLite search database, the Explore summary and the timeline summary (see
+    storage_utils.stream_library_artifacts). Memory stays flat in library size."""
+    import search_db
+
+    def _factory(version: str, workdir: str):
+        return [
+            ListingSink(user_id, version, workdir),
+            search_db.SearchDbSink(user_id, version, workdir),
+            _ExploreSink(user_id, version),
+            _TimelineSink(user_id),
+        ]
+    return stream_library_artifacts(user_id, source_version, _factory)
+
+
+storage_utils_module.LEXICAL_BUILD_HOOK = _streaming_lexical_build
 
 
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))
@@ -9595,6 +9664,7 @@ def _index_build_job_id(user_id: str) -> str:
 
 
 INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS', '30'))
+INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
 
 
 def _index_build_job_active(user_id: str) -> bool:
@@ -9645,12 +9715,23 @@ def enqueue_index_build(user_id: str, reason: str = '') -> str:
     if library_ops_queue_client is None:
         return 'unavailable'
     job_id = _index_build_job_id(key)
+    # A build is a full streamed scan of the library, so an upload burst that
+    # keeps dirtying the indexes must not trigger back-to-back rebuilds: if one
+    # finished moments ago, deliver this message after the minimum interval
+    # instead (the queued job row dedupes everything that arrives meanwhile).
+    delay = 0
+    previous = _get_job_row(key, job_id) if jobs_table_client is not None else None
+    if previous and str(previous.get('status') or '').lower() == 'done':
+        updated = _parse_iso_date(str(previous.get('updatedAt') or ''))
+        if updated is not None:
+            elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
+            delay = int(max(0, INDEX_BUILD_MIN_INTERVAL_SECONDS - elapsed))
     _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'queued')
     try:
         library_ops_queue_client.send_message(json.dumps(
             {'type': 'index_build', 'userId': key, 'jobId': job_id, 'reason': reason},
             separators=(',', ':'),
-        ))
+        ), visibility_timeout=delay or None)
     except Exception:
         worker_logger.exception('Failed to enqueue index build for %s', key)
         _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'failed', error='Could not queue the index build')
@@ -9671,21 +9752,6 @@ def _index_build_progress_callback(user_id: str):
         if building:
             _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running', result={'indexes': indexes, 'ready': ready})
             return
-        # Build finished: derive the small served artifacts from the freshly
-        # built, still-cached lexical snapshot (tools/worker has the RAM; the 1Gi
-        # backend never loads it) while the job still reads 'running'. Each is
-        # best-effort and never fails the build itself.
-        if indexes.get('lexical'):
-            for name, step in (
-                ('Explore summary', refresh_user_explore_summary),
-                ('Timeline summary', refresh_user_timeline_summary),
-                ('Search database', storage_utils_ensure_search_db),
-            ):
-                try:
-                    with perf_instrumentation.span(f'index.build.{name.split()[0].lower()}', user=user_id):
-                        step(user_id)
-                except Exception:
-                    app.logger.exception('%s refresh failed for %s', name, user_id)
         _upsert_job_status(
             job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done' if ready else 'failed',
             result={'indexes': indexes, 'ready': ready},

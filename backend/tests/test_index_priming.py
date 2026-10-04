@@ -36,6 +36,13 @@ from routes.tools import tools_build_indexes, tools_indexes_status
 import storage_utils
 
 
+@pytest.fixture(autouse=True)
+def _no_streaming_hook(monkeypatch):
+    # app registers the streaming build as storage_utils.LEXICAL_BUILD_HOOK on import;
+    # these tests exercise the primer's ordering/locking with patched refreshers.
+    monkeypatch.setattr(storage_utils, 'LEXICAL_BUILD_HOOK', None)
+
+
 # --- prime_all_user_indexes_sequentially -------------------------------------
 
 def _patch_refreshers(monkeypatch, calls, *, slow_kind=None, entered=None, release=None, raise_kind=None):
@@ -372,22 +379,14 @@ def test_tools_build_reports_not_building_when_queue_unavailable(monkeypatch, ro
     assert payload['ok'] is True and payload['building'] is False and payload['queued'] == 'unavailable'
 
 
-def test_progress_callback_writes_job_row_and_derives_summaries_before_done(monkeypatch):
+def test_progress_callback_writes_running_then_done(monkeypatch):
     job_rows = []
     monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: job_rows.append((job_id, uid, jt, status, f)))
-    derived = []
-    monkeypatch.setattr(app, 'refresh_user_explore_summary', lambda uid: derived.append('explore'))
-    monkeypatch.setattr(app, 'refresh_user_timeline_summary', lambda uid: derived.append('timeline'))
-    monkeypatch.setattr(app, 'storage_utils_ensure_search_db', lambda uid: derived.append('searchdb'))
-
     cb = app._index_build_progress_callback('owner')
     cb({'sort': True, 'lexical': False, 'albums': False, 'people': False}, True)
-    assert derived == [] and [r[3] for r in job_rows] == ['running']  # still building
-    # a failing derived step must not fail the build
-    monkeypatch.setattr(app, 'refresh_user_timeline_summary', lambda uid: (_ for _ in ()).throw(RuntimeError('boom')))
     cb({'sort': True, 'lexical': True, 'albums': True, 'people': True}, False)
-    assert derived == ['explore'] or derived == ['explore', 'searchdb']
-    assert 'searchdb' in derived
+    # Explore/timeline/search-db are produced inside the streaming 'lexical' step
+    # now, so the callback only mirrors status.
     assert [r[3] for r in job_rows] == ['running', 'done'] and job_rows[0][2] == app.INDEX_BUILD_JOB_TYPE
     assert job_rows[-1][0] == app._index_build_job_id('owner')
 
@@ -499,9 +498,11 @@ def test_trigger_tools_index_rebuild_posts_with_bearer_token(monkeypatch):
 class _FakeQueue:
     def __init__(self):
         self.sent = []
+        self.delays = []
 
-    def send_message(self, body):
+    def send_message(self, body, visibility_timeout=None):
         self.sent.append(json.loads(body))
+        self.delays.append(visibility_timeout)
 
 
 def test_enqueue_index_build_queues_once_and_marks_the_job(monkeypatch):
@@ -529,7 +530,7 @@ def test_enqueue_index_build_unavailable_without_queue_or_on_send_failure(monkey
     assert app.enqueue_index_build('lib-1') == 'unavailable'
 
     class _Boom:
-        def send_message(self, body):
+        def send_message(self, body, visibility_timeout=None):
             raise RuntimeError('queue down')
 
     rows = []
@@ -642,3 +643,21 @@ def test_worker_leaves_the_message_for_redelivery_when_the_build_raises(monkeypa
 
     app._process_clustering_queue_message(_Msg(), _Q(), 'photostore-library-ops', 3)
     assert deleted == []  # not acked -> becomes visible again and is retried (bounded by max_retries)
+
+
+def test_enqueue_delays_a_rebuild_that_follows_a_finished_one(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    queue = _FakeQueue()
+    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
+    monkeypatch.setattr(app, 'jobs_table_client', object())
+    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
+    monkeypatch.setattr(app, 'INDEX_BUILD_MIN_INTERVAL_SECONDS', 120)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
+    finished = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': finished})
+    assert app.enqueue_index_build('lib-1') == 'queued'
+    assert 80 <= queue.delays[-1] <= 90  # ~120s minus the 30s already elapsed
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': long_ago})
+    assert app.enqueue_index_build('lib-1') == 'queued' and queue.delays[-1] is None  # immediate

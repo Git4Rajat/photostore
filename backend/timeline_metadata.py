@@ -13,7 +13,60 @@ from typing import Dict, List, Optional
 from ordering_utils import metadata_capture_datetime
 
 
-def build_timeline_summary(metadata_rows: List[Dict], *, now: Optional[datetime] = None) -> Dict:
+class TimelineAccumulator:
+    """Streaming form of build_timeline_summary: feed rows one at a time with
+    add() and call summary() at the end -- constant memory (a few counters per
+    day), so the index build never has to hold the library in a list."""
+
+    def __init__(self, *, now: Optional[datetime] = None) -> None:
+        self._today = (now or datetime.now(timezone.utc)).date()
+        self._years: Dict[str, Dict] = {}
+        self._undated = 0
+        self._future = 0
+        self._total = 0
+        self._min: Optional[date] = None
+        self._max: Optional[date] = None
+
+    def add(self, row: Dict) -> None:
+        self._total += 1
+        captured = metadata_capture_datetime(row)
+        if captured is None:
+            self._undated += 1
+            return
+        day = captured.date()
+        if day > self._today:
+            self._future += 1
+            return
+        year_bucket = self._years.setdefault(f'{day.year:04d}', {'count': 0, 'months': {}})
+        month_bucket = year_bucket['months'].setdefault(f'{day.month:02d}', {'count': 0, 'days': {}})
+        year_bucket['count'] += 1
+        month_bucket['count'] += 1
+        day_key = f'{day.day:02d}'
+        month_bucket['days'][day_key] = month_bucket['days'].get(day_key, 0) + 1
+        if self._min is None or day < self._min:
+            self._min = day
+        if self._max is None or day > self._max:
+            self._max = day
+
+    def summary(self) -> Dict:
+        cumulative_by_year: Dict[str, int] = {}
+        running = 0
+        for year_key in sorted(self._years.keys()):
+            running += self._years[year_key]['count']
+            cumulative_by_year[year_key] = running
+        return {
+            'years': self._years,
+            'cumulativeByYear': cumulative_by_year,
+            'firstDate': self._min.isoformat() if self._min else None,
+            'lastDate': self._max.isoformat() if self._max else None,
+            'today': self._today.isoformat(),
+            'undatedCount': self._undated,
+            'futureCount': self._future,
+            'totalCount': self._total,
+        }
+
+
+def build_timeline_summary(metadata_rows, *, now: Optional[datetime] = None) -> Dict:
     """Bucket photo metadata rows into a year/month/day count summary.
 
     Each row's date is resolved via ``metadata_capture_datetime`` (EXIF capture
@@ -27,57 +80,9 @@ def build_timeline_summary(metadata_rows: List[Dict], *, now: Optional[datetime]
     not a real future photo — they're dropped entirely (counted in
     ``futureCount``, not folded into today's bucket) so they can't inflate
     today's count or otherwise distort the timeline. ``now`` is injectable so
-    tests can freeze "today".
+    tests can freeze "today". Accepts any iterable (list or stream).
     """
-    current = now or datetime.now(timezone.utc)
-    today = current.date()
-
-    years: Dict[str, Dict] = {}
-    undated_count = 0
-    future_count = 0
-    min_date: Optional[date] = None
-    max_date: Optional[date] = None
-
+    accumulator = TimelineAccumulator(now=now)
     for row in metadata_rows:
-        captured = metadata_capture_datetime(row)
-        if captured is None:
-            undated_count += 1
-            continue
-
-        day = captured.date()
-        if day > today:
-            future_count += 1
-            continue
-
-        year_key = f'{day.year:04d}'
-        month_key = f'{day.month:02d}'
-        day_key = f'{day.day:02d}'
-
-        year_bucket = years.setdefault(year_key, {'count': 0, 'months': {}})
-        month_bucket = year_bucket['months'].setdefault(month_key, {'count': 0, 'days': {}})
-
-        year_bucket['count'] += 1
-        month_bucket['count'] += 1
-        month_bucket['days'][day_key] = month_bucket['days'].get(day_key, 0) + 1
-
-        if min_date is None or day < min_date:
-            min_date = day
-        if max_date is None or day > max_date:
-            max_date = day
-
-    cumulative_by_year: Dict[str, int] = {}
-    running = 0
-    for year_key in sorted(years.keys()):
-        running += years[year_key]['count']
-        cumulative_by_year[year_key] = running
-
-    return {
-        'years': years,
-        'cumulativeByYear': cumulative_by_year,
-        'firstDate': min_date.isoformat() if min_date else None,
-        'lastDate': max_date.isoformat() if max_date else None,
-        'today': today.isoformat(),
-        'undatedCount': undated_count,
-        'futureCount': future_count,
-        'totalCount': len(metadata_rows),
-    }
+        accumulator.add(row)
+    return accumulator.summary()
