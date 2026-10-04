@@ -406,3 +406,13 @@ A scan failure now aborts the build (vector/tag-embedding) instead of being pers
 **Light person rows.** `_cached_person_rows_for_user(user_id, with_embeddings=False)` (separate `_person_light_scan_cache`, invalidated with the others) drops `repEmbedding`; the People list/roster and the name index use it. Embedding readers keep the default.
 
 **Remaining library-proportional memory on serving roles:** the assignment index loaded from the durable blob on the upload role (`repEmbedding` as Python lists, roughly 0.5 GB at 30k clusters -- moving per-photo assignment to the worker via `PEOPLE_ASSIGNMENT_ENGINE=faiss` removes it) and the compact access map (14.2).
+
+### 14.5 Index builds run on disk, and uploads alone never trigger a heavy rebuild
+
+* `backend/index_files.py` provides the disk-backed toolkit (`workspace`, `RowsWriter`/`iter_rows`, `DiskKV`). The people index keeps its face table in SQLite on disk, and the vector index streams embeddings into an `.npz` file and uploads from the file; neither holds library-sized lists in memory. `INDEX_BUILD_WORK_DIR` points the worker at the Azure Files share. SQLite scratch (`INDEX_BUILD_SQLITE_DIR`) stays on local disk.
+* Per-library caches are bounded (`INDEX_CACHE_MAX_ENTRIES`), so a serving process cannot accumulate every library's index.
+* Build scopes: `full` (all indexes and the search DB) and `light` (sort and access only, separate job row `index-build-<lib>-light`).
+  * Dirty manifests seen after uploads, and ipworker drains, enqueue `light` builds only.
+  * `full` runs when an index has never been built or the search DB is missing, after a clustering job, and after a Workbench/tools action.
+  * `index_build_needed` ignores dirtiness and only reports cold, outdated-schema or missing-search-DB libraries.
+* The vector index is always a full streaming pass; nothing on a serving path reads it.

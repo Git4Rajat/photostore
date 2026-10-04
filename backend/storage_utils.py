@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import BinaryIO, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import BinaryIO, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 from azure.core import MatchConditions
@@ -47,6 +47,7 @@ from image_utils import (
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
 from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
+import index_files
 import maps_utils
 import perf_instrumentation
 import vision_utils
@@ -244,10 +245,45 @@ class _KeyedLockRegistry:
 
 
 _VECTOR_INDEX_CACHE_LOCK = threading.RLock()
-_VECTOR_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+
+# --- Bounded per-library index caches ---------------------------------------------------
+# Every index kind used to keep its finished rows in an unbounded module-level dict
+# keyed by library: one library's vector index is ~266MB, a sort/access index
+# ~70MB, and nothing ever evicted them -- so a worker building for many libraries
+# (or a replica serving many) only ever grew until the OOM killer. These keep at most
+# INDEX_CACHE_MAX_ENTRIES libraries per kind (oldest evicted). Processes that BUILD
+# indexes but never serve them (worker/ipworker) keep none of the serve-only kinds.
+INDEX_CACHE_MAX_ENTRIES = int(os.getenv('INDEX_CACHE_MAX_ENTRIES', '2'))
+_BUILD_ROLE_NAMES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'worker,ipworker').split(',') if r.strip()}
+_IS_BUILD_ROLE = os.getenv('APP_ROLE', 'backend').strip().lower() in _BUILD_ROLE_NAMES
+
+
+class _BoundedCache(dict):
+    """dict with a size cap: inserting beyond ``max_entries`` evicts the oldest
+    entry. max_entries=0 stores nothing. (Locking stays with each cache's lock.)"""
+
+    def __init__(self, max_entries: int) -> None:
+        super().__init__()
+        self.max_entries = max(0, int(max_entries))
+
+    def __setitem__(self, key, value) -> None:
+        if self.max_entries == 0:
+            return
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        while len(self) > self.max_entries:
+            super().__delitem__(next(iter(self)))
+
+
+def _serve_only_cache() -> '_BoundedCache':
+    return _BoundedCache(0 if _IS_BUILD_ROLE else INDEX_CACHE_MAX_ENTRIES)
+
+
+_VECTOR_INDEX_CACHE: Dict[str, Dict[str, object]] = _BoundedCache(1)   # ~266MB per library at 130k photos
 
 _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK = threading.RLock()
-_PEOPLE_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_PEOPLE_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = _BoundedCache(1)
 _PEOPLE_EMBEDDING_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 _VECTOR_INDEX_RELEVANT_FIELDS = {
     'address',
@@ -2370,6 +2406,104 @@ def _build_user_vector_index_snapshot(user_id: str, source_version: str) -> Opti
     )
 
 
+def _build_user_vector_index_file(user_id: str, source_version: str, workdir: str, sqlite_dir: str):
+    """Disk-backed full build of the vector index: returns
+    (npz_path, row_keys, embedding_version) or None if the scan failed.
+
+    Vectors are never gathered in Python lists: stored embeddings stream into a
+    raw float32 file (with a SQLite position table), the final row-ordered
+    matrix streams into a second raw file, and the compressed .npz is written
+    from a memory map. Peak RAM is the row-key list plus a few buffers."""
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return None
+    embedding_version = vision_utils.get_text_embedding_version()
+    compatible = vision_utils.get_text_embedding_dimension() == PHOTO_EMBEDDING_DIMENSION
+    dim = int(PHOTO_EMBEDDING_DIMENSION)
+
+    stored_path = os.path.join(workdir, 'stored.f32')
+    out_path = os.path.join(workdir, 'ordered.f32')
+    positions = index_files.DiskKV(sqlite_dir, 'positions.sqlite')
+    stored_count = 0
+    embeddings_table_client = _CTX.get('embeddings_table_client')
+    try:
+        with open(stored_path, 'wb') as stored_fh:
+            if embeddings_table_client is not None:
+                try:
+                    for emb_row in _query_projected(
+                        embeddings_table_client, f"PartitionKey eq '{_escape_odata(user_id)}'",
+                        ['RowKey', 'photoEmbedding', 'photoEmbeddingVersion'],
+                    ):
+                        key = str(emb_row.get('RowKey') or '')
+                        if not key:
+                            continue
+                        vector = _stored_photo_vector(emb_row, compatible)
+                        if vector is not None and vector.size == dim:
+                            stored_fh.write(vector.tobytes())
+                            positions.put(key, {'p': stored_count})
+                            stored_count += 1
+                        else:
+                            positions.put(key, {'p': -1})   # row exists but unusable -> text fallback
+                except Exception:
+                    _LOGGER.exception('Vector index embeddings scan failed for user %s', user_id)
+                    return None
+        positions.flush()
+        stored = np.memmap(stored_path, dtype=np.float32, mode='r', shape=(stored_count, dim)) if stored_count else None
+
+        row_keys: List[str] = []
+        try:
+            with open(out_path, 'wb') as out_fh:
+                batch: List[str] = []
+                batch_rows: List[Dict] = []
+
+                def _flush() -> None:
+                    pos = positions.get_many([str(r.get('RowKey')) for r in batch_rows])
+                    for r in batch_rows:
+                        name = str(r.get('RowKey'))
+                        entry = pos.get(name)
+                        if entry is None:
+                            vector = _compute_photo_vector(name, r, r, compatible)
+                        elif entry['p'] >= 0 and stored is not None:
+                            vector = np.asarray(stored[entry['p']])
+                        else:
+                            vector = _text_photo_vector(name, r)
+                        if vector is None or vector.size != dim:
+                            continue
+                        out_fh.write(np.ascontiguousarray(vector, dtype=np.float32).tobytes())
+                        row_keys.append(name)
+                    batch_rows.clear()
+
+                for row in _query_projected(
+                    metadata_table_client, f"PartitionKey eq '{_escape_odata(user_id)}'", _VECTOR_META_COLUMNS,
+                ):
+                    filename = str(row.get('RowKey') or '').strip()
+                    if not filename or str(row.get('processing_state') or '').strip().lower() == 'deleted':
+                        continue
+                    batch_rows.append(row)
+                    if len(batch_rows) >= 500:
+                        _flush()
+                _flush()
+        except Exception:
+            _LOGGER.exception('Vector index scan failed for user %s', user_id)
+            return None   # never persist an empty index because a scan failed
+
+        n = len(row_keys)
+        matrix = np.memmap(out_path, dtype=np.float32, mode='r', shape=(n, dim)) if n else np.zeros((0, 0), dtype=np.float32)
+        npz_path = os.path.join(workdir, 'vector.npz')
+        np.savez_compressed(
+            npz_path,
+            embeddings=matrix,
+            row_keys=np.asarray([json.dumps(row_keys, ensure_ascii=False, separators=(',', ':'))]),
+            source_version=np.asarray([source_version]),
+            embedding_version=np.asarray([embedding_version]),
+            updated_at=np.asarray([source_version]),
+        )
+        del matrix, stored
+        return npz_path, row_keys, embedding_version
+    finally:
+        positions.close()
+
+
 def _merge_user_vector_index_snapshot(
     user_id: str, existing: VectorIndexSnapshot, dirty_filenames: Set[str], source_version: str,
 ) -> Optional[VectorIndexSnapshot]:
@@ -2426,73 +2560,57 @@ def _merge_user_vector_index_snapshot(
 def refresh_user_vector_index(
     user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
 ) -> Optional[VectorIndexSnapshot]:
+    """Rebuild the vector index with a disk-backed full build and publish the file.
+    (The old incremental path loaded the entire existing array into RAM; nothing
+    reads this index on a serving path any more, so a streamed full rebuild --
+    run only on demand/by the worker -- is the safe shape.) Returns a snapshot
+    carrying the row keys and versions but NOT the matrix, which now lives only in
+    the published blob."""
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+    dirty_to_clear = _get_dirty_search_index_filenames(key, 'vector') or set()
 
-    snapshot = None
-    dirty_to_clear: Optional[Set[str]] = None
-    if not force_full:
-        existing = _load_vector_index_npz(key)
-        if existing is not None and existing.embedding_version == vision_utils.get_text_embedding_version():
-            dirty = _get_dirty_search_index_filenames(key, 'vector')
-            if dirty is not None:
-                snapshot = _merge_user_vector_index_snapshot(key, existing, dirty, source_version)
-                if snapshot is not None:
-                    dirty_to_clear = dirty
-    if snapshot is None:
-        snapshot = _build_user_vector_index_snapshot(key, source_version)
-        if snapshot is not None:
-            # A full rebuild reflects every currently-dirty filename too --
-            # clear the whole dirty set for this index kind so a later
-            # incremental merge doesn't needlessly re-fetch photos already
-            # correctly reflected in this fresh snapshot.
-            dirty_to_clear = _get_dirty_search_index_filenames(key, 'vector') or set()
-    if snapshot is None:
-        return None
-    container_name = _vector_index_container_name()
-    if container_name:
-        blob_client = _get_blob_client(container_name, _vector_index_npz_blob_name(key))
-        if blob_client is not None:
-            try:
-                blob_client.upload_blob(
-                    _serialize_vector_index(snapshot),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/octet-stream'),
-                )
-            except Exception:
-                pass
-        _clear_manifest_dirty_flag(key, 'vector')
-        manifest = {
-            'userId': key,
-            'sourceVersion': snapshot.source_version,
-            'embeddingVersion': snapshot.embedding_version,
-            'rowCount': len(snapshot.row_keys),
-            'dirty': False,
-            'updatedAt': snapshot.updated_at,
-        }
-        manifest_client = _get_blob_client(container_name, _vector_index_manifest_blob_name(key))
-        if manifest_client is not None:
-            try:
-                manifest_client.upload_blob(
-                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json'),
-                )
-            except Exception:
-                pass
-    with _VECTOR_INDEX_CACHE_LOCK:
-        _VECTOR_INDEX_CACHE[key] = {
-            'source_version': snapshot.source_version,
-            'embedding_version': snapshot.embedding_version,
-            'updated_at': snapshot.updated_at,
-            'row_keys': snapshot.row_keys,
-            'embeddings': snapshot.embeddings,
-        }
+    with index_files.workspace() as workdir, index_files.workspace(sqlite=True) as sqlite_dir:
+        built = _build_user_vector_index_file(key, source_version, workdir, sqlite_dir)
+        if built is None:
+            return None
+        npz_path, row_keys, embedding_version = built
+        container_name = _vector_index_container_name()
+        if container_name:
+            blob_client = _get_blob_client(container_name, _vector_index_npz_blob_name(key))
+            if blob_client is not None:
+                try:
+                    with open(npz_path, 'rb') as fh:
+                        blob_client.upload_blob(
+                            fh, overwrite=True,
+                            content_settings=BlobContentSettings(content_type='application/octet-stream'),
+                        )
+                except Exception:
+                    _LOGGER.exception('Vector index upload failed for user %s', key)
+                    return None
+            _clear_manifest_dirty_flag(key, 'vector')
+            manifest_client = _get_blob_client(container_name, _vector_index_manifest_blob_name(key))
+            if manifest_client is not None:
+                try:
+                    manifest_client.upload_blob(
+                        json.dumps({
+                            'userId': key, 'sourceVersion': source_version, 'embeddingVersion': embedding_version,
+                            'rowCount': len(row_keys), 'dirty': False, 'updatedAt': source_version,
+                        }, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                        overwrite=True,
+                        content_settings=BlobContentSettings(content_type='application/json'),
+                    )
+                except Exception:
+                    pass
+    invalidate_user_vector_index_cache(key)
     if dirty_to_clear:
         _clear_dirty_search_index_filenames(key, 'vector', dirty_to_clear)
-    return snapshot
+    return VectorIndexSnapshot(
+        user_id=key, source_version=source_version, embedding_version=embedding_version,
+        updated_at=source_version, row_keys=row_keys, embeddings=np.zeros((0, 0), dtype=np.float32),
+    )
 
 
 def get_user_vector_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
@@ -2976,7 +3094,7 @@ def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True)
 # (_build_user_tag_embedding_index_snapshot short-circuits otherwise). Reading
 # the cached result back is pure numpy, so backend can do that part fine.
 _TAG_EMBEDDING_INDEX_CACHE_LOCK = threading.RLock()
-_TAG_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_TAG_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = _BoundedCache(1)
 
 
 def _tag_embedding_index_container_name() -> str:
@@ -3312,7 +3430,7 @@ _LEXICAL_INDEX_SCHEMA_VERSION = 'v1'
 # to remember to add it to a select list.
 _LEXICAL_INDEX_EXCLUDED_FIELDS = {'photoEmbedding', 'semanticEmbedding'}
 _LEXICAL_INDEX_CACHE_LOCK = threading.RLock()
-_LEXICAL_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_LEXICAL_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 # Coalesces concurrent rebuilds for the same user onto one expensive Table
 # scan -- a gap the vector index above still has (see _KeyedLockRegistry).
 _LEXICAL_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -3364,7 +3482,7 @@ def invalidate_user_lexical_index_cache(user_id: str) -> None:
 # index rather than having its own independent dirty/rebuild cycle. Lives in
 # the same container, just a differently-named blob pair.
 _LISTING_INDEX_CACHE_LOCK = threading.RLock()
-_LISTING_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_LISTING_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 
 
 def _listing_index_json_blob_name(user_id: str) -> str:
@@ -4415,7 +4533,7 @@ def get_user_lexical_index(
 # lexical rebuild -- so this index tracks its own staleness end to end.
 _SORT_INDEX_SCHEMA_VERSION = 'v2'
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
-_SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 # The Table columns _build_user_sort_index_snapshot SELECTs -- deliberately
 # narrow (no photoEmbedding/semanticEmbedding/ocrText/tagMetadata/etc.),
@@ -4897,7 +5015,7 @@ def get_user_sort_index(
 # hard-deleted row (the physical Table entity gone) drops out.
 _ACCESS_INDEX_SCHEMA_VERSION = 'v1'
 _ACCESS_INDEX_CACHE_LOCK = threading.RLock()
-_ACCESS_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_ACCESS_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _ACCESS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 # Deliberately narrow -- no photoEmbedding/ocrText/tagMetadata/etc., same
 # reasoning as _SORT_INDEX_SOURCE_FIELDS. No processing_state: unlike every
@@ -5304,7 +5422,7 @@ def get_user_access_index(
 # map per index version (cached, never copied), and each call only reads the
 # names it was asked about. The backend never builds this index (the worker does).
 _ACCESS_LOOKUP_CACHE_LOCK = threading.Lock()
-_ACCESS_LOOKUP_CACHE: Dict[str, Tuple[str, Dict[str, Tuple[str, str, str]]]] = {}
+_ACCESS_LOOKUP_CACHE: Dict[str, Tuple[str, Dict[str, Tuple[str, str, str]]]] = _serve_only_cache()
 
 
 def lookup_access_entries(user_id: str, filenames) -> Optional[Dict[str, Dict[str, object]]]:
@@ -5371,7 +5489,7 @@ def access_index_is_dirty(user_id: str) -> bool:
 # flag only (no per-album dirty-filenames partition).
 _ALBUMS_INDEX_SCHEMA_VERSION = 'v1'
 _ALBUMS_INDEX_CACHE_LOCK = threading.RLock()
-_ALBUMS_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_ALBUMS_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _ALBUMS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 
 
@@ -5823,7 +5941,7 @@ def get_user_albums_index(
 # rebuild per idle period, not one per write.
 _PEOPLE_INDEX_SCHEMA_VERSION = 'v1'
 _PEOPLE_INDEX_CACHE_LOCK = threading.RLock()
-_PEOPLE_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
+_PEOPLE_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _PEOPLE_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 _PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY = 16
 
@@ -6042,17 +6160,31 @@ def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Opti
         # refresh_user_people_index persists whatever this returns as the new
         # dirty:false state (see refresh_user_sort_index's identical note).
         return None
-    try:
-        face_by_id: Dict[str, Dict[str, object]] = {}
-        for row in face_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}'", select=_PEOPLE_INDEX_FACE_COLUMNS,
-        ):
-            row_key = str(row.get('RowKey') or '')
-            if row_key:
-                face_by_id[row_key] = {k: row.get(k) for k in _PEOPLE_INDEX_FACE_COLUMNS if k in row}
-    except Exception:
-        return None
+    # The bulk face table lives in a local SQLite file, not a 150k-entry Python
+    # dict: this build is bounded by disk, and each person's faces are fetched
+    # with one batched lookup.
+    with index_files.workspace(sqlite=True) as scratch:
+        face_kv = index_files.DiskKV(scratch, 'faces.sqlite')
+        try:
+            try:
+                for row in _query_projected(
+                    face_table_client, f"PartitionKey eq '{_escape_odata(user_id)}'", _PEOPLE_INDEX_FACE_COLUMNS,
+                ):
+                    row_key = str(row.get('RowKey') or '')
+                    if row_key:
+                        face_kv.put(row_key, {k: row.get(k) for k in _PEOPLE_INDEX_FACE_COLUMNS if k in row})
+                face_kv.flush()
+            except Exception:
+                return None
+            return _people_index_rows_from_scan(
+                user_id, source_version, person_rows, face_kv, person_table_client, face_table_client)
+        finally:
+            face_kv.close()
 
+
+def _people_index_rows_from_scan(
+    user_id: str, source_version: str, person_rows: List[Dict], face_kv, person_table_client, face_table_client,
+) -> LexicalIndexSnapshot:
     def _resolve_missing_face(face_id: str) -> Tuple[str, Optional[Dict[str, object]]]:
         try:
             return face_id, face_table_client.get_entity(partition_key=user_id, row_key=face_id)
@@ -6088,7 +6220,7 @@ def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Opti
             # Known faces resolve from the bulk map with no pool at all; only the
             # (rare) misses need point reads -- creating a thread pool per person
             # for dict lookups was pure overhead at tens of thousands of clusters.
-            resolved = {fid: face_by_id[fid] for fid in face_ids if fid in face_by_id}
+            resolved = face_kv.get_many(face_ids)
             missing = [fid for fid in face_ids if fid not in resolved]
             if missing:
                 with ThreadPoolExecutor(max_workers=min(_PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY, len(missing))) as executor:
@@ -6324,8 +6456,10 @@ def prime_all_user_indexes_sequentially(
     *,
     on_progress: Optional[Callable[[Dict[str, bool], bool], None]] = None,
     wait: bool = False,
+    kinds: Optional[Sequence[str]] = None,
 ) -> None:
-    """Build all four derived indexes for a user, one at a time.
+    """Build all four derived indexes for a user, one at a time (``kinds``
+    restricts it to a subset, e.g. the cheap sort/access pair after uploads).
 
     on_progress (optional) is invoked with (readiness_dict, building) at the
     start, after each index, and once at the end (building=False). The
@@ -6388,6 +6522,8 @@ def prime_all_user_indexes_sequentially(
                 ('albums', refresh_user_albums_index, _ALBUMS_INDEX_REBUILD_LOCKS),
                 ('people', refresh_user_people_index, _PEOPLE_INDEX_REBUILD_LOCKS),
             ):
+                if kinds is not None and kind not in kinds:
+                    continue
                 # Go through this kind's own rebuild lock (not just this
                 # function's own priming lock) so a concurrent page-level
                 # request (e.g. GET /api/photos/sort-index) sees the lock

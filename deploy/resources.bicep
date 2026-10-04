@@ -1340,6 +1340,10 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             // Same share the backend/tools mount at /mnt/photostore/shared -- worker builds the
             // vector/people-embedding indexes, so write-through here feeds every other role.
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/faiss-checkpoints/index-cache' }
+            // Index builds stream rows/vectors into files on the Azure Files share (disk, not RAM);
+            // SQLite scratch stays on local ephemeral disk (needs real file locking).
+            { name: 'INDEX_BUILD_WORK_DIR', value: '/mnt/photostore/faiss-checkpoints/index-build' }
+            { name: 'INDEX_BUILD_SQLITE_DIR', value: '/var/lib/photostore/faiss-work/index-build-sqlite' }
             { name: 'TMPDIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
             // Opt-in microbatching (2026-10-02): adjacent same-library

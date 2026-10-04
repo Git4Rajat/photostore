@@ -322,7 +322,7 @@ def test_tools_build_does_not_prime_when_all_built_and_clean(monkeypatch, route_
         {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=False))
     monkeypatch.setattr(app, 'index_build_needed', lambda uid: False)
     queued = []
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': queued.append(uid) or 'queued')
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': queued.append(uid) or 'queued')
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
         response = tools_build_indexes()
@@ -339,7 +339,7 @@ def test_tools_build_enqueues_when_any_index_missing(monkeypatch, route_ctx):
         {'sort': True, 'lexical': False, 'albums': True, 'people': True}, needs_rebuild=True))
     monkeypatch.setattr(app, 'index_build_needed', lambda uid: True)
     queued = []
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': queued.append((uid, reason)) or 'queued')
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': queued.append((uid, reason)) or 'queued')
     # The route must NOT build inline any more (that is what orphaned jobs on the scale-to-zero tools app).
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda *a, **k: (_ for _ in ()).throw(AssertionError('no inline build')))
 
@@ -359,7 +359,7 @@ def test_tools_build_enqueues_when_built_but_dirty_without_blocking_the_gate(mon
     monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
         {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=True))
     monkeypatch.setattr(app, 'index_build_needed', lambda uid: True)
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': 'already_active')
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': 'already_active')
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
         payload = tools_build_indexes().get_json()
@@ -371,7 +371,7 @@ def test_tools_build_reports_not_building_when_queue_unavailable(monkeypatch, ro
     monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
         {'sort': False, 'lexical': False, 'albums': False, 'people': False}, needs_rebuild=True))
     monkeypatch.setattr(app, 'index_build_needed', lambda uid: True)
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': 'unavailable')
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': 'unavailable')
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
         payload = tools_build_indexes().get_json()
@@ -513,7 +513,7 @@ def test_enqueue_index_build_queues_once_and_marks_the_job(monkeypatch):
     monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: rows.append((job_id, status)))
 
     assert app.enqueue_index_build('lib-1', reason='x') == 'queued'
-    assert queue.sent == [{'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1', 'reason': 'x'}]
+    assert queue.sent == [{'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1', 'reason': 'x', 'scope': 'full'}]
     assert rows == [('index-build-lib-1', 'queued')]
 
 
@@ -594,7 +594,7 @@ def test_trigger_prefers_the_queue_over_the_tools_http_path(monkeypatch):
     monkeypatch.setattr(app, '_TOOLS_REBUILD_TRIGGER_LAST', {})
     monkeypatch.setenv('TOOLS_INTERNAL_URL', 'https://tools.example')
     seen = []
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='': seen.append(uid) or 'queued')
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': seen.append(uid) or 'queued')
     posted = []
     monkeypatch.setattr('requests.post', lambda *a, **k: posted.append(a))
     app._trigger_tools_index_rebuild('lib-9')
@@ -605,7 +605,7 @@ def test_worker_processes_an_index_build_message_and_acks_it(monkeypatch):
     """End to end through the real message processor: an index_build message from
     the library-ops queue runs the build job and is deleted only on success."""
     ran, deleted = [], []
-    monkeypatch.setattr(app, '_run_index_build_job', lambda uid, jid: ran.append((uid, jid)))
+    monkeypatch.setattr(app, '_run_index_build_job', lambda uid, jid, scope='full': ran.append((uid, jid)))
 
     class _Msg:
         content = json.dumps({'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1'})
@@ -626,7 +626,7 @@ def test_worker_processes_an_index_build_message_and_acks_it(monkeypatch):
 
 def test_worker_leaves_the_message_for_redelivery_when_the_build_raises(monkeypatch):
     deleted = []
-    monkeypatch.setattr(app, '_run_index_build_job', lambda uid, jid: (_ for _ in ()).throw(RuntimeError('killed')))
+    monkeypatch.setattr(app, '_run_index_build_job', lambda uid, jid, scope='full': (_ for _ in ()).throw(RuntimeError('killed')))
 
     class _Msg:
         content = json.dumps({'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1'})
@@ -661,3 +661,31 @@ def test_enqueue_delays_a_rebuild_that_follows_a_finished_one(monkeypatch):
     long_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
     monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': long_ago})
     assert app.enqueue_index_build('lib-1') == 'queued' and queue.delays[-1] is None  # immediate
+
+
+def test_dirty_after_uploads_alone_does_not_need_a_full_build(monkeypatch):
+    """Uploads dirty manifests; that must not make the heavy build 'needed'."""
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: {'ready': True, 'needs_rebuild': True, 'indexes': {}})
+    monkeypatch.setattr(app, '_load_sort_index_manifest', lambda uid: {'schemaVersion': app.SORT_INDEX_SCHEMA_VERSION, 'dirty': True})
+    monkeypatch.setattr(app, '_load_lexical_index_manifest', lambda uid: {})
+    assert app.index_build_needed('u1') is False
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: {'ready': False, 'needs_rebuild': True, 'indexes': {}})
+    assert app.index_build_needed('u1') is True
+
+
+def test_light_scope_message_and_job_row_are_separate(monkeypatch):
+    q = _FakeQueue()
+    monkeypatch.setattr(app, 'library_ops_queue_client', q)
+    monkeypatch.setattr(app, 'jobs_table_client', None)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
+    assert app.enqueue_index_build('lib-1', reason='r', scope='light') == 'queued'
+    assert q.sent[0]['scope'] == 'light' and q.sent[0]['jobId'] == 'index-build-lib-1-light'
+
+
+def test_light_job_only_primes_sort_and_access(monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda uid: None)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: calls.append(k.get('kinds')))
+    app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
+    assert calls == [('sort', 'access')]

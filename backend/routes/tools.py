@@ -49,6 +49,12 @@ def record_workbench_action():
         })
     except Exception:
         pass
+    # A Workbench/tools run changes tags, faces and metadata: the heavy indexes
+    # are rebuilt now (not after plain uploads).
+    try:
+        app._trigger_tools_index_rebuild(user_id, reason='workbench-run', scope='full')
+    except Exception:
+        pass
     return app.jsonify({'success': True, 'actionId': action_id})
 
 @tools_bp.route('/api/tools/workbench/actions', methods=['GET'])

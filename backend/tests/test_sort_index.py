@@ -458,7 +458,7 @@ def test_photos_sort_index_dirty_manifest_triggers_tools_rebuild(monkeypatch, so
     monkeypatch.setattr(app, 'get_sort_index_blob_location', lambda *a, **k: ('lexical-index', 'abc-sort.json.gz'))
     monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: ('https://example.invalid/abc?sas', 'exp'))
     triggered = []
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: triggered.append(uid))
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, **kw: triggered.append(uid))
 
     with app.app.test_request_context('/api/photos/sort-index'):
         response = photos_sort_index()

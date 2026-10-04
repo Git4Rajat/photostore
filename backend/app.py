@@ -9692,6 +9692,16 @@ INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS',
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
 
 
+def _job_row_fresh_active(key: str, job_id: str) -> bool:
+    if jobs_table_client is None:
+        return False
+    row = _get_job_row(key, job_id)
+    if not row or str(row.get('status') or '').lower() not in {'queued', 'running'}:
+        return False
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
+    return str(row.get('updatedAt') or '') >= cutoff
+
+
 def _index_build_job_active(user_id: str) -> bool:
     """True if this library has an index_build job that is queued/running and
     fresh (not past the same staleness cutoff /jobs/status uses to declare a
@@ -9707,12 +9717,14 @@ def _index_build_job_active(user_id: str) -> bool:
 
 
 def index_build_needed(user_id: str) -> bool:
-    """Any index missing/dirty, sort index on an older schema, or the SQLite
-    search database missing/stale (all cheap manifest reads)."""
+    """True only when an index has never been built (cold library), the sort
+    index is on an older schema, or the SQLite search database is missing.
+    Dirtiness caused by uploads does NOT count: the heavy indexes are rebuilt
+    after a clustering/tools run (see enqueue_index_build scope='full'), not on
+    every upload burst. All cheap manifest reads."""
     import search_db
     key = str(user_id or '').strip()
-    state = get_user_index_build_state(key)
-    if state['needs_rebuild']:
+    if not get_user_index_build_state(key)['ready']:
         return True
     sort_manifest = _load_sort_index_manifest(key)
     if sort_manifest.get('schemaVersion') != SORT_INDEX_SCHEMA_VERSION:
@@ -9721,7 +9733,13 @@ def index_build_needed(user_id: str) -> bool:
     return bool(lexical_version) and not search_db.is_current(key, lexical_version)
 
 
-def enqueue_index_build(user_id: str, reason: str = '') -> str:
+def light_index_build_needed(user_id: str) -> bool:
+    """Sort/access indexes dirty after uploads (cheap incremental refresh)."""
+    key = str(user_id or '').strip()
+    return bool(_load_sort_index_manifest(key).get('dirty')) or access_index_is_dirty(key)
+
+
+def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> str:
     """Queue the library's index build on the always-awake `worker` role (library-
     ops queue). Returns 'queued', 'already_active' or 'unavailable'.
 
@@ -9735,11 +9753,16 @@ def enqueue_index_build(user_id: str, reason: str = '') -> str:
     key = str(user_id or '').strip()
     if not key:
         return 'unavailable'
+    light = scope == 'light'
     if _index_build_job_active(key):
         return 'already_active'
     if library_ops_queue_client is None:
         return 'unavailable'
-    job_id = _index_build_job_id(key)
+    # Light (post-upload sort/access refresh) uses its own job row so it never
+    # masks or blocks a full build, and does not show as "library indexing".
+    job_id = _index_build_job_id(key) + ('-light' if light else '')
+    if light and _job_row_fresh_active(key, job_id):
+        return 'already_active'
     # A build is a full streamed scan of the library, so an upload burst that
     # keeps dirtying the indexes must not trigger back-to-back rebuilds: if one
     # finished moments ago, deliver this message after the minimum interval
@@ -9754,7 +9777,7 @@ def enqueue_index_build(user_id: str, reason: str = '') -> str:
     _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'queued')
     try:
         library_ops_queue_client.send_message(json.dumps(
-            {'type': 'index_build', 'userId': key, 'jobId': job_id, 'reason': reason},
+            {'type': 'index_build', 'userId': key, 'jobId': job_id, 'reason': reason, 'scope': scope},
             separators=(',', ':'),
         ), visibility_timeout=delay or None)
     except Exception:
@@ -9784,7 +9807,7 @@ def _index_build_progress_callback(user_id: str):
     return _cb
 
 
-def _run_index_build_job(user_id: str, job_id: str) -> None:
+def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None:
     """Worker-side body of an index_build message. A heartbeat thread keeps the
     job row's updatedAt fresh while a long single step (full table scan,
     search-database build) runs, so /jobs/status never declares a live build
@@ -9810,7 +9833,11 @@ def _run_index_build_job(user_id: str, job_id: str) -> None:
     try:
         with perf_instrumentation.span('index.build.job', user=user_id):
             storage_utils_ensure_sort_current(user_id)  # schema upgrade (full rebuild if stale)
-            prime_all_user_indexes_sequentially(user_id, on_progress=_index_build_progress_callback(user_id), wait=True)
+            if scope == 'light':
+                prime_all_user_indexes_sequentially(user_id, wait=True, kinds=('sort', 'access'))
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+            else:
+                prime_all_user_indexes_sequentially(user_id, on_progress=_index_build_progress_callback(user_id), wait=True)
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')
@@ -12634,7 +12661,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         return
 
     if job_type == 'index_build':
-        _run_index_build_job(user_id, job_id or _index_build_job_id(user_id))
+        _run_index_build_job(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
         return
 
     if job_type == 'library_delete_purge':
@@ -12858,6 +12885,12 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         stop_heartbeat.set()
         heartbeat_thread.join(timeout=5)
         _maybe_enqueue_coalesced_rerun(job_id, user_id)
+        # A clustering run changes people/albums; this (not an upload) is what
+        # makes the heavy indexes worth rebuilding.
+        try:
+            _trigger_tools_index_rebuild(user_id, reason='clustering-run', scope='full')
+        except Exception:
+            worker_logger.exception('Post-clustering index rebuild trigger failed for %s', user_id)
 
 
 def _prepare_incremental_assignment(payload, user_id):
@@ -13916,7 +13949,7 @@ _TOOLS_REBUILD_TRIGGER_LAST: Dict[str, float] = {}
 _TOOLS_REBUILD_TRIGGER_LOCK = threading.Lock()
 
 
-def _trigger_tools_index_rebuild(user_id: str) -> None:
+def _trigger_tools_index_rebuild(user_id: str, reason: str = 'trigger', scope: str = 'full') -> None:
     """Ask the `tools` role (2vCPU/4Gi) to rebuild this user's derived indexes.
 
     Direct service-to-service HTTP: the caller mints a normal session token for
@@ -13950,7 +13983,7 @@ def _trigger_tools_index_rebuild(user_id: str) -> None:
     # tools HTTP path below is only the fallback when no queue is configured.
     if library_ops_queue_client is not None:
         try:
-            if enqueue_index_build(key, reason='trigger') != 'unavailable':
+            if enqueue_index_build(key, reason=reason, scope=scope) != 'unavailable':
                 return
         except Exception:
             worker_logger.exception('Failed to enqueue index build for %s', key)
@@ -14282,7 +14315,7 @@ def run_ipworker() -> None:
                     if processed_by_user:
                         for uid, count in list(processed_by_user.items()):
                             if count > 0:
-                                _trigger_tools_index_rebuild(uid)
+                                _trigger_tools_index_rebuild(uid, reason="ipworker", scope="light")
                         processed_by_user.clear()
                     if shutdown_requested.is_set():
                         break
@@ -14353,7 +14386,7 @@ def run_ipworker() -> None:
                         if uid:
                             processed_by_user[uid] = processed_by_user.get(uid, 0) + 1
                             if processed_by_user[uid] >= IPWORKER_INDEX_REBUILD_MILESTONE:
-                                _trigger_tools_index_rebuild(uid)
+                                _trigger_tools_index_rebuild(uid, reason="ipworker", scope="light")
                                 processed_by_user[uid] = 0
                     ack_started = time.monotonic()
                     try:
