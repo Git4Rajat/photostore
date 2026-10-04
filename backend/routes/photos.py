@@ -143,7 +143,7 @@ def photo_access_url_batch():
         metadata_map.update(found)
         try:
             if app.access_index_is_dirty(user_id):
-                app._trigger_tools_index_rebuild(user_id)  # the worker rebuilds; never this process
+                app._trigger_tools_index_rebuild(user_id, reason='access-dirty', scope='light')  # sort/access only; never this process
         except Exception:
             pass
     else:
@@ -884,7 +884,7 @@ def photos_sort_index():
     if sort_summary is None:
         return app.jsonify({'available': False})
     if sort_summary.get('dirty'):
-        app._trigger_tools_index_rebuild(user_id)
+        app._trigger_tools_index_rebuild(user_id, reason='sort-dirty', scope='light')
     try:
         container_name, blob_name = app.get_sort_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)

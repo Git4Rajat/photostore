@@ -374,3 +374,47 @@ The backend (1Gi) used to hold library-sized data in memory for several endpoint
 Behaviour notes: rating/like changes reach list/filter/cover ranking on the next index build (minutes); the photos returned are always fresh. With a location filter active, photos without coordinates are excluded (the old code compared them as 0,0). A library with no current database yet gets `indexBuilding: true` from list/filter and a worker build is requested. The database schema is `sqlite-v2`; existing databases are rebuilt by the next build.
 
 Remaining library-proportional memory on the backend: the compact access map (~tens of MB per worker, loaded once per index version) and the albums/people indexes (sized by album/person count, not photo count).
+
+### 14.3 People: no 200-cluster cap
+
+Accounts have tens of thousands of clusters. The primary People path (the people index blob, downloaded once per session) was never capped; the cap lived in the fallback used when that index is unavailable (`listPersons(undefined, 0, 200)`), so a failed/cold index build meant only 200 people were visible.
+- `GET /api/persons?namesOnly=1&covers=1` returns **every** cluster in one request -- name, `isNamed`, `faceCount` and a `coverFaceId` chosen (confirmed > confidence, never rejected) from the in-memory bulk face map: no per-person lookups and no thumbnail signing, which is the per-page work the paged endpoint does and why it pages. 30,000 clusters build in <1 s in `tests/test_person_roster.py`. Without `covers=1` the response shape is unchanged.
+- `faceService.listAllPersons()` replaces the capped call in the store's fallback; covers load lazily via `/api/faces/crop/<id>`.
+- People grid is windowed (`useWindowedGrid`) so only on-screen cards render and only their covers are requested (it used to request every cover); selection lookups use a Set; the merge picker on a person page is searchable and renders at most 200 options (a `<select>` with 30k options freezes the tab).
+
+### 14.4 Index builds never run in a serving process (the `extras` OOM)
+
+**Incident (microsvcpoc-dev-extras, 0.5 vCPU / 1Gi):** RSS climbed 289 -> 1007 MB within ~2 min of a rollout with `inflight` 1-2, was OOM-killed, and repeated until `Persistent Failure to start container`. Cause: the first People request ran the **people-index build in-process** (`get_user_people_index` -> `_rebuild_people_index_in_background`). `_build_user_people_index_snapshot` did `list(query_entities(...))` of every column of every person **and every face**, including each face's `embedding` and each person's `repEmbedding` (512-float JSON, ~6-8 KB each). Measured on identical synthetic data (distinct 6 KB embedding strings per row): old build **180.6 MB peak at 4,000 persons / 20,000 faces** (~1.35 GB extrapolated to 30,000 / 150,000), new build **12.9 MB**.
+
+**Structural guard.** Only `worker` and `ipworker` may build indexes (`INDEX_BUILD_ROLES`, default `worker,ipworker`; `storage_utils.index_build_allowed()`). In every other process -- backend, extras, admin, upload, tools:
+- the six `_rebuild_*_in_background` kickers are decorated with `_builds_only_where_allowed` and become *"request a worker build"* (`INDEX_BUILD_REQUEST_HOOK` -> `enqueue_index_build`, deduped/throttled);
+- the synchronous branches of every `get_user_*_index` (sort, access, albums, people, vector, tag-embedding, people-embedding) return `None`/stale data and request a build instead of scanning;
+- `_load_people_embedding_index` no longer falls back to scanning person rows (with embeddings) when the durable blob is absent.
+`tests/test_index_build_guard.py` makes the person/face/metadata/embeddings tables explode on any scan in a serving process and asserts a build is requested instead.
+
+**Builders are bounded too** (they run on the 4Gi worker, but 4Gi is also finite):
+| Builder | Fix |
+|---|---|
+| people index | server-side column projection (no embeddings), streamed, compact face map; no thread pool per person |
+| people-embedding index | projected + streamed; reps go straight to float32 arrays (not Python float lists, ~28 B/number) |
+| vector index | streams the embeddings table into one normalized float32 vector per photo instead of holding every ~8 KB row JSON; narrow metadata projection; ~63 MB -> ~25 MB at 6,000 photos, result array ~2.2x |
+| tag-embedding index | streams only the tag-related columns into a set |
+| lexical / listing / search DB / explore / timeline | already one streamed pass (14.1) |
+| sort / access | iterate instead of `list()` (14.1) |
+A scan failure now aborts the build (vector/tag-embedding) instead of being persisted as an empty index.
+
+**Light person rows.** `_cached_person_rows_for_user(user_id, with_embeddings=False)` (separate `_person_light_scan_cache`, invalidated with the others) drops `repEmbedding`; the People list/roster and the name index use it. Embedding readers keep the default.
+
+**Remaining library-proportional memory on serving roles:** the assignment index loaded from the durable blob on the upload role (`repEmbedding` as Python lists, roughly 0.5 GB at 30k clusters -- moving per-photo assignment to the worker via `PEOPLE_ASSIGNMENT_ENGINE=faiss` removes it) and the compact access map (14.2).
+
+### 14.5 Index builds run on disk, and uploads alone never trigger a heavy rebuild
+
+* `backend/index_files.py` provides the disk-backed toolkit (`workspace`, `RowsWriter`/`iter_rows`, `DiskKV`). The people index keeps its face table in SQLite on disk, and the vector index streams embeddings into an `.npz` file and uploads from the file; neither holds library-sized lists in memory. `INDEX_BUILD_WORK_DIR` points the worker at the Azure Files share. SQLite scratch (`INDEX_BUILD_SQLITE_DIR`) stays on local disk.
+* Per-library caches are bounded (`INDEX_CACHE_MAX_ENTRIES`), so a serving process cannot accumulate every library's index.
+* Build scopes: `full` (all indexes and the search DB) and `light` (sort and access only, separate job row `index-build-<lib>-light`).
+  * Dirty manifests seen after uploads, and ipworker drains, enqueue `light` builds only.
+  * `full` runs when an index has never been built or the search DB is missing, after a clustering job, and after a Workbench/tools action.
+  * `index_build_needed` ignores dirtiness and only reports cold, outdated-schema or missing-search-DB libraries.
+* The vector index is always a full streaming pass; nothing on a serving path reads it.
+
+The sort and access indexes follow the same rule. `_refresh_rows_index_on_disk` streams rows from the table into a gzip file and uploads from that file. It also mirrors the file to the share (`_ShareBackedBlob.upload_file`). An incremental refresh streams the previous file through and swaps in only the dirty rows. The snapshot it returns has no rows, and callers that need them reload from the blob.

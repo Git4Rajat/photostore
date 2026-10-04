@@ -91,6 +91,24 @@ const listPersonNames = async (q?: string) => {
     return await get<PersonListResponse>(`/api/persons?${params.toString()}`);
 };
 
+export interface PersonRosterEntry {
+    personId: string;
+    name: string;
+    isNamed: boolean;
+    faceCount: number;
+    /** Best cover face (use /api/faces/crop/<id>); null when the cluster has no usable face. */
+    coverFaceId: string | null;
+}
+
+// EVERY person in the account in one request -- no page cap (accounts have tens
+// of thousands of clusters). Cheap on the server: names, counts and a cover face
+// id from the in-memory face map, with no per-person lookups or thumbnail
+// signing (that per-page work is what listPersons does, and why it pages).
+const listAllPersons = async (): Promise<PersonRosterEntry[]> => {
+    const res = await get<{ persons?: PersonRosterEntry[] }>('/api/persons?namesOnly=1&covers=1');
+    return Array.isArray(res?.persons) ? res.persons : [];
+};
+
 const getPerson = async (personId: string) => {
     return await get(`/api/persons/${personId}`);
 };
@@ -236,6 +254,7 @@ const declineSuggestion = async (sourcePersonId: string, targetPersonId: string)
 export default {
     assignUnclusteredFaces,
     listPersons,
+    listAllPersons,
     listPersonNames,
     getPerson,
     labelPerson,

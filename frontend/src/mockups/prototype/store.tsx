@@ -1236,13 +1236,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, [toast]);
 
-    // Legacy path: a single hardcoded page (listPersons(undefined, 0, 200)) --
-    // anyone with 201+ face clusters silently never sees the rest. Kept only
-    // as a fallback for when the local index is unavailable.
+    // Fallback for when the people index is unavailable (cold/failed build):
+    // ONE request for every cluster -- no 200 (or any) page cap, so accounts with
+    // tens of thousands of clusters see them all. The server returns names,
+    // counts and a cover face id only (no per-person thumbnail work).
     const fetchPeopleViaLegacyEndpoint = useCallback(async () => {
-        const res = await faceService.listPersons(undefined, 0, 200);
-        const list = Array.isArray(res?.persons) ? (res.persons as PersonSummary[]).map(mapPerson) : [];
-        setPeople(list);
+        const roster = await faceService.listAllPersons();
+        setPeople(roster.map((r): Person => ({
+            id: r.personId,
+            name: r.isNamed && r.name.trim() ? r.name : null,
+            swatch: swatchFor(r.personId),
+            photoIds: [],
+            coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
+            faceCount: r.faceCount,
+        })));
     }, []);
 
     // Primary path: the whole-library people index (see localPeopleIndex.ts),

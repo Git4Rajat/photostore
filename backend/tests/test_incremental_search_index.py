@@ -375,7 +375,7 @@ def test_lexical_refresh_clears_dirty_set_after_full_rebuild_fallback(ctx):
 
 # --- vector incremental merge ------------------------------------------------
 
-def test_vector_incremental_refresh_only_point_reads_the_dirty_filename(ctx, monkeypatch):
+def test_vector_refresh_is_a_disk_backed_full_pass_and_holds_no_embeddings(ctx, monkeypatch):
     metadata, _dirty, _blobs = ctx
     monkeypatch.setattr(storage_utils, 'PHOTO_EMBEDDING_DIMENSION', 2)
     monkeypatch.setattr(storage_utils.vision_utils, 'get_text_embedding_dimension', lambda: 2)
@@ -389,13 +389,13 @@ def test_vector_incremental_refresh_only_point_reads_the_dirty_filename(ctx, mon
     assert first is not None
     assert set(first.row_keys) == {'a.jpg', 'b.jpg'}
     assert metadata.scan_count == 1
+    # embeddings stream to a file; nothing library-sized is returned in memory
+    assert first.embeddings.size == 0
 
     storage_utils.touch_user_search_indexes_state('u1', filenames='b.jpg')
     second = storage_utils.refresh_user_vector_index('u1', source_version='v2')
-
     assert second is not None
-    assert metadata.scan_count == 1  # still just the one full scan from the initial build
-    assert metadata.get_entity_calls == [('u1', 'b.jpg')]
+    assert metadata.scan_count == 2
     assert set(second.row_keys) == {'a.jpg', 'b.jpg'}
 
 
