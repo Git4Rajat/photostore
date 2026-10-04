@@ -17,31 +17,56 @@ from tests.fakes import FakeTable
 def _big_row():
     return {
         'PartitionKey': 'lib', 'RowKey': 'a.jpg',
-        'tags': '["dog"]', 'subjectTags': '["dog"]', 'caption': 'a dog',
-        'locationCity': 'Paris', 'faceCount': 1,
-        'ocrText': 'x' * 10000,
+        'tags': json.dumps(['dog', 'grass', 'blurry']), 'subjectTags': json.dumps(['dog']),
+        'objects': json.dumps(['dog', 'ball']), 'backgroundTags': json.dumps(['grass']),
+        'tagMetadata': json.dumps([
+            {'tag': 'dog', 'source': 'ai_tag', 'confidence': 0.9},
+            {'tag': 'grass', 'source': 'ai_tag', 'confidence': 0.6},
+            {'tag': 'blurry', 'source': 'ai_tag', 'confidence': 0.26},
+            {'tag': 'mine', 'source': 'user', 'confidence': 0.1},
+        ]),
+        'caption': 'a dog', 'locationCity': 'Paris', 'faceCount': 1,
+        'latitude': '48.856614', 'longitude': '2.352222',
+        'ocrText': ('word  ' * 5000), 'weakTags': '["w"]', 'faces': 'f' * 5000,
+        'uploadDate': '', 'upload_started_at': '2020-01-02T00:00:00+00:00',
         'exifData': json.dumps({'Model': 'Cam', 'DateTimeOriginal': '2020:01:01 10:00:00',
                                 'MakerNote': 'z' * 5000, 'GPS.GPSLatitude': '1'}),
         'processing_metadata': json.dumps({
-            'client_ai_vision': {'predictions': [{'label': 'cat', 'score': 0.9, 'extra': 'q'},
-                                                 {'label': 'low', 'score': 0.05}]},
+            'client_ai_vision': {'predictions': [{'label': 'cat', 'score': 0.9}, {'label': 'dog', 'score': 0.95},
+                                                 {'label': 'mid', 'score': 0.3}, {'label': 'low', 'score': 0.05}]},
             'client_face': {'blob': 'y' * 5000},
         }),
-        'tagMetadata': 'm' * 5000, 'weakTags': '["w"]', 'faces': 'f' * 5000,
     }
 
 
-def test_slim_row_keeps_search_fields_and_drops_bulk():
+def test_slim_row_dedupes_filters_low_confidence_and_collapses_fields():
     slim = storage_utils._search_slim_row(_big_row())
-    assert slim['RowKey'] == 'a.jpg' and slim['caption'] == 'a dog' and slim['locationCity'] == 'Paris'
+    assert slim['subjectTags'] == ['dog']
+    # grass kept (0.6), 'blurry' dropped (0.26 < 0.45), objects' 'ball' has no recorded confidence -> kept;
+    # tags are real arrays, deduped across tags/objects/backgroundTags, subjects not repeated.
+    assert slim['tags'] == ['grass', 'ball']
+    assert slim['predictionLabels'] == ['cat']  # 'dog' already a tag; 0.3/0.05 below cutoff
+    assert 'objects' not in slim and 'backgroundTags' not in slim and 'tagMetadata' not in slim
+    assert slim['latitude'] == slim['longitude'] == '1'
+    assert slim['uploadDate'] == '2020-01-02T00:00:00+00:00' and 'upload_started_at' not in slim
     assert len(slim['ocrText']) == storage_utils.SEARCH_INDEX_OCR_MAX_CHARS
-    exif = json.loads(slim['exifData'])
-    assert exif == {'Model': 'Cam', 'DateTimeOriginal': '2020:01:01 10:00:00', 'GPSInfo': '1'}
-    preds = json.loads(slim['processing_metadata'])['client_ai_vision']['predictions']
-    assert [p['label'] for p in preds] == ['cat']
-    for dropped in ('tagMetadata', 'weakTags', 'faces', 'PartitionKey'):
+    assert json.loads(slim['exifData']) == {'Model': 'Cam', 'DateTimeOriginal': '2020:01:01 10:00:00', 'GPSInfo': '1'}
+    for dropped in ('weakTags', 'faces', 'PartitionKey', 'processing_metadata'):
         assert dropped not in slim
-    assert len(json.dumps(slim)) < len(json.dumps(_big_row())) / 4
+    assert len(json.dumps(slim)) < len(json.dumps(_big_row())) / 6
+
+
+def test_slim_row_keeps_user_tags_regardless_of_confidence():
+    row = {'RowKey': 'b.jpg', 'tags': json.dumps(['mine']),
+           'tagMetadata': json.dumps([{'tag': 'mine', 'source': 'user', 'confidence': 0.01}])}
+    assert storage_utils._search_slim_row(row)['tags'] == ['mine']
+
+
+def test_slim_row_caps_tag_count(monkeypatch):
+    monkeypatch.setattr(storage_utils, 'SEARCH_INDEX_MAX_TAGS', 3)
+    row = {'RowKey': 'c.jpg', 'subjectTags': json.dumps(['a']), 'tags': json.dumps(['b', 'c', 'd', 'e'])}
+    slim = storage_utils._search_slim_row(row)
+    assert slim['subjectTags'] + slim['tags'] == ['a', 'b', 'c']
 
 
 @pytest.fixture
@@ -75,19 +100,33 @@ def test_delete_removes_slim_blobs(ctx):
     assert not [k for k in blobs.blobs if 'search' in k]
 
 
-def test_route_serves_slim_only_when_in_lockstep(monkeypatch):
+def test_route_serves_slim_only_when_current(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'get_index_manifest_summary',
                         lambda uid, kind: {'source_version': 'v9', 'updated_at': 'u', 'dirty': False})
     monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda c, b: (f'https://x/{b}', 'exp'))
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
     monkeypatch.setattr(app, 'get_vector_index_manifest_summary', lambda uid: None)
-    for version, expect in (('v9', '-search.json.gz'), ('v1', '.json.gz')):
-        monkeypatch.setattr(storage_utils, 'load_search_index_manifest', lambda uid, v=version: {'sourceVersion': v})
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: None)
+    for version, expect_available in (('v9', True), ('v1', False)):
+        monkeypatch.setattr(storage_utils, 'load_search_index_manifest',
+                            lambda uid, v=version: {'sourceVersion': v, 'schemaVersion': storage_utils._SEARCH_INDEX_SCHEMA_VERSION})
         with app.app.test_request_context('/api/photos/search-index'):
-            url = photos_search_index().get_json()['indexUrl']
-        assert url.endswith(expect)
-        assert url.endswith('-search.json.gz') == (version == 'v9')
+            body = photos_search_index().get_json()
+        assert body['available'] is expect_available
+        if expect_available:
+            assert body['indexUrl'].endswith('-search.json.gz')
+
+
+def test_ensure_slim_derives_from_existing_lexical_blob(ctx):
+    table, blobs = ctx
+    table.upsert_entity({**_big_row(), 'processing_complete': True})
+    storage_utils.refresh_user_lexical_index('lib', source_version='v1')
+    # simulate a pre-deploy library: slim blob missing
+    for k in [k for k in blobs.blobs if 'search' in k]:
+        del blobs.blobs[k]
+    assert storage_utils.ensure_user_search_slim_index('lib') is True
+    assert storage_utils.load_search_index_manifest('lib')['schemaVersion'] == storage_utils._SEARCH_INDEX_SCHEMA_VERSION
 
 
 class _EtagBlob:

@@ -3281,20 +3281,40 @@ def get_user_listing_index(
 # lexical/listing blobs (no extra Table reads). The full lexical blob stays the
 # server-side source of truth; search-index falls back to it if this one is
 # missing or stale.
-_SEARCH_INDEX_SCHEMA_VERSION = 'v1'
-SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '1500'))
+_SEARCH_INDEX_SCHEMA_VERSION = 'v2'
+# Browser-index size knobs. Everything here only affects the slim BROWSER blob;
+# the full lexical blob (server-side fallback search) is untouched.
+SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '400'))
+# AI tags are already curated at write time (AI_TAG_MIN_CONFIDENCE, 0.24); the
+# browser index keeps only the confident ones. User-added/stored tags always stay.
+SEARCH_INDEX_TAG_MIN_CONFIDENCE = float(os.getenv('SEARCH_INDEX_TAG_MIN_CONFIDENCE', '0.45'))
+SEARCH_INDEX_MAX_TAGS = int(os.getenv('SEARCH_INDEX_MAX_TAGS', '20'))
+# Raw AI-vision predictions (up to 160 per photo, >=0.2) used to be shipped
+# verbatim; now only the top few confident labels, as bare strings.
+SEARCH_INDEX_PREDICTION_MIN_SCORE = float(os.getenv('SEARCH_INDEX_PREDICTION_MIN_SCORE', '0.5'))
+SEARCH_INDEX_MAX_PREDICTIONS = int(os.getenv('SEARCH_INDEX_MAX_PREDICTIONS', '8'))
 _SEARCH_SLIM_PASSTHROUGH_FIELDS = (
-    'RowKey', 'subjectTags', 'peopleNames', 'peopleIds', 'tags', 'objects', 'backgroundTags',
-    'locationCity', 'locationRegion', 'locationCountry', 'address', 'latitude', 'longitude',
-    'faceCount', 'aiPersonLabel', 'caption', 'uploadDate', 'upload_started_at',
-    'last_processing_update', 'clientLastModified',
+    'peopleIds', 'locationCity', 'locationRegion', 'locationCountry', 'address',
+    'faceCount', 'aiPersonLabel', 'caption', 'clientLastModified',
 )
 _SEARCH_SLIM_EXIF_KEYS = (
     'Model', 'DateTimeOriginal', 'DateTime', 'CreationDate', 'CreateDate',
     'MediaCreateDate', 'TrackCreateDate',
 )
-_SEARCH_PREDICTION_MIN_SCORE = 0.2
-_SEARCH_PREDICTION_MAX = 160
+_PROTECTED_TAG_SOURCES = {'user', 'stored'}
+
+
+def _json_list(raw) -> List[str]:
+    if isinstance(raw, list):
+        return [str(v) for v in raw if str(v).strip()]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        if isinstance(parsed, list):
+            return [str(v) for v in parsed if str(v).strip()]
+    return []
 
 
 def _slim_exif_for_search(raw) -> str:
@@ -3311,39 +3331,128 @@ def _slim_exif_for_search(raw) -> str:
     return json.dumps(slim, ensure_ascii=False, separators=(',', ':'))
 
 
-def _slim_processing_metadata_for_search(raw) -> str:
+def _confident_tag_filter(row: Dict):
+    """Predicate over tag strings: True for user/stored tags, tags with no
+    recorded confidence, and AI tags at/above SEARCH_INDEX_TAG_MIN_CONFIDENCE."""
+    meta: Dict[str, Tuple[float, str]] = {}
+    for item in _json_list_of_objects(row.get('tagMetadata')):
+        tag = str(item.get('tag') or '').strip()
+        if tag:
+            try:
+                conf = float(item.get('confidence'))
+            except Exception:
+                conf = 1.0
+            meta[tag] = (conf, str(item.get('source') or ''))
+
+    def keep(tag: str) -> bool:
+        found = meta.get(tag)
+        if found is None:
+            return True
+        conf, source = found
+        return source in _PROTECTED_TAG_SOURCES or conf >= SEARCH_INDEX_TAG_MIN_CONFIDENCE
+    return keep
+
+
+def _json_list_of_objects(raw) -> List[Dict]:
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    return [x for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
+
+
+def _search_slim_tags(row: Dict) -> Tuple[List[str], List[str]]:
+    """(subjectTags, tags). effective_tags unions tags/objects/backgroundTags/
+    subjectTags into one set, so the browser only needs subjectTags (kept
+    separate: semantic text uses them) plus ONE deduped list of the rest --
+    lossless de-duplication, then the confidence filter and per-photo cap."""
+    keep = _confident_tag_filter(row)
+    subject: List[str] = []
+    seen = set()
+    for tag in _json_list(row.get('subjectTags')):
+        if tag not in seen and keep(tag):
+            seen.add(tag)
+            subject.append(tag)
+    subject = subject[:SEARCH_INDEX_MAX_TAGS]
+    others: List[str] = []
+    budget = max(0, SEARCH_INDEX_MAX_TAGS - len(subject))
+    for source in ('tags', 'objects', 'backgroundTags'):
+        for tag in _json_list(row.get(source)):
+            if len(others) >= budget:
+                break
+            if tag not in seen and keep(tag):
+                seen.add(tag)
+                others.append(tag)
+    return subject, others
+
+
+def _search_prediction_labels(raw, already: set) -> List[str]:
     try:
         pm = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
         predictions = ((pm or {}).get('client_ai_vision') or {}).get('predictions')
-        if not isinstance(predictions, list):
-            return '{}'
-        kept = []
-        for item in predictions[:_SEARCH_PREDICTION_MAX]:
-            if not isinstance(item, dict):
-                continue
-            try:
-                score = float(item.get('score') or 0)
-            except Exception:
-                continue
-            if score >= _SEARCH_PREDICTION_MIN_SCORE:
-                kept.append({'label': item.get('label'), 'score': round(score, 3)})
-        if not kept:
-            return '{}'
-        return json.dumps({'client_ai_vision': {'predictions': kept}}, ensure_ascii=False, separators=(',', ':'))
     except Exception:
-        return '{}'
+        return []
+    if not isinstance(predictions, list):
+        return []
+    scored = []
+    for item in predictions[:160]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            score = float(item.get('score') or 0)
+        except Exception:
+            continue
+        label = str(item.get('label') or '').strip()
+        if label and score >= SEARCH_INDEX_PREDICTION_MIN_SCORE and label not in already:
+            scored.append((score, label))
+    scored.sort(key=lambda x: -x[0])
+    out: List[str] = []
+    for _, label in scored:
+        if label not in out:
+            out.append(label)
+        if len(out) >= SEARCH_INDEX_MAX_PREDICTIONS:
+            break
+    return out
+
+
+def _first_nonempty(row: Dict, *fields: str) -> str:
+    for field in fields:
+        value = row.get(field)
+        if value not in (None, ''):
+            return str(value)
+    return ''
 
 
 def _search_slim_row(row: Dict) -> Dict:
-    out = {k: row[k] for k in _SEARCH_SLIM_PASSTHROUGH_FIELDS if row.get(k) not in (None, '', '[]')}
-    out['RowKey'] = row.get('RowKey')
+    out: Dict[str, object] = {'RowKey': row.get('RowKey')}
+    for field in _SEARCH_SLIM_PASSTHROUGH_FIELDS:
+        value = row.get(field)
+        if value not in (None, '', '[]'):
+            out[field] = value
+    names = _json_list(row.get('peopleNames'))
+    if names:
+        out['peopleNames'] = names
+    subject, others = _search_slim_tags(row)
+    if subject:
+        out['subjectTags'] = subject
+    if others:
+        out['tags'] = others
+    labels = _search_prediction_labels(row.get('processing_metadata'), set(subject) | set(others))
+    if labels:
+        out['predictionLabels'] = labels
+    # Search only tests whether coordinates exist, never their value.
+    if str(row.get('latitude') or '').strip() and str(row.get('longitude') or '').strip():
+        out['latitude'] = out['longitude'] = '1'
+    # metadataUploadDatetime = first non-empty of these three; collapse to one.
+    upload = _first_nonempty(row, 'uploadDate', 'upload_started_at', 'last_processing_update')
+    if upload:
+        out['uploadDate'] = upload
     if row.get('exifData'):
-        out['exifData'] = _slim_exif_for_search(row.get('exifData'))
-    if row.get('processing_metadata'):
-        pm = _slim_processing_metadata_for_search(row.get('processing_metadata'))
-        if pm != '{}':
-            out['processing_metadata'] = pm
-    ocr = str(row.get('ocrText') or '')
+        exif = _slim_exif_for_search(row.get('exifData'))
+        if exif != '{}':
+            out['exifData'] = exif
+    ocr = ' '.join(str(row.get('ocrText') or '').split())
     if ocr:
         out['ocrText'] = ocr[:SEARCH_INDEX_OCR_MAX_CHARS]
     return out
@@ -3370,6 +3479,34 @@ def load_search_index_manifest(user_id: str) -> Dict[str, str]:
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
+
+
+def search_index_is_current(user_id: str, lexical_source_version: str) -> bool:
+    manifest = load_search_index_manifest(user_id)
+    return bool(
+        manifest.get('sourceVersion')
+        and manifest.get('sourceVersion') == lexical_source_version
+        and manifest.get('schemaVersion') == _SEARCH_INDEX_SCHEMA_VERSION
+    )
+
+
+def ensure_user_search_slim_index(user_id: str) -> bool:
+    """(Re)derive the slim browser index from the already-built lexical blob when
+    it is missing or in an older schema -- e.g. right after a deploy, before any
+    new lexical rebuild would write it. Heavy (loads the full lexical blob), so
+    only the `tools` role calls this. True when a current slim blob exists."""
+    key = str(user_id or '').strip()
+    lexical_manifest = _load_lexical_index_manifest(key) if key else {}
+    version = str(lexical_manifest.get('sourceVersion') or '')
+    if not version:
+        return False
+    if search_index_is_current(key, version):
+        return True
+    snapshot = _load_lexical_index_blob(key)
+    if snapshot is None:
+        return False
+    _write_user_search_index(key, snapshot)
+    return search_index_is_current(key, snapshot.source_version)
 
 
 def _write_user_search_index(user_id: str, lexical_snapshot: 'LexicalIndexSnapshot') -> None:

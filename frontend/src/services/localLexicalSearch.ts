@@ -167,6 +167,10 @@ export const locationTags = (row: Record<string, unknown>): string[] => normaliz
 ]);
 
 const predictionTags = (row: Record<string, unknown>): string[] => {
+    // Slim browser index (backend _search_slim_row) ships pre-filtered labels.
+    if (Array.isArray(row.predictionLabels)) {
+        return normalizeTags(row.predictionLabels.map((v) => String(v)));
+    }
     try {
         const processing = JSON.parse(String(row.processing_metadata ?? '{}') || '{}');
         const aiVision = processing?.client_ai_vision;

@@ -12,8 +12,20 @@ the blob itself via the SAS URL.
 """
 from __future__ import annotations
 
+import pytest
+
 import app
+import storage_utils
 from routes.photos import photos_search_index
+
+
+@pytest.fixture(autouse=True)
+def _slim_index_current(monkeypatch):
+    # The route only hands the browser the slim projection; these tests are about
+    # the rest of the response, so pretend the slim blob is current.
+    monkeypatch.setattr(storage_utils, 'search_index_is_current', lambda uid, version: True)
+    monkeypatch.setattr(storage_utils, 'get_search_index_blob_location',
+                        lambda uid: ('lexical-index', f'{uid}-search.json.gz'))
 
 
 def _happy_manifest(**over):
@@ -125,7 +137,7 @@ def test_happy_path_returns_sas_url_and_people_index(monkeypatch):
 
     body = response.get_json()
     assert body['available'] is True
-    assert body['indexUrl'] == 'https://example.blob/lexical-index/owner.json.gz?sas=1'
+    assert body['indexUrl'] == 'https://example.blob/lexical-index/owner-search.json.gz?sas=1'
     assert body['sourceVersion'] == 'v42'
     assert body['updatedAt'] == '2026-09-15T00:00:00+00:00'
     assert body['peopleNameIndex'] == {'pidToName': {'p1': 'Alice'}, 'nameToIds': {'alice': ['p1']}}
@@ -189,3 +201,15 @@ def test_omits_vector_index_when_manifest_read_raises(monkeypatch):
     body = response.get_json()
     assert body['available'] is True
     assert 'vectorIndexUrl' not in body
+
+
+def test_slim_index_not_current_reports_unavailable_and_nudges_tools(monkeypatch):
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: _happy_manifest())
+    monkeypatch.setattr(app, 'get_lexical_index_blob_location', lambda uid: ('lexical-index', f'{uid}.json.gz'))
+    monkeypatch.setattr(storage_utils, 'search_index_is_current', lambda uid, version: False)
+    nudged = []
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: nudged.append(uid))
+    with app.app.test_request_context('/api/photos/search-index'):
+        body = photos_search_index().get_json()
+    assert body == {'available': False} and nudged == ['owner']  # never the full 700MB blob

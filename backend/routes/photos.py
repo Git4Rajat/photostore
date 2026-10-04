@@ -865,15 +865,13 @@ def photos_search_index():
         app._trigger_tools_index_rebuild(user_id)
     try:
         container_name, blob_name = app.get_lexical_index_blob_location(user_id)
-        # Prefer the slim browser projection (only the fields client search
-        # reads, capped OCR/EXIF) when it's in lockstep with the lexical
-        # index; otherwise fall back to the full blob so search never breaks.
-        slim_manifest = storage_utils.load_search_index_manifest(user_id)
-        if (
-            slim_manifest.get('sourceVersion')
-            and slim_manifest.get('sourceVersion') == lexical_summary.get('source_version')
-        ):
-            container_name, blob_name = storage_utils.get_search_index_blob_location(user_id)
+        # Browsers only ever get the slim projection -- the full lexical blob is
+        # hundreds of MB at ~130k photos. If it is missing/old, ask tools to
+        # (re)derive it and report unavailable meanwhile (client falls back).
+        if not storage_utils.search_index_is_current(user_id, str(lexical_summary.get('source_version') or '')):
+            app._trigger_tools_index_rebuild(user_id)
+            return app.jsonify({'available': False})
+        container_name, blob_name = storage_utils.get_search_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
     except Exception:
         app.app.logger.exception('Failed to mint lexical index SAS URL for %s', user_id)

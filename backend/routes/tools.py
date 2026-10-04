@@ -169,6 +169,13 @@ def tools_build_indexes():
     # `ready` (all built) is what the frontend gate waits on -- a built-but-
     # dirty index is still usable, so it doesn't hold the gate.
     state = app.get_user_index_build_state(user_id)
+    if state['indexes'].get('lexical') and not state['needs_rebuild']:
+        # Lexical is built and clean but the slim browser index may predate
+        # this deploy's schema -- derive it from the existing blob.
+        try:
+            app.storage_utils_ensure_slim(user_id)
+        except Exception:
+            app.app.logger.exception('Slim search index ensure failed for %s', user_id)
     if state['needs_rebuild']:
         try:
             app.prime_all_user_indexes_sequentially(
