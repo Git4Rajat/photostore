@@ -66,6 +66,9 @@ param workerFileShareQuotaGiB int = 100
 @maxValue(1)
 param workerMinReplicas int = 0
 
+@description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps console/system logs to. Leave blank (the one-click-deploy default) for no log destination. Required on every redeploy of an EXISTING environment that already has this wired up -- the managedEnvironment resource replaces its properties wholesale, so omitting this on a redeploy silently disconnects logging even if it was set up out-of-band or by a previous deploy.')
+param logAnalyticsWorkspaceName string = ''
+
 // Create the resource group that will hold everything.
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: resourceGroupName
@@ -88,6 +91,7 @@ module app 'resources.bicep' = {
     ipworkerImage: ipworkerImage
     workerFileShareQuotaGiB: workerFileShareQuotaGiB
     workerMinReplicas: workerMinReplicas
+    logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
   }
 }
 
