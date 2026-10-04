@@ -1,6 +1,7 @@
 import { getLocalAlbumsIndex } from './localAlbumsIndex';
 import { getLocalPeopleIndex } from './localPeopleIndex';
 import { getLocalSearchIndex } from './localSearchIndex';
+import { getMediaToken } from './mediaToken';
 import { getLocalSortIndex } from './localSortIndex';
 
 /**
@@ -16,7 +17,7 @@ let started: Promise<void> | null = null;
 export const preloadLocalIndexes = (): Promise<void> => {
     if (!started) {
         started = Promise.allSettled([
-            getLocalSortIndex(), getLocalAlbumsIndex(), getLocalPeopleIndex(), getLocalSearchIndex(),
+            getMediaToken(), getLocalSortIndex(), getLocalAlbumsIndex(), getLocalPeopleIndex(), getLocalSearchIndex(),
         ])
             .then(() => undefined)
             .finally(() => {

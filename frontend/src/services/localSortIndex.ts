@@ -18,6 +18,9 @@ export interface SortIndexRow {
     rating: number;
     likes: number;
     uploadDate: string | null;
+    /** Physical thumbnail blob name once the thumbnail exists; with the media
+     * token this yields a direct URL with no backend call. */
+    thumb?: string;
 }
 
 interface SortIndexResponse {
@@ -85,6 +88,7 @@ const normalizeRows = (raw: Record<string, unknown>[]): SortIndexRow[] => raw
         rating: Number(row.rating) || 0,
         likes: Number(row.likes) || 0,
         uploadDate: typeof row.uploadDate === 'string' ? row.uploadDate : null,
+        ...(typeof row.thumb === 'string' && row.thumb ? { thumb: row.thumb } : {}),
     }))
     .filter((row) => row.filename);
 
