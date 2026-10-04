@@ -35,7 +35,7 @@ from azure.storage.blob import (
     generate_blob_sas, generate_container_sas,
 )
 from azure.storage.queue import QueueServiceClient
-from flask import Flask, Response, jsonify, make_response, request, stream_with_context
+from flask import Flask, Response, g, has_request_context, jsonify, make_response, request, stream_with_context
 from auth_utils import get_request_user_id as resolve_request_user_id
 from auth_utils import validate_bearer_token as validate_entra_bearer_token
 import password_auth
@@ -144,6 +144,7 @@ from storage_utils import (
     store_timeline_summary,
     warm_user_index_files_async,
     ensure_user_search_slim_index as storage_utils_ensure_slim,
+    ensure_user_sort_index_current as storage_utils_ensure_sort_current,
     load_timeline_summary,
     delete_user_explore_summary_data,
     get_user_tag_embedding_index,
@@ -2113,9 +2114,7 @@ def _blob_name_from_metadata(metadata: Optional[Dict], filename: str) -> str:
     return filename
 
 
-def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
-    """Return a thumbnail URL when a real thumbnail or backend preview can be served."""
-    meta = metadata or {}
+def _effective_thumbnail_status(meta: Dict) -> str:
     thumbnail_status = str(meta.get('thumbnail_status') or '').strip().lower()
     # Soft-delete stamps every browser-processing status (thumbnail_status
     # included) to 'deleted' via _mark_processing_deleted_for_file, even though
@@ -2130,6 +2129,35 @@ def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
         except (TypeError, ValueError):
             pre_delete = {}
         thumbnail_status = str((pre_delete or {}).get('thumbnail_status') or '').strip().lower()
+    return thumbnail_status
+
+
+def _direct_media_requested() -> bool:
+    """True when the current request opted into token-based media: the client
+    holds a container-scoped read token (GET /api/photos/media-token) and builds
+    thumbnail URLs itself from blob names, so the backend skips signing one SAS
+    URL per photo (an HMAC + ~400 bytes of response each)."""
+    try:
+        return bool(has_request_context() and getattr(g, 'direct_media', False)) and MEDIA_URL_MODE == 'sas'
+    except Exception:
+        return False
+
+
+def _direct_thumbnail_blob(metadata: Dict, filename: str) -> str:
+    """Physical thumbnail blob name when the client can fetch it directly with
+    the container token, else ''. Only the case that would otherwise have been a
+    signed SAS URL qualifies; proxy/preview fallbacks keep their normal URLs."""
+    if not _direct_media_requested():
+        return ''
+    if _effective_thumbnail_status(metadata or {}) != 'done':
+        return ''
+    return _blob_name_from_metadata(metadata, filename)
+
+
+def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
+    """Return a thumbnail URL when a real thumbnail or backend preview can be served."""
+    meta = metadata or {}
+    thumbnail_status = _effective_thumbnail_status(meta)
     if thumbnail_status != 'done':
         if _filename_requires_backend_preview(filename):
             # No thumbnail blob exists yet; the proxy route falls through to the
@@ -2231,11 +2259,18 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
     upload_dt = metadata_upload_datetime(metadata)
     capture_dt = metadata_capture_datetime(metadata)
 
-    media_urls = _private_photo_media_urls(filename, metadata)
+    # Token mode (see _direct_media_requested): no signing at all -- the client
+    # builds thumbnail URLs from blob names + its container token, and resolves
+    # full-size originals on demand when the viewer opens. Otherwise sign only
+    # what the response actually uses (the thumbnail is signed below).
+    media_urls = {'url': ''} if _direct_media_requested() else {
+        'url': make_media_url(filename, 'image', blob_name=_blob_name_from_metadata(metadata, filename)),
+    }
     return {
         'filename': filename,
         'url': media_urls['url'],
-        'thumbnailUrl': _thumbnail_url_from_metadata(metadata, filename),
+        'thumbnailUrl': '' if _direct_thumbnail_blob(metadata, filename) else _thumbnail_url_from_metadata(metadata, filename),
+        **({'thumbnailBlob': _direct_thumbnail_blob(metadata, filename)} if _direct_thumbnail_blob(metadata, filename) else {}),
         'size': size,
         'lastModified': last_modified_iso,
         'uploadDate': upload_dt.isoformat() if upload_dt else None,

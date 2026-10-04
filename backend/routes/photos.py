@@ -435,6 +435,7 @@ def list_photos():
     except ValueError:
         return app.jsonify({'error': 'Invalid paging parameters.'}), 400
 
+    app.g.direct_media = app.request.args.get('directMedia') in ('1', 'true')
     capture_start, capture_end = app._parse_capture_range_args()
 
     user_id, error = app._require_user_id()
@@ -569,6 +570,37 @@ def lookup_photo(filename: str):
     pid_to_name, _ = app._load_people_name_index(user_id)
     return app.jsonify({'photo': app._build_photo_summary(user_id, safe_name, metadata, include_props=False, pid_to_name=pid_to_name)})
 
+@photos_bp.route('/api/photos/media-token', methods=['GET'])
+def photos_media_token():
+    """ONE container-scoped, read-only token for every thumbnail and preview.
+
+    The browser builds ``{baseUrl}/{blobName}?{sas}`` itself (blob names come from
+    the sort index / photo summaries), so loading a page of thumbnails involves
+    no backend call and no per-photo signing. The token is day-aligned and
+    deterministic (same delegation key as the per-blob SAS URLs), has no list
+    permission -- blobs are only reachable by their unguessable UUID names -- and
+    previews live in the same container under ``preview/``. Cacheable by the
+    client until ``expiresAt``."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if app.MEDIA_URL_MODE != 'sas' or not app.blob_service_client or not app.account_name:
+        return app.jsonify({'available': False})
+    try:
+        base_url, sas, expires_at = app._stable_container_read_sas(app.BLOB_THUMBNAIL_CONTAINER)
+    except Exception:
+        app.app.logger.exception('Failed to mint media token for %s', user_id)
+        return app.jsonify({'available': False})
+    response = app.jsonify({
+        'available': True,
+        'baseUrl': base_url,
+        'sas': sas,
+        'expiresAt': expires_at,
+        'previewPrefix': 'preview/',
+    })
+    response.headers['Cache-Control'] = 'private, max-age=3600'
+    return response
+
 @photos_bp.route('/photos/lookup-batch', methods=['POST'])
 @photos_bp.route('/api/photos/lookup-batch', methods=['POST'])
 def lookup_photos_batch():
@@ -580,6 +612,8 @@ def lookup_photos_batch():
         return error
     data = app.request.get_json(silent=True) or {}
     raw = data.get('filenames')
+    # Client holds a media token and builds thumbnail URLs itself -- skip signing.
+    app.g.direct_media = bool(data.get('directMedia'))
     if not isinstance(raw, list) or not raw:
         return app.jsonify({'error': 'filenames must be a non-empty list', 'code': 'invalid_filenames'}), 400
     if len(raw) > 200:

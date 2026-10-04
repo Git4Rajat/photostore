@@ -4273,7 +4273,7 @@ def get_user_lexical_index(
 # _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
 # tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
 # lexical rebuild -- so this index tracks its own staleness end to end.
-_SORT_INDEX_SCHEMA_VERSION = 'v1'
+_SORT_INDEX_SCHEMA_VERSION = 'v2'
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = {}
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -4292,6 +4292,7 @@ _SORT_INDEX_SOURCE_FIELDS = [
     'PartitionKey', 'RowKey', 'processing_state',
     'rating', 'likes', 'uploadDate',
     'exifData', 'clientLastModified', 'upload_started_at', 'last_processing_update',
+    'anonymousImageId', 'thumbnail_status',
 ]
 
 
@@ -4452,6 +4453,12 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         'rating': entity.get('rating') or 0,
         'likes': entity.get('likes') or 0,
         'uploadDate': entity.get('uploadDate') or None,
+        # Physical thumbnail blob name, only once the thumbnail exists: lets the
+        # browser build the thumbnail URL itself from the media token with no
+        # backend call (see GET /api/photos/media-token). Absent -> the client
+        # falls back to the URL lookup-batch returns.
+        **({'thumb': str(entity.get('anonymousImageId') or filename)}
+           if str(entity.get('thumbnail_status') or '').strip().lower() == 'done' else {}),
     }
 
 
@@ -4595,6 +4602,17 @@ def refresh_user_sort_index(
     if dirty_to_clear:
         _clear_dirty_search_index_filenames(key, 'sort', dirty_to_clear)
     return snapshot
+
+
+def ensure_user_sort_index_current(user_id: str) -> bool:
+    """Full-rebuild the sort index if its stored schema predates this deploy
+    (v2 added per-photo thumbnail blob names). True if a rebuild ran."""
+    key = str(user_id or '').strip()
+    manifest = _load_sort_index_manifest(key) if key else {}
+    if not manifest.get('sourceVersion') or manifest.get('schemaVersion') == _SORT_INDEX_SCHEMA_VERSION:
+        return False
+    refresh_user_sort_index(key, force_full=True)
+    return True
 
 
 def _sort_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:

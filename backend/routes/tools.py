@@ -168,6 +168,10 @@ def tools_build_indexes():
     # full build only for a missing one, all here on the 4Gi tools role.
     # `ready` (all built) is what the frontend gate waits on -- a built-but-
     # dirty index is still usable, so it doesn't hold the gate.
+    try:
+        app.storage_utils_ensure_sort_current(user_id)
+    except Exception:
+        app.app.logger.exception('Sort index schema upgrade failed for %s', user_id)
     state = app.get_user_index_build_state(user_id)
     if state['indexes'].get('lexical') and not state['needs_rebuild']:
         # Lexical is built and clean but the slim browser index may predate
