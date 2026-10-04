@@ -145,6 +145,9 @@ from storage_utils import (
     warm_user_index_files_async,
     ensure_user_search_db as storage_utils_ensure_search_db,
     ensure_user_sort_index_current as storage_utils_ensure_sort_current,
+    _SORT_INDEX_SCHEMA_VERSION as SORT_INDEX_SCHEMA_VERSION,
+    _load_sort_index_manifest,
+    _load_lexical_index_manifest,
     load_timeline_summary,
     delete_user_explore_summary_data,
     get_user_tag_embedding_index,
@@ -9591,6 +9594,141 @@ def _index_build_job_id(user_id: str) -> str:
     return f'index-build-{str(user_id or "").strip()}'
 
 
+INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS', '30'))
+
+
+def _index_build_job_active(user_id: str) -> bool:
+    """True if this library has an index_build job that is queued/running and
+    fresh (not past the same staleness cutoff /jobs/status uses to declare a
+    dead job failed)."""
+    key = str(user_id or '').strip()
+    if not key or jobs_table_client is None:
+        return False
+    row = _get_job_row(key, _index_build_job_id(key))
+    if not row or str(row.get('status') or '').lower() not in {'queued', 'running'}:
+        return False
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
+    return str(row.get('updatedAt') or '') >= cutoff
+
+
+def index_build_needed(user_id: str) -> bool:
+    """Any index missing/dirty, sort index on an older schema, or the SQLite
+    search database missing/stale (all cheap manifest reads)."""
+    import search_db
+    key = str(user_id or '').strip()
+    state = get_user_index_build_state(key)
+    if state['needs_rebuild']:
+        return True
+    sort_manifest = _load_sort_index_manifest(key)
+    if sort_manifest.get('schemaVersion') != SORT_INDEX_SCHEMA_VERSION:
+        return True
+    lexical_version = str(_load_lexical_index_manifest(key).get('sourceVersion') or '')
+    return bool(lexical_version) and not search_db.is_current(key, lexical_version)
+
+
+def enqueue_index_build(user_id: str, reason: str = '') -> str:
+    """Queue the library's index build on the always-awake `worker` role (library-
+    ops queue). Returns 'queued', 'already_active' or 'unavailable'.
+
+    Builds used to run inside a blocking HTTP request on the scale-to-zero
+    `tools` app: ingress cuts requests at ~240s, after which nothing held the
+    replica open, so a scale-down (or OOM restart) mid-build orphaned the job
+    ("Job did not finish (worker restarted or timed out)"). As a queue message
+    the build has a renewed lease, retries, a dead-letter queue and SIGTERM
+    handling, and the outstanding message itself keeps KEDA from scaling the
+    worker away."""
+    key = str(user_id or '').strip()
+    if not key:
+        return 'unavailable'
+    if _index_build_job_active(key):
+        return 'already_active'
+    if library_ops_queue_client is None:
+        return 'unavailable'
+    job_id = _index_build_job_id(key)
+    _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'queued')
+    try:
+        library_ops_queue_client.send_message(json.dumps(
+            {'type': 'index_build', 'userId': key, 'jobId': job_id, 'reason': reason},
+            separators=(',', ':'),
+        ))
+    except Exception:
+        worker_logger.exception('Failed to enqueue index build for %s', key)
+        _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'failed', error='Could not queue the index build')
+        return 'unavailable'
+    return 'queued'
+
+
+def _index_build_progress_callback(user_id: str):
+    # Mirrors prime_all_user_indexes_sequentially's live progress into the single
+    # per-user index_build jobs-table row (deterministic RowKey) so the build is
+    # visible cross-replica and to the notification bell -- storage_utils can't
+    # write this itself without importing app (circular), so it hands each step
+    # out through this callback instead.
+    job_id = _index_build_job_id(user_id)
+
+    def _cb(indexes: dict, building: bool) -> None:
+        ready = all(indexes.values())
+        if building:
+            _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running', result={'indexes': indexes, 'ready': ready})
+            return
+        # Build finished: derive the small served artifacts from the freshly
+        # built, still-cached lexical snapshot (tools/worker has the RAM; the 1Gi
+        # backend never loads it) while the job still reads 'running'. Each is
+        # best-effort and never fails the build itself.
+        if indexes.get('lexical'):
+            for name, step in (
+                ('Explore summary', refresh_user_explore_summary),
+                ('Timeline summary', refresh_user_timeline_summary),
+                ('Search database', storage_utils_ensure_search_db),
+            ):
+                try:
+                    with perf_instrumentation.span(f'index.build.{name.split()[0].lower()}', user=user_id):
+                        step(user_id)
+                except Exception:
+                    app.logger.exception('%s refresh failed for %s', name, user_id)
+        _upsert_job_status(
+            job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done' if ready else 'failed',
+            result={'indexes': indexes, 'ready': ready},
+        )
+    return _cb
+
+
+def _run_index_build_job(user_id: str, job_id: str) -> None:
+    """Worker-side body of an index_build message. A heartbeat thread keeps the
+    job row's updatedAt fresh while a long single step (full table scan,
+    search-database build) runs, so /jobs/status never declares a live build
+    dead -- and if the process really dies the heartbeat stops and the normal
+    staleness sweep (plus queue redelivery) takes over."""
+    started = time.monotonic()
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop.wait(INDEX_BUILD_HEARTBEAT_SECONDS):
+            try:
+                _upsert_job_status(
+                    job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running',
+                    result={'indexes': get_user_index_readiness(user_id), 'ready': False,
+                            'elapsedSeconds': int(time.monotonic() - started)},
+                )
+            except Exception:
+                worker_logger.exception('Index build heartbeat failed for %s', user_id)
+
+    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running')
+    heartbeat = threading.Thread(target=_heartbeat, name='index-build-heartbeat', daemon=True)
+    heartbeat.start()
+    try:
+        with perf_instrumentation.span('index.build.job', user=user_id):
+            storage_utils_ensure_sort_current(user_id)  # schema upgrade (full rebuild if stale)
+            prime_all_user_indexes_sequentially(user_id, on_progress=_index_build_progress_callback(user_id), wait=True)
+    except Exception:
+        worker_logger.exception('Index build failed for %s', user_id)
+        _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')
+        raise  # let the queue's bounded retry / dead-letter handling see it
+    finally:
+        stop.set()
+        heartbeat.join(timeout=5)
+
+
 def _preview_cache_blob_name(blob_name: str) -> str:
     # Keyed on the physical blob name (the anonymous UUID for anonymized photos),
     # so the derived preview blob never embeds the original filename either.
@@ -12404,6 +12542,10 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             raise
         return
 
+    if job_type == 'index_build':
+        _run_index_build_job(user_id, job_id or _index_build_job_id(user_id))
+        return
+
     if job_type == 'library_delete_purge':
         library_id = str(payload.get('libraryId') or user_id)
         try:
@@ -13705,7 +13847,7 @@ def _trigger_tools_index_rebuild(user_id: str) -> None:
     a trigger on every request while an index sits dirty waiting to rebuild."""
     tools_url = os.getenv('TOOLS_INTERNAL_URL', '').strip()
     key = str(user_id or '').strip()
-    if not tools_url or not key:
+    if not key or (not tools_url and library_ops_queue_client is None):
         return
     now = time.monotonic()
     with _TOOLS_REBUILD_TRIGGER_LOCK:
@@ -13713,6 +13855,16 @@ def _trigger_tools_index_rebuild(user_id: str) -> None:
         if last is not None and (now - last) < _TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS:
             return
         _TOOLS_REBUILD_TRIGGER_LAST[key] = now
+    # Preferred: queue the build on the worker (see enqueue_index_build). The
+    # tools HTTP path below is only the fallback when no queue is configured.
+    if library_ops_queue_client is not None:
+        try:
+            if enqueue_index_build(key, reason='trigger') != 'unavailable':
+                return
+        except Exception:
+            worker_logger.exception('Failed to enqueue index build for %s', key)
+    if not tools_url:
+        return
 
     def _fire() -> None:
         try:
