@@ -374,3 +374,10 @@ The backend (1Gi) used to hold library-sized data in memory for several endpoint
 Behaviour notes: rating/like changes reach list/filter/cover ranking on the next index build (minutes); the photos returned are always fresh. With a location filter active, photos without coordinates are excluded (the old code compared them as 0,0). A library with no current database yet gets `indexBuilding: true` from list/filter and a worker build is requested. The database schema is `sqlite-v2`; existing databases are rebuilt by the next build.
 
 Remaining library-proportional memory on the backend: the compact access map (~tens of MB per worker, loaded once per index version) and the albums/people indexes (sized by album/person count, not photo count).
+
+### 14.3 People: no 200-cluster cap
+
+Accounts have tens of thousands of clusters. The primary People path (the people index blob, downloaded once per session) was never capped; the cap lived in the fallback used when that index is unavailable (`listPersons(undefined, 0, 200)`), so a failed/cold index build meant only 200 people were visible.
+- `GET /api/persons?namesOnly=1&covers=1` returns **every** cluster in one request -- name, `isNamed`, `faceCount` and a `coverFaceId` chosen (confirmed > confidence, never rejected) from the in-memory bulk face map: no per-person lookups and no thumbnail signing, which is the per-page work the paged endpoint does and why it pages. 30,000 clusters build in <1 s in `tests/test_person_roster.py`. Without `covers=1` the response shape is unchanged.
+- `faceService.listAllPersons()` replaces the capped call in the store's fallback; covers load lazily via `/api/faces/crop/<id>`.
+- People grid is windowed (`useWindowedGrid`) so only on-screen cards render and only their covers are requested (it used to request every cover); selection lookups use a Set; the merge picker on a person page is searchable and renders at most 200 options (a `<select>` with 30k options freezes the tab).

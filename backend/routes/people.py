@@ -92,6 +92,11 @@ def list_persons():
             return app.jsonify({'error': 'People features not configured'}), 503
         q = (app.request.args.get('q') or '').strip().lower()
         names_only = (app.request.args.get('namesOnly') or '').strip().lower() in ('1', 'true')
+        # covers=1 (with namesOnly): also return each person's best cover face id,
+        # picked from the in-memory bulk face map -- no per-person lookups, no
+        # thumbnail signing -- so ONE request can return every cluster (tens of
+        # thousands) with no paging cap. The client builds /api/faces/crop/<id>.
+        want_covers = (app.request.args.get('covers') or '').strip().lower() in ('1', 'true')
         try:
             offset = int(app.request.args.get('offset', '0'))
             limit = int(app.request.args.get('limit', '15'))
@@ -119,6 +124,8 @@ def list_persons():
                 except Exception:
                     face_ids = []
                 active_count = 0
+                cover_face_id = None
+                cover_score = None
                 # See the identical comment in the Phase B loop below for what
                 # "indeterminate" protects against. Here, a bulk-map miss is
                 # conservatively treated as indeterminate rather than resolved
@@ -133,6 +140,10 @@ def list_persons():
                     if app._face_is_rejected(face) or not app._face_is_owned_by_person(face, person_id):
                         continue
                     active_count += 1
+                    if want_covers:
+                        score = app._face_preview_priority(face)
+                        if cover_score is None or score > cover_score:
+                            cover_face_id, cover_score = str(fid), score
 
                 # See the matching comment in Phase B: never auto-delete a
                 # cluster the user explicitly named, even when it's empty.
@@ -150,7 +161,10 @@ def list_persons():
                     unnamed_counter += 1
                 if q and q not in name.lower():
                     continue
-                entries.append({'personId': person_id, 'name': name, 'isNamed': is_named, 'faceCount': active_count})
+                entries.append({
+                    'personId': person_id, 'name': name, 'isNamed': is_named, 'faceCount': active_count,
+                    'coverFaceId': cover_face_id,
+                })
             except Exception:
                 continue
 
@@ -163,7 +177,10 @@ def list_persons():
         if names_only:
             return app.jsonify({
                 'persons': [
-                    {'personId': e['personId'], 'name': e['name'], 'faceCount': e['faceCount']}
+                    {
+                        'personId': e['personId'], 'name': e['name'], 'faceCount': e['faceCount'],
+                        **({'isNamed': e['isNamed'], 'coverFaceId': e['coverFaceId']} if want_covers else {}),
+                    }
                     for e in entries
                 ],
                 'total': total,

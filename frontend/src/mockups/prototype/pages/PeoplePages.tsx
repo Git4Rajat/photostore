@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft as ArrowLeftIcon, Check as CheckIcon, Sparkles as SparklesIcon, Trash2 as TrashIcon, Users as UserGroupIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch, Spinner, SelectionBar } from '../components/bits';
@@ -7,12 +7,14 @@ import PhotoGrid from '../components/PhotoGrid';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { confirmDialog } from '../../../components/shared/dialogs';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
+import { useWindowedGrid } from '../../../services/useWindowedGrid';
 import type { Person } from '../types';
 
 // The merge target when several selected clusters are merged at once: prefer
 // a named person (merging *into* a name is the common case -- folding
 // unnamed duplicate clusters into someone already identified), falling back
 // to selection order if none are named.
+const MERGE_PICKER_MAX_OPTIONS = 200;
 const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.name) ?? selected[0];
 
 /** People — a grid of face clusters; unnamed ones are flagged for naming.
@@ -31,10 +33,16 @@ export const PeoplePage: React.FC = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    const covers = useProtectedBlobUrls(people.map((p) => p.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
-    const unnamedCount = people.filter((p) => !p.name).length;
+    // Accounts can have tens of thousands of clusters: render (and request cover
+    // images for) only the rows near the viewport, never the whole list.
+    const peopleWindow = useWindowedGrid({ items: people, getKey: (p: Person) => p.id, overscanRows: 3 });
+    const covers = useProtectedBlobUrls(
+        peopleWindow.visibleItems.map((p) => p.coverThumbnailUrl).filter((u): u is string => Boolean(u)),
+    );
+    const unnamedCount = useMemo(() => people.filter((p) => !p.name).length, [people]);
     const [selectMode, setSelectMode] = useState(false);
     const [selectedIds, setSelectedIds] = useState<string[]>([]);
+    const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
 
     const exitSelectMode = () => {
         setSelectMode(false);
@@ -46,7 +54,7 @@ export const PeoplePage: React.FC = () => {
     };
 
     const handleMerge = () => {
-        const selected = people.filter((p) => selectedIds.includes(p.id));
+        const selected = people.filter((p) => selectedSet.has(p.id));
         if (selected.length < 2) return;
         const target = pickMergeTarget(selected);
         const sourceIds = selected.filter((p) => p.id !== target.id).map((p) => p.id);
@@ -90,10 +98,11 @@ export const PeoplePage: React.FC = () => {
                     </button>
                 )}
             </div>
-            <div className="pt-people-grid">
-                {people.map((person) => {
+            <div ref={peopleWindow.containerRef} style={peopleWindow.spacerStyle}>
+            <div ref={peopleWindow.innerRef} className="pt-people-grid" style={peopleWindow.innerStyle}>
+                {peopleWindow.visibleItems.map((person) => {
                     const coverSrc = person.coverThumbnailUrl ? covers[person.coverThumbnailUrl] : undefined;
-                    const checked = selectedIds.includes(person.id);
+                    const checked = selectedSet.has(person.id);
                     return (
                         <button
                             key={person.id}
@@ -114,6 +123,7 @@ export const PeoplePage: React.FC = () => {
                         </button>
                     );
                 })}
+            </div>
             </div>
             {selectMode && selectedIds.length > 0 && (
                 <SelectionBar count={selectedIds.length} onClear={exitSelectMode} label="People selection actions">
@@ -143,6 +153,7 @@ export const PersonDetailPage: React.FC = () => {
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
     const [mergeId, setMergeId] = useState('');
+    const [mergeQuery, setMergeQuery] = useState('');
     const [personTile, setPersonTile] = useTileSize('photostore.personTileSize');
     const headCover = useProtectedBlobUrls(person?.coverThumbnailUrl ? [person.coverThumbnailUrl] : []);
 
@@ -178,7 +189,19 @@ export const PersonDetailPage: React.FC = () => {
         );
     }
 
+    // The merge picker must stay usable with tens of thousands of clusters: search
+    // by name, show the biggest matches first, and cap the rendered options (a
+    // <select> with 30k <option>s freezes the tab). The chosen person always stays
+    // listed so the selection never silently disappears.
+    const mergeQ = mergeQuery.trim().toLowerCase();
     const others = people.filter((p) => p.id !== person.id);
+    const mergeMatches = others
+        .filter((p) => !mergeQ || (p.name ?? 'unnamed').toLowerCase().includes(mergeQ))
+        .sort((a, b) => (b.faceCount ?? 0) - (a.faceCount ?? 0))
+        .slice(0, MERGE_PICKER_MAX_OPTIONS);
+    const mergeOptions = mergeId && !mergeMatches.some((o) => o.id === mergeId)
+        ? [...mergeMatches, ...others.filter((o) => o.id === mergeId)]
+        : mergeMatches;
     const photos = personPhotosById(person.id);
     const coverSrc = person.coverThumbnailUrl ? headCover[person.coverThumbnailUrl] : undefined;
 
@@ -241,9 +264,17 @@ export const PersonDetailPage: React.FC = () => {
             <div className="card-glass pt-merge">
                 <div className="pt-menu-label">Merge another person into {person.name ?? 'this person'}</div>
                 <div className="pt-merge-row">
+                    <input
+                        className="field"
+                        type="search"
+                        value={mergeQuery}
+                        onChange={(e) => setMergeQuery(e.target.value)}
+                        placeholder={`Search ${others.length.toLocaleString()} people…`}
+                        aria-label="Search people to merge"
+                    />
                     <select className="field field-select" value={mergeId} onChange={(e) => setMergeId(e.target.value)} aria-label="Person to merge">
-                        <option value="">Choose a person…</option>
-                        {others.map((o) => (
+                        <option value="">{mergeMatches.length < others.filter((p) => !mergeQ || (p.name ?? 'unnamed').toLowerCase().includes(mergeQ)).length ? `Choose a person… (top ${mergeMatches.length} shown — search to narrow)` : 'Choose a person…'}</option>
+                        {mergeOptions.map((o) => (
                             <option key={o.id} value={o.id}>{o.name ?? 'Unnamed'} · {o.faceCount ?? 0} photos</option>
                         ))}
                     </select>
