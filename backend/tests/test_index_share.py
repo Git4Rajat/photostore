@@ -31,6 +31,7 @@ class _EtagBlob:
         self.name, self.downloads = name, 0
 
     def upload_blob(self, data, overwrite=True, content_settings=None):
+        data = data.read() if hasattr(data, 'read') else data
         _EtagBlob.store[self.name] = (bytes(data), f'"e{len(_EtagBlob.store)}-{len(data)}"')
         return {'etag': _EtagBlob.store[self.name][1]}
 
@@ -123,3 +124,16 @@ def test_warm_async_is_single_flight_with_cooldown(share, monkeypatch):
     storage_utils._WARM_LAST.clear()
     assert storage_utils.warm_user_index_files_async('lib') is True
     assert storage_utils.warm_user_index_files_async('lib') is False
+
+
+def test_upload_file_streams_to_blob_and_mirrors_to_share(share, tmp_path):
+    src = tmp_path / 'built.json.gz'
+    src.write_bytes(b'z' * 200)
+    client = storage_utils._get_blob_client('lexical-index', 'lib-sort.json.gz')
+    storage_utils._upload_file_to_blob(client, str(src), overwrite=True)
+    assert _EtagBlob.store['lexical-index/lib-sort.json.gz'][0] == b'z' * 200
+    assert client.download_blob().readall() == b'z' * 200
+    assert share.clients['lexical-index/lib-sort.json.gz'].downloads == 0
+    dest = tmp_path / 'fetched'
+    client.fetch_to(str(dest))
+    assert dest.read_bytes() == b'z' * 200

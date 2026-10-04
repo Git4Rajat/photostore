@@ -303,16 +303,14 @@ def test_get_user_sort_index_never_blocks_once_a_stale_snapshot_exists(sort_ctx,
     entered = threading.Event()
     release = threading.Event()
 
-    def slow_build(user_id, source_version):
+    real_query = table.query_entities
+
+    def slow_query(*args, **kwargs):
         entered.set()
         release.wait(timeout=5)
-        return storage_utils.LexicalIndexSnapshot(
-            user_id=user_id, source_version=source_version,
-            schema_version=storage_utils._SORT_INDEX_SCHEMA_VERSION,
-            updated_at=source_version, rows=[{'RowKey': 'b.jpg', 'rating': 0, 'likes': 0, 'uploadDate': None, 'captureDate': None}],
-        )
+        return real_query(*args, **kwargs)
 
-    monkeypatch.setattr(storage_utils, '_build_user_sort_index_snapshot', slow_build)
+    table.query_entities = slow_query
 
     start = time.monotonic()
     result = storage_utils.get_user_sort_index('lib-I', allow_refresh=True)
@@ -356,7 +354,8 @@ def test_refresh_incremental_merge_only_refetches_dirty_filenames(sort_ctx):
     refreshed = storage_utils.refresh_user_sort_index('lib-J', source_version='v2')
 
     assert fetched == ['b.jpg']  # a.jpg was carried over from the existing snapshot, not re-fetched
-    by_name = {row['RowKey']: row for row in refreshed.rows}
+    assert refreshed.rows == []  # rows live in the blob, never in the returned snapshot
+    by_name = {row['RowKey']: row for row in storage_utils._load_sort_index_blob('lib-J').rows}
     assert by_name['a.jpg']['rating'] == 1
     assert by_name['b.jpg']['rating'] == 99
 
@@ -534,3 +533,31 @@ def test_get_user_sort_index_cold_sync_build_default_still_builds_inline(sort_ct
     result = storage_utils.get_user_sort_index('lib-sync', allow_refresh=True)
     assert result is not None
     assert [row['RowKey'] for row in result['rows']] == ['a.jpg']
+
+
+def test_streaming_refresh_holds_no_rows_in_memory(sort_ctx):
+    import tracemalloc
+    table, _, _ = sort_ctx
+    for i in range(3000):
+        _seed_row(table, 'lib-M', f'p{i}.jpg', rating=i % 5, uploadDate=f'2026-01-01T00:00:{i % 60:02d}+00:00', note='x' * 50 + str(i))
+    tracemalloc.start()
+    snapshot = storage_utils.refresh_user_sort_index('lib-M', source_version='v1')
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert snapshot.rows == []
+    loaded = storage_utils._load_sort_index_blob('lib-M')
+    assert len(loaded.rows) == 3000
+    assert peak < 3 * 1024 * 1024, f'peak {peak / 1048576:.1f} MB'
+
+
+def test_streaming_merge_drops_deleted_and_appends_new_rows(sort_ctx):
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-N', 'a.jpg', rating=1)
+    _seed_row(table, 'lib-N', 'b.jpg', rating=2)
+    storage_utils.refresh_user_sort_index('lib-N', source_version='v1')
+    _seed_row(table, 'lib-N', 'b.jpg', rating=2, processing_state='deleted')
+    _seed_row(table, 'lib-N', 'c.jpg', rating=3)
+    storage_utils.touch_user_sort_index_dirty('lib-N', ['b.jpg', 'c.jpg'])
+    storage_utils.refresh_user_sort_index('lib-N', source_version='v2')
+    rows = storage_utils._load_sort_index_blob('lib-N').rows
+    assert [r['RowKey'] for r in rows] == ['a.jpg', 'c.jpg']

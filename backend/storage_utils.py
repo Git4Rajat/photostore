@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 import base64
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1810,6 +1811,42 @@ class _ShareBackedBlob:
         else:
             self._forget()
         return result
+
+    def upload_file(self, path: str, **kwargs):
+        """Upload a finished local file and mirror it to the share, both streamed
+        (never the whole payload in memory)."""
+        with open(path, 'rb') as fh:
+            result = self._inner.upload_blob(fh, **kwargs)
+        etag = result.get('etag') if isinstance(result, dict) else getattr(result, 'etag', None)
+        try:
+            if not etag or os.path.getsize(path) < INDEX_DISK_CACHE_MIN_BYTES:
+                self._forget()
+                return result
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            tag = f'.{os.getpid()}.{threading.get_ident()}.tmp'
+            shutil.copyfile(path, self._path + tag)
+            os.replace(self._path + tag, self._path)
+            with open(self._path + '.etag', 'w') as fh:
+                fh.write(str(etag))
+        except OSError:
+            self._forget()
+            _LOGGER.warning('Index share write failed for %s', self._path, exc_info=True)
+        return result
+
+    def fetch_to(self, dest: str) -> None:
+        """Materialise the current blob at ``dest``, streaming (from the share
+        when its copy is current)."""
+        try:
+            with open(self._path + '.etag') as fh:
+                cached = fh.read().strip()
+            if cached and str(self._inner.get_blob_properties().etag or '') == cached:
+                shutil.copyfile(self._path, dest)
+                return
+        except Exception:
+            pass
+        downloader = self._inner.download_blob()
+        with open(dest, 'wb') as fh:
+            downloader.readinto(fh)
 
     def download_blob(self, *args, **kwargs):
         if args or kwargs:
@@ -4795,52 +4832,139 @@ def _merge_user_sort_index_snapshot(
     )
 
 
-def refresh_user_sort_index(
-    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
-) -> Optional[LexicalIndexSnapshot]:
-    key = str(user_id or '').strip()
-    if not key:
-        return None
-    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+def _upload_file_to_blob(client, path: str, **kwargs):
+    """Publish a finished local file. Share-backed/real clients stream it from
+    disk; anything else (small compressed files) gets the bytes."""
+    if hasattr(client, 'upload_file'):
+        return client.upload_file(path, **kwargs)
+    if type(client).__module__.startswith('azure'):
+        with open(path, 'rb') as fh:
+            return client.upload_blob(fh, **kwargs)
+    with open(path, 'rb') as fh:
+        return client.upload_blob(fh.read(), **kwargs)
 
-    snapshot = None
-    dirty_to_clear: Optional[Set[str]] = None
-    if not force_full:
-        existing = _load_sort_index_blob(key)
-        if existing is not None and existing.schema_version == _SORT_INDEX_SCHEMA_VERSION:
-            dirty = _get_dirty_search_index_filenames(key, 'sort')
-            if dirty is not None:
-                snapshot = _merge_user_sort_index_snapshot(key, existing, dirty, source_version)
-                if snapshot is not None:
-                    dirty_to_clear = dirty
-    if snapshot is None:
-        snapshot = _build_user_sort_index_snapshot(key, source_version)
-        if snapshot is not None:
-            dirty_to_clear = _get_dirty_search_index_filenames(key, 'sort') or set()
-    if snapshot is None:
-        return None
+
+def _fetch_blob_to_file(client, dest: str) -> bool:
+    try:
+        if hasattr(client, 'fetch_to'):
+            client.fetch_to(dest)
+        else:
+            downloader = client.download_blob()
+            if type(client).__module__.startswith('azure') and hasattr(downloader, 'readinto'):
+                with open(dest, 'wb') as fh:
+                    downloader.readinto(fh)
+            else:
+                with open(dest, 'wb') as fh:
+                    fh.write(downloader.readall())
+        return True
+    except Exception:
+        return False
+
+
+def _refresh_rows_index_on_disk(
+    kind: str,
+    key: str,
+    source_version: str,
+    *,
+    schema_version: str,
+    blob_name: str,
+    manifest_blob_name: str,
+    source_fields,
+    row_fn,
+    keep_entity,
+    force_full: bool,
+    cache_lock,
+    cache: Dict,
+) -> Optional['LexicalIndexSnapshot']:
+    """Build or incrementally merge a per-photo rows index (sort/access) with
+    O(1) rows in memory: rows stream table -> gzip file on disk (the share when
+    INDEX_BUILD_WORK_DIR points there) -> blob, and a merge streams the previous
+    file through, swapping the dirty rows. Returns a snapshot with NO rows (the
+    file is the artifact); callers needing rows reload from the blob."""
+    metadata_table_client = _CTX.get('metadata_table_client')
     container_name = _lexical_index_container_name()
-    if container_name:
-        blob_client = _get_blob_client(container_name, _sort_index_json_blob_name(key))
+    if metadata_table_client is None:
+        return None
+    blob_client = _get_blob_client(container_name, blob_name) if container_name else None
+    dirty = None if force_full else _get_dirty_search_index_filenames(key, kind)
+    with index_files.workspace() as workdir:
+        out_path = os.path.join(workdir, f'{kind}.json.gz')
+        header = {'userId': key, 'sourceVersion': source_version, 'schemaVersion': schema_version, 'updatedAt': source_version}
+        previous = os.path.join(workdir, f'{kind}-previous.json.gz')
+        merge = False
+        if dirty is not None and blob_client is not None and _fetch_blob_to_file(blob_client, previous):
+            try:
+                merge = index_files.read_header(previous).get('schemaVersion') == schema_version
+            except Exception:
+                merge = False
+        try:
+            writer = index_files.RowsWriter(out_path, header)
+            try:
+                if merge:
+                    refreshed: Dict[str, Optional[Dict]] = {}
+
+                    def _one(filename: str):
+                        try:
+                            entity = metadata_table_client.get_entity(partition_key=key, row_key=filename)
+                        except Exception:
+                            return filename, None
+                        if not keep_entity(entity):
+                            return filename, None
+                        return filename, row_fn(dict(entity))
+
+                    if dirty:
+                        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty)))) as executor:
+                            refreshed = dict(executor.map(_one, list(dirty)))
+                    written: Set[str] = set()
+                    for row in index_files.iter_rows(previous):
+                        name = str(row.get('RowKey') or '')
+                        if not name:
+                            continue
+                        if name in refreshed:
+                            new_row = refreshed[name]
+                            if new_row is not None and name not in written:
+                                writer.add(new_row)
+                                written.add(name)
+                        else:
+                            writer.add(row)
+                    for name, new_row in refreshed.items():
+                        if new_row is not None and name not in written:
+                            writer.add(new_row)
+                    dirty_to_clear = dirty
+                else:
+                    with perf_instrumentation.span(f'index.{kind}.table_scan', user=key):
+                        for entity in metadata_table_client.query_entities(
+                            f"PartitionKey eq '{_escape_odata(key)}'", select=source_fields,
+                        ):
+                            if not keep_entity(entity):
+                                continue
+                            row = row_fn(dict(entity))
+                            if row is not None:
+                                writer.add(row)
+                    dirty_to_clear = _get_dirty_search_index_filenames(key, kind) or set()
+                count = writer.close()
+            except BaseException:
+                writer.abort()
+                raise
+        except Exception:
+            # A failed scan must never be persisted as an empty, clean index.
+            _LOGGER.exception('Streaming %s index build failed user=%s', kind, key)
+            return None
         if blob_client is not None:
             try:
-                blob_client.upload_blob(
-                    _serialize_sort_index(snapshot),
-                    overwrite=True,
+                _upload_file_to_blob(
+                    blob_client, out_path, overwrite=True,
                     content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
                 )
             except Exception:
-                pass
-        _clear_manifest_dirty_flag(key, 'sort')
+                _LOGGER.warning('Uploading %s index failed user=%s', kind, key, exc_info=True)
+    if container_name:
+        _clear_manifest_dirty_flag(key, kind)
         manifest = {
-            'userId': key,
-            'sourceVersion': snapshot.source_version,
-            'schemaVersion': snapshot.schema_version,
-            'rowCount': len(snapshot.rows),
-            'dirty': False,
-            'updatedAt': snapshot.updated_at,
+            'userId': key, 'sourceVersion': source_version, 'schemaVersion': schema_version,
+            'rowCount': count, 'dirty': False, 'updatedAt': source_version,
         }
-        manifest_client = _get_blob_client(container_name, _sort_index_manifest_blob_name(key))
+        manifest_client = _get_blob_client(container_name, manifest_blob_name)
         if manifest_client is not None:
             try:
                 manifest_client.upload_blob(
@@ -4850,16 +4974,35 @@ def refresh_user_sort_index(
                 )
             except Exception:
                 pass
-    with _SORT_INDEX_CACHE_LOCK:
-        _SORT_INDEX_CACHE[key] = {
-            'source_version': snapshot.source_version,
-            'schema_version': snapshot.schema_version,
-            'updated_at': snapshot.updated_at,
-            'rows': snapshot.rows,
-        }
+    with cache_lock:
+        cache.pop(key, None)  # the rows are on disk/blob, not held here
     if dirty_to_clear:
-        _clear_dirty_search_index_filenames(key, 'sort', dirty_to_clear)
-    return snapshot
+        _clear_dirty_search_index_filenames(key, kind, dirty_to_clear)
+    perf_instrumentation.log_event('index_streamed', kind=kind, user=key, rows=count, merged=merge)
+    return LexicalIndexSnapshot(
+        user_id=key, source_version=source_version, schema_version=schema_version,
+        updated_at=source_version, rows=[],
+    )
+
+
+
+def refresh_user_sort_index(
+    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
+) -> Optional[LexicalIndexSnapshot]:
+    key = str(user_id or '').strip()
+    if not key:
+        return None
+    return _refresh_rows_index_on_disk(
+        'sort', key, str(source_version or datetime.now(timezone.utc).isoformat()),
+        schema_version=_SORT_INDEX_SCHEMA_VERSION,
+        blob_name=_sort_index_json_blob_name(key),
+        manifest_blob_name=_sort_index_manifest_blob_name(key),
+        source_fields=_SORT_INDEX_SOURCE_FIELDS,
+        row_fn=_sort_index_row,
+        keep_entity=lambda e: str(e.get('processing_state') or '').strip().lower() != 'deleted',
+        force_full=force_full,
+        cache_lock=_SORT_INDEX_CACHE_LOCK, cache=_SORT_INDEX_CACHE,
+    )
 
 
 def ensure_user_sort_index_current(user_id: str) -> bool:
@@ -4972,14 +5115,8 @@ def get_user_sort_index(
                 fresh = _sort_index_fresh_cache_entry(key, _load_sort_index_manifest(key))
                 if fresh is None:
                     source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-                    refreshed = refresh_user_sort_index(key, source_version=source_version)
-                    if refreshed is not None:
-                        fresh = {
-                            'source_version': refreshed.source_version,
-                            'schema_version': refreshed.schema_version,
-                            'updated_at': refreshed.updated_at,
-                            'rows': refreshed.rows,
-                        }
+                    if refresh_user_sort_index(key, source_version=source_version) is not None:
+                        fresh = _sort_index_fresh_cache_entry(key, _load_sort_index_manifest(key))
         else:
             # Cold + caller must not block (the gallery's initial load): build
             # off-thread so the next request is fast, and report "not ready"
@@ -5244,68 +5381,21 @@ def _merge_user_access_index_snapshot(
 def refresh_user_access_index(
     user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
 ) -> Optional[LexicalIndexSnapshot]:
+    # Trashed rows stay in this index (see the module comment above).
     key = str(user_id or '').strip()
     if not key:
         return None
-    source_version = str(source_version or datetime.now(timezone.utc).isoformat())
-
-    snapshot = None
-    dirty_to_clear: Optional[Set[str]] = None
-    if not force_full:
-        existing = _load_access_index_blob(key)
-        if existing is not None and existing.schema_version == _ACCESS_INDEX_SCHEMA_VERSION:
-            dirty = _get_dirty_search_index_filenames(key, 'access')
-            if dirty is not None:
-                snapshot = _merge_user_access_index_snapshot(key, existing, dirty, source_version)
-                if snapshot is not None:
-                    dirty_to_clear = dirty
-    if snapshot is None:
-        snapshot = _build_user_access_index_snapshot(key, source_version)
-        if snapshot is not None:
-            dirty_to_clear = _get_dirty_search_index_filenames(key, 'access') or set()
-    if snapshot is None:
-        return None
-    container_name = _lexical_index_container_name()
-    if container_name:
-        blob_client = _get_blob_client(container_name, _access_index_json_blob_name(key))
-        if blob_client is not None:
-            try:
-                blob_client.upload_blob(
-                    _serialize_access_index(snapshot),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
-                )
-            except Exception:
-                pass
-        _clear_manifest_dirty_flag(key, 'access')
-        manifest = {
-            'userId': key,
-            'sourceVersion': snapshot.source_version,
-            'schemaVersion': snapshot.schema_version,
-            'rowCount': len(snapshot.rows),
-            'dirty': False,
-            'updatedAt': snapshot.updated_at,
-        }
-        manifest_client = _get_blob_client(container_name, _access_index_manifest_blob_name(key))
-        if manifest_client is not None:
-            try:
-                manifest_client.upload_blob(
-                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json'),
-                )
-            except Exception:
-                pass
-    with _ACCESS_INDEX_CACHE_LOCK:
-        _ACCESS_INDEX_CACHE[key] = {
-            'source_version': snapshot.source_version,
-            'schema_version': snapshot.schema_version,
-            'updated_at': snapshot.updated_at,
-            'rows': snapshot.rows,
-        }
-    if dirty_to_clear:
-        _clear_dirty_search_index_filenames(key, 'access', dirty_to_clear)
-    return snapshot
+    return _refresh_rows_index_on_disk(
+        'access', key, str(source_version or datetime.now(timezone.utc).isoformat()),
+        schema_version=_ACCESS_INDEX_SCHEMA_VERSION,
+        blob_name=_access_index_json_blob_name(key),
+        manifest_blob_name=_access_index_manifest_blob_name(key),
+        source_fields=_ACCESS_INDEX_SOURCE_FIELDS,
+        row_fn=_access_index_row,
+        keep_entity=lambda e: True,
+        force_full=force_full,
+        cache_lock=_ACCESS_INDEX_CACHE_LOCK, cache=_ACCESS_INDEX_CACHE,
+    )
 
 
 def _access_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Optional[Dict[str, object]]:
@@ -5397,14 +5487,8 @@ def get_user_access_index(
                 fresh = _access_index_fresh_cache_entry(key, _load_access_index_manifest(key))
                 if fresh is None:
                     source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-                    refreshed = refresh_user_access_index(key, source_version=source_version)
-                    if refreshed is not None:
-                        fresh = {
-                            'source_version': refreshed.source_version,
-                            'schema_version': refreshed.schema_version,
-                            'updated_at': refreshed.updated_at,
-                            'rows': refreshed.rows,
-                        }
+                    if refresh_user_access_index(key, source_version=source_version) is not None:
+                        fresh = _access_index_fresh_cache_entry(key, _load_access_index_manifest(key))
         else:
             # Cold + caller must not block (access-batch): build off-thread so
             # the next request is fast, and report "not ready" now so the

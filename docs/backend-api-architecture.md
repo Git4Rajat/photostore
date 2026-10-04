@@ -416,3 +416,5 @@ A scan failure now aborts the build (vector/tag-embedding) instead of being pers
   * `full` runs when an index has never been built or the search DB is missing, after a clustering job, and after a Workbench/tools action.
   * `index_build_needed` ignores dirtiness and only reports cold, outdated-schema or missing-search-DB libraries.
 * The vector index is always a full streaming pass; nothing on a serving path reads it.
+
+The sort and access indexes follow the same rule. `_refresh_rows_index_on_disk` streams rows from the table into a gzip file and uploads from that file. It also mirrors the file to the share (`_ShareBackedBlob.upload_file`). An incremental refresh streams the previous file through and swaps in only the dirty rows. The snapshot it returns has no rows, and callers that need them reload from the blob.
