@@ -7,7 +7,7 @@ import { getActiveLibraryFromToken } from './passwordAuthClient';
  * captureDate, rating, likes, uploadDate} projection, small enough to
  * download once per session and sort/paginate locally instead of every
  * gallery page request materializing and sorting the whole library
- * server-side. Combines localSearchIndex.ts's fetch/gunzip/cache shape with
+ * server-side. Combines the former browser search index's fetch/gunzip/cache shape with
  * photoCache.ts's raw-IndexedDB idiom, persisted (not just in-memory) so a
  * reload within the manifest's still-fresh window skips the blob re-download
  * entirely.
@@ -75,7 +75,7 @@ const idbPutStored = async (key: string, value: StoredSortIndex): Promise<void> 
 };
 
 const decompressGzip = async (buffer: ArrayBuffer): Promise<string> => {
-    // Same approach as localSearchIndex.ts -- DecompressionStream is the
+    // Same approach as the former browser search index -- DecompressionStream is the
     // standard, dependency-free way to gunzip in a browser.
     const stream = new Response(buffer).body!.pipeThrough(new DecompressionStream('gzip'));
     return new Response(stream).text();
@@ -96,7 +96,7 @@ const normalizeRows = (raw: Record<string, unknown>[]): SortIndexRow[] => raw
 // promise forever instead of rejecting, which (via getLocalSortIndex's
 // module-scoped inFlight dedup) would wedge every caller behind the same
 // permanently-pending promise for the rest of the tab session. See
-// localSearchIndex.ts's BLOB_FETCH_TIMEOUT_MS for the full writeup --
+// the former browser search index's BLOB_FETCH_TIMEOUT_MS for the full writeup --
 // confirmed live 2026-09-29 for that index's blob fetch; same latent gap
 // here since the code shape is identical.
 const BLOB_FETCH_TIMEOUT_MS = 120000;
@@ -117,7 +117,7 @@ const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> 
     // transparently decompress it before we ever see the bytes, so try
     // parsing directly first and only fall back to manual decompression if
     // the fetch handed back the raw compressed bytes instead (mirrors
-    // localSearchIndex.ts's downloadIndexBlob).
+    // the former browser search index's downloadIndexBlob).
     try {
         const text = new TextDecoder().decode(buffer);
         const parsed = JSON.parse(text);
@@ -132,7 +132,7 @@ const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> 
     return normalizeRows(Array.isArray(parsed?.rows) ? parsed.rows : []);
 };
 
-// Keyed by active library, same reasoning as localSearchIndex.ts's indexKey/
+// Keyed by active library, same reasoning as the former browser search index's indexKey/
 // photoCache.ts's photoCacheKey -- switching libraries can't serve one
 // library's rows while browsing another.
 const indexKey = (): string => getActiveLibraryFromToken() || '__default__';

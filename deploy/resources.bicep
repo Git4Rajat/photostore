@@ -630,6 +630,9 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
           image: backendImage
           volumeMounts: [
             { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+            // Ephemeral (replica-local) disk for the SQLite search database -- SQLite needs a
+            // real local filesystem, not the SMB share. Re-fetched from Blob per replica.
+            { volumeName: 'search-db', mountPath: '/var/lib/photostore/search-db' }
           ]
           resources: {
             // 2026-09-03: raised from 1.25vCPU/2.5Gi live on photostore-test
@@ -697,6 +700,9 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // Shared Azure Files volume: index blobs are cached here by ETag so a
             // restart/scale-out re-reads from disk instead of re-downloading them.
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
+            { name: 'SEARCH_DB_DIR', value: '/var/lib/photostore/search-db' }
+            // Must fit the replica's ephemeral storage (0.5 vCPU -> ~2GiB); oldest files evicted.
+            { name: 'SEARCH_DB_MAX_CACHE_MB', value: '1200' }
             // Gunicorn workers are separate processes and the app is imported
             // AFTER fork (no --preload), so every worker loads its own copy of
             // numpy/scipy/scikit-learn/Pillow + the Azure SDKs (~250-350 MB
@@ -827,6 +833,7 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
       ]
       volumes: [
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
+        { name: 'search-db', storageType: 'EmptyDir' }
       ]
       scale: {
         minReplicas: 0

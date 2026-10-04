@@ -101,7 +101,7 @@ const normalizeRows = (raw: Record<string, unknown>[]): AlbumIndexRow[] => raw
 // promise forever instead of rejecting, which (via getLocalAlbumsIndex's
 // module-scoped inFlight dedup) would wedge every caller behind the same
 // permanently-pending promise for the rest of the tab session. See
-// localSearchIndex.ts's BLOB_FETCH_TIMEOUT_MS for the full writeup --
+// the former browser search index's BLOB_FETCH_TIMEOUT_MS for the full writeup --
 // confirmed live 2026-09-29 for that index's blob fetch; same latent gap
 // here since the code shape is identical.
 const BLOB_FETCH_TIMEOUT_MS = 120000;
