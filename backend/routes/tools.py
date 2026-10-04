@@ -174,12 +174,12 @@ def tools_build_indexes():
         app.app.logger.exception('Sort index schema upgrade failed for %s', user_id)
     state = app.get_user_index_build_state(user_id)
     if state['indexes'].get('lexical') and not state['needs_rebuild']:
-        # Lexical is built and clean but the slim browser index may predate
-        # this deploy's schema -- derive it from the existing blob.
+        # Lexical is built and clean but the SQLite search database may be
+        # missing/old (first deploy, schema bump) -- derive it from the blob.
         try:
-            app.storage_utils_ensure_slim(user_id)
+            app.storage_utils_ensure_search_db(user_id)
         except Exception:
-            app.app.logger.exception('Slim search index ensure failed for %s', user_id)
+            app.app.logger.exception('Search DB ensure failed for %s', user_id)
     if state['needs_rebuild']:
         try:
             app.prime_all_user_indexes_sequentially(

@@ -1797,7 +1797,9 @@ def _get_blob_client(container_name: str, filename: str):
         client = blob_service_client.get_blob_client(container=container_name, blob=filename)
     except Exception:
         return None
-    if INDEX_DISK_CACHE_DIR and container_name in _index_container_names():
+    # The SQLite search DB must live on LOCAL EPHEMERAL disk (search_db.py), never
+    # on the SMB share -- so it bypasses the share-backed client.
+    if INDEX_DISK_CACHE_DIR and container_name in _index_container_names() and '-searchdb' not in filename:
         return _ShareBackedBlob(client, container_name, filename)
     return client
 
@@ -1807,7 +1809,6 @@ def _user_index_blob_locations(user_id: str) -> List[Tuple[str, str]]:
     lexical = _lexical_index_container_name()
     return [
         (lexical, _sort_index_json_blob_name(key)),
-        (lexical, _search_index_json_blob_name(key)),
         (lexical, _listing_index_json_blob_name(key)),
         (lexical, _access_index_json_blob_name(key)),
         (lexical, _albums_index_json_blob_name(key)),
@@ -3429,7 +3430,7 @@ def get_user_listing_index(
     }
 
 
-# --- "Search" slim projection of the lexical index ----------------------------
+# --- Search-database row reduction helpers -------------------------------------
 # What the BROWSER downloads for client-side search (localLexicalSearch.ts).
 # The full lexical blob carries every metadata column (hundreds of MB gzipped
 # -> 700MB+ of JSON at ~130k photos, enough to blow V8's string limit and the
@@ -3440,7 +3441,6 @@ def get_user_listing_index(
 # lexical/listing blobs (no extra Table reads). The full lexical blob stays the
 # server-side source of truth; search-index falls back to it if this one is
 # missing or stale.
-_SEARCH_INDEX_SCHEMA_VERSION = 'v2'
 # Browser-index size knobs. Everything here only affects the slim BROWSER blob;
 # the full lexical blob (server-side fallback search) is untouched.
 SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '400'))
@@ -3575,138 +3575,26 @@ def _search_prediction_labels(raw, already: set) -> List[str]:
     return out
 
 
-def _first_nonempty(row: Dict, *fields: str) -> str:
-    for field in fields:
-        value = row.get(field)
-        if value not in (None, ''):
-            return str(value)
-    return ''
 
 
-def _search_slim_row(row: Dict) -> Dict:
-    out: Dict[str, object] = {'RowKey': row.get('RowKey')}
-    for field in _SEARCH_SLIM_PASSTHROUGH_FIELDS:
-        value = row.get(field)
-        if value not in (None, '', '[]'):
-            out[field] = value
-    names = _json_list(row.get('peopleNames'))
-    if names:
-        out['peopleNames'] = names
-    subject, others = _search_slim_tags(row)
-    if subject:
-        out['subjectTags'] = subject
-    if others:
-        out['tags'] = others
-    labels = _search_prediction_labels(row.get('processing_metadata'), set(subject) | set(others))
-    if labels:
-        out['predictionLabels'] = labels
-    # Search only tests whether coordinates exist, never their value.
-    if str(row.get('latitude') or '').strip() and str(row.get('longitude') or '').strip():
-        out['latitude'] = out['longitude'] = '1'
-    # metadataUploadDatetime = first non-empty of these three; collapse to one.
-    upload = _first_nonempty(row, 'uploadDate', 'upload_started_at', 'last_processing_update')
-    if upload:
-        out['uploadDate'] = upload
-    if row.get('exifData'):
-        exif = _slim_exif_for_search(row.get('exifData'))
-        if exif != '{}':
-            out['exifData'] = exif
-    ocr = ' '.join(str(row.get('ocrText') or '').split())
-    if ocr:
-        out['ocrText'] = ocr[:SEARCH_INDEX_OCR_MAX_CHARS]
-    return out
-
-
-def _search_index_json_blob_name(user_id: str) -> str:
-    return f'{_vector_index_blob_key(user_id)}-search.json.gz'
-
-
-def _search_index_manifest_blob_name(user_id: str) -> str:
-    return f'{_vector_index_blob_key(user_id)}-search.json'
-
-
-def get_search_index_blob_location(user_id: str) -> Tuple[str, str]:
-    return _lexical_index_container_name(), _search_index_json_blob_name(user_id)
-
-
-def load_search_index_manifest(user_id: str) -> Dict[str, str]:
-    client = _lexical_index_blob_client(_search_index_manifest_blob_name(user_id))
-    if client is None:
-        return {}
-    try:
-        parsed = json.loads(client.download_blob().readall().decode('utf-8'))
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def search_index_is_current(user_id: str, lexical_source_version: str) -> bool:
-    manifest = load_search_index_manifest(user_id)
-    return bool(
-        manifest.get('sourceVersion')
-        and manifest.get('sourceVersion') == lexical_source_version
-        and manifest.get('schemaVersion') == _SEARCH_INDEX_SCHEMA_VERSION
-    )
-
-
-def ensure_user_search_slim_index(user_id: str) -> bool:
-    """(Re)derive the slim browser index from the already-built lexical blob when
-    it is missing or in an older schema -- e.g. right after a deploy, before any
-    new lexical rebuild would write it. Heavy (loads the full lexical blob), so
-    only the `tools` role calls this. True when a current slim blob exists."""
+def ensure_user_search_db(user_id: str) -> bool:
+    """(Re)build the library's SQLite search database (see search_db.py) from the
+    already-built lexical blob when it is missing or stale -- e.g. right after a
+    deploy, before any new lexical rebuild would write it. Heavy (loads the full
+    lexical blob), so only the `tools` role calls this. True when a current DB
+    exists."""
+    import search_db
     key = str(user_id or '').strip()
     lexical_manifest = _load_lexical_index_manifest(key) if key else {}
     version = str(lexical_manifest.get('sourceVersion') or '')
     if not version:
         return False
-    if search_index_is_current(key, version):
+    if search_db.is_current(key, version):
         return True
     snapshot = _load_lexical_index_blob(key)
     if snapshot is None:
         return False
-    _write_user_search_index(key, snapshot)
-    return search_index_is_current(key, snapshot.source_version)
-
-
-def _write_user_search_index(user_id: str, lexical_snapshot: 'LexicalIndexSnapshot') -> None:
-    """Best-effort, non-fatal -- see the block comment above."""
-    container_name = _lexical_index_container_name()
-    if not container_name:
-        return
-    try:
-        with perf_instrumentation.span('index.search_slim.build', rows=len(lexical_snapshot.rows)):
-            slim = LexicalIndexSnapshot(
-                user_id=lexical_snapshot.user_id,
-                source_version=lexical_snapshot.source_version,
-                schema_version=_SEARCH_INDEX_SCHEMA_VERSION,
-                updated_at=lexical_snapshot.updated_at,
-                rows=[_search_slim_row(row) for row in lexical_snapshot.rows],
-            )
-            payload = _serialize_lexical_index(slim)
-        perf_instrumentation.log_event(
-            'search_slim_written', user=user_id, rows=len(slim.rows), gz_mb=round(len(payload) / 1048576, 1),
-        )
-        blob_client = _get_blob_client(container_name, _search_index_json_blob_name(user_id))
-        manifest_client = _get_blob_client(container_name, _search_index_manifest_blob_name(user_id))
-        if blob_client is None or manifest_client is None:
-            return
-        blob_client.upload_blob(
-            payload, overwrite=True,
-            content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
-        )
-        manifest_client.upload_blob(
-            json.dumps({
-                'userId': user_id,
-                'sourceVersion': slim.source_version,
-                'schemaVersion': slim.schema_version,
-                'rowCount': len(slim.rows),
-                'updatedAt': slim.updated_at,
-            }, separators=(',', ':')).encode('utf-8'),
-            overwrite=True,
-            content_settings=BlobContentSettings(content_type='application/json'),
-        )
-    except Exception:
-        _LOGGER.exception('Slim search index write failed for user %s', user_id)
+    return search_db.write_for_snapshot(key, snapshot)
 
 
 def delete_user_lexical_index_data(user_id: str) -> None:
@@ -3719,7 +3607,6 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     for blob_name in (
         _lexical_index_json_blob_name(key), _lexical_index_manifest_blob_name(key),
         _listing_index_json_blob_name(key), _listing_index_manifest_blob_name(key),
-        _search_index_json_blob_name(key), _search_index_manifest_blob_name(key),
     ):
         blob_client = _lexical_index_blob_client(blob_name)
         if blob_client is None:
@@ -3731,6 +3618,8 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     # The Explore summary is derived from the lexical index, so it's cleaned
     # on the same purge (defined below; safe to call regardless of order).
     delete_user_explore_summary_data(key)
+    import search_db
+    search_db.delete_for_user(key)
     _tl = _timeline_summary_blob_client(key)
     if _tl is not None:
         try:
@@ -4121,7 +4010,8 @@ def refresh_user_lexical_index(
             'rows': snapshot.rows,
         }
     _write_user_listing_index(key, snapshot)
-    _write_user_search_index(key, snapshot)
+    import search_db
+    search_db.write_for_snapshot(key, snapshot)
     if dirty_to_clear:
         _clear_dirty_search_index_filenames(key, 'lexical', dirty_to_clear)
     return snapshot

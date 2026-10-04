@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Blueprint
 
 import app
+import search_db
 import storage_utils
 
 photos_bp = Blueprint('photos', __name__)
@@ -678,17 +679,13 @@ def photos_timeline():
 @photos_bp.route('/api/photos/search', methods=['GET'])
 @photos_bp.route('/api/photos/search/', methods=['GET'])
 def search_photos():
-    # Server-side search is frozen by default -- it loads the full lexical
-    # index into backend memory + runs an inline CLIP encode, the heavy work
-    # that OOM-ed the 1Gi backend. The browser does the identical search
-    # client-side against the same index (localSearchIndex.ts); this route is
-    # only a fallback, so when frozen it returns an empty result immediately
-    # (no blob load) and the client's own search stands in. See
-    # SERVER_SEARCH_ENABLED in app.py. `serverSearchDisabled` lets the client
-    # distinguish "frozen" from a genuine zero-match if it ever wants to.
-    if not app.SERVER_SEARCH_ENABLED:
-        return app.jsonify({'photos': [], 'total': 0, 'serverSearchDisabled': True})
-
+    # Server-side search over the library's SQLite (FTS5) search database -- see
+    # search_db.py. The database lives on this replica's LOCAL EPHEMERAL disk
+    # (copied once per library version from Blob Storage, and prefetched at
+    # session start), so a query is: bm25 candidate selection in SQLite, then the
+    # unchanged scoring code on a few thousand candidate rows. No index is held in
+    # memory, which is what made the old in-memory approach OOM the 1Gi backend.
+    # Browser-side search has been removed; this is the only search path.
     query = (app.request.args.get('q') or '').strip()
     if not query:
         return app.jsonify({'photos': [], 'total': 0})
@@ -702,9 +699,7 @@ def search_photos():
     capture_start, capture_end = app._parse_capture_range_args()
     # Bare year in the query text ("beach 2022") narrows to that calendar year,
     # same as if the user had set the explicit date-range control -- only when
-    # they didn't already set one, so it never overrides a real choice. This is
-    # deliberately just a year: month/season/"last summer"-style parsing is a
-    # bigger, separate feature, not a one-line regex.
+    # they didn't already set one, so it never overrides a real choice.
     matched_year = None
     if capture_start is None and capture_end is None:
         year_match = app.re.search(r'\b(19|20)\d{2}\b', query)
@@ -717,74 +712,69 @@ def search_photos():
     if error:
         return error
 
-    rows = None
-    try:
-        lexical_index = app.get_user_lexical_index(user_id, allow_refresh=True)
-        if lexical_index is not None:
-            rows = lexical_index.get('rows')
-    except Exception as exc:
-        app.app.logger.warning('Lexical index unavailable for user=%s, falling back to full scan: %s', user_id, exc)
-        rows = None
-
-    if rows is None:
-        try:
-            rows = app._cached_metadata_rows_for_user(user_id, purpose='photos.search')
-        except Exception as exc:
-            app.app.logger.exception('Photo search metadata read failed')
-            return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
+    with app.perf_instrumentation.span('search.open_db', user=user_id):
+        db = search_db.open_database(user_id)
+    if db is None:
+        # No current search database yet (new library / first deploy): have tools
+        # build it and tell the client, instead of scanning the library here.
+        app._trigger_tools_index_rebuild(user_id)
+        return app.jsonify({'photos': [], 'total': 0, 'searchIndexBuilding': True})
 
     pid_to_name, name_to_ids = app._load_people_name_index(user_id)
     matched_person_groups = app._matched_query_people_groups(query, name_to_ids)
-    matched_location_terms = app._matched_query_locations(query, rows)
+    query_norm = app._normalize_search_phrase(query)
+    matched_location_terms = [
+        term for term in db.location_terms() if app.re.search(rf'(^| ){app.re.escape(term)}( |$)', query_norm)
+    ]
     tokens = app.parse_search_query(query)
-    app._expand_tokens_with_tag_embeddings(tokens, user_id)
-    query_embedding = app.vision_utils.encode_text_embedding(app.build_expanded_query_text(query, tokens))
-    current_embedding_version = app.vision_utils.get_text_embedding_version()
-    vector_scores: app.Dict[str, float] = {}
-    if query_embedding:
-        for row_key, score in app.vector_search_candidates(user_id, query_embedding, top_k=max(limit * 25, 500), allow_refresh=False):
-            if row_key:
-                vector_scores[row_key] = score
-    semantic_threshold = float(app.os.getenv('SEMANTIC_SEARCH_THRESHOLD', '0.16'))
+    try:
+        app._expand_tokens_with_tag_embeddings(tokens, user_id)
+    except Exception:
+        app.app.logger.warning('Tag-embedding query expansion failed for %s', user_id, exc_info=True)
     has_context_intent = bool(tokens.get('required_object') and tokens.get('modifiers'))
+
+    with app.perf_instrumentation.span('search.candidates', user=user_id):
+        candidates = db.candidates(
+            search_db.match_terms(tokens),
+            person_ids=[pid for group in matched_person_groups for pid in group],
+            capture_start_day=capture_start.date().toordinal() if capture_start else None,
+            capture_end_day=capture_end.date().toordinal() if capture_end else None,
+        )
+
     scored: app.List[app.Tuple[float, str, app.Dict]] = []
     fallback_scored: app.List[app.Tuple[float, str, app.Dict]] = []
+    with app.perf_instrumentation.span('search.score', user=user_id, candidates=len(candidates)):
+        for filename, row in candidates:
+            row = app._metadata_with_people_names(row, pid_to_name)
 
-    for row in rows:
-        filename = row.get('RowKey')
-        if not filename:
-            continue
-        row = app._metadata_with_people_names(row, pid_to_name)
+            # Tier 1: hard filters. A row failing any of these is excluded
+            # unconditionally, before scoring ever runs.
+            if not app._row_passes_search_filters(row, capture_start, capture_end, matched_person_groups, matched_location_terms):
+                continue
 
-        # Tier 1: hard filters. A row failing any of these is excluded
-        # unconditionally, before scoring ever runs.
-        if not app._row_passes_search_filters(row, capture_start, capture_end, matched_person_groups, matched_location_terms):
-            continue
+            # Tier 2: lexical scoring (semantic/CLIP scoring needs an embedding
+            # model, which this torch-less role does not run).
+            exif_data = app.parse_exif_data(row.get('exifData', '{}'))
+            score, lexical_score, semantic_text = app._score_search_row(
+                user_id, tokens, filename, row, exif_data,
+                query_embedding=[],
+                vector_scores={},
+                current_embedding_version='',
+                semantic_threshold=1.0,
+                matched_person_groups=matched_person_groups,
+                matched_location_terms=matched_location_terms,
+            )
+            if score <= 0:
+                continue
 
-        # Tier 2: scoring. Always computes both lexical and semantic signals
-        # in full -- neither can veto the other.
-        exif_data = app.parse_exif_data(row.get('exifData', '{}'))
-        score, lexical_score, semantic_text = app._score_search_row(
-            user_id, tokens, filename, row, exif_data,
-            query_embedding=query_embedding,
-            vector_scores=vector_scores,
-            current_embedding_version=current_embedding_version,
-            semantic_threshold=semantic_threshold,
-            matched_person_groups=matched_person_groups,
-            matched_location_terms=matched_location_terms,
-        )
-        if score <= 0:
-            continue
-
-        # Tier 3: bucketing/ranking. Every row reaching here already has a
-        # positive combined score; this only decides primary vs. fallback.
-        if app._search_row_belongs_in_fallback_bucket(
-            score, lexical_score, semantic_text, tokens, filename, row,
-            has_context_intent=has_context_intent,
-        ):
-            fallback_scored.append((score, filename, row))
-        else:
-            scored.append((score, filename, row))
+            # Tier 3: bucketing/ranking.
+            if app._search_row_belongs_in_fallback_bucket(
+                score, lexical_score, semantic_text, tokens, filename, row,
+                has_context_intent=has_context_intent,
+            ):
+                fallback_scored.append((score, filename, row))
+            else:
+                scored.append((score, filename, row))
 
     fallback_notice = None
     if has_context_intent and not scored and fallback_scored:
@@ -797,26 +787,36 @@ def search_photos():
     total = len(scored)
     selected = scored[offset:offset + limit]
 
-    photos = app._build_photo_summaries_page(
-        user_id,
-        [(filename, metadata) for _, filename, metadata in selected],
-        pid_to_name,
-    )
+    # The stored rows are intentionally reduced (search fields only); the page
+    # being returned needs the full metadata (rating, likes, rotation, status...),
+    # so point-read just these few photos, in parallel.
+    def _full(item):
+        _, filename, reduced = item
+        return filename, (app._get_metadata_entity(user_id, filename) or None)
+
+    with app.perf_instrumentation.span('search.page_metadata', n=len(selected)):
+        if len(selected) > 1:
+            with ThreadPoolExecutor(max_workers=min(8, len(selected))) as executor:
+                full_rows = list(executor.map(_full, selected))
+        else:
+            full_rows = [_full(item) for item in selected]
+    page_pairs = [
+        (filename, metadata) for filename, metadata in full_rows
+        if metadata and metadata.get('processing_state') != 'deleted'
+    ]
+    photos = app._build_photo_summaries_page(user_id, page_pairs, pid_to_name)
 
     response_payload = {'photos': photos, 'total': total}
     if fallback_notice:
         response_payload['searchNotice'] = fallback_notice
-    # Surfaces why results matched (person/location chips in the UI) --
-    # already computed above for filtering/scoring, just wasn't returned.
+    # Surfaces why results matched (person/location chips in the UI).
     if matched_person_groups:
         matched_people = sorted({
             pid_to_name[group[0]] for group in matched_person_groups if group and pid_to_name.get(group[0])
         })
         if matched_people:
             response_payload['matchedPeople'] = matched_people
-        # Per-person match counts for the Ask results' People panel -- counted
-        # over the full ranked/scored set (pre-pagination), not just the
-        # current page, so the count reflects the whole result set.
+        # Per-person match counts over the full scored set (pre-pagination).
         people_detail = []
         for group in matched_person_groups:
             if not group:
@@ -846,98 +846,13 @@ def search_photos():
 
 @photos_bp.route('/api/photos/search-index', methods=['GET'])
 def photos_search_index():
-    # Hands the browser direct SAS URLs to the per-user lexical-index blob
-    # (also used server-side by get_user_lexical_index) and vector-index
-    # blob, plus the small people-name index -- see
-    # localSearchIndex.ts/localLexicalSearch.ts/localVectorIndexParser.ts on
-    # the frontend, which run parse_search_query/lexical_search_score's
-    # exact logic plus a real client-side CLIP text-query encode (Phase B of
-    # backend-cpu-optimization-2026-09) so most /photos/search traffic never
-    # has to reach the backend at all. The blobs' own bytes stream straight
-    # from storage, never through this request.
-    #
-    # Lexical index: ensured fresh via allow_refresh=True (safe -- built from
-    # plain metadata fields, no ML/version dependency). allow_sync_build=False
-    # -- like photos_sort_index -- means a user with no snapshot ever built
-    # gets available:false back immediately (background build kicked off)
-    # instead of blocking ~60-75s on a full Table scan: this route only hands
-    # out a SAS URL, and the frontend (runLocalSemanticSearch) already
-    # degrades to server-side /photos/search when the local index isn't
-    # ready, so nothing here needs the synchronous build. Vector index:
-    # deliberately NOT read via get_user_vector_index -- see
-    # get_vector_index_manifest_summary's docstring for why that function's
-    # version-gated freshness check is both always-false and actively
-    # destructive to call from this torch-less role. This just hands out
-    # whatever real index already exists (built by ipworker/the browser),
-    # best-effort, without ever touching that gate.
+    # Retired: search runs on the backend (/api/photos/search over the SQLite
+    # search database), so browsers no longer download a search index. Kept as a
+    # cheap stub so already-open/cached clients stop quietly instead of erroring.
     user_id, error = app._require_user_id()
     if error:
         return error
-    # Manifest-only read -- do NOT call get_user_lexical_index here. That loads
-    # the entire lexical data blob (OCR/tags/objects/faces per row, hundreds of
-    # MB on a big library) into THIS process's memory just to read two version
-    # fields, and this route is polled every ~15s by the frontend's search-index
-    # warm-up -- which pinned the 1Gi backend's working set over its cap and
-    # OOM-crash-looped it (2026-09-30 microsvcpoc-dev). The browser downloads
-    # the blob itself via the SAS URL below; the backend only needs the manifest
-    # to mint that URL. If the manifest is dirty we fire a rebuild on the tools
-    # role (never here) to preserve the freshness the old allow_refresh=True
-    # call used to provide.
-    try:
-        lexical_summary = app.get_index_manifest_summary(user_id, 'lexical')
-    except Exception:
-        lexical_summary = None
-    if lexical_summary is None:
-        # 200, not 503: a plain 503 here would hit httpClient.ts's cold-start
-        # retry loop (any 503 is treated as "ingress rejected before reaching
-        # the app, safe to retry" -- see isRetriableColdStart), stalling for
-        # ~90s of retries before localSearchIndex.ts's caller ever sees the
-        # null it needs to fall back to server-side search. Same fix as
-        # photos_sort_index's identical bug (see that route's comment).
-        return app.jsonify({'available': False})
-    if lexical_summary.get('dirty'):
-        app._trigger_tools_index_rebuild(user_id)
-    try:
-        container_name, blob_name = app.get_lexical_index_blob_location(user_id)
-        # Browsers only ever get the slim projection -- the full lexical blob is
-        # hundreds of MB at ~130k photos. If it is missing/old, ask tools to
-        # (re)derive it and report unavailable meanwhile (client falls back).
-        if not storage_utils.search_index_is_current(user_id, str(lexical_summary.get('source_version') or '')):
-            app._trigger_tools_index_rebuild(user_id)
-            return app.jsonify({'available': False})
-        container_name, blob_name = storage_utils.get_search_index_blob_location(user_id)
-        index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
-    except Exception:
-        app.app.logger.exception('Failed to mint lexical index SAS URL for %s', user_id)
-        return app.jsonify({'available': False})
-
-    vector_index_payload = None
-    try:
-        vector_manifest = app.get_vector_index_manifest_summary(user_id)
-        if vector_manifest and not vector_manifest.get('dirty'):
-            vcontainer_name, vblob_name = app.get_vector_index_blob_location(user_id)
-            vector_index_url, vector_expires_at = app._create_stable_read_sas_url(vcontainer_name, vblob_name)
-            vector_index_payload = {
-                'vectorIndexUrl': vector_index_url,
-                'vectorIndexExpiresAt': vector_expires_at,
-                'embeddingVersion': vector_manifest.get('embedding_version'),
-            }
-    except Exception:
-        app.app.logger.warning('Vector index unavailable for %s, semantic search stays lexical-only', user_id)
-        vector_index_payload = None
-
-    pid_to_name, name_to_ids = app._load_people_name_index(user_id)
-    response_payload = {
-        'available': True,
-        'indexUrl': index_url,
-        'expiresAt': expires_at,
-        'sourceVersion': lexical_summary.get('source_version'),
-        'updatedAt': lexical_summary.get('updated_at'),
-        'peopleNameIndex': {'pidToName': pid_to_name, 'nameToIds': name_to_ids},
-    }
-    if vector_index_payload:
-        response_payload.update(vector_index_payload)
-    return app.jsonify(response_payload)
+    return app.jsonify({'available': False, 'retired': True})
 
 @photos_bp.route('/api/photos/sort-index', methods=['GET'])
 def photos_sort_index():
@@ -1011,6 +926,8 @@ def photos_index_status():
         # version in the background (single-flight, cooled down) so this
         # session's loads -- on any replica/role -- come off local disk.
         app.warm_user_index_files_async(user_id)
+        # ...and put the search database on this replica's ephemeral disk.
+        search_db.warm_async(user_id)
     return app.jsonify({'ready': ready, 'indexes': indexes})
 
 @photos_bp.route('/photos/metadata', methods=['POST'])

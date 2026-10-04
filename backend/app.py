@@ -143,7 +143,7 @@ from storage_utils import (
     load_explore_summary,
     store_timeline_summary,
     warm_user_index_files_async,
-    ensure_user_search_slim_index as storage_utils_ensure_slim,
+    ensure_user_search_db as storage_utils_ensure_search_db,
     ensure_user_sort_index_current as storage_utils_ensure_sort_current,
     load_timeline_summary,
     delete_user_explore_summary_data,

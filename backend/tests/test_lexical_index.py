@@ -403,46 +403,13 @@ def search_route_ctx(monkeypatch):
     monkeypatch.setattr(app, 'vector_search_candidates', lambda *a, **k: [])
 
 
-def test_search_falls_back_to_full_scan_when_lexical_index_unavailable(monkeypatch, search_route_ctx):
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)
-    monkeypatch.setattr(app, '_cached_metadata_rows_for_user', lambda *a, **k: [_fallback_row('vacation.jpg')])
-
-    with app.app.test_request_context('/photos/search?q=vacation'):
-        response = search_photos()
-
-    payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
-    filenames = [p['filename'] for p in payload['photos']]
-    assert 'vacation.jpg' in filenames
 
 
-def test_search_503s_when_lexical_index_and_fallback_scan_both_fail(monkeypatch, search_route_ctx):
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)
-
-    def _boom(*a, **k):
-        raise RuntimeError('table storage hiccup')
-
-    monkeypatch.setattr(app, '_cached_metadata_rows_for_user', _boom)
-
-    with app.app.test_request_context('/photos/search?q=vacation'):
-        response = search_photos()
-
-    assert response[1] == 503
 
 
-def test_search_uses_lexical_index_rows_when_available(monkeypatch, search_route_ctx):
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: {'rows': [_fallback_row('fromindex.jpg')]})
 
-    def _boom(*a, **k):
-        raise AssertionError('should not fall back to the full scan when the lexical index is available')
 
-    monkeypatch.setattr(app, '_cached_metadata_rows_for_user', _boom)
 
-    with app.app.test_request_context('/photos/search?q=fromindex'):
-        response = search_photos()
-
-    payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
-    filenames = [p['filename'] for p in payload['photos']]
-    assert 'fromindex.jpg' in filenames
 
 
 # --- _cached_metadata_list_rows_for_user (gallery list/timeline/access-batch/filter) ----
