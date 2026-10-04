@@ -385,6 +385,45 @@ PEOPLE_CLUSTER_EPS_2PT = float(os.getenv('PEOPLE_CLUSTER_EPS_2PT', '0.60'))
 # ipwork_face.py) once enough real landmark-5pt-mp faces accumulate to
 # calibrate from a larger, more representative sample than 7 people.
 PEOPLE_CLUSTER_EPS_MP = float(os.getenv('PEOPLE_CLUSTER_EPS_MP', '0.18'))
+# DBSCAN epsilon for landmark-2pt-mp (ipworker's MediaPipe eyes-only fallback,
+# used when 5-point alignment fails -- see landmark-2pt-mp note above
+# PEOPLE_CLUSTER_ALIGNMENT_TIERS). Calibrated 2026-10-04 against this tier's
+# first real production sample: 17,194 clusterable landmark-2pt-mp faces,
+# 123,207 total face rows scanned. SAME-PHOTO pairs (two faces in one image --
+# near-certain different people) reached p99=+0.562 cosine similarity, a
+# materially higher noise floor than landmark-5pt-mp's. The naive p99+0.03
+# formula (calibrate_face_thresholds.py's default suggestion) was rejected: it
+# landed at eps=0.408 (needs only >=0.592 similarity), a margin too thin to
+# trust blind. Manually inspected the script's top-30 cross-photo pairs by
+# downloading and cropping the actual images: nearly every pair at
+# similarity>=0.98 turned out to be the SAME photo stored under two different
+# filenames (identical bbox/confidence to 3 decimal places -- a duplicate-
+# upload/dedup gap, not a same-person signal) rather than a genuine two-photo
+# match. The one pair in that top-30 list that was NOT a duplicate (different
+# bbox, different confidence) was a confirmed same-person pair (same shoot,
+# different frame) scoring +0.983 -- a full 0.42 above the real negative
+# ceiling. 0.22 (needs >=0.78 similarity) clears that negative ceiling with a
+# healthy margin while comfortably catching that confirmed positive.
+#
+# KNOWN GAP (tracked, not yet fixed as of 2026-10-04): this eps only governs
+# the periodic DBSCAN maintenance pass below. Live incremental assignment
+# (faiss_assignment.FaissAssigner/AssignmentConfig, driven by the worker
+# role's people_incremental_assign jobs) does NOT look up a per-tier
+# threshold at all -- every tier's live match decision uses one blanket
+# PEOPLE_CLUSTER_ASSIGN_THRESHOLD regardless of which alignment tier a face
+# belongs to. On this account that currently resolves to 0.62 (PEOPLE_CLUSTER_
+# PRESET=loose), only 0.058 above this tier's measured +0.562 negative
+# ceiling -- a real false-merge risk for landmark-2pt-mp specifically, even
+# though 0.62 is presumably fine for landmark-5pt/-5pt-mp's tighter natural
+# separation. Enabled anyway at the user's explicit call (ship now, fix
+# thresholds later) -- the real fix is making FaissAssigner tier-aware
+# (a per-tier threshold/margin instead of one shared AssignmentConfig value),
+# not something to paper over with a single global bump that would also
+# affect every other tier. Revisit with calibrate_face_thresholds.py
+# --alignment-tier landmark-2pt-mp once more production data accumulates, and
+# fix the duplicate-photo gap found during this calibration separately (it
+# inflated this tier's apparent fragmentation risk and is worth its own look).
+PEOPLE_CLUSTER_EPS_2PT_MP = float(os.getenv('PEOPLE_CLUSTER_EPS_2PT_MP', '0.22'))
 
 register_heif_opener()
 
@@ -3981,17 +4020,16 @@ def _face_alignment_tier(face: Dict) -> str:
 
 # 'landmark-5pt-mp' (ipworker, MediaPipe-aligned) added after real-data
 # calibration -- see PEOPLE_CLUSTER_EPS_MP's comment. 'landmark-2pt-mp'
-# (ipworker's own eyes-only fallback) is deliberately NOT included yet: no
-# real landmark-2pt-mp faces have been observed to calibrate against. Of 13
-# real photos used across two calibration passes, all 13 that produced a
-# usable face landed in the 5pt path; the one deliberately-extreme
-# full-profile shot included specifically to probe the 2pt fallback instead
-# produced NO detection at all (crop_and_align_face returned None -- YOLO
-# found a candidate box, but MediaPipe couldn't resolve landmarks in it well
-# enough for either the 5pt or 2pt path). So it's not just unobserved, it may
-# be rare for this detector/landmarker pairing. Faces landing there stay
-# stored-but-excluded from clustering until real data exists.
-PEOPLE_CLUSTER_ALIGNMENT_TIERS = ('landmark-5pt', 'landmark-2pt', 'landmark-5pt-mp')
+# (ipworker's own eyes-only fallback, used when 5-point alignment fails) was
+# excluded for the same reason until 2026-10-04: the original 13-photo
+# calibration sample never produced a single real landmark-2pt-mp face to
+# measure (the one deliberately-extreme full-profile shot included to probe
+# it instead produced no detection at all -- MediaPipe couldn't resolve
+# landmarks well enough for either path). Added now that a real production
+# sample exists (17,194 faces) -- see PEOPLE_CLUSTER_EPS_2PT_MP's comment for
+# the calibration. 'none' (no alignment could be solved at all) stays
+# excluded -- there's still no calibrated distance metric for it.
+PEOPLE_CLUSTER_ALIGNMENT_TIERS = ('landmark-5pt', 'landmark-2pt', 'landmark-5pt-mp', 'landmark-2pt-mp')
 
 
 def _face_embedding_allowed_for_clustering(face: Dict) -> bool:
@@ -6231,6 +6269,7 @@ def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool
         ),
         _dbscan_pass(tier_indices['landmark-2pt'], PEOPLE_CLUSTER_EPS_2PT, PEOPLE_CLUSTER_EPS_2PT),
         _dbscan_pass(tier_indices['landmark-5pt-mp'], PEOPLE_CLUSTER_EPS_MP, PEOPLE_CLUSTER_EPS_MP),
+        _dbscan_pass(tier_indices['landmark-2pt-mp'], PEOPLE_CLUSTER_EPS_2PT_MP, PEOPLE_CLUSTER_EPS_2PT_MP),
     ):
         for _, global_idxs in tier_clusters.items():
             clusters[next_label] = global_idxs
