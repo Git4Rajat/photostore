@@ -11,7 +11,7 @@ import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
-import type { PersonSummary } from '../../types/people';
+import type { PersonFace, PersonSummary } from '../../types/people';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
 import type {
     Album,
@@ -133,6 +133,30 @@ const mapPersonRow = (r: PeoplePageRow): Person => ({
     coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
     faceCount: r.faceCount,
 });
+
+const facesToPhotos = (faces: PersonFace[]): Photo[] => {
+    const seen = new Set<string>();
+    const out: Photo[] = [];
+    for (const face of faces) {
+        const filename = face.filename;
+        if (!filename || seen.has(filename)) continue;
+        seen.add(filename);
+        out.push({
+            id: filename,
+            filename,
+            swatch: swatchFor(filename),
+            dateLabel: '',
+            year: 0,
+            rating: 0,
+            liked: false,
+            placeId: null,
+            personIds: [],
+            tags: [],
+            thumbnailUrl: face.thumbnailUrl,
+        });
+    }
+    return out;
+};
 
 const mapPerson = (p: PersonSummary): Person => {
     const cover = p.representativeFace;
@@ -1337,18 +1361,35 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const personFaceOffsets = useRef<Record<string, number>>({});
     const [personPaging, setPersonPaging] = useState<Record<string, { total: number; hasMore: boolean }>>({});
     const personLoadingMore = useRef<Record<string, boolean>>({});
-    // A person's photos come from the library database's people index (the same paged, token-based path
-    // the gallery uses): exact total, newest first, no face-table scan and no per-face work.
+    // A person's photos, best face first: extras returns one page of filenames from the person-membership
+    // table (a single small partition read, exact total), and one lookup-batch call on the backend turns them
+    // into photo records with token-built thumbnails. If the membership endpoint fails, fall back to the
+    // person's face list so the page is never empty when the person has faces.
     const fetchPersonPage = useCallback(async (id: string, offset: number) => {
-        const token = getCachedMediaToken();
-        const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
-            `/photos?personId=${encodeURIComponent(id)}&sort=capture&offset=${offset}&limit=${PERSON_PAGE}${token ? '&directMedia=1' : ''}`,
+        try {
+            const page = await getExtras<{ filenames?: string[]; total?: number; hasMore?: boolean }>(
+                `/api/persons/${encodeURIComponent(id)}/photos?offset=${offset}&limit=${PERSON_PAGE}`,
+            );
+            const names = Array.isArray(page?.filenames) ? page.filenames : [];
+            let list: Photo[] = [];
+            if (names.length) {
+                const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: Boolean(getCachedMediaToken()) });
+                const byName = new Map((res?.photos ?? []).map((p) => [p.filename, p]));
+                list = names.map((n) => byName.get(n)).filter((p): p is BackendPhoto => Boolean(p)).map((p) => mapPhoto(p));
+            }
+            personFaceOffsets.current[id] = offset + names.length;
+            setPersonPaging((prev) => ({ ...prev, [id]: { total: page?.total ?? names.length, hasMore: Boolean(page?.hasMore) && names.length > 0 } }));
+            return list;
+        } catch {
+            // fall through to the face list
+        }
+        const res = await getExtras<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
+            `/api/persons/${encodeURIComponent(id)}?offset=${offset}&limit=${PERSON_PAGE}`,
         );
-        const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
-        const total = typeof res?.total === 'number' ? res.total : offset + list.length;
-        personFaceOffsets.current[id] = offset + PERSON_PAGE;
-        setPersonPaging((prev) => ({ ...prev, [id]: { total, hasMore: offset + PERSON_PAGE < total } }));
-        return list;
+        const faces = Array.isArray(res?.faces) ? res.faces : [];
+        personFaceOffsets.current[id] = offset + faces.length;
+        setPersonPaging((prev) => ({ ...prev, [id]: { total: res?.total ?? faces.length, hasMore: Boolean(res?.hasMore) && faces.length > 0 } }));
+        return facesToPhotos(faces);
     }, []);
 
     const openPerson = useCallback(async (id: string) => {

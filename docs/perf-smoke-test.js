@@ -216,8 +216,10 @@
   const first = people[0];
   if (first) {
     const pid = encodeURIComponent(first.personId);
-    await call('person photos page 1 (120, people index)', 'GET', `${API}/api/photos?personId=${pid}&sort=capture&offset=0&limit=120&directMedia=1`);
-    await call('person photos page 2 (120)', 'GET', `${API}/api/photos?personId=${pid}&sort=capture&offset=120&limit=120&directMedia=1`);
+    const pp1 = await call('person photos page 1 (membership table)', 'GET', `${EXTRAS}/api/persons/${pid}/photos?offset=0&limit=120`);
+    await call('person photos page 2', 'GET', `${EXTRAS}/api/persons/${pid}/photos?offset=120&limit=120`);
+    const ppNames = (pp1.json && pp1.json.filenames) || [];
+    if (ppNames.length) await call(`lookup-batch of the person's photos (${ppNames.length})`, 'POST', `${API}/api/photos/lookup-batch`, { filenames: ppNames, directMedia: true });
     await call('people lookup by id', 'GET', `${EXTRAS}/api/persons/page?ids=${pid}&limit=1`);
     const cover = first.coverFaceId;
     if (cover) await call('face crop endpoint (one, fallback path)', 'GET', `${EXTRAS}/api/faces/crop/${encodeURIComponent(cover)}`);

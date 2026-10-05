@@ -6191,6 +6191,11 @@ def get_user_albums_index(
 _PEOPLE_INDEX_SCHEMA_VERSION = 'v2'   # v2: rows carry autoName so incremental refresh can renumber "Unnamed N"
 _PEOPLE_INCREMENTAL_MAX_CHANGED = int(os.getenv('PEOPLE_INDEX_INCREMENTAL_MAX_CHANGED', '3000'))
 _PEOPLE_INCREMENTAL_SKEW_SECONDS = 180
+# Finding faces changed since the last build means filtering the face table on Timestamp, which Table
+# Storage cannot index: every page of results rescans the partition (measured 55-77 s when clustering had
+# just rewritten ~13k faces). Person rows change whenever a face is rejected, moved, merged or labelled, so
+# by default only the (small) person table is consulted; the daily full rebuild bounds anything missed.
+_PEOPLE_INCREMENTAL_SCAN_FACES = os.getenv('PEOPLE_INDEX_SCAN_FACE_CHANGES', '0').strip().lower() in ('1', 'true')
 _PEOPLE_FULL_REBUILD_HOURS = float(os.getenv('PEOPLE_INDEX_FULL_REBUILD_HOURS', '24'))   # bounds any drift the incremental path could miss
 _PEOPLE_INDEX_CACHE_LOCK = threading.RLock()
 _PEOPLE_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
@@ -6566,7 +6571,11 @@ def _incremental_people_index_snapshot(
                 changed[rk] = {k: row.get(k) for k in _PEOPLE_INDEX_PERSON_COLUMNS if k in row}
         touched: set = set()
         touched_faces: set = set()
-        for row in _query_projected(face_table_client, f"{base} and {stamp}", ['PartitionKey', 'RowKey', 'personId']):
+        face_rows = (
+            _query_projected(face_table_client, f"{base} and {stamp}", ['PartitionKey', 'RowKey', 'personId'])
+            if _PEOPLE_INCREMENTAL_SCAN_FACES else []
+        )
+        for row in face_rows:
             pid = str(row.get('personId') or '')
             if pid:
                 touched.add(pid)
