@@ -1,3 +1,4 @@
+import { reportIndexBuilding } from '../services/indexBuilding';
 import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
@@ -923,9 +924,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         let cancelled = false;
         void (async () => {
-            const status = await get<{ ready?: boolean }>('/api/photos/index-status').catch(() => null);
+            const status = await get<{ ready?: boolean; building?: boolean }>('/api/photos/index-status').catch(() => null);
             if (cancelled) return;
             setLibraryIndexReady(true);
+            if (status && (!status.ready || status.building)) {
+                reportIndexBuilding('session', true);
+            }
             if (status && !status.ready) {
                 void postTools('/api/tools/indexes/build', {}).catch(() => null);
             } else if (status?.ready) {

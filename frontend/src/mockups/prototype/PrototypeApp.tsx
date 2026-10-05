@@ -1,3 +1,4 @@
+import IndexBuildBar from './components/IndexBuildBar';
 import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
@@ -329,6 +330,7 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
                         <Topbar theme={theme} onTheme={setTheme} onSignOut={onSignOut} />
                         <div className="mock-body pt-body">
                             <UploadPausedBanner />
+                            <IndexBuildBar />
                             <Page />
                         </div>
                         <MobileTabbar />
