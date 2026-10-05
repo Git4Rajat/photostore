@@ -690,6 +690,91 @@ def photos_timeline():
         return app.jsonify(app.build_timeline_summary([]))
     return app.jsonify(summary)
 
+SEARCH_MAX_PAGE = int(__import__('os').getenv('SEARCH_MAX_PAGE', '500'))
+SEARCH_WINDOW = int(__import__('os').getenv('SEARCH_DB_CANDIDATE_LIMIT', '4000'))
+_SEARCH_WINDOW_TTL_SECONDS = float(__import__('os').getenv('SEARCH_WINDOW_CACHE_SECONDS', '45'))
+_SEARCH_WINDOW_CACHE: dict = {}
+_SEARCH_WINDOW_LOCK = __import__('threading').Lock()
+
+
+def _search_window_cached(key):
+    """Paging through one query's results must not re-score the ranked window on every page."""
+    import time as _time
+    with _SEARCH_WINDOW_LOCK:
+        hit = _SEARCH_WINDOW_CACHE.get(key)
+        if hit is not None and _time.monotonic() - hit[0] < _SEARCH_WINDOW_TTL_SECONDS:
+            return hit[1]
+    return None
+
+
+def _search_window_store(key, window) -> None:
+    import time as _time
+    with _SEARCH_WINDOW_LOCK:
+        _SEARCH_WINDOW_CACHE[key] = (_time.monotonic(), window)
+        while len(_SEARCH_WINDOW_CACHE) > 6:       # a window is a few MB: keep only the latest queries
+            oldest = min(_SEARCH_WINDOW_CACHE, key=lambda k: _SEARCH_WINDOW_CACHE[k][0])
+            _SEARCH_WINDOW_CACHE.pop(oldest, None)
+
+
+def _build_search_window(
+    db, user_id, tokens, match_terms, person_ids, matched_person_groups, matched_location_terms,
+    capture_start, capture_end, start_day, end_day, pid_to_name, has_context_intent,
+):
+    """Score the best SEARCH_WINDOW candidates exactly (filters, lexical score, buckets), best first."""
+    with app.perf_instrumentation.span('search.candidates', user=user_id):
+        candidates = db.candidates_with_ids(
+            match_terms, person_ids=person_ids, person_groups=matched_person_groups,
+            capture_start_day=start_day, capture_end_day=end_day, limit=SEARCH_WINDOW)
+    scored: app.List[app.Tuple[float, str, app.Dict]] = []
+    fallback_scored: app.List[app.Tuple[float, str, app.Dict]] = []
+    with app.perf_instrumentation.span('search.score', user=user_id, candidates=len(candidates)):
+        for _row_id, filename, row in candidates:
+            row = app._metadata_with_people_names(row, pid_to_name)
+
+            # Tier 1: hard filters. A row failing any of these is excluded
+            # unconditionally, before scoring ever runs.
+            if not app._row_passes_search_filters(row, capture_start, capture_end, matched_person_groups, matched_location_terms):
+                continue
+
+            # Tier 2: lexical scoring (semantic/CLIP scoring needs an embedding
+            # model, which this torch-less role does not run).
+            exif_data = app.parse_exif_data(row.get('exifData', '{}'))
+            score, lexical_score, semantic_text = app._score_search_row(
+                user_id, tokens, filename, row, exif_data,
+                query_embedding=[],
+                vector_scores={},
+                current_embedding_version='',
+                semantic_threshold=1.0,
+                matched_person_groups=matched_person_groups,
+                matched_location_terms=matched_location_terms,
+            )
+            if score <= 0:
+                continue
+
+            # Tier 3: bucketing/ranking.
+            if app._search_row_belongs_in_fallback_bucket(
+                score, lexical_score, semantic_text, tokens, filename, row,
+                has_context_intent=has_context_intent,
+            ):
+                fallback_scored.append((score, filename, row))
+            else:
+                scored.append((score, filename, row))
+
+    fallback_notice = None
+    if has_context_intent and not scored and fallback_scored:
+        modifier = tokens.get('modifiers', [''])[0]
+        obj = tokens.get('required_object', [''])[0]
+        fallback_notice = f"No {modifier} {obj} found. Showing {obj} results instead."
+        scored = fallback_scored
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return {
+        'scored': scored, 'fallback_notice': fallback_notice,
+        'candidate_ids': [row_id for row_id, _name, _row in candidates],
+        'candidate_count': len(candidates),
+        'saturated': len(candidates) >= SEARCH_WINDOW,
+    }
+
+
 @photos_bp.route('/photos/search', methods=['GET'])
 @photos_bp.route('/photos/search/', methods=['GET'])
 @photos_bp.route('/api/photos/search', methods=['GET'])
@@ -707,8 +792,10 @@ def search_photos():
         return app.jsonify({'photos': [], 'total': 0})
 
     try:
-        offset = int(app.request.args.get('offset', '0'))
-        limit = int(app.request.args.get('limit', '24'))
+        offset = max(0, int(app.request.args.get('offset', '0')))
+        # Any page of the result set can be requested (there is no 200-result ceiling); one request
+        # is bounded only so a single response stays a sensible size.
+        limit = max(1, min(SEARCH_MAX_PAGE, int(app.request.args.get('limit', '24'))))
     except ValueError:
         return app.jsonify({'error': 'Invalid paging parameters.'}), 400
 
@@ -750,59 +837,49 @@ def search_photos():
         app.app.logger.warning('Tag-embedding query expansion failed for %s', user_id, exc_info=True)
     has_context_intent = bool(tokens.get('required_object') and tokens.get('modifiers'))
 
-    with app.perf_instrumentation.span('search.candidates', user=user_id):
-        candidates = db.candidates(
-            search_db.match_terms(tokens),
-            person_ids=[pid for group in matched_person_groups for pid in group],
-            capture_start_day=capture_start.date().toordinal() if capture_start else None,
-            capture_end_day=capture_end.date().toordinal() if capture_end else None,
-        )
+    app.g.direct_media = app.request.args.get('directMedia') in ('1', 'true')   # thumbnail blob names, no per-photo URL signing
+    start_day = capture_start.date().toordinal() if capture_start else None
+    end_day = capture_end.date().toordinal() if capture_end else None
+    match_terms = search_db.match_terms(tokens)
+    person_ids = [pid for group in matched_person_groups for pid in group]
+    cache_key = (user_id, db.path, db.applied_seq(), query, start_day, end_day)
+    window = _search_window_cached(cache_key)
+    if window is None:
+        window = _build_search_window(
+            db, user_id, tokens, match_terms, person_ids, matched_person_groups, matched_location_terms,
+            capture_start, capture_end, start_day, end_day, pid_to_name, has_context_intent)
+        _search_window_store(cache_key, window)
+    scored = window['scored']
+    fallback_notice = window['fallback_notice']
+    window_len = len(scored)
 
-    scored: app.List[app.Tuple[float, str, app.Dict]] = []
-    fallback_scored: app.List[app.Tuple[float, str, app.Dict]] = []
-    with app.perf_instrumentation.span('search.score', user=user_id, candidates=len(candidates)):
-        for filename, row in candidates:
-            row = app._metadata_with_people_names(row, pid_to_name)
+    # The ranked window covers the best SEARCH_WINDOW candidates; when the match set is bigger,
+    # the rest follows it newest-first (see SearchDatabase.tail_rows) and ``total`` is exact.
+    tail_total = 0
+    if window['saturated']:
+        with app.perf_instrumentation.span('search.count', user=user_id):
+            tail_total = max(0, db.count_matches(
+                match_terms, person_ids=person_ids, person_groups=matched_person_groups,
+                capture_start_day=start_day, capture_end_day=end_day) - window['candidate_count'])
+    total = window_len + tail_total
 
-            # Tier 1: hard filters. A row failing any of these is excluded
-            # unconditionally, before scoring ever runs.
-            if not app._row_passes_search_filters(row, capture_start, capture_end, matched_person_groups, matched_location_terms):
-                continue
-
-            # Tier 2: lexical scoring (semantic/CLIP scoring needs an embedding
-            # model, which this torch-less role does not run).
-            exif_data = app.parse_exif_data(row.get('exifData', '{}'))
-            score, lexical_score, semantic_text = app._score_search_row(
-                user_id, tokens, filename, row, exif_data,
-                query_embedding=[],
-                vector_scores={},
-                current_embedding_version='',
-                semantic_threshold=1.0,
-                matched_person_groups=matched_person_groups,
-                matched_location_terms=matched_location_terms,
-            )
-            if score <= 0:
-                continue
-
-            # Tier 3: bucketing/ranking.
-            if app._search_row_belongs_in_fallback_bucket(
-                score, lexical_score, semantic_text, tokens, filename, row,
-                has_context_intent=has_context_intent,
-            ):
-                fallback_scored.append((score, filename, row))
-            else:
-                scored.append((score, filename, row))
-
-    fallback_notice = None
-    if has_context_intent and not scored and fallback_scored:
-        modifier = tokens.get('modifiers', [''])[0]
-        obj = tokens.get('required_object', [''])[0]
-        fallback_notice = f"No {modifier} {obj} found. Showing {obj} results instead."
-        scored = fallback_scored
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    total = len(scored)
     selected = scored[offset:offset + limit]
+    tail_pairs: app.List[app.Tuple[str, app.Dict]] = []
+    if tail_total and offset + limit > window_len:
+        want = offset + limit - max(offset, window_len)
+        with app.perf_instrumentation.span('search.tail', user=user_id, offset=max(0, offset - window_len), limit=want):
+            tail_pairs = db.tail_rows(
+                match_terms, person_ids=person_ids, person_groups=matched_person_groups,
+                capture_start_day=start_day, capture_end_day=end_day, exclude_ids=window['candidate_ids'],
+                offset=max(0, offset - window_len), limit=want)
+        # Same hard filters as the window (location is the one SQL does not apply).
+        tail_pairs = [
+            (name, app._metadata_with_people_names(row, pid_to_name)) for name, row in tail_pairs
+            if app._row_passes_search_filters(
+                app._metadata_with_people_names(row, pid_to_name), capture_start, capture_end,
+                matched_person_groups, matched_location_terms)
+        ]
+    selected = [*selected, *[(0.0, name, row) for name, row in tail_pairs]]
 
     # The stored rows are intentionally reduced (search fields only); the page
     # being returned needs the full metadata (rating, likes, rotation, status...),
@@ -816,7 +893,9 @@ def search_photos():
     ]
     photos = app._build_photo_summaries_page(user_id, page_pairs, pid_to_name)
 
-    response_payload = {'photos': photos, 'total': total}
+    response_payload = {'photos': photos, 'total': total, 'offset': offset, 'hasMore': offset + limit < total}
+    if window['saturated']:
+        response_payload['rankedWindow'] = window_len   # results past this position are newest-first
     if fallback_notice:
         response_payload['searchNotice'] = fallback_notice
     # Surfaces why results matched (person/location chips in the UI).

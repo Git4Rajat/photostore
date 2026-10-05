@@ -439,13 +439,91 @@ class SearchDatabase:
             self._location_terms = json.loads(row[0]) if row else []
         return self._location_terms
 
-    def candidates(
+    @staticmethod
+    def _group_sql(person_groups: Sequence[Sequence[str]]) -> Tuple[str, List[object]]:
+        """Every queried person must appear on the photo ("alice and bob" means both), one EXISTS per group."""
+        sql, args = '', []
+        for group in person_groups:
+            ids = [str(pid) for pid in group if pid]
+            if not ids:
+                continue
+            sql += f' AND EXISTS (SELECT 1 FROM row_people rp WHERE rp.id = rows.id AND rp.person_id IN ({",".join("?" * len(ids))}))'
+            args.extend(ids)
+        return sql, args
+
+    def _set_sql(
+        self, terms: Sequence[str], person_ids: Sequence[str], person_groups: Sequence[Sequence[str]],
+        start_day: Optional[int], end_day: Optional[int],
+    ) -> Tuple[str, List[object]]:
+        """WHERE clause (over ``rows``) for the full result set: photos whose text matches OR who are
+        one of the queried people, that carry every queried person, inside the date range."""
+        parts, args = [], []
+        if terms:
+            parts.append('rows.id IN (SELECT rowid FROM fts WHERE fts MATCH ?)')
+            args.append(fts_expression(terms))
+        if person_ids:
+            parts.append(f'rows.id IN (SELECT id FROM row_people WHERE person_id IN ({",".join("?" * len(person_ids))}))')
+            args.extend(person_ids)
+        if not parts:
+            return '0', []
+        sql = '(' + ' OR '.join(parts) + ')'
+        group_sql, group_args = self._group_sql(person_groups)
+        sql += group_sql
+        args.extend(group_args)
+        if start_day is not None:
+            sql += ' AND rows.capture_day >= ?'
+            args.append(start_day)
+        if end_day is not None:
+            sql += ' AND rows.capture_day <= ?'
+            args.append(end_day)
+        return sql, args
+
+    def count_matches(
+        self, terms: Sequence[str], *, person_ids: Sequence[str] = (), person_groups: Sequence[Sequence[str]] = (),
+        capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,
+    ) -> int:
+        """Exact size of the whole result set (not just the ranked window)."""
+        sql, args = self._set_sql(terms, person_ids, person_groups, capture_start_day, capture_end_day)
+        try:
+            return int(self._conn().execute(f'SELECT COUNT(*) FROM rows WHERE {sql}', args).fetchone()[0])
+        except sqlite3.OperationalError:
+            _LOGGER.warning('FTS count failed for terms=%s', list(terms)[:8], exc_info=True)
+            return 0
+
+    def tail_rows(
+        self, terms: Sequence[str], *, person_ids: Sequence[str] = (), person_groups: Sequence[Sequence[str]] = (),
+        capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,
+        exclude_ids: Sequence[int] = (), offset: int = 0, limit: int = 100,
+    ) -> List[Tuple[str, Dict]]:
+        """A page of the result set BEYOND the ranked window: everything the window did not cover,
+        newest capture first (relevance ranking stops at the window; past it the order is simply
+        recency, which is stable and cheap to page through at any depth)."""
+        sql, args = self._set_sql(terms, person_ids, person_groups, capture_start_day, capture_end_day)
+        if exclude_ids:
+            sql += ' AND rows.id NOT IN (SELECT value FROM json_each(?))'
+            args.append(json.dumps([int(i) for i in exclude_ids]))
+        try:
+            cur = self._conn().execute(
+                f'SELECT rows.filename, rows.row_json FROM rows WHERE {sql} '
+                'ORDER BY rows.capture_ts DESC, rows.filename ASC LIMIT ? OFFSET ?',
+                [*args, int(limit), max(0, int(offset))])
+            return [(filename, json.loads(row_json)) for filename, row_json in cur]
+        except sqlite3.OperationalError:
+            _LOGGER.warning('Tail query failed for terms=%s', list(terms)[:8], exc_info=True)
+            return []
+
+    def candidates(self, terms: Sequence[str], **kwargs) -> List[Tuple[str, Dict]]:
+        return [(filename, row) for _id, filename, row in self.candidates_with_ids(terms, **kwargs)]
+
+    def candidates_with_ids(
         self, terms: Sequence[str], *, person_ids: Sequence[str] = (),
+        person_groups: Sequence[Sequence[str]] = (),
         capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,
         limit: int = CANDIDATE_LIMIT,
-    ) -> List[Tuple[str, Dict]]:
-        """bm25-ranked candidate (filename, reduced_row) pairs. Rows of explicitly
-        named people are always included, even if their text doesn't match."""
+    ) -> List[Tuple[int, str, Dict]]:
+        """The ranked WINDOW: up to ``limit`` bm25-ranked (id, filename, reduced_row) triples, plus
+        rows of explicitly named people (newest first), always included even if their text doesn't
+        match. Rows missing a queried person are excluded here, not later."""
         conn = self._conn()
         ids: List[int] = []
         range_sql, range_args = '', []
@@ -455,12 +533,13 @@ class SearchDatabase:
         if capture_end_day is not None:
             range_sql += ' AND rows.capture_day <= ?'
             range_args.append(capture_end_day)
+        group_sql, group_args = self._group_sql(person_groups)
         if terms:
             try:
                 cur = conn.execute(
                     'SELECT fts.rowid FROM fts JOIN rows ON rows.id = fts.rowid '
-                    f'WHERE fts MATCH ?{range_sql} ORDER BY fts.rank LIMIT ?',
-                    [fts_expression(terms), *range_args, int(limit)],
+                    f'WHERE fts MATCH ?{range_sql}{group_sql} ORDER BY fts.rank LIMIT ?',
+                    [fts_expression(terms), *range_args, *group_args, int(limit)],
                 )
                 ids.extend(r[0] for r in cur)
             except sqlite3.OperationalError:
@@ -468,20 +547,24 @@ class SearchDatabase:
         if person_ids:
             marks = ','.join('?' * len(person_ids))
             cur = conn.execute(
-                f'SELECT DISTINCT row_people.id FROM row_people JOIN rows ON rows.id = row_people.id '
-                f'WHERE row_people.person_id IN ({marks}){range_sql} LIMIT ?',
-                [*person_ids, *range_args, int(limit)],
+                f'SELECT DISTINCT rows.id FROM row_people JOIN rows ON rows.id = row_people.id '
+                f'WHERE row_people.person_id IN ({marks}){range_sql}{group_sql} '
+                'ORDER BY rows.capture_ts DESC, rows.id ASC LIMIT ?',
+                [*person_ids, *range_args, *group_args, int(limit)],
             )
             ids.extend(r[0] for r in cur)
         ids = list(dict.fromkeys(ids))
-        out: List[Tuple[str, Dict]] = []
+        out: List[Tuple[int, str, Dict]] = []
         for start in range(0, len(ids), 500):
             chunk = ids[start:start + 500]
             marks = ','.join('?' * len(chunk))
             for _id, filename, row_json in conn.execute(
                 f'SELECT id, filename, row_json FROM rows WHERE id IN ({marks})', chunk,
             ):
-                out.append((filename, json.loads(row_json)))
+                out.append((int(_id), filename, json.loads(row_json)))
+        # Keep the ranked order (the IN() chunks come back in id order).
+        position = {i: n for n, i in enumerate(ids)}
+        out.sort(key=lambda item: position.get(item[0], 0))
         return out
 
     # --- gallery queries (flat memory: SQL ORDER BY / LIMIT, never a loaded list) ---

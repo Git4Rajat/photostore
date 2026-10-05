@@ -292,3 +292,79 @@ def test_gallery_order_puts_undated_photos_last_with_filename_ties(tmp_path):
     db = search_db.SearchDatabase(path)
     assert db.list_page(sort='date', limit=10)[0] == ['new.jpg', 'a.jpg', 'b.jpg', 'nodate1.jpg', 'nodate2.jpg']
     assert db.list_page(sort='capture', limit=10)[0][-2:] == ['nodate1.jpg', 'nodate2.jpg']
+
+
+# --- paging through result sets bigger than the ranked window -------------------------------------
+
+@pytest.fixture
+def big_db(tmp_path):
+    rows = []
+    for i in range(300):
+        rows.append({
+            'RowKey': f'dog{i:04d}.jpg', 'tags': json.dumps(['dog']), 'subjectTags': json.dumps(['dog']),
+            'uploadDate': f'2020-{(i % 12) + 1:02d}-{(i % 27) + 1:02d}T10:00:00+00:00',
+            'exifData': json.dumps({'DateTimeOriginal': f'{2000 + i // 15}:03:04 10:00:00'}),   # 2000..2019, 15 per year
+            'peopleIds': json.dumps(['p1']) if i % 3 == 0 else '[]',
+        })
+    rows.append({'RowKey': 'cat.jpg', 'tags': json.dumps(['cat']), 'subjectTags': json.dumps(['cat'])})
+    path = str(tmp_path / 'big.sqlite')
+    search_db.build_database(rows, path)
+    return search_db.SearchDatabase(path)
+
+
+def _page(query, offset, limit):
+    with app.app.test_request_context(f'/photos/search?q={query}&offset={offset}&limit={limit}'):
+        response = search_photos()
+    return response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
+
+
+def test_every_result_beyond_the_window_is_reachable_exactly_once(monkeypatch, big_db):
+    from routes import photos
+    _route_ctx(monkeypatch, big_db)
+    monkeypatch.setattr(photos, 'SEARCH_WINDOW', 50)
+    photos._SEARCH_WINDOW_CACHE.clear()
+    seen, first = [], None
+    for offset in range(0, 320, 40):
+        payload = _page('dog', offset, 40)
+        first = first or payload
+        seen += [p['filename'] for p in payload['photos']]
+        assert payload['total'] == 300                                   # exact, not capped at the window
+        assert payload['hasMore'] is (offset + 40 < 300)
+    assert len(seen) == 300 and len(set(seen)) == 300                  # no duplicates, nothing skipped
+    assert first['rankedWindow'] == 50
+    window, tail = seen[:50], seen[50:]
+    assert not set(window) & set(tail)
+    tail_dates = [big_db._conn().execute('SELECT capture_ts FROM rows WHERE filename = ?', (n,)).fetchone()[0] for n in tail]
+    assert tail_dates == sorted(tail_dates, reverse=True)               # past the window: newest first
+
+
+def test_a_result_set_that_fits_the_window_is_not_counted_or_tailed(monkeypatch, big_db):
+    from routes import photos
+    _route_ctx(monkeypatch, big_db)
+    photos._SEARCH_WINDOW_CACHE.clear()
+    called = []
+    monkeypatch.setattr(big_db, 'count_matches', lambda *a, **k: called.append(1) or 0)
+    payload = _page('cat', 0, 10)
+    assert payload['total'] == 1 and 'rankedWindow' not in payload and called == []
+
+
+def test_tail_pages_keep_the_person_and_date_filters(monkeypatch, big_db):
+    from routes import photos
+    _route_ctx(monkeypatch, big_db)
+    monkeypatch.setattr(photos, 'SEARCH_WINDOW', 20)
+    photos._SEARCH_WINDOW_CACHE.clear()
+    everyone = []
+    for offset in range(0, 140, 35):
+        payload = _page('alice dog', offset, 35)
+        assert payload['total'] == 100                                   # only the 100 dog photos Alice is in
+        everyone += [p['filename'] for p in payload['photos']]
+    assert len(everyone) == 100 and all(int(n[3:7]) % 3 == 0 for n in everyone)
+    assert _page('dog 2005', 0, 100)['total'] == 15                     # the year narrows the tail too
+
+
+def test_page_size_is_bounded_but_depth_is_not(monkeypatch, big_db):
+    from routes import photos
+    _route_ctx(monkeypatch, big_db)
+    photos._SEARCH_WINDOW_CACHE.clear()
+    assert len(_page('dog', 0, 100000)['photos']) <= photos.SEARCH_MAX_PAGE
+    assert _page('dog', 5000, 40)['photos'] == []                       # past the end: empty, not an error
