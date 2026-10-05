@@ -1063,16 +1063,23 @@ def list_trashed_photos():
     except (TypeError, ValueError):
         limit = 50
 
-    # Only the trashed rows are transferred (positive server-side filter), so this
-    # is bounded by the size of the trash, not the library.
-    trashed = list(app._iter_metadata_rows_for_user(
-        user_id, select=app.TRASH_SELECT, include_deleted=True,
-        extra_filter="processing_state eq 'deleted'", purpose='photos.list_trash',
-    ))
-    trashed.sort(key=lambda row: str(row.get('deletedAt') or ''), reverse=True)
+    # Membership comes from the small trash index (a query over just the trashed rows), not a
+    # server-side filtered scan of the whole library; only the requested page is read fresh.
+    entries = app._trash_index_entries(user_id)
+    page_names = [e['RowKey'] for e in entries[offset:offset + limit]]
+    fresh = app._get_metadata_entities(user_id, page_names) if page_names else {}
+    page, stale = [], []
+    for name in page_names:
+        row = fresh.get(name)
+        if not isinstance(row, dict) or str(row.get('processing_state') or '') != 'deleted':
+            stale.append(name)  # purged or restored since it was indexed
+            continue
+        page.append(row)
+    if stale:
+        app._trash_index_remove(user_id, stale)
+    trashed = entries  # for the totals below: [{'RowKey', 'deletedAt'}], newest first
 
     retention_days = app.TRASH_RETENTION_DAYS
-    page = trashed[offset:offset + limit]
     pid_to_name, _ = app._load_people_name_index(user_id)
     photos = app._build_photo_summaries_page(
         user_id,
@@ -1084,7 +1091,7 @@ def list_trashed_photos():
         photo['deletedAt'] = deleted_at
         photo['purgeAt'] = app._compute_trash_purge_at(deleted_at, retention_days)
 
-    response_payload = {'photos': photos, 'total': len(trashed), 'offset': offset, 'limit': limit, 'retentionDays': retention_days}
+    response_payload = {'photos': photos, 'total': len(trashed) - len(stale), 'offset': offset, 'limit': limit, 'retentionDays': retention_days}
     if trashed:
         # `trashed` is already sorted by deletedAt descending (most recent
         # first), so the oldest deletion -- the one closest to purging -- is
@@ -1136,12 +1143,7 @@ def restore_all_trashed_photos():
     if error:
         return error
 
-    trashed_names = [
-        str(row.get('RowKey') or '') for row in app._iter_metadata_rows_for_user(
-            user_id, select=['RowKey', 'processing_state'], include_deleted=True,
-            extra_filter="processing_state eq 'deleted'", purpose='photos.restore_all_trash',
-        )
-    ]
+    trashed_names = [e['RowKey'] for e in app._trash_index_entries(user_id)]
     trashed_names = [name for name in trashed_names if name]
 
     restored = []

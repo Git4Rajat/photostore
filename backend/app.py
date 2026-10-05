@@ -528,6 +528,10 @@ HASH_INDEX_TABLE = os.getenv('HASH_INDEX_TABLE', 'photofilehashes')
 # so /upload/finalize can check "does any OTHER library already own this filename"
 # without scanning the entire metadata table.
 FILENAME_OWNERS_TABLE = os.getenv('FILENAME_OWNERS_TABLE', 'photofilenameowners')
+# Trash membership index: PartitionKey=user/library id, RowKey=filename (+ a '__init__' marker row).
+# "Which photos are in trash" is a non-indexed property, so asking the metadata table scans the
+# whole library server-side (~45 s at 130k photos even when the trash is empty).
+TRASH_INDEX_TABLE = os.getenv('TRASH_INDEX_TABLE', 'phototrashindex')
 # Multi-tenant library sharing (accounts, libraries, memberships, invites, audit).
 USERS_TABLE = os.getenv('USERS_TABLE', 'photousers')
 LIBRARIES_TABLE = os.getenv('LIBRARIES_TABLE', 'photolibraries')
@@ -1088,6 +1092,7 @@ workbench_actions_table_client = None
 image_names_table_client = None
 hash_index_table_client = None
 filename_owners_table_client = None
+trash_index_table_client = None
 config_table_client = None
 users_table_client = None
 libraries_table_client = None
@@ -1389,7 +1394,7 @@ def _init_storage_clients():
     global jobs_table_client
     global workbench_actions_table_client
     global image_names_table_client
-    global hash_index_table_client, filename_owners_table_client
+    global hash_index_table_client, filename_owners_table_client, trash_index_table_client
     global embeddings_table_client
     global face_embeddings_table_client
     global search_index_dirty_table_client
@@ -1420,6 +1425,7 @@ def _init_storage_clients():
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
         filename_owners_table_client_local = tbl_svc.get_table_client(FILENAME_OWNERS_TABLE)
+        trash_index_table_client_local = tbl_svc.get_table_client(TRASH_INDEX_TABLE)
         config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
         users_table_client_local = tbl_svc.get_table_client(USERS_TABLE)
         libraries_table_client_local = tbl_svc.get_table_client(LIBRARIES_TABLE)
@@ -1486,6 +1492,7 @@ def _init_storage_clients():
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
         filename_owners_table_client_local = tbl_svc.get_table_client(FILENAME_OWNERS_TABLE)
+        trash_index_table_client_local = tbl_svc.get_table_client(TRASH_INDEX_TABLE)
         config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
         users_table_client_local = tbl_svc.get_table_client(USERS_TABLE)
         libraries_table_client_local = tbl_svc.get_table_client(LIBRARIES_TABLE)
@@ -1515,6 +1522,7 @@ def _init_storage_clients():
     image_names_table_client = image_names_table_client_local
     hash_index_table_client = hash_index_table_client_local
     filename_owners_table_client = filename_owners_table_client_local
+    trash_index_table_client = trash_index_table_client_local
     users_table_client = users_table_client_local
     libraries_table_client = libraries_table_client_local
     memberships_table_client = memberships_table_client_local
@@ -1737,6 +1745,14 @@ def create_hash_index_table() -> None:
         pass
 
 
+def create_trash_index_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=TRASH_INDEX_TABLE)
+    except AzureError:
+        pass
+
+
 def create_filename_owners_table() -> None:
     try:
         svc = _ensure_table_service_client()
@@ -1870,17 +1886,39 @@ def _parse_capture_range_args() -> Tuple[Optional[datetime], Optional[datetime]]
     )
 
 
+_ENTITY_BATCH_KEYS = 15   # Table Storage allows at most 15 discrete comparisons in one filter
+
+
 def _get_metadata_entities(user_id: str, filenames: List[str], workers: int = 8) -> Dict[str, Optional[Dict]]:
-    """Fresh full metadata rows for one page of filenames, point-read in
-    parallel. The library-sized queries (search, list, filter) run against the
-    local SQLite database and only ever need this for the page they return."""
+    """Fresh full metadata rows for one page of filenames. The library-sized queries (search,
+    list, filter) run against the local SQLite database and only ever need this for the page
+    they return.
+
+    A 48-photo page used to cost 48 point reads (the dominant storage cost of every gallery page).
+    The names are now fetched 15 at a time with one ``RowKey eq .. or RowKey eq ..`` query each, in
+    parallel -- ~4 round trips. If a batched query fails, those names fall back to point reads."""
     names = list(dict.fromkeys(filenames))
     if not names:
         return {}
-    if len(names) == 1:
-        return {names[0]: _get_metadata_entity(user_id, names[0])}
-    with ThreadPoolExecutor(max_workers=min(workers, len(names))) as executor:
-        return dict(zip(names, executor.map(lambda name: _get_metadata_entity(user_id, name), names)))
+    if len(names) == 1 or metadata_table_client is None:
+        return {name: _get_metadata_entity(user_id, name) for name in names}
+    pk = _escape_odata(user_id)
+
+    def _fetch_batch(batch: List[str]) -> Dict[str, Optional[Dict]]:
+        clause = ' or '.join(f"RowKey eq '{_escape_odata(name)}'" for name in batch)
+        try:
+            rows = {str(r.get('RowKey') or ''): dict(r)
+                    for r in metadata_table_client.query_entities(f"PartitionKey eq '{pk}' and ({clause})")}
+            return {name: rows.get(name) for name in batch}
+        except Exception:
+            return {name: _get_metadata_entity(user_id, name) for name in batch}
+
+    batches = [names[i:i + _ENTITY_BATCH_KEYS] for i in range(0, len(names), _ENTITY_BATCH_KEYS)]
+    out: Dict[str, Optional[Dict]] = {}
+    with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
+        for part in executor.map(_fetch_batch, batches):
+            out.update(part)
+    return out
 
 
 def _open_library_db(user_id: str):
@@ -2705,8 +2743,9 @@ def _cached_person_rows_for_user(user_id: str, *, with_embeddings: bool = True) 
         def _fetch_light() -> List[Dict]:
             try:
                 try:
-                    rows = person_table_client.query_entities(
-                        f"PartitionKey eq '{_escape_odata(user_id)}'", select=PERSON_LIGHT_COLUMNS)
+                    rows = list(table_scan.scan_partition(
+                        person_table_client.query_entities,
+                        f"PartitionKey eq '{_escape_odata(user_id)}'", select=PERSON_LIGHT_COLUMNS))
                 except TypeError:
                     rows = person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
                 return [{k: v for k, v in row.items() if k != 'repEmbedding'} for row in rows]
@@ -7498,7 +7537,9 @@ def _load_user_face_summary_by_id(user_id: str) -> Dict[str, Dict]:
     def _fetch() -> List[Dict]:
         query = f"PartitionKey eq '{_escape_odata(user_id)}'"
         try:
-            return list(face_table_client.query_entities(query, select=FACE_SUMMARY_COLUMNS))
+            # A library can hold hundreds of thousands of faces; read the partition as several
+            # RowKey ranges at once (table_scan.py).
+            return list(table_scan.scan_partition(face_table_client.query_entities, query, select=FACE_SUMMARY_COLUMNS))
         except TypeError:
             try:
                 return list(face_table_client.query_entities(query))
@@ -7584,8 +7625,14 @@ def _compute_people_suggestions(
 ) -> List[Dict]:
     if person_table_client is None:
         return []
+    # Unnamed clusters are skipped below unless PEOPLE_SUGGEST_INCLUDE_UNNAMED, so only named
+    # people are read (with their embeddings). With tens of thousands of clusters, reading every
+    # row's embedding JSON here was both minutes of work and a memory spike on the extras app.
+    person_filter = f"PartitionKey eq '{_escape_odata(user_id)}'"
+    if not PEOPLE_SUGGEST_INCLUDE_UNNAMED:
+        person_filter += " and name ne ''"
     try:
-        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        rows = list(table_scan.scan_partition(person_table_client.query_entities, person_filter))
     except Exception:
         return []
 
@@ -11701,6 +11748,77 @@ def _compute_trash_purge_at(deleted_at: str, retention_days: int = TRASH_RETENTI
     return (parsed + timedelta(days=retention_days)).isoformat()
 
 
+# --- trash index -------------------------------------------------------------------------
+_TRASH_INDEX_INIT_KEY = '__init__'
+
+
+def _trash_index_add(user_id: str, filename: str, deleted_at: str) -> None:
+    if trash_index_table_client is None:
+        return
+    try:
+        trash_index_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, 'deletedAt': deleted_at})
+    except Exception:
+        app.logger.warning('Trash index add failed for %s', filename, exc_info=True)
+
+
+def _trash_index_remove(user_id: str, filenames: List[str]) -> None:
+    if trash_index_table_client is None:
+        return
+    for name in filenames:
+        try:
+            trash_index_table_client.delete_entity(partition_key=user_id, row_key=name)
+        except Exception:
+            pass  # absent (never indexed) or already gone
+
+
+def _trash_index_entries(user_id: str) -> List[Dict]:
+    """[{RowKey, deletedAt}] for every photo in trash, newest first.
+
+    Read from the small trash index. The first call for a library (no init marker) builds the index
+    with ONE scan of the metadata table (the slow filter the index exists to avoid), so every later
+    call is a query over just the trashed rows. Entries can briefly outlive a purge; the listing
+    prunes them when it reads the page. Without a trash index table, the scan is used directly."""
+    def _scan() -> List[Dict]:
+        return [
+            {'RowKey': str(row.get('RowKey') or ''), 'deletedAt': str(row.get('deletedAt') or '')}
+            for row in _iter_metadata_rows_for_user(
+                user_id, select=['RowKey', 'deletedAt', 'processing_state'], include_deleted=True,
+                extra_filter="processing_state eq 'deleted'", purpose='trash.index_backfill',
+            ) if row.get('RowKey')
+        ]
+
+    entries: List[Dict]
+    if trash_index_table_client is None:
+        entries = _scan()
+    else:
+        try:
+            trash_index_table_client.get_entity(partition_key=user_id, row_key=_TRASH_INDEX_INIT_KEY)
+            initialised = True
+        except Exception:
+            initialised = False
+        if not initialised:
+            entries = _scan()
+            try:
+                for entry in entries:
+                    trash_index_table_client.upsert_entity(
+                        {'PartitionKey': user_id, 'RowKey': entry['RowKey'], 'deletedAt': entry['deletedAt']})
+                trash_index_table_client.upsert_entity({
+                    'PartitionKey': user_id, 'RowKey': _TRASH_INDEX_INIT_KEY,
+                    'deletedAt': datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                app.logger.warning('Trash index backfill failed for %s', user_id, exc_info=True)
+        else:
+            entries = [
+                {'RowKey': str(row.get('RowKey') or ''), 'deletedAt': str(row.get('deletedAt') or '')}
+                for row in trash_index_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
+                if row.get('RowKey') and row.get('RowKey') != _TRASH_INDEX_INIT_KEY
+            ]
+    entries.sort(key=lambda e: e['deletedAt'], reverse=True)
+    return entries
+
+
+
 def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[Dict[str, Any]]:
     """Soft-delete a photo row in place: flips it to the trash state every
     read path already guards against (processing_state == 'deleted'), stamps
@@ -11731,6 +11849,7 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
     entity['processing_lease_expires_at'] = ''
     entity['last_processing_update'] = now_iso
     metadata_table_client.upsert_entity(entity)
+    _trash_index_add(user_id, filename, now_iso)
     return entity
 
 
@@ -11758,6 +11877,7 @@ def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any
         entity[status_field] = pre_delete_statuses.get(status_field, 'pending')
     entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
     metadata_table_client.upsert_entity(entity)
+    _trash_index_remove(user_id, [filename])
     return entity
 
 
@@ -11889,6 +12009,7 @@ def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[st
                 pass
 
     if deleted:
+        _trash_index_remove(user_id, deleted)
         _invalidate_metadata_scan_cache(user_id)
         try:
             touch_user_search_indexes_state(user_id, filenames=deleted)
@@ -14529,7 +14650,7 @@ def _remove_file_quietly(path: str) -> None:
 
 
 # Guard other optional startup helpers to avoid import-time failures
-for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_face_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
+for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_face_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table', 'create_trash_index_table'):
     if _fn in globals() and callable(globals().get(_fn)):
         try:
             globals().get(_fn)()

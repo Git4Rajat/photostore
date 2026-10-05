@@ -63,11 +63,19 @@
     if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const t0 = performance.now();
-    let res, text = '', error = '';
-    try {
-      res = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, cache: 'no-store' });
-      text = await res.text();
-    } catch (e) { error = String(e); }
+    let res, text = '', error = '', attempts = 0;
+    // Scale-to-zero apps answer the first request with a gateway error (no CORS headers, so the
+    // browser reports "Failed to fetch"). Retry those like the app does, and report how many tries.
+    for (; attempts < 4; attempts++) {
+      error = ''; res = undefined; text = '';
+      try {
+        res = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, cache: 'no-store' });
+        text = await res.text();
+      } catch (e) { error = String(e); }
+      const transient = !res || res.status === 502 || res.status === 503 || res.status === 504;
+      if (!transient || attempts === 3) { attempts++; break; }
+      await new Promise((r) => setTimeout(r, 1500 * (attempts + 1)));
+    }
     const ms = performance.now() - t0;
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch (e) { /* not json */ }
@@ -75,11 +83,22 @@
     const row = {
       name, method, path: url.replace(/^https?:\/\/[^/]+/, '').split('?')[0], status: res ? res.status : 0,
       ms: Math.round(ms), serverMs: timing.app, storageMs: timing.storage,
-      kb: Math.round(text.length / 1024), rid, error: error || (res && !res.ok ? (json && json.error) || res.statusText : ''),
+      kb: Math.round(text.length / 1024), rid, attempts,
+      error: error || (res && !res.ok ? (json && json.error) || res.statusText : ''),
       ...extra,
     };
     results.push(row);
     return { ok: !!res && res.ok, json, row };
+  }
+
+  // The browser usually gunzips Content-Encoding:gzip blobs itself; only decompress when the
+  // bytes still start with the gzip magic number (1f 8b).
+  async function bufferToText(buf) {
+    const u8 = new Uint8Array(buf);
+    if (u8[0] === 0x1f && u8[1] === 0x8b) {
+      return await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+    }
+    return new TextDecoder().decode(buf);
   }
 
   async function blobJson(name, url) {
@@ -90,12 +109,7 @@
       const buf = await r.arrayBuffer();
       kb = Math.round(buf.byteLength / 1024);
       const t1 = performance.now();
-      let text;
-      try { text = new TextDecoder().decode(buf); JSON.parse(text.slice(0, 2)); } catch (e) { text = null; }
-      if (!text || text[0] !== '{') {
-        const ds = new DecompressionStream('gzip');
-        text = await new Response(new Blob([buf]).stream().pipeThrough(ds)).text();
-      }
+      const text = await bufferToText(buf);
       rows = (JSON.parse(text).rows || []).length;
       parseMs = Math.round(performance.now() - t1);
     } catch (e) { error = String(e); }
@@ -104,6 +118,11 @@
     return rows;
   }
 
+  note('0/9 warm-up (scale-to-zero apps may take ~30 s to start; reported separately)');
+  for (const [label, host] of [['backend', API], ['extras', EXTRAS], ['tools', TOOLS]]) {
+    if (label !== 'backend' && host === API) continue;
+    await call(`WARM-UP ${label} /health`, 'GET', `${host}/health`);
+  }
   note('1/9 health and tokens');
   await call('health', 'GET', `${API}/health`);
   const mt = await call('media-token', 'GET', `${API}/api/photos/media-token`);
@@ -189,8 +208,7 @@
   try {
     const sortRows = (sortM.json && sortM.json.indexUrl) ? await (async () => {
       const r = await fetch(sortM.json.indexUrl); const b = await r.arrayBuffer();
-      let t; try { t = new TextDecoder().decode(b); JSON.parse(t.slice(0, 2)); } catch (e) { t = null; }
-      if (!t || t[0] !== '{') t = await new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+      const t = await bufferToText(b);
       return JSON.parse(t).rows || [];
     })() : [];
     const withThumb = sortRows.filter((r) => r.thumb).slice(0, OPTIONS.thumbnails);
@@ -231,11 +249,15 @@
   for (let i = 0; i < 3; i++) rep.push((await call(`repeat ${i + 1}: albums index manifest`, 'GET', `${API}/api/albums/index`)).row.ms);
 
   // ---------- report ----------
-  const bad = results.filter((r) => r.status === 0 || r.status >= 400);
-  const slow = results.filter((r) => r.ms >= OPTIONS.slowMs).sort((a, b) => b.ms - a.ms);
+  const warm = results.filter((r) => r.name.startsWith('WARM-UP'));
+  const measured = results.filter((r) => !r.name.startsWith('WARM-UP'));
+  const bad = measured.filter((r) => r.status === 0 || r.status >= 400);
+  const slow = measured.filter((r) => r.ms >= OPTIONS.slowMs).sort((a, b) => b.ms - a.ms);
   const summary = {
     when: new Date().toISOString(), session, apiBase: API, extrasBase: EXTRAS, toolsBase: TOOLS,
-    calls: results.length, failed: bad.length, slow: slow.length,
+    calls: measured.length, failed: bad.length, slow: slow.length,
+    coldStartMs: Object.fromEntries(warm.map((w) => [w.name, w.ms])),
+    retriedCalls: measured.filter((r) => r.attempts > 1).map((r) => `${r.name} x${r.attempts}`),
     thumbnails: thumbStats,
     queueing: {
       singlePageMs: single && single.ms, burstOf: OPTIONS.concurrency, burstWallMs: burstWall,
@@ -249,7 +271,7 @@
       return Object.fromEntries(Object.entries(m).map(([h, v]) => [h, { requests: v.n, avgMs: Math.round(v.ms / v.n) }]));
     })(),
   };
-  window.__smoke = { summary, results, failed: bad, slowest: slow.slice(0, 15) };
+  window.__smoke = { summary, results: measured, failed: bad, slowest: slow.slice(0, 15) };
 
   console.log('%c==== SMOKE TEST RESULT ====', 'font-weight:bold;font-size:14px');
   console.table(results.map(({ name, status, ms, serverMs, storageMs, kb, rows, parseMs, error }) =>

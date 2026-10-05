@@ -457,3 +457,12 @@ Everything logs as `PERF event=...` lines (backend, worker, and the browser thro
 - **Thumbnails:** every grid builds its thumbnail URL from the sort index's blob name and the single container token. A thumbnail loaded on one page is then a browser-cache hit on the others. Album covers use the same path.
 - **Duplicate-call detection:** table queries are keyed by a hash of their `$filter`, so `dup_io` means the same query was repeated.
 - **Not changed:** `finalize-batch` still makes about 12 storage calls per file. That would need a batched finalize across files.
+
+### 15.2 Fixes from the browser smoke test
+
+- **Trash:** membership comes from a small trash index table (`TRASH_INDEX_TABLE`, default `phototrashindex`; PartitionKey = library, RowKey = filename). It is maintained on soft delete, restore and purge. Before this, "list trash" was a server-side filtered scan of the whole library, about 45 s at 130k photos even with an empty trash.
+  - The first call per library builds the index with one scan, then later calls are a query over only the trashed rows.
+  - The listing reads just the requested page fresh and prunes stale index entries.
+- **Gallery pages:** a page's rows are fetched 15 per query (`RowKey eq .. or ..`), in parallel, instead of one point read each. This is about 4 round trips instead of 48.
+- **People:** the face and person scans use the parallel scan. Merge suggestions read only named people instead of every cluster's embedding, which was both minutes of work and a memory risk on the extras app.
+- **Smoke script:** it now retries cold-start gateway errors, warms all three apps first and reports cold-start times separately. It decompresses blobs only when the bytes start with the gzip magic number. The earlier "Failed to fetch" on the index blobs and thumbnails was this script bug, not the app.

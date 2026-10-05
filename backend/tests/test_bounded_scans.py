@@ -84,11 +84,14 @@ def _call(view, url, method='GET', **kw):
     return response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
 
 
-def test_trash_list_transfers_only_trashed_rows(monkeypatch):
+def test_trash_membership_scan_transfers_only_trashed_rows_and_the_page_is_read_by_key(monkeypatch):
     table = _RecordingTable(lambda: iter([{'RowKey': 'a.jpg', 'processing_state': 'deleted', 'deletedAt': '2026-01-01T00:00:00+00:00'}]))
     _install(monkeypatch, table)
+    monkeypatch.setattr(app, 'trash_index_table_client', None)     # no index table -> the scan path
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
+    monkeypatch.setattr(app, '_get_metadata_entities', lambda uid, names: {n: {'RowKey': n, 'processing_state': 'deleted', 'deletedAt': '2026-01-01T00:00:00+00:00'} for n in names})
+    monkeypatch.setattr(app, '_build_photo_summaries_page', lambda uid, items, names: [{'filename': n} for n, _ in items])
     payload = _call(photos.list_trashed_photos, '/api/photos/trash')
     assert payload['total'] == 1
     query, kwargs = table.calls[0]

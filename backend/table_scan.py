@@ -69,7 +69,8 @@ def _filter_for(base: str, rng: _Range) -> str:
 def _cut_chars(first_char: str, last_char: str) -> str:
     """Characters to cut on at one key position: stay inside the character class the
     keys were observed in (digits, lowercase, uppercase), else use the full alphabet."""
-    for run in (string.digits, string.ascii_lowercase, string.ascii_uppercase):
+    # Digits include a-f: hex ids (face-v1-<sha1>) and numbered names (IMG_00123) look alike here.
+    for run in (string.digits + 'abcdef', string.ascii_lowercase, string.ascii_uppercase):
         if first_char in run and last_char in run:
             return run
     return _ALPHABET
