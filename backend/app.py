@@ -14856,3 +14856,10 @@ else:
     # real memory/CPU savings.
     for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp):
         app.register_blueprint(_bp)
+
+# Every role answers /health (system_bp only exists on the backend role; upload has its own), so the
+# browser's warm-up probe and any manual check never see a 404 from extras/tools/admin.
+if not any(rule.rule == '/health' for rule in app.url_map.iter_rules()):
+    @app.route('/health', methods=['GET'])
+    def _role_health():
+        return jsonify({'status': 'healthy', 'role': _app_role})

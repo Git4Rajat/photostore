@@ -1361,7 +1361,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [personPaging, setPersonPaging] = useState<Record<string, { total: number; hasMore: boolean }>>({});
     const personLoadingMore = useRef<Record<string, boolean>>({});
     const fetchPersonPage = useCallback(async (id: string, offset: number) => {
-        const res = await get<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
+        // people_bp lives on the extras app, not the backend: /api/persons/<id> 404s on the backend host.
+        const res = await getExtras<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
             `/api/persons/${encodeURIComponent(id)}?offset=${offset}&limit=${PERSON_PAGE}`,
         );
         const faces = Array.isArray(res?.faces) ? res.faces : [];
