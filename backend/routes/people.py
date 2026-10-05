@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from flask import Blueprint
 
+import person_photos
+
 import app
 
 people_bp = Blueprint('people', __name__)
@@ -387,6 +389,29 @@ def get_person(person_id: str):
     if limit > 0:
         response['hasMore'] = offset + limit < len(active)
     return app.jsonify(response)
+
+@people_bp.route('/api/persons/<person_id>/photos', methods=['GET'])
+def get_person_photos(person_id: str):
+    """A page of one person's photos (filenames, best face first) with the exact total, read from the
+    person-membership table (see person_photos.py). The browser turns the filenames into photo records with
+    one /api/photos/lookup-batch call, so no face-table scan and no per-face work happens here."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._people_features_available() or app.person_members_table_client is None:
+        return app.jsonify({'error': 'People features not configured'}), 503
+    try:
+        app.person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+    except Exception:
+        return app.jsonify({'error': 'Not found'}), 404
+    try:
+        offset = max(0, int(app.request.args.get('offset', 0)))
+        limit = max(1, min(500, int(app.request.args.get('limit', 120))))
+    except ValueError:
+        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
+    names = person_photos.ranked_filenames(user_id, person_id, app.person_members_table_client, app.face_table_client)
+    window = names[offset:offset + limit]
+    return app.jsonify({'filenames': window, 'total': len(names), 'offset': offset, 'hasMore': offset + len(window) < len(names)})
 
 @people_bp.route('/api/persons/suggestions', methods=['GET'])
 def list_person_suggestions():

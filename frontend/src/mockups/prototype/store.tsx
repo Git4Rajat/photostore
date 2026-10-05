@@ -1361,28 +1361,28 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const personFaceOffsets = useRef<Record<string, number>>({});
     const [personPaging, setPersonPaging] = useState<Record<string, { total: number; hasMore: boolean }>>({});
     const personLoadingMore = useRef<Record<string, boolean>>({});
-    // A person's photos come from the library database's people index (the same paged, token-based path
-    // the gallery uses): exact total, newest first, no face-table scan and no per-face work. If that index
-    // knows nothing about the person (photos whose people were never written to the database), the page
-    // falls back to the person's face list so it is never empty when the person has faces.
-    const personSource = useRef<Record<string, 'db' | 'faces'>>({});
+    // A person's photos, best face first: extras returns one page of filenames from the person-membership
+    // table (a single small partition read, exact total), and one lookup-batch call on the backend turns them
+    // into photo records with token-built thumbnails. If the membership endpoint fails, fall back to the
+    // person's face list so the page is never empty when the person has faces.
     const fetchPersonPage = useCallback(async (id: string, offset: number) => {
-        if (personSource.current[id] !== 'faces') {
-            const token = getCachedMediaToken();
-            const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
-                `/photos?personId=${encodeURIComponent(id)}&sort=capture&offset=${offset}&limit=${PERSON_PAGE}${token ? '&directMedia=1' : ''}`,
+        try {
+            const page = await getExtras<{ filenames?: string[]; total?: number; hasMore?: boolean }>(
+                `/api/persons/${encodeURIComponent(id)}/photos?offset=${offset}&limit=${PERSON_PAGE}`,
             );
-            const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
-            const total = typeof res?.total === 'number' ? res.total : offset + list.length;
-            if (!(offset === 0 && total === 0)) {
-                personSource.current[id] = 'db';
-                personFaceOffsets.current[id] = offset + PERSON_PAGE;
-                setPersonPaging((prev) => ({ ...prev, [id]: { total, hasMore: offset + PERSON_PAGE < total } }));
-                return list;
+            const names = Array.isArray(page?.filenames) ? page.filenames : [];
+            let list: Photo[] = [];
+            if (names.length) {
+                const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: Boolean(getCachedMediaToken()) });
+                const byName = new Map((res?.photos ?? []).map((p) => [p.filename, p]));
+                list = names.map((n) => byName.get(n)).filter((p): p is BackendPhoto => Boolean(p)).map((p) => mapPhoto(p));
             }
-            personSource.current[id] = 'faces';
+            personFaceOffsets.current[id] = offset + names.length;
+            setPersonPaging((prev) => ({ ...prev, [id]: { total: page?.total ?? names.length, hasMore: Boolean(page?.hasMore) && names.length > 0 } }));
+            return list;
+        } catch {
+            // fall through to the face list
         }
-        // people_bp lives on the extras app, not the backend.
         const res = await getExtras<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
             `/api/persons/${encodeURIComponent(id)}?offset=${offset}&limit=${PERSON_PAGE}`,
         );
