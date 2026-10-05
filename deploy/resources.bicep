@@ -863,10 +863,17 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // a light-but-bursty gallery load is the intended trade, not a
             // cost concern (minReplicas stays 0; this only affects the
             // ceiling under real concurrent load).
+            //
+            // 2026-10-05: raised 2 -> 4 to match one replica's real capacity
+            // (GUNICORN_WORKERS=2 x GUNICORN_THREADS=2). At 2, an 8-call page
+            // of parallel gallery requests scaled 1 -> 4 replicas; each new
+            // replica needs ~25s to pull the image and then re-downloads the
+            // library search database, and serves nothing meanwhile. Do not
+            // go much higher: a 0.5vCPU replica cannot serve 20 at once.
             name: 'http-scaler'
             http: {
               metadata: {
-                concurrentRequests: '2'
+                concurrentRequests: '4'
               }
             }
           }
