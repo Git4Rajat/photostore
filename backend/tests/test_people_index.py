@@ -498,6 +498,7 @@ def _refresh(user, version):
 
 
 def test_incremental_refresh_rederives_only_changed_clusters(people_ctx, monkeypatch):
+    monkeypatch.setattr(storage_utils, '_PEOPLE_INCREMENTAL_SCAN_FACES', True)   # opt-in face-change scan
     person_table, face_table, _ = people_ctx
     _seed_person(person_table, 'lib-A', 'p1', name='Alice', faceIds=json.dumps(['f1']))
     _seed_person(person_table, 'lib-A', 'p2', name='', faceIds=json.dumps(['f2']))
@@ -547,7 +548,8 @@ def test_incremental_refresh_falls_back_to_full_build_when_too_much_changed(peop
     assert built == [1]
 
 
-def test_incremental_rederives_cluster_whose_cover_face_moved_without_its_row_changing(people_ctx):
+def test_incremental_rederives_cluster_whose_cover_face_moved_without_its_row_changing(people_ctx, monkeypatch):
+    monkeypatch.setattr(storage_utils, '_PEOPLE_INCREMENTAL_SCAN_FACES', True)   # opt-in face-change scan
     person_table, face_table, _ = people_ctx
     _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1', 'f2']))
     _seed_person(person_table, 'lib-A', 'p2', name='B', faceIds=json.dumps(['f3']))
@@ -620,3 +622,17 @@ def test_get_person_with_a_blank_name_returns_the_faces_instead_of_500(monkeypat
     body = resp.get_json()
     assert resp.status_code == 200 and body['name'] == 'Unnamed' and [f['faceId'] for f in body['faces']] == ['f1', 'f2']
     assert person_table.rows[('u', 'p1')]['name'] == ''          # nothing was written back
+
+
+def test_default_incremental_refresh_never_filters_the_face_table_by_timestamp(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _refresh('lib-A', 'v1')
+    queries = []
+    original = face_table.query_entities
+    face_table.query_entities = lambda f, select=None, **kw: (queries.append(f), original(f, select=select, **kw))[1]
+    _seed_person(person_table, 'lib-A', 'p1', name='Renamed', faceIds=json.dumps(['f1']))
+    second = _refresh('lib-A', 'v2')
+    assert second.rows[0]['name'] == 'Renamed'
+    assert not any('Timestamp' in q for q in queries)       # that filter rescans the whole partition
