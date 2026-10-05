@@ -203,6 +203,23 @@ export const getLocalSortIndex = async (): Promise<SortIndexRow[] | null> => {
 // invalidateLocalSearchIndex, so the next gallery load picks up newly-added
 // photos instead of serving a stale in-memory copy for the rest of the tab
 // session.
+// Filename -> thumbnail blob name for the loaded sort index, so any grid can build the same
+// container-token URL the gallery uses (one browser-cache entry per thumbnail, whichever page
+// shows it). Empty until the sort index is loaded.
+let thumbMap: Map<string, string> | null = null;
+let thumbMapSource: SortIndexRow[] | null = null;
+export const getCachedSortThumb = (filename: string): string => {
+    if (!cachedIndex) return '';
+    if (thumbMapSource !== cachedIndex || !thumbMap) {
+        thumbMap = new Map();
+        for (const row of cachedIndex) {
+            if (row.thumb) thumbMap.set(row.filename, row.thumb);
+        }
+        thumbMapSource = cachedIndex;
+    }
+    return thumbMap.get(filename) || '';
+};
+
 export const invalidateLocalSortIndex = (): void => {
     cachedIndex = null;
     cachedKey = null;

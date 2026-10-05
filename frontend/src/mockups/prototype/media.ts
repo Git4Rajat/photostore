@@ -4,6 +4,8 @@ import { isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress } from '../../services/imageClient';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { resolveMediaAccessUrls } from '../../services/mediaAccessCache';
+import { getCachedSortThumb } from '../../services/localSortIndex';
+import { getCachedMediaToken, thumbnailUrlForBlob } from '../../services/mediaToken';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
 import { isRawFilename } from '../../utils/photoDisplay';
 import type { Photo } from './types';
@@ -15,7 +17,14 @@ import type { Photo } from './types';
 // we reuse those instead of duplicating the rules.
 
 /** Directly-loadable thumbnail source when no scoped access token is needed. */
-const directThumbnailSource = (photo: Photo): string | undefined => {
+export const directThumbnailSource = (photo: Photo): string | undefined => {
+    // Same URL the gallery uses (container token + sort-index blob name) whenever both are
+    // loaded, so a thumbnail already fetched on another page is a browser-cache hit instead
+    // of a second download through a per-photo SAS link.
+    const tokenUrl = thumbnailUrlForBlob(getCachedSortThumb(photo.filename), getCachedMediaToken());
+    if (tokenUrl) {
+        return tokenUrl;
+    }
     if (!photo.thumbnailUrl) {
         return undefined;
     }
@@ -39,6 +48,7 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
         }
         const need = photos
             .filter((p) => shouldFetchScopedThumbnail(p.filename, p.thumbnailUrl))
+            .filter((p) => !thumbnailUrlForBlob(getCachedSortThumb(p.filename), getCachedMediaToken()))
             .map((p) => p.filename)
             .filter((filename) => !resolvedRef.current.has(filename));
         if (need.length === 0) {
@@ -67,7 +77,10 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
 
     const out: Record<string, string> = {};
     for (const photo of photos) {
-        if (shouldFetchScopedThumbnail(photo.filename, photo.thumbnailUrl)) {
+        const tokenUrl = thumbnailUrlForBlob(getCachedSortThumb(photo.filename), getCachedMediaToken());
+        if (tokenUrl) {
+            out[photo.filename] = tokenUrl;
+        } else if (shouldFetchScopedThumbnail(photo.filename, photo.thumbnailUrl)) {
             const url = scoped[photo.filename];
             if (url) {
                 out[photo.filename] = url;

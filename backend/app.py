@@ -231,6 +231,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 worker_logger = logging.getLogger(__name__)
 import perf_instrumentation
+import table_scan
 import storage_utils as storage_utils_module
 perf_instrumentation.install(app)
 placeholder_bytes = create_placeholder_thumbnail()
@@ -2883,6 +2884,68 @@ def _upsert_job_status(job_id: str, user_id: str, job_type: str, status: str, **
             pass
 
 
+JOB_RETENTION_DAYS = int(os.getenv('JOB_RETENTION_DAYS', '14'))
+_JOB_SWEEP_INTERVAL_SECONDS = float(os.getenv('JOB_SWEEP_INTERVAL_SECONDS', '3600'))
+_JOB_SWEEP_LAST: Dict[str, float] = {}
+_JOB_SWEEP_LOCK = threading.Lock()
+_JOB_SWEEP_MAX_ROWS = 1000
+
+
+def _sweep_old_job_rows(user_id: str) -> int:
+    """Delete finished job rows older than JOB_RETENTION_DAYS from one partition.
+
+    The jobs table otherwise grows forever (one row per upload batch, clustering run, preview...),
+    and every per-user job query scales with it. In-flight rows are never touched. Returns how many
+    rows were removed; at most _JOB_SWEEP_MAX_ROWS per call so a big backlog drains over several."""
+    if jobs_table_client is None or JOB_RETENTION_DAYS <= 0:
+        return 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=JOB_RETENTION_DAYS)).isoformat()
+    removed = 0
+    try:
+        doomed = []
+        for row in jobs_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and updatedAt lt '{cutoff}'"
+        ):
+            if str(row.get('status') or '').lower() in {'queued', 'running'}:
+                continue
+            doomed.append({'PartitionKey': row['PartitionKey'], 'RowKey': row['RowKey']})
+            if len(doomed) >= _JOB_SWEEP_MAX_ROWS:
+                break
+        submit = getattr(jobs_table_client, 'submit_transaction', None)
+        for start in range(0, len(doomed), 100):
+            chunk = doomed[start:start + 100]
+            done = False
+            if submit is not None:
+                try:
+                    submit([('delete', entity) for entity in chunk])
+                    done = True
+                except Exception:
+                    done = False
+            if not done:
+                for entity in chunk:
+                    try:
+                        jobs_table_client.delete_entity(partition_key=entity['PartitionKey'], row_key=entity['RowKey'])
+                    except Exception:
+                        continue
+            removed += len(chunk)
+    except Exception:
+        app.logger.warning('Job row sweep failed for %s', user_id, exc_info=True)
+    if removed:
+        perf_instrumentation.log_event('job_sweep', user=user_id, removed=removed)
+    return removed
+
+
+def _maybe_sweep_old_job_rows(user_id: str) -> None:
+    """At most once per interval per user, in the background (never on the request thread)."""
+    now = time.monotonic()
+    with _JOB_SWEEP_LOCK:
+        last = _JOB_SWEEP_LAST.get(user_id)
+        if last is not None and now - last < _JOB_SWEEP_INTERVAL_SECONDS:
+            return
+        _JOB_SWEEP_LAST[user_id] = now
+    threading.Thread(target=_sweep_old_job_rows, args=(user_id,), name='job-sweep', daemon=True).start()
+
+
 def _get_job_row(partition_key: str, job_id: str) -> Optional[Dict]:
     """Point-read a job row by its scope (userId or libraryId) and jobId.
 
@@ -3623,14 +3686,22 @@ def _iter_metadata_rows_for_user(
         kwargs['select'] = select if include_deleted or 'processing_state' in select else [*select, 'processing_state']
     if PHOTO_TABLE_SCAN_PAGE_SIZE > 0:
         kwargs['results_per_page'] = PHOTO_TABLE_SCAN_PAGE_SIZE
-    try:
-        rows_iter = metadata_table_client.query_entities(query, **kwargs)
-    except TypeError:
-        kwargs.pop('results_per_page', None)
+    partition_filter = f"PartitionKey eq '{_escape_odata(user_id)}'"
+    if extra_filter:
+        partition_filter += f' and ({extra_filter})'
+
+    def _query(filter_str, **query_kwargs):
         try:
-            rows_iter = metadata_table_client.query_entities(query, **kwargs)
+            return metadata_table_client.query_entities(filter_str, **query_kwargs)
         except TypeError:
-            rows_iter = metadata_table_client.query_entities(query)
+            query_kwargs.pop('results_per_page', None)
+            try:
+                return metadata_table_client.query_entities(filter_str, **query_kwargs)
+            except TypeError:
+                return metadata_table_client.query_entities(filter_str)
+
+    # Several RowKey ranges are read at once, still in RowKey order (see table_scan.py).
+    rows_iter = table_scan.scan_partition(_query, partition_filter, **kwargs)
     scanned = 0
     for row in rows_iter:
         scanned += 1
@@ -8093,8 +8164,9 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
         filename = row.get('RowKey')
         if not filename:
             continue
-        upload_dt = _metadata_upload_date(row)
-        capture_dt = _metadata_capture_date(row)
+        # Rows read from the local library database carry precomputed datetimes.
+        upload_dt = row.get('_upload_dt') or _metadata_upload_date(row)
+        capture_dt = row.get('_capture_dt') or _metadata_capture_date(row)
 
         if rule == 'location':
             city = str(row.get('locationCity') or '').strip()

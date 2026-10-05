@@ -246,3 +246,29 @@ def test_route_never_loads_the_lexical_index_or_scans_the_table(monkeypatch, db)
 def test_empty_query_short_circuits(monkeypatch):
     with app.app.test_request_context('/photos/search?q='):
         assert search_photos().get_json() == {'photos': [], 'total': 0}
+
+
+# --- smart albums read from the database, same groups as from the table ------------------
+
+def _group_view(candidates):
+    return {c['name']: sorted(c['filenames']) for c in candidates}
+
+
+@pytest.mark.parametrize('rule', ['recent-upload', 'event-window', 'location', 'person', 'tag-object'])
+def test_smart_album_groups_from_the_database_match_the_table_scan(tmp_path, monkeypatch, rule):
+    rows = [
+        {'RowKey': 'a.jpg', 'locationCity': 'Paris', 'locationCountry': 'France', 'uploadDate': '2020-05-01T10:00:00+00:00',
+         'peopleIds': json.dumps(['p1']), 'tags': json.dumps(['dog']), 'subjectTags': json.dumps(['dog']),
+         'exifData': json.dumps({'DateTimeOriginal': '2019:12:25 09:00:00'})},
+        {'RowKey': 'b.jpg', 'locationCity': 'Paris', 'locationCountry': 'France', 'uploadDate': '2020-05-01T11:00:00+00:00',
+         'peopleIds': json.dumps(['p1', 'p2']), 'tags': json.dumps(['dog', 'ball']), 'subjectTags': json.dumps(['dog']),
+         'exifData': json.dumps({'DateTimeOriginal': '2019:12:25 18:00:00'})},
+        {'RowKey': 'c.jpg', 'locationCity': 'Goa', 'uploadDate': '2021-02-03T00:00:00+00:00', 'tags': json.dumps(['beach'])},
+    ]
+    monkeypatch.setattr(app, '_smart_album_person_names', lambda uid: {'p1': 'Asha', 'p2': 'Ravi'})
+    path = str(tmp_path / 's.sqlite')
+    search_db.build_database(rows, path)
+    from_db = app._smart_album_candidates('u', rule, list(search_db.SearchDatabase(path).iter_smart_rows()))
+    from_table = app._smart_album_candidates('u', rule, rows)
+    assert _group_view(from_db) == _group_view(from_table)
+    assert [c['name'] for c in from_db] == [c['name'] for c in from_table]

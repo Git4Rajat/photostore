@@ -371,14 +371,26 @@ def autocreate_albums():
             'rules': sorted(set(app.SMART_ALBUM_RULES.values())),
         }), 400
 
+    # Read the library from the local search database (disk) when this replica has a current
+    # one: grouping 130k photos straight off the table took ~200 s and held a web thread the
+    # whole time. Without a database yet, fall back to the streamed table scan.
+    import search_db
     try:
-        # Streamed, narrow projection: the rules loop over the rows once.
-        metadata_rows = app._iter_metadata_rows_for_user(
-            user_id, select=app.SMART_ALBUM_SELECT, purpose='albums.smart_create',
-        )
-    except Exception as exc:
-        app.app.logger.exception('Smart album metadata read failed')
-        return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
+        db = search_db.open_database(user_id)
+    except Exception:
+        app.app.logger.exception('Could not open the library database for smart albums')
+        db = None
+    if db is not None:
+        metadata_rows = db.iter_smart_rows()
+    else:
+        try:
+            # Streamed, narrow projection: the rules loop over the rows once.
+            metadata_rows = app._iter_metadata_rows_for_user(
+                user_id, select=app.SMART_ALBUM_SELECT, purpose='albums.smart_create',
+            )
+        except Exception as exc:
+            app.app.logger.exception('Smart album metadata read failed')
+            return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
 
     try:
         existing_rows = list(app.albums_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))

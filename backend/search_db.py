@@ -41,7 +41,7 @@ import sqlite3
 import tempfile
 import threading
 import time
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import perf_instrumentation
@@ -432,6 +432,38 @@ class SearchDatabase:
 
     def row_count(self) -> int:
         return int(self._conn().execute('SELECT COUNT(*) FROM rows').fetchone()[0])
+
+    def iter_smart_rows(self):
+        """Stream every photo as a metadata-shaped row for the smart-album rules
+        (location / upload day / capture day / person / tag), read from local disk
+        instead of scanning the table. Dates come from the stored timestamps
+        (``_capture_dt`` / ``_upload_dt``); tags are the high-confidence set the
+        search index keeps."""
+        cur = self._conn().execute('SELECT filename, row_json, capture_ts, upload_ts, lat, lon FROM rows')
+        for filename, row_json, capture_ts, upload_ts, lat, lon in cur:
+            try:
+                row = json.loads(row_json)
+            except Exception:
+                continue
+            row['RowKey'] = filename
+            if lat is not None and lon is not None:
+                row['latitude'], row['longitude'] = repr(lat), repr(lon)
+            else:
+                row.pop('latitude', None)
+                row.pop('longitude', None)
+            tags: List[str] = []
+            for field in ('subjectTags', 'tags'):
+                try:
+                    tags.extend(str(t) for t in json.loads(row.get(field) or '[]'))
+                except Exception:
+                    pass
+            row['tags'] = json.dumps(tags, ensure_ascii=False)
+            row['objects'] = '[]'
+            if capture_ts is not None:
+                row['_capture_dt'] = datetime.fromtimestamp(capture_ts, tz=timezone.utc)
+            if upload_ts is not None:
+                row['_upload_dt'] = datetime.fromtimestamp(upload_ts, tz=timezone.utc)
+            yield row
 
 
 # --- blob storage + local ephemeral cache -------------------------------------

@@ -49,6 +49,7 @@ from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
 from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
 import index_files
+import table_scan
 import maps_utils
 import perf_instrumentation
 import vision_utils
@@ -3855,7 +3856,10 @@ def iter_library_rows(user_id: str):
     metadata_table_client = _CTX.get('metadata_table_client')
     if metadata_table_client is None:
         raise RuntimeError('metadata table not configured')
-    for row in metadata_table_client.query_entities(
+    # Page fetches are latency-bound, so the partition is read as several RowKey ranges at once
+    # (still in RowKey order) -- see table_scan.py.
+    for row in table_scan.scan_partition(
+        metadata_table_client.query_entities,
         f"PartitionKey eq '{_escape_odata(user_id)}' and processing_complete eq true",
         select=_STREAM_SELECT_FIELDS,
     ):

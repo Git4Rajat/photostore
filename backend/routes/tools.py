@@ -173,6 +173,7 @@ def jobs_status():
             return error
         if app.jobs_table_client is None:
             return app.jsonify({'jobs': []})
+        app._maybe_sweep_old_job_rows(user_id)  # background, hourly per user
         cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(minutes=app.JOB_STATUS_WINDOW_MINUTES)).isoformat()
         # A job of ANY type (clustering, ipwork, library_clean, preview, ...)
         # this old and still queued/running is dead, not in-flight — the

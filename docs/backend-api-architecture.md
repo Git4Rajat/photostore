@@ -445,3 +445,15 @@ Everything logs as `PERF event=...` lines (backend, worker, and the browser thro
 - Slow builds: `event=scope_summary name=index.build.*`, then drill into `event=step` and `event=stream_scan_split`.
 - Client versus server: join `client_req` and `request` on `rid`. `ms - serverMs` is network plus queueing.
 - Duplicate downloads: `event=client_dup`, grouped by `kind`.
+
+### 15.1 Fixes made from the first production PERF data
+
+- **Job status:** `/api/jobs/status` filters server-side (in-flight or recently updated). Finished rows older than `JOB_RETENTION_DAYS` (14) are swept in the background, at most hourly per user (`event=job_sweep`).
+- **Naming a person:** faces are confirmed with parallel reads and 100-row write transactions. Each step logs `event=step name=label.*`.
+- **Smart albums:** read from the library's local search database (`SearchDatabase.iter_smart_rows`) when a current one exists, and fall back to the table scan otherwise. Groups are the same as the table scan's, except tags: the database keeps only the high-confidence tags.
+- **Parallel partition scan (`table_scan.py`):** the library scan reads RowKey ranges concurrently and still returns rows in RowKey order. Hot prefixes (`IMG_...`) are split on the fly. Settings: `TABLE_SCAN_PARALLELISM` (default 4, 1 = off), `TABLE_SCAN_SPLIT_ROWS`, `TABLE_SCAN_QUEUE_ROWS`.
+  - `event=table_scan` logs rows, ranges and ms. Compare ms per 1000 rows with `TABLE_SCAN_PARALLELISM=1`.
+  - Azure documents a soft target of about 2,000 entities per second per partition, so expect a gain of up to roughly 2x. Watch for 503s on the table when raising the worker count.
+- **Thumbnails:** every grid builds its thumbnail URL from the sort index's blob name and the single container token. A thumbnail loaded on one page is then a browser-cache hit on the others. Album covers use the same path.
+- **Duplicate-call detection:** table queries are keyed by a hash of their `$filter`, so `dup_io` means the same query was repeated.
+- **Not changed:** `finalize-batch` still makes about 12 storage calls per file. That would need a batched finalize across files.
