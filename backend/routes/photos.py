@@ -1051,7 +1051,19 @@ def photos_index_status():
         building = bool(search_db.is_building(user_id))
     except Exception:
         building = False
-    return app.jsonify({'ready': ready, 'indexes': indexes, 'building': building})
+    # What the library database holds right now (read from its manifest, no table scan): lets anyone tell
+    # "empty / still being built" from "populated" without guessing.
+    try:
+        manifest = search_db.load_manifest(user_id)
+        library_db = {
+            'rowCount': int(manifest.get('rowCount') or 0),
+            'deltaSeq': int(manifest.get('deltaSeq') or 0),
+            'schemaVersion': manifest.get('schemaVersion'),
+            'building': bool(manifest.get('building')),
+        }
+    except Exception:
+        library_db = None
+    return app.jsonify({'ready': ready, 'indexes': indexes, 'building': building, 'libraryDb': library_db})
 
 @photos_bp.route('/photos/metadata', methods=['POST'])
 @photos_bp.route('/photos/metadata/', methods=['POST'])
