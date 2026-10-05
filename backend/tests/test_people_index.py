@@ -16,6 +16,7 @@ from __future__ import annotations
 import gzip
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 import time
 
 import pytest
@@ -354,6 +355,51 @@ def test_invalidate_people_scan_cache_noop_for_empty_user_id(monkeypatch):
     assert calls == []
 
 
+def test_touch_user_people_index_state_debounces_repeated_calls(people_ctx):
+    """_invalidate_people_scan_cache fires on every write to
+    person_table_client/face_table_client -- during upload face detection
+    that's once per detected FACE, not once per photo. Repeated calls in a
+    burst must not rewrite the manifest blob every time. See
+    _manifest_already_marked_dirty."""
+    first = storage_utils.touch_user_people_index_state('lib-Z')
+    second = storage_utils.touch_user_people_index_state('lib-Z')
+
+    assert first != ''
+    assert second == ''
+    assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS[('lib-Z', 'people')] is True
+
+
+def test_people_manifest_dirty_flag_clears_after_a_real_rebuild(people_ctx):
+    storage_utils.touch_user_people_index_state('lib-Z')
+    assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS.get(('lib-Z', 'people')) is True
+
+    storage_utils.refresh_user_people_index('lib-Z', source_version='v1')
+
+    assert ('lib-Z', 'people') not in storage_utils._INDEX_MANIFEST_DIRTY_FLAGS
+    assert storage_utils.touch_user_people_index_state('lib-Z') != ''
+
+
+def test_people_rebuild_cooldown_skips_a_second_trigger_right_after_the_first(people_ctx, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        storage_utils, 'refresh_user_people_index',
+        lambda key, source_version=None: calls.append(key) or None,
+    )
+    manifest = {'sourceVersion': 'v1'}
+
+    storage_utils._rebuild_people_index_in_background('lib-Y', manifest)
+    for thread in list(threading.enumerate()):
+        if thread.name == 'people-index-rebuild':
+            thread.join(timeout=2)
+    assert calls == ['lib-Y']
+
+    storage_utils._rebuild_people_index_in_background('lib-Y', manifest)
+    for thread in list(threading.enumerate()):
+        if thread.name == 'people-index-rebuild':
+            thread.join(timeout=2)
+    assert calls == ['lib-Y']
+
+
 # --- cleanup -------------------------------------------------------------
 
 def test_delete_user_people_index_data_removes_blobs_and_cache(people_ctx):
@@ -443,3 +489,218 @@ def test_people_index_returns_available_true_with_sas_url(monkeypatch, people_in
     assert payload['available'] is True
     assert payload['indexUrl'] == 'https://example.invalid/abc-people.json.gz?sas'
     assert payload['sourceVersion'] == 'v2'
+
+
+# --- incremental refresh -------------------------------------------------------
+
+def _refresh(user, version):
+    return storage_utils.refresh_user_people_index(user, source_version=version)
+
+
+def test_incremental_refresh_rederives_only_changed_clusters(people_ctx, monkeypatch):
+    monkeypatch.setattr(storage_utils, '_PEOPLE_INCREMENTAL_SCAN_FACES', True)   # opt-in face-change scan
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='Alice', faceIds=json.dumps(['f1']))
+    _seed_person(person_table, 'lib-A', 'p2', name='', faceIds=json.dumps(['f2']))
+    _seed_person(person_table, 'lib-A', 'p3', name='', faceIds=json.dumps(['f3']))
+    for fid, pid in (('f1', 'p1'), ('f2', 'p2'), ('f3', 'p3')):
+        _seed_face(face_table, 'lib-A', fid, filename=f'{fid}.jpg', personId=pid)
+    old = datetime.now(timezone.utc) - timedelta(days=1)
+    person_table.clock = face_table.clock = lambda: old
+    for t in (person_table, face_table):
+        t.stamps = {k: old for k in t.rows}
+    first = _refresh('lib-A', 'v1')
+    assert [r['name'] for r in first.rows] == ['Alice', 'Unnamed 1', 'Unnamed 2']
+
+    # p2 is rejected-away (face rejected), p4 appears, p1 is renamed; p3 is untouched.
+    person_table.clock = face_table.clock = None
+    _seed_face(face_table, 'lib-A', 'f2', filename='f2.jpg', personId='p2', rejected=True)
+    _seed_person(person_table, 'lib-A', 'p1', name='Alicia', faceIds=json.dumps(['f1']))
+    _seed_person(person_table, 'lib-A', 'p4', name='', faceIds=json.dumps(['f4']))
+    _seed_face(face_table, 'lib-A', 'f4', filename='f4.jpg', personId='p4')
+    lookups = []
+    original = face_table.get_entity
+    face_table.get_entity = lambda partition_key, row_key: (lookups.append(row_key), original(partition_key, row_key))[1]
+    bulk = []
+    original_query = face_table.query_entities
+    face_table.query_entities = lambda f, select=None, **kw: (bulk.append(f), original_query(f, select=select, **kw))[1]
+
+    second = _refresh('lib-A', 'v2')
+    rows = {r['personId']: r for r in second.rows}
+    assert set(rows) == {'p1', 'p3', 'p4'}                      # p2 emptied -> removed
+    assert rows['p1']['name'] == 'Alicia'
+    assert [rows['p3']['name'], rows['p4']['name']] == ['Unnamed 1', 'Unnamed 2']   # renumbered
+    assert 'f3' not in lookups                                  # the untouched cluster's faces were never read
+    assert all('Timestamp ge' in f for f in bulk)               # no full face scan
+
+
+def test_incremental_refresh_falls_back_to_full_build_when_too_much_changed(people_ctx, monkeypatch):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _refresh('lib-A', 'v1')
+    monkeypatch.setattr(storage_utils, '_PEOPLE_INCREMENTAL_MAX_CHANGED', 0)
+    built = []
+    real = storage_utils._build_user_people_index_snapshot
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *a: (built.append(1), real(*a))[1])
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1', rejected=False)
+    _refresh('lib-A', 'v2')
+    assert built == [1]
+
+
+def test_incremental_rederives_cluster_whose_cover_face_moved_without_its_row_changing(people_ctx, monkeypatch):
+    monkeypatch.setattr(storage_utils, '_PEOPLE_INCREMENTAL_SCAN_FACES', True)   # opt-in face-change scan
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1', 'f2']))
+    _seed_person(person_table, 'lib-A', 'p2', name='B', faceIds=json.dumps(['f3']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='1.jpg', personId='p1', confidence=0.9)
+    _seed_face(face_table, 'lib-A', 'f2', filename='2.jpg', personId='p1', confidence=0.1)
+    _seed_face(face_table, 'lib-A', 'f3', filename='3.jpg', personId='p2')
+    old = datetime.now(timezone.utc) - timedelta(days=1)
+    for t in (person_table, face_table):
+        t.stamps = {k: old for k in t.rows}
+    first = _refresh('lib-A', 'v1')
+    assert {r['personId']: r['faceCount'] for r in first.rows} == {'p1': 2, 'p2': 1}
+    for t in (person_table, face_table):
+        t.stamps = {k: old for k in t.rows}
+    # f1 moves to p2 but p1's person row is (wrongly) left untouched.
+    _seed_face(face_table, 'lib-A', 'f1', filename='1.jpg', personId='p2', confidence=0.9)
+    second = _refresh('lib-A', 'v2')
+    rows = {r['personId']: r for r in second.rows}
+    assert rows['p1']['faceCount'] == 1 and rows['p1']['coverFaceId'] == 'f2'
+
+
+def test_full_rebuild_is_forced_once_the_last_full_build_is_old(people_ctx, monkeypatch):
+    person_table, face_table, blobs = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _refresh('lib-A', 'v1')
+    monkeypatch.setattr(storage_utils, '_PEOPLE_FULL_REBUILD_HOURS', 0.0)
+    built = []
+    real = storage_utils._build_user_people_index_snapshot
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *a: (built.append(1), real(*a))[1])
+    _refresh('lib-A', 'v2')
+    assert built == [1]
+
+
+def test_people_page_route_pages_filters_and_looks_up_ids(monkeypatch):
+    from routes import people as people_routes
+    rows = [{'personId': f'p{i:03d}', 'name': ('Ann %d' % i) if i < 5 else f'Unnamed {i}', 'isNamed': i < 5,
+             'faceCount': i, 'coverFaceId': f'f{i}', 'coverFilename': 'a.jpg'} for i in range(300)]
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    seen = []
+    monkeypatch.setattr(app, 'get_user_people_index', lambda uid, **kw: (seen.append(kw), {'rows': rows})[1])
+
+    def call(qs):
+        with app.app.test_request_context('/api/persons/page?' + qs):
+            return people_routes.people_page().get_json()
+
+    first = call('limit=120')
+    assert first['total'] == 300 and len(first['rows']) == 120 and first['hasMore'] and first['namedCount'] == 5
+    last = call('offset=240&limit=120')
+    assert len(last['rows']) == 60 and not last['hasMore'] and last['rows'][0]['personId'] == 'p240'
+    assert [r['personId'] for r in call('q=ann%202')['rows']] == ['p002']
+    assert [r['personId'] for r in call('ids=p007,p250')['rows']] == ['p007', 'p250']
+    assert all(kw.get('copy_rows') is False for kw in seen)        # no per-request copy of every row
+
+
+def test_get_person_with_a_blank_name_returns_the_faces_instead_of_500(monkeypatch):
+    from routes import people as people_routes
+    person_table, face_table = FakeTable(), FakeTable()
+    _seed_person(person_table, 'u', 'p1', name='', faceIds=json.dumps(['f1', 'f2']))
+    _seed_face(face_table, 'u', 'f1', filename='a.jpg', personId='p1', confidence=0.9, bbox='{}')
+    _seed_face(face_table, 'u', 'f2', filename='b.jpg', personId='p1', confidence=0.5, bbox='{}')
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'person_table_client', person_table)
+    monkeypatch.setattr(app, 'face_table_client', face_table)
+    monkeypatch.setattr(app, '_load_user_face_summary_by_id', lambda uid: {r['RowKey']: r for r in face_table.rows.values()})
+    monkeypatch.setattr(app, '_face_thumbnail_url', lambda *a, **k: '')
+    with app.app.test_request_context('/api/persons/p1?offset=0&limit=120'):
+        resp = people_routes.get_person('p1')
+    body = resp.get_json()
+    assert resp.status_code == 200 and body['name'] == 'Unnamed' and [f['faceId'] for f in body['faces']] == ['f1', 'f2']
+    assert person_table.rows[('u', 'p1')]['name'] == ''          # nothing was written back
+
+
+def test_default_incremental_refresh_never_filters_the_face_table_by_timestamp(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _refresh('lib-A', 'v1')
+    queries = []
+    original = face_table.query_entities
+    face_table.query_entities = lambda f, select=None, **kw: (queries.append(f), original(f, select=select, **kw))[1]
+    _seed_person(person_table, 'lib-A', 'p1', name='Renamed', faceIds=json.dumps(['f1']))
+    second = _refresh('lib-A', 'v2')
+    assert second.rows[0]['name'] == 'Renamed'
+    assert not any('Timestamp' in q for q in queries)       # that filter rescans the whole partition
+
+
+# --- a person's photos from the membership table --------------------------------------------------
+
+def _members_ctx(monkeypatch):
+    import person_photos
+    person_photos._CACHE.clear()
+    persons, faces, members = FakeTable(), FakeTable(), FakeTable()
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(app, 'face_table_client', faces)
+    monkeypatch.setattr(app, 'person_members_table_client', members)
+    _seed_person(persons, 'u', 'p1', name='', faceIds='[]')
+    return persons, faces, members
+
+
+def _call_photos(qs):
+    from routes import people as people_routes
+    with app.app.test_request_context('/api/persons/p1/photos?' + qs):
+        resp = people_routes.get_person_photos('p1')
+    return resp.status_code, resp.get_json()
+
+
+def test_person_photos_hydrates_legacy_member_rows_once_then_reads_only_the_membership_partition(monkeypatch):
+    persons, faces, members = _members_ctx(monkeypatch)
+    for fid, fname, conf, confirmed in (('f1', 'a.jpg', 0.4, False), ('f2', 'b.jpg', 0.9, False),
+                                        ('f3', 'c.jpg', 0.1, True), ('f4', 'b.jpg', 0.2, False)):
+        _seed_face(faces, 'u', fid, filename=fname, personId='p1', confidence=conf, confirmedByUser=confirmed)
+        members.upsert_entity({'PartitionKey': 'p1', 'RowKey': fid, 'userId': 'u'})      # legacy row: no attributes
+    status, body = _call_photos('offset=0&limit=2')
+    assert status == 200 and body['total'] == 3 and body['hasMore'] is True
+    assert body['filenames'] == ['c.jpg', 'b.jpg']                       # confirmed first, then confidence; b.jpg once
+    assert members.rows[('p1', 'f2')]['filename'] == 'b.jpg'            # written back
+    import person_photos
+    person_photos._CACHE.clear()
+    reads = []
+    original = faces.get_entity
+    faces.get_entity = lambda partition_key, row_key: (reads.append(row_key), original(partition_key, row_key))[1]
+    status, body = _call_photos('offset=2&limit=2')
+    assert body['filenames'] == ['a.jpg'] and body['hasMore'] is False
+    assert reads == []                                                  # no face reads the second time
+
+
+def test_person_photos_ignores_faces_that_moved_and_unknown_people(monkeypatch):
+    persons, faces, members = _members_ctx(monkeypatch)
+    _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='someone-else', confidence=0.9)
+    members.upsert_entity({'PartitionKey': 'p1', 'RowKey': 'f1', 'userId': 'u'})
+    assert _call_photos('limit=10')[1]['filenames'] == []
+    from routes import people as people_routes
+    with app.app.test_request_context('/api/persons/nope/photos'):
+        assert people_routes.get_person_photos('nope')[1] == 404
+
+
+def test_rebuilding_a_photos_faces_uses_the_filename_index_not_a_library_wide_face_scan(monkeypatch):
+    metadata, faces = FakeTable(), FakeTable()
+    metadata.upsert_entity({'PartitionKey': 'u', 'RowKey': 'a.jpg', 'faces': '[]', 'faceCount': 0, 'peopleIds': '[]'})
+    _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='p1', confidence=0.9, bbox='{}')
+    monkeypatch.setattr(app, 'metadata_table_client', metadata)
+    monkeypatch.setattr(app, 'face_table_client', faces)
+    monkeypatch.setattr(app, 'get_face_ids_for_filename', lambda uid, fn: ['f1'])
+    monkeypatch.setattr(app, '_load_user_face_summary_by_id',
+                        lambda uid: (_ for _ in ()).throw(AssertionError('must not scan every face')))
+    updates = []
+    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda uid, fn, fields: updates.append((fn, fields)))
+    result = app._rebuild_metadata_faces_for_filename('u', 'a.jpg', searchable_person_index={'p1': 'Ann'})
+    assert result['changed'] and result['peopleIdsAfter'] == ['p1']
+    assert updates and updates[0][0] == 'a.jpg' and json.loads(updates[0][1]['peopleIds']) == ['p1']

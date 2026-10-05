@@ -1,4 +1,5 @@
 import { getExtras } from './apiClient';
+import { perf, perfNow } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 
 /**
@@ -94,16 +95,35 @@ const normalizeRows = (raw: Record<string, unknown>[]): PersonIndexRow[] => raw
     }))
     .filter((row) => row.personId);
 
+// A plain fetch() has no default timeout -- a stalled connection hangs this
+// promise forever instead of rejecting, which (via getLocalPeopleIndex's
+// module-scoped inFlight dedup) would wedge every caller behind the same
+// permanently-pending promise for the rest of the tab session. See
+// the former browser search index's BLOB_FETCH_TIMEOUT_MS for the full writeup --
+// confirmed live 2026-09-29 for that index's blob fetch; same latent gap
+// here since the code shape is identical.
+const BLOB_FETCH_TIMEOUT_MS = 120000;
+
+const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+};
+
 const downloadPeopleIndexBlob = async (indexUrl: string): Promise<PersonIndexRow[]> => {
-    const response = await fetch(indexUrl);
+    const downloadStarted = perfNow();
+    const response = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     if (!response.ok) {
         throw new Error(`Failed to download people index (${response.status})`);
     }
     const buffer = await response.arrayBuffer();
+    perf.recordSpan('index.people.blob_download', perfNow() - downloadStarted, { bytes: buffer.byteLength });
+    const parseStarted = perfNow();
     try {
         const text = new TextDecoder().decode(buffer);
         const parsed = JSON.parse(text);
         if (parsed && Array.isArray(parsed.rows)) {
+            perf.recordSpan('index.people.parse', perfNow() - parseStarted, { rows: parsed.rows.length });
             return normalizeRows(parsed.rows);
         }
     } catch {
@@ -121,13 +141,19 @@ let cachedIndex: PersonIndexRow[] | null = null;
 let inFlight: Promise<PersonIndexRow[] | null> | null = null;
 
 const fetchLocalPeopleIndex = async (key: string): Promise<PersonIndexRow[] | null> => {
+    const totalStarted = perfNow();
+    const manifestStarted = perfNow();
     const response: PeopleIndexResponse = await getExtras('/api/persons/index');
+    perf.recordSpan('index.people.manifest', perfNow() - manifestStarted);
     if (!response?.available || !response.indexUrl) {
         return null;
     }
     const sourceVersion = response.sourceVersion || '';
+    const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
+    perf.recordSpan('index.people.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
     if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
+        perf.recordSpan('index.people.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
         return stored.rows;
     }
     const rows = await downloadPeopleIndexBlob(response.indexUrl);

@@ -7,6 +7,9 @@ index directly used to.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 import storage_utils
@@ -47,7 +50,7 @@ class _FakeBlobServiceClient:
 
 
 def _seed_row(table, user_id: str, filename: str, **overrides) -> None:
-    table.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, **overrides})
+    table.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, 'processing_complete': True, **overrides})
 
 
 @pytest.fixture
@@ -111,18 +114,19 @@ def test_listing_index_written_as_side_effect_not_separate_rebuild(ctx):
     assert [r['RowKey'] for r in listing['rows']] == ['a.jpg']
 
 
-def test_listing_index_falls_back_to_lexical_index_when_stale(ctx):
-    """If the listing blob is missing/stale but allow_refresh=True, it must
-    fall back through get_user_lexical_index (which will itself rebuild and
-    re-derive the listing blob), not just return None."""
+def test_listing_index_never_builds_the_full_lexical_snapshot_when_stale(ctx, monkeypatch):
+    """A missing/stale listing blob used to fall back through
+    get_user_lexical_index, i.e. build the whole-library snapshot -- on the 1Gi
+    backend. It must now just report "not available" (the index build writes the
+    listing blob) without touching the full lexical path."""
     metadata, _blobs = ctx
     _seed_row(metadata, 'u1', 'a.jpg', tags='["cat"]', ocrText='ignored by listing')
+    monkeypatch.setattr(storage_utils, '_build_user_lexical_index_snapshot',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('must not build the full snapshot')))
+    monkeypatch.setattr(storage_utils, 'get_user_lexical_index',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('must not load the full lexical index')))
 
-    listing = storage_utils.get_user_listing_index('u1', allow_refresh=True)
-
-    assert listing is not None
-    assert listing['rows'][0]['RowKey'] == 'a.jpg'
-    assert 'ocrText' not in listing['rows'][0]
+    assert storage_utils.get_user_listing_index('u1', allow_refresh=True) is None
 
 
 def test_listing_index_reflects_incremental_merge_updates(ctx):
@@ -132,12 +136,30 @@ def test_listing_index_reflects_incremental_merge_updates(ctx):
     _seed_row(metadata, 'u1', 'a.jpg', tags='["cat"]', rating=1)
     storage_utils.refresh_user_lexical_index('u1', source_version='v1')
 
-    metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'a.jpg', 'tags': '["cat"]', 'rating': 5})
+    metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'a.jpg', 'tags': '["cat"]', 'rating': 5, 'processing_complete': True})
     storage_utils.touch_user_search_indexes_state('u1', filenames='a.jpg')
     storage_utils.refresh_user_lexical_index('u1', source_version='v2')
 
     listing = storage_utils.get_user_listing_index('u1', allow_refresh=False)
     assert listing['rows'][0]['rating'] == 5
+
+
+def test_listing_index_allow_sync_build_false_never_blocks_on_cold_account(ctx, monkeypatch):
+    """Cold account (no listing blob): return None immediately and start NO
+    background full-snapshot rebuild either (that is a multi-GB allocation)."""
+    metadata, _blobs = ctx
+    _seed_row(metadata, 'u1', 'a.jpg', tags='["cat"]')
+    started = []
+    monkeypatch.setattr(storage_utils, '_build_user_lexical_index_snapshot',
+                        lambda user_id, source_version: started.append(user_id))
+
+    start = time.monotonic()
+    result = storage_utils.get_user_listing_index('u1', allow_refresh=True, allow_sync_build=False)
+
+    assert time.monotonic() - start < 1.0
+    assert result is None
+    time.sleep(0.05)
+    assert started == []
 
 
 def test_delete_user_lexical_index_data_also_clears_listing_blob(ctx):

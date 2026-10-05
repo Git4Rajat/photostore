@@ -168,7 +168,7 @@ class TestSweepLoop:
         monkeypatch.setattr(app, 'library_store', _FakeLibraryStore())
         monkeypatch.setattr(app, 'metadata_table_client', object())
         monkeypatch.setattr(
-            app, '_query_metadata_rows_for_user',
+            app, '_iter_metadata_rows_for_user',
             lambda library_id, select=None, purpose='metadata': rows_by_library[library_id],
         )
         monkeypatch.setattr(app, 'is_video_file', lambda filename: filename.endswith('.mov'))
@@ -199,7 +199,7 @@ class TestSweepLoop:
 
         monkeypatch.setattr(app, 'library_store', _FakeLibraryStore())
         monkeypatch.setattr(app, 'metadata_table_client', object())
-        monkeypatch.setattr(app, '_query_metadata_rows_for_user', _scan)
+        monkeypatch.setattr(app, '_iter_metadata_rows_for_user', _scan)
         monkeypatch.setattr(app, 'is_video_file', lambda filename: False)
         queued_calls = []
         monkeypatch.setattr(

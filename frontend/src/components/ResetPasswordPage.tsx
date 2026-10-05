@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import * as passwordAuth from '../services/passwordAuthClient';
-import { LogoLockup } from './shared/Logo';
+import AuthShell from './shared/AuthShell';
 
 // Public page reached from the "reset your password" link in a recovery email:
 //   /reset-password?token=<token>
@@ -40,10 +40,7 @@ const ResetPasswordPage: React.FC = () => {
     };
 
     return (
-        <section className="auth-page card-glass">
-            <LogoLockup size={46} className="auth-logo" />
-            <p className="additional-kicker">RESET</p>
-            <h2 className="auth-page-title">Choose a new password</h2>
+        <AuthShell kicker="RESET" title="Choose a new password">
             {!token ? (
                 <p className="status error">This link is missing its reset token. Request a new reset email from the login page.</p>
             ) : done ? (
@@ -80,7 +77,7 @@ const ResetPasswordPage: React.FC = () => {
                     <button type="button" className="btn btn-link auth-page-link" onClick={goToSignIn}>Back to sign in</button>
                 </form>
             )}
-        </section>
+        </AuthShell>
     );
 };
 

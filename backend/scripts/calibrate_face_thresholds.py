@@ -108,6 +108,9 @@ def main():
     ap.add_argument("--account", default=os.getenv("STORAGE_ACCOUNT_NAME", ""), help="storage account name")
     ap.add_argument("--table", default=os.getenv("FACE_TABLE", "photofaces"))
     ap.add_argument("--version", default="", help="restrict to one embeddingVersion (default: the dominant one)")
+    ap.add_argument("--alignment-tier", default="", help="restrict to one alignmentMethod value (e.g. landmark-2pt-mp) -- "
+                                                          "required to calibrate a tier separately rather than mixing it "
+                                                          "with whatever else shares its embeddingVersion")
     ap.add_argument("--suspicious", type=float, default=float(os.getenv("SUSPICIOUS_FACE_CONFIDENCE", "0.60")))
     ap.add_argument("--top", type=int, default=30, help="how many top cross-photo pairs to print")
     ap.add_argument("--eps", type=float, default=0.03, help="current DBSCAN eps to compare against")
@@ -124,7 +127,8 @@ def main():
 
     pk = args.user_id.replace("'", "''")
     select = ["RowKey", "embedding", "embeddingVersion", "modelTaxonomyVersion",
-              "filename", "confidence", "rejected", "reviewStatus", "confirmedByUser", "personId"]
+              "filename", "confidence", "rejected", "reviewStatus", "confirmedByUser", "personId",
+              "alignmentMethod"]
     rows = list(table.query_entities(f"PartitionKey eq '{pk}'", select=select))
     print(f"Fetched {len(rows)} face rows for user '{args.user_id}' from {args.account}/{args.table}\n")
     if not rows:
@@ -141,6 +145,8 @@ def main():
     kept = []
     for r in rows:
         if not _is_clusterable(r, args.suspicious):
+            continue
+        if args.alignment_tier and str(r.get("alignmentMethod") or "") != args.alignment_tier:
             continue
         emb = _embedding(r)
         if not emb:

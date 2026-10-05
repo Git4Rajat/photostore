@@ -1,5 +1,7 @@
+import { reportIndexBuilding } from '../services/indexBuilding';
+import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { get, getUpload, post, postUpload, resolveApiUrl } from '../services/apiClient';
+import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
@@ -264,6 +266,7 @@ interface AppServicesContextValue {
     clusteringStatusLabel: string;
     ipworkActive: boolean;
     ipworkStatusLabel: string;
+    libraryIndexReady: boolean | null;
 }
 
 export type BrowserProcessingAction = 'preview' | 'thumbnails' | 'exif' | 'ocr' | 'vision' | 'map' | 'faces';
@@ -307,7 +310,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Caps how many submitted jobs run at once (at most `concurrency`), and lets
 // a caller check slot availability BEFORE committing to run something -- see
-// uploadDispatchGateRef (shared by init/finalize/client-processing). `run`
+// uploadDispatchGateRef (shared by finalize/client-processing/processing-
+// claim) and uploadInitGateRef (init-batch's own, separate instance). `run`
 // always eventually runs its job (queueing if busy); `onNextFreeSlot`
 // registers a callback that fires once, the next time a slot frees up (used
 // to defer a soft/adaptive flush instead of queueing it early) -- safe for
@@ -317,9 +321,10 @@ const createDispatchGate = (concurrency: number) => {
     const queue: Array<() => Promise<void>> = [];
     let active = 0;
     // A list, not a single slot: this gate can be shared across several
-    // independent callers (init/finalize/client-processing batches all
-    // share one gate -- see uploadDispatchGateRef below), and each can be
-    // waiting for a free slot at the same time. A single `waiter` variable
+    // independent callers (finalize/client-processing/processing-claim
+    // batches all share one gate -- see uploadDispatchGateRef below), and
+    // each can be waiting for a free slot at the same time. A single
+    // `waiter` variable
     // would let the second registration silently clobber the first,
     // leaving that caller's batch waiting forever for a callback that will
     // never fire.
@@ -367,20 +372,20 @@ const TARGET_CONCURRENT_UPLOAD_BLOCKS = 6;
 // than this, so the cap only ever lowers the large desktop sizes.
 const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
 
-// How many concurrent init-batch/finalize-batch/client-processing calls the
-// shared uploadDispatchGateRef allows AT ONCE, TOTAL, ACROSS ALL THREE.
-// History: was capacity 2 (d8583a5, 2026-08-28), then briefly uncapped
-// entirely -- both extremes measured badly on photostore-test's real backend
-// (GUNICORN_WORKERS=1, GUNICORN_THREADS=4 per replica): capacity 2 topped out
-// around 250-330/hr, while fully uncapped drove genuine 503/504s and
-// 100-240s stalls even on that same known-stable backend config, because
-// finalize_uploaded_file does real per-file Table Storage round-trips (not
-// parallelizable across a single partition/GIL the way pure I/O wait is) and
-// an unbounded frontend can throw far more concurrent load at that than the
-// backend's per-replica thread pool can absorb. 8 matches the backend's own
-// KEDA http-scaler concurrentRequests threshold (deploy/resources.bicep) --
-// enough concurrent load to reliably trigger scale-out without overwhelming
-// a single replica before it does.
+// How many concurrent finalize-batch/client-processing/processing-claim
+// calls the shared uploadDispatchGateRef allows AT ONCE, TOTAL, ACROSS ALL
+// THREE. History: was capacity 2 (d8583a5, 2026-08-28), then briefly
+// uncapped entirely -- both extremes measured badly on photostore-test's
+// real backend (GUNICORN_WORKERS=1, GUNICORN_THREADS=4 per replica):
+// capacity 2 topped out around 250-330/hr, while fully uncapped drove
+// genuine 503/504s and 100-240s stalls even on that same known-stable
+// backend config, because finalize_uploaded_file does real per-file Table
+// Storage round-trips (not parallelizable across a single partition/GIL the
+// way pure I/O wait is) and an unbounded frontend can throw far more
+// concurrent load at that than the backend's per-replica thread pool can
+// absorb. 8 matches the backend's own KEDA http-scaler concurrentRequests
+// threshold (deploy/resources.bicep) -- enough concurrent load to reliably
+// trigger scale-out without overwhelming a single replica before it does.
 //
 // 2026-08-29: init/finalize/client-processing used to each get their OWN
 // gate at this same capacity -- up to 3x8=24 concurrent requests when all
@@ -402,7 +407,34 @@ const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
 // GUNICORN_THREADS=4) and the backend's threshold lowered to 4 (see
 // resources.bicep) so real sustained demand now clearly exceeds the
 // scale-out threshold instead of sitting flush with it.
-const UPLOAD_DISPATCH_CONCURRENCY = 20;
+//
+// 2026-09-30: init-batch pulled back OUT of this shared gate into its own
+// uploadInitGateRef (below) -- see that ref's comment for why. Lowered from
+// 20 to 14 so the combined ceiling this whole comment history reasoned about
+// (init + finalize + client-processing, all sharing backend capacity) stays
+// unchanged at 20 (14 here + 6 in uploadInitGateRef), not silently raised.
+const UPLOAD_DISPATCH_CONCURRENCY = 14;
+
+// init-batch's dedicated gate. A live HAR on microsvcpoc-dev caught the
+// failure mode the pre-2026-08-29 separate-gate design (see
+// UPLOAD_DISPATCH_CONCURRENCY's history above) was guarding against:
+// finalize-batch calls are slow (1-3s, dominated by real Table Storage
+// writes) but don't block a lane -- a lane that's already PUT its bytes can
+// move on the instant finalize is fired off, win or lose. init-batch calls
+// are fast (measured 50-110ms) but DO block a lane -- no blob URL, no PUT.
+// Sharing one gate meant a burst of finalize-batch calls filling every slot
+// could leave zero slots for the init-batch call a about-to-start lane
+// actually needed, stalling new blob PUTs for the full 1-3s finalize
+// duration even though the real bottleneck (Table Storage) had nothing to
+// do with starting a new transfer. The HAR showed this directly: PUTs
+// arriving in bursts of exactly ~20 with ~2-3s of total silence between
+// bursts, lining up with measured finalize-batch latency, on a connection
+// independently confirmed fast (283Mbps) via speedtest. Capacity 6 matches
+// TARGET_CONCURRENT_UPLOAD_BLOCKS -- no more than 6 lanes can usefully be
+// blob-transferring at once anyway (HTTP/1.1 6-connections-per-origin cap),
+// so init-batch never needs more than 6 concurrent backend calls to keep
+// every real transfer slot fed.
+const UPLOAD_INIT_DISPATCH_CONCURRENCY = 6;
 
 // Shared IndexedDB-access concurrency for the upload resume cache (writing it
 // in cacheUploadFilesForResume/attachSelectedFilesToPendingSession, and
@@ -865,6 +897,53 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // cold (uncached) download+warm-up has gotten so the UI can show real progress
     // instead of an indeterminate spinner for up to ~90s.
     const [browserAiLoadProgress, setBrowserAiLoadProgress] = useState<BrowserAiLoadStage | null>(null);
+    // True once the one-time "has this account's derived index ever been
+    // built" check is back; starts null ("not checked yet") -- NOT true --
+    // so Shell holds off mounting Gallery/Explore/People/Albums (StoreProvider's
+    // own mount effects fire unconditionally) until that single round trip
+    // resolves. Defaulting to true would let everything mount immediately on
+    // every load, firing each page's own data call before this ever resolves
+    // -- the concurrent cold-start pile-up this gate exists to prevent (same
+    // shape as the existing !authReady gate above). It is deliberately NOT a
+    // "wait for the index build to finish" gate -- see the effect below.
+    const [libraryIndexReady, setLibraryIndexReady] = useState<boolean | null>(null);
+
+    // Fires once per session (this provider only mounts once signed in): asks
+    // BACKEND whether this account's derived index files already exist (GET
+    // /api/photos/index-status -- a cheap manifest read, no table scan), then
+    // immediately unblocks the app either way. A cold/dirty account also
+    // kicks the TOOLS role to (re)build its indexes (POST /api/tools/indexes/
+    // build), but strictly fire-and-forget: the frontend never awaits it, polls
+    // its progress, or blocks the UI on its outcome. Index building is a
+    // backend-owned background job -- each page's own data route already has
+    // its own cold/dirty-index fallback (/photos/timeline, /explore, etc.), so
+    // there is nothing for the UI to gate on beyond this one existence check.
+    useEffect(() => {
+        if (!isLikelyAuthenticated()) {
+            return;
+        }
+        let cancelled = false;
+        void (async () => {
+            const status = await get<{ ready?: boolean; building?: boolean }>('/api/photos/index-status').catch(() => null);
+            if (cancelled) return;
+            setLibraryIndexReady(true);
+            if (status && (!status.ready || status.building)) {
+                reportIndexBuilding('session', true);
+            }
+            if (status && !status.ready) {
+                void postTools('/api/tools/indexes/build', {}).catch(() => null);
+            } else if (status?.ready) {
+                // Prebuilt indexes exist: start both downloads now, in parallel,
+                // so they are warm (and in IndexedDB) before the gallery or
+                // search ask for them. Fire-and-forget -- each loader already
+                // dedupes in-flight work and swallows its own failures.
+                void preloadLocalIndexes();
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []);
 
     const warmEndpoint = useCallback(async (
         runner: () => Promise<any>,
@@ -1022,48 +1101,39 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }>>([]);
     const batchFinalizeDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const batchFinalizeMaxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    // Caps how many /upload/init-batch (resp. /upload/finalize-batch) network
-    // calls can be in flight against the backend at once -- independent of
-    // blob-transfer lane count (which can legitimately run ~20 wide since
-    // those PUTs bypass the backend entirely). A live HAR caught up to 16
-    // concurrent init-batch and 20 concurrent finalize-batch requests hitting
-    // the backend at once (one per lane), each queueing behind gunicorn
-    // thread/GIL contention for 80-240s. Separate gates (not one shared one)
-    // so a burst of finalize jobs, which don't block a lane, can never queue
-    // ahead of an init job, which does.
-    //
-    // flushInitBatch/flushFinalizeBatch use these for more than a plain
-    // concurrency cap, though: when both slots are busy, they leave the
-    // pending batch OPEN (see the `force` parameter) instead of queueing a
-    // same-moment snapshot behind the busy slots. New arrivals keep piling
-    // into that still-open batch until a slot actually frees up, at which
-    // point whatever accumulated gets sent as ONE call. Without this, a
-    // second live HAR -- taken AFTER the concurrency cap alone was live --
-    // still showed batches stuck at ~1 file/call: the old fixed debounce/
-    // max-wait timers fired and snapshotted on their own clock regardless of
-    // whether a slot was free, so under backend congestion they mostly just
-    // queued a stream of singleton batches one slot-turn behind each other,
-    // never actually letting arrivals coalesce. Gating snapshot timing on
-    // slot availability (not just gating the dispatch) is what turns backend
+    // flushInitBatch/flushFinalizeBatch use their gate for more than a plain
+    // concurrency cap: when no slot is free, they leave the pending batch
+    // OPEN (see the `force` parameter) instead of queueing a same-moment
+    // snapshot behind the busy slots. New arrivals keep piling into that
+    // still-open batch until a slot actually frees up, at which point
+    // whatever accumulated gets sent as ONE call. Without this, a live HAR
+    // -- taken AFTER a concurrency cap alone was live -- still showed
+    // batches stuck at ~1 file/call: the old fixed debounce/max-wait timers
+    // fired and snapshotted on their own clock regardless of whether a slot
+    // was free, so under backend congestion they mostly just queued a
+    // stream of singleton batches one slot-turn behind each other, never
+    // actually letting arrivals coalesce. Gating snapshot timing on slot
+    // availability (not just gating the dispatch) is what turns backend
     // slowness into fewer, bigger batches instead of many small queued ones.
-    // ONE shared gate for init-batch, finalize-batch, AND client-processing --
-    // not three separate ones. They used to each get their own
-    // createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY) instance, which meant
-    // up to 3x UPLOAD_DISPATCH_CONCURRENCY (24) concurrent requests in
-    // flight at once when all three phases overlap during a sustained
-    // upload (a real, common pattern: some lanes finalizing while others
-    // are still initializing while late client-processing reports trickle
-    // in). UPLOAD_DISPATCH_CONCURRENCY was tuned (see below) to match the
-    // backend's own KEDA scale-out trigger for ONE stream of load -- three
-    // independent gates each hitting that number silently tripled the
-    // real ceiling this was meant to enforce, which a live HAR capture
-    // confirmed: sustained ~100% CPU across all 5 (max) replicas for 10+
-    // minutes, with per-request latency (16-150s) showing zero correlation
-    // to how much work any individual request actually had to do --
-    // the signature of contention, not expensive work. Sharing one gate
-    // caps total concurrent upload-related load at UPLOAD_DISPATCH_CONCURRENCY
-    // regardless of which phase(s) are contributing it.
+    //
+    // finalize-batch, client-processing, and processing-claim/heartbeat
+    // share ONE gate (uploadDispatchGateRef) -- not three separate ones.
+    // They used to each get their own createDispatchGate(N) instance, which
+    // meant up to 3xN concurrent requests in flight at once when all three
+    // phases overlap during a sustained upload (a real, common pattern). A
+    // live HAR capture confirmed the cost: sustained ~100% CPU across all 5
+    // (max) replicas for 10+ minutes, with per-request latency (16-150s)
+    // showing zero correlation to how much work any individual request
+    // actually had to do -- the signature of contention, not expensive
+    // work. Sharing one gate caps their combined load at
+    // UPLOAD_DISPATCH_CONCURRENCY regardless of which phase(s) contribute.
     const uploadDispatchGateRef = useRef(createDispatchGate(UPLOAD_DISPATCH_CONCURRENCY));
+    // init-batch does NOT share the gate above -- see
+    // UPLOAD_INIT_DISPATCH_CONCURRENCY's comment for why: unlike finalize/
+    // client-processing, an init-batch call blocks a lane from starting its
+    // blob PUT, so it can never be safe to let it queue behind a burst of
+    // slow-but-non-blocking finalize-batch calls filling every shared slot.
+    const uploadInitGateRef = useRef(createDispatchGate(UPLOAD_INIT_DISPATCH_CONCURRENCY));
     // Files picked (e.g. from a second folder) while a batch is already
     // uploading. Drained one batch at a time by the effect below once the
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
@@ -1837,7 +1907,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (pendingBatchInitRef.current.length === 0) {
             return;
         }
-        const gate = uploadDispatchGateRef.current;
+        const gate = uploadInitGateRef.current;
         if (!force && !gate.hasFreeSlot()) {
             // Gate is full -- don't snapshot yet. Leave pendingBatchInitRef
             // open so new arrivals keep piling into it, and retry (forced)
@@ -3444,8 +3514,25 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // budget grows -- draining by index (re-checking .length each
             // iteration) picks those up too, unlike a Promise.all snapshot
             // taken at call time.
+            //
+            // Each await is individually try/caught (rather than letting a
+            // rejection break out of the loop) because a Stop rejects every
+            // lane's worker() at once -- breaking out on the first one would
+            // leave the rest of workerPromises un-awaited, and their later
+            // rejections would surface as uncaught "upload_stopped_by_user"
+            // errors instead of being handled below.
+            let firstWorkerError: unknown;
             for (let i = 0; i < workerPromises.length; i += 1) {
-                await workerPromises[i];
+                try {
+                    await workerPromises[i];
+                } catch (err) {
+                    if (firstWorkerError === undefined) {
+                        firstWorkerError = err;
+                    }
+                }
+            }
+            if (firstWorkerError !== undefined) {
+                throw firstWorkerError;
             }
 
             // Every lane has finished transferring bytes (whether by running out
@@ -4565,6 +4652,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clusteringStatusLabel,
         ipworkActive,
         ipworkStatusLabel,
+        libraryIndexReady,
     }), [
         notifications,
         unreadCount,
@@ -4598,6 +4686,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clusteringStatusLabel,
         ipworkActive,
         ipworkStatusLabel,
+        libraryIndexReady,
     ]);
 
     return (

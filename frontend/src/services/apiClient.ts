@@ -1,6 +1,7 @@
 import { getRuntimeConfig } from '../config/appConfig';
 import { createHttpClient, requestJson } from './httpClient';
 import { configureBackendStatus } from './backendStatus';
+import { perf } from './perf';
 const runtimeConfig = getRuntimeConfig();
 const env = import.meta.env as Record<string, string | undefined>;
 const apiUrl =
@@ -132,6 +133,10 @@ try {
 } catch (e) {
     // ignore
 }
+
+// Instrumentation reports go to the main API origin; registered here (not imported by perf.ts)
+// because the HTTP client already imports perf.
+perf.setSender((body) => requestJson(apiClient, 'post', '/api/perf/client', body, { singleAttempt: true, timeout: 15000 }));
 
 export const get = async <T = any>(url: string, config?: Parameters<typeof apiClient.get>[1]) => requestJson<T>(apiClient, 'get', url, undefined, config);
 export const getUpload = async <T = any>(url: string, config?: Parameters<typeof uploadClient.get>[1]) => requestJson<T>(uploadClient, 'get', url, undefined, config);

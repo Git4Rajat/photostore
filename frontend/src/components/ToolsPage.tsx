@@ -23,6 +23,7 @@ import {
 import { get, post, getTools, postTools, getUpload, getAdmin, postAdmin, getExtras } from '../services/apiClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import { requestJobPoll } from '../services/jobNotifications';
+import { queuePhotoBackfill } from '../services/photoBackfill';
 import { plural } from '../utils/format';
 import { confirmDialog } from './shared/dialogs';
 import { useAppServices, browserProcessingActionSteps, BROWSER_AI_GATED_STEPS } from './AppServicesProvider';
@@ -861,6 +862,24 @@ const ToolsPage: React.FC = () => {
         return Array.from(steps);
     };
 
+    const startBackfillProcessing = async (mode: string): Promise<string> => {
+        if (mode === 'backend') return ' Backend processing will continue without this tab.';
+        try {
+            if (browserAiModelState.status !== 'available') {
+                const state = await loadBrowserAiModel();
+                if (state.status !== 'available') {
+                    return ` Photos remain queued, but browser AI is unavailable: ${state.detail || state.reason || state.status}.${mode === 'both' ? ' Backend processing remains scheduled.' : ''}`;
+                }
+            }
+            void startBrowserProcessing().catch((err: unknown) => {
+                setMessage(`Photos remain queued. Browser processing failed to start: ${String(err)}`);
+            });
+            return ' Processing will start in the background.';
+        } catch (err) {
+            return ` Photos remain queued. Browser processing failed to start: ${String(err)}.${mode === 'both' ? ' Backend processing remains scheduled.' : ''}`;
+        }
+    };
+
     // Queues one or more steps for every non-deleted, non-video photo in the
     // account (server-side, not limited to whatever page of `photos` happens to
     // be loaded in this tab) and then kicks off the browser's background
@@ -869,7 +888,7 @@ const ToolsPage: React.FC = () => {
         const label = describeStepActions(actions);
         if (!(await confirmDialog({
             title: 'Run on entire library',
-            message: `Re-run ${label} on every photo in your library, including ones already processed? The browser will work through them in the background. This can take a while for large libraries.`,
+            message: `Re-run ${label} on every photo in your library, including ones already processed? Keep this tab open until queueing finishes. Processing uses your configured browser or backend pipeline. This can take a while for large libraries.`,
             confirmLabel: 'Run on all photos',
             danger: false,
         }))) {
@@ -879,22 +898,13 @@ const ToolsPage: React.FC = () => {
         setMessage(`Queueing ${label} for the entire library…`);
         try {
             const steps = combinedStepsForActions(actions);
-            const response = await postAdmin('/api/admin/backfill/photos', {
-                repair: true,
-                confirm: 'BACKFILL_ALL_PHOTOS',
-                steps,
+            const response = await queuePhotoBackfill(steps, (progress) => {
+                setMessage(`Queueing ${label}: ${progress.queued} photos queued, ${progress.skipped} skipped, ${progress.failed} failed… Keep this tab open until queueing finishes.`);
             });
-            const queued = Number(response?.queued ?? 0);
-            const skipped = Number(response?.skipped ?? 0);
-            setMessage(`${label} queued for ${plural(queued, 'photo')}${skipped > 0 ? `, ${skipped} skipped (videos / deleted)` : ''}. Processing will start in the background.`);
+            const { queued, skipped, failed } = response;
+            const startupNote = queued > 0 ? await startBackfillProcessing(response.processingMode || getRuntimeConfig().processingMode || 'browser') : '';
+            setMessage(`${label} queued for ${plural(queued, 'photo')}${skipped > 0 ? `, ${skipped} skipped (videos / deleted)` : ''}${failed > 0 ? `, ${failed} failed to queue — retry those photos from Processing steps` : ''}.${startupNote}`);
             await loadQueueStatus();
-            // Same reasoning as runBackfillPhotos(): without this, a freshly opened
-            // Tools tab would queue the work server-side but never actually start
-            // processing it.
-            if (browserAiModelState.status !== 'available') {
-                await loadBrowserAiModel();
-            }
-            void startBrowserProcessing();
             void postTools('/api/tools/workbench/actions', {
                 action: label,
                 steps,
@@ -1029,7 +1039,7 @@ const ToolsPage: React.FC = () => {
         const tick = async () => {
             attempts += 1;
             try {
-                const response = await get('/api/jobs/status') as { jobs?: Array<Record<string, unknown>> };
+                const response = await getTools('/api/jobs/status') as { jobs?: Array<Record<string, unknown>> };
                 const job = (response?.jobs || []).find((j) => j.jobId === jobId);
                 if (job && (job.status === 'done' || job.status === 'failed')) {
                     const snapshotId = String(job.snapshotId || '');
@@ -1256,7 +1266,7 @@ const ToolsPage: React.FC = () => {
     const runBackfillPhotos = async () => {
         if (!(await confirmDialog({
             title: 'Backfill all photos',
-            message: 'Re-process every photo in your library from scratch? This resets thumbnails, EXIF, OCR, AI vision, map tagging, and face detection for all photos and re-runs them through the full pipeline — the same as a fresh upload. The browser will work through them in the background. This can take a while for large libraries.',
+            message: 'Re-process every photo in your library? This re-queues previews, thumbnails, EXIF, OCR, AI vision, map tagging, and face detection. Keep this tab open until queueing finishes. Processing uses your configured browser or backend pipeline. This can take a while for large libraries.',
             confirmLabel: 'Start backfill',
             danger: false,
         }))) {
@@ -1265,22 +1275,13 @@ const ToolsPage: React.FC = () => {
         setRunning('backfillPhotos');
         setMessage('Queueing all photos for backfill…');
         try {
-            const response = await postAdmin('/api/admin/backfill/photos', {
-                repair: true,
-                confirm: 'BACKFILL_ALL_PHOTOS',
+            const response = await queuePhotoBackfill(undefined, (progress) => {
+                setMessage(`Queueing backfill: ${progress.queued} photos queued, ${progress.skipped} skipped, ${progress.failed} failed… Keep this tab open until queueing finishes.`);
             });
-            const queued = Number(response?.queued ?? 0);
-            const skipped = Number(response?.skipped ?? 0);
-            setMessage(`Backfill queued: ${plural(queued, 'photo')} queued${skipped > 0 ? `, ${skipped} skipped (videos / deleted)` : ''}. Processing will start in the background.`);
+            const { queued, skipped, failed } = response;
+            const startupNote = queued > 0 ? await startBackfillProcessing(response.processingMode || getRuntimeConfig().processingMode || 'browser') : '';
+            setMessage(`Backfill queued: ${plural(queued, 'photo')} queued${skipped > 0 ? `, ${skipped} skipped (videos / deleted)` : ''}${failed > 0 ? `, ${failed} failed to queue — retry those photos from Processing steps` : ''}.${startupNote}`);
             await loadQueueStatus();
-            // startBrowserProcessing()'s automatic-pull path no-ops until browser AI is
-            // loaded (see AppServicesProvider) -- without this, a freshly opened Tools
-            // tab would queue the backfill server-side but never actually start
-            // processing (not even AI-independent steps like thumbnails/EXIF).
-            if (browserAiModelState.status !== 'available') {
-                await loadBrowserAiModel();
-            }
-            void startBrowserProcessing();
         } catch (err) {
             setMessage(`Backfill failed: ${String(err)}`);
         } finally {

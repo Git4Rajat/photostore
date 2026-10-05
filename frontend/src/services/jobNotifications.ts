@@ -3,7 +3,11 @@
 // the worker and record their lifecycle in the backend `jobs` table. This
 // module lets the app poll `/api/jobs/status` and surface completions in the
 // notification bell + a toast. See AppServicesProvider for the poll loop.
-import { get } from './apiClient';
+// /api/jobs/status is served by the tools role (routes/tools.py), not
+// backend -- moved 2026-10-01 so this continuous, indefinite poll stops
+// competing with interactive gallery traffic for backend's thin
+// GUNICORN_WORKERS=2/THREADS=2 pool. See routes/system.py's comment there.
+import { getTools } from './apiClient';
 import { isAuthEnabled, getActiveAccount } from './authClient';
 import { hasValidSession } from './passwordAuthClient';
 
@@ -77,7 +81,7 @@ export const ipworkActivityLabel = (jobs: JobStatusRecord[]): string => {
 export const JOB_NOTIFY_WINDOW_MS = 15 * 60 * 1000;
 
 export const fetchJobStatuses = async (): Promise<JobStatusRecord[]> => {
-    const response = await get<{ jobs?: JobStatusRecord[] }>('/api/jobs/status');
+    const response = await getTools<{ jobs?: JobStatusRecord[] }>('/api/jobs/status');
     const jobs = response?.jobs;
     return Array.isArray(jobs) ? jobs : [];
 };

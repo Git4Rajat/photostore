@@ -1,4 +1,5 @@
 import { get } from './apiClient';
+import { perf, perfNow } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 
 /**
@@ -17,7 +18,8 @@ export interface AlbumIndexRow {
     photoCount: number;
     coverFilename: string;
     updatedAt: string;
-    filenames: string[];
+    /** Not carried by the index any more (albums open from the server); present only in old cached copies. */
+    filenames?: string[];
     isPublic: boolean;
     publicUrl: string;
     publicExpiresAt: string;
@@ -97,16 +99,35 @@ const normalizeRows = (raw: Record<string, unknown>[]): AlbumIndexRow[] => raw
     }))
     .filter((row) => row.albumId);
 
+// A plain fetch() has no default timeout -- a stalled connection hangs this
+// promise forever instead of rejecting, which (via getLocalAlbumsIndex's
+// module-scoped inFlight dedup) would wedge every caller behind the same
+// permanently-pending promise for the rest of the tab session. See
+// the former browser search index's BLOB_FETCH_TIMEOUT_MS for the full writeup --
+// confirmed live 2026-09-29 for that index's blob fetch; same latent gap
+// here since the code shape is identical.
+const BLOB_FETCH_TIMEOUT_MS = 120000;
+
+const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+};
+
 const downloadAlbumsIndexBlob = async (indexUrl: string): Promise<AlbumIndexRow[]> => {
-    const response = await fetch(indexUrl);
+    const downloadStarted = perfNow();
+    const response = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     if (!response.ok) {
         throw new Error(`Failed to download albums index (${response.status})`);
     }
     const buffer = await response.arrayBuffer();
+    perf.recordSpan('index.albums.blob_download', perfNow() - downloadStarted, { bytes: buffer.byteLength });
+    const parseStarted = perfNow();
     try {
         const text = new TextDecoder().decode(buffer);
         const parsed = JSON.parse(text);
         if (parsed && Array.isArray(parsed.rows)) {
+            perf.recordSpan('index.albums.parse', perfNow() - parseStarted, { rows: parsed.rows.length });
             return normalizeRows(parsed.rows);
         }
     } catch {
@@ -124,13 +145,19 @@ let cachedIndex: AlbumIndexRow[] | null = null;
 let inFlight: Promise<AlbumIndexRow[] | null> | null = null;
 
 const fetchLocalAlbumsIndex = async (key: string): Promise<AlbumIndexRow[] | null> => {
+    const totalStarted = perfNow();
+    const manifestStarted = perfNow();
     const response: AlbumsIndexResponse = await get('/api/albums/index');
+    perf.recordSpan('index.albums.manifest', perfNow() - manifestStarted);
     if (!response?.available || !response.indexUrl) {
         return null;
     }
     const sourceVersion = response.sourceVersion || '';
+    const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
+    perf.recordSpan('index.albums.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
     if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
+        perf.recordSpan('index.albums.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
         return stored.rows;
     }
     const rows = await downloadAlbumsIndexBlob(response.indexUrl);

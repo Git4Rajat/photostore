@@ -1,6 +1,5 @@
 import React from 'react';
-import { CheckCircleIcon, HeartIcon } from '@heroicons/react/24/solid';
-import { StarIcon } from '@heroicons/react/24/solid';
+import { CircleCheck as CheckCircleIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { usePhotoThumbnails } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
@@ -9,13 +8,15 @@ import type { Photo } from '../types';
 // The served thumbnail bakes in only the client's auto-orientation
 // (thumbnailRotation); the user's manual rotate action lives in `rotation` and
 // is applied on top as a CSS transform -- mirrors PhotoTile's remainingRotation
-// so the grid tile matches what the viewer shows. The 0.74 down-scale on
-// quarter-turns keeps a rotated landscape thumbnail from overflowing its square.
+// so the grid tile matches what the viewer shows. No down-scale is needed: the
+// img is already forced to a square via object-fit: cover (see .pt-tile-img),
+// so a 90/270 rotation keeps the same square footprint and can't overflow —
+// scaling it down just left the tile looking unfilled after a manual rotate.
 const normRot = (value?: number) => { const r = Number(value || 0) % 360; return r < 0 ? r + 360 : r; };
 const tileRotationStyle = (photo: Photo): React.CSSProperties | undefined => {
     const remaining = normRot(normRot(photo.rotation) - normRot(photo.thumbnailRotation));
     if (!remaining) return undefined;
-    return { transform: `rotate(${remaining}deg) scale(${remaining % 180 === 0 ? 1 : 0.74})` };
+    return { transform: `rotate(${remaining}deg)` };
 };
 
 /**
@@ -24,7 +25,7 @@ const tileRotationStyle = (photo: Photo): React.CSSProperties | undefined => {
  * state show as small overlays.
  */
 export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean }> = ({ photos, emptyHint, extendable }) => {
-    const { selection, toggleSelect, selectMany, openViewer } = useStore();
+    const { selection, toggleSelect, selectMany, openViewer, selectMode, setSelectMode } = useStore();
     const thumbs = usePhotoThumbnails(photos);
     const [lastSelected, setLastSelected] = React.useState<number | null>(null);
     // Drag origin is a ref, not state: mouseenter fires as the pointer moves and
@@ -95,6 +96,9 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
     };
 
     const handleMouseDown = (i: number) => {
+        // Mouse sweep-select only inside select mode, so an ordinary click never
+        // begins a selection.
+        if (!selectMode) return;
         dragStartRef.current = i;
         draggedRef.current = false;
         preDragSelectionRef.current = selection;
@@ -120,7 +124,7 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
 
     return (
         <div
-            className="pt-grid"
+            className={`pt-grid${selectMode ? ' select-mode' : ''}`}
             ref={gridRef}
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
@@ -143,12 +147,20 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                                 draggedRef.current = false;
                                 return;
                             }
+                            // In select mode a tap toggles selection instead of
+                            // opening the viewer (iOS Photos behaviour).
+                            if (selectMode) {
+                                toggleSelect(ids[i]);
+                                setLastSelected(i);
+                                return;
+                            }
                             openViewer(ids, i, { extendable });
                         }}
                         onKeyDown={(e) => {
                             if (e.key === 'Enter' || e.key === ' ') {
                                 e.preventDefault();
-                                openViewer(ids, i, { extendable });
+                                if (selectMode) { toggleSelect(ids[i]); setLastSelected(i); }
+                                else openViewer(ids, i, { extendable });
                             }
                         }}
                         onMouseDown={() => handleMouseDown(i)}
@@ -156,8 +168,12 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                         onTouchStart={() => {
                             longPressedRef.current = false;
                             clearLongPress();
+                            // Long-press enters select mode (if not already) and
+                            // selects this tile -- a deliberate hold, so scrolling
+                            // (which cancels the timer via onTouchMove) can't trip it.
                             longPressTimer.current = window.setTimeout(() => {
                                 longPressedRef.current = true;
+                                if (!selectMode) setSelectMode(true);
                                 toggleSelect(ids[i]);
                                 setLastSelected(i);
                             }, 400);
@@ -191,10 +207,10 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                             <CheckCircleIcon />
                         </button>
                         <span className="pt-tile-badges" aria-hidden="true">
-                            {photo.liked && <HeartIcon className="liked" />}
+                            {photo.liked && <HeartIcon className="liked" fill="currentColor" />}
                             {photo.rating > 0 && (
                                 <span className="rating">
-                                    <StarIcon /> {photo.rating}
+                                    <StarIcon fill="currentColor" /> {photo.rating}
                                 </span>
                             )}
                         </span>

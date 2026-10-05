@@ -66,8 +66,31 @@ def test_backend_role_does_not_serve_extras_routes():
 
 def test_tools_role_serves_only_tools_routes():
     paths = _rule_paths_for_role('tools')
-    non_static = {p for p in paths if not p.startswith('/static')}
-    assert non_static == {'/api/tools/workbench/actions', '/api/tools/workbench/actions/<action_id>'}
+    non_static = {p for p in paths if not p.startswith('/static') and p != '/health'}   # /health is on every role (warm-up probe)
+    assert non_static == {
+        '/api/tools/workbench/actions',
+        '/api/tools/workbench/actions/<action_id>',
+        # The derived-index builder moved here from backend (2026-09-30): tools
+        # is the 2vCPU/4Gi role that can safely scan a full metadata partition.
+        '/api/tools/indexes/build',
+        '/api/tools/indexes/status',
+        # jobs_status moved here from backend (2026-10-01): polled
+        # continuously by every session, indefinitely -- competed with
+        # interactive gallery traffic for backend's thin GUNICORN_WORKERS=2/
+        # THREADS=2 pool. See routes/tools.py's comment on jobs_status.
+        '/api/jobs/status',
+        '/jobs/status',
+    }
+
+
+def test_backend_role_does_not_serve_jobs_status():
+    """jobs_status moved to tools (2026-10-01) -- see the tools-role test
+    above. Backend must not keep serving it too, or the move wouldn't
+    actually relieve backend's thread pool of this continuous poll."""
+    paths = _rule_paths_for_role(None)
+    assert '/api/jobs/status' not in paths
+    assert '/jobs/status' not in paths
+    assert '/health' in paths  # sanity: system_bp's other routes still registered
 
 
 def test_upload_role_serves_only_upload_routes():
@@ -82,7 +105,7 @@ def test_upload_role_serves_only_upload_routes():
 
 def test_admin_role_serves_only_admin_routes():
     paths = _rule_paths_for_role('admin')
-    non_static = {p for p in paths if not p.startswith('/static')}
+    non_static = {p for p in paths if not p.startswith('/static') and p != '/health'}   # /health is on every role (warm-up probe)
     assert non_static  # non-empty
     assert all(p.startswith(('/admin', '/api/admin')) for p in non_static)
     assert '/api/admin/people/dedupe-faces' in non_static
@@ -91,7 +114,7 @@ def test_admin_role_serves_only_admin_routes():
 
 def test_extras_role_serves_only_extras_routes():
     paths = _rule_paths_for_role('extras')
-    non_static = {p for p in paths if not p.startswith('/static')}
+    non_static = {p for p in paths if not p.startswith('/static') and p != '/health'}   # /health is on every role (warm-up probe)
     assert non_static  # non-empty
     extras_prefixes = ('/api/persons', '/api/faces', '/api/people', '/persons', '/people', '/api/library', '/public', '/api/public')
     assert all(p.startswith(extras_prefixes) for p in non_static)

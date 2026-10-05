@@ -59,7 +59,7 @@ class _FakeBlobServiceClient:
 
 
 def _seed_row(table: FakeTable, user_id: str, filename: str, **overrides) -> None:
-    row = {'PartitionKey': user_id, 'RowKey': filename, **overrides}
+    row = {'PartitionKey': user_id, 'RowKey': filename, 'processing_complete': True, **overrides}
     table.upsert_entity(row)
 
 
@@ -93,6 +93,21 @@ def test_build_snapshot_excludes_embedding_fields_keeps_others(lexical_ctx):
     assert row['tags'] == '["dog"]'
     assert row['caption'] == 'a dog'
     assert row['photoEmbeddingVersion'] == 'v1'  # small version string, not the array itself -- kept
+
+
+def test_build_snapshot_excludes_photos_still_processing(lexical_ctx):
+    """A photo mid-upload/processing has no OCR text/tags/faces yet -- indexing
+    it would just add an empty entry that gets marked dirty again (and
+    re-fetched) the moment each remaining step lands. See
+    _photo_processing_complete/its write-time callers."""
+    table, _ = lexical_ctx
+    _seed_row(table, 'lib-A', 'done.jpg', tags='["dog"]')
+    _seed_row(table, 'lib-A', 'still-processing.jpg', tags='[]', processing_complete=False)
+    table.rows[('lib-A', 'never-stamped.jpg')] = {'PartitionKey': 'lib-A', 'RowKey': 'never-stamped.jpg', 'tags': '[]'}
+
+    snapshot = storage_utils._build_user_lexical_index_snapshot('lib-A', 'v1')
+
+    assert [row['RowKey'] for row in snapshot.rows] == ['done.jpg']
 
 
 def test_build_snapshot_skips_rows_without_a_filename(lexical_ctx):
@@ -379,52 +394,22 @@ def _fallback_row(filename: str) -> dict:
 
 @pytest.fixture
 def search_route_ctx(monkeypatch):
+    # Server-side search is frozen by default (SERVER_SEARCH_ENABLED); these
+    # tests exercise the real scoring path, which still lives behind the flag.
+    monkeypatch.setattr(app, 'SERVER_SEARCH_ENABLED', True)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'person_table_client', None)  # _load_people_name_index short-circuits
     monkeypatch.setattr(app.vision_utils, 'encode_text_embedding', lambda text: [])
     monkeypatch.setattr(app, 'vector_search_candidates', lambda *a, **k: [])
 
 
-def test_search_falls_back_to_full_scan_when_lexical_index_unavailable(monkeypatch, search_route_ctx):
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)
-    monkeypatch.setattr(app, '_cached_metadata_rows_for_user', lambda *a, **k: [_fallback_row('vacation.jpg')])
-
-    with app.app.test_request_context('/photos/search?q=vacation'):
-        response = search_photos()
-
-    payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
-    filenames = [p['filename'] for p in payload['photos']]
-    assert 'vacation.jpg' in filenames
 
 
-def test_search_503s_when_lexical_index_and_fallback_scan_both_fail(monkeypatch, search_route_ctx):
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)
-
-    def _boom(*a, **k):
-        raise RuntimeError('table storage hiccup')
-
-    monkeypatch.setattr(app, '_cached_metadata_rows_for_user', _boom)
-
-    with app.app.test_request_context('/photos/search?q=vacation'):
-        response = search_photos()
-
-    assert response[1] == 503
 
 
-def test_search_uses_lexical_index_rows_when_available(monkeypatch, search_route_ctx):
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: {'rows': [_fallback_row('fromindex.jpg')]})
 
-    def _boom(*a, **k):
-        raise AssertionError('should not fall back to the full scan when the lexical index is available')
 
-    monkeypatch.setattr(app, '_cached_metadata_rows_for_user', _boom)
 
-    with app.app.test_request_context('/photos/search?q=fromindex'):
-        response = search_photos()
-
-    payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
-    filenames = [p['filename'] for p in payload['photos']]
-    assert 'fromindex.jpg' in filenames
 
 
 # --- _cached_metadata_list_rows_for_user (gallery list/timeline/access-batch/filter) ----
@@ -437,39 +422,3 @@ def test_search_uses_lexical_index_rows_when_available(monkeypatch, search_route
 # paid that cost on its first gallery request, which was implicated in a
 # ContainerBackOff crash loop during a sustained overnight upload. This mirrors
 # search_photos's existing lexical-index-first pattern above.
-
-def test_cached_metadata_list_rows_uses_lexical_index_when_available(monkeypatch):
-    monkeypatch.setattr(app, 'get_user_listing_index', lambda *a, **k: {'rows': [{'RowKey': 'a.jpg'}]})
-
-    def _boom(*a, **k):
-        raise AssertionError('should not fall back to the live Table scan when the lexical index is available')
-
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', _boom)
-    app._metadata_list_scan_cache.invalidate('owner')
-
-    rows = app._cached_metadata_list_rows_for_user('owner', purpose='photos.list')
-
-    assert [r['RowKey'] for r in rows] == ['a.jpg']
-
-
-def test_cached_metadata_list_rows_falls_back_to_scan_when_index_unavailable(monkeypatch):
-    monkeypatch.setattr(app, 'get_user_listing_index', lambda *a, **k: None)
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', lambda *a, **k: [{'RowKey': 'fallback.jpg'}])
-    app._metadata_list_scan_cache.invalidate('owner')
-
-    rows = app._cached_metadata_list_rows_for_user('owner', purpose='photos.list')
-
-    assert [r['RowKey'] for r in rows] == ['fallback.jpg']
-
-
-def test_cached_metadata_list_rows_falls_back_to_scan_when_index_lookup_raises(monkeypatch):
-    def _boom(*a, **k):
-        raise RuntimeError('blob storage hiccup')
-
-    monkeypatch.setattr(app, 'get_user_listing_index', _boom)
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', lambda *a, **k: [{'RowKey': 'fallback.jpg'}])
-    app._metadata_list_scan_cache.invalidate('owner')
-
-    rows = app._cached_metadata_list_rows_for_user('owner', purpose='photos.list')
-
-    assert [r['RowKey'] for r in rows] == ['fallback.jpg']

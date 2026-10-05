@@ -9,6 +9,7 @@
 // Deploys (into the resource group created by main.bicep):
 //   - a Storage account with blob containers (images/thumbnails/covers);
 //     metadata tables are created automatically by the app on first use
+//   - dedicated Azure Files storage for worker FAISS checkpoints
 //   - a Container Apps environment (+ Log Analytics workspace)
 //   - backend, frontend, and worker container apps
 //   - role assignments so the apps reach storage via managed identity
@@ -40,7 +41,7 @@ param adminPassword string
   'Australia'
   'United Kingdom'
 ])
-param emailDataLocation string = 'United States'
+param emailDataLocation string = 'Europe'
 
 @description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new ipworker container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running ipworker (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and ipworker both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
 @allowed([
@@ -58,6 +59,16 @@ param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 
 @description('Public ipworker image. Only pulled/deployed when processingMode is "backend" or "both". Separate from backendImage (unlike the clustering `worker` role, which reuses it) because ipworker needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every backend/worker cold start if bundled into their shared image. Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment.')
 param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
+
+@description('Quota in GiB for the dedicated worker FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
+@minValue(1)
+@maxValue(5120)
+param workerFileShareQuotaGiB int = 100
+
+@description('Minimum clustering worker replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
+@minValue(0)
+@maxValue(1)
+param workerMinReplicas int = 0
 
 @description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
 @secure()
@@ -81,6 +92,8 @@ var suffix = uniqueString(resourceGroup().id)
 // which is deterministic and predictable from public resource metadata.
 var sessionSecret = sessionSecretParam
 var storageAccountName = take(toLower(replace('${appName}${suffix}', '-', '')), 24)
+// Preserve the full unique suffix within the 24-character account-name limit.
+var workerCacheStorageAccountName = 'workercache${uniqueString(resourceGroup().id, appName)}'
 
 var environmentName = '${appName}-env'
 var backendAppName = '${appName}-backend'
@@ -178,6 +191,38 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     // user-delegation SAS, so account/shared keys are never needed. Disabling
     // them removes an entire class of credential-leak risk.
     allowSharedKeyAccess: false
+  }
+}
+
+resource workerCacheStorage 'Microsoft.Storage/storageAccounts@2025-06-01' = {
+  name: workerCacheStorageAccountName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+    allowBlobPublicAccess: false
+    // ACA's AzureFile SMB mount requires an account key. Isolate this explicit
+    // exception from photo/metadata storage, which keeps shared keys disabled.
+    allowSharedKeyAccess: true
+  }
+}
+
+resource workerFileService 'Microsoft.Storage/storageAccounts/fileServices@2025-06-01' = {
+  parent: workerCacheStorage
+  name: 'default'
+  properties: {}
+}
+
+resource workerCheckpointShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2025-06-01' = {
+  parent: workerFileService
+  name: 'faiss-checkpoints'
+  properties: {
+    enabledProtocols: 'SMB'
+    shareQuota: workerFileShareQuotaGiB
   }
 }
 
@@ -299,6 +344,21 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
         customerId: logAnalyticsWorkspace.properties.customerId
         sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
       }
+    }
+  }
+}
+
+resource workerCheckpointStorage 'Microsoft.App/managedEnvironments/storages@2025-01-01' = {
+  parent: managedEnvironment
+  name: 'faiss-checkpoints'
+  properties: {
+    azureFile: {
+      accessMode: 'ReadWrite'
+      accountName: workerCacheStorage.name
+      // Resolve only during deployment, directly into the mount resource:
+      // never expose the account key in outputs or container environment.
+      accountKey: workerCacheStorage.listKeys().keys[0].value
+      shareName: workerCheckpointShare.name
     }
   }
 }
@@ -452,7 +512,7 @@ var backendEnv = [
   { name: 'FACE_CLUSTER_EMBEDDING_VERSION', value: 'browser-adaface-ir101-v1-fixed' }
   { name: 'PEOPLE_CLUSTER_EPS_2PT', value: '0.60' }
   { name: 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', value: '512' }
-  { name: 'SUSPICIOUS_FACE_CONFIDENCE', value: '0.75' }
+  { name: 'SUSPICIOUS_FACE_CONFIDENCE', value: '0.55' }
   // Lowered from 0.55 (2026-08-01): this was a hard reject floor calibrated for
   // the pre-YOLOv8n-face detector, never revisited after the swap. YOLO's own
   // detection threshold is 0.35 (yoloFaceDetectionRuntime.ts) and its real-world
@@ -568,6 +628,12 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'backend'
           image: backendImage
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+            // Ephemeral (replica-local) disk for the SQLite search database -- SQLite needs a
+            // real local filesystem, not the SMB share. Re-fetched from Blob per replica.
+            { volumeName: 'search-db', mountPath: '/var/lib/photostore/search-db' }
+          ]
           resources: {
             // 2026-09-03: raised from 1.25vCPU/2.5Gi live on photostore-test
             // after a sustained OOM crash-loop (working-set pinned at the
@@ -606,19 +672,61 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // already spiking to 89% on THIS 1.0vCPU tier during the one day
             // with real traffic. Cutting to 0.5vCPU would have reintroduced
             // the exact 502/503 incident above on data, not just risk.
-            cpu: json('1.0')
-            memory: '2Gi'
+            //
+            // 2026-09-29: cut to 0.5vCPU/1Gi again on forenkla-ppe, this time
+            // deliberately retried (not a blind repeat of the 2026-09-21
+            // attempt above) because three fixes landed on this app's
+            // remaining surface since that revert: 591adc4 (jobs table
+            // split, fixes the unscoped partition scan behind
+            // /api/jobs/status), 532304f (/api/photos/search-index no longer
+            // blocks inline on a dirty lexical-index rebuild), and
+            // 9075cfc/abfefb2 (/explore and /photos/timeline no longer block
+            // on a cold full-library scan). Confirmed live and stable
+            // (0 restarts) after real traffic including a 713-file upload
+            // burst the same day. Residual risk, NOT covered by any of the
+            // above: semantic/CLIP cosine-similarity scoring for
+            // /photos/search still runs inline per-candidate on request
+            // threads, and CR3/RAW on-demand preview decode is a known
+            // memory-spike risk that's now much closer to this 1Gi ceiling
+            // than the 2Gi budget it was originally sized against. Watch
+            // WorkingSetBytes/p90 latency for OOM or 502/503 recurrence; if
+            // it reappears, these two are the first places to look before
+            // reverting to 1.0/2Gi.
+            cpu: json('0.5')
+            memory: '1Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'backend' }
+            // Shared Azure Files volume: index blobs are cached here by ETag so a
+            // restart/scale-out re-reads from disk instead of re-downloading them.
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
+            { name: 'SEARCH_DB_DIR', value: '/var/lib/photostore/search-db' }
+            // Must fit the replica's ephemeral storage (0.5 vCPU -> ~2GiB); oldest files evicted.
+            { name: 'SEARCH_DB_MAX_CACHE_MB', value: '1200' }
             // Gunicorn workers are separate processes and the app is imported
             // AFTER fork (no --preload), so every worker loads its own copy of
             // numpy/scipy/scikit-learn/Pillow + the Azure SDKs (~250-350 MB
-            // each) and primes its own vector-index cache. Keep process
-            // fan-out at 1 and use threads (below) for concurrency instead --
-            // each additional worker duplicates that baseline RSS, while
-            // threads share it.
-            { name: 'GUNICORN_WORKERS', value: '1' }
+            // each) and primes its own vector-index cache -- each additional
+            // worker duplicates that baseline RSS, while threads share it.
+            //
+            // 2026-10-01: raised 1->2 to fix a live ContainerBackOff crash
+            // loop on microsvcpoc-dev: with a single worker process, both of
+            // its GUNICORN_THREADS=2 request threads could get tied up by a
+            // slow access-batch call (Table Storage fallback for filenames
+            // outside the listing index), leaving nothing to answer the
+            // liveness probe -- "liveness probe failed: connection refused"
+            // in system events, 6+ restarts/replica in 40min. A second
+            // worker is a separate process with its own thread pool, so it
+            // keeps answering health checks even while worker 1 is
+            // saturated. NOTE: the ~250-350MB/worker RSS duplication this
+            // guards against above is only affordable because live
+            // microsvcpoc-dev-backend is actually running 2vCPU/4Gi right
+            // now, NOT the 0.5vCPU/1Gi this file's cpu/memory lines below
+            // still say (unreconciled bicep/live drift -- see that resource
+            // block's own comment history). Don't deploy this file's
+            // cpu/memory values live without reconciling that drift first,
+            // or this doubles RSS on a container sized for half a worker.
+            { name: 'GUNICORN_WORKERS', value: '2' }
             // 2026-08-28: tried raising 4->12 live on photostore-test to fix
             // slow /upload/finalize|init-batch|client-processing|processing-
             // claim calls (each 20-90s+, ~19-28 concurrent against a 20-slot
@@ -680,8 +788,52 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // to this app's OWN host, which 404s since backend no longer
             // serves that route. See public-album-share-preview memory.
             { name: 'EXTRAS_PUBLIC_BASE_URL', value: 'https://${extras.properties.configuration.ingress.fqdn}' }
+            // Lets the search-index/sort-index SAS-mint routes fire a
+            // fire-and-forget rebuild on the tools role when they observe a
+            // dirty manifest -- replacing the in-process background rebuild
+            // backend used to run (which loaded the whole index blob into this
+            // 1Gi container's memory, the OOM driver fixed 2026-09-30). Backend
+            // never builds/loads the blob itself now; it only mints the URL and
+            // nudges tools. See _trigger_tools_index_rebuild in backend/app.py.
+            { name: 'TOOLS_INTERNAL_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
           ])
+          // Explicit liveness probe, replacing whatever Container Apps'
+          // unconfigured default was (no probes block existed here before --
+          // every env var and timing choice on this container was deliberate
+          // except this one). Targets the gunicorn-master-owned health
+          // sidecar (port 5001, see gunicorn.conf.py's on_starting) instead
+          // of the app's own port 5000: a liveness check against 5000 shares
+          // fate with GUNICORN_THREADS -- if both of backend's two request
+          // threads are tied up (e.g. access-batch's Table Storage
+          // fallback), the probe queues behind them too and times out, which
+          // is exactly the live 2026-10-01 ContainerBackOff crash loop this
+          // fixes. The sidecar has zero dependency on app.py/Flask/storage
+          // clients, so it keeps answering even when every app thread is
+          // saturated -- it only stops if the master process itself is
+          // actually dead, which is the one case a restart is correct.
+          // Deliberately NOT overriding readiness here: whether a replica
+          // should receive NEW traffic right now is a different question
+          // from whether it should be killed, and the default readiness
+          // behavior correctly reflects real app-port capacity.
+          probes: [
+            {
+              type: 'Liveness'
+              httpGet: {
+                path: '/'
+                port: 5001
+                scheme: 'HTTP'
+              }
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            }
+          ]
         }
+      ]
+      volumes: [
+        { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
+        { name: 'search-db', storageType: 'EmptyDir' }
       ]
       scale: {
         minReplicas: 0
@@ -711,10 +863,17 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // a light-but-bursty gallery load is the intended trade, not a
             // cost concern (minReplicas stays 0; this only affects the
             // ceiling under real concurrent load).
+            //
+            // 2026-10-05: raised 2 -> 4 to match one replica's real capacity
+            // (GUNICORN_WORKERS=2 x GUNICORN_THREADS=2). At 2, an 8-call page
+            // of parallel gallery requests scaled 1 -> 4 replicas; each new
+            // replica needs ~25s to pull the image and then re-downloads the
+            // library search database, and serves nothing meanwhile. Do not
+            // go much higher: a 0.5vCPU replica cannot serve 20 at once.
             name: 'http-scaler'
             http: {
               metadata: {
-                concurrentRequests: '2'
+                concurrentRequests: '4'
               }
             }
           }
@@ -722,6 +881,10 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
       }
     }
   }
+  // storageName is a literal, so explicitly wait for the SMB registration.
+  dependsOn: [
+    workerCheckpointStorage
+  ]
 }
 
 // 2026-09-15: first real service split (see backend-cpu-optimization-2026-09
@@ -762,12 +925,23 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'tools'
           image: backendImage
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+          ]
+          // 2vCPU/4Gi (was 0.5/1Gi): tools is now the derived-index builder
+          // (POST /api/tools/indexes/build). Building the lexical index scans
+          // a user's full metadata partition (OCR/tags/faces per row) -- the
+          // exact work that OOM-ed the 1Gi backend, so it gets worker-class
+          // headroom here. See prime_all_user_indexes_sequentially.
           resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'tools' }
+            // Shared Azure Files volume: index blobs are cached here by ETag so a
+            // restart/scale-out re-reads from disk instead of re-downloading them.
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
@@ -776,6 +950,9 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
           ])
         }
+      ]
+      volumes: [
+        { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
         minReplicas: 0
@@ -793,6 +970,10 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
       }
     }
   }
+  // storageName is a literal, so explicitly wait for the SMB registration.
+  dependsOn: [
+    workerCheckpointStorage
+  ]
 }
 
 // 2026-09-16: third service split -- admin (Tools/Workbench recovery actions:
@@ -911,6 +1092,9 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'extras'
           image: backendImage
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+          ]
           // 2026-09-21: halved from 1.0vCPU/2Gi based on real forenkla-qa
           // platform metrics (max 40% CPU / 13% memory over the one 3-day
           // window with real activity). The library_export executor.map()
@@ -926,6 +1110,7 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'extras' }
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
@@ -934,6 +1119,9 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
           ])
         }
+      ]
+      volumes: [
+        { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
         minReplicas: 0
@@ -951,6 +1139,10 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
       }
     }
   }
+  // storageName is a literal, so explicitly wait for the SMB registration.
+  dependsOn: [
+    workerCheckpointStorage
+  ]
 }
 
 // 2026-09-15: second service split -- upload (init/finalize/processing-lease/
@@ -963,6 +1155,17 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
 // Right-sizing the CORE backend now that it no longer carries this load is a
 // deliberate follow-up, not done here -- better done from real per-service
 // metrics post-split than guessed upfront.
+//
+// 2026-09-29: that follow-up done on forenkla-ppe -- a 2-hour Azure Monitor
+// window (including a real 713-file upload burst) showed this app only
+// hitting 0.43vCPU (21%) and 341MB (8% of 4Gi) at peak. Cut to 0.75vCPU/1.5Gi
+// (~2x headroom over the observed peak); a follow-up 15-minute watch at the
+// new size confirmed 0 restarts and CPU/memory both well within the new
+// ceiling. Unlike worker/backend, this app has no documented OOM/starvation
+// incident history at a smaller size -- init-batch/finalize-batch are
+// lightweight coordination calls (the actual image bytes go browser->Blob
+// directly, never through this app), so this resize carries materially less
+// risk than the sibling apps' below.
 resource upload 'Microsoft.App/containerApps@2024-03-01' = {
   name: uploadAppName
   location: location
@@ -992,8 +1195,8 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'upload'
           image: backendImage
           resources: {
-            cpu: json('2')
-            memory: '4Gi'
+            cpu: json('0.75')
+            memory: '1.5Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'upload' }
@@ -1127,33 +1330,39 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
         {
           name: 'worker'
           image: backendImage
-          // 2026-08-10: live was manually bumped from 0.5vCPU/1Gi to 2/4Gi
-          // (same incident/session as the backend cpu/memory fix above) --
-          // unprojected full-table scans in worker job handlers (see the
-          // library_clean OOM writeup) can pull large partitions into memory
-          // in one pass.
-          //
-          // 2026-09-21: cpu halved to 1.0 based on real forenkla-qa platform
-          // metrics (max 59% of the 2.0vCPU allocation, i.e. ~1.18 cores
-          // peak, over the one 3-day window with real activity) -- accepted
-          // knowingly without re-testing the library_clean/full-DBSCAN burst
-          // path this app exists for, since worker is an async queue
-          // consumer, not a live HTTP path: CPU throttling here slows a
-          // background job, it doesn't 502 a user request the way backend
-          // throttling does. Memory kept at 2Gi (not reverted to the old
-          // 1Gi that caused the OOM crash-loop) specifically because that
-          // incident was memory-driven, not CPU-driven -- observed peak
-          // memory in the same window was only 14% of 4Gi (~560MB), so 2Gi
-          // still leaves real headroom. Watch WorkingSetBytes/OOMKilled next
-          // time a library_clean or large full-reclustering job runs; raise
-          // back to 2.0/4Gi if either recurs.
+          // Restore headroom for live FAISS builds and clustering bursts.
+          // SQLite and temporary files stay local; SMB holds checkpoints only.
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
+          volumeMounts: [
+            { volumeName: 'faiss-work', mountPath: '/var/lib/photostore/faiss-work' }
+            { volumeName: 'faiss-checkpoints', mountPath: '/mnt/photostore/faiss-checkpoints' }
+          ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'worker' }
+            { name: 'PEOPLE_FAISS_WORK_DIR', value: '/var/lib/photostore/faiss-work' }
+            { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }
+            // Same share the backend/tools mount at /mnt/photostore/shared -- worker builds the
+            // vector/people-embedding indexes, so write-through here feeds every other role.
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/faiss-checkpoints/index-cache' }
+            // Index builds stream rows/vectors into files on the Azure Files share (disk, not RAM);
+            // SQLite scratch stays on local ephemeral disk (needs real file locking).
+            { name: 'INDEX_BUILD_WORK_DIR', value: '/mnt/photostore/faiss-checkpoints/index-build' }
+            { name: 'INDEX_BUILD_SQLITE_DIR', value: '/var/lib/photostore/faiss-work/index-build-sqlite' }
+            // The worker's own copy of each library's search database (base + deltas) lives on local disk;
+            // compaction snapshots it, so the budget must hold one library's database plus its copy.
+            { name: 'SEARCH_DB_DIR', value: '/var/lib/photostore/faiss-work/search-db' }
+            { name: 'SEARCH_DB_MAX_CACHE_MB', value: '3500' }
+            { name: 'TMPDIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
+            // Opt-in microbatching (2026-10-02): adjacent same-library
+            // incremental-assign messages share one Blob lease/revision
+            // publication instead of paying that cost per message. Default
+            // off upstream (CLUSTERING_WORKER_BATCH_SIZE=1); enabled here
+            // after confirming correctness against the live backlog.
+            { name: 'CLUSTERING_WORKER_BATCH_SIZE', value: '8' }
             // Short lease, actively renewed by run_clustering_worker every
             // CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS via update_message()
             // while a message is being processed -- NOT a fixed 1800s
@@ -1198,23 +1407,17 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
           ])
         }
       ]
+      volumes: [
+        { name: 'faiss-work', storageType: 'EmptyDir' }
+        { name: 'faiss-checkpoints', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
+      ]
       scale: {
-        minReplicas: 0
+        // Live FAISS cannot amortize training if queue lulls destroy its only
+        // replica. A replica floor, not merely cooldown, prevents this teardown.
+        // It does not prevent deployment/platform/OOM restarts or cache changes.
+        minReplicas: workerMinReplicas
         maxReplicas: 1
-        // 2026-09-21: found via forenkla2-qa telemetry during a real 986-file
-        // upload -- the platform's effective cooldown between the last active
-        // trigger and scale-to-zero was only ~60s (confirmed live via
-        // ContainerAppSystemLogs_CL: 'Deactivated...from 1 to 0' followed by
-        // 'Scaled...from 0 to 1' exactly 60s later), not the ~300s a GET on
-        // the resource reports as a schema default. Under one continuous
-        // upload session, the clustering queue kept draining to empty for
-        // brief gaps between bursts, so the worker fully cold-started 5
-        // separate times in ~65 minutes instead of staying warm across the
-        // session. Set explicitly to 300s so a short lull no longer tears
-        // the replica down -- cost impact is negligible (a few extra idle
-        // minutes on a 1.0vCPU app); benefit is removing repeated
-        // process-restart/reconnect latency right when a user is watching
-        // clustering results land.
+        // Relevant only when explicitly opting back into a zero-replica floor.
         cooldownPeriod: 300
         rules: [
           {
@@ -1249,6 +1452,10 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
       }
     }
   }
+  // storageName is a literal, so explicitly wait for the SMB registration.
+  dependsOn: [
+    workerCheckpointStorage
+  ]
 }
 
 // ipworker mirrors the browser's OCR/face/vision/geo pipeline server-side
@@ -1339,6 +1546,13 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // a replica only stays up for that rule's 5-minute window, so
             // this only needs to fire once per wake.
             { name: 'IPWORK_SWEEP_INTERVAL_SECONDS', value: '432000' }
+            // Lets the ipworker trigger a derived-index rebuild on the tools
+            // role (2vCPU/4Gi) when it drains the queue -- and every
+            // IPWORKER_INDEX_REBUILD_MILESTONE files on a very large import --
+            // via a direct service-to-service POST authenticated with a session
+            // token it mints itself (SESSION_SECRET is shared across all
+            // roles). See _trigger_tools_index_rebuild in backend/app.py.
+            { name: 'TOOLS_INTERNAL_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
           ])
         }
       ]

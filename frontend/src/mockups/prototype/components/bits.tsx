@@ -1,7 +1,36 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { StarIcon as StarSolid } from '@heroicons/react/24/solid';
-import { StarIcon as StarOutline } from '@heroicons/react/24/outline';
+import { Star, X as XMarkIcon } from 'lucide-react';
 import type { SwatchKey } from '../types';
+
+/** Shared floating multi-select action bar — one consistent bottom-center pill
+ *  for "N selected → act" across photos, people, and albums (replacing the mix
+ *  of a floating bar, a different floating menu, and an inline list bar). It
+ *  always carries a clear/close button and the selection count; callers pass
+ *  their own action buttons/menus as children. */
+export const SelectionBar: React.FC<{
+    count: number;
+    onClear: () => void;
+    label?: string;
+    children?: React.ReactNode;
+}> = ({ count, onClear, label = 'Selection actions', children }) => (
+    <div className="pt-floating-menu" role="toolbar" aria-label={label}>
+        <button type="button" className="pt-fm-close" onClick={onClear} aria-label="Clear selection">
+            <XMarkIcon />
+        </button>
+        <div className="pt-fm-badge">{count}</div>
+        {children}
+    </div>
+);
+
+/** Shared inline loading indicator — one consistent spinner + label for every
+ *  in-page "Loading…" state (grids, lists, the viewer), replacing the mix of
+ *  ad-hoc plain-text placeholders. */
+export const Spinner: React.FC<{ label?: string; center?: boolean; className?: string }> = ({ label = 'Loading…', center = true, className }) => (
+    <div className={`pt-loading${center ? ' center' : ''}${className ? ` ${className}` : ''}`} role="status" aria-live="polite">
+        <span className="pt-spinner" aria-hidden="true" />
+        {label && <span>{label}</span>}
+    </div>
+);
 
 /** A placeholder photo swatch (stands in for a real thumbnail). */
 export const Swatch: React.FC<{ swatch: SwatchKey; className?: string }> = ({ swatch, className }) => (
@@ -43,8 +72,7 @@ export const Stars: React.FC<{ value: number; onRate?: (n: number) => void; size
         <>
             <span className="pt-stars pt-stars-full" onMouseLeave={() => setHover(0)}>
                 {[1, 2, 3, 4, 5].map((n) => {
-                    const Filled = n <= shown;
-                    const Icon = Filled ? StarSolid : StarOutline;
+                    const filled = n <= shown;
                     return (
                         <button
                             key={n}
@@ -57,9 +85,8 @@ export const Stars: React.FC<{ value: number; onRate?: (n: number) => void; size
                                 onRate?.(value === n ? 0 : n);
                             }}
                             disabled={!onRate}
-                            style={{ width: size, height: size }}
                         >
-                            <Icon />
+                            <Star fill={filled ? 'currentColor' : 'none'} style={{ width: size, height: size }} />
                         </button>
                     );
                 })}
@@ -73,10 +100,10 @@ export const Stars: React.FC<{ value: number; onRate?: (n: number) => void; size
                     onRate?.(value >= 5 ? 0 : value + 1);
                 }}
                 disabled={!onRate}
-                style={{ width: size, height: size, '--pt-star-fill': `${Math.max(0, Math.min(5, value)) / 5 * 100}%` } as React.CSSProperties}
+                style={{ '--pt-star-fill': `${Math.max(0, Math.min(5, value)) / 5 * 100}%` } as React.CSSProperties}
             >
-                <StarOutline className="pt-star-compact-bg" />
-                <StarSolid className="pt-star-compact-fg" />
+                <Star className="pt-star-compact-bg" />
+                <Star className="pt-star-compact-fg" fill="currentColor" />
             </button>
         </>
     );
@@ -92,6 +119,7 @@ export const Menu: React.FC<{
 }> = ({ renderTrigger, children, align = 'left', className }) => {
     const [open, setOpen] = useState(false);
     const wrapRef = useRef<HTMLDivElement | null>(null);
+    const panelRef = useRef<HTMLDivElement | null>(null);
     const toggle = () => setOpen((v) => !v);
     const close = () => setOpen(false);
 
@@ -109,10 +137,38 @@ export const Menu: React.FC<{
         };
     }, [open]);
 
+    // Move focus into the panel when it opens so the menu is operable by keyboard
+    // (and screen readers announce it), matching HIG menu behavior.
+    useEffect(() => {
+        if (!open) return;
+        panelRef.current?.querySelector<HTMLElement>('button:not([disabled]), [href], input, select')?.focus();
+    }, [open]);
+
+    // Arrow keys roam between the menu's own controls; Home/End jump to ends.
+    const onPanelKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+        if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
+        const items = Array.from(
+            panelRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input, select') ?? [],
+        );
+        if (!items.length) return;
+        e.preventDefault();
+        const current = items.indexOf(document.activeElement as HTMLElement);
+        let next = current;
+        if (e.key === 'ArrowDown') next = current < items.length - 1 ? current + 1 : 0;
+        else if (e.key === 'ArrowUp') next = current > 0 ? current - 1 : items.length - 1;
+        else if (e.key === 'Home') next = 0;
+        else if (e.key === 'End') next = items.length - 1;
+        items[next]?.focus();
+    };
+
     return (
         <div className={`pt-menu-anchor${className ? ` ${className}` : ''}`} ref={wrapRef}>
             {renderTrigger(toggle, open)}
-            {open && <div className={`pt-menu-panel ${align}`}>{children(close)}</div>}
+            {open && (
+                <div ref={panelRef} className={`pt-menu-panel ${align}`} role="menu" onKeyDown={onPanelKeyDown}>
+                    {children(close)}
+                </div>
+            )}
         </div>
     );
 };

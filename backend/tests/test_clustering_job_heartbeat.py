@@ -47,7 +47,7 @@ def test_slow_people_cluster_job_gets_heartbeated_before_it_finishes(monkeypatch
     job_id = 'cluster:u1:job1'
     thread = threading.Thread(
         target=app._handle_clustering_queue_payload,
-        args=({'trigger': 'upload_face_ready'}, job_id, 'u1', 'people_cluster'),
+        args=({'trigger': 'manual_repair'}, job_id, 'u1', 'people_cluster'),
     )
     thread.start()
 

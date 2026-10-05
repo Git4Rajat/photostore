@@ -10,11 +10,46 @@ from __future__ import annotations
 
 import json
 import random
+import re
 
 import pytest
 
 import app
+import storage_utils
 from fakes import FakeTable
+
+
+class _FakeBlob:
+    def __init__(self, store: dict, key: str) -> None:
+        self._store = store
+        self._key = key
+
+    def upload_blob(self, data, overwrite=True, content_settings=None):
+        self._store[self._key] = data
+
+    def download_blob(self):
+        if self._key not in self._store:
+            raise KeyError(self._key)
+        return _Downloaded(self._store[self._key])
+
+    def delete_blob(self):
+        self._store.pop(self._key, None)
+
+
+class _Downloaded:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def readall(self) -> bytes:
+        return self._data
+
+
+class _FakeBlobServiceClient:
+    def __init__(self) -> None:
+        self.blobs: dict = {}
+
+    def get_blob_client(self, container, blob):
+        return _FakeBlob(self.blobs, f'{container}/{blob}')
 
 # Two embeddings deliberately far enough apart (near-orthogonal) that cosine
 # similarity sits well below any of the assign-threshold presets (0.68-0.80),
@@ -23,10 +58,14 @@ from fakes import FakeTable
 PERSON_A_EMBEDDING = [1.0, 0.2, 0.1, 0.05, 0.0, 0.0, 0.0, 0.0]
 PERSON_A_EMBEDDING_CLOSE = [0.98, 0.22, 0.11, 0.04, 0.01, 0.0, 0.0, 0.0]
 PERSON_B_EMBEDDING = [0.0, 0.0, 0.0, 0.0, 1.0, 0.2, 0.1, 0.05]
+PERSON_B_EMBEDDING_CLOSE = [0.0, 0.0, 0.0, 0.01, 0.98, 0.22, 0.11, 0.04]
 
 
 @pytest.fixture(autouse=True)
 def clustering_tables(monkeypatch):
+    # These tests intentionally cover the legacy scan/cache architecture;
+    # production and unrelated tests retain the live FAISS default.
+    monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'legacy')
     face_table = FakeTable()
     person_table = FakeTable()
     monkeypatch.setattr(app, 'face_table_client', face_table)
@@ -77,6 +116,33 @@ def test_empty_face_ids_is_a_no_op(clustering_tables):
     assert person_table.rows == {}
 
 
+def test_face_ownership_write_failure_propagates_and_replay_recovers(clustering_tables, monkeypatch):
+    face_table, person_table = clustering_tables
+    _seed_face(face_table, 'lib-A', 'face-1', 'photo.jpg', PERSON_A_EMBEDDING)
+    original_upsert = face_table.upsert_entity
+    def fail(entity):
+        raise RuntimeError('face ownership write unavailable')
+    monkeypatch.setattr(face_table, 'upsert_entity', fail)
+    with pytest.raises(RuntimeError, match='face ownership write unavailable'):
+        app._assign_faces_to_people_incrementally('lib-A', 'photo.jpg', ['face-1'])
+    assert len(person_table.rows) == 1
+    person_id = next(iter(person_table.rows))[1]
+    monkeypatch.setattr(face_table, 'upsert_entity', original_upsert)
+    assignments, created = app._assign_faces_to_people_incrementally('lib-A', 'photo.jpg', ['face-1'])
+    assert assignments == {'face-1': person_id}
+    assert created == set()
+    assert len(person_table.rows) == 1
+
+
+def test_face_read_transport_failure_propagates(clustering_tables, monkeypatch):
+    face_table, _ = clustering_tables
+    def fail(*args, **kwargs):
+        raise RuntimeError('face read unavailable')
+    monkeypatch.setattr(face_table, 'get_entity', fail)
+    with pytest.raises(RuntimeError, match='face read unavailable'):
+        app._assign_faces_to_people_incrementally('lib-A', 'photo.jpg', ['face-1'])
+
+
 def test_confident_match_assigns_to_existing_person_without_creating_new_one(clustering_tables):
     face_table, person_table = clustering_tables
     user_id = 'lib-A'
@@ -88,9 +154,239 @@ def test_confident_match_assigns_to_existing_person_without_creating_new_one(clu
 
     assert assignments == {'new-face': 'person-1'}
     assert created == set()
+
+
+def test_matches_using_embedding_from_dedicated_table_when_row_has_no_inline_embedding(
+    clustering_tables, monkeypatch,
+):
+    """A face row written after the embeddings-table split carries no
+    inline 'embedding' at all -- _assign_faces_to_people_incrementally must
+    still find it via FACE_EMBEDDINGS_TABLE (_ensure_face_embedding_present)
+    and match exactly as if it had been inline all along."""
+    face_table, person_table = clustering_tables
+    user_id = 'lib-A'
+    face_embeddings_table = FakeTable()
+    monkeypatch.setitem(storage_utils._CTX, 'face_embeddings_table_client', face_embeddings_table)
+
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE)
+    # Simulate the post-split write path: strip the inline embedding off the
+    # face row and store it in the dedicated table instead.
+    row = face_table.get_entity(user_id, 'new-face')
+    del row['embedding']
+    face_table.upsert_entity(row)
+    face_embeddings_table.upsert_entity({
+        'PartitionKey': user_id, 'RowKey': 'new-face',
+        'embedding': json.dumps(PERSON_A_EMBEDDING_CLOSE),
+    })
+
+    assignments, created = app._assign_faces_to_people_incrementally(user_id, 'photo.jpg', ['new-face'])
+
+    assert assignments == {'new-face': 'person-1'}
+    assert created == set()
     assert face_table.get_entity(user_id, 'new-face')['personId'] == 'person-1'
     # Only the one pre-existing person row -- no new person was minted.
     assert len(person_table.rows) == 1
+
+
+class _EtagEntity(dict):
+    """Minimal stand-in for azure.data.tables.TableEntity: exposes
+    .metadata['etag'], which _update_person_entity_with_retry reads before
+    calling update_entity(..., match_condition=IfNotModified). Plain
+    FakeTable.get_entity returns a bare dict (no .metadata), so that read
+    raises AttributeError and _update_person_entity_with_retry silently
+    returns None in every test using it as-is -- the write never happens,
+    so it never invalidates anything either, which would hide exactly the
+    regression this test exists to catch."""
+
+    @property
+    def metadata(self):
+        return {'etag': 'v1', 'timestamp': None}
+
+
+class _FaceEmbeddingsFakeTable:
+    """Minimal fake for FACE_EMBEDDINGS_TABLE supporting the parenthesized
+    OR-filter query get_face_embeddings_batch issues -- mirrors
+    test_face_embeddings_table.py's dedicated fake, since tests/fakes.py's
+    generic FakeTable only parses a single unparenthesized 'and' clause."""
+
+    def __init__(self) -> None:
+        self.rows: dict = {}
+
+    def upsert_entity(self, entity):
+        self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
+
+    def get_entity(self, partition_key, row_key):
+        key = (partition_key, row_key)
+        if key not in self.rows:
+            raise Exception('not found')
+        return dict(self.rows[key])
+
+    def query_entities(self, filter_str, select=None):
+        m = re.match(r"PartitionKey eq '([^']*)' and \((.*)\)$", filter_str)
+        if m:
+            pk = m.group(1)
+            row_keys = set(re.findall(r"RowKey eq '([^']*)'", m.group(2)))
+            return [
+                dict(row) for (p, rk), row in self.rows.items()
+                if p == pk and rk in row_keys
+            ]
+        m = re.match(r"PartitionKey eq '([^']*)'$", filter_str)
+        assert m, f'unexpected filter: {filter_str}'
+        pk = m.group(1)
+        return [dict(row) for (p, _), row in self.rows.items() if p == pk]
+
+
+class _EtagAwareFakeTable(FakeTable):
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_calls: list = []
+
+    def get_entity(self, partition_key, row_key):
+        return _EtagEntity(super().get_entity(partition_key, row_key))
+
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        self.update_calls.append((entity['PartitionKey'], entity['RowKey']))
+        self.upsert_entity(entity)
+
+
+def test_add_face_to_person_writes_faceids_and_rep_embedding_in_one_round_trip(monkeypatch):
+    """_add_face_to_person used to call _update_person_rep_embedding as a
+    separate step right after its own faceIds update -- a second full
+    get_entity+update_entity cycle on the exact same person row for every
+    matched-face assignment. Both fields must now land via a single
+    update_entity call."""
+    face_table = FakeTable()
+    person_table = _EtagAwareFakeTable()
+    app.face_table_client = face_table
+    app.person_table_client = person_table
+    app._person_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._face_summary_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    # _compute_rep_embedding_for_face_ids reads embeddings via
+    # get_face_embeddings_batch, a parenthesized OR-filter query that
+    # tests/fakes.py's FakeTable can't parse -- reuse
+    # test_face_embeddings_table.py's dedicated fake, which already handles
+    # that exact shape.
+    face_embeddings_table = _FaceEmbeddingsFakeTable()
+    monkeypatch.setitem(storage_utils._CTX, 'face_embeddings_table_client', face_embeddings_table)
+
+    user_id = 'lib-A'
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1', confidence=0.95)
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE, confidence=0.95)
+    face_embeddings_table.upsert_entity({
+        'PartitionKey': user_id, 'RowKey': 'old-face', 'embedding': json.dumps(PERSON_A_EMBEDDING),
+    })
+
+    result = app._add_face_to_person(user_id, 'person-1', 'new-face')
+
+    assert result is True
+    assert person_table.update_calls == [(user_id, 'person-1')]  # exactly one write
+    stored = person_table.get_entity(user_id, 'person-1')
+    assert json.loads(stored['faceIds']) == ['old-face', 'new-face']
+    assert json.loads(stored['repEmbedding'])  # non-empty: computed, not left stale
+
+
+def test_incremental_assign_patches_face_summary_cache_instead_of_forcing_a_rescan():
+    """Regression test: _assign_faces_to_people_incrementally's own
+    face_table_client.upsert_entity (stamping personId) and _add_face_to_person's
+    person-table update both go through the real _InvalidatingTableClient in
+    production, which blanket-invalidates _face_summary_scan_cache on every
+    write regardless of which table changed. _add_face_to_person already
+    refreshes the matched person's rep embedding (reading the face summary)
+    BEFORE this call's own face-table write lands, so that read's cache
+    refill is immediately invalidated again by the face write -- without
+    this call patching its own local face-summary snapshot and flushing it
+    back once at the end, the very next read would re-scan the whole face
+    partition from scratch. Confirmed live as a recurring ~20-35s stall on
+    microsvcpoc-dev once the other synchronous-scan fixes landed.
+
+    Uses _EtagAwareFakeTable for person_table specifically so
+    _add_face_to_person's person-row update actually succeeds (see
+    _EtagEntity) -- with the autouse fixture's plain FakeTable, that update
+    silently no-ops, which masks this exact bug (see that fixture's own
+    comment on why it bypasses _InvalidatingTableClient entirely)."""
+    face_table = FakeTable()
+    person_table = _EtagAwareFakeTable()
+    app.face_table_client = app._InvalidatingTableClient(face_table, app._invalidate_people_scan_cache)
+    app.person_table_client = app._InvalidatingTableClient(person_table, app._invalidate_people_scan_cache)
+    app._person_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._face_summary_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._people_embedding_index_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+
+    user_id = 'lib-A'
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING, name='')
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    # confidence must clear SUSPICIOUS_FACE_CONFIDENCE (default 0.60) --
+    # otherwise _add_face_to_person's suspicious-face guard bails out before
+    # ever reaching the person-row update, silently hiding this regression.
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING_CLOSE, confidence=0.95)
+
+    query_calls = {'count': 0}
+    original_query = face_table.query_entities
+
+    def _counting_query(*args, **kwargs):
+        query_calls['count'] += 1
+        return original_query(*args, **kwargs)
+
+    face_table.query_entities = _counting_query
+
+    assignments, _created = app._assign_faces_to_people_incrementally(user_id, 'photo.jpg', ['new-face'])
+    assert assignments == {'new-face': 'person-1'}
+    # Sanity: the person row really was updated (not silently skipped).
+    assert 'new-face' in json.loads(person_table.get_entity(user_id, 'person-1')['faceIds'])
+
+    calls_during_call = query_calls['count']
+    # The cache this call just flushed back must already reflect the new
+    # personId stamp without needing another table scan.
+    summary = app._load_user_face_summary_by_id(user_id)
+    assert summary['new-face']['personId'] == 'person-1'
+    assert query_calls['count'] == calls_during_call, (
+        "reading the face summary right after the call should hit the "
+        "patched cache, not trigger a fresh full-partition scan"
+    )
+
+
+def test_load_people_embedding_index_uses_blob_instead_of_scanning_tables(
+    clustering_tables, monkeypatch,
+):
+    """_load_people_embedding_index's blob-first branch must find a fresh
+    people-embedding-index blob and use it, without needing to scan
+    person_table_client/face_table_client at all -- the whole point of the
+    durable index for a freshly-scaled-up worker replica's first call."""
+    face_table, person_table = clustering_tables
+    user_id = 'lib-A'
+    blob_service = _FakeBlobServiceClient()
+    monkeypatch.setitem(storage_utils._CTX, 'blob_service_client', blob_service)
+    monkeypatch.setitem(storage_utils._CTX, 'blob_people_embedding_index_container', 'people-embedding-index')
+    # storage_utils._build_user_people_embedding_index_snapshot reads its own
+    # _CTX-level table clients (separate from app.py's globals this fixture
+    # already patched) -- point both at the same fixture tables so the blob
+    # build sees the exact data app.py's own scan would have.
+    monkeypatch.setitem(storage_utils._CTX, 'person_table_client', person_table)
+    monkeypatch.setitem(storage_utils._CTX, 'face_table_client', face_table)
+
+    _seed_person(person_table, user_id, 'person-1', ['face-1'], PERSON_A_EMBEDDING, name='Alice')
+    _seed_face(face_table, user_id, 'face-1', 'photo.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    storage_utils.refresh_user_people_embedding_index(user_id)
+
+    # Sabotage the live tables -- if _load_people_embedding_index fell
+    # through to its Table-scan path instead of using the blob, it would
+    # find nothing and return an empty index.
+    person_table.rows.clear()
+    face_table.rows.clear()
+
+    index = app._load_people_embedding_index(user_id)
+
+    assert len(index) == 1
+    assert index[0]['personId'] == 'person-1'
+    assert index[0]['name'] == 'Alice'
+    assert index[0]['faceIds'] == ['face-1']
+    # pytest.approx -- the blob stores embeddings as float32 (same as the
+    # photo vector index), so a float64 round trip loses precision in the
+    # last couple of digits; this is expected, not a correctness bug.
+    assert index[0]['repEmbedding'] == pytest.approx(PERSON_A_EMBEDDING, rel=1e-6)
 
 
 def test_no_match_creates_exactly_one_new_unnamed_person(clustering_tables):
@@ -260,6 +556,19 @@ def test_batched_normalize_agrees_with_per_entry_reference_including_mixed_dimen
 # cover the worker-side 'people_incremental_assign' dispatch that now does
 # the work _queue_people_clustering_after_face_processing used to do itself.
 
+@pytest.mark.parametrize('stored_ids, ready, expected', [(['accepted-face'], True, 1), ([], True, 0), (['accepted-face'], False, 0)])
+def test_partial_failed_pass_queues_only_persisted_embeddings(monkeypatch, stored_ids, ready, expected):
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'faiss')
+    queued = []
+    monkeypatch.setattr(app, '_enqueue_incremental_assign_job', lambda *args: queued.append(args))
+    app._queue_people_clustering_after_face_processing('lib-A', 'photo.jpg', {
+        'face_status': 'failed', 'faceCount': 1,
+        'processing_metadata': json.dumps({'client_face': {'storedFaceIds': stored_ids, 'embeddingsReady': ready}}),
+    })
+    assert len(queued) == expected
+
+
 def test_incremental_assign_job_matches_awaiting_face_to_existing_person(clustering_tables, monkeypatch):
     face_table, person_table = clustering_tables
     user_id = 'lib-A'
@@ -333,3 +642,67 @@ def test_incremental_assign_job_skips_deleted_photo(clustering_tables, monkeypat
     )
 
     assert assign_calls == []
+
+
+def test_multi_face_message_does_not_rescan_partitions_per_face(monkeypatch):
+    """Regression test: a group photo with N faces that each match a
+    DIFFERENT existing person used to pay for a fresh full-partition scan
+    of both the person and face tables on every face after the first --
+    _add_face_to_person's internal _remove_face_from_other_people and
+    _compute_rep_embedding_for_face_ids calls read the global
+    _person_scan_cache/_face_summary_scan_cache directly, which this same
+    loop's own prior-face writes had just invalidated via
+    _InvalidatingTableClient's blanket invalidate-on-write. Both helpers
+    now take this call's own local snapshots instead, so the per-face
+    query count must stay flat regardless of how many faces are in the
+    message."""
+    face_table = FakeTable()
+    person_table = _EtagAwareFakeTable()
+    app.face_table_client = app._InvalidatingTableClient(face_table, app._invalidate_people_scan_cache)
+    app.person_table_client = app._InvalidatingTableClient(person_table, app._invalidate_people_scan_cache)
+    app._person_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._face_summary_scan_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    app._people_embedding_index_cache = app._UserScanCache(app.PEOPLE_SCAN_CACHE_TTL_SECONDS)
+    face_embeddings_table = _FaceEmbeddingsFakeTable()
+    monkeypatch.setitem(storage_utils._CTX, 'face_embeddings_table_client', face_embeddings_table)
+
+    user_id = 'lib-A'
+    _seed_person(person_table, user_id, 'person-1', ['old-face-1'], PERSON_A_EMBEDDING, name='Alice')
+    _seed_person(person_table, user_id, 'person-2', ['old-face-2'], PERSON_B_EMBEDDING, name='Bob')
+    _seed_face(face_table, user_id, 'old-face-1', 'earlier1.jpg', PERSON_A_EMBEDDING, personId='person-1', confidence=0.95)
+    _seed_face(face_table, user_id, 'old-face-2', 'earlier2.jpg', PERSON_B_EMBEDDING, personId='person-2', confidence=0.95)
+    _seed_face(face_table, user_id, 'new-face-1', 'group.jpg', PERSON_A_EMBEDDING_CLOSE, confidence=0.95)
+    _seed_face(face_table, user_id, 'new-face-2', 'group.jpg', PERSON_B_EMBEDDING_CLOSE, confidence=0.95)
+    for row_key, emb in (('old-face-1', PERSON_A_EMBEDDING), ('old-face-2', PERSON_B_EMBEDDING)):
+        face_embeddings_table.upsert_entity({'PartitionKey': user_id, 'RowKey': row_key, 'embedding': json.dumps(emb)})
+
+    face_query_calls = {'count': 0}
+    person_query_calls = {'count': 0}
+    original_face_query = face_table.query_entities
+    original_person_query = person_table.query_entities
+
+    def _counting_face_query(*args, **kwargs):
+        face_query_calls['count'] += 1
+        return original_face_query(*args, **kwargs)
+
+    def _counting_person_query(*args, **kwargs):
+        person_query_calls['count'] += 1
+        return original_person_query(*args, **kwargs)
+
+    face_table.query_entities = _counting_face_query
+    person_table.query_entities = _counting_person_query
+
+    assignments, _created = app._assign_faces_to_people_incrementally(
+        user_id, 'group.jpg', ['new-face-1', 'new-face-2'],
+    )
+
+    assert assignments == {'new-face-1': 'person-1', 'new-face-2': 'person-2'}
+    # One face-partition scan (the top-of-function face-summary snapshot)
+    # and one person-partition scan (the top-of-function person-rows
+    # snapshot) regardless of face count -- not one of each per face.
+    assert face_query_calls['count'] == 1, (
+        f"expected exactly 1 face-partition scan for a 2-face message, got {face_query_calls['count']}"
+    )
+    assert person_query_calls['count'] == 1, (
+        f"expected exactly 1 person-partition scan for a 2-face message, got {person_query_calls['count']}"
+    )

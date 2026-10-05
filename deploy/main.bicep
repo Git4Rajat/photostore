@@ -37,7 +37,7 @@ param adminPassword string
   'Australia'
   'United Kingdom'
 ])
-param emailDataLocation string = 'United States'
+param emailDataLocation string = 'Europe'
 
 @description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new ipworker container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running ipworker (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and ipworker both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
 @allowed([
@@ -55,6 +55,19 @@ param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 
 @description('Public ipworker image. Only pulled/deployed when processingMode is "backend" or "both". Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment.')
 param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
+
+@description('Quota in GiB for the dedicated worker FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
+@minValue(1)
+@maxValue(5120)
+param workerFileShareQuotaGiB int = 100
+
+@description('Minimum clustering worker replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
+@minValue(0)
+@maxValue(1)
+param workerMinReplicas int = 0
+
+@description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps console/system logs to. Leave blank (the one-click-deploy default) for no log destination. Required on every redeploy of an EXISTING environment that already has this wired up -- the managedEnvironment resource replaces its properties wholesale, so omitting this on a redeploy silently disconnects logging even if it was set up out-of-band or by a previous deploy.')
+param logAnalyticsWorkspaceName string = ''
 
 // Create the resource group that will hold everything.
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
@@ -76,6 +89,9 @@ module app 'resources.bicep' = {
     backendImage: backendImage
     frontendImage: frontendImage
     ipworkerImage: ipworkerImage
+    workerFileShareQuotaGiB: workerFileShareQuotaGiB
+    workerMinReplicas: workerMinReplicas
+    logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
   }
 }
 

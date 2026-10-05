@@ -52,66 +52,55 @@ def geocode_reverse():
 def performance_throughput():
     return app.jsonify(app._get_throughput_metrics())
 
-@system_bp.route('/api/jobs/status', methods=['GET'])
-@system_bp.route('/jobs/status', methods=['GET'])
-def jobs_status():
-    """Return the current user's recent background jobs so the in-app notifier
-    can surface completions (reclustering, find-more-faces, library cleanup,
-    preview generation, ...). Includes anything still queued/running plus jobs
-    that finished within the recent window; the client dedupes what it has
-    already shown so a completed job is only ever announced once.
-    """
-    try:
-        user_id, error = app._require_user_id()
-        if error:
-            return error
-        if app.jobs_table_client is None:
-            return app.jsonify({'jobs': []})
-        cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(minutes=app.JOB_STATUS_WINDOW_MINUTES)).isoformat()
-        # A job of ANY type (clustering, ipwork, library_clean, preview, ...)
-        # this old and still queued/running is dead, not in-flight — the
-        # worker/ipworker crashed mid-job (e.g. OOM) and never wrote a
-        # terminal status. This used to only cover job_type == 'clustering'
-        # (mirroring _has_active_clustering_job's de-dupe cutoff), but any job
-        # type can be orphaned the same way — an old stuck 'ipwork' row was
-        # found stuck 15 days "running", keeping the server-processing
-        # indicator on forever with nothing left to actually process. Without
-        # this cutoff a dead row shows as perpetually "in flight" and its
-        # activity indicator never clears.
-        stale_cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(minutes=app.CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
-        try:
-            # Jobs are userId-partitioned (library_clean/library_download are
-            # mirrored into the initiator's userId partition too -- see
-            # _upsert_job_status), so this is a normal scoped partition query,
-            # not the fleet-wide 219k+-row scan this used to share with
-            # _has_active_clustering_job.
-            rows = list(app.jobs_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))
-        except Exception:
-            app.app.logger.exception('Failed to query job status rows for %s', user_id)
-            return app.jsonify({'jobs': []})
-        jobs = []
-        for row in rows:
-            status = str(row.get('status') or '').lower()
-            updated_at = str(row.get('updatedAt') or '')
-            job_type = str(row.get('jobType') or '')
-            if status in {'queued', 'running'} and updated_at and updated_at < stale_cutoff:
-                # Passing libraryId through (when present) re-derives the same
-                # authoritative partition_key as the original write, so this
-                # updates the real (library_clean/library_download) row, not
-                # just this userId-partition mirror.
-                app._upsert_job_status(
-                    str(row.get('jobId') or ''), user_id, job_type, 'failed',
-                    error='Job did not finish (worker restarted or timed out)',
-                    libraryId=row.get('libraryId'),
-                )
-                continue
-            # Keep in-flight jobs, plus terminal ones that finished recently.
-            # updatedAt is a UTC isoformat string, so lexicographic comparison
-            # against the cutoff is a valid recency test.
-            if status in {'queued', 'running'} or updated_at >= cutoff:
-                jobs.append(app._humanize_job(row))
-        jobs.sort(key=lambda job: job.get('updatedAt') or '', reverse=True)
-        return app.jsonify({'jobs': jobs[:50]})
-    except Exception as exc:
-        app.app.logger.exception('Job status route failed')
-        return app.jsonify({'jobs': [], 'error': 'Internal server error'}), 500
+# jobs_status moved to routes/tools.py (APP_ROLE=tools) 2026-10-01: polled
+# continuously by every session (every ~15-30s, indefinitely), competing with
+# interactive gallery/photo traffic for backend's thin GUNICORN_WORKERS=2/
+# THREADS=2 pool -- the same scarce resource the 2026-10-01 crash-loop fix
+# was about. tools has no such contention (no interactive request traffic),
+# so this background polling belongs there instead.
+
+
+_CLIENT_PERF_FIELDS = {
+    'req': ('method', 'path', 'status', 'ms', 'ttfbMs', 'serverMs', 'storageMs', 'bytes', 'rid', 'attempt', 'coalesced', 'queuedMs', 'view', 'ok'),
+    'resource': ('kind', 'host', 'path', 'ms', 'cached', 'bytes', 'n', 'view'),
+    'span': ('name', 'ms', 'view', 'bytes', 'rows', 'cached', 'n'),
+    'dup': ('kind', 'key', 'n', 'windowMs', 'view'),
+    'vital': ('name', 'value', 'view'),
+    'view': ('name', 'ms', 'requests', 'netMs', 'dups', 'bytes', 'resources', 'cachedResources', 'longTasks', 'longTaskMs'),
+    'summary': ('windowMs', 'requests', 'failed', 'dups', 'bytes', 'slowest', 'chattiest', 'dupBlobs', 'resources', 'cachedResources', 'longTasks', 'longTaskMs'),
+}
+_CLIENT_PERF_MAX_EVENTS = 300
+
+
+def _clean_perf_value(value) -> str:
+    text = str(value).replace('\n', ' ').replace('\r', ' ').replace(' ', '_')
+    return text.split('?', 1)[0][:160]  # never log query strings (SAS tokens)
+
+
+@system_bp.route('/api/perf/client', methods=['POST'])
+def client_perf_report():
+    """Browser-side performance events (request timings, duplicate fetches,
+    resource-cache behaviour, view summaries). Logged as `PERF event=client_*`
+    lines next to the backend's own, joinable on `rid`/`sess`. Never fails the
+    caller; unknown fields are dropped and values are length-capped."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    body = app.request.get_json(silent=True) or {}
+    events = body.get('events')
+    if not isinstance(events, list):
+        return app.jsonify({'ok': True, 'accepted': 0})
+    session = _clean_perf_value(body.get('session') or '-')[:16]
+    logger = app.logging.getLogger('perf')
+    accepted = 0
+    for event in events[:_CLIENT_PERF_MAX_EVENTS]:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get('t') or '')
+        fields = _CLIENT_PERF_FIELDS.get(kind)
+        if not fields:
+            continue
+        rendered = ' '.join(f'{name}={_clean_perf_value(event[name])}' for name in fields if event.get(name) is not None)
+        logger.info('PERF event=client_%s user=%s sess=%s %s', kind, _clean_perf_value(user_id), session, rendered)
+        accepted += 1
+    return app.jsonify({'ok': True, 'accepted': accepted})

@@ -1,63 +1,120 @@
-import React from 'react';
-import { PlusIcon } from '@heroicons/react/24/outline';
-import { Menu } from './bits';
+import React, { useMemo, useState } from 'react';
+import { Plus as PlusIcon, Search as SearchIcon } from 'lucide-react';
+import { BottomSheet } from './BottomSheet';
 import { useStore } from '../store';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
+import { promptDialog } from '../../../components/shared/dialogs';
 
 /**
- * "Add to album" popover — lists existing albums (with covers) and a create
- * option. Reused by the selection command bar and the photo viewer.
+ * Controlled "Add to album" bottom sheet: lists every album (with a search
+ * field for large libraries) plus a "New album" action. It portals to <body>,
+ * so it's rendered on its own (not inside a popover menu whose outside-click
+ * handler would tear it down while the user is interacting with the sheet).
  */
-export const AddToAlbumMenu: React.FC<{
+export const AddToAlbumSheet: React.FC<{
+    open: boolean;
+    onClose: () => void;
     photoIds: string[];
-    renderTrigger: (toggle: () => void, open: boolean) => React.ReactNode;
-    align?: 'left' | 'right';
-}> = ({ photoIds, renderTrigger, align = 'left' }) => {
+    // Fired after photos are actually added (not on a plain cancel/close) --
+    // lets the selection command bar clear its selection the way iOS Photos
+    // does once the add completes, instead of leaving it stuck selected.
+    onAdded?: () => void;
+}> = ({ open, onClose, photoIds, onAdded }) => {
     const { albums, addPhotosToAlbum, createAlbum } = useStore();
+    const [query, setQuery] = useState('');
     const covers = useProtectedBlobUrls(
         albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)),
     );
 
+    const close = () => { setQuery(''); onClose(); };
+
+    const filtered = useMemo(() => {
+        const q = query.trim().toLowerCase();
+        return q ? albums.filter((a) => a.name.toLowerCase().includes(q)) : albums;
+    }, [albums, query]);
+
+    const createNew = () => {
+        void (async () => {
+            const name = await promptDialog({
+                title: 'New album',
+                label: 'Album name',
+                defaultValue: query.trim() || 'New album',
+                placeholder: 'e.g. Summer trip',
+                confirmLabel: 'Create',
+            });
+            if (name === null) return; // cancelled
+            const id = await createAlbum(name.trim() || 'New album');
+            if (id) { addPhotosToAlbum(id, photoIds); onAdded?.(); }
+            close();
+        })();
+    };
+
     return (
-        <Menu renderTrigger={renderTrigger} align={align}>
-            {(close) => (
-                <div className="pt-album-menu">
-                    <div className="pt-menu-label">Add to album</div>
-                    {albums.map((a) => (
-                        <button
-                            key={a.id}
-                            type="button"
-                            className="pt-album-menu-row"
-                            onClick={() => {
-                                addPhotosToAlbum(a.id, photoIds);
-                                close();
-                            }}
-                        >
-                            {a.coverThumbnailUrl && covers[a.coverThumbnailUrl] ? (
-                                <img className="pt-album-menu-cover" src={covers[a.coverThumbnailUrl]} alt="" />
-                            ) : (
-                                <span className="pt-album-menu-cover empty" />
-                            )}
-                            <span className="pt-album-menu-name">{a.name}</span>
-                            <span className="pt-album-menu-count">{a.photoCount}</span>
-                        </button>
-                    ))}
-                    <button
-                        type="button"
-                        className="pt-album-menu-new"
-                        onClick={() => {
-                            void (async () => {
-                                const id = await createAlbum('New album');
-                                if (id) addPhotosToAlbum(id, photoIds);
-                                close();
-                            })();
-                        }}
-                    >
-                        <PlusIcon /> New album from selection
-                    </button>
+        <BottomSheet open={open} onClose={close} title={`Add ${photoIds.length} to album`}
+            header={(
+                <div className="pt-sheet-search">
+                    <SearchIcon />
+                    <input
+                        type="text"
+                        placeholder="Search albums…"
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        aria-label="Search albums"
+                    />
                 </div>
             )}
-        </Menu>
+        >
+            <button type="button" className="pt-sheet-new" onClick={createNew}>
+                <span className="pt-sheet-new-icon"><PlusIcon /></span>
+                <span className="pt-sheet-new-label">New Album{query.trim() ? ` “${query.trim()}”` : ''}</span>
+            </button>
+            <div className="pt-sheet-albums">
+                {filtered.map((a) => (
+                    <button
+                        key={a.id}
+                        type="button"
+                        className="pt-sheet-album"
+                        onClick={() => { addPhotosToAlbum(a.id, photoIds); onAdded?.(); close(); }}
+                    >
+                        {a.coverThumbnailUrl && covers[a.coverThumbnailUrl] ? (
+                            <img className="pt-sheet-album-cover" src={covers[a.coverThumbnailUrl]} alt="" />
+                        ) : (
+                            <span className="pt-sheet-album-cover empty" />
+                        )}
+                        <span className="pt-sheet-album-meta">
+                            <b>{a.name}</b>
+                            <span>{a.photoCount} photo{a.photoCount === 1 ? '' : 's'}</span>
+                        </span>
+                    </button>
+                ))}
+                {filtered.length === 0 && (
+                    <p className="pt-sheet-empty">
+                        {albums.length === 0 ? 'No albums yet — create your first one above.' : `No albums match “${query.trim()}”.`}
+                    </p>
+                )}
+            </div>
+        </BottomSheet>
+    );
+};
+
+/**
+ * Trigger-driven wrapper around AddToAlbumSheet for call sites that render their
+ * own button (the photo viewer). The selection command bar uses AddToAlbumSheet
+ * directly instead, since its trigger lives inside a popover menu.
+ */
+export const AddToAlbumMenu: React.FC<{
+    photoIds: string[];
+    renderTrigger: (toggle: () => void, open: boolean) => React.ReactNode;
+    // Accepted for call-site compatibility with the old popover API; the sheet
+    // is always centred/bottom-anchored, so it's otherwise unused.
+    align?: 'left' | 'right';
+}> = ({ photoIds, renderTrigger }) => {
+    const [open, setOpen] = useState(false);
+    return (
+        <>
+            {renderTrigger(() => setOpen((v) => !v), open)}
+            <AddToAlbumSheet open={open} onClose={() => setOpen(false)} photoIds={photoIds} />
+        </>
     );
 };
 

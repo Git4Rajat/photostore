@@ -1,10 +1,13 @@
+import { onIndexReady, reportIndexBuilding } from '../../services/indexBuilding';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
-import { get, post } from '../../services/apiClient';
-import { getLocalSortIndex, patchLocalSortIndexRow } from '../../services/localSortIndex';
+import { get, getExtras, post } from '../../services/apiClient';
+import { getLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, type SortIndexRow } from '../../services/localSortIndex';
+import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
-import { getLocalPeopleIndex, invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
+import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
+import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/gridCapacity';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
@@ -29,7 +32,28 @@ import type {
 // ---- backend <-> prototype photo mapping -------------------------------------
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const PAGE_SIZE = 100;
+const PAGE_SIZE = 100; // legacy /photos fallback page size
+// lookup-batch accepts <=200 filenames; enrich in parallel chunks of this size.
+const ENRICH_CHUNK = 100;
+
+// The sort/albums/people local indexes all report "unavailable" immediately
+// on a cold account instead of blocking (their backend routes kick a
+// background rebuild and return right away) -- see the 2026-09-29 forenkla-qa
+// HAR investigation. Each caller below used to treat that first null as
+// final and fall straight through to its O(library size) legacy endpoint,
+// which is exactly the multi-second-to-minutes cost the index exists to
+// avoid. A short bounded retry gives the just-kicked-off rebuild a chance to
+// land before paying that cost -- and still falls back for a genuinely
+// unavailable index (network error, feature not supported) after 3 tries.
+const withIndexRetry = async <T,>(fetchIndex: () => Promise<T | null>): Promise<T | null> => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        const result = await fetchIndex();
+        if (result) return result;
+        if (isServerPagedLibrary()) return null;   // too big for a client index: retrying cannot help
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+    return null;
+};
 
 // Stable placeholder swatch derived from the filename, so a photo shows the same
 // tint every render while its real thumbnail loads.
@@ -42,7 +66,7 @@ const swatchFor = (filename: string): SwatchKey => {
     return `s${n}` as SwatchKey;
 };
 
-const mapPhoto = (b: BackendPhoto): Photo => {
+export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMediaToken()): Photo => {
     const iso = b.captureDate || b.uploadDate || b.lastModified || null;
     const date = iso ? new Date(iso) : null;
     const valid = date && !Number.isNaN(date.getTime()) ? date : null;
@@ -58,12 +82,80 @@ const mapPhoto = (b: BackendPhoto): Photo => {
         placeId: null,
         personIds: (b.people ?? []).map((p) => p.personId),
         tags: b.tags ?? [],
-        thumbnailUrl: b.thumbnailUrl,
+        // Token mode: the backend sends a blob name and the browser builds the
+        // direct URL; otherwise (or for proxy fallbacks) the backend's URL.
+        thumbnailUrl: (b.thumbnailBlob && token ? thumbnailUrlForBlob(b.thumbnailBlob, token) : '') || b.thumbnailUrl,
         rotation: b.rotation,
         thumbnailRotation: b.thumbnailRotation,
         captureDate: iso,
         processing: b.processing,
     };
+};
+
+// Backend-free first paint: a Photo built from nothing but a sort-index row and
+// the media token. Metadata the index doesn't carry (people, tags, per-user
+// "liked", processing status, thumbnail rotation) arrives with the background
+// lookup-batch enrichment and replaces this entry by id.
+const provisionalPhoto = (row: SortIndexRow, token: MediaToken | null): Photo => {
+    const iso = row.captureDate || row.uploadDate || null;
+    const date = iso ? new Date(iso) : null;
+    const valid = date && !Number.isNaN(date.getTime()) ? date : null;
+    return {
+        id: row.filename,
+        filename: row.filename,
+        swatch: swatchFor(row.filename),
+        dateLabel: valid ? `${MONTHS[valid.getMonth()]} ${valid.getDate()}, ${valid.getFullYear()}` : 'Undated',
+        year: valid ? valid.getFullYear() : 0,
+        rating: row.rating,
+        liked: false,
+        likes: row.likes,
+        placeId: null,
+        personIds: [],
+        tags: [],
+        thumbnailUrl: thumbnailUrlForBlob(row.thumb, token) || undefined,
+        captureDate: iso,
+    };
+};
+
+interface PeoplePageRow { personId: string; name: string; isNamed: boolean; faceCount: number; coverFaceId?: string }
+interface PeoplePageResponse {
+    available?: boolean; rows?: PeoplePageRow[]; total?: number; hasMore?: boolean;
+    namedCount?: number; unnamedCount?: number;
+}
+const PEOPLE_PAGE = 120;
+const mapPersonRow = (r: PeoplePageRow): Person => ({
+    id: r.personId,
+    name: r.isNamed && (r.name ?? '').trim() ? r.name : null,
+    swatch: swatchFor(r.personId),
+    photoIds: [],
+    // The avatar loader turns this into a direct storage URL (face-crop token); the path is only the
+    // fallback that generates a crop that doesn't exist yet.
+    coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
+    faceCount: r.faceCount,
+});
+
+const facesToPhotos = (faces: PersonFace[]): Photo[] => {
+    const seen = new Set<string>();
+    const out: Photo[] = [];
+    for (const face of faces) {
+        const filename = face.filename;
+        if (!filename || seen.has(filename)) continue;
+        seen.add(filename);
+        out.push({
+            id: filename,
+            filename,
+            swatch: swatchFor(filename),
+            dateLabel: '',
+            year: 0,
+            rating: 0,
+            liked: false,
+            placeId: null,
+            personIds: [],
+            tags: [],
+            thumbnailUrl: face.thumbnailUrl,
+        });
+    }
+    return out;
 };
 
 const mapPerson = (p: PersonSummary): Person => {
@@ -107,29 +199,6 @@ const mapThing = (g: ExploreGroup): ThingTag => ({
 });
 
 // Build the set of distinct photos a person appears in, from their face list.
-const facesToPhotos = (faces: PersonFace[]): Photo[] => {
-    const seen = new Set<string>();
-    const out: Photo[] = [];
-    for (const face of faces) {
-        const filename = face.filename;
-        if (!filename || seen.has(filename)) continue;
-        seen.add(filename);
-        out.push({
-            id: filename,
-            filename,
-            swatch: swatchFor(filename),
-            dateLabel: '',
-            year: 0,
-            rating: 0,
-            liked: false,
-            placeId: null,
-            personIds: [],
-            tags: [],
-            thumbnailUrl: face.thumbnailUrl,
-        });
-    }
-    return out;
-};
 
 interface ViewerState {
     ids: string[];
@@ -202,6 +271,10 @@ interface Store {
     // explore (places / things from /explore)
     exploreLoading: boolean;
     reloadExplore: () => void;
+    // Promise-returning counterpart of reloadExplore, for callers (the
+    // Explore tab's own mount effect) that need to queue/await/cancel it
+    // instead of firing it unconditionally -- see that page's mount effect.
+    fetchExplore: () => Promise<void>;
 
     // lookups
     photoById: (id: string) => Photo | undefined;
@@ -220,6 +293,11 @@ interface Store {
     toggleSelect: (id: string) => void;
     selectMany: (ids: string[]) => void;
     clearSelection: () => void;
+    // iOS-style explicit selection mode: photo grids only show checkboxes and
+    // treat a tap as "toggle selection" while this is on, so scrolling can't
+    // trigger accidental selections. Reset on navigate / clear.
+    selectMode: boolean;
+    setSelectMode: (on: boolean) => void;
 
     // viewer
     openViewer: (ids: string[], index: number, opts?: { extendable?: boolean }) => void;
@@ -246,9 +324,14 @@ interface Store {
     // albums (server-backed)
     albumsLoading: boolean;
     reloadAlbums: () => void;
+    // Promise-returning counterpart of reloadAlbums -- see fetchExplore above.
+    fetchAlbums: () => Promise<void>;
     openAlbum: (id: string) => void;
     albumPhotosById: (id: string) => Photo[] | undefined;
-    albumPhotosLoading: boolean;
+    isAlbumPhotosLoading: (id: string) => boolean;
+    loadMoreAlbumPhotos: (id: string) => void;
+    albumPhotosTotal: (id: string) => number | undefined;
+    albumPhotosHasMore: (id: string) => boolean;
     createAlbum: (name?: string) => Promise<string>;
     autoCreateAlbum: (rule: string) => Promise<{ albumId: string; count: number; message?: string }>;
     renameAlbum: (id: string, name: string) => void;
@@ -260,9 +343,24 @@ interface Store {
 
     // people (server-backed)
     peopleLoading: boolean;
+    /** Clusters in the library / how many still need a name (the list below loads a screenful at a time). */
+    peopleTotal: number;
+    peopleUnnamedTotal: number;
+    peopleHasMore: boolean;
+    /** The server's paged people list could not be loaded (index still building, or a network error). */
+    peopleUnavailable: boolean;
+    loadMorePeople: () => void;
+    /** Server-side name search (not stored in the list). */
+    searchPeople: (query: string, limit?: number) => Promise<Person[]>;
     reloadPeople: () => void;
+    // Promise-returning counterpart of reloadPeople -- see fetchExplore above.
+    fetchPeople: () => Promise<void>;
     openPerson: (id: string) => void;
     personPhotosById: (id: string) => Photo[] | undefined;
+    /** Total photos of the person on the server (the list below fills in a screenful at a time). */
+    personPhotosTotal: (id: string) => number | undefined;
+    personPhotosHasMore: (id: string) => boolean;
+    loadMorePersonPhotos: (id: string) => void;
     personPhotosLoading: boolean;
     renamePerson: (id: string, name: string) => void;
     mergePeople: (sourceId: string, targetId: string) => void;
@@ -272,13 +370,15 @@ interface Store {
 
     // members / sharing (server-backed shared libraries)
     reloadMembers: () => void;
+    // Promise-returning counterpart of reloadMembers -- see fetchExplore above.
+    fetchMembers: () => Promise<void>;
     invite: (email: string, targetType: 'join' | 'fresh') => void;
     revokeInvite: (inviteId: string) => void;
     removeMember: (userId: string) => void;
     renameLibrary: (name: string) => void;
 
     // toasts
-    toast: (message: string, actionLabel?: string, onAction?: () => void) => void;
+    toast: (message: string, actionLabel?: string, onAction?: () => void, tone?: 'info' | 'error') => void;
     dismissToast: (id: string) => void;
 }
 
@@ -307,14 +407,24 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // /api/photos/lookup-batch instead of GET /albums/<id>'s sequential
     // per-photo point-read loop. Empty (album not found here) means the
     // fallback path (GET /albums/<id>) should be used instead.
-    const albumFilenamesRef = useRef<Record<string, string[]>>({});
     const [albumPhotos, setAlbumPhotos] = useState<Record<string, Photo[]>>({});
-    const [albumPhotosLoading, setAlbumPhotosLoading] = useState<boolean>(false);
+    // Keyed per album id -- a single shared flag raced when switching albums
+    // quickly: a fast fetch for album B finishing after a slow fetch for album
+    // A was still in flight cleared the flag for both, so A's still-loading,
+    // still-undefined photo list briefly read as "no photos in this album".
+    const [albumPhotosLoadingIds, setAlbumPhotosLoadingIds] = useState<Record<string, boolean>>({});
     const [placesState, setPlacesState] = useState<Place[]>([]);
     const [thingsState, setThingsState] = useState<ThingTag[]>([]);
     const [exploreLoading, setExploreLoading] = useState<boolean>(true);
     const [people, setPeople] = useState<Person[]>([]);
     const [peopleLoading, setPeopleLoading] = useState<boolean>(true);
+    const [peopleTotal, setPeopleTotal] = useState(0);
+    const [peopleUnnamedTotal, setPeopleUnnamedTotal] = useState(0);
+    const [peopleHasMore, setPeopleHasMore] = useState(false);
+    const [peopleUnavailable, setPeopleUnavailable] = useState(false);
+    const [extraPeople, setExtraPeople] = useState<Record<string, Person>>({});
+    const peopleOffsetRef = useRef(0);
+    const peopleLoadingMoreRef = useRef(false);
     const [personPhotos, setPersonPhotos] = useState<Record<string, Photo[]>>({});
     const [personPhotosLoading, setPersonPhotosLoading] = useState<boolean>(false);
     const [members, setMembers] = useState<LibraryMember[]>([]);
@@ -328,6 +438,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [albumTrash, setAlbumTrash] = useState<AlbumTrashItem[]>([]);
     const [albumTrashLoading, setAlbumTrashLoading] = useState<boolean>(false);
     const [selection, setSelection] = useState<string[]>([]);
+    const [selectMode, setSelectModeState] = useState<boolean>(false);
     const [viewer, setViewer] = useState<ViewerState | null>(null);
     const [toasts, setToasts] = useState<Toast[]>([]);
     const toastTimers = useRef<Record<string, number>>({});
@@ -370,22 +481,25 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [photoIndex],
     );
     const albumById = useCallback((id: string) => albums.find((a) => a.id === id), [albums]);
-    const personById = useCallback((id: string) => people.find((p) => p.id === id), [people]);
+    const personById = useCallback((id: string) => people.find((p) => p.id === id) ?? extraPeople[id], [people, extraPeople]);
 
-    // Legacy server-paged fetch (was the only path; now the fallback -- see
-    // fetchPhotos below). Materializes and sorts the whole library
-    // server-side per request, which is the O(library size) cost the
-    // sort-index path exists to avoid; kept only so the gallery degrades
-    // gracefully instead of breaking when the sort-index is unavailable.
+    // Server-paged fetch: the gallery's path for libraries too large for a client-side sort index
+    // (see isServerPagedLibrary) and its fallback whenever the index is unavailable. The backend
+    // answers from the library database with one indexed SQL page plus a few batched row reads, so
+    // a page costs the same at 10k or 10M photos. With the media token, thumbnails are built
+    // client-side from the returned blob names (directMedia), and a page is sized to the screen.
     const fetchPhotosViaLegacyEndpoint = useCallback(async (offset: number, reset: boolean) => {
         const range = captureRangeRef.current;
         const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
-        const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
-            `/photos?sort=capture&offset=${offset}&limit=${PAGE_SIZE}${rangeQuery}`,
+        const token = getCachedMediaToken();
+        const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
+        const res = await get<{ photos?: BackendPhoto[]; total?: number; indexBuilding?: boolean; indexPartial?: boolean }>(
+            `/photos?sort=capture&offset=${offset}&limit=${pageSize}${rangeQuery}${token ? '&directMedia=1' : ''}`,
         );
-        const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
+        reportIndexBuilding('gallery', Boolean(res?.indexBuilding || res?.indexPartial));
+        const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
         photoOffsetRef.current = offset + list.length;
-        photoHasMoreRef.current = list.length === PAGE_SIZE;
+        photoHasMoreRef.current = list.length === pageSize;
         setHasMorePhotos(photoHasMoreRef.current);
         if (typeof res?.total === 'number') setTotalPhotos(res.total);
         setPhotos((prev) => (reset ? list : [...prev, ...list]));
@@ -406,7 +520,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setPhotosLoading(true);
         const offset = reset ? 0 : photoOffsetRef.current;
         try {
-            const sortIndex = await getLocalSortIndex();
+            // Token and sort index load in parallel (both are normally already warm
+            // from the session-start preload).
+            const [sortIndex, token] = await Promise.all([
+                withIndexRetry(getLocalSortIndex),
+                getMediaToken().catch(() => null),
+            ]);
             if (!sortIndex) {
                 throw new Error('sort index unavailable');
             }
@@ -432,23 +551,52 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
             });
             const total = sorted.length;
-            const pageFilenames = sorted.slice(offset, offset + PAGE_SIZE).map((row) => row.filename);
-            const lookupRes = pageFilenames.length
-                ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames })
-                : { photos: [] };
-            const byFilename = new Map((lookupRes?.photos ?? []).map((p) => [p.filename, p]));
-            // Re-order to match the sort-index's order -- lookup-batch may
-            // silently drop a filename deleted between the index build and
-            // this page fetch, so don't assume a 1:1 positional response.
-            const list = pageFilenames
-                .map((f) => byFilename.get(f))
-                .filter((p): p is BackendPhoto => Boolean(p))
-                .map(mapPhoto);
+            // With the media token, thumbnails cost no backend calls, so load as
+            // many tiles as the screen needs (a few viewports' worth) per step.
+            const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
+            const pageRows = sorted.slice(offset, offset + pageSize);
+            const pageFilenames = pageRows.map((row) => row.filename);
             photoOffsetRef.current = offset + pageFilenames.length;
             photoHasMoreRef.current = offset + pageFilenames.length < total;
             setHasMorePhotos(photoHasMoreRef.current);
             setTotalPhotos(total);
-            setPhotos((prev) => (reset ? list : [...prev, ...list]));
+            if (token && pageRows.length) {
+                // 1) Backend-free paint of the whole window.
+                const provisional = pageRows.map((row) => provisionalPhoto(row, token));
+                setPhotos((prev) => (reset ? provisional : [...prev, ...provisional]));
+                // 2) Enrich with full metadata in parallel chunks (first chunk =
+                //    the top of the window, which is what's on screen). directMedia
+                //    skips URL signing; each chunk lands as soon as it returns.
+                await Promise.all(chunk(pageFilenames, ENRICH_CHUNK).map(async (names) => {
+                    // A failed chunk is non-fatal: its tiles are already on screen
+                    // from the sort index; they just keep the provisional metadata.
+                    const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: true })
+                        .catch(() => null);
+                    if (!res) return;
+                    const byFilename = new Map((res?.photos ?? []).map((p) => [p.filename, p]));
+                    const enriched = new Map<string, Photo>();
+                    for (const f of names) {
+                        const b = byFilename.get(f);
+                        if (b) enriched.set(f, mapPhoto(b, token));
+                    }
+                    const nameSet = new Set(names);
+                    // lookup-batch may drop a filename deleted since the index build.
+                    setPhotos((prev) => prev
+                        .filter((p) => !nameSet.has(p.id) || enriched.has(p.id))
+                        .map((p) => enriched.get(p.id) ?? p));
+                }));
+            } else {
+                // No token (proxy mode): same as before -- wait for lookup-batch.
+                const lookupRes = pageFilenames.length
+                    ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames })
+                    : { photos: [] };
+                const byFilename = new Map((lookupRes?.photos ?? []).map((p) => [p.filename, p]));
+                const list = pageFilenames
+                    .map((f) => byFilename.get(f))
+                    .filter((p): p is BackendPhoto => Boolean(p))
+                    .map((p) => mapPhoto(p, null));
+                setPhotos((prev) => (reset ? list : [...prev, ...list]));
+            }
         } catch {
             try {
                 await fetchPhotosViaLegacyEndpoint(offset, reset);
@@ -462,8 +610,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, [fetchPhotosViaLegacyEndpoint]);
 
+    // Queued (not called directly) so this doesn't race fetchTimeline below
+    // for the same backend -- both used to fire in the same mount tick.
+    // Interactive callers (loadMorePhotos, reloadPhotos, setCaptureRange,
+    // the viewer-prefetch effect below) deliberately call fetchPhotos
+    // directly, not through the queue -- scrolling/pagination needs to stay
+    // immediate, not wait behind other boot/tab work. See the 2026-10-01
+    // boot-request audit.
     useEffect(() => {
-        void fetchPhotos(true);
+        void enqueueBackgroundRequest(() => fetchPhotos(true)).catch(() => {});
     }, [fetchPhotos]);
 
     const loadMorePhotos = useCallback(() => { void fetchPhotos(false); }, [fetchPhotos]);
@@ -483,8 +638,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, []);
 
+    // Queued behind fetchPhotos above -- see that effect's comment.
     useEffect(() => {
-        void fetchTimeline();
+        void enqueueBackgroundRequest(() => fetchTimeline()).catch(() => {});
     }, [fetchTimeline]);
 
     // Narrow the gallery to a capture-date window (from the timeline rail) and
@@ -535,13 +691,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, []);
 
     const toast = useCallback(
-        (message: string, actionLabel?: string, onAction?: () => void) => {
+        (message: string, actionLabel?: string, onAction?: () => void, tone: 'info' | 'error' = 'info') => {
             const id = nextId();
-            setToasts((prev) => [...prev, { id, message, actionLabel, onAction }]);
+            setToasts((prev) => [...prev, { id, message, actionLabel, onAction, tone }]);
             toastTimers.current[id] = window.setTimeout(() => {
                 setToasts((prev) => prev.filter((t) => t.id !== id));
                 delete toastTimers.current[id];
-            }, 4200);
+                // Errors linger a little longer so a failure isn't missed.
+            }, tone === 'error' ? 6500 : 4200);
         },
         [],
     );
@@ -549,6 +706,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const navigate = useCallback((page: PageId, params: RouteParams = {}) => {
         setRoute({ page, params });
         setSelection([]);
+        setSelectModeState(false);
         setViewer(null);
         window.scrollTo(0, 0);
     }, []);
@@ -557,7 +715,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setSelection((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
     }, []);
     const selectMany = useCallback((ids: string[]) => setSelection(ids), []);
-    const clearSelection = useCallback(() => setSelection([]), []);
+    // Turning select mode off also drops the current selection; turning it on
+    // just reveals the checkboxes.
+    const setSelectMode = useCallback((on: boolean) => {
+        setSelectModeState(on);
+        if (!on) setSelection([]);
+    }, []);
+    const clearSelection = useCallback(() => { setSelection([]); setSelectModeState(false); }, []);
 
     const openViewer = useCallback((ids: string[], index: number, opts?: { extendable?: boolean }) => (
         setViewer({ ids, index, extendable: opts?.extendable })
@@ -598,20 +762,36 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // on any failure (cold index, network error) so the page never breaks.
     const fetchAlbumsViaLegacyEndpoint = useCallback(async () => {
         const res = await get<{ albums?: Album[] }>('/albums');
-        albumFilenamesRef.current = {};
         setAlbums(Array.isArray(res?.albums) ? res.albums : []);
     }, []);
 
     const fetchAlbums = useCallback(async () => {
         setAlbumsLoading(true);
         try {
-            const rows = await getLocalAlbumsIndex();
+            const rows = await withIndexRetry(getLocalAlbumsIndex);
             if (!rows) {
                 throw new Error('albums index unavailable');
             }
             const coverFilenames = rows.map((r) => r.coverFilename).filter(Boolean);
-            const covers = coverFilenames.length ? await resolveThumbnailAccessUrls(coverFilenames) : new Map<string, string>();
-            albumFilenamesRef.current = Object.fromEntries(rows.map((r) => [r.albumId, r.filenames]));
+            // Covers resolve from the sort index's thumbnail blob names + the one container
+            // token: no backend call, and the same URL the gallery uses, so the browser
+            // cache serves a thumbnail already loaded there. Only covers the sort index
+            // can't name (older rows, other formats) fall back to the per-photo batch call.
+            const [coverSortRows, coverToken] = await Promise.all([
+                getLocalSortIndex().catch(() => null),
+                getMediaToken().catch(() => null),
+            ]);
+            const thumbByName = new Map<string, string>();
+            (coverSortRows ?? []).forEach((r) => { if (r.thumb) thumbByName.set(r.filename, r.thumb); });
+            const covers = new Map<string, string>();
+            const needBatch: string[] = [];
+            coverFilenames.forEach((filename) => {
+                const direct = coverToken ? thumbnailUrlForBlob(thumbByName.get(filename), coverToken) : '';
+                if (direct) covers.set(filename, direct); else needBatch.push(filename);
+            });
+            if (needBatch.length) {
+                (await resolveThumbnailAccessUrls(needBatch)).forEach((url, filename) => covers.set(filename, url));
+            }
             const mapped: Album[] = rows.map((r) => ({
                 id: r.albumId,
                 name: r.name,
@@ -655,7 +835,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 .catch(() => {
                     setPhotos((prev) => prev.map((p) => (prevRatings.has(p.id) ? { ...p, rating: prevRatings.get(p.id)! } : p)));
                     prevRatings.forEach((prevRating, id) => patchLocalSortIndexRow(id, { rating: prevRating }));
-                    toast('Couldn’t save rating');
+                    toast('Couldn’t save rating', undefined, undefined, 'error');
                 });
         },
         [photos, toast, reloadAlbums],
@@ -684,7 +864,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                         ? { ...p, liked: Boolean(current?.liked), likes: prevLikes }
                         : p)));
                     patchLocalSortIndexRow(id, { likes: prevLikes });
-                    toast('Couldn’t update like');
+                    toast('Couldn’t update like', undefined, undefined, 'error');
                 });
         },
         [photos, toast, reloadAlbums],
@@ -752,7 +932,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const movedSet = new Set(moved.map((p) => p.id));
             setPhotos((cur) => cur.filter((p) => !movedSet.has(p.id)));
             setTrash((prev) => [...moved.map((photo) => ({ photo, purgesInDays: 30 })), ...prev]);
-            toast('Couldn’t restore photos');
+            toast('Couldn’t restore photos', undefined, undefined, 'error');
         });
     }, [toast]);
 
@@ -773,7 +953,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const set = new Set(ids);
                 setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
                 setPhotos((cur) => [...doomed, ...cur]);
-                toast('Couldn’t delete photos');
+                toast('Couldn’t delete photos', undefined, undefined, 'error');
             });
         },
         [photosByIds, removeFromEverywhere, toast, restorePhotos],
@@ -782,16 +962,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const reloadTrash = useCallback(async () => {
         setTrashLoading(true);
         try {
-            const res = await get<{ photos?: (BackendPhoto & { purgeAt?: string })[] }>('/photos/trash?limit=200');
             const now = Date.now();
-            const items: TrashItem[] = Array.isArray(res?.photos)
-                ? res.photos.map((p) => {
+            // Page through the whole trash (200 per request) so nothing past the first page is hidden.
+            const items: TrashItem[] = [];
+            for (;;) {
+                const res = await get<{ photos?: (BackendPhoto & { purgeAt?: string })[]; total?: number }>(`/photos/trash?limit=200&offset=${items.length}`);
+                const page = Array.isArray(res?.photos) ? res.photos : [];
+                items.push(...page.map((p) => {
                     const purgeAt = (p as { purgeAt?: string }).purgeAt;
                     const days = purgeAt ? Math.max(0, Math.ceil((new Date(purgeAt).getTime() - now) / 86400000)) : 30;
                     return { photo: mapPhoto(p), purgesInDays: days };
-                })
-                : [];
-            setTrash(items);
+                }));
+                setTrash(items.slice());
+                if (page.length < 200 || (typeof res?.total === 'number' && items.length >= res.total)) break;
+            }
         } catch {
             // keep the current list on failure
         } finally {
@@ -807,7 +991,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast('Restored everything from Recently Deleted'))
             .catch(() => {
                 setTrash(snapshot);
-                toast('Couldn’t restore everything');
+                toast('Couldn’t restore everything', undefined, undefined, 'error');
             });
     }, [trash, toast]);
 
@@ -816,7 +1000,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setTrash((prev) => prev.filter((t) => t.photo.id !== id));
         void post('/photos/trash/purge', { filenames: [id] }).catch(() => {
             setTrash(snapshot);
-            toast('Couldn’t delete photo');
+            toast('Couldn’t delete photo', undefined, undefined, 'error');
         });
     }, [trash, toast]);
 
@@ -829,7 +1013,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast('Recently Deleted emptied'))
             .catch(() => {
                 setTrash(snapshot);
-                toast('Couldn’t empty Recently Deleted');
+                toast('Couldn’t empty Recently Deleted', undefined, undefined, 'error');
             });
     }, [trash, toast]);
 
@@ -861,7 +1045,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         void post(`/albums/${encodeURIComponent(id)}/restore`, {}).catch(() => {
             setAlbumTrash(snapshot);
             if (restored) setAlbums((prev) => prev.filter((a) => a.id !== id));
-            toast('Couldn’t restore album');
+            toast('Couldn’t restore album', undefined, undefined, 'error');
         });
     }, [albumTrash, toast]);
 
@@ -871,13 +1055,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         invalidateLocalAlbumsIndex();
         void post(`/albums/${encodeURIComponent(id)}/purge`, {}).catch(() => {
             setAlbumTrash(snapshot);
-            toast('Couldn’t permanently delete album');
+            toast('Couldn’t permanently delete album', undefined, undefined, 'error');
         });
     }, [albumTrash, toast]);
 
-    useEffect(() => {
-        void fetchAlbums();
-    }, [fetchAlbums]);
+    // No longer fetched unconditionally on app mount -- AlbumsPage's own
+    // mount effect enqueues this (queue-managed, canceled on tab-leave) only
+    // when the user actually visits Albums. See the 2026-10-01 boot-request
+    // audit: this was one of six independent fetches StoreProvider fired in
+    // parallel in the same mount tick regardless of which tab was open.
 
     const fetchExplore = useCallback(async () => {
         setExploreLoading(true);
@@ -892,71 +1078,64 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, []);
 
-    useEffect(() => {
-        void fetchExplore();
-    }, [fetchExplore]);
+    // No longer fetched unconditionally on app mount -- see the fetchAlbums
+    // comment above; ExplorePage's own mount effect enqueues this instead.
 
     const reloadExplore = useCallback(() => { void fetchExplore(); }, [fetchExplore]);
 
-    // /api/photos/lookup-batch caps a single call at 200 filenames -- chunk
-    // and resolve chunks concurrently rather than sequentially, so a large
-    // album's cost is one round trip's worth of latency, not N.
-    const LOOKUP_BATCH_CHUNK = 200;
-    const lookupPhotosByFilenames = useCallback(async (filenames: string[]): Promise<Photo[]> => {
-        if (filenames.length === 0) return [];
-        const chunks: string[][] = [];
-        for (let i = 0; i < filenames.length; i += LOOKUP_BATCH_CHUNK) {
-            chunks.push(filenames.slice(i, i + LOOKUP_BATCH_CHUNK));
-        }
-        const responses = await Promise.all(
-            chunks.map((chunk) => post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: chunk })),
+    // Album contents are served by the backend a screenful at a time and more are fetched only as the
+    // user scrolls (a 50,000-photo album is never pulled in one go).
+    const ALBUM_PAGE = 120;
+    const albumLoadSeq = useRef<Record<string, number>>({});
+    const albumOffsets = useRef<Record<string, number>>({});
+    const albumLoadingMore = useRef<Record<string, boolean>>({});
+    const [albumPaging, setAlbumPaging] = useState<Record<string, { total: number; hasMore: boolean }>>({});
+    const fetchAlbumPage = useCallback(async (id: string, offset: number) => {
+        const res = await get<{ album?: Album; photos?: BackendPhoto[]; hasMore?: boolean; total?: number }>(
+            `/albums/${encodeURIComponent(id)}?offset=${offset}&limit=${ALBUM_PAGE}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
         );
-        const byFilename = new Map<string, BackendPhoto>();
-        responses.forEach((res) => (res?.photos ?? []).forEach((p) => byFilename.set(p.filename, p)));
-        // Re-order to match the album's stored order -- lookup-batch may
-        // silently drop a filename deleted since the index was built.
-        return filenames
-            .map((f) => byFilename.get(f))
-            .filter((p): p is BackendPhoto => Boolean(p))
-            .map(mapPhoto);
+        const page = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
+        albumOffsets.current[id] = offset + page.length;
+        setAlbumPaging((prev) => ({ ...prev, [id]: { total: res?.total ?? page.length, hasMore: Boolean(res?.hasMore) && page.length > 0 } }));
+        return { page, album: res?.album };
     }, []);
-
-    // Legacy path: the sequential per-photo point-read GET /albums/<id> does
-    // server-side. Kept only as a fallback for when the album isn't in the
-    // locally-cached index (cold index, network error) so opening an album
-    // never breaks.
-    const openAlbumViaLegacyEndpoint = useCallback(async (id: string) => {
-        const res = await get<{ album?: Album; photos?: BackendPhoto[] }>(`/albums/${encodeURIComponent(id)}`);
-        const list = Array.isArray(res?.photos) ? res.photos.map(mapPhoto) : [];
-        setAlbumPhotos((prev) => ({ ...prev, [id]: list }));
-        if (res?.album) {
-            setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
-        }
-    }, []);
-
     const openAlbum = useCallback(async (id: string) => {
-        setAlbumPhotosLoading(true);
+        const seq = (albumLoadSeq.current[id] ?? 0) + 1;
+        albumLoadSeq.current[id] = seq;
+        const stale = () => albumLoadSeq.current[id] !== seq;
+        setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: true }));
         try {
-            const filenames = albumFilenamesRef.current[id];
-            if (filenames === undefined) {
-                // Not in the locally-cached index (cold/unavailable) -- fall
-                // back rather than silently showing an empty album.
-                throw new Error('album not in local index');
-            }
-            const list = await lookupPhotosByFilenames(filenames);
-            setAlbumPhotos((prev) => ({ ...prev, [id]: list }));
+            const { page, album } = await fetchAlbumPage(id, 0);
+            if (stale()) return;
+            setAlbumPhotos((prev) => ({ ...prev, [id]: page }));
+            if (album) setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...album } : a)));
         } catch {
-            try {
-                await openAlbumViaLegacyEndpoint(id);
-            } catch {
-                setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
-            }
+            setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
         } finally {
-            setAlbumPhotosLoading(false);
+            if (!stale()) setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: false }));
         }
-    }, [lookupPhotosByFilenames, openAlbumViaLegacyEndpoint]);
+    }, [fetchAlbumPage]);
+    const loadMoreAlbumPhotos = useCallback((id: string) => {
+        if (albumLoadingMore.current[id] || !albumPaging[id]?.hasMore) return;
+        albumLoadingMore.current[id] = true;
+        const seq = albumLoadSeq.current[id];
+        void fetchAlbumPage(id, albumOffsets.current[id] ?? 0)
+            .then(({ page }) => {
+                if (albumLoadSeq.current[id] !== seq) return;
+                setAlbumPhotos((prev) => {
+                    const have = prev[id] ?? [];
+                    const seen = new Set(have.map((p) => p.id));
+                    return { ...prev, [id]: [...have, ...page.filter((p) => !seen.has(p.id))] };
+                });
+            })
+            .catch(() => setAlbumPaging((prev) => ({ ...prev, [id]: { total: prev[id]?.total ?? 0, hasMore: false } })))
+            .finally(() => { albumLoadingMore.current[id] = false; });
+    }, [fetchAlbumPage, albumPaging]);
+    const albumPhotosTotal = useCallback((id: string) => albumPaging[id]?.total, [albumPaging]);
+    const albumPhotosHasMore = useCallback((id: string) => Boolean(albumPaging[id]?.hasMore), [albumPaging]);
 
     const albumPhotosById = useCallback((id: string) => albumPhotos[id], [albumPhotos]);
+    const isAlbumPhotosLoading = useCallback((id: string) => Boolean(albumPhotosLoadingIds[id]), [albumPhotosLoadingIds]);
 
     const createAlbum = useCallback(
         async (name?: string): Promise<string> => {
@@ -966,12 +1145,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const created = res?.album;
                 if (created) {
                     setAlbums((prev) => [...prev, created]);
-                    albumFilenamesRef.current = { ...albumFilenamesRef.current, [created.id]: [] };
                     invalidateLocalAlbumsIndex();
                     return created.id;
                 }
             } catch {
-                toast('Couldn’t create album');
+                toast('Couldn’t create album', undefined, undefined, 'error');
             }
             return '';
         },
@@ -994,7 +1172,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 }
                 return { albumId: '', count: 0, message: res?.message };
             } catch {
-                toast('Couldn’t create smart album');
+                toast('Couldn’t create smart album', undefined, undefined, 'error');
                 return { albumId: '', count: 0 };
             }
         },
@@ -1009,7 +1187,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         invalidateLocalAlbumsIndex();
         void post(`/albums/${encodeURIComponent(id)}/rename`, { name: trimmed }).catch(() => {
             setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: previous ?? a.name } : a)));
-            toast('Couldn’t rename album');
+            toast('Couldn’t rename album', undefined, undefined, 'error');
         });
     }, [albums, toast]);
 
@@ -1017,29 +1195,38 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         (albumId: string, ids: string[]) => {
             if (!ids.length) return;
             const album = albums.find((a) => a.id === albumId);
+            const idSet = new Set(ids);
+            const added = photosByIds(ids);
             setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: a.photoCount + ids.length } : a)));
+            // Optimistically drop the added photos into the album's photo cache
+            // so opening the album shows them *immediately* -- otherwise a brand
+            // new album (or one whose fetch is slow) appears empty for as long
+            // as the server round-trip takes, which read as "nothing happened"
+            // for minutes. The server fetch below reconciles order/cover.
+            if (added.length) {
+                setAlbumPhotos((prev) => {
+                    const existing = prev[albumId] ?? [];
+                    const rest = existing.filter((p) => !idSet.has(p.id));
+                    return { ...prev, [albumId]: [...added, ...rest] };
+                });
+            }
             invalidateLocalAlbumsIndex();
             void post(`/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids })
                 .then(() => {
                     toast(`Added ${ids.length} to “${album?.name ?? 'album'}”`);
-                    // Keep the cached filename list in step so, if this album
-                    // is currently open, the openAlbum call below (which reads
-                    // from this ref) sees the new photos immediately instead
-                    // of the stale pre-add list.
-                    const existing = albumFilenamesRef.current[albumId] ?? [];
-                    albumFilenamesRef.current = {
-                        ...albumFilenamesRef.current,
-                        [albumId]: Array.from(new Set([...existing, ...ids])),
-                    };
-                    // Refresh the album's photos if it's currently open/cached.
-                    if (albumPhotos[albumId]) void openAlbum(albumId);
+                    // Reconcile with the server (cover, ordering). The cache is
+                    // already seeded above, so this refresh never shows a spinner.
+                    void openAlbum(albumId);
                 })
                 .catch(() => {
                     setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: Math.max(0, a.photoCount - ids.length) } : a)));
-                    toast('Couldn’t add photos to album');
+                    setAlbumPhotos((prev) => (prev[albumId]
+                        ? { ...prev, [albumId]: prev[albumId].filter((p) => !idSet.has(p.id)) }
+                        : prev));
+                    toast('Couldn’t add photos to album', undefined, undefined, 'error');
                 });
         },
-        [albums, albumPhotos, openAlbum, toast],
+        [albums, photosByIds, openAlbum, toast],
     );
 
     const deleteAlbum = useCallback((id: string) => {
@@ -1050,7 +1237,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast(`Deleted “${removed?.name ?? 'album'}”`))
             .catch(() => {
                 if (removed) setAlbums((prev) => [...prev, removed]);
-                toast('Couldn’t delete album');
+                toast('Couldn’t delete album', undefined, undefined, 'error');
             });
     }, [albums, toast]);
 
@@ -1064,7 +1251,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast(`Deleted ${removed.length} album${removed.length === 1 ? '' : 's'}`))
             .catch(() => {
                 if (removed.length) setAlbums((prev) => [...prev, ...removed]);
-                toast('Couldn’t delete albums');
+                toast('Couldn’t delete albums', undefined, undefined, 'error');
             });
     }, [albums, toast]);
 
@@ -1081,7 +1268,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             }
             invalidateLocalAlbumsIndex();
         } catch {
-            toast('Couldn’t update share link');
+            toast('Couldn’t update share link', undefined, undefined, 'error');
         }
     }, [toast]);
 
@@ -1093,73 +1280,147 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 : a)));
             invalidateLocalAlbumsIndex();
         } catch {
-            toast('Couldn’t revoke share link');
+            toast('Couldn’t revoke share link', undefined, undefined, 'error');
         }
     }, [toast]);
 
-    // Legacy path: a single hardcoded page (listPersons(undefined, 0, 200)) --
-    // anyone with 201+ face clusters silently never sees the rest. Kept only
-    // as a fallback for when the local index is unavailable.
-    const fetchPeopleViaLegacyEndpoint = useCallback(async () => {
-        const res = await faceService.listPersons(undefined, 0, 200);
-        const list = Array.isArray(res?.persons) ? (res.persons as PersonSummary[]).map(mapPerson) : [];
-        setPeople(list);
-    }, []);
-
-    // Primary path: the whole-library people index (see localPeopleIndex.ts),
-    // downloaded once per session -- covers the full list (fixing the 200
-    // cap) without list_persons's per-page face-table work. Falls back to
-    // the legacy endpoint on any failure (cold index, network error) so the
-    // page never breaks.
+    // Primary path: one server page of clusters (named first), cut from the cached people index, then
+    // more as the user scrolls -- the browser never downloads every cluster. Falls back to the legacy
+    // single request only while the server's people index is still building.
     const fetchPeople = useCallback(async () => {
         setPeopleLoading(true);
         try {
-            const rows = await getLocalPeopleIndex();
-            if (!rows) {
+            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?offset=0&limit=${PEOPLE_PAGE}`);
+            if (!res?.available || !Array.isArray(res.rows)) {
                 throw new Error('people index unavailable');
             }
-            const mapped: Person[] = rows.map((r) => ({
-                id: r.personId,
-                name: r.isNamed && r.name.trim() ? r.name : null,
-                swatch: swatchFor(r.personId),
-                photoIds: [],
-                // Stable backend-proxy path, not a day-expiring SAS -- same
-                // fallback shape mapPerson already used when a face had no
-                // pre-minted thumbnailUrl, so no separate resolve step is
-                // needed here (unlike album covers).
-                coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
-                faceCount: r.faceCount,
-            }));
+            const mapped = res.rows.map(mapPersonRow);
+            peopleOffsetRef.current = mapped.length;
             setPeople(mapped);
+            setPeopleTotal(res.total ?? mapped.length);
+            setPeopleUnnamedTotal(res.unnamedCount ?? 0);
+            setPeopleHasMore(Boolean(res.hasMore));
+            setPeopleUnavailable(false);
+            reportIndexBuilding('people', false);
         } catch {
-            try {
-                await fetchPeopleViaLegacyEndpoint();
-            } catch {
-                // keep the current list on transient failures
-            }
+            // Never fall back to fetching every cluster at once: show a "preparing" state and let the
+            // user (or the next visit) retry the paged request.
+            setPeopleHasMore(false);
+            setPeopleUnavailable(true);
+            reportIndexBuilding('people', true);
         } finally {
             setPeopleLoading(false);
         }
-    }, [fetchPeopleViaLegacyEndpoint]);
+    }, []);
 
-    useEffect(() => {
-        void fetchPeople();
-    }, [fetchPeople]);
+    const loadMorePeople = useCallback(() => {
+        if (peopleLoadingMoreRef.current) return;
+        peopleLoadingMoreRef.current = true;
+        void getExtras<PeoplePageResponse>(`/api/persons/page?offset=${peopleOffsetRef.current}&limit=${PEOPLE_PAGE}`)
+            .then((res) => {
+                const rows = Array.isArray(res?.rows) ? res.rows.map(mapPersonRow) : [];
+                peopleOffsetRef.current += rows.length;
+                setPeople((prev) => {
+                    const seen = new Set(prev.map((p) => p.id));
+                    return [...prev, ...rows.filter((p) => !seen.has(p.id))];
+                });
+                setPeopleHasMore(Boolean(res?.hasMore) && rows.length > 0);
+            })
+            .catch(() => setPeopleHasMore(false))
+            .finally(() => { peopleLoadingMoreRef.current = false; });
+    }, []);
+
+    const searchPeople = useCallback(async (query: string, limit = 50): Promise<Person[]> => {
+        try {
+            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
+            return Array.isArray(res?.rows) ? res.rows.map(mapPersonRow) : [];
+        } catch {
+            return [];
+        }
+    }, []);
+
+    // A deep link to a person who isn't in the loaded pages: fetch just that cluster.
+    const ensurePerson = useCallback(async (id: string) => {
+        try {
+            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?ids=${encodeURIComponent(id)}&limit=1`);
+            const row = Array.isArray(res?.rows) ? res.rows[0] : undefined;
+            if (row) setExtraPeople((prev) => ({ ...prev, [row.personId]: mapPersonRow(row) }));
+        } catch {
+            // the page shows "no longer exists"
+        }
+    }, []);
+
+    // No longer fetched unconditionally on app mount -- see the fetchAlbums
+    // comment above; PeoplePage's own mount effect enqueues this instead.
 
     const reloadPeople = useCallback(() => { void fetchPeople(); }, [fetchPeople]);
 
+    // A person can have tens of thousands of photos: the server returns their faces best-first a page
+    // at a time, and the page appends the next one as the user scrolls (no cap on how many can load).
+    const PERSON_PAGE = 120;
+    const personFaceOffsets = useRef<Record<string, number>>({});
+    const [personPaging, setPersonPaging] = useState<Record<string, { total: number; hasMore: boolean }>>({});
+    const personLoadingMore = useRef<Record<string, boolean>>({});
+    // A person's photos, best face first: extras returns one page of filenames from the person-membership
+    // table (a single small partition read, exact total), and one lookup-batch call on the backend turns them
+    // into photo records with token-built thumbnails. If the membership endpoint fails, fall back to the
+    // person's face list so the page is never empty when the person has faces.
+    const fetchPersonPage = useCallback(async (id: string, offset: number) => {
+        try {
+            const page = await getExtras<{ filenames?: string[]; total?: number; hasMore?: boolean }>(
+                `/api/persons/${encodeURIComponent(id)}/photos?offset=${offset}&limit=${PERSON_PAGE}`,
+            );
+            const names = Array.isArray(page?.filenames) ? page.filenames : [];
+            let list: Photo[] = [];
+            if (names.length) {
+                const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: Boolean(getCachedMediaToken()) });
+                const byName = new Map((res?.photos ?? []).map((p) => [p.filename, p]));
+                list = names.map((n) => byName.get(n)).filter((p): p is BackendPhoto => Boolean(p)).map((p) => mapPhoto(p));
+            }
+            personFaceOffsets.current[id] = offset + names.length;
+            setPersonPaging((prev) => ({ ...prev, [id]: { total: page?.total ?? names.length, hasMore: Boolean(page?.hasMore) && names.length > 0 } }));
+            return list;
+        } catch {
+            // fall through to the face list
+        }
+        const res = await getExtras<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
+            `/api/persons/${encodeURIComponent(id)}?offset=${offset}&limit=${PERSON_PAGE}`,
+        );
+        const faces = Array.isArray(res?.faces) ? res.faces : [];
+        personFaceOffsets.current[id] = offset + faces.length;
+        setPersonPaging((prev) => ({ ...prev, [id]: { total: res?.total ?? faces.length, hasMore: Boolean(res?.hasMore) && faces.length > 0 } }));
+        return facesToPhotos(faces);
+    }, []);
+
     const openPerson = useCallback(async (id: string) => {
+        void ensurePerson(id);
         setPersonPhotosLoading(true);
         try {
-            const res = await faceService.getPerson(id) as { faces?: PersonFace[]; name?: string; faceCount?: number };
-            const faces = Array.isArray(res?.faces) ? res.faces : [];
-            setPersonPhotos((prev) => ({ ...prev, [id]: facesToPhotos(faces) }));
+            personFaceOffsets.current[id] = 0;
+            const first = await fetchPersonPage(id, 0);
+            setPersonPhotos((prev) => ({ ...prev, [id]: first }));
         } catch {
             setPersonPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
         } finally {
             setPersonPhotosLoading(false);
         }
-    }, []);
+    }, [fetchPersonPage, ensurePerson]);
+
+    const loadMorePersonPhotos = useCallback((id: string) => {
+        if (personLoadingMore.current[id] || !personPaging[id]?.hasMore) return;
+        personLoadingMore.current[id] = true;
+        void fetchPersonPage(id, personFaceOffsets.current[id] ?? 0)
+            .then((more) => setPersonPhotos((prev) => {
+                const have = prev[id] ?? [];
+                const seen = new Set(have.map((p) => p.id));
+                return { ...prev, [id]: [...have, ...more.filter((p) => !seen.has(p.id))] };
+            }))
+            .catch(() => setPersonPaging((prev) => ({ ...prev, [id]: { total: prev[id]?.total ?? 0, hasMore: false } })))
+            .finally(() => { personLoadingMore.current[id] = false; });
+    }, [fetchPersonPage, personPaging]);
+
+    const personPhotosTotal = useCallback((id: string) => personPaging[id]?.total, [personPaging]);
+    const personPhotosHasMore = useCallback((id: string) => Boolean(personPaging[id]?.hasMore), [personPaging]);
 
     const personPhotosById = useCallback((id: string) => personPhotos[id], [personPhotos]);
 
@@ -1167,10 +1428,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const trimmed = name.trim();
         const previous = people.find((p) => p.id === id)?.name ?? null;
         setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: trimmed || null } : p)));
-        invalidateLocalPeopleIndex();
+        setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: trimmed || null } } : prev));
         void faceService.labelPerson(id, trimmed).catch(() => {
             setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: previous } : p)));
-            toast('Couldn’t save name');
+            toast('Couldn’t save name', undefined, undefined, 'error');
         });
     }, [people, toast]);
 
@@ -1179,16 +1440,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             // Optimistically drop the source cluster; the target absorbs it.
             const removed = people.find((p) => p.id === sourceId);
             setPeople((prev) => prev.filter((p) => p.id !== sourceId));
-            invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, [sourceId])
                 .then(() => {
                     toast('People merged');
-                    invalidateLocalPeopleIndex();
                     void fetchPeople();
                 })
                 .catch(() => {
                     if (removed) setPeople((prev) => [...prev, removed]);
-                    toast('Couldn’t merge people');
+                    toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
         },
         [people, fetchPeople, toast],
@@ -1205,16 +1464,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const removedSet = new Set(ids);
             const removed = people.filter((p) => removedSet.has(p.id));
             setPeople((prev) => prev.filter((p) => !removedSet.has(p.id)));
-            invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, ids)
                 .then(() => {
                     toast(`Merged ${ids.length + 1} people`);
-                    invalidateLocalPeopleIndex();
                     void fetchPeople();
                 })
                 .catch(() => {
                     if (removed.length) setPeople((prev) => [...prev, ...removed]);
-                    toast('Couldn’t merge people');
+                    toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
         },
         [people, fetchPeople, toast],
@@ -1226,12 +1483,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const deletePerson = useCallback((id: string) => {
         const removed = people.find((p) => p.id === id);
         setPeople((prev) => prev.filter((p) => p.id !== id));
-        invalidateLocalPeopleIndex();
         void faceService.deletePersons([id])
             .then(() => toast('Person deleted'))
             .catch(() => {
                 if (removed) setPeople((prev) => [...prev, removed]);
-                toast('Couldn’t delete person');
+                toast('Couldn’t delete person', undefined, undefined, 'error');
             });
     }, [people, toast]);
 
@@ -1240,12 +1496,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const idSet = new Set(ids);
         const removed = people.filter((p) => idSet.has(p.id));
         setPeople((prev) => prev.filter((p) => !idSet.has(p.id)));
-        invalidateLocalPeopleIndex();
         void faceService.deletePersons(ids)
             .then(() => toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`))
             .catch(() => {
                 if (removed.length) setPeople((prev) => [...prev, ...removed]);
-                toast('Couldn’t delete people');
+                toast('Couldn’t delete people', undefined, undefined, 'error');
             });
     }, [people, toast]);
 
@@ -1265,30 +1520,32 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, []);
 
-    useEffect(() => {
-        void fetchMembers();
-    }, [fetchMembers]);
+    // No longer fetched unconditionally on app mount -- see the fetchAlbums
+    // comment above; SharingPage's own mount effect enqueues this instead
+    // (it used to ALSO call reloadMembers() itself on its own mount, so
+    // visiting Sharing actually fetched members twice -- once here, once
+    // there).
 
     const reloadMembers = useCallback(() => { void fetchMembers(); }, [fetchMembers]);
 
     const invite = useCallback((email: string, targetType: 'join' | 'fresh') => {
         void library.sendInvite(email, targetType)
             .then(() => { toast(`Invite sent to ${email}`); void fetchMembers(); })
-            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t send invite'));
+            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t send invite', undefined, undefined, 'error'));
     }, [fetchMembers, toast]);
 
     const revokeInvite = useCallback((inviteId: string) => {
         setPendingInvites((prev) => prev.filter((p) => p.inviteId !== inviteId));
         void library.revokePendingInvite(inviteId)
             .then(() => toast('Invitation revoked'))
-            .catch(() => { toast('Couldn’t revoke invite'); void fetchMembers(); });
+            .catch(() => { toast('Couldn’t revoke invite', undefined, undefined, 'error'); void fetchMembers(); });
     }, [fetchMembers, toast]);
 
     const removeMember = useCallback((userId: string) => {
         setMembers((prev) => prev.filter((m) => m.userId !== userId));
         void library.removeMember(userId)
             .then(() => toast('Member removed'))
-            .catch(() => { toast('Couldn’t remove member'); void fetchMembers(); });
+            .catch(() => { toast('Couldn’t remove member', undefined, undefined, 'error'); void fetchMembers(); });
     }, [fetchMembers, toast]);
 
     const renameLibrary = useCallback((name: string) => {
@@ -1298,8 +1555,24 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setLibraryName(trimmed);
         void library.renameLibrary(trimmed)
             .then(() => toast('Library renamed'))
-            .catch(() => { setLibraryName(previous); toast('Couldn’t rename library'); });
+            .catch(() => { setLibraryName(previous); toast('Couldn’t rename library', undefined, undefined, 'error'); });
     }, [libraryName, toast]);
+
+    // While the people list is unavailable (server still building it), retry quietly every 10 s.
+    useEffect(() => {
+        if (!peopleUnavailable) return undefined;
+        const timer = window.setTimeout(() => { void fetchPeople(); }, 10000);
+        return () => window.clearTimeout(timer);
+    }, [peopleUnavailable, fetchPeople, people.length]);
+
+    // The server finished preparing the library: pull in what was missing while it built.
+    useEffect(() => onIndexReady(() => {
+        reloadPhotos();
+        void fetchTimeline();
+        void fetchPeople();
+        void fetchAlbums();
+        void fetchExplore();
+    }), [reloadPhotos, fetchTimeline, fetchPeople, fetchAlbums, fetchExplore]);
 
     const value = useMemo<Store>(
         () => ({
@@ -1335,6 +1608,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             timeline,
             exploreLoading,
             reloadExplore,
+            fetchExplore,
             photoById,
             photosByIds,
             albumById,
@@ -1344,6 +1618,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             toggleSelect,
             selectMany,
             clearSelection,
+            selectMode,
+            setSelectMode,
             openViewer,
             closeViewer,
             viewerStep,
@@ -1362,9 +1638,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             purgeAlbum,
             albumsLoading,
             reloadAlbums,
+            fetchAlbums,
             openAlbum,
             albumPhotosById,
-            albumPhotosLoading,
+            isAlbumPhotosLoading,
+            loadMoreAlbumPhotos,
+            albumPhotosTotal,
+            albumPhotosHasMore,
             createAlbum,
             autoCreateAlbum,
             renameAlbum,
@@ -1373,10 +1653,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             deleteAlbums,
             shareAlbum,
             revokeAlbum,
-            peopleLoading,
+            peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople,
             reloadPeople,
+            fetchPeople,
             openPerson,
             personPhotosById,
+            personPhotosTotal,
+            personPhotosHasMore,
+            loadMorePersonPhotos,
             personPhotosLoading,
             renamePerson,
             mergePeople,
@@ -1384,6 +1668,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             deletePerson,
             deletePeopleBatch,
             reloadMembers,
+            fetchMembers,
             invite,
             revokeInvite,
             removeMember,
@@ -1393,18 +1678,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }),
         [
             route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
-            placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, viewer, toasts,
+            placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, selectMode, viewer, toasts,
             photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
             mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
-            exploreLoading, reloadExplore,
+            exploreLoading, reloadExplore, fetchExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
-            clearSelection, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
+            clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
-            albumsLoading, reloadAlbums, openAlbum, albumPhotosById, albumPhotosLoading,
+            albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
-            peopleLoading, reloadPeople, openPerson, personPhotosById, personPhotosLoading,
-            renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, invite, revokeInvite,
+            peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
+            renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],
     );

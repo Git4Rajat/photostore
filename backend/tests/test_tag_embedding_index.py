@@ -178,13 +178,14 @@ def _row(filename: str, **overrides) -> dict:
     }
 
 
-def test_search_photos_surfaces_photo_via_tag_embedding_expansion(monkeypatch):
+def test_search_photos_surfaces_photo_via_tag_embedding_expansion(monkeypatch, tmp_path):
+    import search_db
+    path = str(tmp_path / 's.sqlite')
+    search_db.build_database([_row('dog.jpg', tags='["dog"]')], path)
+    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: search_db.SearchDatabase(path))
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'person_table_client', None)
-    monkeypatch.setattr(app, 'get_user_lexical_index', lambda *a, **k: None)
-    monkeypatch.setattr(app, '_cached_metadata_rows_for_user', lambda *a, **k: [_row('dog.jpg', tags='["dog"]')])
-    monkeypatch.setattr(app.vision_utils, 'encode_text_embedding', lambda text: [])
-    monkeypatch.setattr(app, 'vector_search_candidates', lambda *a, **k: [])
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda uid, name: _row(name, tags='["dog"]'))
     monkeypatch.setattr(app, 'get_user_tag_embedding_index', lambda uid, allow_refresh=False: {
         'tags': ['dog'],
         'embeddings': np.vstack([_unit([1.0, 0.0])]),

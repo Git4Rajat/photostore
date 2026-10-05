@@ -20,8 +20,10 @@ import os
 import signal
 import threading
 import time
+from types import SimpleNamespace
 
 import app
+import pytest
 
 
 class _FakeQueueMessage:
@@ -100,3 +102,66 @@ def test_sigterm_finishes_in_flight_message_and_stops_polling(monkeypatch):
     # -- no grace-period wait needed for this (synchronous, one-at-a-time)
     # loop, unlike run_ipworker's thread-pool drain.
     assert elapsed < 2
+
+
+@pytest.mark.parametrize('batch_size', [1, 8])
+def test_shutdown_drains_inflight_group_before_final_checkpoint(monkeypatch, batch_size):
+    monkeypatch.setenv('CLUSTERING_WORKER_BATCH_SIZE', str(batch_size))
+    queue = _FakeQueueClient()
+    monkeypatch.setattr(app, 'queue_service_client', _FakeQueueServiceClient(queue))
+    handlers, events = {}, []
+    monkeypatch.setattr(app.signal, 'signal', lambda sig, handler: handlers.update({sig: handler}))
+
+    def finish_group(*args, **kwargs):
+        events.append('started')
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        events.extend(['durable', 'acknowledged'])
+        return True
+
+    def poll_single(client, name, *args):
+        if name == app.LIBRARY_OPS_QUEUE_NAME:
+            return False
+        return finish_group()
+
+    monkeypatch.setattr(app, '_poll_clustering_queue_once', poll_single)
+    monkeypatch.setattr(app, '_poll_clustering_queue_batch_once', finish_group)
+    monkeypatch.setattr(app, '_live_faiss_assigner', SimpleNamespace(
+        final_checkpoint=lambda: events.append('final_checkpoint')))
+    app.run_clustering_worker()
+    assert events == ['started', 'durable', 'acknowledged', 'final_checkpoint']
+
+
+def test_shutdown_without_runtime_never_initializes_adapter(monkeypatch):
+    queue = _FakeQueueClient()
+    monkeypatch.setattr(app, 'queue_service_client', _FakeQueueServiceClient(queue))
+    monkeypatch.setattr(app, '_live_faiss_assigner', None)
+    monkeypatch.setattr(app.time, 'sleep', lambda *a: pytest.fail('shutdown must not idle-wait'))
+    handlers = {}
+    monkeypatch.setattr(app.signal, 'signal', lambda sig, handler: handlers.update({sig: handler}))
+    monkeypatch.setattr(app, '_get_live_faiss_assigner', lambda: pytest.fail('must not initialize'))
+
+    def poll(*args):
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        return False
+
+    monkeypatch.setattr(app, '_poll_clustering_queue_once', poll)
+    app.run_clustering_worker()
+
+
+def test_shutdown_checkpoint_error_does_not_break_exit(monkeypatch, caplog):
+    queue = _FakeQueueClient()
+    monkeypatch.setattr(app, 'queue_service_client', _FakeQueueServiceClient(queue))
+    handlers = {}
+    monkeypatch.setattr(app.signal, 'signal', lambda sig, handler: handlers.update({sig: handler}))
+
+    def poll(*args):
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        return True
+
+    def fail():
+        raise OSError('share disconnected')
+
+    monkeypatch.setattr(app, '_poll_clustering_queue_once', poll)
+    monkeypatch.setattr(app, '_live_faiss_assigner', SimpleNamespace(final_checkpoint=fail))
+    app.run_clustering_worker()
+    assert 'Final clustering checkpoint failed' in caplog.text

@@ -1,4 +1,5 @@
 import { get } from './apiClient';
+import { perf, perfNow } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 
 /**
@@ -7,7 +8,7 @@ import { getActiveLibraryFromToken } from './passwordAuthClient';
  * captureDate, rating, likes, uploadDate} projection, small enough to
  * download once per session and sort/paginate locally instead of every
  * gallery page request materializing and sorting the whole library
- * server-side. Combines localSearchIndex.ts's fetch/gunzip/cache shape with
+ * server-side. Combines the former browser search index's fetch/gunzip/cache shape with
  * photoCache.ts's raw-IndexedDB idiom, persisted (not just in-memory) so a
  * reload within the manifest's still-fresh window skips the blob re-download
  * entirely.
@@ -18,9 +19,18 @@ export interface SortIndexRow {
     rating: number;
     likes: number;
     uploadDate: string | null;
+    /** Physical thumbnail blob name once the thumbnail exists; with the media
+     * token this yields a direct URL with no backend call. */
+    thumb?: string;
 }
 
+/** True once the server said this library is too big for a client-side sort index (it pages instead). */
+let serverPaged = false;
+export const isServerPagedLibrary = (): boolean => serverPaged;
+
 interface SortIndexResponse {
+    reason?: string;
+    rowCount?: number;
     available: boolean;
     indexUrl?: string;
     sourceVersion?: string;
@@ -72,7 +82,7 @@ const idbPutStored = async (key: string, value: StoredSortIndex): Promise<void> 
 };
 
 const decompressGzip = async (buffer: ArrayBuffer): Promise<string> => {
-    // Same approach as localSearchIndex.ts -- DecompressionStream is the
+    // Same approach as the former browser search index -- DecompressionStream is the
     // standard, dependency-free way to gunzip in a browser.
     const stream = new Response(buffer).body!.pipeThrough(new DecompressionStream('gzip'));
     return new Response(stream).text();
@@ -85,24 +95,44 @@ const normalizeRows = (raw: Record<string, unknown>[]): SortIndexRow[] => raw
         rating: Number(row.rating) || 0,
         likes: Number(row.likes) || 0,
         uploadDate: typeof row.uploadDate === 'string' ? row.uploadDate : null,
+        ...(typeof row.thumb === 'string' && row.thumb ? { thumb: row.thumb } : {}),
     }))
     .filter((row) => row.filename);
 
+// A plain fetch() has no default timeout -- a stalled connection hangs this
+// promise forever instead of rejecting, which (via getLocalSortIndex's
+// module-scoped inFlight dedup) would wedge every caller behind the same
+// permanently-pending promise for the rest of the tab session. See
+// the former browser search index's BLOB_FETCH_TIMEOUT_MS for the full writeup --
+// confirmed live 2026-09-29 for that index's blob fetch; same latent gap
+// here since the code shape is identical.
+const BLOB_FETCH_TIMEOUT_MS = 120000;
+
+const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+};
+
 const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> => {
-    const response = await fetch(indexUrl);
+    const downloadStarted = perfNow();
+    const response = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     if (!response.ok) {
         throw new Error(`Failed to download sort index (${response.status})`);
     }
     const buffer = await response.arrayBuffer();
+    perf.recordSpan('index.sort.blob_download', perfNow() - downloadStarted, { bytes: buffer.byteLength });
+    const parseStarted = perfNow();
     // The blob is stored with Content-Encoding: gzip -- most browsers
     // transparently decompress it before we ever see the bytes, so try
     // parsing directly first and only fall back to manual decompression if
     // the fetch handed back the raw compressed bytes instead (mirrors
-    // localSearchIndex.ts's downloadIndexBlob).
+    // the former browser search index's downloadIndexBlob).
     try {
         const text = new TextDecoder().decode(buffer);
         const parsed = JSON.parse(text);
         if (parsed && Array.isArray(parsed.rows)) {
+            perf.recordSpan('index.sort.parse', perfNow() - parseStarted, { rows: parsed.rows.length });
             return normalizeRows(parsed.rows);
         }
     } catch {
@@ -113,7 +143,7 @@ const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> 
     return normalizeRows(Array.isArray(parsed?.rows) ? parsed.rows : []);
 };
 
-// Keyed by active library, same reasoning as localSearchIndex.ts's indexKey/
+// Keyed by active library, same reasoning as the former browser search index's indexKey/
 // photoCache.ts's photoCacheKey -- switching libraries can't serve one
 // library's rows while browsing another.
 const indexKey = (): string => getActiveLibraryFromToken() || '__default__';
@@ -123,22 +153,35 @@ let cachedIndex: SortIndexRow[] | null = null;
 let inFlight: Promise<SortIndexRow[] | null> | null = null;
 
 const fetchLocalSortIndex = async (key: string): Promise<SortIndexRow[] | null> => {
+    const totalStarted = perfNow();
+    const manifestStarted = perfNow();
     const response: SortIndexResponse = await get('/api/photos/sort-index');
+    perf.recordSpan('index.sort.manifest', perfNow() - manifestStarted);
+    if (response?.reason === 'library_too_large') {
+        serverPaged = true;      // nothing to download: the gallery pages from the server
+        return null;
+    }
     if (!response?.available || !response.indexUrl) {
         return null;
     }
     const sourceVersion = response.sourceVersion || '';
+    const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
+    perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
     if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
         // Unchanged since the last download for this library -- skip the
         // blob re-fetch entirely, this is the whole point of persisting it.
+        perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
         return stored.rows;
     }
     const rows = await downloadSortIndexBlob(response.indexUrl);
+    const writeStarted = perfNow();
     await idbPutStored(key, { sourceVersion, updatedAt: response.updatedAt || '', rows }).catch(() => {
         // Best-effort persistence -- an in-memory-only session still works,
         // it just re-downloads next reload instead of skipping the fetch.
     });
+    perf.recordSpan('index.sort.idb_write', perfNow() - writeStarted, { rows: rows.length });
+    perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: false, rows: rows.length });
     return rows;
 };
 
@@ -170,6 +213,23 @@ export const getLocalSortIndex = async (): Promise<SortIndexRow[] | null> => {
 // invalidateLocalSearchIndex, so the next gallery load picks up newly-added
 // photos instead of serving a stale in-memory copy for the rest of the tab
 // session.
+// Filename -> thumbnail blob name for the loaded sort index, so any grid can build the same
+// container-token URL the gallery uses (one browser-cache entry per thumbnail, whichever page
+// shows it). Empty until the sort index is loaded.
+let thumbMap: Map<string, string> | null = null;
+let thumbMapSource: SortIndexRow[] | null = null;
+export const getCachedSortThumb = (filename: string): string => {
+    if (!cachedIndex) return '';
+    if (thumbMapSource !== cachedIndex || !thumbMap) {
+        thumbMap = new Map();
+        for (const row of cachedIndex) {
+            if (row.thumb) thumbMap.set(row.filename, row.thumb);
+        }
+        thumbMapSource = cachedIndex;
+    }
+    return thumbMap.get(filename) || '';
+};
+
 export const invalidateLocalSortIndex = (): void => {
     cachedIndex = null;
     cachedKey = null;

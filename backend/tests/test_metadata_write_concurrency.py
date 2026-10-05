@@ -65,6 +65,8 @@ class _RacyTable:
         self.etags: dict = {}
         self.lock = threading.Lock()
         self.read_barrier = None  # set by a test to synchronize concurrent reads
+        self.get_calls = 0
+        self.update_calls = 0
 
     def upsert_entity(self, entity):
         key = (entity['PartitionKey'], entity['RowKey'])
@@ -75,6 +77,7 @@ class _RacyTable:
     def get_entity(self, partition_key, row_key):
         key = (partition_key, row_key)
         with self.lock:
+            self.get_calls += 1
             if key not in self.rows:
                 raise ResourceNotFoundError(str(key))
             data = dict(self.rows[key])
@@ -88,6 +91,7 @@ class _RacyTable:
         key = (entity['PartitionKey'], entity['RowKey'])
         check_etag = etag if etag is not None else entity.metadata.get('etag')
         with self.lock:
+            self.update_calls += 1
             if key not in self.rows:
                 raise ResourceNotFoundError(str(key))
             current_etag = self.etags.get(key, 0)
@@ -217,3 +221,70 @@ def test_lease_release_rechecks_ownership_against_fresh_read(racy_ctx):
 
     final = table.get_entity('u1', 'a.jpg')
     assert final['processing_lease_owner'] == 'worker-B'  # untouched
+
+
+def test_batched_processing_status_updates_uses_one_round_trip(racy_ctx):
+    """apply_client_processing_results_for_file's single call can finish
+    several steps (ocr/face/ai_vision/map_detection/...) for one photo. Each
+    update_processing_status call used to be its own full get_entity +
+    conditional update_entity round trip; batched_processing_status_updates
+    must fold them into exactly one of each, regardless of how many steps
+    were reported -- see the 2026-10-01 apply_ms investigation."""
+    table = racy_ctx
+    _seed(table, 'u1', 'a.jpg')
+    table.get_calls = 0
+    table.update_calls = 0
+
+    with storage_utils.batched_processing_status_updates('u1', 'a.jpg'):
+        storage_utils.update_processing_status('u1', 'a.jpg', 'ocr', 'done', result={'text': 'hi'})
+        storage_utils.update_processing_status('u1', 'a.jpg', 'face', 'done', result={'count': 2})
+        storage_utils.update_processing_status('u1', 'a.jpg', 'ai_vision', 'done', result={'tags': ['x']})
+        storage_utils.update_processing_status('u1', 'a.jpg', 'map_detection', 'no_data')
+
+    assert table.get_calls == 1
+    assert table.update_calls == 1
+
+    final = table.get_entity('u1', 'a.jpg')
+    assert final['ocr_status'] == 'done'
+    assert final['face_status'] == 'done'
+    assert final['ai_vision_status'] == 'done'
+    assert final['map_detection_status'] == 'no_data'
+    processing = storage_utils._safe_json_load(final['processing_metadata'])
+    assert processing['ocr'] == {'text': 'hi'}
+    assert processing['face'] == {'count': 2}
+    assert processing['ai_vision'] == {'tags': ['x']}
+    assert processing['map_detection'] is None
+
+
+def test_update_processing_status_outside_batch_context_is_unbatched(racy_ctx):
+    """No active batch (every caller except apply_client_processing_results_for_file)
+    must keep writing immediately, one round trip per call -- unchanged
+    behavior for every other update_processing_status caller in the codebase."""
+    table = racy_ctx
+    _seed(table, 'u1', 'a.jpg')
+    table.get_calls = 0
+    table.update_calls = 0
+
+    storage_utils.update_processing_status('u1', 'a.jpg', 'ocr', 'done')
+    storage_utils.update_processing_status('u1', 'a.jpg', 'face', 'done')
+
+    assert table.get_calls == 2
+    assert table.update_calls == 2
+
+
+def test_batched_processing_status_updates_flushes_partial_batch_on_exception(racy_ctx):
+    """If the code inside the batch context raises partway through (e.g. a
+    later step's inference blows up), whatever steps were already recorded
+    must still be persisted -- matching the old immediate-write behavior,
+    where an earlier step's write had already landed by the time a later
+    step failed."""
+    table = racy_ctx
+    _seed(table, 'u1', 'a.jpg')
+
+    with pytest.raises(RuntimeError):
+        with storage_utils.batched_processing_status_updates('u1', 'a.jpg'):
+            storage_utils.update_processing_status('u1', 'a.jpg', 'ocr', 'done')
+            raise RuntimeError('boom')
+
+    final = table.get_entity('u1', 'a.jpg')
+    assert final['ocr_status'] == 'done'

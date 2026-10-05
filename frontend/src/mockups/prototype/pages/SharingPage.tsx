@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { PaperAirplaneIcon } from '@heroicons/react/24/outline';
+import { Send as PaperAirplaneIcon } from 'lucide-react';
 import { useStore } from '../store';
-import { Avatar } from '../components/bits';
+import { Avatar, Spinner } from '../components/bits';
 import * as library from '../../../services/libraryClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
+import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -18,7 +19,7 @@ const initialsFor = (value: string): string => {
 export const SharingPage: React.FC = () => {
     const {
         members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
-        reloadMembers, invite, revokeInvite, removeMember, renameLibrary, toast,
+        reloadMembers, fetchMembers, invite, revokeInvite, removeMember, renameLibrary, toast,
     } = useStore();
     const [email, setEmail] = useState('');
     const [targetType, setTargetType] = useState<'join' | 'fresh'>('join');
@@ -26,8 +27,16 @@ export const SharingPage: React.FC = () => {
     const memberCount = members.length;
     const atCapacity = memberCount + pendingInvites.filter((p) => p.targetType === 'join').length >= maxMembers;
 
+    // Loads members when this tab is actually visited, queued behind
+    // whatever else is in flight, aborted if the user navigates away before
+    // its turn -- this used to ALSO fire unconditionally from StoreProvider
+    // on every app mount (every session paid for a members fetch even if
+    // Sharing was never opened), so visiting this tab fetched members twice.
+    // See the 2026-10-01 boot-request audit.
     useEffect(() => {
-        reloadMembers();
+        const controller = new AbortController();
+        void enqueueBackgroundRequest(() => fetchMembers(), { signal: controller.signal }).catch(() => {});
+        return () => controller.abort();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
@@ -71,7 +80,7 @@ export const SharingPage: React.FC = () => {
         }
         void library.requestLibraryClean(password)
             .then((res) => toast(res.sentTo?.length ? `Confirmation link sent to ${res.sentTo.join(', ')}` : 'Cleanup confirmation requested'))
-            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t start cleanup'));
+            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t start cleanup', undefined, undefined, 'error'));
     };
 
     return (
@@ -84,7 +93,7 @@ export const SharingPage: React.FC = () => {
             </div>
 
             <div className="card-glass lib-card">
-                {membersLoading && members.length === 0 && <div className="member-row"><span className="member-meta"><b>Loading members…</b></span></div>}
+                {membersLoading && members.length === 0 && <Spinner label="Loading members…" center={false} />}
                 {members.map((m) => (
                     <div key={m.userId} className="member-row">
                         <Avatar initials={initialsFor(m.email || m.userId)} />

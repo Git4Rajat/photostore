@@ -1,39 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { MagnifyingGlassIcon, PlusIcon } from '@heroicons/react/24/outline';
+import { Search as MagnifyingGlassIcon, Plus as PlusIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { get, post } from '../../../services/apiClient';
-import { runLocalSemanticSearch } from '../../../services/localSemanticSearch';
+import { getAskState, loadMoreAsk, mapSearchResult as mapResult, runAskSearch, setAskQuery, setAskScroll, useAskState } from '../askSearchStore';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 import type { Photo } from '../types';
 
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-const mapResult = (b: BackendPhoto): Photo => {
-    const iso = b.captureDate || b.uploadDate || null;
-    const d = iso ? new Date(iso) : null;
-    const valid = d && !Number.isNaN(d.getTime()) ? d : null;
-    return {
-        id: b.filename,
-        filename: b.filename,
-        swatch: 's1',
-        dateLabel: valid ? `${MONTHS[valid.getMonth()]} ${valid.getDate()}, ${valid.getFullYear()}` : '',
-        year: valid ? valid.getFullYear() : 0,
-        rating: b.rating ?? 0,
-        liked: Boolean(b.liked),
-        likes: b.likes,
-        placeId: null,
-        personIds: (b.people ?? []).map((p) => p.personId),
-        tags: b.tags ?? [],
-        thumbnailUrl: b.thumbnailUrl,
-        rotation: b.rotation,
-        thumbnailRotation: b.thumbnailRotation,
-        captureDate: iso,
-    };
-};
-
-const SEARCH_PAGE_LIMIT = 200;
+// "Save as album" collects matches up to what one album can hold (the server enforces the real limit).
+const SAVE_AS_ALBUM_MAX = 10000;
+const SAVE_PAGE = 500;
 
 // The local search scores filenames; turn them back into full photo records
 // (thumbnails, ratings, dates, ...) via a point-lookup, preserving the local
@@ -50,26 +27,31 @@ const resolvePhotos = async (filenames: string[]): Promise<Photo[]> => {
 };
 
 /**
- * Ask — one search box fused across people / places / things / years. Results
- * come from the full client-side search the legacy gallery built (lexical +
- * semantic CLIP tier over a locally-cached index; see localSemanticSearch.ts),
- * which avoids the slow server-side /photos/search full-scan for the common
- * case. When the local index isn't available (e.g. never built server-side, or
- * a brand-new library) it falls back to that server endpoint and tells the user
- * the search is running on the server and will take longer. Matched people and
- * places surface as cards, live typeahead disambiguates the trailing term, and
- * a search can be saved as an album.
+ * Ask — one search box fused across people / places / things / years. Search
+ * runs entirely on the backend (/photos/search over a per-library SQLite
+ * full-text database on the server's local disk); the browser downloads no
+ * search index. A brand-new library whose database is still being built gets a
+ * "preparing" notice and is retried automatically. Matched people and places
+ * surface as cards, live typeahead disambiguates the trailing term, and a
+ * search can be saved as an album.
  */
 export const AskPage: React.FC = () => {
     const { people, places, route, createAlbum, addPhotosToAlbum, registerPhotos, navigate } = useStore();
-    const [query, setQuery] = useState(route.params.query ?? '');
-    const [results, setResults] = useState<Photo[]>([]);
-    const [searching, setSearching] = useState(false);
-    // True once a search has been routed to the slower server endpoint (the
-    // local index couldn't answer it) -- surfaced in the UI so the user knows
-    // why this particular search is taking longer.
-    const [usingBackend, setUsingBackend] = useState(false);
-    const seqRef = useRef(0);
+    const ask = useAskState();
+    const { query, results, total, hasMore, rankedWindow, searching, loadingMore, indexBuilding } = ask;
+    const [saving, setSaving] = useState(false);
+    const sentinelRef = useRef<HTMLDivElement>(null);
+    const setQuery = setAskQuery;
+    const runSearch = runAskSearch;
+    const restoredScroll = useRef(ask.scrollY).current;
+
+    // Coming back to Ask: put the scroll position back, and remember it again on the way out. The
+    // search itself (running or finished) lives in askSearchStore and is untouched by leaving.
+    useEffect(() => {
+        if (restoredScroll > 0) requestAnimationFrame(() => window.scrollTo(0, restoredScroll));
+        return () => setAskScroll(window.scrollY);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     // Search results aren't part of the gallery's paginated photo list, so the
     // viewer can't resolve them by id unless they're registered here too --
@@ -78,77 +60,6 @@ export const AskPage: React.FC = () => {
     useEffect(() => {
         registerPhotos(results);
     }, [results, registerPhotos]);
-
-    // Clear reactively as the user backspaces the box to empty (not just on
-    // Enter/route navigation) -- bumps seqRef too, so an in-flight request
-    // for whatever was just cleared can't land afterward and repopulate
-    // results the user already watched disappear.
-    useEffect(() => {
-        if (!query.trim()) {
-            seqRef.current += 1;
-            setResults([]);
-            setSearching(false);
-            setUsingBackend(false);
-        }
-    }, [query]);
-
-    const runSearch = (queryOverride?: string) => {
-        const trimmed = (queryOverride ?? query).trim();
-        // Bump the sequence even on a no-op/empty search so a response for a
-        // *previous* in-flight request (e.g. one just superseded by the user
-        // clearing the box) can never land after the guard below already
-        // decided this search doesn't need one -- otherwise a late response
-        // could repopulate results/re-toggle "Searching…" after the UI had
-        // already moved on.
-        const seq = ++seqRef.current;
-        if (!trimmed) {
-            setResults([]);
-            setSearching(false);
-            setUsingBackend(false);
-            return;
-        }
-        setSearching(true);
-        setUsingBackend(false);
-        void (async () => {
-            // Primary path: the full client-side search (lexical + semantic
-            // CLIP tier) over the locally-cached index. Returns null when the
-            // local index can't answer -- either it isn't available yet or it
-            // scored nothing, both of which fall through to the server below.
-            let local: Awaited<ReturnType<typeof runLocalSemanticSearch>>;
-            try {
-                local = await runLocalSemanticSearch(trimmed, 0, SEARCH_PAGE_LIMIT, null, null);
-            } catch {
-                local = null;
-            }
-            if (seq !== seqRef.current) return;
-
-            if (local) {
-                try {
-                    const photos = await resolvePhotos(local.filenames);
-                    if (seq !== seqRef.current) return;
-                    setResults(photos);
-                } catch {
-                    if (seq === seqRef.current) setResults([]);
-                } finally {
-                    if (seq === seqRef.current) setSearching(false);
-                }
-                return;
-            }
-
-            // Fallback: the slower server-side full-scan search. Flag it so the
-            // UI can tell the user this search is running on the server.
-            setUsingBackend(true);
-            try {
-                const res = await get<{ photos?: BackendPhoto[] }>(`/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=${SEARCH_PAGE_LIMIT}`);
-                if (seq !== seqRef.current) return;
-                setResults(Array.isArray(res?.photos) ? res.photos.map(mapResult) : []);
-            } catch {
-                if (seq === seqRef.current) setResults([]);
-            } finally {
-                if (seq === seqRef.current) setSearching(false);
-            }
-        })();
-    };
 
     // Single effect drives both the input box and the actual search off the
     // same incoming route param, passing it straight to runSearch instead of
@@ -161,7 +72,7 @@ export const AskPage: React.FC = () => {
     useEffect(() => {
         const incoming = route.params.query;
         if (incoming === undefined) return;
-        setQuery(incoming);
+        if (incoming.trim() === getAskState().activeQuery) return;   // this search is already showing (or running)
         runSearch(incoming);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [route.params.query]);
@@ -192,12 +103,44 @@ export const AskPage: React.FC = () => {
         setQuery(`${prefix}${label} `);
     };
 
+    // Infinite scroll: load the next page when the bottom sentinel comes into view.
+    useEffect(() => {
+        const node = sentinelRef.current;
+        if (!node || !hasMore) return undefined;
+        const observer = new IntersectionObserver((entries) => {
+            if (entries.some((e) => e.isIntersecting)) loadMoreAsk();
+        }, { rootMargin: '600px' });
+        observer.observe(node);
+        return () => observer.disconnect();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [hasMore, results.length, loadingMore, searching]);
+
+    // Saves the matches (as many as one album can hold), not just the pages scrolled so far.
     const saveAsAlbum = () => {
+        if (saving) return;
+        setSaving(true);
         void (async () => {
-            const id = await createAlbum(query.trim() || 'Saved search');
-            if (!id) return;
-            addPhotosToAlbum(id, results.map((r) => r.id));
-            navigate('albums', { albumId: id });
+            try {
+                const id = await createAlbum(query.trim() || 'Saved search');
+                if (!id) return;
+                const q = ask.activeQuery || query.trim();
+                const names: string[] = results.map((r) => r.id);
+                let more = hasMore;
+                while (more && names.length < SAVE_AS_ALBUM_MAX) {
+                    const res = await get<{ photos?: BackendPhoto[]; hasMore?: boolean }>(
+                        `/photos/search?q=${encodeURIComponent(q)}&offset=${names.length}&limit=${SAVE_PAGE}`,
+                    );
+                    const batch = (res?.photos ?? []).map((p) => p.filename);
+                    if (!batch.length) break;
+                    names.push(...batch);
+                    more = Boolean(res?.hasMore);
+                }
+                const unique = Array.from(new Set(names)).slice(0, SAVE_AS_ALBUM_MAX);
+                for (let i = 0; i < unique.length; i += 2000) addPhotosToAlbum(id, unique.slice(i, i + 2000));
+                navigate('albums', { albumId: id });
+            } finally {
+                setSaving(false);
+            }
         })();
     };
 
@@ -212,22 +155,25 @@ export const AskPage: React.FC = () => {
                 </div>
             </div>
 
-            <div className="pt-ask-box">
-                <MagnifyingGlassIcon />
+            <form className="pt-ask-box" role="search" onSubmit={(e) => { e.preventDefault(); runSearch(); }}>
+                <button type="submit" className="pt-ask-search" aria-label="Search">
+                    <MagnifyingGlassIcon />
+                </button>
                 <input
                     className="pt-ask-input"
+                    type="search"
+                    enterKeyHint="search"
                     autoFocus
                     placeholder="Search people, places, things, years…"
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                        if (e.key === 'Enter') runSearch();
-                    }}
                 />
                 {results.length > 0 && (
-                    <button type="button" className="btn mock-cta" onClick={saveAsAlbum}><PlusIcon className="toolbar-icon" /> Save as album</button>
+                    <button type="button" className="btn mock-cta" onClick={saveAsAlbum} disabled={saving}>
+                        <PlusIcon className="toolbar-icon" /> {saving ? 'Saving…' : 'Save as album'}
+                    </button>
                 )}
-            </div>
+            </form>
 
             {suggestions.length > 0 && (
                 <div className="pt-suggest-row">
@@ -245,29 +191,45 @@ export const AskPage: React.FC = () => {
                 <>
                     {(matchedPeople.length > 0 || matchedPlaces.length > 0) && (
                         <div className="pt-match-cards">
-                            {matchedPeople.map((p) => (
-                                <div key={p.id} className="card-glass pt-match-card" onClick={() => navigate('person', { personId: p.id })} role="button" tabIndex={0}>
-                                    <Swatch swatch={p.swatch} className="pt-match-face" />
-                                    <div><b>{p.name}</b><span>{p.faceCount ?? 0} photos</span></div>
-                                </div>
-                            ))}
-                            {matchedPlaces.map((pl) => (
-                                <div key={pl.id} className="card-glass pt-match-card" onClick={() => navigate('ask', { query: pl.name })} role="button" tabIndex={0}>
-                                    <Swatch swatch={pl.swatch} className="pt-match-face" />
-                                    <div><b>{pl.name}</b><span>place</span></div>
-                                </div>
-                            ))}
+                            {matchedPeople.map((p) => {
+                                const go = () => navigate('person', { personId: p.id });
+                                return (
+                                    <div key={p.id} className="card-glass pt-match-card" onClick={go} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }} role="button" tabIndex={0}>
+                                        <Swatch swatch={p.swatch} className="pt-match-face" />
+                                        <div><b>{p.name}</b><span>{p.faceCount ?? 0} photos</span></div>
+                                    </div>
+                                );
+                            })}
+                            {matchedPlaces.map((pl) => {
+                                const go = () => navigate('ask', { query: pl.name });
+                                return (
+                                    <div key={pl.id} className="card-glass pt-match-card" onClick={go} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }} role="button" tabIndex={0}>
+                                        <Swatch swatch={pl.swatch} className="pt-match-face" />
+                                        <div><b>{pl.name}</b><span>place</span></div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                    {searching && (
+                        <div className="pt-ask-progress" role="status" aria-live="polite">
+                            <div className="pt-index-bar-track" aria-hidden="true"><div className="pt-index-bar-fill" /></div>
                         </div>
                     )}
                     <div className="pt-menu-label">
                         {searching
-                            ? (usingBackend ? 'Searching on the server (this can take longer)…' : 'Searching…')
-                            : `${results.length} result${results.length === 1 ? '' : 's'}`}
+                            ? (indexBuilding ? 'Preparing your library for search — this can take a minute…' : 'Searching…')
+                            : `${total.toLocaleString()} result${total === 1 ? '' : 's'}`}
                     </div>
-                    {usingBackend && !searching && (
-                        <p className="pt-page-sub">Searched on the server — the fast on-device index wasn’t available for this query.</p>
+                    {!searching && rankedWindow !== null && total > rankedWindow && (
+                        <p className="pt-page-sub">Best matches first; after the top {rankedWindow.toLocaleString()} the rest are newest first.</p>
+                    )}
+                    {indexBuilding && !searching && (
+                        <p className="pt-page-sub">Your library’s search is still being prepared — try again in a minute.</p>
                     )}
                     <PhotoGrid photos={results} emptyHint={searching ? '' : 'No photos match that search.'} />
+                    {hasMore && <div ref={sentinelRef} className="pt-scroll-sentinel" aria-hidden="true" />}
+                    {loadingMore && <p className="pt-page-sub">Loading more…</p>}
                 </>
             )}
         </div>

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowDownTrayIcon, CheckIcon, LockClosedIcon, PhotoIcon } from '@heroicons/react/24/outline';
+import { CircleCheck as CheckCircleIcon, Download as DownloadIcon, Lock as LockIcon, Image as PhotoIcon, PlayCircle as PlayCircleIcon } from 'lucide-react';
 import { useParams } from 'react-router-dom';
 // public_bp moved to the dedicated `extras` container app (2026-09-17, see
 // app.py's APP_ROLE=extras split) -- aliased so every call site below stays
@@ -11,12 +11,10 @@ import { notifyApiError } from '../services/requestFeedback';
 import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 import { getBackendStatusSnapshot } from '../services/backendStatus';
 import { showToast } from '../services/toast';
-import PhotoTile from './shared/PhotoTile';
 import { useDragSelect } from '../services/useDragSelect';
 import PhotoViewer, { getMainMediaPath } from './shared/PhotoViewer';
-import { Logo } from './shared/Logo';
+import { Logo, LogoLockup } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
-import { Loading } from './shared/Loading';
 import { ErrorState } from './shared/ErrorState';
 import { isVideoFilename } from '../utils/photoDisplay';
 
@@ -34,6 +32,40 @@ interface PublicAlbum {
     name: string;
     photoCount: number;
 }
+
+// Shared inline "Loading…" indicator that matches the app's Spinner (see the
+// prototype's bits.tsx / prototype.css .pt-loading). Kept local so this
+// standalone public page needn't reach into the prototype component tree.
+const InlineSpinner: React.FC<{ label: string }> = ({ label }) => (
+    <div className="pt-loading center" role="status" aria-live="polite">
+        <span className="pt-spinner" aria-hidden="true" />
+        <span>{label}</span>
+    </div>
+);
+
+// The served thumbnail bakes in only the client's auto-orientation
+// (thumbnailRotation); the user's manual rotate lives in `rotation` and is
+// applied on top as a CSS transform -- mirrors PhotoGrid/PhotoTile so a grid
+// tile matches what the viewer shows. The 0.74 down-scale on quarter-turns
+// keeps a rotated landscape thumbnail from overflowing its square.
+const normalizeRotation = (value?: number): number => {
+    const rotation = Number(value || 0) % 360;
+    return rotation < 0 ? rotation + 360 : rotation;
+};
+const tileRotationStyle = (photo: PublicPhoto): React.CSSProperties | undefined => {
+    const remaining = normalizeRotation(normalizeRotation(photo.rotation) - normalizeRotation(photo.thumbnailRotation));
+    if (!remaining) {
+        return undefined;
+    }
+    return { transform: `rotate(${remaining}deg) scale(${remaining % 180 === 0 ? 1 : 0.74})` };
+};
+
+const resolveMediaSrc = (url?: string): string => {
+    if (!url) {
+        return '';
+    }
+    return url.startsWith('http') ? url : resolveApiUrl(url);
+};
 
 // Thumbnails are cheap (small, day-stable SAS/proxy URLs) so warming them all
 // up front makes scrolling feel instant instead of waiting on native
@@ -114,8 +146,12 @@ const PublicAlbumPage: React.FC = () => {
     const [photos, setPhotos] = useState<PublicPhoto[]>([]);
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
     const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
+    const [selectMode, setSelectMode] = useState<boolean>(false);
     const [downloading, setDownloading] = useState<boolean>(false);
     const downloadFormRef = useRef<HTMLFormElement | null>(null);
+    // The scrollable region is the app-shell body (overflow-y:auto), not the
+    // document -- so scroll save/restore below targets this element, not window.
+    const bodyRef = useRef<HTMLDivElement | null>(null);
     // bufferReady gates the initial grid reveal; bufferPercent keeps updating
     // past that point so the ongoing background prefetch can still surface a
     // running percentage (see the meta line below) until it finishes.
@@ -159,7 +195,11 @@ const PublicAlbumPage: React.FC = () => {
                 return;
             }
         }
-        window.scrollTo(0, preViewerScrollYRef.current);
+        if (bodyRef.current) {
+            bodyRef.current.scrollTop = preViewerScrollYRef.current;
+        } else {
+            window.scrollTo(0, preViewerScrollYRef.current);
+        }
     }, [viewerIndex]);
     useEffect(() => {
         if (!returnHighlightFilename) {
@@ -169,7 +209,7 @@ const PublicAlbumPage: React.FC = () => {
         return () => window.clearTimeout(timer);
     }, [returnHighlightFilename]);
     const openViewerAt = useCallback((index: number) => {
-        preViewerScrollYRef.current = window.scrollY;
+        preViewerScrollYRef.current = bodyRef.current?.scrollTop ?? window.scrollY;
         openedViewerIndexRef.current = index;
         setViewerIndex(index);
     }, []);
@@ -205,6 +245,7 @@ const PublicAlbumPage: React.FC = () => {
                 setAlbum(response.album || null);
                 setPhotos(Array.isArray(response.photos) ? response.photos : []);
                 setSelectedPhotos(new Set());
+                setSelectMode(false);
                 setCodeRequired(false);
             } catch (err) {
                 setLoadError(classifyApiError(err));
@@ -364,6 +405,25 @@ const PublicAlbumPage: React.FC = () => {
     const downloadActionUrl = token
         ? resolveApiUrl(`/public/albums/${encodeURIComponent(token)}/download`)
         : '';
+    const allSelected = selectedCount > 0 && selectedCount === photos.length;
+    const toggleSelectAll = () => {
+        setSelectedPhotos(allSelected ? new Set() : new Set(photos.map((photo) => photo.filename)));
+    };
+    const exitSelectMode = () => {
+        setSelectMode(false);
+        setSelectedPhotos(new Set());
+    };
+    const togglePhoto = (filename: string) => {
+        setSelectedPhotos((current) => {
+            const next = new Set(current);
+            if (next.has(filename)) {
+                next.delete(filename);
+            } else {
+                next.add(filename);
+            }
+            return next;
+        });
+    };
 
     const handleDownload = useCallback(async () => {
         const files = selectedCount > 0
@@ -431,174 +491,208 @@ const PublicAlbumPage: React.FC = () => {
         void loadPublicAlbum('');
     }, [loadPublicAlbum]);
 
+    const countLabel = `${photos.length} photo${photos.length === 1 ? '' : 's'}`;
+    const showToolbar = !loading && !error && bufferReady && photos.length > 0;
+
     return (
-        <section className="gallery-wrap card-glass reveal-up delay-1 public-album-shell public-album-studio">
-            <div className="public-banner public-banner-compact">
-                <div className="public-banner-brand">
-                    <Logo size={38} />
-                    <div>
-                        <p className="additional-kicker">SHARED VIEW</p>
-                        <h2 className="page-topline-title">{album ? album.name : 'Public Album'}</h2>
-                        <p className="gallery-meta-line">
-                            <span className="gallery-meta-count">{photos.length}</span>
-                            <span> photos</span>
-                            <span className="gallery-meta-dim"> · read-only</span>
-                            {codeRequired && <span className="gallery-meta-dim"> · code required</span>}
-                            {bufferReady && bufferPercent < 100 && (
-                                <span className="gallery-meta-dim"> · caching {bufferPercent}%</span>
+        <div className="pt-shell pt-public-shell">
+            <div className="mock-stage">
+                <div className="mock-viewport">
+                    <div className="mock-app">
+                        <header className="ios-header pt-public-header">
+                            <LogoLockup size={30} className="ios-header-wordmark" />
+                            <span className="pt-public-tag">Shared album</span>
+                        </header>
+
+                        <div className="mock-body pt-body" ref={bodyRef}>
+                            {showToolbar && (
+                                <div className="pt-toolbar">
+                                    <div>
+                                        <h1 className="pt-page-title">{album ? album.name : 'Shared album'}</h1>
+                                        <p className="pt-page-sub">
+                                            {countLabel}
+                                            <span> · Read-only</span>
+                                            {selectMode && selectedCount > 0 && <span> · {selectedCount} selected</span>}
+                                            {bufferReady && bufferPercent < 100 && <span> · Caching {bufferPercent}%</span>}
+                                        </p>
+                                    </div>
+                                    <div className="pt-toolbar-actions">
+                                        {selectMode ? (
+                                            <>
+                                                <button type="button" className="btn" onClick={toggleSelectAll}>
+                                                    {allSelected ? 'Clear' : 'Select all'}
+                                                </button>
+                                                <button type="button" className="btn" onClick={exitSelectMode}>
+                                                    Done
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    className="btn mock-cta"
+                                                    disabled={downloading || selectedCount === 0}
+                                                    onClick={() => void handleDownload()}
+                                                >
+                                                    <DownloadIcon className="toolbar-icon" />
+                                                    Download{selectedCount > 0 ? ` (${selectedCount})` : ''}
+                                                </button>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <button type="button" className="btn" onClick={() => setSelectMode(true)}>
+                                                    Select
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    className="btn mock-cta"
+                                                    disabled={downloading}
+                                                    onClick={() => void handleDownload()}
+                                                >
+                                                    <DownloadIcon className="toolbar-icon" />
+                                                    Download all
+                                                </button>
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
                             )}
-                        </p>
+
+                            <form
+                                ref={downloadFormRef}
+                                action={downloadActionUrl}
+                                method="post"
+                                style={{ display: 'none' }}
+                            >
+                                <input type="hidden" name="filenames" defaultValue="" />
+                            </form>
+
+                            {loading && (
+                                <div className="pt-arrive pt-public-state">
+                                    <InlineSpinner label="Loading shared album…" />
+                                </div>
+                            )}
+
+                            {!loading && !error && !codeRequired && !bufferReady && photos.length > 0 && (
+                                <div className="pt-arrive pt-public-buffering">
+                                    <InlineSpinner label={`Loading photos… ${bufferPercent}%`} />
+                                    <div className="progress-track">
+                                        <div className="progress-bar" style={{ width: `${bufferPercent}%` }} />
+                                    </div>
+                                </div>
+                            )}
+
+                            {!loading && error && !codeRequired && (
+                                <div className="pt-arrive pt-public-state">
+                                    <ErrorState
+                                        title="Album unavailable"
+                                        message={error}
+                                        onRetry={loadError?.retriable ? () => { void loadPublicAlbum(accessCode); } : undefined}
+                                    />
+                                </div>
+                            )}
+
+                            {!loading && codeRequired && (
+                                <div className="pt-arrive pt-public-state">
+                                    <div className="empty-state pt-public-lock">
+                                        <span className="empty-state-icon" aria-hidden="true"><LockIcon /></span>
+                                        <p className="empty-state-title">This album is protected</p>
+                                        <p className="empty-state-message">{error || 'Enter the access code to continue.'}</p>
+                                        <div className="pt-public-lock-form">
+                                            <input
+                                                id="public-album-access-code"
+                                                type="password"
+                                                className="field"
+                                                placeholder="Access code"
+                                                autoComplete="current-password"
+                                                value={accessCode}
+                                                onChange={(e) => setAccessCode(e.target.value)}
+                                                onKeyDown={(e) => { if (e.key === 'Enter') void loadPublicAlbum(accessCode); }}
+                                            />
+                                            <button
+                                                type="button"
+                                                className="btn mock-cta"
+                                                disabled={retryAfterSeconds !== null && retryAfterSeconds > 0}
+                                                onClick={() => { void loadPublicAlbum(accessCode); }}
+                                            >
+                                                <LockIcon className="toolbar-icon" />
+                                                Unlock
+                                            </button>
+                                        </div>
+                                        {retryAfterSeconds !== null && retryAfterSeconds > 0 && (
+                                            <p className="pt-page-sub">Retry available in {retryAfterSeconds}s.</p>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {!loading && !error && !codeRequired && photos.length === 0 && (
+                                <div className="pt-arrive pt-public-state">
+                                    <EmptyState icon={<PhotoIcon />} title="Nothing here yet" message="This shared album doesn't have any photos in it right now." />
+                                </div>
+                            )}
+
+                            {!loading && !error && bufferReady && photos.length > 0 && viewerIndex === null && (
+                                <div className={`pt-grid pt-public-grid${selectMode ? ' select-mode' : ''}`}>
+                                    {photos.map((photo, index) => {
+                                        const isSelected = selectedPhotos.has(photo.filename);
+                                        const isVideo = isVideoFilename(photo.filename);
+                                        return (
+                                            <div
+                                                key={photo.filename}
+                                                className={`pt-tile${isSelected ? ' selected' : ''}${photo.filename === returnHighlightFilename ? ' tile-return-highlight' : ''}`}
+                                                role="button"
+                                                tabIndex={0}
+                                                data-tile-id={photo.filename}
+                                                title={photo.filename}
+                                                onClick={() => { if (selectMode) { togglePhoto(photo.filename); } else { openViewerAt(index); } }}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === 'Enter' || e.key === ' ') {
+                                                        e.preventDefault();
+                                                        if (selectMode) { togglePhoto(photo.filename); } else { openViewerAt(index); }
+                                                    }
+                                                }}
+                                            >
+                                                <img
+                                                    className="pt-tile-img"
+                                                    src={resolveMediaSrc(photo.thumbnailUrl)}
+                                                    alt={photo.filename}
+                                                    loading="lazy"
+                                                    draggable={false}
+                                                    style={tileRotationStyle(photo)}
+                                                />
+                                                {isVideo && (
+                                                    <span className="pt-tile-video" aria-hidden="true">
+                                                        <PlayCircleIcon />
+                                                    </span>
+                                                )}
+                                                {selectMode && (
+                                                    <button
+                                                        type="button"
+                                                        className={`pt-tile-check${isSelected ? ' on' : ''}`}
+                                                        aria-label={isSelected ? 'Deselect' : 'Select'}
+                                                        aria-pressed={isSelected}
+                                                        onClick={(e) => { e.stopPropagation(); togglePhoto(photo.filename); }}
+                                                        onTouchStart={(e) => e.stopPropagation()}
+                                                        {...dragSelectHandlers}
+                                                    >
+                                                        <CheckCircleIcon />
+                                                    </button>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+
+                            {!loading && (
+                                <footer className="pt-public-footer">
+                                    <Logo size={18} />
+                                    <span>Powered by <strong>Keepsake</strong> — your own private photo library</span>
+                                </footer>
+                            )}
+                        </div>
                     </div>
                 </div>
             </div>
 
-            {!loading && !error && bufferReady && photos.length > 0 && (
-                <div className="toolbar public-album-toolbar">
-                    <div className="toolbar-left">
-                        <button
-                            type="button"
-                            className="btn btn-soft icon-btn"
-                            onClick={() => {
-                                if (selectedCount > 0 && selectedCount === photos.length) {
-                                    setSelectedPhotos(new Set());
-                                } else {
-                                    setSelectedPhotos(new Set(photos.map((photo) => photo.filename)));
-                                }
-                            }}
-                            aria-label={selectedCount > 0 && selectedCount === photos.length ? 'Clear selection' : 'Select all photos'}
-                        >
-                            <CheckIcon className="toolbar-icon" />
-                            <span className="sr-only">
-                                {selectedCount > 0 && selectedCount === photos.length ? 'Clear selection' : 'Select all photos'}
-                            </span>
-                        </button>
-                    </div>
-                    <div className="toolbar-right">
-                        <button
-                            type="button"
-                            className="btn btn-primary icon-btn"
-                            disabled={downloading}
-                            onClick={() => void handleDownload()}
-                            aria-label={selectedCount > 0 ? `Download selected (${selectedCount})` : `Download all (${photos.length})`}
-                        >
-                            <ArrowDownTrayIcon className="toolbar-icon" />
-                            <span className="sr-only">
-                                {selectedCount > 0 ? `Download selected (${selectedCount})` : `Download all (${photos.length})`}
-                            </span>
-                        </button>
-                    </div>
-                </div>
-            )}
-            <form
-                ref={downloadFormRef}
-                action={downloadActionUrl}
-                method="post"
-                style={{ display: 'none' }}
-            >
-                <input type="hidden" name="filenames" defaultValue="" />
-            </form>
-
-            {loading && <Loading label="Loading shared album…" fullPage={false} />}
-            {!loading && !error && !codeRequired && !bufferReady && photos.length > 0 && (
-                <div className="public-album-buffering">
-                    <Loading label={`Loading photos… ${bufferPercent}%`} fullPage={false} />
-                    <div className="progress-track">
-                        <div className="progress-bar" style={{ width: `${bufferPercent}%` }} />
-                    </div>
-                </div>
-            )}
-            {!loading && error && !codeRequired && (
-                <ErrorState
-                    title="Album unavailable"
-                    message={error}
-                    onRetry={loadError?.retriable ? () => { void loadPublicAlbum(accessCode); } : undefined}
-                />
-            )}
-            {!loading && error && codeRequired && <p className="status error">{error}</p>}
-            {!loading && codeRequired && (
-                <div className="toolbar-left public-album-lock">
-                    <input
-                        id="public-album-access-code"
-                        type="password"
-                        className="field field-compact"
-                        placeholder="Access code"
-                        autoComplete="current-password"
-                        value={accessCode}
-                        onChange={(e) => setAccessCode(e.target.value)}
-                    />
-                    <button
-                        type="button"
-                        className="btn btn-primary icon-btn"
-                        disabled={retryAfterSeconds !== null && retryAfterSeconds > 0}
-                        onClick={() => {
-                            void loadPublicAlbum(accessCode);
-                        }}
-                        aria-label="Unlock"
-                    >
-                        <LockClosedIcon className="toolbar-icon" />
-                        <span className="sr-only">Unlock</span>
-                    </button>
-                </div>
-            )}
-            {!loading && codeRequired && retryAfterSeconds !== null && retryAfterSeconds > 0 && (
-                <p className="status">Retry available in {retryAfterSeconds}s.</p>
-            )}
-            {!loading && !error && photos.length === 0 && (
-                <EmptyState icon={<PhotoIcon />} title="Nothing here yet" message="This shared album doesn't have any photos in it right now." />
-            )}
-
-            {!loading && !error && bufferReady && photos.length > 0 && viewerIndex === null && (
-                <div className="gallery-grid public-gallery-grid">
-                    {photos.map((photo, index) => {
-                        const isSelected = selectedPhotos.has(photo.filename);
-                        const toggle = () => {
-                            setSelectedPhotos((current) => {
-                                const next = new Set(current);
-                                if (next.has(photo.filename)) {
-                                    next.delete(photo.filename);
-                                } else {
-                                    next.add(photo.filename);
-                                }
-                                return next;
-                            });
-                        };
-                        return (
-                            <PhotoTile
-                                key={photo.filename}
-                                photo={photo}
-                                selected={isSelected}
-                                animationDelayMs={(index % 8) * 36}
-                                className={photo.filename === returnHighlightFilename ? 'tile-return-highlight' : undefined}
-                                title={photo.filename}
-                                showBody={false}
-                                useProtectedMedia={false}
-                                mediaOverlay={(
-                                    <label
-                                        className={`tile-select ${isSelected ? 'is-on' : ''}`}
-                                        onClick={(e) => e.stopPropagation()}
-                                        title={isSelected ? 'Selected' : 'Select photo'}
-                                        {...dragSelectHandlers}
-                                    >
-                                        <input
-                                            type="checkbox"
-                                            className="tile-select-input"
-                                            checked={isSelected}
-                                            onChange={toggle}
-                                            aria-label={`Select ${photo.filename}`}
-                                        />
-                                        <CheckIcon className="tile-select-icon" aria-hidden="true" />
-                                    </label>
-                                )}
-                                onMediaClick={(e) => {
-                                    e.stopPropagation();
-                                    e.preventDefault();
-                                    openViewerAt(index);
-                                }}
-                            />
-                        );
-                    })}
-                </div>
-            )}
             {viewerIndex !== null && (
                 <PhotoViewer
                     photos={photos}
@@ -608,12 +702,7 @@ const PublicAlbumPage: React.FC = () => {
                     useProtectedMedia={false}
                 />
             )}
-
-            <footer className="public-album-footer">
-                <Logo size={20} />
-                <span>Powered by <strong>Keepsake</strong> — your own private photo library</span>
-            </footer>
-        </section>
+        </div>
     );
 };
 

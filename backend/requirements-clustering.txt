@@ -1,0 +1,3 @@
+# Dependency for live FAISS assignment, installed by the backend/worker image.
+# Kept separate from image-inference dependencies; lazy-loaded by assignment.
+faiss-cpu==1.15.1

@@ -42,6 +42,9 @@ class _FakeQueueClient:
     def create_queue(self):
         pass
 
+    def send_message(self, content):
+        pass
+
     def receive_messages(self, **kwargs):
         if self._batches:
             return self._batches.pop(0)
@@ -219,3 +222,50 @@ def test_library_clean_exceeding_its_own_ceiling_marks_library_failed(monkeypatc
     row = metadata_table.get_entity('lib1', 'libclean:lib1:job1')
     assert row['status'] == 'failed'
     assert calls == [('lib1', row['error'])]
+
+
+def test_dispatch_exception_leaves_message_for_retry_instead_of_deleting(
+    monkeypatch, metadata_table,
+):
+    """Regression test: people_cluster/people_recluster/people_propagate*
+    share one try block in _handle_clustering_queue_payload with no
+    per-branch exception handling of their own, so an uncaught bug in any
+    of them used to propagate all the way to _poll_clustering_queue_once's
+    outer handler -- which deleted the message unconditionally in its
+    finally block regardless of success or failure. That made the
+    dequeue_count/max_retries ceiling this file otherwise tests dead code
+    in practice: a message could never accumulate dequeue_count from a
+    real processing failure, since it was removed from the queue on its
+    very first attempt. The message must now survive an uncaught exception
+    so Azure's own visibility-timeout redelivery gives it a genuine retry,
+    up to the ceiling this file's other tests cover."""
+    def _raise(payload, job_id, user_id, job_type):
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(app, '_handle_clustering_queue_payload', _raise)
+    message = _FakeQueueMessage(
+        {'jobId': 'cluster:u1:job1', 'user_id': 'u1', 'type': 'people_cluster'},
+        dequeue_count=1,
+    )
+    queue_client = _FakeQueueClient(batches=[[message]])
+
+    _run_one_poll(monkeypatch, queue_client)
+
+    assert queue_client.delete_calls == []  # left in place for redelivery
+    row = metadata_table.get_entity('u1', 'cluster:u1:job1')
+    assert row['status'] == 'failed'  # status still reported immediately
+
+
+def test_successful_dispatch_deletes_the_message(monkeypatch, metadata_table, dispatch_spy):
+    """Companion to the regression test above: a message that dispatches
+    without raising must still be deleted exactly as before."""
+    message = _FakeQueueMessage(
+        {'jobId': 'cluster:u1:job1', 'user_id': 'u1', 'type': 'people_cluster'},
+        dequeue_count=1,
+    )
+    queue_client = _FakeQueueClient(batches=[[message]])
+
+    _run_one_poll(monkeypatch, queue_client)
+
+    assert len(dispatch_spy) == 1
+    assert queue_client.delete_calls == ['m1']

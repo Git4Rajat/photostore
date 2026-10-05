@@ -33,6 +33,8 @@ from __future__ import annotations
 import io
 import os
 import threading
+import time
+from contextvars import ContextVar
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -113,6 +115,24 @@ _face_mesh = None
 # landmark results across threads, not just a crash), so serialize just
 # the detect() call below.
 _FACE_LANDMARKER_LOCK = threading.Lock()
+# Per-call aggregates only; never retain images, vectors, or per-face errors.
+_FACE_DIAGNOSTICS = ContextVar('face_diagnostics', default=None)
+
+
+def _timed(stage, function, *args):
+    started = time.perf_counter()
+    diagnostics = _FACE_DIAGNOSTICS.get()
+    prior_wait = diagnostics['stageTimingsMs']['landmarkWait'] if diagnostics is not None else 0
+    try:
+        return function(*args)
+    finally:
+        diagnostics = _FACE_DIAGNOSTICS.get()
+        if diagnostics is not None:
+            timings = diagnostics['stageTimingsMs']
+            elapsed = (time.perf_counter() - started) * 1000
+            if stage == 'landmark':
+                elapsed = max(0, elapsed - (timings['landmarkWait'] - prior_wait))
+            timings[stage] = round(timings[stage] + elapsed, 3)
 
 
 def _single_threaded_session_options() -> ort.SessionOptions:
@@ -139,6 +159,9 @@ def _get_yolo_session() -> ort.InferenceSession:
             YOLO_FACE_MODEL_PATH, sess_options=_single_threaded_session_options(),
             providers=['CPUExecutionProvider'],
         )
+    diagnostics = _FACE_DIAGNOSTICS.get()
+    if diagnostics is not None:
+        diagnostics['detectorModelReady'] = True
     return _yolo_session
 
 
@@ -151,6 +174,9 @@ def _get_adaface_session() -> ort.InferenceSession:
             ADAFACE_MODEL_PATH, sess_options=_single_threaded_session_options(),
             providers=['CPUExecutionProvider'],
         )
+    diagnostics = _FACE_DIAGNOSTICS.get()
+    if diagnostics is not None:
+        diagnostics['embeddingModelReady'] = True
     return _adaface_session
 
 
@@ -165,6 +191,9 @@ def _get_face_landmarker() -> 'FaceLandmarker':
             min_face_detection_confidence=0.5,
         )
         _face_mesh = FaceLandmarker.create_from_options(options)
+    diagnostics = _FACE_DIAGNOSTICS.get()
+    if diagnostics is not None:
+        diagnostics['landmarkModelReady'] = True
     return _face_mesh
 
 
@@ -214,12 +243,28 @@ def detect_faces(image_bgr: np.ndarray) -> List[dict]:
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
     raw = session.run([output_name], {input_name: tensor})[0]
-    if raw.ndim != 3 or raw.shape[1] < 5:
-        return []
+    diagnostics = _FACE_DIAGNOSTICS.get()
+    if diagnostics is not None:
+        diagnostics['detectorOutputShape'] = list(raw.shape[:4]) if isinstance(raw, np.ndarray) else []
+    # The frontend's bundled single-class export is [1, 5, N], NOT Nx5,
+    # batched, multi-class, or an export with baked-in NMS. A contract failure
+    # cannot authorize a zero-face reconciliation.
+    if not isinstance(raw, np.ndarray) or raw.ndim != 3 or raw.shape[0] != 1 or raw.shape[1] != 5 or raw.shape[2] <= 0:
+        raise ValueError('yolo_output_shape_invalid: expected 1x5xN with N > 0')
+    if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw)):
+        raise ValueError('yolo_output_nonfinite_or_invalid_dtype')
     raw = raw[0]  # 5xN
     scores = raw[4]
+    if np.any(scores < 0) or np.any(scores > 1) or np.any(raw[2:4] < 0):
+        raise ValueError('yolo_output_values_invalid')
+    selected = np.where(scores >= YOLO_SCORE_THRESHOLD)[0]
+    if diagnostics is not None:
+        diagnostics.update(anchorCount=int(raw.shape[1]), scorePassedCount=int(len(selected)))
+        diagnostics.update(detectorMaxScore=float(np.max(scores)),
+                           detectorScoreThreshold=YOLO_SCORE_THRESHOLD,
+                           detectorInputSize=YOLO_INPUT_SIZE)
     candidates: List[dict] = []
-    for a in np.where(scores >= YOLO_SCORE_THRESHOLD)[0]:
+    for a in selected:
         # Cast out of numpy.float32 immediately -- confirmed via a real
         # end-to-end run (Azurite + real queue + real table write) that
         # letting these flow downstream as numpy scalars reaches
@@ -244,7 +289,11 @@ def detect_faces(image_bgr: np.ndarray) -> List[dict]:
             'left': clamped_left, 'top': clamped_top,
             'width': cw, 'height': ch, 'score': float(scores[a]),
         })
-    return _nms(candidates, YOLO_IOU_THRESHOLD)
+    kept = _nms(candidates, YOLO_IOU_THRESHOLD)
+    if diagnostics is not None:
+        diagnostics.update(validBoxCount=len(candidates), invalidBoxCount=len(selected) - len(candidates),
+                           nmsKeptCount=len(kept), nmsRemovedCount=len(candidates) - len(kept))
+    return kept
 
 
 # --- Landmarks (MediaPipe stand-in for face-api's 68-point net) -------------
@@ -288,7 +337,12 @@ def detect_five_landmarks(image_bgr: np.ndarray, bbox: dict) -> Optional[np.ndar
     landmarker = _get_face_landmarker()
     rgb_crop = np.ascontiguousarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_crop)
+    wait_started = time.perf_counter()
     with _FACE_LANDMARKER_LOCK:
+        diagnostics = _FACE_DIAGNOSTICS.get()
+        if diagnostics is not None:
+            timings = diagnostics['stageTimingsMs']
+            timings['landmarkWait'] = round(timings['landmarkWait'] + (time.perf_counter() - wait_started) * 1000, 3)
         result = landmarker.detect(mp_image)
     if not result.face_landmarks:
         return None
@@ -418,6 +472,9 @@ def compute_face_embedding(aligned_bgr: np.ndarray) -> Optional[np.ndarray]:
     output_name = session.get_outputs()[0].name
     raw = session.run([output_name], {input_name: tensor})[0]
     values = raw.reshape(-1)
+    diagnostics = _FACE_DIAGNOSTICS.get()
+    if diagnostics is not None:
+        diagnostics['embeddingOutputShape'] = list(raw.shape[:4])
     if values.shape[0] != FACE_EMBEDDING_DIMENSIONS or not np.all(np.isfinite(values)):
         return None
     norm = float(np.linalg.norm(values))
@@ -445,6 +502,31 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
 
 
 def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
+    diagnostics = {
+        'stageTimingsMs': dict.fromkeys(('decode', 'detect', 'landmarkWait', 'landmark', 'align', 'embed', 'total'), 0),
+        'reasonCounts': {}, 'failureCount': 0, 'qualityRejectedCount': 0,
+        'landmarkCount': 0, 'alignedCount': 0, 'embeddedCount': 0,
+        'detectorModelReady': False, 'landmarkModelReady': False, 'embeddingModelReady': False,
+    }
+    token = _FACE_DIAGNOSTICS.set(diagnostics)
+    started = time.perf_counter()
+    try:
+        result = _process_face(user_id, filename, image_bytes)
+        if result.get('faceFailureStage') and not diagnostics['failureCount'] and not diagnostics['qualityRejectedCount']:
+            diagnostics['failureCount'] = 1
+        for key in ('error', 'faceFailureDetail'):
+            if key in result:
+                result[key] = str(result[key])[:512]
+        diagnostics['stageTimingsMs']['total'] = round((time.perf_counter() - started) * 1000, 3)
+        result['faceDiagnostics'] = diagnostics
+        return result
+    finally:
+        _FACE_DIAGNOSTICS.reset(token)
+
+
+def _process_face(user_id: str, filename: str, image_bytes: bytes) -> Dict:
+    diagnostics = _FACE_DIAGNOSTICS.get()
+    decode_started = time.perf_counter()
     try:
         with Image.open(io.BytesIO(_decodable_image_bytes(image_bytes, filename))) as pil_image:
             # Most phone photos are stored with an EXIF orientation tag rather
@@ -475,17 +557,23 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
             'faceFailureStage': 'unsupported_runtime',
             'faceFailureDetail': f'ipworker_decode_failed: {exc}',
         }
+    finally:
+        diagnostics['stageTimingsMs']['decode'] = round((time.perf_counter() - decode_started) * 1000, 3)
+
+    diagnostics.update(imageWidth=image_width, imageHeight=image_height)
 
     try:
-        detections = detect_faces(image_bgr)
+        detections = _timed('detect', detect_faces, image_bgr)
+        diagnostics['detectorModelReady'] = True
     except Exception as exc:
         return {
             'hasData': False,
             'faces': [],
             'rawFaceCount': 0,
             'error': f'detection_failed: {exc}',
-            'faceFailureStage': 'unsupported_runtime',
+            'faceFailureStage': 'detection_failed' if isinstance(exc, ValueError) else 'unsupported_runtime',
             'faceFailureDetail': f'ipworker_detection_failed: {exc}',
+            'faceModelReady': False,
         }
 
     faces: List[Dict] = []
@@ -495,22 +583,49 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
     # from stored data instead of a guess -- previously neither continue below
     # recorded anything, matching the exact gap the 2026-08-01 face_reject_diagnostic
     # comment above describes for the browser-reported path.
-    filtered_reasons: List[str] = []
+    def reject(reason, *, quality=False):
+        reasons = diagnostics['reasonCounts']
+        reasons[reason] = reasons.get(reason, 0) + 1
+        diagnostics['qualityRejectedCount' if quality else 'failureCount'] += 1
+
+    invalid_boxes = diagnostics.get('invalidBoxCount', 0)
+    if invalid_boxes:
+        diagnostics['reasonCounts']['invalid_detection_boxes'] = invalid_boxes
+        diagnostics['qualityRejectedCount'] += invalid_boxes
+
     for detection in detections:
         bbox = {k: detection[k] for k in ('left', 'top', 'width', 'height')}
         try:
-            landmarks = detect_five_landmarks(image_bgr, bbox)
+            landmarks = _timed('landmark', detect_five_landmarks, image_bgr, bbox)
         except Exception:
-            landmarks = None
-        crop_result = crop_and_align_face(image_bgr, bbox, landmarks)
+            reject('landmark_exception')
+            continue
+        if landmarks is None:
+            reject('landmark_detection_failed')
+            continue
+        if np.shape(landmarks) != (5, 2) or not np.all(np.isfinite(landmarks)):
+            reject('landmark_invalid')
+            continue
+        diagnostics['landmarkCount'] += 1
+        try:
+            crop_result = _timed('align', crop_and_align_face, image_bgr, bbox, landmarks)
+        except Exception:
+            reject('alignment_exception')
+            continue
         if crop_result is None:
-            filtered_reasons.append('landmark_detection_failed' if landmarks is None else 'alignment_transform_rejected')
+            reject('alignment_transform_rejected', quality=True)
             continue
         aligned, alignment_method = crop_result
-        embedding = compute_face_embedding(aligned)
-        if embedding is None:
-            filtered_reasons.append('embedding_computation_failed')
+        diagnostics['alignedCount'] += 1
+        try:
+            embedding = _timed('embed', compute_face_embedding, aligned)
+        except Exception:
+            reject('embedding_exception')
             continue
+        if embedding is None or np.shape(embedding) != (FACE_EMBEDDING_DIMENSIONS,) or not np.all(np.isfinite(embedding)) or np.linalg.norm(embedding) <= 0:
+            reject('embedding_computation_failed')
+            continue
+        diagnostics['embeddedCount'] += 1
         faces.append({
             'bbox': bbox,
             'confidence': detection['score'],
@@ -537,12 +652,18 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
         'modelTaxonomyVersion': FACE_EMBEDDING_MODEL_TAXONOMY_VERSION,
         'runtime': FACE_EMBEDDING_RUNTIME,
         'modelAvailability': 'available',
+        'faceModelReady': True,
     }
-    if not faces:
-        result = {'hasData': False, 'faces': [], 'rawFaceCount': len(detections), **model_fields}
-        if filtered_reasons:
-            result['candidateFaceCount'] = len(detections)
-            result['filteredFaceCount'] = len(filtered_reasons)
-            result['filteredReason'] = filtered_reasons[0]
-        return result
-    return {'hasData': True, 'faces': faces, 'rawFaceCount': len(detections), **model_fields}
+    filtered_count = diagnostics['failureCount'] + diagnostics['qualityRejectedCount']
+    result = {
+        'hasData': bool(faces), 'faces': faces, 'rawFaceCount': len(detections) + invalid_boxes,
+        'candidateFaceCount': len(detections), 'filteredFaceCount': filtered_count,
+        **model_fields,
+    }
+    if filtered_count:
+        result['filteredReason'] = next(iter(diagnostics['reasonCounts']))
+        result['faceFailureStage'] = 'postprocessing_failed' if diagnostics['failureCount'] else 'quality_filter_rejected'
+        result['faceFailureDetail'] = 'ipworker_candidates_not_fully_embedded'
+    elif not detections:
+        result['noDetectionReason'] = 'below_score_threshold'
+    return result

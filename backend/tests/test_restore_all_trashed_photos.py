@@ -11,7 +11,15 @@ from routes.photos import restore_all_trashed_photos
 
 def _patch_common(monkeypatch, rows, restorable):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', lambda *a, **k: rows)
+    calls = []
+
+    def _fake_scan(user_id, select=None, include_deleted=False, extra_filter='', purpose=''):
+        # emulate the server-side filter the routes now push down
+        calls.append(extra_filter)
+        return iter([r for r in rows if r.get('processing_state') == 'deleted'] if 'deleted' in extra_filter else rows)
+
+    monkeypatch.setattr(app, '_iter_metadata_rows_for_user', _fake_scan)
+    monkeypatch.setattr(app, '_scan_filters_seen', calls, raising=False)
     monkeypatch.setattr(app, '_restore_deleted_file', lambda uid, name: ({'RowKey': name} if name in restorable else None))
     monkeypatch.setattr(app, '_invalidate_metadata_scan_cache', lambda uid: None)
     monkeypatch.setattr(app, 'touch_user_search_indexes_state', lambda uid, filenames=None: None)

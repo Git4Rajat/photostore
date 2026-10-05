@@ -1,13 +1,14 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowsPointingOutIcon, InformationCircleIcon } from '@heroicons/react/24/outline';
+import { Maximize2 as ArrowsPointingOutIcon, Info as InformationCircleIcon } from 'lucide-react';
 import { useStore } from '../store';
 import WorkbenchGrid from '../components/WorkbenchGrid';
+import { Spinner } from '../components/bits';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import type { BrowserProcessingAction } from '../../../components/AppServicesProvider';
 import { getTools, postTools, postAdmin, getExtras } from '../../../services/apiClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog } from '../../../components/shared/dialogs';
-import type { Photo } from '../types';
+
 
 const TABS = ['Overview', 'Workbench', 'Recovery', 'History', 'Diagnostics'];
 
@@ -29,6 +30,19 @@ const AI_STEPS = new Set<BrowserProcessingAction>(['ocr', 'vision', 'faces']);
 
 interface HistoryEntry { actionId?: string; action?: string; steps?: string[]; scope?: string; filenameCount?: number; createdAt?: string; }
 
+interface VerifyFaceIndexResult {
+    checked: number;
+    mismatches: number;
+    errors: number;
+    results: Array<{
+        filename: string;
+        beforeFaceIds?: string[] | null;
+        afterFaceIds?: string[] | null;
+        mismatch?: boolean;
+        error?: string;
+    }>;
+}
+
 interface PeopleDiagnostic {
     totalFaces: number;
     acceptedForClustering: number;
@@ -49,7 +63,7 @@ interface PeopleDiagnostic {
 
 /** Tools — live pipeline health + a bulk re-run row + recovery/history. */
 export const ToolsPage: React.FC = () => {
-    const { toast, route, photos, navigate } = useStore();
+    const { toast, route, navigate } = useStore();
     const {
         activeJobs, clusteringActive, clusteringStatusLabel, ipworkActive, ipworkStatusLabel,
         startBrowserProcessing, browserProcessingActive, browserAiModelState, loadBrowserAiModel,
@@ -66,6 +80,9 @@ export const ToolsPage: React.FC = () => {
     const [reselectingId, setReselectingId] = useState<string | null>(null);
     const [diagnostic, setDiagnostic] = useState<PeopleDiagnostic | null>(null);
     const [diagnosticLoading, setDiagnosticLoading] = useState(false);
+    const [verifyInput, setVerifyInput] = useState('');
+    const [verifyResult, setVerifyResult] = useState<VerifyFaceIndexResult | null>(null);
+    const [verifyLoading, setVerifyLoading] = useState(false);
 
     // A deep link ("Open in Workbench" from the gallery) pre-selects those
     // photos, but any photo in the loaded library can be searched for and
@@ -84,12 +101,12 @@ export const ToolsPage: React.FC = () => {
             const res = await getTools<{ filenames?: string[] }>(`/api/tools/workbench/actions/${actionId}`);
             const filenames = Array.isArray(res?.filenames) ? res.filenames : [];
             if (!filenames.length) {
-                toast("Those photos aren't available anymore");
+                toast("Those photos aren't available anymore", undefined, undefined, 'error');
                 return;
             }
             navigate('tools', { filenames: filenames.join(',') });
         } catch {
-            toast('Couldn’t reselect those photos');
+            toast('Couldn’t reselect those photos', undefined, undefined, 'error');
         } finally {
             setReselectingId(null);
         }
@@ -114,13 +131,6 @@ export const ToolsPage: React.FC = () => {
 
     const toggleWbSelect = (id: string) =>
         setWbSelection((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-
-    // Any deep-linked filename not present in the loaded library yet still
-    // needs a minimal record so it can render as a tile.
-    const missingDeepLinked: Photo[] = workbenchFilenames
-        .filter((filename) => !photos.some((p) => p.id === filename))
-        .map((filename) => ({ id: filename, filename, swatch: 's1', dateLabel: '', year: 0, rating: 0, liked: false, placeId: null, personIds: [], tags: [] }));
-    const workbenchLibrary: Photo[] = [...missingDeepLinked, ...photos];
 
     const loadHistory = async () => {
         setHistoryLoading(true);
@@ -176,7 +186,7 @@ export const ToolsPage: React.FC = () => {
                 ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${wbSteps.join(', ')}`
                 : `Queued ${wbSelection.length} photo${wbSelection.length === 1 ? '' : 's'} · ${wbSteps.join(', ')}`);
         } catch {
-            toast('Couldn’t start processing');
+            toast('Couldn’t start processing', undefined, undefined, 'error');
         }
     };
 
@@ -195,7 +205,7 @@ export const ToolsPage: React.FC = () => {
                 ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${steps.join(', ')}`
                 : `Started ${steps.join(', ')} — pulling pending photos…`);
         } catch {
-            toast('Couldn’t start processing');
+            toast('Couldn’t start processing', undefined, undefined, 'error');
         }
     };
 
@@ -213,9 +223,27 @@ export const ToolsPage: React.FC = () => {
             recordAction([], 'library', undefined, label);
             toast(`${label} started`);
         } catch {
-            toast(`Couldn’t start ${label.toLowerCase()}`);
+            toast(`Couldn’t start ${label.toLowerCase()}`, undefined, undefined, 'error');
         } finally {
             setBusy(false);
+        }
+    };
+
+    const runVerifyFaceIndex = async () => {
+        const filenames = verifyInput.split(/[\n,]/).map((f) => f.trim()).filter(Boolean);
+        if (!filenames.length) return;
+        setVerifyLoading(true);
+        setVerifyResult(null);
+        try {
+            const result = await postAdmin<VerifyFaceIndexResult>('/api/admin/people/verify-face-index', { filenames });
+            setVerifyResult(result);
+            toast(result.mismatches > 0
+                ? `Fixed ${result.mismatches} of ${result.checked} photo${result.checked === 1 ? '' : 's'}`
+                : `All ${result.checked} photo${result.checked === 1 ? '' : 's'} already correct`);
+        } catch {
+            toast('Couldn’t verify face index', undefined, undefined, 'error');
+        } finally {
+            setVerifyLoading(false);
         }
     };
 
@@ -289,7 +317,7 @@ export const ToolsPage: React.FC = () => {
                         each tile shows how all 7 steps did and an <InformationCircleIcon className="pt-inline-icon" /> for its EXIF + tags.
                     </div>
                     <WorkbenchGrid
-                        photos={workbenchLibrary}
+                        pinned={workbenchFilenames}
                         selection={wbSelection}
                         onToggleSelect={toggleWbSelect}
                         onSelectMany={setWbSelection}
@@ -347,13 +375,43 @@ export const ToolsPage: React.FC = () => {
                         <span>Remove leftover rows/blobs for photos that no longer exist in the library.</span>
                         <button type="button" className="btn btn-danger" disabled={busy} onClick={() => void runAdmin('Purge orphaned photo data', '/api/admin/photos/purge-orphaned-data', { repair: true, confirm: 'PURGE_ORPHANED_PHOTO_DATA' })}>Purge</button>
                     </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Verify/repair face index</strong>
+                        <span>Enter specific filenames (one per line, or comma-separated) to force a real re-check of their face data — fixes the ones that were wrong, confirms the rest.</span>
+                        <textarea
+                            className="pt-verify-input"
+                            rows={3}
+                            placeholder={'IMG_1234.jpg\nIMG_1235.heic'}
+                            value={verifyInput}
+                            onChange={(e) => setVerifyInput(e.target.value)}
+                            disabled={verifyLoading}
+                        />
+                        <button type="button" className="btn" disabled={verifyLoading || !verifyInput.trim()} onClick={() => void runVerifyFaceIndex()}>
+                            {verifyLoading ? <Spinner /> : 'Verify & repair'}
+                        </button>
+                        {verifyResult && (
+                            <div className="pt-verify-results">
+                                <div>{verifyResult.checked} checked · {verifyResult.mismatches} fixed · {verifyResult.errors} error{verifyResult.errors === 1 ? '' : 's'}</div>
+                                {verifyResult.results.map((r) => (
+                                    <div key={r.filename} className={`pt-verify-row${r.mismatch ? ' fixed' : ''}${r.error ? ' error' : ''}`}>
+                                        {r.filename}
+                                        {r.error
+                                            ? ` — error: ${r.error}`
+                                            : r.mismatch
+                                                ? ` — was ${(r.beforeFaceIds ?? []).length}, now ${(r.afterFaceIds ?? []).length} face(s)`
+                                                : ` — OK (${(r.afterFaceIds ?? []).length} face(s))`}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
                 </div>
             )}
 
             {tab === 'History' && (
                 <div className="card-glass pt-history">
                     {historyLoading ? (
-                        <div className="pt-history-row">Loading history…</div>
+                        <Spinner label="Loading history…" center={false} />
                     ) : history.length === 0 ? (
                         <div className="pt-history-row">No recent actions.</div>
                     ) : (
@@ -392,7 +450,7 @@ export const ToolsPage: React.FC = () => {
                                 {diagnosticLoading ? 'Refreshing…' : 'Refresh'}
                             </button>
                         </div>
-                        {diagnosticLoading && !diagnostic && <span>Running diagnostics…</span>}
+                        {diagnosticLoading && !diagnostic && <Spinner label="Running diagnostics…" center={false} />}
                         {!diagnosticLoading && !diagnostic && <span>Couldn’t load diagnostics.</span>}
                         {diagnostic && (
                             <>

@@ -11,7 +11,10 @@ from routes.photos import list_trashed_photos
 
 def _patch_common(monkeypatch, rows):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    monkeypatch.setattr(app, '_query_metadata_rows_for_user', lambda *a, **k: rows)
+    trashed = [r for r in rows if r.get('processing_state') == 'deleted']
+    monkeypatch.setattr(app, '_trash_index_entries', lambda uid: sorted(
+        [{'RowKey': r['RowKey'], 'deletedAt': r.get('deletedAt', '')} for r in trashed], key=lambda e: e['deletedAt'], reverse=True))
+    monkeypatch.setattr(app, '_get_metadata_entities', lambda uid, names: {r['RowKey']: r for r in trashed if r['RowKey'] in names})
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
     monkeypatch.setattr(app, '_build_photo_summaries_page', lambda uid, items, pid_to_name: [{'filename': name} for name, _ in items])
 

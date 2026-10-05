@@ -144,4 +144,5 @@ export interface Toast {
     message: string;
     actionLabel?: string;
     onAction?: () => void;
+    tone?: 'info' | 'error';
 }

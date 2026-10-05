@@ -7,6 +7,7 @@ clause]), delete_entity, create_table.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 
 class ResourceNotFound(Exception):
@@ -16,12 +17,31 @@ class ResourceNotFound(Exception):
 class FakeTable:
     def __init__(self) -> None:
         self.rows: dict = {}  # (pk, rk) -> dict
+        self.stamps: dict = {}  # (pk, rk) -> datetime of the last write (the service-side Timestamp)
+        self.clock = None  # tests may set a callable returning a datetime
+        self.submit_transaction_calls: list = []  # list of the operations lists passed in
 
     def create_table(self):
         pass
 
-    def upsert_entity(self, entity):
+    def upsert_entity(self, entity, mode=None, **kwargs):
         self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
+        self.stamps[(entity['PartitionKey'], entity['RowKey'])] = self.clock() if self.clock else datetime.now(timezone.utc)
+
+    def submit_transaction(self, operations):
+        # Real azure-data-tables requires every entity in one transaction to
+        # share a PartitionKey and caps it at 100 operations -- not enforced
+        # here since nothing in this test suite needs that failure mode, only
+        # the "N upserts become 1 call" behavior storage_utils's dirty-
+        # filename batching relies on (see _flush_dirty_filename_buffer).
+        self.submit_transaction_calls.append(list(operations))
+        for op_type, entity in operations:
+            if op_type == 'upsert':
+                self.upsert_entity(entity)
+            elif op_type == 'delete':
+                self.delete_entity(entity['PartitionKey'], entity['RowKey'])
+            else:
+                raise ValueError(f'Unsupported fake transaction op: {op_type}')
 
     def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
         # No real etag/optimistic-concurrency simulation here -- tests that
@@ -42,16 +62,52 @@ class FakeTable:
     def delete_entity(self, partition_key, row_key):
         self.rows.pop((partition_key, row_key), None)
 
-    def query_entities(self, filter_str, select=None):
+    def query_entities(self, filter_str, select=None, **kwargs):
         # Compound clause checked first -- the plain-PartitionKey pattern's
-        # greedy '(.*)' would otherwise swallow " and field eq '...'" as part
-        # of the partition key value itself.
+        # greedy '(.*)' would otherwise swallow " and field eq ..." as part
+        # of the partition key value itself. Second alternative covers
+        # unquoted OData boolean literals (e.g. "processing_complete eq
+        # true"), which don't fit the quoted-string '(.*)' form.
+        m = re.match(r"PartitionKey eq '([^']*)' and Timestamp ge datetime'([^']+)'$", filter_str.strip())
+        if m:
+            pk, since = m.group(1), datetime.strptime(m.group(2), '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            rows = [dict(v) for (p, r), v in self.rows.items() if p == pk and self.stamps.get((p, r), since) >= since]
+            if select:
+                rows = [{k: v[k] for k in select if k in v} for v in rows]
+            return rows
+        m = re.match(r"PartitionKey eq '([^']*)' and \((.+)\)$", filter_str.strip())
+        if m:
+            # "PartitionKey eq 'x' and (a ge 'v' or b eq 'w' or ...)"
+            pk = m.group(1)
+            clauses = []
+            for part in m.group(2).split(' or '):
+                cm = re.match(r"(\w+) (eq|ge|le|gt|lt) '(.*)'$", part.strip())
+                if not cm:
+                    raise ValueError(f'Unsupported filter: {filter_str}')
+                clauses.append(cm.groups())
+            ops = {
+                'eq': lambda a, b: a == b, 'ge': lambda a, b: a >= b, 'le': lambda a, b: a <= b,
+                'gt': lambda a, b: a > b, 'lt': lambda a, b: a < b,
+            }
+            rows = [
+                dict(v) for (p, _), v in self.rows.items()
+                if p == pk and any(ops[op](str(v.get(f, '')), val) for f, op, val in clauses)
+            ]
+            if select:
+                rows = [{k: v[k] for k in select if k in v} for v in rows]
+            return rows
         m = re.match(r"PartitionKey eq '(.*)' and (\w+) eq '(.*)'$", filter_str.strip())
         if m:
             pk, field, value = m.group(1), m.group(2), m.group(3)
             rows = [
                 dict(v) for (p, _), v in self.rows.items()
                 if p == pk and str(v.get(field, '')) == value
+            ]
+        elif (m := re.match(r"PartitionKey eq '(.*)' and (\w+) eq (true|false)$", filter_str.strip())):
+            pk, field, value = m.group(1), m.group(2), m.group(3) == 'true'
+            rows = [
+                dict(v) for (p, _), v in self.rows.items()
+                if p == pk and bool(v.get(field, False)) == value
             ]
         else:
             m = re.match(r"PartitionKey eq '(.*)'$", filter_str.strip())

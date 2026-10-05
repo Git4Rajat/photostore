@@ -1,10 +1,28 @@
+import IndexBuildBar from './components/IndexBuildBar';
+import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
-import { PlusIcon, MagnifyingGlassIcon, PhotoIcon, RectangleStackIcon, UserGroupIcon, SparklesIcon } from '@heroicons/react/24/outline';
-import { MagnifyingGlassIcon as MagnifyingGlassIconSolid, PhotoIcon as PhotoIconSolid, RectangleStackIcon as RectangleStackIconSolid, UserGroupIcon as UserGroupIconSolid, SparklesIcon as SparklesIconSolid } from '@heroicons/react/24/solid';
+import {
+    Plus as PlusIcon,
+    Search as MagnifyingGlassIcon,
+    Image as PhotoIcon,
+    Images as RectangleStackIcon,
+    Users as UserGroupIcon,
+    Sparkles as SparklesIcon,
+    MoreHorizontal as EllipsisHorizontalIcon,
+    // The active-tab "solid" cue is handled by color + a heavier stroke in the
+    // tab bar (Lucide is a single outline set), so the solid aliases point at
+    // the same glyphs.
+    Search as MagnifyingGlassIconSolid,
+    Image as PhotoIconSolid,
+    Images as RectangleStackIconSolid,
+    Users as UserGroupIconSolid,
+    Sparkles as SparklesIconSolid,
+} from 'lucide-react';
 import { LogoLockup } from '../../components/shared/Logo';
 import Loading from '../../components/shared/Loading';
 import { AppServicesProvider, useAppServices } from '../../components/AppServicesProvider';
+import { formatBytes } from '../../components/browserAiShared';
 import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
@@ -77,7 +95,12 @@ const NAV: { id: PageId; label: string }[] = [
     { id: 'tools', label: 'Tools' },
     { id: 'sharing', label: 'Sharing' },
 ];
+// The phone tab bar holds 5 primary destinations; the remaining ones live
+// behind a "More" tab (HIG: fold overflow beyond 5 tabs into More rather than
+// dropping those destinations, which previously left Tools/Sharing unreachable
+// on mobile).
 const MOBILE_NAV = NAV.slice(0, 5);
+const MOBILE_MORE = NAV.slice(5); // Tools, Sharing
 
 const MOBILE_NAV_ICONS: Record<string, [React.ElementType, React.ElementType]> = {
     ask: [MagnifyingGlassIcon, MagnifyingGlassIconSolid],
@@ -104,6 +127,8 @@ const activeNavFor = (page: PageId): PageId | '' => (
 
 const Page: React.FC = () => {
     const { route } = useStore();
+    // Tag every request / resource / long task with the page that caused it.
+    React.useEffect(() => { perf.setView(route.page); }, [route.page]);
     switch (route.page) {
         case 'ask': return <AskPage />;
         case 'gallery': return <GalleryPage />;
@@ -130,7 +155,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 
     return (
         <header className="ios-header">
-            <button type="button" className="pt-wordmark-btn" onClick={() => navigate('gallery')} aria-label="Home">
+            <button type="button" className="pt-wordmark-btn" onClick={() => navigate('gallery')} aria-label="Go to Gallery">
                 <LogoLockup size={30} className="ios-header-wordmark" />
             </button>
             <nav className="ios-tabs" aria-label="Primary navigation">
@@ -157,8 +182,8 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                         <div className="pt-account-menu">
                             <div className="pt-account-head"><b>{accountName}</b>{accountEmail && <span>{accountEmail}</span>}</div>
                             <button type="button" onClick={() => { navigate('trash'); close(); }}>Recently Deleted</button>
-                            <button type="button" onClick={() => { toast('Corrupted uploads: all clear'); close(); }}>Corrupted uploads</button>
-                            <button type="button" onClick={() => { navigate('additional'); close(); }}>Additional info</button>
+                            <button type="button" onClick={() => { toast('Corrupted uploads: all clear'); close(); }}>Corrupted Uploads</button>
+                            <button type="button" onClick={() => { navigate('additional'); close(); }}>Additional Info</button>
                             <div className="pt-account-sep" />
                             <div className="pt-account-theme">
                                 <span>Theme</span>
@@ -169,7 +194,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                                 </div>
                             </div>
                             <div className="pt-account-sep" />
-                            <button type="button" onClick={() => { close(); onSignOut(); }}>Sign out</button>
+                            <button type="button" onClick={() => { close(); onSignOut(); }}>Sign Out</button>
                         </div>
                     )}
                 </Menu>
@@ -181,6 +206,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 const MobileTabbar: React.FC = () => {
     const { route, navigate } = useStore();
     const active = activeNavFor(route.page);
+    const moreActive = MOBILE_MORE.some((item) => item.id === route.page);
     return (
         <nav className="mock-tabbar" aria-label="Primary navigation (mobile)">
             {MOBILE_NAV.map((item) => {
@@ -189,12 +215,106 @@ const MobileTabbar: React.FC = () => {
                 const Icon = isActive ? Solid : Outline;
                 return (
                     <button key={item.id} type="button" className={isActive ? 'on' : undefined} onClick={() => navigate(item.id)}>
-                        <Icon className="mock-tabbar-icon" aria-hidden="true" />
+                        <Icon className="mock-tabbar-icon" aria-hidden="true" strokeWidth={isActive ? 2.5 : 2} />
                         <span>{item.label}</span>
                     </button>
                 );
             })}
+            <Menu
+                align="right"
+                className="mock-tabbar-more"
+                renderTrigger={(toggle) => (
+                    <button type="button" className={moreActive ? 'on' : undefined} onClick={toggle} aria-haspopup="menu" aria-label="More">
+                        <EllipsisHorizontalIcon className="mock-tabbar-icon" aria-hidden="true" />
+                        <span>More</span>
+                    </button>
+                )}
+            >
+                {(close) => (
+                    <div className="pt-more-menu">
+                        {MOBILE_MORE.map((item) => (
+                            <button key={item.id} type="button" onClick={() => { navigate(item.id); close(); }}>{item.label}</button>
+                        ))}
+                    </div>
+                )}
+            </Menu>
         </nav>
+    );
+};
+
+// A paused upload session (some files failed, none retried/discarded) never
+// surfaced Retry/Discard in this UI -- only App.tsx (the legacy shell) ported
+// them. Mirrors that banner (same appServices state, same classes from
+// index.css) at the root so it's visible from every page, not just Gallery.
+const UploadPausedBanner: React.FC = () => {
+    const { pendingUploadSummary, pendingUploadFailedFiles, retryPersistedUploadSession, discardPersistedUploadSession, uploading } = useAppServices();
+    if (!pendingUploadSummary) return null;
+    return (
+        <div className="upload-approval-bar root-upload-approval-bar">
+            <div>
+                <p className="upload-approval-title">Upload paused</p>
+                <p className="upload-approval-details">
+                    {pendingUploadSummary.fileCount} file(s) waiting
+                    {pendingUploadSummary.failedCount > 0 ? `, ${pendingUploadSummary.failedCount} failed` : ''}
+                    {pendingUploadSummary.failedCount > 0
+                        ? '. If Retry can’t find them, use Upload and reselect the same photos (or the whole folder) — files already uploaded are skipped automatically, so there’s no need to pick out just the failed ones.'
+                        : ''}
+                </p>
+                {pendingUploadFailedFiles.length > 0 && (
+                    <details className="upload-approval-failed-details">
+                        <summary>Show {pendingUploadFailedFiles.length} failed file(s)</summary>
+                        <ul className="upload-approval-failed-list">
+                            {pendingUploadFailedFiles.map((file) => (
+                                <li key={file.key} className="upload-approval-failed-item">
+                                    {file.previewDataUrl ? (
+                                        <img src={file.previewDataUrl} alt="" className="upload-approval-failed-thumb" />
+                                    ) : (
+                                        <span className="upload-approval-failed-thumb upload-approval-failed-thumb-fallback">
+                                            <PhotoIcon />
+                                        </span>
+                                    )}
+                                    <span className="upload-approval-failed-info">
+                                        <span className="upload-approval-failed-name">{file.name}</span>
+                                        <span className="upload-approval-failed-size">{formatBytes(file.size)}</span>
+                                        <span className="upload-approval-failed-reason">{file.error || 'Upload failed.'}</span>
+                                    </span>
+                                </li>
+                            ))}
+                        </ul>
+                    </details>
+                )}
+            </div>
+            <div className="upload-approval-actions">
+                <button type="button" className="btn btn-primary" onClick={() => void retryPersistedUploadSession()} disabled={uploading}>
+                    Retry
+                </button>
+                <button type="button" className="btn btn-soft" onClick={() => void discardPersistedUploadSession()} disabled={uploading}>
+                    Discard
+                </button>
+            </div>
+        </div>
+    );
+};
+
+// Gates StoreProvider itself, not just what Shell renders inside it --
+// StoreProvider's own mount effects (fetchPhotos, /explore, fetchAlbums,
+// fetchPeople) fire unconditionally as soon as it mounts, regardless of
+// which page is actually showing, so holding the gate inside Shell (i.e.
+// below StoreProvider) doesn't stop them. libraryIndexReady starts null
+// ("backend readiness check not back yet") and flips true as soon as that
+// one check is back -- it does NOT wait for an index build to finish (that
+// runs as a backend-owned background job the frontend never monitors; see
+// AppServicesProvider's index-readiness effect), only for the brief existence
+// check that avoids a cold account's pages all firing concurrent full scans.
+const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
+    const { libraryIndexReady } = useAppServices();
+    if (libraryIndexReady !== true) {
+        return <Loading label="Loading Keepsake…" />;
+    }
+    return (
+        <StoreProvider>
+            <Shell onSignOut={onSignOut} />
+        </StoreProvider>
     );
 };
 
@@ -209,6 +329,8 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
                     <div className="mock-app">
                         <Topbar theme={theme} onTheme={setTheme} onSignOut={onSignOut} />
                         <div className="mock-body pt-body">
+                            <UploadPausedBanner />
+                            <IndexBuildBar />
                             <Page />
                         </div>
                         <MobileTabbar />
@@ -253,6 +375,16 @@ const PrototypeApp: React.FC = () => {
         await signOut();
         await refreshAuthState();
     }, [refreshAuthState]);
+
+    // The client-side lexical/vector search index warm-up used to start
+    // unconditionally here, the moment ANY session signed in, regardless of
+    // whether Ask was ever opened -- one more fetch racing five others in
+    // the same mount window (see the 2026-10-01 boot-request audit). That
+    // blob can be very large (hundreds of MB compressed on a big library),
+    // so a session that never searches no longer pays for it at all now:
+    // AskPage's own mount effect starts the same warm-up (still a retry
+    // loop, since a cold account's server-side index may not have finished
+    // building yet), only when the user actually opens Ask.
 
     // Public share links render the real album page regardless of auth state.
     if (isPublicAlbumPath()) {
@@ -334,9 +466,7 @@ const PrototypeApp: React.FC = () => {
 
     return (
         <AppServicesProvider>
-            <StoreProvider>
-                <Shell onSignOut={handleSignOut} />
-            </StoreProvider>
+            <AppShellGate onSignOut={handleSignOut} />
         </AppServicesProvider>
     );
 };

@@ -7,6 +7,8 @@ export interface Photo {
     filename: string;
     url: string;
     thumbnailUrl?: string;
+    /** Physical thumbnail blob name (token mode); build the URL with mediaToken.ts. */
+    thumbnailBlob?: string;
     thumbnailRotation?: number;
     size: number;
     lastModified?: string | null;

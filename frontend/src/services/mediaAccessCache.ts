@@ -6,7 +6,7 @@ import { getActiveLibraryFromToken } from './passwordAuthClient';
 // (rather than a kind parameter bolted onto thumbnailAccessCache.ts) so the
 // existing, widely-used thumbnail cache's storage format and call sites stay
 // completely untouched -- same "mirror, don't modify" precedent as
-// localSortIndex.ts mirroring localSearchIndex.ts rather than parametrizing
+// localSortIndex.ts mirroring the former browser search index rather than parametrizing
 // it in place.
 //
 // Fixes: the viewer (mockups/prototype/media.ts's useMainMedia) used to mint

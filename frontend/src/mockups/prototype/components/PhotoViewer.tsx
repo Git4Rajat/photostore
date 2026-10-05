@@ -1,19 +1,18 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-    ArrowLeftIcon,
-    ArrowUturnLeftIcon,
-    ArrowUturnRightIcon,
-    ChevronLeftIcon,
-    ChevronRightIcon,
-    EllipsisHorizontalIcon,
-    MagnifyingGlassMinusIcon,
-    MagnifyingGlassPlusIcon,
-    PlusIcon,
-    TrashIcon,
-} from '@heroicons/react/24/outline';
-import { HeartIcon as HeartSolid } from '@heroicons/react/24/solid';
-import { HeartIcon as HeartOutline } from '@heroicons/react/24/outline';
-import { Menu, Stars } from './bits';
+    ArrowLeft as ArrowLeftIcon,
+    RotateCcw as ArrowUturnLeftIcon,
+    RotateCw as ArrowUturnRightIcon,
+    ChevronLeft as ChevronLeftIcon,
+    ChevronRight as ChevronRightIcon,
+    MoreHorizontal as EllipsisHorizontalIcon,
+    ZoomOut as MagnifyingGlassMinusIcon,
+    ZoomIn as MagnifyingGlassPlusIcon,
+    Plus as PlusIcon,
+    Trash2 as TrashIcon,
+    Heart,
+} from 'lucide-react';
+import { Menu, Stars, Spinner } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
 import { useStore, isVideoFilename } from '../store';
 import { useMainMedia, downloadPhoto, fetchPhotoMetadata, setPhotoRotation, preloadMediaAccessUrls } from '../media';
@@ -26,6 +25,31 @@ const ZOOM_STEP = 0.5;
 const dash = (value?: string | number): string => {
     const text = value === undefined || value === null ? '' : String(value).trim();
     return text || '—';
+};
+
+// EXIF arrives as raw, unrounded numeric strings (e.g. a computed FNumber of
+// "7.66082624558859") -- these convert them to the rounded, unit-suffixed
+// form a camera's own display would show (ISO 6400, 500mm, f8, 1/100s).
+const formatIso = (iso?: string): string | null => {
+    if (!iso) return null;
+    const n = parseFloat(iso);
+    return `ISO ${Number.isFinite(n) ? Math.round(n) : iso}`;
+};
+const formatFocalLength = (focalLength?: string): string | null => {
+    if (!focalLength) return null;
+    const n = parseFloat(focalLength);
+    return Number.isFinite(n) ? `${Math.round(n)} mm` : focalLength;
+};
+const formatAperture = (fNumber?: string): string | null => {
+    if (!fNumber) return null;
+    const n = parseFloat(fNumber);
+    return `f${Number.isFinite(n) ? Math.round(n) : fNumber}`;
+};
+const formatShutterSpeed = (exposureTime?: string): string | null => {
+    if (!exposureTime) return null;
+    const n = parseFloat(exposureTime);
+    if (!Number.isFinite(n) || n <= 0) return `${exposureTime} s`;
+    return n >= 1 ? `${Number.isInteger(n) ? n : n.toFixed(1)} s` : `1/${Math.round(1 / n)} s`;
 };
 
 /** Full-screen photo viewer with a persistent action bar, prev/next, keyboard,
@@ -86,6 +110,10 @@ export const PhotoViewer: React.FC = () => {
     const [fullRes, setFullRes] = useState(false);
     const [showInfo, setShowInfo] = useState(false);
     const [meta, setMeta] = useState<PhotoMetadata | null>(null);
+    // On touch devices the floating zoom/rotate toolbar sits over the top of the
+    // photo (it overlaps tall portrait shots). Hide it until the user taps the
+    // photo, iOS-style; a tap toggles it. Desktop keeps it always visible (CSS).
+    const [showTools, setShowTools] = useState(false);
     const panRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
     // Rotation is applied to the CSS transform immediately (see `rotate` below)
     // but the save request is deliberately deferred -- it fires once the user
@@ -102,7 +130,7 @@ export const PhotoViewer: React.FC = () => {
         applyPhotoRotation(pending.filename, pending.rotation);
         void setPhotoRotation(pending.filename, pending.rotation).catch(() => {
             applyPhotoRotation(pending.filename, pending.previous);
-            toast('Couldn’t save rotation');
+            toast('Couldn’t save rotation', undefined, undefined, 'error');
         });
     }, [toast, applyPhotoRotation]);
 
@@ -119,6 +147,7 @@ export const PhotoViewer: React.FC = () => {
         setFullRes(false);
         setShowInfo(false);
         setMeta(null);
+        setShowTools(false);
         return () => flushPendingRotation();
     }, [photo?.id, flushPendingRotation]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -141,6 +170,21 @@ export const PhotoViewer: React.FC = () => {
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
     const photoRef = useRef<HTMLDivElement>(null);
+    // Focus management for the modal (HIG: a modal traps focus and restores it
+    // to the trigger on close).
+    const rootRef = useRef<HTMLDivElement>(null);
+    const restoreFocusRef = useRef<HTMLElement | null>(null);
+    const isOpen = Boolean(viewer);
+    useEffect(() => {
+        if (!isOpen) return undefined;
+        restoreFocusRef.current = (document.activeElement as HTMLElement) ?? null;
+        // Focus the dialog itself so Tab starts inside it and SR announces it.
+        rootRef.current?.focus();
+        return () => {
+            const el = restoreFocusRef.current;
+            if (el && typeof el.focus === 'function' && document.contains(el)) el.focus();
+        };
+    }, [isOpen]);
 
     const resetZoom = useCallback(() => { setZoom(1); setPan({ x: 0, y: 0 }); }, []);
     const zoomBy = useCallback((delta: number) => {
@@ -202,6 +246,28 @@ export const PhotoViewer: React.FC = () => {
             if (e.key === 'ArrowRight') viewerStep(1);
             if (e.key === '+' || e.key === '=') zoomBy(ZOOM_STEP);
             if (e.key === '-' || e.key === '_') zoomBy(-ZOOM_STEP);
+            if (e.key === 'Tab') {
+                // Trap Tab within the dialog so focus can't wander to the
+                // (visually hidden) page behind the overlay.
+                const root = rootRef.current;
+                if (!root) return;
+                const focusables = Array.from(
+                    root.querySelectorAll<HTMLElement>(
+                        'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+                    ),
+                ).filter((el) => el.offsetParent !== null || el === root);
+                if (!focusables.length) { e.preventDefault(); root.focus(); return; }
+                const first = focusables[0];
+                const last = focusables[focusables.length - 1];
+                const active = document.activeElement as HTMLElement;
+                if (e.shiftKey && (active === first || active === root)) {
+                    e.preventDefault();
+                    last.focus();
+                } else if (!e.shiftKey && active === last) {
+                    e.preventDefault();
+                    first.focus();
+                }
+            }
         };
         document.addEventListener('keydown', onKey);
         return () => document.removeEventListener('keydown', onKey);
@@ -277,11 +343,20 @@ export const PhotoViewer: React.FC = () => {
     // from claiming the gesture for its own page-zoom; passive:false lets us
     // preventDefault so the pinch scales the photo instead of the page.
     const touchPinchRef = useRef<{ dist: number; zoom: number; pan: { x: number; y: number }; offsetX: number; offsetY: number } | null>(null);
+    // Single-finger drag-to-pan while zoomed. The mouse handlers on
+    // .pt-viewer-photo cover pointer devices, but touch devices never get those
+    // synthesized reliably, so a pinched-in photo couldn't be moved around on
+    // mobile (reported: "can't pan the zoom"). Baseline (px,py) is seeded from
+    // the current pan and deltas are measured from the finger's start point.
+    const touchPanRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
     useEffect(() => {
         const el = stageWrapRef.current;
         if (!el) return undefined;
         const touchDist = (t: TouchList) => t.length >= 2 ? Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) : 0;
         const touchMid = (t: TouchList) => ({ x: (t[0].clientX + t[1].clientX) / 2, y: (t[0].clientY + t[1].clientY) / 2 });
+        const seedPan = (t: Touch) => {
+            touchPanRef.current = { x: t.clientX, y: t.clientY, px: panStateRef.current.x, py: panStateRef.current.y };
+        };
         const onTouchStart = (e: TouchEvent) => {
             if (e.touches.length === 2) {
                 e.preventDefault();
@@ -294,6 +369,13 @@ export const PhotoViewer: React.FC = () => {
                     offsetX: rect ? mid.x - (rect.left + rect.width / 2) : 0,
                     offsetY: rect ? mid.y - (rect.top + rect.height / 2) : 0,
                 };
+                // A second finger starts a pinch, so drop any single-finger pan.
+                touchPanRef.current = null;
+            } else if (e.touches.length === 1 && zoomRef.current > 1) {
+                // Only claim the single-finger gesture when zoomed -- otherwise
+                // leave it to the swipe-to-navigate handler on .pt-viewer-stage.
+                e.preventDefault();
+                seedPan(e.touches[0]);
             }
         };
         const onTouchMove = (e: TouchEvent) => {
@@ -312,10 +394,25 @@ export const PhotoViewer: React.FC = () => {
                     });
                 }
                 setZoom(next);
+            } else if (e.touches.length === 1 && zoomRef.current > 1) {
+                e.preventDefault();
+                // Seed lazily if the drag began before zoom, or after lifting one
+                // finger out of a pinch, so the photo doesn't jump.
+                if (!touchPanRef.current) { seedPan(e.touches[0]); return; }
+                const start = touchPanRef.current;
+                const t = e.touches[0];
+                setPan({ x: start.px + (t.clientX - start.x), y: start.py + (t.clientY - start.y) });
             }
         };
         const onTouchEnd = (e: TouchEvent) => {
             if (e.touches.length < 2) touchPinchRef.current = null;
+            if (e.touches.length === 0) {
+                touchPanRef.current = null;
+            } else if (e.touches.length === 1 && zoomRef.current > 1) {
+                // Transitioning from pinch (2 fingers) down to one: re-seed the
+                // pan baseline against the remaining finger so it doesn't jump.
+                seedPan(e.touches[0]);
+            }
         };
         el.addEventListener('touchstart', onTouchStart, { passive: false });
         el.addEventListener('touchmove', onTouchMove, { passive: false });
@@ -340,7 +437,7 @@ export const PhotoViewer: React.FC = () => {
     const locationLine = [loc.city, loc.country].filter(Boolean).join(', ');
 
     return (
-        <div className="pt-viewer" role="dialog" aria-modal="true" aria-label="Photo viewer">
+        <div ref={rootRef} tabIndex={-1} className={`pt-viewer${showTools ? ' tools-visible' : ''}`} role="dialog" aria-modal="true" aria-label="Photo viewer">
             <div className="pt-viewer-top">
                 <button type="button" className="pt-viewer-back" onClick={closeViewer}>
                     <ArrowLeftIcon /> Back
@@ -376,6 +473,10 @@ export const PhotoViewer: React.FC = () => {
                     <div
                         ref={photoRef}
                         className="pt-viewer-photo"
+                        // Tapping the photo toggles the floating tools on touch
+                        // (they're always shown on desktop via CSS, so this is a
+                        // no-op there).
+                        onClick={() => setShowTools((v) => !v)}
                         onDoubleClick={(e) => (zoomed ? resetZoom() : zoomAtPoint(zoom + ZOOM_STEP * 2, e.clientX, e.clientY))}
                         onMouseDown={(e) => { if (zoomed) panRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y }; }}
                         onMouseMove={(e) => {
@@ -396,7 +497,7 @@ export const PhotoViewer: React.FC = () => {
                                 style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)` }}
                             />
                         ) : (
-                            <div className="pt-viewer-loading">Loading…</div>
+                            <div className="pt-viewer-loading"><Spinner label="" center={false} /></div>
                         )}
                     </div>
                     <button
@@ -471,10 +572,10 @@ export const PhotoViewer: React.FC = () => {
                                         <dt>Exposure</dt>
                                         <dd>
                                             {[
-                                                exif.focalLength && `${exif.focalLength}`,
-                                                exif.fNumber && `ƒ/${exif.fNumber}`,
-                                                exif.exposureTime && `${exif.exposureTime}s`,
-                                                exif.iso && `ISO ${exif.iso}`,
+                                                formatIso(exif.iso),
+                                                formatFocalLength(exif.focalLength),
+                                                formatAperture(exif.fNumber),
+                                                formatShutterSpeed(exif.exposureTime),
                                             ].filter(Boolean).join(' · ') || '—'}
                                         </dd>
                                     </>
@@ -499,7 +600,7 @@ export const PhotoViewer: React.FC = () => {
                 </div>
                 <div className="pt-vb-group center">
                     <button type="button" className={`pt-vb-btn${photo.liked ? ' on' : ''}`} onClick={() => toggleLike(photo.id)}>
-                        {photo.liked ? <HeartSolid /> : <HeartOutline />} <span>Like</span>
+                        <Heart fill={photo.liked ? 'currentColor' : 'none'} /> <span>Like</span>
                     </button>
                     <AddToAlbumMenu
                         photoIds={[photo.id]}
@@ -521,7 +622,7 @@ export const PhotoViewer: React.FC = () => {
                         {(close) => (
                             <div className="pt-more-menu">
                                 <button type="button" onClick={() => { setShowInfo(true); close(); }}>Photo info</button>
-                                <button type="button" onClick={() => { close(); void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed')); }}>Download</button>
+                                <button type="button" onClick={() => { close(); void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed', undefined, undefined, 'error')); }}>Download</button>
                                 <button type="button" onClick={() => { close(); navigate('tools', { filenames: photo.filename }); }}>Open in Workbench</button>
                                 {route.page !== 'gallery' && (
                                     <button
