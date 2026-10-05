@@ -170,6 +170,9 @@
   await call('search "dog" page 2', 'GET', `${API}/api/photos/search?q=dog&limit=24&offset=24`);
   const sd = await call('search "dog" 120 + directMedia', 'GET', `${API}/api/photos/search?q=dog&limit=120&offset=0&directMedia=1`);
   if (sd.json) note(`  search "dog": total ${sd.json.total}, rankedWindow ${sd.json.rankedWindow}, hasMore ${sd.json.hasMore}`);
+  // Diagnostic: the same photos read directly (point reads) - compare with the search call's own time.
+  const dogNames = ((sd.json && sd.json.photos) || []).map((p) => p.filename).filter(Boolean).slice(0, 24);
+  if (dogNames.length) await call(`lookup-batch of the "dog" results (${dogNames.length})`, 'POST', `${API}/api/photos/lookup-batch`, { filenames: dogNames });
   // Deep paging past the ranked window (newest-first tail), if there are that many matches.
   const deepOff = Math.max(0, Math.min(((sd.json && sd.json.total) || 0) - 120, 6000));
   if (deepOff > 4000) await call(`search "dog" deep page (offset ${deepOff})`, 'GET', `${API}/api/photos/search?q=dog&limit=120&offset=${deepOff}&directMedia=1`);
