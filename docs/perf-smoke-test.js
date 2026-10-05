@@ -12,10 +12,14 @@
  *
  * WHAT IT DOES
  *   READ-ONLY by default. It calls every list/read API the app uses, downloads the
- *   three client indexes the way the app does, loads real thumbnails with the media
+ *   sort and albums client indexes the way the app does, loads real thumbnails and face avatars with the media
  *   token, then runs concurrency and repeat-call probes. It never deletes, renames,
  *   uploads, labels, merges or creates anything unless you turn on the OPT-IN
  *   section below.
+ *
+ *   It follows how the app loads things today: server-paged gallery / search / album / person
+ *   / people lists (no whole-library downloads), one container token for thumbnails AND face
+ *   avatars, and select-all via ids-only paging.
  *
  *   Each call sends X-Request-ID "smoke-N" so you can find it in Log Analytics
  *   (`PERF event=request ... rid=smoke-N`), next to the browser-side numbers.
@@ -25,6 +29,8 @@
 (async () => {
   const OPTIONS = {
     thumbnails: 60,        // how many real thumbnails to download via the media token
+    avatars: 40,           // how many face avatars to load straight from storage with the cover token
+    legacyPeopleRoster: false,  // also time the old load-every-cluster call (slow on big libraries)
     searchTerms: ['dog', 'beach', 'birthday 2022', 'zzzzqq'],  // last one should return nothing
     slowMs: 1500,          // flag anything slower than this
     concurrency: 8,        // parallel requests in the queueing probe
@@ -118,31 +124,36 @@
     return rows;
   }
 
-  note('0/9 warm-up (scale-to-zero apps may take ~30 s to start; reported separately)');
+  note('0/10 warm-up (scale-to-zero apps may take ~30 s to start; reported separately)');
   for (const [label, host] of [['backend', API], ['extras', EXTRAS], ['tools', TOOLS]]) {
     if (label !== 'backend' && host === API) continue;
     await call(`WARM-UP ${label} /health`, 'GET', `${host}/health`);
   }
-  note('1/9 health and tokens');
+  note('1/10 health and tokens');
   await call('health', 'GET', `${API}/health`);
   const mt = await call('media-token', 'GET', `${API}/api/photos/media-token`);
   const media = mt.json || {};
 
-  note('2/9 client indexes (what the app downloads at session start)');
+  note('2/10 client indexes (what the app downloads at session start)');
   const sortM = await call('sort-index manifest', 'GET', `${API}/api/photos/sort-index`);
+  const serverPaged = !!(sortM.json && sortM.json.available === false);   // library_too_large: gallery pages from the server
+  if (serverPaged) note('  library is server-paged (no browser sort index): rowCount ' + (sortM.json.rowCount || '?'));
   if (sortM.json && sortM.json.indexUrl) await blobJson('sort-index blob', sortM.json.indexUrl);
   const albM = await call('albums-index manifest', 'GET', `${API}/api/albums/index`);
   if (albM.json && albM.json.indexUrl) await blobJson('albums-index blob', albM.json.indexUrl);
-  const pplM = await call('people-index manifest', 'GET', `${EXTRAS}/api/persons/index`);
-  if (pplM.json && pplM.json.indexUrl) await blobJson('people-index blob', pplM.json.indexUrl);
+  // The people index is no longer downloaded by the app (the People page is server-paged, see step 7).
   await call('index-status', 'GET', `${API}/api/photos/index-status`);
   await call('tools index status', 'GET', `${TOOLS}/api/tools/indexes/status`);
 
-  note('3/9 gallery pages, filters, timeline, explore');
+  note('3/10 gallery pages, filters, timeline, explore');
   const p1 = await call('photos page 1 (48)', 'GET', `${API}/api/photos?sort=capture&limit=48&offset=0&directMedia=1`);
   await call('photos page 2 (48)', 'GET', `${API}/api/photos?sort=capture&limit=48&offset=48&directMedia=1`);
   await call('photos page 100 (deep)', 'GET', `${API}/api/photos?sort=capture&limit=48&offset=4800&directMedia=1`);
-  await call('photos sort=upload', 'GET', `${API}/api/photos?sort=upload&limit=48&offset=0&directMedia=1`);
+  await call('photos sort=date (Workbench)', 'GET', `${API}/api/photos?sort=date&limit=120&offset=0&directMedia=1`);
+  await call('photos sort=name (Workbench)', 'GET', `${API}/api/photos?sort=name&limit=120&offset=0&directMedia=1`);
+  await call('photos nameContains=img', 'GET', `${API}/api/photos?sort=name&nameContains=img&limit=120&offset=0&directMedia=1`);
+  const ids1 = await call('photos idsOnly (select all, 5000)', 'GET', `${API}/api/photos?sort=name&idsOnly=1&limit=5000&offset=0`);
+  if (ids1.json && ids1.json.hasMore) await call('photos idsOnly page 2', 'GET', `${API}/api/photos?sort=name&idsOnly=1&limit=5000&offset=5000`);
   await call('photos sort=rating', 'GET', `${API}/api/photos?sort=rating&limit=48&offset=0&directMedia=1`);
   await call('photos filter rating>=3', 'GET', `${API}/api/photos/filter?minRating=3&limit=48&offset=0`);
   await call('timeline', 'GET', `${API}/api/photos/timeline`);
@@ -152,13 +163,18 @@
   const photos = ((p1.json && p1.json.photos) || []);
   const names = photos.map((p) => p.filename).filter(Boolean);
 
-  note('4/9 search');
+  note('4/10 search');
   for (const q of OPTIONS.searchTerms) {
     await call(`search "${q}"`, 'GET', `${API}/api/photos/search?q=${encodeURIComponent(q)}&limit=24&offset=0`);
   }
   await call('search "dog" page 2', 'GET', `${API}/api/photos/search?q=dog&limit=24&offset=24`);
+  const sd = await call('search "dog" 120 + directMedia', 'GET', `${API}/api/photos/search?q=dog&limit=120&offset=0&directMedia=1`);
+  if (sd.json) note(`  search "dog": total ${sd.json.total}, rankedWindow ${sd.json.rankedWindow}, hasMore ${sd.json.hasMore}`);
+  // Deep paging past the ranked window (newest-first tail), if there are that many matches.
+  const deepOff = Math.max(0, Math.min(((sd.json && sd.json.total) || 0) - 120, 6000));
+  if (deepOff > 4000) await call(`search "dog" deep page (offset ${deepOff})`, 'GET', `${API}/api/photos/search?q=dog&limit=120&offset=${deepOff}&directMedia=1`);
 
-  note('5/9 photo detail and batch lookups');
+  note('5/10 photo detail and batch lookups');
   if (names.length) {
     await call('metadata (1 photo)', 'GET', `${API}/api/photos/${encodeURIComponent(names[0])}/metadata`);
     await call('lookup-batch (24)', 'POST', `${API}/api/photos/lookup-batch`, { filenames: names.slice(0, 24) });
@@ -166,35 +182,75 @@
     await call('access-batch preview (6)', 'POST', `${API}/api/photos/access-batch`, { kind: 'preview', filenames: names.slice(0, 6) });
   } else note('  (no photos returned; skipping per-photo calls)');
 
-  note('6/9 albums');
+  note('6/10 albums');
   const al = await call('albums list', 'GET', `${API}/api/albums`);
   const albums = (al.json && al.json.albums) || [];
-  if (albums[0]) await call('album detail (first)', 'GET', `${API}/api/albums/${encodeURIComponent(albums[0].albumId || albums[0].id)}`);
+  if (albums[0]) {
+    const aid = encodeURIComponent(albums[0].albumId || albums[0].id);
+    await call('album page 1 (120)', 'GET', `${API}/api/albums/${aid}?offset=0&limit=120&directMedia=1`);
+    await call('album page 2 (120)', 'GET', `${API}/api/albums/${aid}?offset=120&limit=120&directMedia=1`);
+  }
+  // Biggest album, to see paging on a large one (membership-table albums report membersPaged).
+  const bigAlbum = albums.slice().sort((a, b) => (b.photoCount || 0) - (a.photoCount || 0))[0];
+  if (bigAlbum && bigAlbum !== albums[0]) await call(`biggest album page 1 (${bigAlbum.photoCount} photos)`, 'GET', `${API}/api/albums/${encodeURIComponent(bigAlbum.albumId || bigAlbum.id)}?offset=0&limit=120&directMedia=1`);
   await call('albums trash', 'GET', `${API}/api/albums/trash`);
 
-  note('7/9 people');
-  const roster = await call('people roster (names+covers)', 'GET', `${EXTRAS}/api/persons?namesOnly=1&covers=1&limit=100000`);
-  const people = (roster.json && (roster.json.persons || roster.json.people)) || [];
-  await call('people page (15)', 'GET', `${EXTRAS}/api/persons?limit=15&offset=0`);
+  note('7/10 people (server-paged)');
+  const pg1 = await call('people page 1 (120)', 'GET', `${EXTRAS}/api/persons/page?offset=0&limit=120`);
+  const pgJson = pg1.json || {};
+  if (pgJson.available === false) note('  people index not ready yet (available:false) - the app shows "still being prepared"');
+  else note(`  people: total ${pgJson.total}, unnamed ${pgJson.unnamedCount}, hasMore ${pgJson.hasMore}`);
+  if (pgJson.hasMore) await call('people page 2 (120)', 'GET', `${EXTRAS}/api/persons/page?offset=120&limit=120`);
+  const deepPeople = Math.max(0, ((pgJson.total || 0) - 120));
+  if (deepPeople > 240) await call(`people deep page (offset ${deepPeople})`, 'GET', `${EXTRAS}/api/persons/page?offset=${deepPeople}&limit=120`);
+  await call('people search q=a (merge picker)', 'GET', `${EXTRAS}/api/persons/page?q=a&limit=50`);
+  const people = pgJson.rows || [];
+  if (OPTIONS.legacyPeopleRoster) {
+    await call('LEGACY people roster (every cluster)', 'GET', `${EXTRAS}/api/persons?namesOnly=1&covers=1&limit=100000`);
+  }
   await call('people suggestions', 'GET', `${EXTRAS}/api/persons/suggestions`);
   await call('people merges', 'GET', `${EXTRAS}/api/persons/merges`);
   const first = people[0];
   if (first) {
-    const pid = first.personId || first.id;
-    await call('person detail (first)', 'GET', `${EXTRAS}/api/persons/${encodeURIComponent(pid)}`);
+    const pid = encodeURIComponent(first.personId);
+    await call('person page 1 (120 faces)', 'GET', `${EXTRAS}/api/persons/${pid}?offset=0&limit=120`);
+    await call('person page 2 (120 faces)', 'GET', `${EXTRAS}/api/persons/${pid}?offset=120&limit=120`);
+    await call('people lookup by id', 'GET', `${EXTRAS}/api/persons/page?ids=${pid}&limit=1`);
     const cover = first.coverFaceId;
-    if (cover) await call('face crop (cover)', 'GET', `${EXTRAS}/api/faces/crop/${encodeURIComponent(cover)}`);
-    // 12 person avatars at once, like the People grid
-    const covers = people.map((p) => p.coverFaceId).filter(Boolean).slice(0, 12);
-    const t0 = performance.now();
-    await Promise.all(covers.map((c, i) => call(`face crop #${i + 1} (parallel)`, 'GET', `${EXTRAS}/api/faces/crop/${encodeURIComponent(c)}`)));
-    results.push({ name: 'face crops: 12 in parallel (wall)', method: 'GET', path: '(group)', status: 200, ms: Math.round(performance.now() - t0) });
+    if (cover) await call('face crop endpoint (one, fallback path)', 'GET', `${EXTRAS}/api/faces/crop/${encodeURIComponent(cover)}`);
   }
 
-  note('8/9 account, jobs, tools');
+  note('7b/10 face avatars straight from storage (cover token, no extras calls)');
+  let avatarStats = null;
+  try {
+    const cv = media.cover;
+    const faceIds = people.map((p) => p.coverFaceId).filter(Boolean).slice(0, OPTIONS.avatars);
+    if (!cv || !cv.baseUrl) avatarStats = { skipped: 'media-token has no `cover` entry (old backend, or proxy media mode)' };
+    else if (!faceIds.length) avatarStats = { skipped: 'no people with a cover face' };
+    else {
+      const loadImg = (u) => new Promise((resolve) => {
+        const t = performance.now(); const im = new Image();
+        im.onload = () => resolve({ ok: true, ms: performance.now() - t });
+        im.onerror = () => resolve({ ok: false, ms: performance.now() - t });
+        im.src = u;
+      });
+      const urls = faceIds.map((f) => `${cv.baseUrl}/${cv.prefix}${encodeURIComponent(f)}.jpg?${cv.sas}`);
+      const w0 = performance.now();
+      const out = await Promise.all(urls.map(loadImg));
+      const okMs = out.filter((o) => o.ok).map((o) => o.ms);
+      avatarStats = {
+        requested: urls.length, loaded: okMs.length,
+        missingNeedGeneration: out.length - okMs.length,   // these fall back to /api/faces/crop/<id>
+        wallMs: Math.round(performance.now() - w0),
+        avgMs: Math.round(okMs.reduce((a, b) => a + b, 0) / Math.max(1, okMs.length)),
+      };
+    }
+  } catch (e) { avatarStats = { error: String(e) }; }
+
+  note('8/10 account, jobs, tools');
   await call('jobs status', 'GET', `${TOOLS}/api/jobs/status`);
   await call('workbench actions', 'GET', `${TOOLS}/api/tools/workbench/actions`);
-  await call('trash list', 'GET', `${API}/api/photos/trash?limit=50`);
+  await call('trash list (200)', 'GET', `${API}/api/photos/trash?limit=200&offset=0`);
   await call('library mine', 'GET', `${EXTRAS}/api/library/mine`);
   await call('library members', 'GET', `${EXTRAS}/api/library/members`);
   await call('library cleanup-info', 'GET', `${EXTRAS}/api/library/cleanup-info`);
@@ -202,15 +258,17 @@
     await call('SMART ALBUM autocreate (writes!)', 'POST', `${API}/api/albums/autocreate`, { rule: 'recent-upload' });
   }
 
-  note('9/9 thumbnails, concurrency and repeat probes');
+  note('9/10 thumbnails, concurrency and repeat probes');
   // Thumbnails the way the gallery loads them: container token + sort-index blob name.
   let thumbStats = null;
   try {
-    const sortRows = (sortM.json && sortM.json.indexUrl) ? await (async () => {
+    let sortRows = (sortM.json && sortM.json.indexUrl) ? await (async () => {
       const r = await fetch(sortM.json.indexUrl); const b = await r.arrayBuffer();
       const t = await bufferToText(b);
       return JSON.parse(t).rows || [];
     })() : [];
+    // Server-paged libraries have no sort index: take thumbnail blob names from a directMedia page instead.
+    if (!sortRows.length) sortRows = photos.map((p) => ({ thumb: p.thumbnailBlob }));
     const withThumb = sortRows.filter((r) => r.thumb).slice(0, OPTIONS.thumbnails);
     if (media.available && media.baseUrl && withThumb.length) {
       const enc = (s) => s.split('/').map(encodeURIComponent).join('/');
@@ -259,6 +317,8 @@
     coldStartMs: Object.fromEntries(warm.map((w) => [w.name, w.ms])),
     retriedCalls: measured.filter((r) => r.attempts > 1).map((r) => `${r.name} x${r.attempts}`),
     thumbnails: thumbStats,
+    avatars: avatarStats,
+    serverPagedLibrary: serverPaged,
     queueing: {
       singlePageMs: single && single.ms, burstOf: OPTIONS.concurrency, burstWallMs: burstWall,
       burstSlowestMs: Math.max(...burstMs), burstMedianMs: burstMs.sort((a, b) => a - b)[Math.floor(burstMs.length / 2)],
@@ -279,7 +339,7 @@
   console.log('%cFAILED / ERROR (' + bad.length + ')', 'color:red;font-weight:bold'); console.table(bad);
   console.log('%cSLOW >= ' + OPTIONS.slowMs + 'ms (' + slow.length + ')', 'color:orange;font-weight:bold');
   console.table(slow.map(({ name, ms, serverMs, storageMs, kb }) => ({ name, ms, serverMs, storageMs, kb })));
-  console.log('Thumbnails:', thumbStats); console.log('Queueing probe:', summary.queueing);
+  console.log('Thumbnails:', thumbStats); console.log('Avatars (cover token):', avatarStats); console.log('Queueing probe:', summary.queueing);
   console.log('%cDONE. Run: copy(JSON.stringify(window.__smoke, null, 1))  and paste it to Claude.', 'color:green;font-weight:bold');
   if (window.photostorePerf) { console.log('App perf collector report:'); window.photostorePerf.report(); }
 })();
