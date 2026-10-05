@@ -4968,11 +4968,37 @@ def _filename_from_face(user_id: str, face_id: str) -> str:
         return ''
 
 
-def _filenames_for_face_ids(user_id: str, face_ids: List[str]) -> List[str]:
+def _io_pool_map(function, items, workers: int = 12) -> List:
+    """Ordered parallel map for storage round trips (a sequential loop over thousands of faces or
+    files is minutes of latency). Falls back to a plain loop for tiny inputs."""
+    items = list(items)
+    if len(items) <= 1:
+        return [function(item) for item in items]
+    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as executor:
+        return list(executor.map(function, items))
+
+
+def _filenames_for_face_ids(user_id: str, face_ids: List[str], summary: Optional[Dict[str, Dict]] = None) -> List[str]:
+    """Filenames of the given faces, in order, de-duplicated. The (cached) face summary map answers
+    most ids with no storage call; only ids it lacks are point-read, in parallel."""
+    ids = [str(f) for f in face_ids]
+    if summary is None:
+        summary = _load_user_face_summary_by_id(user_id) if ids else {}
+    resolved: Dict[str, str] = {}
+    missing = []
+    for face_id in ids:
+        row = summary.get(face_id)
+        if row is not None and row.get('filename'):
+            resolved[face_id] = str(row.get('filename'))
+        else:
+            missing.append(face_id)
+    if missing:
+        for face_id, name in zip(missing, _io_pool_map(lambda f: _filename_from_face(user_id, f), missing)):
+            resolved[face_id] = name
     filenames = []
     seen = set()
-    for face_id in face_ids:
-        filename = _filename_from_face(user_id, str(face_id))
+    for face_id in ids:
+        filename = resolved.get(face_id, '')
         if filename and filename not in seen:
             filenames.append(filename)
             seen.add(filename)
@@ -6752,15 +6778,15 @@ def _rebuild_metadata_faces_for_filenames(
         if value and value not in seen:
             unique_filenames.append(value)
             seen.add(value)
-    results = [
-        _rebuild_metadata_faces_for_filename(
+    results = _io_pool_map(
+        lambda filename: _rebuild_metadata_faces_for_filename(
             user_id,
             filename,
             searchable_person_index=searchable_person_index,
             dry_run=dry_run,
-        )
-        for filename in unique_filenames
-    ]
+        ),
+        unique_filenames,
+    )
     return {
         'affectedFiles': len(unique_filenames),
         'updatedFiles': sum(1 for result in results if result.get('updated')),
@@ -10348,21 +10374,18 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
     except Exception:
         face_ids = []
 
-    filenames = set()
-    faces_updated = 0
-    for face_id in face_ids:
+    def _release_face(face_id):
+        """Returns the face's filename (or '') when the face was released."""
         try:
             face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
             filename = face.get('filename')
-            if filename:
-                filenames.add(filename)
             if face.get('personId') == person_id:
                 face.pop('personId', None)
             face.pop('confirmedByUser', None)
             # Deleting a cluster is explicit user intent to stop tracking these
             # faces. Without marking them rejected, they're simply "unclustered"
             # and the next upload's auto-cluster pass (or a manual recluster)
-            # regroups them by embedding similarity — silently resurrecting the
+            # regroups them by embedding similarity -- silently resurrecting the
             # deleted cluster under a new personId. Reuse the existing
             # rejected/reviewStatus mechanism (already respected by
             # _face_is_clusterable) so released faces stay out of clustering
@@ -10378,13 +10401,22 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
             # popped fields server-side since `face` is the full entity we
             # just fetched, not a partial payload.
             face_table_client.upsert_entity(face, mode=UpdateMode.REPLACE)
-            faces_updated += 1
+            return str(filename or '') or True
         except Exception:
+            return None
+
+    filenames = set()
+    faces_updated = 0
+    # One round trip per face used to run strictly one after another; clusters hold up to thousands.
+    for outcome in _io_pool_map(_release_face, face_ids, workers=12):
+        if outcome is None:
             continue
+        faces_updated += 1
+        if isinstance(outcome, str) and outcome:
+            filenames.add(outcome)
     try:
         person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
-        for face_id in face_ids:
-            _remove_person_member(person_id, face_id)
+        _io_pool_map(lambda fid: _remove_person_member(person_id, fid), face_ids, workers=12)
     except Exception:
         pass
     if rebuild_metadata:
@@ -10392,7 +10424,9 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
     return {'deleted': True, 'facesUpdated': faces_updated, 'filenames': sorted(filenames)}
 
 
-def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Optional[Dict]:
+def _merge_persons_core(
+    user_id: str, person_id: str, merge_ids: List, *, face_summary: Optional[Dict[str, Dict]] = None,
+) -> Optional[Dict]:
     """Reassign faces from ``merge_ids`` into ``person_id`` and delete the source
     person rows. Returns ``{'mergeId': ...}``, or ``None`` if the base person
     doesn't exist.
@@ -10476,21 +10510,18 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
     external_removals: List[Tuple[str, str]] = []
 
     owner_face_ids_by_person: Dict[str, set] = {}
+    face_snapshot: Dict[str, Dict] = {}
     if face_table_client is not None:
-        try:
-            # select= excludes 'embedding' -- only RowKey/personId are read
-            # here, for membership bookkeeping. The actual mutated-and-upserted
-            # face_ent below is a separate, fresh get_entity() per face_id, not
-            # this scan's rows, so dropping embedding here is safe.
-            all_face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'", select=FACE_SUMMARY_COLUMNS))
-        except Exception:
-            all_face_rows = []
-        for face_row in all_face_rows:
-            fid = str(face_row.get('RowKey') or '')
+        # The shared cached face summary (one scan per cache window, however many merges run --
+        # a 50-pair batch used to do 50 full-table scans) supplies who owns which face. Only
+        # RowKey/personId are read here; each face is re-read fresh below before it is changed.
+        # A caller merging several pairs passes one snapshot: each merge's own face writes
+        # invalidate the shared cache, so without it every pair would rescan the table.
+        face_snapshot = face_summary if face_summary is not None else _load_user_face_summary_by_id(user_id)
+        for fid, face_row in face_snapshot.items():
             owner = str(face_row.get('personId') or '')
-            if not fid or owner not in merge_id_set:
-                continue
-            owner_face_ids_by_person.setdefault(owner, set()).add(fid)
+            if fid and owner in merge_id_set:
+                owner_face_ids_by_person.setdefault(owner, set()).add(fid)
 
     # Captured per source person before its row is deleted below, so the old
     # (mid, faceId) membership rows can be cleared once the merge actually
@@ -10514,13 +10545,23 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
             *sorted(owner_face_ids_by_person.get(str(mid), set())),
         ]))
         mid_face_ids_before_delete[str(mid)] = merged_face_ids
-        for fid in merged_face_ids:
+
+    # Fresh read of every face being moved, fanned out (this was one sequential round trip per face).
+    def _read_face(fid: str):
+        try:
+            return fid, face_table_client.get_entity(partition_key=user_id, row_key=fid)
+        except Exception:
+            return fid, None
+
+    ordered_fids = list(dict.fromkeys(str(f) for ids in mid_face_ids_before_delete.values() for f in ids))
+    fresh_faces = dict(_io_pool_map(_read_face, ordered_fids, workers=16))
+    for mid in merge_ids:
+        for fid in mid_face_ids_before_delete.get(str(mid), []):
             fid = str(fid)
             if fid in face_updates:
                 continue
-            try:
-                face_ent = face_table_client.get_entity(partition_key=user_id, row_key=fid)
-            except Exception:
+            face_ent = fresh_faces.get(fid)
+            if face_ent is None:
                 continue
             if _face_is_rejected(face_ent):
                 continue
@@ -10546,16 +10587,15 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
         _remove_face_from_person(user_id, owner_id, fid)
 
     _batch_upsert_entities(face_table_client, list(face_updates.values()))
-    for fid in face_updates:
-        _add_person_member(user_id, person_id, fid)
+    _io_pool_map(lambda fid: _add_person_member(user_id, person_id, fid), list(face_updates), workers=16)
 
     for mid in merge_ids:
         try:
             person_table_client.delete_entity(partition_key=user_id, row_key=mid)
-            for fid in mid_face_ids_before_delete.get(str(mid), []):
-                _remove_person_member(str(mid), fid)
         except Exception:
-            pass
+            continue
+        _io_pool_map(lambda fid, _m=str(mid): _remove_person_member(_m, fid),
+                     mid_face_ids_before_delete.get(str(mid), []), workers=16)
 
     base_name = str(base.get('name') or '').strip()
     if _is_unnamed_name(base_name):
@@ -10580,7 +10620,10 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
         'faceIds': json.dumps(list(base_face_ids)),
     })
     _update_person_rep_embedding(user_id, person_id)
-    _rebuild_metadata_faces_for_filenames(user_id, _filenames_for_face_ids(user_id, list(base_face_ids)))
+    _rebuild_metadata_faces_for_filenames(
+        user_id,
+        _filenames_for_face_ids(user_id, list(base_face_ids), summary={**face_snapshot, **face_updates}),
+    )
 
     # Finalise the restore record written before the destructive phase: same
     # RowKey (merge_id), now carrying the real faceMap so undo can revert face
@@ -11881,6 +11924,31 @@ def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any
     return entity
 
 
+def _strip_deleted_people_from_photos(user_id: str, person_ids: set, skip_names: set) -> None:
+    """Remove ``person_ids`` from the peopleIds of every surviving photo (streamed scan)."""
+    try:
+        for row in _iter_metadata_rows_for_user(
+            user_id, select=['PartitionKey', 'RowKey', 'peopleIds'], purpose='photos.hard_delete_person_cleanup',
+        ):
+            name = str(row.get('RowKey') or '')
+            if name in skip_names:
+                continue
+            try:
+                pids = json.loads(row.get('peopleIds', '[]') or '[]')
+            except Exception:
+                continue
+            next_pids = [pid for pid in pids if pid not in person_ids]
+            if len(next_pids) == len(pids):
+                continue
+            row['peopleIds'] = json.dumps(next_pids)
+            try:
+                metadata_table_client.upsert_entity(row)
+            except Exception:
+                pass
+    except Exception:
+        app.logger.warning('Deleted-people cleanup failed for %s', user_id, exc_info=True)
+
+
 def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[str], List[str]]:
     """Permanently remove photos: blob + metadata row + dedup/collision index
     rows and the faces/people, job-row, and album-membership cascades.
@@ -11985,28 +12053,12 @@ def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[st
         app.logger.warning('Batch album cleanup failed for %s: %s', user_id, exc)
 
     if deleted_person_ids and metadata_table_client is not None:
-        try:
-            surviving_rows = _query_metadata_rows_for_user(
-                user_id, select=['PartitionKey', 'RowKey', 'peopleIds'], purpose='photos.hard_delete_person_cleanup',
-            )
-        except Exception:
-            surviving_rows = []
-        for row in surviving_rows:
-            name = str(row.get('RowKey') or '')
-            if name in deleted_names_set:
-                continue
-            try:
-                pids = json.loads(row.get('peopleIds', '[]') or '[]')
-            except Exception:
-                continue
-            next_pids = [pid for pid in pids if pid not in deleted_person_ids]
-            if len(next_pids) == len(pids):
-                continue
-            row['peopleIds'] = json.dumps(next_pids)
-            try:
-                metadata_table_client.upsert_entity(row)
-            except Exception:
-                pass
+        # Defensive cleanup of stale peopleIds on surviving photos. It needs a whole-library read,
+        # so it runs in the background (streamed, never listed) instead of holding this request.
+        threading.Thread(
+            target=_strip_deleted_people_from_photos, args=(user_id, set(deleted_person_ids), set(deleted_names_set)),
+            name='strip-deleted-people', daemon=True,
+        ).start()
 
     if deleted:
         _trash_index_remove(user_id, deleted)
@@ -12411,7 +12463,15 @@ def _batch_remove_faces_for_filenames(user_id: str, names_set: set) -> set:
         # Reconcile shadows BEFORE deleting source rows. A failed operation
         # leaves source rows discoverable for a retry under a dirty generation.
         if removed_face_ids and person_table_client is not None:
-            people = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+            # Only faceIds/name are needed to reconcile (and upsert_entity merges just these columns);
+            # without a projection every cluster's repEmbedding came along -- gigabytes at tens of
+            # thousands of clusters.
+            try:
+                people = list(table_scan.scan_partition(
+                    person_table_client.query_entities, f"PartitionKey eq '{_escape_odata(user_id)}'",
+                    select=PERSON_LIGHT_COLUMNS))
+            except TypeError:
+                people = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
             _renew_face_filename_mutations(user_id, generations)
             for person in people:
                 person_id = str(person.get('RowKey') or '')

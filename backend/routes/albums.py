@@ -214,12 +214,18 @@ def add_photos_to_album(album_id: str):
     current = set(app._album_filenames(entity))
     added = []
     errors = []
+    valid = []
     for filename in filenames:
         safe = app._validate_media_filename(str(filename))
         if not safe:
             errors.append(f'{filename}: Invalid filename')
-            continue
-        if not app._get_metadata_entity(user_id, safe):
+        else:
+            valid.append((filename, safe))
+    # Existence is checked for the whole selection in a few batched queries (it was one sequential
+    # point read per photo: minutes, and a request timeout, for a few thousand photos).
+    exists = app._get_metadata_entities(user_id, [safe for _, safe in valid])
+    for filename, safe in valid:
+        if not exists.get(safe):
             errors.append(f'{filename}: Not found')
             continue
         if safe not in current:

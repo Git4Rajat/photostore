@@ -467,14 +467,23 @@ def label_person(person_id: str):
     # this person's faces out of unnamed clusters automatically. Best-effort so a
     # propagation hiccup never fails the label action itself.
     auto_assigned = 0
+    propagate_job_id = None
     if name.strip() and not app._is_unnamed_name(name):
-        try:
-            with app.perf_instrumentation.step('label.propagate_identity'):
-                propagation = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
-            auto_assigned = int(propagation.get('autoAssignedCount') or 0)
-        except Exception:
-            app.app.logger.exception('Identity propagation after label failed for %s', person_id)
-    return app.jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': auto_assigned})
+        # Reclaiming this person's faces from unnamed clusters scans the whole face table, so (like
+        # merge) it runs on the queue-scaled worker instead of inside this request. Only without a
+        # worker is it run inline.
+        queued = app._enqueue_propagate_job(user_id, person_id)
+        if queued.get('status') == 'queued':
+            propagate_job_id = queued.get('jobId')
+        else:
+            try:
+                with app.perf_instrumentation.step('label.propagate_identity'):
+                    propagation = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
+                auto_assigned = int(propagation.get('autoAssignedCount') or 0)
+            except Exception:
+                app.app.logger.exception('Identity propagation after label failed for %s', person_id)
+    return app.jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': auto_assigned,
+                        'propagateJobId': propagate_job_id})
 
 @people_bp.route('/api/faces/crop/<face_id>', methods=['GET'])
 def face_crop(face_id: str):
@@ -782,11 +791,12 @@ def delete_person_clusters():
     errors = []
     affected_filenames = set()
     faces_updated = 0
-    for raw_person_id in person_ids:
-        person_id_value = str(raw_person_id or '').strip()
-        if not person_id_value:
-            continue
-        result = app._delete_person_cluster(user_id, person_id_value, rebuild_metadata=False)
+    wanted = [str(raw or '').strip() for raw in person_ids]
+    wanted = [pid for pid in dict.fromkeys(wanted) if pid]
+    # Clusters are independent, so several are removed at once (tens of thousands can be selected).
+    results = app._io_pool_map(
+        lambda pid: app._delete_person_cluster(user_id, pid, rebuild_metadata=False), wanted, workers=6)
+    for person_id_value, result in zip(wanted, results):
         if result.get('deleted'):
             deleted_person_ids.append(person_id_value)
             faces_updated += int(result.get('facesUpdated') or 0)
@@ -876,13 +886,16 @@ def merge_persons_batch():
     results = []
     named_target_ids: app.List[str] = []
     seen_targets = set()
+    # One face-ownership snapshot for the whole batch (every merge's own writes invalidate the
+    # shared cache, which would otherwise force a full face-table rescan per pair).
+    face_summary = app._load_user_face_summary_by_id(user_id)
     for pair in pairs:
         target_id = str((pair or {}).get('targetPersonId') or (pair or {}).get('personId') or '') if isinstance(pair, dict) else ''
         source_ids = pair.get('mergeIds') if isinstance(pair, dict) else None
         if not target_id or not isinstance(source_ids, list) or not source_ids:
             results.append({'targetPersonId': target_id, 'success': False, 'error': 'invalid pair'})
             continue
-        core = app._merge_persons_core(user_id, target_id, source_ids)
+        core = app._merge_persons_core(user_id, target_id, source_ids, face_summary=face_summary)
         if core is None:
             results.append({'targetPersonId': target_id, 'success': False, 'error': 'base person not found'})
             continue
@@ -970,21 +983,27 @@ def undo_merge(merge_id: str):
     # -- _merge_persons_core's own dual-write moved these rows onto the merge
     # target; undo must move them back, or a future paginated membership
     # reader would disagree with the faceIds just restored above.
+    # Member-row and face writes fan out: each used to be one sequential round trip per face
+    # (thousands of faces for a big merged cluster).
+    member_adds = []
     for entity in ([base] if base.get('RowKey') else []) + [m for m in merged if m.get('RowKey')]:
         restored_person_id = str(entity['RowKey'])
         try:
             restored_face_ids = app.json.loads(entity.get('faceIds', '[]') or '[]')
         except Exception:
             restored_face_ids = []
-        for fid in restored_face_ids:
-            app._add_person_member(user_id, restored_person_id, str(fid))
+        member_adds.extend((restored_person_id, str(fid)) for fid in restored_face_ids)
+    app._io_pool_map(lambda pair: app._add_person_member(user_id, pair[0], pair[1]), member_adds, workers=16)
     base_person_id = str(base.get('RowKey') or '')
     if base_person_id:
-        for fid, original_pid in face_map.items():
-            if str(original_pid or '') != base_person_id:
-                app._remove_person_member(base_person_id, str(fid))
+        app._io_pool_map(
+            lambda fid: app._remove_person_member(base_person_id, fid),
+            [str(fid) for fid, original_pid in face_map.items() if str(original_pid or '') != base_person_id],
+            workers=16,
+        )
 
-    for fid, original_pid in face_map.items():
+    def _restore_face(item):
+        fid, original_pid = item
         try:
             face_ent = app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
             if original_pid:
@@ -1000,6 +1019,8 @@ def undo_merge(merge_id: str):
             app.face_table_client.upsert_entity(face_ent)
         except Exception:
             pass
+
+    app._io_pool_map(_restore_face, list(face_map.items()), workers=16)
 
     affected_person_ids = set()
     if base.get('RowKey'):

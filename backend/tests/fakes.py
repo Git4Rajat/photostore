@@ -21,7 +21,7 @@ class FakeTable:
     def create_table(self):
         pass
 
-    def upsert_entity(self, entity):
+    def upsert_entity(self, entity, mode=None, **kwargs):
         self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
 
     def submit_transaction(self, operations):

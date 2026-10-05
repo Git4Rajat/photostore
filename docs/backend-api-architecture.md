@@ -466,3 +466,19 @@ Everything logs as `PERF event=...` lines (backend, worker, and the browser thro
 - **Gallery pages:** a page's rows are fetched 15 per query (`RowKey eq .. or ..`), in parallel, instead of one point read each. This is about 4 round trips instead of 48.
 - **People:** the face and person scans use the parallel scan. Merge suggestions read only named people instead of every cluster's embedding, which was both minutes of work and a memory risk on the extras app.
 - **Smoke script:** it now retries cold-start gateway errors, warms all three apps first and reports cold-start times separately. It decompresses blobs only when the bytes start with the gzip magic number. The earlier "Failed to fetch" on the index blobs and thumbnails was this script bug, not the app.
+
+### 15.3 Delete and merge paths, reviewed for the same patterns
+
+The smoke test did not call destructive routes. These were read for the patterns it exposed: full-table scans per call, one-at-a-time storage calls, and heavy work inside the request.
+
+| Route | Problem found | Change |
+| --- | --- | --- |
+| `POST /api/persons/<id>/merge` and `/merge/batch` | `_merge_persons_core` scanned the whole face table for every pair, so a 50-pair batch did 50 full scans. It also read every moved face one at a time. | One shared snapshot per batch, parallel face reads, and parallel member-row writes. |
+| `POST /api/persons/<id>/label` | Identity propagation, a full face-table scan, ran inline. | It is queued to the worker like merge, with the inline path only as a fallback. The response now carries `propagateJobId`. |
+| `POST /api/persons/merge/<id>/undo` | Sequential per-face reads and writes. | Parallel. |
+| `POST /api/persons/delete` and `/<id>/delete` | Per-face sequential reads and writes, and clusters deleted one after another. | Faces and clusters are released in parallel. |
+| `POST /api/photos/trash/purge` (hard delete) | Read every cluster's embeddings while reconciling people. It also scanned the whole library in the request to clean stale `peopleIds`. | Projected columns only, parallel scan, and the library-wide cleanup runs in a background thread. |
+| `POST /api/albums/<id>/photos/add` | One sequential point read per photo to check it exists. | Batched queries, about 4 round trips per 50 photos. |
+| `POST /api/photos/delete` and restore | Already parallel point reads and writes. | Trash-index update per photo only. |
+
+Known remaining cost: purge's job-row cleanup still reads the user's jobs partition. The retention sweep (§15.1) keeps that small.
