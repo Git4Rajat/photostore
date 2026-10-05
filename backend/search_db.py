@@ -612,6 +612,17 @@ class SearchDatabase:
             f'SELECT filename FROM {source}{where} ORDER BY {order} LIMIT ? OFFSET ?', [*args, int(limit), max(0, int(offset))])]
         return names, int(total)
 
+    def existing_filenames(self, filenames: Sequence[str]) -> set:
+        """The subset of ``filenames`` that are in the library (one indexed SQL lookup per 500 names)."""
+        names = list(dict.fromkeys(str(n) for n in filenames))
+        found: set = set()
+        conn = self._conn()
+        for start in range(0, len(names), 500):
+            chunk = names[start:start + 500]
+            marks = ','.join('?' * len(chunk))
+            found.update(r[0] for r in conn.execute(f'SELECT filename FROM rows WHERE filename IN ({marks})', chunk))
+        return found
+
     def filter_page(
         self, *, min_rating: int = 0, min_likes: int = 0, offset: int = 0, limit: int = 24,
         capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,

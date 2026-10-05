@@ -12,6 +12,26 @@ import app
 
 albums_bp = Blueprint('albums', __name__)
 
+def _existing_photos(user_id, names):
+    """{name: row-or-None}-style existence for the photos being added. The library database answers for
+    nearly all of them in a few SQL lookups (adding 15,000 photos used to be ~1,000 scattered table
+    queries); only names it does not know yet (a photo uploaded seconds ago) are checked in the table."""
+    names = list(dict.fromkeys(names))
+    known = set()
+    db = None
+    try:
+        db = app._open_library_db(user_id)
+        if db is not None:
+            known = db.existing_filenames(names)
+    except Exception:
+        known = set()
+    result = {name: True for name in known}
+    remaining = [n for n in names if n not in known]
+    if remaining:
+        result.update(app._get_metadata_entities(user_id, remaining, point_reads=True))
+    return result
+
+
 @albums_bp.route('/albums/delete-multiple', methods=['POST'])
 @albums_bp.route('/api/albums/delete-multiple', methods=['POST'])
 def delete_multiple_albums_people():
@@ -234,7 +254,7 @@ def add_photos_to_album(album_id: str):
             valid.append((filename, safe))
     # Existence is checked for the whole selection in a few batched queries (it was one sequential
     # point read per photo: minutes, and a request timeout, for a few thousand photos).
-    exists = app._get_metadata_entities(user_id, [safe for _, safe in valid])
+    exists = _existing_photos(user_id, [safe for _, safe in valid])
     for filename, safe in valid:
         if not exists.get(safe):
             errors.append(f'{filename}: Not found')
