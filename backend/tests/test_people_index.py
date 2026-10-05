@@ -579,3 +579,25 @@ def test_full_rebuild_is_forced_once_the_last_full_build_is_old(people_ctx, monk
     monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *a: (built.append(1), real(*a))[1])
     _refresh('lib-A', 'v2')
     assert built == [1]
+
+
+def test_people_page_route_pages_filters_and_looks_up_ids(monkeypatch):
+    from routes import people as people_routes
+    rows = [{'personId': f'p{i:03d}', 'name': ('Ann %d' % i) if i < 5 else f'Unnamed {i}', 'isNamed': i < 5,
+             'faceCount': i, 'coverFaceId': f'f{i}', 'coverFilename': 'a.jpg'} for i in range(300)]
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    seen = []
+    monkeypatch.setattr(app, 'get_user_people_index', lambda uid, **kw: (seen.append(kw), {'rows': rows})[1])
+
+    def call(qs):
+        with app.app.test_request_context('/api/persons/page?' + qs):
+            return people_routes.people_page().get_json()
+
+    first = call('limit=120')
+    assert first['total'] == 300 and len(first['rows']) == 120 and first['hasMore'] and first['namedCount'] == 5
+    last = call('offset=240&limit=120')
+    assert len(last['rows']) == 60 and not last['hasMore'] and last['rows'][0]['personId'] == 'p240'
+    assert [r['personId'] for r in call('q=ann%202')['rows']] == ['p002']
+    assert [r['personId'] for r in call('ids=p007,p250')['rows']] == ['p007', 'p250']
+    assert all(kw.get('copy_rows') is False for kw in seen)        # no per-request copy of every row

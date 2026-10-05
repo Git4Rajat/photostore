@@ -82,6 +82,53 @@ def people_index():
         'updatedAt': people_index_data.get('updated_at'),
     })
 
+PEOPLE_PAGE_MAX = 500
+
+
+@people_bp.route('/api/persons/page', methods=['GET'])
+def people_page():
+    """One page of the people list (named clusters first), cut from the cached people index, so the
+    People page loads a screenful and fetches more as the user scrolls instead of downloading every
+    cluster. ``q`` filters by name (``unnamed`` matches unnamed clusters); ``ids`` returns exactly
+    those clusters (deep links, merge pickers). ``available: false`` while the index is still building."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._people_features_available():
+        return app.jsonify({'available': False})
+    try:
+        offset = max(0, int(app.request.args.get('offset', 0)))
+        limit = max(1, min(PEOPLE_PAGE_MAX, int(app.request.args.get('limit', 120))))
+    except ValueError:
+        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
+    try:
+        data = app.get_user_people_index(user_id, allow_refresh=True, allow_sync_build=False, copy_rows=False)
+    except Exception:
+        data = None
+    if data is None:
+        return app.jsonify({'available': False})
+    rows = data.get('rows') or []
+    named = sum(1 for r in rows if r.get('isNamed'))
+    ids = {i for i in (app.request.args.get('ids') or '').split(',') if i}
+    needle = (app.request.args.get('q') or '').strip().lower()
+    if ids:
+        matches = [r for r in rows if str(r.get('personId')) in ids]
+    elif needle:
+        matches = [r for r in rows if needle in str(r.get('name') or '').lower()]
+    else:
+        matches = rows
+    window = matches[offset:offset + limit]
+    return app.jsonify({
+        'available': True,
+        'rows': [{k: r.get(k) for k in ('personId', 'name', 'isNamed', 'faceCount', 'coverFaceId', 'coverFilename')} for r in window],
+        'total': len(matches),
+        'offset': offset,
+        'hasMore': offset + len(window) < len(matches),
+        'namedCount': named,
+        'unnamedCount': len(rows) - named,
+        'libraryTotal': len(rows),
+    })
+
 @people_bp.route('/api/persons', methods=['GET'])
 def list_persons():
     try:

@@ -1,10 +1,9 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
-import { get, post } from '../../services/apiClient';
+import { get, getExtras, post } from '../../services/apiClient';
 import { getLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
-import { getLocalPeopleIndex, invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
 import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/gridCapacity';
@@ -116,6 +115,23 @@ const provisionalPhoto = (row: SortIndexRow, token: MediaToken | null): Photo =>
         captureDate: iso,
     };
 };
+
+interface PeoplePageRow { personId: string; name: string; isNamed: boolean; faceCount: number; coverFaceId?: string }
+interface PeoplePageResponse {
+    available?: boolean; rows?: PeoplePageRow[]; total?: number; hasMore?: boolean;
+    namedCount?: number; unnamedCount?: number;
+}
+const PEOPLE_PAGE = 120;
+const mapPersonRow = (r: PeoplePageRow): Person => ({
+    id: r.personId,
+    name: r.isNamed && (r.name ?? '').trim() ? r.name : null,
+    swatch: swatchFor(r.personId),
+    photoIds: [],
+    // The avatar loader turns this into a direct storage URL (face-crop token); the path is only the
+    // fallback that generates a crop that doesn't exist yet.
+    coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
+    faceCount: r.faceCount,
+});
 
 const mapPerson = (p: PersonSummary): Person => {
     const cover = p.representativeFace;
@@ -311,6 +327,9 @@ interface Store {
     openAlbum: (id: string) => void;
     albumPhotosById: (id: string) => Photo[] | undefined;
     isAlbumPhotosLoading: (id: string) => boolean;
+    loadMoreAlbumPhotos: (id: string) => void;
+    albumPhotosTotal: (id: string) => number | undefined;
+    albumPhotosHasMore: (id: string) => boolean;
     createAlbum: (name?: string) => Promise<string>;
     autoCreateAlbum: (rule: string) => Promise<{ albumId: string; count: number; message?: string }>;
     renameAlbum: (id: string, name: string) => void;
@@ -322,6 +341,13 @@ interface Store {
 
     // people (server-backed)
     peopleLoading: boolean;
+    /** Clusters in the library / how many still need a name (the list below loads a screenful at a time). */
+    peopleTotal: number;
+    peopleUnnamedTotal: number;
+    peopleHasMore: boolean;
+    loadMorePeople: () => void;
+    /** Server-side name search (not stored in the list). */
+    searchPeople: (query: string, limit?: number) => Promise<Person[]>;
     reloadPeople: () => void;
     // Promise-returning counterpart of reloadPeople -- see fetchExplore above.
     fetchPeople: () => Promise<void>;
@@ -388,6 +414,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [exploreLoading, setExploreLoading] = useState<boolean>(true);
     const [people, setPeople] = useState<Person[]>([]);
     const [peopleLoading, setPeopleLoading] = useState<boolean>(true);
+    const [peopleTotal, setPeopleTotal] = useState(0);
+    const [peopleUnnamedTotal, setPeopleUnnamedTotal] = useState(0);
+    const [peopleHasMore, setPeopleHasMore] = useState(false);
+    const [extraPeople, setExtraPeople] = useState<Record<string, Person>>({});
+    const peopleOffsetRef = useRef(0);
+    const peopleLoadingMoreRef = useRef(false);
     const [personPhotos, setPersonPhotos] = useState<Record<string, Photo[]>>({});
     const [personPhotosLoading, setPersonPhotosLoading] = useState<boolean>(false);
     const [members, setMembers] = useState<LibraryMember[]>([]);
@@ -444,7 +476,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [photoIndex],
     );
     const albumById = useCallback((id: string) => albums.find((a) => a.id === id), [albums]);
-    const personById = useCallback((id: string) => people.find((p) => p.id === id), [people]);
+    const personById = useCallback((id: string) => people.find((p) => p.id === id) ?? extraPeople[id], [people, extraPeople]);
 
     // Server-paged fetch: the gallery's path for libraries too large for a client-side sort index
     // (see isServerPagedLibrary) and its fallback whenever the index is unavailable. The backend
@@ -1045,41 +1077,56 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const reloadExplore = useCallback(() => { void fetchExplore(); }, [fetchExplore]);
 
-    // Album contents are served by the backend, a screenful at a time: the albums index no longer
-    // carries every album's filename list (it grew with the album sizes and the browser downloaded all
-    // of it). The first page lands immediately; the remaining pages stream in behind it.
+    // Album contents are served by the backend a screenful at a time and more are fetched only as the
+    // user scrolls (a 50,000-photo album is never pulled in one go).
     const ALBUM_PAGE = 120;
     const albumLoadSeq = useRef<Record<string, number>>({});
+    const albumOffsets = useRef<Record<string, number>>({});
+    const albumLoadingMore = useRef<Record<string, boolean>>({});
+    const [albumPaging, setAlbumPaging] = useState<Record<string, { total: number; hasMore: boolean }>>({});
+    const fetchAlbumPage = useCallback(async (id: string, offset: number) => {
+        const res = await get<{ album?: Album; photos?: BackendPhoto[]; hasMore?: boolean; total?: number }>(
+            `/albums/${encodeURIComponent(id)}?offset=${offset}&limit=${ALBUM_PAGE}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
+        );
+        const page = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
+        albumOffsets.current[id] = offset + page.length;
+        setAlbumPaging((prev) => ({ ...prev, [id]: { total: res?.total ?? page.length, hasMore: Boolean(res?.hasMore) && page.length > 0 } }));
+        return { page, album: res?.album };
+    }, []);
     const openAlbum = useCallback(async (id: string) => {
         const seq = (albumLoadSeq.current[id] ?? 0) + 1;
         albumLoadSeq.current[id] = seq;
         const stale = () => albumLoadSeq.current[id] !== seq;
         setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: true }));
         try {
-            let offset = 0;
-            let collected: Photo[] = [];
-            for (;;) {
-                const res = await get<{ album?: Album; photos?: BackendPhoto[]; hasMore?: boolean }>(
-                    `/albums/${encodeURIComponent(id)}?offset=${offset}&limit=${ALBUM_PAGE}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
-                );
-                if (stale()) return;
-                const page = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
-                collected = offset === 0 ? page : [...collected, ...page];
-                setAlbumPhotos((prev) => ({ ...prev, [id]: collected }));
-                if (offset === 0) {
-                    if (res?.album) setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
-                    // First screenful is in: stop showing the spinner while the rest streams in.
-                    setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: false }));
-                }
-                if (!res?.hasMore || page.length === 0) break;
-                offset += ALBUM_PAGE;
-            }
+            const { page, album } = await fetchAlbumPage(id, 0);
+            if (stale()) return;
+            setAlbumPhotos((prev) => ({ ...prev, [id]: page }));
+            if (album) setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...album } : a)));
         } catch {
             setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
         } finally {
             if (!stale()) setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: false }));
         }
-    }, []);
+    }, [fetchAlbumPage]);
+    const loadMoreAlbumPhotos = useCallback((id: string) => {
+        if (albumLoadingMore.current[id] || !albumPaging[id]?.hasMore) return;
+        albumLoadingMore.current[id] = true;
+        const seq = albumLoadSeq.current[id];
+        void fetchAlbumPage(id, albumOffsets.current[id] ?? 0)
+            .then(({ page }) => {
+                if (albumLoadSeq.current[id] !== seq) return;
+                setAlbumPhotos((prev) => {
+                    const have = prev[id] ?? [];
+                    const seen = new Set(have.map((p) => p.id));
+                    return { ...prev, [id]: [...have, ...page.filter((p) => !seen.has(p.id))] };
+                });
+            })
+            .catch(() => setAlbumPaging((prev) => ({ ...prev, [id]: { total: prev[id]?.total ?? 0, hasMore: false } })))
+            .finally(() => { albumLoadingMore.current[id] = false; });
+    }, [fetchAlbumPage, albumPaging]);
+    const albumPhotosTotal = useCallback((id: string) => albumPaging[id]?.total, [albumPaging]);
+    const albumPhotosHasMore = useCallback((id: string) => Boolean(albumPaging[id]?.hasMore), [albumPaging]);
 
     const albumPhotosById = useCallback((id: string) => albumPhotos[id], [albumPhotos]);
     const isAlbumPhotosLoading = useCallback((id: string) => Boolean(albumPhotosLoadingIds[id]), [albumPhotosLoadingIds]);
@@ -1247,34 +1294,26 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         })));
     }, []);
 
-    // Primary path: the whole-library people index (see localPeopleIndex.ts),
-    // downloaded once per session -- covers the full list (fixing the 200
-    // cap) without list_persons's per-page face-table work. Falls back to
-    // the legacy endpoint on any failure (cold index, network error) so the
-    // page never breaks.
+    // Primary path: one server page of clusters (named first), cut from the cached people index, then
+    // more as the user scrolls -- the browser never downloads every cluster. Falls back to the legacy
+    // single request only while the server's people index is still building.
     const fetchPeople = useCallback(async () => {
         setPeopleLoading(true);
         try {
-            const rows = await withIndexRetry(getLocalPeopleIndex);
-            if (!rows) {
+            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?offset=0&limit=${PEOPLE_PAGE}`);
+            if (!res?.available || !Array.isArray(res.rows)) {
                 throw new Error('people index unavailable');
             }
-            const mapped: Person[] = rows.map((r) => ({
-                id: r.personId,
-                name: r.isNamed && r.name.trim() ? r.name : null,
-                swatch: swatchFor(r.personId),
-                photoIds: [],
-                // Stable backend-proxy path, not a day-expiring SAS -- same
-                // fallback shape mapPerson already used when a face had no
-                // pre-minted thumbnailUrl, so no separate resolve step is
-                // needed here (unlike album covers).
-                coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
-                faceCount: r.faceCount,
-            }));
+            const mapped = res.rows.map(mapPersonRow);
+            peopleOffsetRef.current = mapped.length;
             setPeople(mapped);
+            setPeopleTotal(res.total ?? mapped.length);
+            setPeopleUnnamedTotal(res.unnamedCount ?? 0);
+            setPeopleHasMore(Boolean(res.hasMore));
         } catch {
             try {
                 await fetchPeopleViaLegacyEndpoint();
+                setPeopleHasMore(false);
             } catch {
                 // keep the current list on transient failures
             }
@@ -1282,6 +1321,43 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setPeopleLoading(false);
         }
     }, [fetchPeopleViaLegacyEndpoint]);
+
+    const loadMorePeople = useCallback(() => {
+        if (peopleLoadingMoreRef.current) return;
+        peopleLoadingMoreRef.current = true;
+        void getExtras<PeoplePageResponse>(`/api/persons/page?offset=${peopleOffsetRef.current}&limit=${PEOPLE_PAGE}`)
+            .then((res) => {
+                const rows = Array.isArray(res?.rows) ? res.rows.map(mapPersonRow) : [];
+                peopleOffsetRef.current += rows.length;
+                setPeople((prev) => {
+                    const seen = new Set(prev.map((p) => p.id));
+                    return [...prev, ...rows.filter((p) => !seen.has(p.id))];
+                });
+                setPeopleHasMore(Boolean(res?.hasMore) && rows.length > 0);
+            })
+            .catch(() => setPeopleHasMore(false))
+            .finally(() => { peopleLoadingMoreRef.current = false; });
+    }, []);
+
+    const searchPeople = useCallback(async (query: string, limit = 50): Promise<Person[]> => {
+        try {
+            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
+            return Array.isArray(res?.rows) ? res.rows.map(mapPersonRow) : [];
+        } catch {
+            return [];
+        }
+    }, []);
+
+    // A deep link to a person who isn't in the loaded pages: fetch just that cluster.
+    const ensurePerson = useCallback(async (id: string) => {
+        try {
+            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?ids=${encodeURIComponent(id)}&limit=1`);
+            const row = Array.isArray(res?.rows) ? res.rows[0] : undefined;
+            if (row) setExtraPeople((prev) => ({ ...prev, [row.personId]: mapPersonRow(row) }));
+        } catch {
+            // the page shows "no longer exists"
+        }
+    }, []);
 
     // No longer fetched unconditionally on app mount -- see the fetchAlbums
     // comment above; PeoplePage's own mount effect enqueues this instead.
@@ -1305,6 +1381,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, []);
 
     const openPerson = useCallback(async (id: string) => {
+        void ensurePerson(id);
         setPersonPhotosLoading(true);
         try {
             personFaceOffsets.current[id] = 0;
@@ -1315,7 +1392,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         } finally {
             setPersonPhotosLoading(false);
         }
-    }, [fetchPersonPage]);
+    }, [fetchPersonPage, ensurePerson]);
 
     const loadMorePersonPhotos = useCallback((id: string) => {
         if (personLoadingMore.current[id] || !personPaging[id]?.hasMore) return;
@@ -1339,7 +1416,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const trimmed = name.trim();
         const previous = people.find((p) => p.id === id)?.name ?? null;
         setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: trimmed || null } : p)));
-        invalidateLocalPeopleIndex();
+        setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: trimmed || null } } : prev));
         void faceService.labelPerson(id, trimmed).catch(() => {
             setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: previous } : p)));
             toast('Couldn’t save name', undefined, undefined, 'error');
@@ -1351,11 +1428,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             // Optimistically drop the source cluster; the target absorbs it.
             const removed = people.find((p) => p.id === sourceId);
             setPeople((prev) => prev.filter((p) => p.id !== sourceId));
-            invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, [sourceId])
                 .then(() => {
                     toast('People merged');
-                    invalidateLocalPeopleIndex();
                     void fetchPeople();
                 })
                 .catch(() => {
@@ -1377,11 +1452,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const removedSet = new Set(ids);
             const removed = people.filter((p) => removedSet.has(p.id));
             setPeople((prev) => prev.filter((p) => !removedSet.has(p.id)));
-            invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, ids)
                 .then(() => {
                     toast(`Merged ${ids.length + 1} people`);
-                    invalidateLocalPeopleIndex();
                     void fetchPeople();
                 })
                 .catch(() => {
@@ -1398,7 +1471,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const deletePerson = useCallback((id: string) => {
         const removed = people.find((p) => p.id === id);
         setPeople((prev) => prev.filter((p) => p.id !== id));
-        invalidateLocalPeopleIndex();
         void faceService.deletePersons([id])
             .then(() => toast('Person deleted'))
             .catch(() => {
@@ -1412,7 +1484,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const idSet = new Set(ids);
         const removed = people.filter((p) => idSet.has(p.id));
         setPeople((prev) => prev.filter((p) => !idSet.has(p.id)));
-        invalidateLocalPeopleIndex();
         void faceService.deletePersons(ids)
             .then(() => toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`))
             .catch(() => {
@@ -1543,6 +1614,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             openAlbum,
             albumPhotosById,
             isAlbumPhotosLoading,
+            loadMoreAlbumPhotos,
+            albumPhotosTotal,
+            albumPhotosHasMore,
             createAlbum,
             autoCreateAlbum,
             renameAlbum,
@@ -1551,7 +1625,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             deleteAlbums,
             shareAlbum,
             revokeAlbum,
-            peopleLoading,
+            peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, loadMorePeople, searchPeople,
             reloadPeople,
             fetchPeople,
             openPerson,
@@ -1584,9 +1658,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
-            albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading,
+            albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
-            peopleLoading, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
+            peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
             renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],

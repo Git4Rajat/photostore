@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
+import ScrollSentinel from '../components/ScrollSentinel';
 import { Spinner, SelectionBar } from '../components/bits';
 import { BottomSheet } from '../components/BottomSheet';
 import { ThumbSizeControl, useTileSize } from '../components/controls';
@@ -43,7 +44,7 @@ const randomCode = () => Math.random().toString(16).slice(2, 6).toUpperCase();
 /** Albums — list first on mobile, detail view on larger screens. */
 export const AlbumsPage: React.FC = () => {
     const {
-        albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, isAlbumPhotosLoading,
+        albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosHasMore,
         createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
         selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums,
     } = useStore();
@@ -372,6 +373,7 @@ export const AlbumsPage: React.FC = () => {
                         ) : (
                             <div style={{ ['--pt-tile-min' as string]: `${albumTile}px` } as React.CSSProperties}>
                                 <PhotoGrid photos={activePhotos ?? []} emptyHint="No photos yet — add some from the gallery." />
+                                {albumPhotosHasMore(album.id) && <ScrollSentinel onVisible={() => loadMoreAlbumPhotos(album.id)} deps={activePhotos?.length ?? 0} />}
                             </div>
                         )}
                     </section>

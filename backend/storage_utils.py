@@ -6750,7 +6750,7 @@ def _rebuild_people_index_in_background(key: str, manifest: Dict[str, str]) -> N
 
 
 def get_user_people_index(
-    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True, copy_rows: bool = True,
 ) -> Optional[Dict[str, object]]:
     """Mirrors get_user_albums_index's "serve stale immediately, rebuild
     off-thread" read path, including allow_sync_build=False for the
@@ -6789,6 +6789,8 @@ def get_user_people_index(
             _rebuild_people_index_in_background(key, manifest)
     if fresh is None:
         return None
+    if not copy_rows:
+        return dict(fresh)      # read-only callers (paging) must not mutate the shared rows
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
 
 

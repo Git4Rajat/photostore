@@ -566,3 +566,9 @@ The old 200-result limits are gone. Each list now pages, reports an exact total,
 ### 15.9 People avatars: one token instead of one call per face
 
 `GET /api/photos/media-token` now also returns `cover: {baseUrl, sas, prefix}` for the face-crop container (prefix = first 16 hex of sha256(user id) + `/`). The browser builds each avatar URL as `{baseUrl}/{prefix}{faceId}.jpg?{sas}`, so a grid of hundreds of faces costs no extras calls. A crop that isn't stored yet (404) falls back to `/api/faces/crop/<id>`, which generates and stores it, so the next load is direct. The face-crop endpoint is unchanged. The token covers the whole container and has no list permission; crop names are content hashes, the same model as thumbnails. Tokens cached in browser storage before this change have no `cover` and are replaced on next load.
+
+### 15.10 People and album views load as you scroll
+
+- **People.** `GET /api/persons/page?offset&limit&q&ids` cuts a page (named clusters first, 120 by default, max 500) from the backend's cached people index, with `total`, `namedCount`, `unnamedCount` and `hasMore`. The People page loads the first page and fetches more as a sentinel scrolls into view, so the browser no longer downloads the whole people index at session start or renders it through a hand-rolled virtual grid. The merge picker uses `q` (server-side name search) and a deep link to a person outside the loaded pages uses `ids`. The older single-request roster is used only while the server's index is still building.
+- **Albums.** Opening an album loads one page (120 photos); further pages load as the grid scrolls. It used to stream every page back to back.
+- **Search** already paged on scroll (§15.7).

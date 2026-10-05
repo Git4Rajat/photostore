@@ -8,7 +8,6 @@ import ScrollSentinel from '../components/ScrollSentinel';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { confirmDialog } from '../../../components/shared/dialogs';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
-import { useWindowedGrid } from '../../../services/useWindowedGrid';
 import type { Person } from '../types';
 
 // The merge target when several selected clusters are merged at once: prefer
@@ -22,7 +21,7 @@ const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.n
  *  "Select" mode lets several clusters be picked and merged into one in a
  *  single action, instead of the one-at-a-time merge on the detail page. */
 export const PeoplePage: React.FC = () => {
-    const { people, peopleLoading, navigate, mergePeopleBatch, deletePeopleBatch, fetchPeople } = useStore();
+    const { people, peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, loadMorePeople, navigate, mergePeopleBatch, deletePeopleBatch, fetchPeople } = useStore();
 
     // Loads people when this tab is actually visited, queued behind whatever
     // else is in flight, aborted if the user navigates away before its turn.
@@ -34,13 +33,12 @@ export const PeoplePage: React.FC = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // Accounts can have tens of thousands of clusters: render (and request cover
-    // images for) only the rows near the viewport, never the whole list.
-    const peopleWindow = useWindowedGrid({ items: people, getKey: (p: Person) => p.id, overscanRows: 3 });
+    // Clusters arrive a screenful at a time (the server pages them, named first) and more load as the
+    // user scrolls, so only what has been scrolled to is ever requested or rendered.
     const covers = useProtectedBlobUrls(
-        peopleWindow.visibleItems.map((p) => p.coverThumbnailUrl).filter((u): u is string => Boolean(u)),
+        people.map((p) => p.coverThumbnailUrl).filter((u): u is string => Boolean(u)),
     );
-    const unnamedCount = useMemo(() => people.filter((p) => !p.name).length, [people]);
+    const unnamedCount = peopleUnnamedTotal;
     const [selectMode, setSelectMode] = useState(false);
     const [selectedIds, setSelectedIds] = useState<string[]>([]);
     const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
@@ -91,7 +89,7 @@ export const PeoplePage: React.FC = () => {
             <div className="pt-toolbar">
                 <div>
                     <h1 className="pt-page-title">People</h1>
-                    <p className="pt-page-sub">{people.length} people{unnamedCount > 0 ? ` · ${unnamedCount} to name` : ''}</p>
+                    <p className="pt-page-sub">{peopleTotal.toLocaleString()} people{unnamedCount > 0 ? ` · ${unnamedCount} to name` : ''}</p>
                 </div>
                 {people.length > 1 && (
                     <button type="button" className="pt-linkish" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}>
@@ -99,9 +97,8 @@ export const PeoplePage: React.FC = () => {
                     </button>
                 )}
             </div>
-            <div ref={peopleWindow.containerRef} style={peopleWindow.spacerStyle}>
-            <div ref={peopleWindow.innerRef} className="pt-people-grid" style={peopleWindow.innerStyle}>
-                {peopleWindow.visibleItems.map((person) => {
+            <div className="pt-people-grid">
+                {people.map((person) => {
                     const coverSrc = person.coverThumbnailUrl ? covers[person.coverThumbnailUrl] : undefined;
                     const checked = selectedSet.has(person.id);
                     return (
@@ -125,7 +122,7 @@ export const PeoplePage: React.FC = () => {
                     );
                 })}
             </div>
-            </div>
+            {peopleHasMore && <ScrollSentinel onVisible={loadMorePeople} deps={people.length} />}
             {selectMode && selectedIds.length > 0 && (
                 <SelectionBar count={selectedIds.length} onClear={exitSelectMode} label="People selection actions">
                     <button
@@ -149,12 +146,14 @@ export const PeoplePage: React.FC = () => {
 
 /** Person detail — rename / name, browse their photos, and merge in another cluster. */
 export const PersonDetailPage: React.FC = () => {
-    const { route, people, personById, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, fetchPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
+    const { route, personById, searchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, fetchPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
     const personId = route.params.personId;
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
     const [mergeId, setMergeId] = useState('');
     const [mergeQuery, setMergeQuery] = useState('');
+    const [mergeResults, setMergeResults] = useState<Person[]>([]);
+    const [chosenMerge, setChosenMerge] = useState<Person | null>(null);
     const [personTile, setPersonTile] = useTileSize('photostore.personTileSize');
     const headCover = useProtectedBlobUrls(person?.coverThumbnailUrl ? [person.coverThumbnailUrl] : []);
 
@@ -178,6 +177,14 @@ export const PersonDetailPage: React.FC = () => {
     }, []);
 
     useEffect(() => {
+        let active = true;
+        const timer = setTimeout(() => {
+            void searchPeople(mergeQuery.trim(), MERGE_PICKER_MAX_OPTIONS).then((rows) => { if (active) setMergeResults(rows); });
+        }, 250);
+        return () => { active = false; clearTimeout(timer); };
+    }, [mergeQuery, searchPeople]);
+
+    useEffect(() => {
         setDraft(person?.name ?? '');
     }, [person?.name]);
 
@@ -190,18 +197,11 @@ export const PersonDetailPage: React.FC = () => {
         );
     }
 
-    // The merge picker must stay usable with tens of thousands of clusters: search
-    // by name, show the biggest matches first, and cap the rendered options (a
-    // <select> with 30k <option>s freezes the tab). The chosen person always stays
-    // listed so the selection never silently disappears.
-    const mergeQ = mergeQuery.trim().toLowerCase();
-    const others = people.filter((p) => p.id !== person.id);
-    const mergeMatches = others
-        .filter((p) => !mergeQ || (p.name ?? 'unnamed').toLowerCase().includes(mergeQ))
-        .sort((a, b) => (b.faceCount ?? 0) - (a.faceCount ?? 0))
-        .slice(0, MERGE_PICKER_MAX_OPTIONS);
-    const mergeOptions = mergeId && !mergeMatches.some((o) => o.id === mergeId)
-        ? [...mergeMatches, ...others.filter((o) => o.id === mergeId)]
+    // The merge picker searches on the server (name contains), so it works however many clusters
+    // exist; the chosen person always stays listed so the selection never silently disappears.
+    const mergeMatches = mergeResults.filter((p) => p.id !== person.id);
+    const mergeOptions = mergeId && !mergeMatches.some((o) => o.id === mergeId) && chosenMerge
+        ? [...mergeMatches, chosenMerge]
         : mergeMatches;
     const photos = personPhotosById(person.id);
     const coverSrc = person.coverThumbnailUrl ? headCover[person.coverThumbnailUrl] : undefined;
@@ -271,11 +271,11 @@ export const PersonDetailPage: React.FC = () => {
                         type="search"
                         value={mergeQuery}
                         onChange={(e) => setMergeQuery(e.target.value)}
-                        placeholder={`Search ${others.length.toLocaleString()} people…`}
+                        placeholder="Search people by name…"
                         aria-label="Search people to merge"
                     />
-                    <select className="field field-select" value={mergeId} onChange={(e) => setMergeId(e.target.value)} aria-label="Person to merge">
-                        <option value="">{mergeMatches.length < others.filter((p) => !mergeQ || (p.name ?? 'unnamed').toLowerCase().includes(mergeQ)).length ? `Choose a person… (top ${mergeMatches.length} shown — search to narrow)` : 'Choose a person…'}</option>
+                    <select className="field field-select" value={mergeId} onChange={(e) => { setMergeId(e.target.value); setChosenMerge(mergeResults.find((p) => p.id === e.target.value) ?? null); }} aria-label="Person to merge">
+                        <option value="">Choose a person…</option>
                         {mergeOptions.map((o) => (
                             <option key={o.id} value={o.id}>{o.name ?? 'Unnamed'} · {o.faceCount ?? 0} photos</option>
                         ))}
