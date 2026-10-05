@@ -1,4 +1,5 @@
 import { get } from './apiClient';
+import { perf } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 
 /**
@@ -73,7 +74,7 @@ export const getMediaToken = async (): Promise<MediaToken | null> => {
         cached = stored;
         return stored;
     }
-    inFlight = get<MediaTokenResponse>('/api/photos/media-token')
+    inFlight = perf.span('media_token.fetch', () => get<MediaTokenResponse>('/api/photos/media-token'))
         .then((res) => {
             if (!res?.available || !res.baseUrl || !res.sas || !res.expiresAt) {
                 cached = null;

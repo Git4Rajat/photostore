@@ -1,3 +1,4 @@
+import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
 import {
@@ -125,6 +126,8 @@ const activeNavFor = (page: PageId): PageId | '' => (
 
 const Page: React.FC = () => {
     const { route } = useStore();
+    // Tag every request / resource / long task with the page that caused it.
+    React.useEffect(() => { perf.setView(route.page); }, [route.page]);
     switch (route.page) {
         case 'ask': return <AskPage />;
         case 'gallery': return <GalleryPage />;

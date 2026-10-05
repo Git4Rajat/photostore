@@ -418,3 +418,30 @@ A scan failure now aborts the build (vector/tag-embedding) instead of being pers
 * The vector index is always a full streaming pass; nothing on a serving path reads it.
 
 The sort and access indexes follow the same rule. `_refresh_rows_index_on_disk` streams rows from the table into a gzip file and uploads from that file. It also mirrors the file to the share (`_ShareBackedBlob.upload_file`). An incremental refresh streams the previous file through and swaps in only the dirty rows. The snapshot it returns has no rows, and callers that need them reload from the blob.
+
+## 15. Performance instrumentation (find slow steps, extra round trips, duplicate work)
+
+Everything logs as `PERF event=...` lines (backend, worker, and the browser through `POST /api/perf/client`), so one Log Analytics query set covers the whole path. Switch off with `PERF_INSTRUMENTATION=false` on the backend and `localStorage['photostore.perf']='off'` in the browser. Query strings (SAS tokens) are never logged.
+
+**Backend (`perf_instrumentation.py`)**
+- Every Azure Table, Blob and Queue call is traced at the SDK transport. Each request and job records round-trip count, storage time, bytes and the top operations. These are labelled `table:GET:photos(..)` or `blob:GET:lexical-index`, with ids collapsed.
+- `event=request` now carries `rid`, `view`, `sess`, `io_calls`, `io_ms`, `io_mb` and `io_top`. The response gets `X-Request-ID` and `Server-Timing: app;dur, storage;dur`.
+- `event=dup_io` is logged when one request or job repeats the same storage call `PERF_IO_DUP_WARN` (3) or more times.
+- `event=scope_summary` is logged per queue message, per ipworker message and per index-build job. It includes wall time, I/O, peak RSS, the slowest spans and `io_top`.
+- `event=step` is logged per phase of a job (`index.prime.<kind>`, `index.<kind>.table_scan|fetch_previous|upload`). It reports the storage calls made inside the step. This tells a slow step apart from a chatty one.
+- `event=stream_scan_split` breaks the library scan into time waiting on the table versus time in each sink, such as ListingSink or SearchDbSink.
+- `event=io_totals` is logged every sample interval with process-wide storage calls ranked by time.
+
+**Browser (`services/perf.ts`)**
+- Every API call records its duration, bytes, retries and the server and storage time from `Server-Timing`. It also carries `X-Request-ID`, `X-Client-View` and `X-Client-Session`, so a browser event joins the backend line.
+- Duplicates are flagged: the same request completed twice within 15 s (`event=client_dup kind=request`), concurrent identical GETs that were coalesced, and one blob fetched through several URLs or re-downloaded (`blob-multi-url`, `blob-refetch`). The last two are exactly the thumbnail double-download case.
+- `event=client_view` summarises each page: requests, network time, duplicates, resources, cache hits and long tasks. `event=client_span` covers the index preload phases for sort, albums and people (manifest, IndexedDB read, blob download, parse, IndexedDB write, total, cached or not) and the media token. Web vitals are logged as `client_vital`.
+- In the browser console, `photostorePerf.report()` prints slowest, chattiest and duplicate tables, plus `summary()` and `events()`.
+
+**Starting queries (KQL, `ContainerAppConsoleLogs_CL | where Log_s has "PERF event="`)**
+- Slowest endpoints: `event=request`, order by `ms`. Compare `io_ms` with `ms` to see whether time is storage or app work.
+- Chatty endpoints: `event=request`, sort by `io_calls`.
+- Duplicate storage work: `event=dup_io`, grouped by `call`.
+- Slow builds: `event=scope_summary name=index.build.*`, then drill into `event=step` and `event=stream_scan_split`.
+- Client versus server: join `client_req` and `request` on `rid`. `ms - serverMs` is network plus queueing.
+- Duplicate downloads: `event=client_dup`, grouped by `kind`.

@@ -3936,13 +3936,26 @@ def stream_library_artifacts(user_id: str, source_version: Optional[str], sinks_
     count = 0
     try:
         sinks = list(sinks_factory(version, workdir))
-        with perf_instrumentation.span('index.stream.scan', user=key):
+        # Attribute the scan's wall time: waiting on the table (paging + row
+        # decode) versus each sink's add(). The one that dominates is what to fix.
+        sink_ms = {type(sink).__name__: 0.0 for sink in sinks}
+        fetch_ms, mark = 0.0, time.perf_counter()
+        with perf_instrumentation.step('index.stream.scan', user=key):
             for row in iter_library_rows(key):
+                now = time.perf_counter()
+                fetch_ms += (now - mark) * 1000
                 for sink in sinks:
+                    sink_start = time.perf_counter()
                     sink.add(row)
+                    sink_ms[type(sink).__name__] += (time.perf_counter() - sink_start) * 1000
                 count += 1
+                mark = time.perf_counter()
+        perf_instrumentation.log_event(
+            'stream_scan_split', user=key, rows=count, table_fetch_ms=round(fetch_ms),
+            **{f'sink_{name}_ms': round(ms) for name, ms in sink_ms.items()},
+        )
         for sink in sinks:
-            with perf_instrumentation.span(f'index.stream.finish.{type(sink).__name__}', user=key):
+            with perf_instrumentation.step(f'index.stream.finish.{type(sink).__name__}', user=key):
                 sink.finish()
     except Exception:
         _LOGGER.exception('Streaming library build failed for user %s', key)
@@ -4861,6 +4874,11 @@ def _fetch_blob_to_file(client, dest: str) -> bool:
         return False
 
 
+def _timed_fetch(kind: str, client, dest: str) -> bool:
+    with perf_instrumentation.step(f'index.{kind}.fetch_previous'):
+        return _fetch_blob_to_file(client, dest)
+
+
 def _refresh_rows_index_on_disk(
     kind: str,
     key: str,
@@ -4892,7 +4910,7 @@ def _refresh_rows_index_on_disk(
         header = {'userId': key, 'sourceVersion': source_version, 'schemaVersion': schema_version, 'updatedAt': source_version}
         previous = os.path.join(workdir, f'{kind}-previous.json.gz')
         merge = False
-        if dirty is not None and blob_client is not None and _fetch_blob_to_file(blob_client, previous):
+        if dirty is not None and blob_client is not None and _timed_fetch(kind, blob_client, previous):
             try:
                 merge = index_files.read_header(previous).get('schemaVersion') == schema_version
             except Exception:
@@ -4932,7 +4950,7 @@ def _refresh_rows_index_on_disk(
                             writer.add(new_row)
                     dirty_to_clear = dirty
                 else:
-                    with perf_instrumentation.span(f'index.{kind}.table_scan', user=key):
+                    with perf_instrumentation.step(f'index.{kind}.table_scan', user=key):
                         for entity in metadata_table_client.query_entities(
                             f"PartitionKey eq '{_escape_odata(key)}'", select=source_fields,
                         ):
@@ -4952,10 +4970,11 @@ def _refresh_rows_index_on_disk(
             return None
         if blob_client is not None:
             try:
-                _upload_file_to_blob(
-                    blob_client, out_path, overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
-                )
+                with perf_instrumentation.step(f'index.{kind}.upload', user=key, mb=round(os.path.getsize(out_path) / 1048576, 1)):
+                    _upload_file_to_blob(
+                        blob_client, out_path, overwrite=True,
+                        content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                    )
             except Exception:
                 _LOGGER.warning('Uploading %s index failed user=%s', kind, key, exc_info=True)
     if container_name:
@@ -6620,7 +6639,8 @@ def prime_all_user_indexes_sequentially(
                 if not kind_lock.acquire(blocking=False):
                     continue
                 try:
-                    refresh_fn(key, source_version=source_version)
+                    with perf_instrumentation.step(f'index.prime.{kind}', user=key):
+                        refresh_fn(key, source_version=source_version)
                     _mark_index_rebuild_completed(key, kind)
                 except Exception:
                     _LOGGER.exception('Sequential index priming failed kind=%s user=%s', kind, key)
