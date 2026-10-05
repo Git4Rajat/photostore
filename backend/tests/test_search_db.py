@@ -397,3 +397,17 @@ def test_list_route_returns_filenames_only_for_select_all(monkeypatch, tmp_path)
         payload = photos.list_photos().get_json()
     assert payload['total'] == 300 and len(payload['filenames']) == 200 and payload['hasMore'] is False
     assert payload['filenames'][0] == 'p0100.jpg'
+
+
+def test_list_page_for_one_person_pages_from_the_people_index(tmp_path):
+    rows = [{'RowKey': f'p{i:03d}.jpg', 'uploadDate': f'2020-01-01T00:00:{i % 60:02d}+00:00',
+             'peopleIds': json.dumps(['ann'] if i % 3 == 0 else ['bob'] if i % 3 == 1 else [])}
+            for i in range(90)]
+    path = str(tmp_path / 'l.sqlite')
+    search_db.build_database(rows, path)
+    db = search_db.SearchDatabase(path)
+    ann_all, total = db.list_page(sort='capture', limit=100, person_id='ann')
+    assert total == 30 and len(ann_all) == 30 and all(int(n[1:4]) % 3 == 0 for n in ann_all)
+    page2, total2 = db.list_page(sort='capture', offset=10, limit=10, person_id='ann')
+    assert total2 == 30 and page2 == ann_all[10:20]
+    assert db.list_page(sort='capture', person_id='nobody') == ([], 0)

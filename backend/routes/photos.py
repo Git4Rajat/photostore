@@ -442,6 +442,7 @@ def list_photos():
     app.g.direct_media = app.request.args.get('directMedia') in ('1', 'true')
     capture_start, capture_end = app._parse_capture_range_args()
     name_contains = (app.request.args.get('nameContains') or '').strip()
+    person_id = (app.request.args.get('personId') or '').strip()
     ids_only = app.request.args.get('idsOnly') in ('1', 'true')
     # idsOnly returns just filenames (up to 5000 per call) -- how "select every match" walks a huge
     # result set without loading a photo record for each; otherwise a page stays a sensible size.
@@ -460,7 +461,7 @@ def list_photos():
         filenames, total = db.list_page(
             sort=sort, offset=offset, limit=limit,
             capture_start_day=app._day_ordinal(capture_start), capture_end_day=app._day_ordinal(capture_end),
-            name_contains=name_contains,
+            name_contains=name_contains, person_id=person_id,
         )
     except Exception as exc:
         app.app.logger.exception('Photo list query failed')

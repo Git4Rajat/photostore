@@ -588,12 +588,18 @@ class SearchDatabase:
     def list_page(
         self, *, sort: str = 'capture', offset: int = 0, limit: int = 24,
         capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,
-        name_contains: str = '',
+        name_contains: str = '', person_id: str = '',
     ) -> Tuple[List[str], int]:
         """(filenames for one page, total matching) in the gallery's deterministic
         order -- same semantics as ordering_utils.order_photo_entries. ``name_contains`` keeps only
-        filenames containing that text (case-insensitive)."""
+        filenames containing that text (case-insensitive). ``person_id`` keeps only that person's photos
+        (driven from the ``row_people`` index, so it costs the size of the person, not the library)."""
         where, args = _range_clause(capture_start_day, capture_end_day)
+        source = 'rows'
+        if person_id:
+            source = 'rows JOIN row_people rp ON rp.id = rows.id'
+            where += (' AND ' if where else ' WHERE ') + 'rp.person_id = ?'
+            args = [*args, str(person_id)]
         needle = (name_contains or '').strip()
         if needle:
             escaped = needle.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
@@ -601,9 +607,9 @@ class SearchDatabase:
             args = [*args, f'%{escaped}%']
         order = self._LIST_ORDER.get(sort, self._LIST_ORDER['date'])
         conn = self._conn()
-        total = conn.execute(f'SELECT COUNT(*) FROM rows{where}', args).fetchone()[0]
+        total = conn.execute(f'SELECT COUNT(*) FROM {source}{where}', args).fetchone()[0]
         names = [r[0] for r in conn.execute(
-            f'SELECT filename FROM rows{where} ORDER BY {order} LIMIT ? OFFSET ?', [*args, int(limit), max(0, int(offset))])]
+            f'SELECT filename FROM {source}{where} ORDER BY {order} LIMIT ? OFFSET ?', [*args, int(limit), max(0, int(offset))])]
         return names, int(total)
 
     def filter_page(

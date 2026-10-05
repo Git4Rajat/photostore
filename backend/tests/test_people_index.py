@@ -601,3 +601,22 @@ def test_people_page_route_pages_filters_and_looks_up_ids(monkeypatch):
     assert [r['personId'] for r in call('q=ann%202')['rows']] == ['p002']
     assert [r['personId'] for r in call('ids=p007,p250')['rows']] == ['p007', 'p250']
     assert all(kw.get('copy_rows') is False for kw in seen)        # no per-request copy of every row
+
+
+def test_get_person_with_a_blank_name_returns_the_faces_instead_of_500(monkeypatch):
+    from routes import people as people_routes
+    person_table, face_table = FakeTable(), FakeTable()
+    _seed_person(person_table, 'u', 'p1', name='', faceIds=json.dumps(['f1', 'f2']))
+    _seed_face(face_table, 'u', 'f1', filename='a.jpg', personId='p1', confidence=0.9, bbox='{}')
+    _seed_face(face_table, 'u', 'f2', filename='b.jpg', personId='p1', confidence=0.5, bbox='{}')
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'person_table_client', person_table)
+    monkeypatch.setattr(app, 'face_table_client', face_table)
+    monkeypatch.setattr(app, '_load_user_face_summary_by_id', lambda uid: {r['RowKey']: r for r in face_table.rows.values()})
+    monkeypatch.setattr(app, '_face_thumbnail_url', lambda *a, **k: '')
+    with app.app.test_request_context('/api/persons/p1?offset=0&limit=120'):
+        resp = people_routes.get_person('p1')
+    body = resp.get_json()
+    assert resp.status_code == 200 and body['name'] == 'Unnamed' and [f['faceId'] for f in body['faces']] == ['f1', 'f2']
+    assert person_table.rows[('u', 'p1')]['name'] == ''          # nothing was written back

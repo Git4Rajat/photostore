@@ -317,14 +317,10 @@ def get_person(person_id: str):
     except Exception:
         return app.jsonify({'error': 'Not found'}), 404
 
-    name = str(person.get('name', '') or '').strip()
-    if not name:
-        name = app._next_unnamed_person_name(user_id)
-        person['name'] = name
-        try:
-            app.person_table_client.upsert_entity(person)
-        except Exception:
-            pass
+    # An unnamed cluster has a blank name on its row. It used to be given (and saved with) the next
+    # "Unnamed N" here, via a helper that no longer exists -- every blank-named cluster 500'd. The
+    # people list numbers unnamed clusters itself, so this just reports a neutral label and writes nothing.
+    name = str(person.get('name', '') or '').strip() or 'Unnamed'
 
     try:
         face_ids = app.json.loads(person.get('faceIds', '[]'))
