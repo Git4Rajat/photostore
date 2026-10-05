@@ -14,6 +14,8 @@ import app
 import search_db
 import storage_utils
 
+SORT_INDEX_CLIENT_MAX_ROWS = int(__import__('os').getenv('SORT_INDEX_CLIENT_MAX_ROWS', '200000'))
+
 photos_bp = Blueprint('photos', __name__)
 
 @photos_bp.route('/api/photos/thumbnail/<path:filename>', methods=['GET'])
@@ -147,10 +149,10 @@ def photo_access_url_batch():
         except Exception:
             pass
     else:
-        # No access index yet: have the worker build it; this call uses the
-        # per-filename fallback below.
+        # No access index yet: have the worker build it (sort/access only -- not the whole
+        # library); this call uses the per-filename fallback below.
         try:
-            app._trigger_tools_index_rebuild(user_id)
+            app._trigger_tools_index_rebuild(user_id, reason='no-access-index', scope='light')
         except Exception:
             pass
 
@@ -439,6 +441,12 @@ def list_photos():
 
     app.g.direct_media = app.request.args.get('directMedia') in ('1', 'true')
     capture_start, capture_end = app._parse_capture_range_args()
+    name_contains = (app.request.args.get('nameContains') or '').strip()
+    ids_only = app.request.args.get('idsOnly') in ('1', 'true')
+    # idsOnly returns just filenames (up to 5000 per call) -- how "select every match" walks a huge
+    # result set without loading a photo record for each; otherwise a page stays a sensible size.
+    limit = max(1, min(5000 if ids_only else 1000, limit))
+    offset = max(0, offset)
 
     user_id, error = app._require_user_id()
     if error:
@@ -452,10 +460,13 @@ def list_photos():
         filenames, total = db.list_page(
             sort=sort, offset=offset, limit=limit,
             capture_start_day=app._day_ordinal(capture_start), capture_end_day=app._day_ordinal(capture_end),
+            name_contains=name_contains,
         )
     except Exception:
         app.app.logger.exception('Photo list query failed')
         return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
+    if ids_only:
+        return app.jsonify({'filenames': filenames, 'total': total, 'offset': offset, 'hasMore': offset + limit < total})
 
     fetched = app._get_metadata_entities(user_id, filenames)
     metadata_map = {name: row for name, row in fetched.items() if row and row.get('processing_state') != 'deleted'}
@@ -517,7 +528,10 @@ def list_photos():
         pid_to_name,
     )
 
-    return app.jsonify({'photos': photos, 'total': total})
+    payload = {'photos': photos, 'total': total}
+    if search_db.is_building(user_id):
+        payload['indexPartial'] = True       # first build still running: more photos will appear
+    return app.jsonify(payload)
 
 @photos_bp.route('/photos/processing-status', methods=['GET'])
 @photos_bp.route('/photos/processing-status/', methods=['GET'])
@@ -593,13 +607,25 @@ def photos_media_token():
     except Exception:
         app.app.logger.exception('Failed to mint media token for %s', user_id)
         return app.jsonify({'available': False})
-    response = app.jsonify({
+    payload = {
         'available': True,
         'baseUrl': base_url,
         'sas': sas,
         'expiresAt': expires_at,
         'previewPrefix': 'preview/',
-    })
+    }
+    # Face crops (the People avatars) live in their own container under a per-user prefix; one more
+    # token lets the browser build every avatar URL itself instead of calling /api/faces/crop/<id>.
+    try:
+        cover_base, cover_sas, _ = app._stable_container_read_sas(app.BLOB_COVER_CONTAINER)
+        payload['cover'] = {
+            'baseUrl': cover_base,
+            'sas': cover_sas,
+            'prefix': f"{app.hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:16]}/",
+        }
+    except Exception:
+        app.app.logger.warning('Failed to mint face-crop token for %s', user_id, exc_info=True)
+    response = app.jsonify(payload)
     response.headers['Cache-Control'] = 'private, max-age=3600'
     return response
 
@@ -666,7 +692,17 @@ def photos_timeline():
     # Serve the PRECOMPUTED summary (built on tools after each index build, see
     # refresh_user_timeline_summary) -- never load the listing index into this
     # process. Cold account: empty timeline now, nudge tools to build it.
-    summary = storage_utils.load_timeline_summary(user_id)
+    # Read from the library database (up to date with every delta); the precomputed blob is the
+    # fallback when no database is available on this replica yet.
+    summary = None
+    try:
+        db = search_db.open_database(user_id)
+        if db is not None:
+            summary = db.timeline_summary()
+    except Exception:
+        app.app.logger.warning('Timeline from the library database failed', exc_info=True)
+    if summary is None:
+        summary = storage_utils.load_timeline_summary(user_id)
     if summary is None:
         try:
             app._trigger_tools_index_rebuild(user_id)
@@ -675,77 +711,45 @@ def photos_timeline():
         return app.jsonify(app.build_timeline_summary([]))
     return app.jsonify(summary)
 
-@photos_bp.route('/photos/search', methods=['GET'])
-@photos_bp.route('/photos/search/', methods=['GET'])
-@photos_bp.route('/api/photos/search', methods=['GET'])
-@photos_bp.route('/api/photos/search/', methods=['GET'])
-def search_photos():
-    # Server-side search over the library's SQLite (FTS5) search database -- see
-    # search_db.py. The database lives on this replica's LOCAL EPHEMERAL disk
-    # (copied once per library version from Blob Storage, and prefetched at
-    # session start), so a query is: bm25 candidate selection in SQLite, then the
-    # unchanged scoring code on a few thousand candidate rows. No index is held in
-    # memory, which is what made the old in-memory approach OOM the 1Gi backend.
-    # Browser-side search has been removed; this is the only search path.
-    query = (app.request.args.get('q') or '').strip()
-    if not query:
-        return app.jsonify({'photos': [], 'total': 0})
+SEARCH_MAX_PAGE = int(__import__('os').getenv('SEARCH_MAX_PAGE', '500'))
+SEARCH_WINDOW = int(__import__('os').getenv('SEARCH_DB_CANDIDATE_LIMIT', '4000'))
+_SEARCH_WINDOW_TTL_SECONDS = float(__import__('os').getenv('SEARCH_WINDOW_CACHE_SECONDS', '45'))
+_SEARCH_WINDOW_CACHE: dict = {}
+_SEARCH_WINDOW_LOCK = __import__('threading').Lock()
 
-    try:
-        offset = int(app.request.args.get('offset', '0'))
-        limit = int(app.request.args.get('limit', '24'))
-    except ValueError:
-        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
 
-    capture_start, capture_end = app._parse_capture_range_args()
-    # Bare year in the query text ("beach 2022") narrows to that calendar year,
-    # same as if the user had set the explicit date-range control -- only when
-    # they didn't already set one, so it never overrides a real choice.
-    matched_year = None
-    if capture_start is None and capture_end is None:
-        year_match = app.re.search(r'\b(19|20)\d{2}\b', query)
-        if year_match:
-            matched_year = int(year_match.group(0))
-            capture_start = app.datetime(matched_year, 1, 1, tzinfo=app.timezone.utc)
-            capture_end = app.datetime(matched_year, 12, 31, tzinfo=app.timezone.utc)
+def _search_window_cached(key):
+    """Paging through one query's results must not re-score the ranked window on every page."""
+    import time as _time
+    with _SEARCH_WINDOW_LOCK:
+        hit = _SEARCH_WINDOW_CACHE.get(key)
+        if hit is not None and _time.monotonic() - hit[0] < _SEARCH_WINDOW_TTL_SECONDS:
+            return hit[1]
+    return None
 
-    user_id, error = app._require_user_id()
-    if error:
-        return error
 
-    with app.perf_instrumentation.span('search.open_db', user=user_id):
-        db = search_db.open_database(user_id)
-    if db is None:
-        # No current search database yet (new library / first deploy): have tools
-        # build it and tell the client, instead of scanning the library here.
-        app._trigger_tools_index_rebuild(user_id)
-        return app.jsonify({'photos': [], 'total': 0, 'searchIndexBuilding': True})
+def _search_window_store(key, window) -> None:
+    import time as _time
+    with _SEARCH_WINDOW_LOCK:
+        _SEARCH_WINDOW_CACHE[key] = (_time.monotonic(), window)
+        while len(_SEARCH_WINDOW_CACHE) > 6:       # a window is a few MB: keep only the latest queries
+            oldest = min(_SEARCH_WINDOW_CACHE, key=lambda k: _SEARCH_WINDOW_CACHE[k][0])
+            _SEARCH_WINDOW_CACHE.pop(oldest, None)
 
-    pid_to_name, name_to_ids = app._load_people_name_index(user_id)
-    matched_person_groups = app._matched_query_people_groups(query, name_to_ids)
-    query_norm = app._normalize_search_phrase(query)
-    matched_location_terms = [
-        term for term in db.location_terms() if app.re.search(rf'(^| ){app.re.escape(term)}( |$)', query_norm)
-    ]
-    tokens = app.parse_search_query(query)
-    try:
-        app._expand_tokens_with_tag_embeddings(tokens, user_id)
-    except Exception:
-        app.app.logger.warning('Tag-embedding query expansion failed for %s', user_id, exc_info=True)
-    has_context_intent = bool(tokens.get('required_object') and tokens.get('modifiers'))
 
+def _build_search_window(
+    db, user_id, tokens, match_terms, person_ids, matched_person_groups, matched_location_terms,
+    capture_start, capture_end, start_day, end_day, pid_to_name, has_context_intent,
+):
+    """Score the best SEARCH_WINDOW candidates exactly (filters, lexical score, buckets), best first."""
     with app.perf_instrumentation.span('search.candidates', user=user_id):
-        candidates = db.candidates(
-            search_db.match_terms(tokens),
-            person_ids=[pid for group in matched_person_groups for pid in group],
-            capture_start_day=capture_start.date().toordinal() if capture_start else None,
-            capture_end_day=capture_end.date().toordinal() if capture_end else None,
-        )
-
+        candidates = db.candidates_with_ids(
+            match_terms, person_ids=person_ids, person_groups=matched_person_groups,
+            capture_start_day=start_day, capture_end_day=end_day, limit=SEARCH_WINDOW)
     scored: app.List[app.Tuple[float, str, app.Dict]] = []
     fallback_scored: app.List[app.Tuple[float, str, app.Dict]] = []
     with app.perf_instrumentation.span('search.score', user=user_id, candidates=len(candidates)):
-        for filename, row in candidates:
+        for _row_id, filename, row in candidates:
             row = app._metadata_with_people_names(row, pid_to_name)
 
             # Tier 1: hard filters. A row failing any of these is excluded
@@ -783,10 +787,120 @@ def search_photos():
         obj = tokens.get('required_object', [''])[0]
         fallback_notice = f"No {modifier} {obj} found. Showing {obj} results instead."
         scored = fallback_scored
-
     scored.sort(key=lambda item: item[0], reverse=True)
-    total = len(scored)
+    return {
+        'scored': scored, 'fallback_notice': fallback_notice,
+        'candidate_ids': [row_id for row_id, _name, _row in candidates],
+        'candidate_count': len(candidates),
+        'saturated': len(candidates) >= SEARCH_WINDOW,
+    }
+
+
+@photos_bp.route('/photos/search', methods=['GET'])
+@photos_bp.route('/photos/search/', methods=['GET'])
+@photos_bp.route('/api/photos/search', methods=['GET'])
+@photos_bp.route('/api/photos/search/', methods=['GET'])
+def search_photos():
+    # Server-side search over the library's SQLite (FTS5) search database -- see
+    # search_db.py. The database lives on this replica's LOCAL EPHEMERAL disk
+    # (copied once per library version from Blob Storage, and prefetched at
+    # session start), so a query is: bm25 candidate selection in SQLite, then the
+    # unchanged scoring code on a few thousand candidate rows. No index is held in
+    # memory, which is what made the old in-memory approach OOM the 1Gi backend.
+    # Browser-side search has been removed; this is the only search path.
+    query = (app.request.args.get('q') or '').strip()
+    if not query:
+        return app.jsonify({'photos': [], 'total': 0})
+
+    try:
+        offset = max(0, int(app.request.args.get('offset', '0')))
+        # Any page of the result set can be requested (there is no 200-result ceiling); one request
+        # is bounded only so a single response stays a sensible size.
+        limit = max(1, min(SEARCH_MAX_PAGE, int(app.request.args.get('limit', '24'))))
+    except ValueError:
+        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
+
+    capture_start, capture_end = app._parse_capture_range_args()
+    # Bare year in the query text ("beach 2022") narrows to that calendar year,
+    # same as if the user had set the explicit date-range control -- only when
+    # they didn't already set one, so it never overrides a real choice.
+    matched_year = None
+    if capture_start is None and capture_end is None:
+        year_match = app.re.search(r'\b(19|20)\d{2}\b', query)
+        if year_match:
+            matched_year = int(year_match.group(0))
+            capture_start = app.datetime(matched_year, 1, 1, tzinfo=app.timezone.utc)
+            capture_end = app.datetime(matched_year, 12, 31, tzinfo=app.timezone.utc)
+
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    with app.perf_instrumentation.span('search.open_db', user=user_id):
+        db = search_db.open_database(user_id)
+    if db is None:
+        # No current search database yet (new library / first deploy): have tools
+        # build it and tell the client, instead of scanning the library here.
+        if search_db.needs_build(user_id):
+            app._trigger_tools_index_rebuild(user_id, reason='no-search-db')
+        return app.jsonify({'photos': [], 'total': 0, 'searchIndexBuilding': True})
+
+    pid_to_name, name_to_ids = app._load_people_name_index(user_id)
+    matched_person_groups = app._matched_query_people_groups(query, name_to_ids)
+    query_norm = app._normalize_search_phrase(query)
+    matched_location_terms = [
+        term for term in db.location_terms() if app.re.search(rf'(^| ){app.re.escape(term)}( |$)', query_norm)
+    ]
+    tokens = app.parse_search_query(query)
+    try:
+        app._expand_tokens_with_tag_embeddings(tokens, user_id)
+    except Exception:
+        app.app.logger.warning('Tag-embedding query expansion failed for %s', user_id, exc_info=True)
+    has_context_intent = bool(tokens.get('required_object') and tokens.get('modifiers'))
+
+    app.g.direct_media = app.request.args.get('directMedia') in ('1', 'true')   # thumbnail blob names, no per-photo URL signing
+    start_day = capture_start.date().toordinal() if capture_start else None
+    end_day = capture_end.date().toordinal() if capture_end else None
+    match_terms = search_db.match_terms(tokens)
+    person_ids = [pid for group in matched_person_groups for pid in group]
+    cache_key = (user_id, db.path, db.applied_seq(), query, start_day, end_day)
+    window = _search_window_cached(cache_key)
+    if window is None:
+        window = _build_search_window(
+            db, user_id, tokens, match_terms, person_ids, matched_person_groups, matched_location_terms,
+            capture_start, capture_end, start_day, end_day, pid_to_name, has_context_intent)
+        _search_window_store(cache_key, window)
+    scored = window['scored']
+    fallback_notice = window['fallback_notice']
+    window_len = len(scored)
+
+    # The ranked window covers the best SEARCH_WINDOW candidates; when the match set is bigger,
+    # the rest follows it newest-first (see SearchDatabase.tail_rows) and ``total`` is exact.
+    tail_total = 0
+    if window['saturated']:
+        with app.perf_instrumentation.span('search.count', user=user_id):
+            tail_total = max(0, db.count_matches(
+                match_terms, person_ids=person_ids, person_groups=matched_person_groups,
+                capture_start_day=start_day, capture_end_day=end_day) - window['candidate_count'])
+    total = window_len + tail_total
+
     selected = scored[offset:offset + limit]
+    tail_pairs: app.List[app.Tuple[str, app.Dict]] = []
+    if tail_total and offset + limit > window_len:
+        want = offset + limit - max(offset, window_len)
+        with app.perf_instrumentation.span('search.tail', user=user_id, offset=max(0, offset - window_len), limit=want):
+            tail_pairs = db.tail_rows(
+                match_terms, person_ids=person_ids, person_groups=matched_person_groups,
+                capture_start_day=start_day, capture_end_day=end_day, exclude_ids=window['candidate_ids'],
+                offset=max(0, offset - window_len), limit=want)
+        # Same hard filters as the window (location is the one SQL does not apply).
+        tail_pairs = [
+            (name, app._metadata_with_people_names(row, pid_to_name)) for name, row in tail_pairs
+            if app._row_passes_search_filters(
+                app._metadata_with_people_names(row, pid_to_name), capture_start, capture_end,
+                matched_person_groups, matched_location_terms)
+        ]
+    selected = [*selected, *[(0.0, name, row) for name, row in tail_pairs]]
 
     # The stored rows are intentionally reduced (search fields only); the page
     # being returned needs the full metadata (rating, likes, rotation, status...),
@@ -800,7 +914,9 @@ def search_photos():
     ]
     photos = app._build_photo_summaries_page(user_id, page_pairs, pid_to_name)
 
-    response_payload = {'photos': photos, 'total': total}
+    response_payload = {'photos': photos, 'total': total, 'offset': offset, 'hasMore': offset + limit < total}
+    if window['saturated']:
+        response_payload['rankedWindow'] = window_len   # results past this position are newest-first
     if fallback_notice:
         response_payload['searchNotice'] = fallback_notice
     # Surfaces why results matched (person/location chips in the UI).
@@ -836,6 +952,8 @@ def search_photos():
         response_payload['matchedLocations'] = [app._smart_album_title(term) for term in matched_location_terms]
     if matched_year:
         response_payload['matchedYear'] = matched_year
+    if search_db.is_building(user_id):
+        response_payload['indexPartial'] = True   # first build still running: more photos will appear
     return app.jsonify(response_payload)
 
 @photos_bp.route('/api/photos/search-index', methods=['GET'])
@@ -883,6 +1001,11 @@ def photos_sort_index():
         sort_summary = None
     if sort_summary is None:
         return app.jsonify({'available': False})
+    # Past this size the file is too big for a browser to download and sort (about 180 MB at a
+    # million photos). Tell the client up front so it pages from the server instead, without
+    # fetching anything or retrying.
+    if sort_summary.get('row_count', 0) > SORT_INDEX_CLIENT_MAX_ROWS:
+        return app.jsonify({'available': False, 'reason': 'library_too_large', 'rowCount': sort_summary['row_count']})
     if sort_summary.get('dirty'):
         app._trigger_tools_index_rebuild(user_id, reason='sort-dirty', scope='light')
     try:
@@ -1063,16 +1186,23 @@ def list_trashed_photos():
     except (TypeError, ValueError):
         limit = 50
 
-    # Only the trashed rows are transferred (positive server-side filter), so this
-    # is bounded by the size of the trash, not the library.
-    trashed = list(app._iter_metadata_rows_for_user(
-        user_id, select=app.TRASH_SELECT, include_deleted=True,
-        extra_filter="processing_state eq 'deleted'", purpose='photos.list_trash',
-    ))
-    trashed.sort(key=lambda row: str(row.get('deletedAt') or ''), reverse=True)
+    # Membership comes from the small trash index (a query over just the trashed rows), not a
+    # server-side filtered scan of the whole library; only the requested page is read fresh.
+    entries = app._trash_index_entries(user_id)
+    page_names = [e['RowKey'] for e in entries[offset:offset + limit]]
+    fresh = app._get_metadata_entities(user_id, page_names) if page_names else {}
+    page, stale = [], []
+    for name in page_names:
+        row = fresh.get(name)
+        if not isinstance(row, dict) or str(row.get('processing_state') or '') != 'deleted':
+            stale.append(name)  # purged or restored since it was indexed
+            continue
+        page.append(row)
+    if stale:
+        app._trash_index_remove(user_id, stale)
+    trashed = entries  # for the totals below: [{'RowKey', 'deletedAt'}], newest first
 
     retention_days = app.TRASH_RETENTION_DAYS
-    page = trashed[offset:offset + limit]
     pid_to_name, _ = app._load_people_name_index(user_id)
     photos = app._build_photo_summaries_page(
         user_id,
@@ -1084,7 +1214,7 @@ def list_trashed_photos():
         photo['deletedAt'] = deleted_at
         photo['purgeAt'] = app._compute_trash_purge_at(deleted_at, retention_days)
 
-    response_payload = {'photos': photos, 'total': len(trashed), 'offset': offset, 'limit': limit, 'retentionDays': retention_days}
+    response_payload = {'photos': photos, 'total': len(trashed) - len(stale), 'offset': offset, 'limit': limit, 'retentionDays': retention_days}
     if trashed:
         # `trashed` is already sorted by deletedAt descending (most recent
         # first), so the oldest deletion -- the one closest to purging -- is
@@ -1136,12 +1266,7 @@ def restore_all_trashed_photos():
     if error:
         return error
 
-    trashed_names = [
-        str(row.get('RowKey') or '') for row in app._iter_metadata_rows_for_user(
-            user_id, select=['RowKey', 'processing_state'], include_deleted=True,
-            extra_filter="processing_state eq 'deleted'", purpose='photos.restore_all_trash',
-        )
-    ]
+    trashed_names = [e['RowKey'] for e in app._trash_index_entries(user_id)]
     trashed_names = [name for name in trashed_names if name]
 
     restored = []

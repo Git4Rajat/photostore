@@ -16,6 +16,7 @@ from __future__ import annotations
 import gzip
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 import time
 
 import pytest
@@ -488,3 +489,115 @@ def test_people_index_returns_available_true_with_sas_url(monkeypatch, people_in
     assert payload['available'] is True
     assert payload['indexUrl'] == 'https://example.invalid/abc-people.json.gz?sas'
     assert payload['sourceVersion'] == 'v2'
+
+
+# --- incremental refresh -------------------------------------------------------
+
+def _refresh(user, version):
+    return storage_utils.refresh_user_people_index(user, source_version=version)
+
+
+def test_incremental_refresh_rederives_only_changed_clusters(people_ctx, monkeypatch):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='Alice', faceIds=json.dumps(['f1']))
+    _seed_person(person_table, 'lib-A', 'p2', name='', faceIds=json.dumps(['f2']))
+    _seed_person(person_table, 'lib-A', 'p3', name='', faceIds=json.dumps(['f3']))
+    for fid, pid in (('f1', 'p1'), ('f2', 'p2'), ('f3', 'p3')):
+        _seed_face(face_table, 'lib-A', fid, filename=f'{fid}.jpg', personId=pid)
+    old = datetime.now(timezone.utc) - timedelta(days=1)
+    person_table.clock = face_table.clock = lambda: old
+    for t in (person_table, face_table):
+        t.stamps = {k: old for k in t.rows}
+    first = _refresh('lib-A', 'v1')
+    assert [r['name'] for r in first.rows] == ['Alice', 'Unnamed 1', 'Unnamed 2']
+
+    # p2 is rejected-away (face rejected), p4 appears, p1 is renamed; p3 is untouched.
+    person_table.clock = face_table.clock = None
+    _seed_face(face_table, 'lib-A', 'f2', filename='f2.jpg', personId='p2', rejected=True)
+    _seed_person(person_table, 'lib-A', 'p1', name='Alicia', faceIds=json.dumps(['f1']))
+    _seed_person(person_table, 'lib-A', 'p4', name='', faceIds=json.dumps(['f4']))
+    _seed_face(face_table, 'lib-A', 'f4', filename='f4.jpg', personId='p4')
+    lookups = []
+    original = face_table.get_entity
+    face_table.get_entity = lambda partition_key, row_key: (lookups.append(row_key), original(partition_key, row_key))[1]
+    bulk = []
+    original_query = face_table.query_entities
+    face_table.query_entities = lambda f, select=None, **kw: (bulk.append(f), original_query(f, select=select, **kw))[1]
+
+    second = _refresh('lib-A', 'v2')
+    rows = {r['personId']: r for r in second.rows}
+    assert set(rows) == {'p1', 'p3', 'p4'}                      # p2 emptied -> removed
+    assert rows['p1']['name'] == 'Alicia'
+    assert [rows['p3']['name'], rows['p4']['name']] == ['Unnamed 1', 'Unnamed 2']   # renumbered
+    assert 'f3' not in lookups                                  # the untouched cluster's faces were never read
+    assert all('Timestamp ge' in f for f in bulk)               # no full face scan
+
+
+def test_incremental_refresh_falls_back_to_full_build_when_too_much_changed(people_ctx, monkeypatch):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _refresh('lib-A', 'v1')
+    monkeypatch.setattr(storage_utils, '_PEOPLE_INCREMENTAL_MAX_CHANGED', 0)
+    built = []
+    real = storage_utils._build_user_people_index_snapshot
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *a: (built.append(1), real(*a))[1])
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1', rejected=False)
+    _refresh('lib-A', 'v2')
+    assert built == [1]
+
+
+def test_incremental_rederives_cluster_whose_cover_face_moved_without_its_row_changing(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1', 'f2']))
+    _seed_person(person_table, 'lib-A', 'p2', name='B', faceIds=json.dumps(['f3']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='1.jpg', personId='p1', confidence=0.9)
+    _seed_face(face_table, 'lib-A', 'f2', filename='2.jpg', personId='p1', confidence=0.1)
+    _seed_face(face_table, 'lib-A', 'f3', filename='3.jpg', personId='p2')
+    old = datetime.now(timezone.utc) - timedelta(days=1)
+    for t in (person_table, face_table):
+        t.stamps = {k: old for k in t.rows}
+    first = _refresh('lib-A', 'v1')
+    assert {r['personId']: r['faceCount'] for r in first.rows} == {'p1': 2, 'p2': 1}
+    for t in (person_table, face_table):
+        t.stamps = {k: old for k in t.rows}
+    # f1 moves to p2 but p1's person row is (wrongly) left untouched.
+    _seed_face(face_table, 'lib-A', 'f1', filename='1.jpg', personId='p2', confidence=0.9)
+    second = _refresh('lib-A', 'v2')
+    rows = {r['personId']: r for r in second.rows}
+    assert rows['p1']['faceCount'] == 1 and rows['p1']['coverFaceId'] == 'f2'
+
+
+def test_full_rebuild_is_forced_once_the_last_full_build_is_old(people_ctx, monkeypatch):
+    person_table, face_table, blobs = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _refresh('lib-A', 'v1')
+    monkeypatch.setattr(storage_utils, '_PEOPLE_FULL_REBUILD_HOURS', 0.0)
+    built = []
+    real = storage_utils._build_user_people_index_snapshot
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *a: (built.append(1), real(*a))[1])
+    _refresh('lib-A', 'v2')
+    assert built == [1]
+
+
+def test_people_page_route_pages_filters_and_looks_up_ids(monkeypatch):
+    from routes import people as people_routes
+    rows = [{'personId': f'p{i:03d}', 'name': ('Ann %d' % i) if i < 5 else f'Unnamed {i}', 'isNamed': i < 5,
+             'faceCount': i, 'coverFaceId': f'f{i}', 'coverFilename': 'a.jpg'} for i in range(300)]
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    seen = []
+    monkeypatch.setattr(app, 'get_user_people_index', lambda uid, **kw: (seen.append(kw), {'rows': rows})[1])
+
+    def call(qs):
+        with app.app.test_request_context('/api/persons/page?' + qs):
+            return people_routes.people_page().get_json()
+
+    first = call('limit=120')
+    assert first['total'] == 300 and len(first['rows']) == 120 and first['hasMore'] and first['namedCount'] == 5
+    last = call('offset=240&limit=120')
+    assert len(last['rows']) == 60 and not last['hasMore'] and last['rows'][0]['personId'] == 'p240'
+    assert [r['personId'] for r in call('q=ann%202')['rows']] == ['p002']
+    assert [r['personId'] for r in call('ids=p007,p250')['rows']] == ['p007', 'p250']
+    assert all(kw.get('copy_rows') is False for kw in seen)        # no per-request copy of every row

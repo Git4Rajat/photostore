@@ -21,23 +21,16 @@ import app
 from routes.tools import jobs_status
 
 
-class _FakeJobsTable:
-    """Just enough of azure.data.tables to run jobs_status()'s exact query."""
+from tests.fakes import FakeTable
 
-    def __init__(self) -> None:
-        self.rows: dict = {}
 
-    def upsert_entity(self, entity):
-        self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
+class _FakeJobsTable(FakeTable):
+    """FakeTable understands jobs_status()'s partition + (updatedAt/status) filter."""
 
-    def query_entities(self, filter_str):
-        # jobs_status() queries the caller's own userId partition directly --
-        # jobs are partitioned by scope (see _job_partition_key), so no
-        # client-side userId filter or cross-user cache is needed any more.
-        m = re.match(r"PartitionKey eq '([^']*)'$", filter_str)
-        assert m, f'unexpected filter: {filter_str}'
-        pk = m.group(1)
-        return [dict(row) for (p, _), row in self.rows.items() if p == pk]
+    def query_entities(self, filter_str, **kwargs):
+        # Guard the contract: the route must filter server-side, never read the whole partition.
+        assert " and (" in filter_str, f'jobs_status must filter server-side: {filter_str}'
+        return super().query_entities(filter_str, **kwargs)
 
 
 @pytest.fixture

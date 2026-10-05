@@ -122,12 +122,16 @@ def albums_ctx(monkeypatch):
 
 # --- _build_user_albums_index_snapshot ---------------------------------------
 
-def test_build_snapshot_projects_expected_fields(albums_ctx):
+def test_build_snapshot_projects_expected_fields(albums_ctx, monkeypatch, tmp_path):
+    import search_db
     albums_table, metadata_table, _ = albums_ctx
     _seed_album(albums_table, 'lib-A', 'alb-1', name='Trip', filenames=json.dumps(['a.jpg', 'b.jpg']))
-    _seed_photo(metadata_table, 'lib-A', 'a.jpg', rating=2, likes=0, uploadDate='2026-01-01T00:00:00+00:00')
-    _seed_photo(metadata_table, 'lib-A', 'b.jpg', rating=5, likes=1, uploadDate='2026-01-02T00:00:00+00:00')
-    storage_utils.refresh_user_sort_index('lib-A', source_version='sv1')  # cover source
+    path = str(tmp_path / 'lib.sqlite')
+    search_db.build_database([
+        {'RowKey': 'a.jpg', 'rating': 2, 'likes': 0, 'uploadDate': '2026-01-01T00:00:00+00:00'},
+        {'RowKey': 'b.jpg', 'rating': 5, 'likes': 1, 'uploadDate': '2026-01-02T00:00:00+00:00'},
+    ], path)
+    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: search_db.SearchDatabase(path))
 
     snapshot = storage_utils._build_user_albums_index_snapshot('lib-A', 'v1')
 
@@ -137,8 +141,21 @@ def test_build_snapshot_projects_expected_fields(albums_ctx):
     assert row['albumId'] == 'alb-1'
     assert row['name'] == 'Trip'
     assert row['photoCount'] == 2
-    assert row['coverFilename'] == 'b.jpg'  # higher rating wins
-    assert row['filenames'] == ['a.jpg', 'b.jpg']
+    assert row['coverFilename'] == 'b.jpg'  # higher rating wins, picked by SQL over the library database
+    assert 'filenames' not in row           # album contents are served by the server, not downloaded
+
+
+def test_a_large_album_is_indexed_without_carrying_its_photo_list(albums_ctx, monkeypatch):
+    import album_store
+    import search_db
+    albums_table, _, _ = albums_ctx
+    names = [f'IMG_{i:06d}.jpg' for i in range(9000)]
+    entity = {'PartitionKey': 'lib-A', 'RowKey': 'big', 'name': 'Everything'}
+    album_store.write_filenames(entity, names)                    # spans several properties
+    albums_table.upsert_entity(entity)
+    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: None)
+    row = storage_utils._build_user_albums_index_snapshot('lib-A', 'v1').rows[0]
+    assert row['photoCount'] == 9000 and row['coverFilename'] == 'IMG_000000.jpg' and 'filenames' not in row
 
 
 def test_build_snapshot_includes_share_status_fields(albums_ctx, monkeypatch):
@@ -214,24 +231,19 @@ def test_build_snapshot_cover_falls_back_to_first_filename_when_sort_index_cold(
     assert snapshot.rows[0]['coverFilename'] == 'x.jpg'
 
 
-def test_build_snapshot_never_blocks_on_a_cold_sort_index(albums_ctx, monkeypatch):
-    """The sort-index lookup inside the albums-index build must pass
-    allow_sync_build=False -- building an albums index must never trigger (or
-    wait on) a ~60s+ cold sort-index build."""
+def test_building_the_albums_index_never_touches_the_sort_index(albums_ctx, monkeypatch):
+    """Covers come from the library database; loading every photo's sort row (hundreds of MB at a
+    million photos) is exactly what this build must never do."""
+    import search_db
     albums_table, _, _ = albums_ctx
     _seed_album(albums_table, 'lib-A', 'alb-1', filenames=json.dumps(['x.jpg']))
+    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: None)
 
-    captured = {}
+    def boom(*a, **k):
+        raise AssertionError('albums index build must not load the sort index')
 
-    def _spy(user_id, **kwargs):
-        captured.update(kwargs)
-        return None
-
-    monkeypatch.setattr(storage_utils, 'get_user_sort_index', _spy)
-
-    storage_utils._build_user_albums_index_snapshot('lib-A', 'v1')
-
-    assert captured.get('allow_sync_build') is False
+    monkeypatch.setattr(storage_utils, 'get_user_sort_index', boom)
+    assert storage_utils._build_user_albums_index_snapshot('lib-A', 'v1').rows[0]['coverFilename'] == 'x.jpg'
 
 
 # --- serialize / round trip ---------------------------------------------------

@@ -52,7 +52,7 @@ def record_workbench_action():
     # A Workbench/tools run changes tags, faces and metadata: the heavy indexes
     # are rebuilt now (not after plain uploads).
     try:
-        app._trigger_tools_index_rebuild(user_id, reason='workbench-run', scope='full')
+        app._trigger_tools_index_rebuild(user_id, reason='workbench-run', scope='light')
     except Exception:
         pass
     return app.jsonify({'success': True, 'actionId': action_id})
@@ -173,6 +173,7 @@ def jobs_status():
             return error
         if app.jobs_table_client is None:
             return app.jsonify({'jobs': []})
+        app._maybe_sweep_old_job_rows(user_id)  # background, hourly per user
         cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(minutes=app.JOB_STATUS_WINDOW_MINUTES)).isoformat()
         # A job of ANY type (clustering, ipwork, library_clean, preview, ...)
         # this old and still queued/running is dead, not in-flight — the
@@ -191,7 +192,14 @@ def jobs_status():
             # _upsert_job_status), so this is a normal scoped partition query,
             # not the fleet-wide 219k+-row scan this used to share with
             # _has_active_clustering_job.
-            rows = list(app.jobs_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))
+            # Server-side filter: only what the response can include (in-flight, or
+            # recently updated). The partition holds every job the library ever ran, and
+            # this endpoint is polled continuously -- reading all of it was ~160 storage
+            # pages per call.
+            rows = list(app.jobs_table_client.query_entities(
+                f"PartitionKey eq '{app._escape_odata(user_id)}' and "
+                f"(updatedAt ge '{cutoff}' or status eq 'queued' or status eq 'running')"
+            ))
         except Exception:
             app.app.logger.exception('Failed to query job status rows for %s', user_id)
             return app.jsonify({'jobs': []})

@@ -48,7 +48,9 @@ from image_utils import (
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
 from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
+import album_store
 import index_files
+import table_scan
 import maps_utils
 import perf_instrumentation
 import vision_utils
@@ -3855,7 +3857,10 @@ def iter_library_rows(user_id: str):
     metadata_table_client = _CTX.get('metadata_table_client')
     if metadata_table_client is None:
         raise RuntimeError('metadata table not configured')
-    for row in metadata_table_client.query_entities(
+    # Page fetches are latency-bound, so the partition is read as several RowKey ranges at once
+    # (still in RowKey order) -- see table_scan.py.
+    for row in table_scan.scan_partition(
+        metadata_table_client.query_entities,
         f"PartitionKey eq '{_escape_odata(user_id)}' and processing_complete eq true",
         select=_STREAM_SELECT_FIELDS,
     ):
@@ -3988,6 +3993,89 @@ def stream_library_artifacts(user_id: str, source_version: Optional[str], sinks_
     return count
 
 
+SEARCH_DB_DELTA_CHUNK = int(os.getenv('SEARCH_DB_DELTA_CHUNK', '5000'))
+# Above this many changed photos one pass rebuilds the database instead of appending deltas.
+SEARCH_DB_DELTA_MAX_NAMES = int(os.getenv('SEARCH_DB_DELTA_MAX_NAMES', '200000'))
+
+
+def _fetch_rows_by_names(user_id: str, names: List[str], select: List[str]) -> Dict[str, Optional[Dict]]:
+    """Rows for specific filenames: ``RowKey eq .. or ..`` queries of 15 names each (the Table
+    Storage limit), several at a time -- ~N/15 round trips instead of N point reads."""
+    table = _CTX.get('metadata_table_client')
+    if table is None:
+        raise RuntimeError('metadata table not configured')
+    pk = _escape_odata(user_id)
+    batches = [names[i:i + 15] for i in range(0, len(names), 15)]
+
+    def _fetch(batch: List[str]) -> Dict[str, Optional[Dict]]:
+        clause = ' or '.join(f"RowKey eq '{_escape_odata(name)}'" for name in batch)
+        rows = {str(r.get('RowKey') or ''): dict(r)
+                for r in _query_projected(table, f"PartitionKey eq '{pk}' and ({clause})", select)}
+        return {name: rows.get(name) for name in batch}
+
+    out: Dict[str, Optional[Dict]] = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(batches)))) as executor:
+        for part in executor.map(_fetch, batches):
+            out.update(part)
+    return out
+
+
+def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
+    """Bring the library's search database up to date by publishing small DELTAS for the photos
+    whose rows changed, instead of re-scanning and rebuilding the whole library.
+
+    Cost is proportional to what changed (a few round trips per 15 photos), not to the library, so
+    it stays cheap at millions of photos. Replicas apply the deltas to their local copy in place
+    (see search_db.sync_deltas). Returns a status:
+      noop        nothing is dirty
+      delta       one or more deltas were published (``published`` of them)
+      no_base     the library has no database yet (a full build is needed first)
+      needs_full  too much changed, or the delta log is long: caller should rebuild/compact
+      unavailable the dirty-name table cannot be read (never treated as "nothing changed")
+      conflict    a concurrent rebuild/publisher won; nothing is lost, the names stay dirty
+    """
+    import search_db
+    key = str(user_id or '').strip()
+    if not key:
+        return {'status': 'unavailable'}
+    search_db.invalidate_manifest_cache(key)
+    manifest = search_db.load_manifest(key)
+    if not manifest.get('sourceVersion') or manifest.get('schemaVersion') != search_db.SCHEMA_VERSION:
+        return {'status': 'no_base'}
+    dirty = _get_dirty_search_index_filenames(key, 'lexical')
+    if dirty is None:
+        return {'status': 'unavailable'}
+    if not dirty:
+        return {'status': 'noop'}
+    if len(dirty) > SEARCH_DB_DELTA_MAX_NAMES or search_db.delta_budget_exceeded(manifest, len(dirty)):
+        return {'status': 'needs_full', 'dirty': len(dirty)}
+
+    names = sorted(dirty)
+    published = 0
+    upserted = removed = 0
+    with perf_instrumentation.step('searchdb.delta.build', user=key, dirty=len(names)):
+        for start in range(0, len(names), SEARCH_DB_DELTA_CHUNK):
+            chunk = names[start:start + SEARCH_DB_DELTA_CHUNK]
+            rows = _fetch_rows_by_names(key, chunk, _STREAM_SELECT_FIELDS)
+            upserts, deletes = [], []
+            for name in chunk:
+                row = rows.get(name)
+                complete = row is not None and str(row.get('processing_complete')).strip().lower() in ('true', '1')
+                gone = row is None or str(row.get('processing_state') or '').strip().lower() == 'deleted'
+                record = search_db.row_record(row) if (complete and not gone) else None
+                if record is not None:
+                    upserts.append(record)
+                else:
+                    deletes.append(name)
+            if search_db.publish_delta(key, upserts, deletes) is None:
+                return {'status': 'conflict', 'published': published}
+            _clear_dirty_search_index_filenames(key, 'lexical', chunk)
+            published += 1
+            upserted += len(upserts)
+            removed += len(deletes)
+    return {'status': 'delta', 'published': published, 'upserts': upserted, 'deletes': removed}
+
+
 def refresh_user_lexical_artifacts(user_id: str, source_version: Optional[str] = None):
     """What the index primer runs for the 'lexical' kind: the app-level streaming
     build when registered, else the legacy full-snapshot refresh (tests only)."""
@@ -4075,7 +4163,9 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     return source_version
 
 
-_SEARCH_INDEX_KINDS = ('vector', 'lexical', 'sort', 'access')
+# 'vector' is deliberately absent: its rebuild is always a full streaming pass (nothing merges just the
+# changed photos), so a per-photo dirty row for it was a table write per photo that nothing ever used.
+_SEARCH_INDEX_KINDS = ('lexical', 'sort', 'access')
 
 
 def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
@@ -4126,7 +4216,7 @@ def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
             pass
 
 
-def _mark_search_index_dirty_filenames(user_id: str, filenames) -> None:
+def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> None:
     """Buffer filenames as dirty for the vector/lexical/sort indexes'
     incremental rebuilds (kept in separate partitions per index kind so one
     index's rebuild consuming its dirty set doesn't blind the other to the
@@ -4148,12 +4238,15 @@ def _mark_search_index_dirty_filenames(user_id: str, filenames) -> None:
     if not filenames:
         return
     to_flush: List[Tuple[str, str]] = []
+    wanted = tuple(kinds) if kinds is not None else _SEARCH_INDEX_KINDS
+    if 'sort' in wanted and sort_index_skipped(user_id):
+        wanted = tuple(k for k in wanted if k != 'sort')
     with _DIRTY_FILENAME_BUFFER_LOCK:
         for filename in filenames:
             filename = str(filename or '').strip()
             if not filename:
                 continue
-            for kind in _SEARCH_INDEX_KINDS:
+            for kind in wanted:
                 key = (user_id, kind)
                 bucket = _DIRTY_FILENAME_BUFFER.setdefault(key, set())
                 bucket.add(filename)
@@ -4207,6 +4300,37 @@ def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames
             pass
 
 
+# Past this many photos the sort index has no consumer: the browser pages from the server instead of
+# downloading it (see routes/photos.py photos_sort_index) and nothing server-side reads it. So it is
+# not built, not marked dirty, and not rewritten by every light build (a full streamed pass at 1M).
+SORT_INDEX_MAX_ROWS = int(os.getenv('SORT_INDEX_CLIENT_MAX_ROWS', '200000'))
+
+
+def _library_row_count(user_id: str) -> int:
+    try:
+        import search_db
+        return int(search_db.load_manifest(user_id).get('rowCount') or 0)
+    except Exception:
+        return 0
+
+
+def sort_index_skipped(user_id: str) -> bool:
+    return SORT_INDEX_MAX_ROWS > 0 and _library_row_count(user_id) > SORT_INDEX_MAX_ROWS
+
+
+def _publish_skipped_sort_manifest(user_id: str, version: str, row_count: int) -> None:
+    """Record that the sort index is intentionally absent for a huge library (readiness still holds)."""
+    container = _lexical_index_container_name()
+    client = _get_blob_client(container, _sort_index_manifest_blob_name(user_id)) if container else None
+    if client is None:
+        return
+    client.upload_blob(
+        json.dumps({'userId': user_id, 'sourceVersion': version, 'schemaVersion': _SORT_INDEX_SCHEMA_VERSION,
+                    'rowCount': row_count, 'dirty': False, 'skipped': True, 'updatedAt': version},
+                   separators=(',', ':')).encode('utf-8'),
+        overwrite=True, content_settings=BlobContentSettings(content_type='application/json'))
+
+
 def touch_user_search_indexes_state(
     user_id: str, *, embedding_version: Optional[str] = None, filenames=None,
 ) -> None:
@@ -4232,7 +4356,8 @@ def touch_user_search_indexes_state(
     touch_user_vector_index_state(user_id, embedding_version=embedding_version)
     touch_user_lexical_index_state(user_id)
     touch_user_tag_embedding_index_state(user_id)
-    touch_user_sort_index_state(user_id)
+    if not sort_index_skipped(user_id):
+        touch_user_sort_index_state(user_id)
     touch_user_access_index_state(user_id)
     if filenames:
         _mark_search_index_dirty_filenames(user_id, filenames if isinstance(filenames, (list, set, tuple)) else [filenames])
@@ -4699,6 +4824,11 @@ def touch_user_sort_index_dirty(user_id: str, filenames) -> None:
     key = str(user_id or '').strip()
     if not key or not filenames:
         return
+    # The search database stores rating/likes too (filter and gallery order), so the change must
+    # reach it as a delta even though no search *text* changed.
+    _mark_search_index_dirty_filenames(key, [str(f) for f in filenames], kinds=('lexical',))
+    if sort_index_skipped(key):
+        return
     touch_user_sort_index_state(key)
     table = _CTX.get('search_index_dirty_table_client')
     if table is None:
@@ -4905,6 +5035,14 @@ def _refresh_rows_index_on_disk(
         return None
     blob_client = _get_blob_client(container_name, blob_name) if container_name else None
     dirty = None if force_full else _get_dirty_search_index_filenames(key, kind)
+    if dirty is not None and not dirty and blob_client is not None:
+        # Nothing changed since the last build and the manifest is clean: rewriting the whole file
+        # (a full streamed pass) would only refresh its timestamp.
+        current = (_load_sort_index_manifest if kind == 'sort' else _load_access_index_manifest)(key)
+        if current.get('schemaVersion') == schema_version and current.get('sourceVersion') and not current.get('dirty'):
+            return LexicalIndexSnapshot(
+                user_id=key, source_version=str(current['sourceVersion']), schema_version=schema_version,
+                updated_at=str(current.get('updatedAt') or current['sourceVersion']), rows=[])
     with index_files.workspace() as workdir:
         out_path = os.path.join(workdir, f'{kind}.json.gz')
         header = {'userId': key, 'sourceVersion': source_version, 'schemaVersion': schema_version, 'updatedAt': source_version}
@@ -5011,6 +5149,11 @@ def refresh_user_sort_index(
     key = str(user_id or '').strip()
     if not key:
         return None
+    if sort_index_skipped(key):
+        version = str(source_version or datetime.now(timezone.utc).isoformat())
+        _publish_skipped_sort_manifest(key, version, _library_row_count(key))
+        return LexicalIndexSnapshot(user_id=key, source_version=version, schema_version=_SORT_INDEX_SCHEMA_VERSION,
+                                    updated_at=version, rows=[])
     return _refresh_rows_index_on_disk(
         'sort', key, str(source_version or datetime.now(timezone.utc).isoformat()),
         schema_version=_SORT_INDEX_SCHEMA_VERSION,
@@ -5590,7 +5733,7 @@ def access_index_is_dirty(user_id: str) -> bool:
 # rebuild (re-scan the small album partition + look up cover data from the
 # already-resident sort index) is cheap enough to just always do. Own dirty
 # flag only (no per-album dirty-filenames partition).
-_ALBUMS_INDEX_SCHEMA_VERSION = 'v1'
+_ALBUMS_INDEX_SCHEMA_VERSION = 'v2'  # v2: no per-album filename lists (the browser opens albums from the server)
 _ALBUMS_INDEX_CACHE_LOCK = threading.RLock()
 _ALBUMS_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _ALBUMS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -5818,18 +5961,27 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
         # dirty:false state (see refresh_user_sort_index's identical note).
         return None
 
-    # Best-effort cover data source -- never blocks this build on the sort
-    # index's own cold-build path (allow_sync_build=False): covers just fall
-    # back to "first filename in the album" until the sort index catches up.
-    sort_rows_by_filename: Dict[str, Dict[str, object]] = {}
+    # Covers come from the library database (highest rating, then most likes, then newest): a SQL
+    # lookup per album, so memory does not grow with the library. Without a database yet the first
+    # photo in album order stands in. (This used to load every photo's sort-index row into a dict --
+    # hundreds of MB at a million photos.)
+    import search_db
     try:
-        sort_index = get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
-        if sort_index is not None:
-            sort_rows_by_filename = {
-                str(row.get('RowKey') or ''): row for row in sort_index.get('rows', []) if row.get('RowKey')
-            }
+        library_db = search_db.open_database(user_id)
     except Exception:
-        sort_rows_by_filename = {}
+        library_db = None
+
+    def _cover(names: List[str]) -> str:
+        if not names:
+            return ''
+        if library_db is not None:
+            try:
+                best = library_db.top_rated(names, limit=1)
+                if best:
+                    return best[0]
+            except Exception:
+                _LOGGER.warning('Album cover lookup failed', exc_info=True)
+        return names[0]
 
     trimmed_rows: List[Dict[str, object]] = []
     for row in rows:
@@ -5838,19 +5990,13 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
             continue
         if str(row.get('deleted') or '').strip().lower() in ('true', '1'):
             continue
-        try:
-            filenames = json.loads(row.get('filenames', '[]') or '[]')
-        except Exception:
-            filenames = []
-        if not isinstance(filenames, list):
-            filenames = []
+        filenames = album_store.sample(row) if album_store.is_table_backed(row) else album_store.read_filenames(row)
         trimmed_rows.append({
             'albumId': album_id,
             'name': str(row.get('name') or ''),
-            'photoCount': len(filenames),
-            'coverFilename': _pick_album_cover_filename(filenames, sort_rows_by_filename),
+            'photoCount': album_store.count(row),
+            'coverFilename': _cover(filenames),
             'updatedAt': str(row.get('updatedAt') or ''),
-            'filenames': filenames,
             **_album_share_fields(row),
         })
 
@@ -6042,7 +6188,10 @@ def get_user_albums_index(
 # background-rebuild machinery already ensures a burst of writes (e.g. a
 # clustering run reassigning hundreds of faces) triggers at most one real
 # rebuild per idle period, not one per write.
-_PEOPLE_INDEX_SCHEMA_VERSION = 'v1'
+_PEOPLE_INDEX_SCHEMA_VERSION = 'v2'   # v2: rows carry autoName so incremental refresh can renumber "Unnamed N"
+_PEOPLE_INCREMENTAL_MAX_CHANGED = int(os.getenv('PEOPLE_INDEX_INCREMENTAL_MAX_CHANGED', '3000'))
+_PEOPLE_INCREMENTAL_SKEW_SECONDS = 180
+_PEOPLE_FULL_REBUILD_HOURS = float(os.getenv('PEOPLE_INDEX_FULL_REBUILD_HOURS', '24'))   # bounds any drift the incremental path could miss
 _PEOPLE_INDEX_CACHE_LOCK = threading.RLock()
 _PEOPLE_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _PEOPLE_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -6361,6 +6510,7 @@ def _people_index_rows_from_scan(
 
         trimmed_rows.append({
             'personId': person_id,
+            'autoName': not raw_name,
             'name': name,
             'isNamed': is_named,
             'faceCount': len(active_face_ids),
@@ -6383,13 +6533,119 @@ def _people_index_rows_from_scan(
     )
 
 
+class _PointReadFaces:
+    """face_kv stand-in for the incremental path: nothing is bulk-loaded, so every face
+    is a miss and _people_index_rows_from_scan point-reads just the changed persons' faces."""
+
+    def get_many(self, ids):
+        return {}
+
+
+def _odata_utc(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _incremental_people_index_snapshot(
+    user_id: str, source_version: str, since: str, prev_rows: List[Dict[str, object]],
+) -> Optional[LexicalIndexSnapshot]:
+    """Re-derive only the clusters touched since ``since`` (person rows or face rows written
+    after it) and carry every other row over from the previous snapshot. Costs one key-only
+    pass over the person table plus point reads for the changed clusters, instead of reading
+    every face. Returns None to ask the caller for a full build."""
+    person_table_client = _CTX.get('person_table_client')
+    face_table_client = _CTX.get('face_table_client')
+    if person_table_client is None or face_table_client is None:
+        return None
+    base = f"PartitionKey eq '{_escape_odata(user_id)}'"
+    stamp = f"Timestamp ge datetime'{since}'"
+    try:
+        changed: Dict[str, Dict] = {}
+        for row in _query_projected(person_table_client, f"{base} and {stamp}", _PEOPLE_INDEX_PERSON_COLUMNS):
+            rk = str(row.get('RowKey') or '')
+            if rk:
+                changed[rk] = {k: row.get(k) for k in _PEOPLE_INDEX_PERSON_COLUMNS if k in row}
+        touched: set = set()
+        touched_faces: set = set()
+        for row in _query_projected(face_table_client, f"{base} and {stamp}", ['PartitionKey', 'RowKey', 'personId']):
+            pid = str(row.get('personId') or '')
+            if pid:
+                touched.add(pid)
+            touched_faces.add(str(row.get('RowKey') or ''))
+            if len(touched) + len(changed) > _PEOPLE_INCREMENTAL_MAX_CHANGED:
+                return None
+        existing = {
+            str(row.get('RowKey') or '')
+            for row in _query_projected(person_table_client, base, ['PartitionKey', 'RowKey'])
+        }
+    except Exception:
+        return None
+    existing.discard('')
+    # A face that moved or was rejected may have left a cluster whose own row was not rewritten:
+    # re-derive any cluster using a touched face as its cover.
+    for row in prev_rows:
+        if isinstance(row, dict) and str(row.get('coverFaceId') or '') in touched_faces:
+            touched.add(str(row.get('personId') or ''))
+    for pid in touched:
+        if pid in existing and pid not in changed:
+            try:
+                changed[pid] = person_table_client.get_entity(partition_key=user_id, row_key=pid)
+            except Exception:
+                return None
+    if len(changed) > _PEOPLE_INCREMENTAL_MAX_CHANGED:
+        return None
+    by_id = {str(r.get('personId')): r for r in prev_rows if isinstance(r, dict)}
+    for pid in list(by_id):
+        if pid not in existing:
+            del by_id[pid]          # deleted or merged away
+    fresh = _people_index_rows_from_scan(
+        user_id, source_version,
+        [changed[k] for k in sorted(changed) if k in existing],
+        _PointReadFaces(), person_table_client, face_table_client,
+    )
+    for pid in changed:
+        by_id.pop(pid, None)        # re-derived below, or dropped if now empty
+    for row in fresh.rows:
+        by_id[str(row['personId'])] = row
+    rows = [by_id[k] for k in sorted(by_id)]
+    counter = 1
+    for row in rows:                # "Unnamed N" is positional, so renumber over the merged list
+        if row.get('autoName'):
+            row['name'] = f'Unnamed {counter}'
+            counter += 1
+    rows.sort(key=lambda r: 0 if r.get('isNamed') else 1)
+    return LexicalIndexSnapshot(
+        user_id=str(user_id), source_version=source_version, schema_version=_PEOPLE_INDEX_SCHEMA_VERSION,
+        updated_at=source_version, rows=rows,
+    )
+
+
 def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+    started = datetime.now(timezone.utc)
 
-    snapshot = _build_user_people_index_snapshot(key, source_version)
+    snapshot = None
+    previous_manifest = _load_people_index_manifest(key)
+    since = str(previous_manifest.get('builtThrough') or '')
+    full_at = str(previous_manifest.get('fullBuiltAt') or '')
+    try:
+        full_age_hours = (started - datetime.fromisoformat(full_at)).total_seconds() / 3600 if full_at else None
+    except ValueError:
+        full_age_hours = None
+    incremental_ok = full_age_hours is not None and 0 <= full_age_hours < _PEOPLE_FULL_REBUILD_HOURS
+    if since and incremental_ok and previous_manifest.get('schemaVersion') == _PEOPLE_INDEX_SCHEMA_VERSION:
+        prev = _load_people_index_blob(key)
+        if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
+                and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
+            snapshot = _incremental_people_index_snapshot(key, source_version, since, prev.rows)
+            perf_instrumentation.log_event(
+                'people_index_incremental', user=key, ok=snapshot is not None,
+                rows=len(snapshot.rows) if snapshot else 0)
+    full_built_at = str(previous_manifest.get('fullBuiltAt') or '') if snapshot is not None else started.isoformat()
+    if snapshot is None:
+        snapshot = _build_user_people_index_snapshot(key, source_version)
     if snapshot is None:
         return None
     container_name = _lexical_index_container_name()
@@ -6412,6 +6668,8 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
             'rowCount': len(snapshot.rows),
             'dirty': False,
             'updatedAt': snapshot.updated_at,
+            'fullBuiltAt': full_built_at,
+            'builtThrough': _odata_utc(started - timedelta(seconds=_PEOPLE_INCREMENTAL_SKEW_SECONDS)),
         }
         manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))
         if manifest_client is not None:
@@ -6492,7 +6750,7 @@ def _rebuild_people_index_in_background(key: str, manifest: Dict[str, str]) -> N
 
 
 def get_user_people_index(
-    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True,
+    user_id: str, *, allow_refresh: bool = True, allow_sync_build: bool = True, copy_rows: bool = True,
 ) -> Optional[Dict[str, object]]:
     """Mirrors get_user_albums_index's "serve stale immediately, rebuild
     off-thread" read path, including allow_sync_build=False for the
@@ -6531,6 +6789,8 @@ def get_user_people_index(
             _rebuild_people_index_in_background(key, manifest)
     if fresh is None:
         return None
+    if not copy_rows:
+        return dict(fresh)      # read-only callers (paging) must not mutate the shared rows
     return {**fresh, 'rows': [dict(row) for row in fresh.get('rows', [])]}
 
 
@@ -6728,10 +6988,15 @@ def get_index_manifest_summary(user_id: str, kind: str) -> Optional[Dict[str, ob
     source_version = str(manifest.get('sourceVersion') or '').strip()
     if not source_version:
         return None
+    try:
+        row_count = int(manifest.get('rowCount') or 0)
+    except (TypeError, ValueError):
+        row_count = 0
     return {
         'source_version': source_version,
         'updated_at': manifest.get('updatedAt') or source_version,
         'dirty': bool(manifest.get('dirty')),
+        'row_count': row_count,
     }
 
 

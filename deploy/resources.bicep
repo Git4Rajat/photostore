@@ -1344,6 +1344,10 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             // SQLite scratch stays on local ephemeral disk (needs real file locking).
             { name: 'INDEX_BUILD_WORK_DIR', value: '/mnt/photostore/faiss-checkpoints/index-build' }
             { name: 'INDEX_BUILD_SQLITE_DIR', value: '/var/lib/photostore/faiss-work/index-build-sqlite' }
+            // The worker's own copy of each library's search database (base + deltas) lives on local disk;
+            // compaction snapshots it, so the budget must hold one library's database plus its copy.
+            { name: 'SEARCH_DB_DIR', value: '/var/lib/photostore/faiss-work/search-db' }
+            { name: 'SEARCH_DB_MAX_CACHE_MB', value: '3500' }
             { name: 'TMPDIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'CLUSTERING_WORKER_POLL_SECONDS', value: '2' }
             // Opt-in microbatching (2026-10-02): adjacent same-library

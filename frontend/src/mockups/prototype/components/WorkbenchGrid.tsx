@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
     CircleCheck as CheckCircleSolid,
     Search as MagnifyingGlassIcon,
@@ -15,6 +15,9 @@ import { usePhotoThumbnails, fetchPhotoMetadata } from '../media';
 import { ThumbSizeControl, useTileSize } from './controls';
 import type { PhotoMetadata } from '../media';
 import type { Photo } from '../types';
+import { get, post } from '../../../services/apiClient';
+import { mapPhoto } from '../store';
+import ScrollSentinel from './ScrollSentinel';
 
 // The Workbench tile carries a filename + 7 processing-step badges under the
 // thumbnail, so it needs a larger floor than the plain photo grids.
@@ -147,32 +150,123 @@ const WorkbenchTile: React.FC<{
     );
 };
 
+const WB_PAGE = 120;
+// Server-side "select all" walks ids in pages of 5000; stop at this many so a
+// runaway click can't queue a million photos by accident.
+const SELECT_ALL_CAP = 100000;
+
+const stubPhoto = (filename: string): Photo => ({ id: filename, filename, swatch: 's1', dateLabel: '', year: 0, rating: 0, liked: false, placeId: null, personIds: [], tags: [] });
+
 export const WorkbenchGrid: React.FC<{
-    photos: Photo[];
+    /** Deep-linked filenames: pinned at the top (while not searching) even if they are far down the library. */
+    pinned?: string[];
     selection: string[];
     onToggleSelect: (id: string) => void;
     onSelectMany: (ids: string[]) => void;
-}> = ({ photos, selection, onToggleSelect, onSelectMany }) => {
+}> = ({ pinned = [], selection, onToggleSelect, onSelectMany }) => {
     const [query, setQuery] = useState('');
+    const [debounced, setDebounced] = useState('');
     const [sort, setSort] = useState<SortMode>('uploaded');
     const [infoOpenId, setInfoOpenId] = useState<string | null>(null);
     const [tile, setTile] = useTileSize('photostore.workbenchTileSize', WB_TILE);
+    const [items, setItems] = useState<Photo[]>([]);
+    const [total, setTotal] = useState<number | null>(null);
+    const [hasMore, setHasMore] = useState(false);
+    const [loading, setLoading] = useState(false);
+    const [selectingAll, setSelectingAll] = useState(false);
+    const [selectNote, setSelectNote] = useState('');
+    const [pinnedPhotos, setPinnedPhotos] = useState<Photo[]>([]);
+    const seq = useRef(0);
+    const offsetRef = useRef(0);
+    const loadingRef = useRef(false);
 
-    const filtered = useMemo(() => {
-        const q = query.trim().toLowerCase();
-        const list = q ? photos.filter((p) => p.filename.toLowerCase().includes(q)) : photos.slice();
-        list.sort((a, b) => {
-            if (sort === 'name') return a.filename.localeCompare(b.filename);
-            const ad = a.captureDate ? new Date(a.captureDate).getTime() : 0;
-            const bd = b.captureDate ? new Date(b.captureDate).getTime() : 0;
-            return bd - ad;
-        });
-        return list;
-    }, [photos, query, sort]);
+    useEffect(() => {
+        const t = setTimeout(() => setDebounced(query.trim()), 250);
+        return () => clearTimeout(t);
+    }, [query]);
 
-    const thumbs = usePhotoThumbnails(filtered);
+    const queryString = useCallback((extra: string) => {
+        const sortParam = sort === 'name' ? 'name' : 'date';
+        return `/photos?sort=${sortParam}${debounced ? `&nameContains=${encodeURIComponent(debounced)}` : ''}${extra}`;
+    }, [sort, debounced]);
+
+    const loadPage = useCallback(async (reset: boolean) => {
+        if (loadingRef.current && !reset) return;
+        const mine = ++seq.current;
+        if (reset) offsetRef.current = 0;
+        loadingRef.current = true;
+        setLoading(true);
+        try {
+            const res = await get<{ photos?: Parameters<typeof mapPhoto>[0][]; total?: number }>(
+                queryString(`&offset=${offsetRef.current}&limit=${WB_PAGE}&directMedia=1`),
+            );
+            if (mine !== seq.current) return;
+            const page = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
+            offsetRef.current += page.length;
+            setItems((prev) => (reset ? page : [...prev, ...page]));
+            if (typeof res?.total === 'number') setTotal(res.total);
+            setHasMore(page.length === WB_PAGE);
+        } catch {
+            if (mine === seq.current) setHasMore(false);
+        } finally {
+            if (mine === seq.current) {
+                loadingRef.current = false;
+                setLoading(false);
+            }
+        }
+    }, [queryString]);
+
+    useEffect(() => {
+        loadingRef.current = false;
+        void loadPage(true);
+    }, [loadPage]);
+
+    const pinnedKey = pinned.join('|');
+    useEffect(() => {
+        if (!pinned.length) { setPinnedPhotos([]); return undefined; }
+        let active = true;
+        setPinnedPhotos(pinned.map(stubPhoto));
+        void post<{ photos?: Parameters<typeof mapPhoto>[0][] }>('/api/photos/lookup-batch', { filenames: pinned.slice(0, 200), directMedia: true })
+            .then((res) => {
+                if (!active || !Array.isArray(res?.photos)) return;
+                const found = new Map(res.photos.map((p) => { const m = mapPhoto(p); return [m.filename, m] as const; }));
+                setPinnedPhotos(pinned.map((f) => found.get(f) ?? stubPhoto(f)));
+            })
+            .catch(() => undefined);
+        return () => { active = false; };
+    }, [pinnedKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const shown = React.useMemo(() => {
+        if (debounced || !pinnedPhotos.length) return items;
+        const pinnedNames = new Set(pinnedPhotos.map((p) => p.filename));
+        return [...pinnedPhotos, ...items.filter((p) => !pinnedNames.has(p.filename))];
+    }, [items, pinnedPhotos, debounced]);
+
+    const thumbs = usePhotoThumbnails(shown);
     const selectedSet = new Set(selection);
-    const allVisibleSelected = filtered.length > 0 && filtered.every((p) => selectedSet.has(p.id));
+    const allSelected = total !== null && total > 0 && selection.length >= Math.min(total, SELECT_ALL_CAP) && shown.every((p) => selectedSet.has(p.id));
+
+    const selectAllMatching = async () => {
+        if (allSelected) { onSelectMany([]); setSelectNote(''); return; }
+        setSelectingAll(true);
+        setSelectNote('');
+        try {
+            const names: string[] = [];
+            for (;;) {
+                const res = await get<{ filenames?: string[]; hasMore?: boolean }>(queryString(`&idsOnly=1&offset=${names.length}&limit=5000`));
+                const batch = Array.isArray(res?.filenames) ? res.filenames : [];
+                names.push(...batch);
+                if (!res?.hasMore || batch.length === 0 || names.length >= SELECT_ALL_CAP) break;
+            }
+            const capped = names.slice(0, SELECT_ALL_CAP);
+            onSelectMany(capped);
+            if (total !== null && total > capped.length) setSelectNote(`Selected the first ${capped.length.toLocaleString()} of ${total.toLocaleString()} — narrow the search to cover the rest.`);
+        } catch {
+            setSelectNote('Couldn’t select everything — try again.');
+        } finally {
+            setSelectingAll(false);
+        }
+    };
 
     return (
         <div className="wb-wrap">
@@ -181,7 +275,7 @@ export const WorkbenchGrid: React.FC<{
                     <MagnifyingGlassIcon />
                     <input
                         type="text"
-                        placeholder="Search photos…"
+                        placeholder="Search filenames…"
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
                     />
@@ -191,20 +285,17 @@ export const WorkbenchGrid: React.FC<{
                     <option value="name">Filename</option>
                 </select>
                 <ThumbSizeControl value={tile} onChange={setTile} min={WB_TILE.min} max={WB_TILE.max} step={WB_TILE.step} />
-                <button
-                    type="button"
-                    className="pt-linkish"
-                    onClick={() => onSelectMany(allVisibleSelected ? [] : filtered.map((p) => p.id))}
-                >
-                    {allVisibleSelected ? 'Deselect all' : `Select all (${filtered.length})`}
+                <button type="button" className="pt-linkish" onClick={() => void selectAllMatching()} disabled={selectingAll || total === 0}>
+                    {selectingAll ? 'Selecting…' : allSelected ? 'Deselect all' : `Select all${total !== null ? ` (${total.toLocaleString()})` : ''}`}
                 </button>
             </div>
+            {selectNote && <p className="pt-menu-label">{selectNote}</p>}
 
-            {filtered.length === 0 ? (
-                <p className="pt-grid-empty">No photos match “{query}”.</p>
+            {shown.length === 0 && !loading ? (
+                <p className="pt-grid-empty">{debounced ? `No photos match “${debounced}”.` : 'No photos yet.'}</p>
             ) : (
                 <div className="wb-grid" style={{ ['--wb-tile-min' as string]: `${tile}px` } as React.CSSProperties}>
-                    {filtered.map((photo) => (
+                    {shown.map((photo) => (
                         <WorkbenchTile
                             key={photo.id}
                             photo={photo}
@@ -217,6 +308,7 @@ export const WorkbenchGrid: React.FC<{
                     ))}
                 </div>
             )}
+            {hasMore && <ScrollSentinel onVisible={() => void loadPage(false)} deps={items.length} />}
         </div>
     );
 };

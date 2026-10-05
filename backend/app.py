@@ -104,6 +104,7 @@ from storage_utils import (
     upload_media_file,
     prime_available_vector_indexes,
     refresh_user_vector_index,
+    refresh_user_search_db_incremental,
     get_vector_index_manifest_summary,
     get_vector_index_blob_location,
     invalidate_user_vector_index_cache,
@@ -230,7 +231,9 @@ app.logger.setLevel(os.getenv('LOG_LEVEL', 'INFO').upper())
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 worker_logger = logging.getLogger(__name__)
+import album_store
 import perf_instrumentation
+import table_scan
 import storage_utils as storage_utils_module
 perf_instrumentation.install(app)
 placeholder_bytes = create_placeholder_thumbnail()
@@ -505,6 +508,7 @@ FACE_BY_FILENAME_TABLE = os.getenv('FACE_BY_FILENAME_TABLE', 'photofacebyfilenam
 # access path that doesn't require materializing a popular person's entire
 # membership as one string.
 PERSON_MEMBERS_TABLE = os.getenv('PERSON_MEMBERS_TABLE', 'photopersonmembers')
+ALBUM_MEMBERS_TABLE = os.getenv('ALBUM_MEMBERS_TABLE', 'photoalbummembers')   # one row per photo of an album too big for its row
 MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
 # Job status/progress rows: PartitionKey=userId (or libraryId for
 # library_clean/library_download, which any member of a shared library must
@@ -527,6 +531,10 @@ HASH_INDEX_TABLE = os.getenv('HASH_INDEX_TABLE', 'photofilehashes')
 # so /upload/finalize can check "does any OTHER library already own this filename"
 # without scanning the entire metadata table.
 FILENAME_OWNERS_TABLE = os.getenv('FILENAME_OWNERS_TABLE', 'photofilenameowners')
+# Trash membership index: PartitionKey=user/library id, RowKey=filename (+ a '__init__' marker row).
+# "Which photos are in trash" is a non-indexed property, so asking the metadata table scans the
+# whole library server-side (~45 s at 130k photos even when the trash is empty).
+TRASH_INDEX_TABLE = os.getenv('TRASH_INDEX_TABLE', 'phototrashindex')
 # Multi-tenant library sharing (accounts, libraries, memberships, invites, audit).
 USERS_TABLE = os.getenv('USERS_TABLE', 'photousers')
 LIBRARIES_TABLE = os.getenv('LIBRARIES_TABLE', 'photolibraries')
@@ -1075,6 +1083,7 @@ embeddings_table_client = None
 face_embeddings_table_client = None
 face_by_filename_table_client = None
 person_members_table_client = None
+album_members_table_client = None
 search_index_dirty_table_client = None
 blob_service_client = None
 albums_table_client = None
@@ -1087,6 +1096,7 @@ workbench_actions_table_client = None
 image_names_table_client = None
 hash_index_table_client = None
 filename_owners_table_client = None
+trash_index_table_client = None
 config_table_client = None
 users_table_client = None
 libraries_table_client = None
@@ -1383,12 +1393,12 @@ def _init_storage_clients():
     global account_name, credential
     global metadata_table_client
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
-    global face_by_filename_table_client, person_members_table_client
+    global face_by_filename_table_client, person_members_table_client, album_members_table_client
     global album_token_index_table_client
     global jobs_table_client
     global workbench_actions_table_client
     global image_names_table_client
-    global hash_index_table_client, filename_owners_table_client
+    global hash_index_table_client, filename_owners_table_client, trash_index_table_client
     global embeddings_table_client
     global face_embeddings_table_client
     global search_index_dirty_table_client
@@ -1413,12 +1423,14 @@ def _init_storage_clients():
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         face_by_filename_table_client_local = tbl_svc.get_table_client(FACE_BY_FILENAME_TABLE)
         person_members_table_client_local = tbl_svc.get_table_client(PERSON_MEMBERS_TABLE)
+        album_members_table_client_local = tbl_svc.get_table_client(ALBUM_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
         filename_owners_table_client_local = tbl_svc.get_table_client(FILENAME_OWNERS_TABLE)
+        trash_index_table_client_local = tbl_svc.get_table_client(TRASH_INDEX_TABLE)
         config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
         users_table_client_local = tbl_svc.get_table_client(USERS_TABLE)
         libraries_table_client_local = tbl_svc.get_table_client(LIBRARIES_TABLE)
@@ -1479,12 +1491,14 @@ def _init_storage_clients():
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         face_by_filename_table_client_local = tbl_svc.get_table_client(FACE_BY_FILENAME_TABLE)
         person_members_table_client_local = tbl_svc.get_table_client(PERSON_MEMBERS_TABLE)
+        album_members_table_client_local = tbl_svc.get_table_client(ALBUM_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
         filename_owners_table_client_local = tbl_svc.get_table_client(FILENAME_OWNERS_TABLE)
+        trash_index_table_client_local = tbl_svc.get_table_client(TRASH_INDEX_TABLE)
         config_table_client_local = tbl_svc.get_table_client(CONFIG_TABLE)
         users_table_client_local = tbl_svc.get_table_client(USERS_TABLE)
         libraries_table_client_local = tbl_svc.get_table_client(LIBRARIES_TABLE)
@@ -1508,12 +1522,15 @@ def _init_storage_clients():
     person_table_client = _InvalidatingTableClient(person_table_client_local, _invalidate_people_scan_cache)
     face_by_filename_table_client = face_by_filename_table_client_local
     person_members_table_client = person_members_table_client_local
+    album_members_table_client = album_members_table_client_local
+    album_store.configure(album_members_table_client)
     merge_table_client = merge_table_client_local
     jobs_table_client = jobs_table_client_local
     workbench_actions_table_client = workbench_actions_table_client_local
     image_names_table_client = image_names_table_client_local
     hash_index_table_client = hash_index_table_client_local
     filename_owners_table_client = filename_owners_table_client_local
+    trash_index_table_client = trash_index_table_client_local
     users_table_client = users_table_client_local
     libraries_table_client = libraries_table_client_local
     memberships_table_client = memberships_table_client_local
@@ -1539,7 +1556,7 @@ def _init_storage_clients():
         lambda t=tbl: t.create_table()
         for tbl in (users_table_client, libraries_table_client, memberships_table_client,
                     invites_table_client, audit_table_client, clean_requests_table_client,
-                    face_by_filename_table_client, person_members_table_client)
+                    face_by_filename_table_client, person_members_table_client, album_members_table_client)
     ] + [
         lambda q=clustering_queue_client: q.create_queue(),
         lambda q=ipwork_queue_client: q.create_queue(),
@@ -1736,6 +1753,14 @@ def create_hash_index_table() -> None:
         pass
 
 
+def create_trash_index_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=TRASH_INDEX_TABLE)
+    except AzureError:
+        pass
+
+
 def create_filename_owners_table() -> None:
     try:
         svc = _ensure_table_service_client()
@@ -1869,17 +1894,39 @@ def _parse_capture_range_args() -> Tuple[Optional[datetime], Optional[datetime]]
     )
 
 
+_ENTITY_BATCH_KEYS = 15   # Table Storage allows at most 15 discrete comparisons in one filter
+
+
 def _get_metadata_entities(user_id: str, filenames: List[str], workers: int = 8) -> Dict[str, Optional[Dict]]:
-    """Fresh full metadata rows for one page of filenames, point-read in
-    parallel. The library-sized queries (search, list, filter) run against the
-    local SQLite database and only ever need this for the page they return."""
+    """Fresh full metadata rows for one page of filenames. The library-sized queries (search,
+    list, filter) run against the local SQLite database and only ever need this for the page
+    they return.
+
+    A 48-photo page used to cost 48 point reads (the dominant storage cost of every gallery page).
+    The names are now fetched 15 at a time with one ``RowKey eq .. or RowKey eq ..`` query each, in
+    parallel -- ~4 round trips. If a batched query fails, those names fall back to point reads."""
     names = list(dict.fromkeys(filenames))
     if not names:
         return {}
-    if len(names) == 1:
-        return {names[0]: _get_metadata_entity(user_id, names[0])}
-    with ThreadPoolExecutor(max_workers=min(workers, len(names))) as executor:
-        return dict(zip(names, executor.map(lambda name: _get_metadata_entity(user_id, name), names)))
+    if len(names) == 1 or metadata_table_client is None:
+        return {name: _get_metadata_entity(user_id, name) for name in names}
+    pk = _escape_odata(user_id)
+
+    def _fetch_batch(batch: List[str]) -> Dict[str, Optional[Dict]]:
+        clause = ' or '.join(f"RowKey eq '{_escape_odata(name)}'" for name in batch)
+        try:
+            rows = {str(r.get('RowKey') or ''): dict(r)
+                    for r in metadata_table_client.query_entities(f"PartitionKey eq '{pk}' and ({clause})")}
+            return {name: rows.get(name) for name in batch}
+        except Exception:
+            return {name: _get_metadata_entity(user_id, name) for name in batch}
+
+    batches = [names[i:i + _ENTITY_BATCH_KEYS] for i in range(0, len(names), _ENTITY_BATCH_KEYS)]
+    out: Dict[str, Optional[Dict]] = {}
+    with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
+        for part in executor.map(_fetch_batch, batches):
+            out.update(part)
+    return out
 
 
 def _open_library_db(user_id: str):
@@ -1888,8 +1935,11 @@ def _open_library_db(user_id: str):
     import search_db
     db = search_db.open_database(user_id)
     if db is None:
+        # Only a library that truly has no database is built. A failed download or a blip reading
+        # the manifest must not start a full rebuild (the caller just reports "warming").
         try:
-            _trigger_tools_index_rebuild(user_id)
+            if search_db.needs_build(user_id):
+                _trigger_tools_index_rebuild(user_id, reason='no-search-db')
         except Exception:
             pass
     return db
@@ -2051,11 +2101,8 @@ def _album_cover_thumbnail_url(user_id: str, filenames: List[str]) -> str:
 
 
 def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = None) -> Dict:
-    filenames = []
-    try:
-        filenames = json.loads(entity.get('filenames', '[]') or '[]')
-    except Exception:
-        filenames = []
+    table_backed = album_store.is_table_backed(entity)
+    filenames = [] if table_backed else album_store.read_filenames(entity)   # a big album is paged, never inlined
     is_public = _coerce_bool(entity.get('isPublic', False))
     token = entity.get('publicToken') or ''
     has_access_code = bool(str(entity.get('accessCode', '')).strip())
@@ -2074,8 +2121,9 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
     payload = {
         'id': entity.get('RowKey'),
         'name': entity.get('name', ''),
-        'photoCount': len(filenames),
+        'photoCount': album_store.count(entity),
         'filenames': filenames,
+        'membersPaged': table_backed,
         'isPublic': is_public and not is_expired,
         'publicUrl': public_url,
         'publicExpiresAt': entity.get('publicExpiresAt') or '',
@@ -2704,8 +2752,9 @@ def _cached_person_rows_for_user(user_id: str, *, with_embeddings: bool = True) 
         def _fetch_light() -> List[Dict]:
             try:
                 try:
-                    rows = person_table_client.query_entities(
-                        f"PartitionKey eq '{_escape_odata(user_id)}'", select=PERSON_LIGHT_COLUMNS)
+                    rows = list(table_scan.scan_partition(
+                        person_table_client.query_entities,
+                        f"PartitionKey eq '{_escape_odata(user_id)}'", select=PERSON_LIGHT_COLUMNS))
                 except TypeError:
                     rows = person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
                 return [{k: v for k, v in row.items() if k != 'repEmbedding'} for row in rows]
@@ -2881,6 +2930,68 @@ def _upsert_job_status(job_id: str, user_id: str, job_type: str, status: str, **
             jobs_table_client.upsert_entity({**entity, 'PartitionKey': user_id})
         except Exception:
             pass
+
+
+JOB_RETENTION_DAYS = int(os.getenv('JOB_RETENTION_DAYS', '14'))
+_JOB_SWEEP_INTERVAL_SECONDS = float(os.getenv('JOB_SWEEP_INTERVAL_SECONDS', '3600'))
+_JOB_SWEEP_LAST: Dict[str, float] = {}
+_JOB_SWEEP_LOCK = threading.Lock()
+_JOB_SWEEP_MAX_ROWS = 1000
+
+
+def _sweep_old_job_rows(user_id: str) -> int:
+    """Delete finished job rows older than JOB_RETENTION_DAYS from one partition.
+
+    The jobs table otherwise grows forever (one row per upload batch, clustering run, preview...),
+    and every per-user job query scales with it. In-flight rows are never touched. Returns how many
+    rows were removed; at most _JOB_SWEEP_MAX_ROWS per call so a big backlog drains over several."""
+    if jobs_table_client is None or JOB_RETENTION_DAYS <= 0:
+        return 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=JOB_RETENTION_DAYS)).isoformat()
+    removed = 0
+    try:
+        doomed = []
+        for row in jobs_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and updatedAt lt '{cutoff}'"
+        ):
+            if str(row.get('status') or '').lower() in {'queued', 'running'}:
+                continue
+            doomed.append({'PartitionKey': row['PartitionKey'], 'RowKey': row['RowKey']})
+            if len(doomed) >= _JOB_SWEEP_MAX_ROWS:
+                break
+        submit = getattr(jobs_table_client, 'submit_transaction', None)
+        for start in range(0, len(doomed), 100):
+            chunk = doomed[start:start + 100]
+            done = False
+            if submit is not None:
+                try:
+                    submit([('delete', entity) for entity in chunk])
+                    done = True
+                except Exception:
+                    done = False
+            if not done:
+                for entity in chunk:
+                    try:
+                        jobs_table_client.delete_entity(partition_key=entity['PartitionKey'], row_key=entity['RowKey'])
+                    except Exception:
+                        continue
+            removed += len(chunk)
+    except Exception:
+        app.logger.warning('Job row sweep failed for %s', user_id, exc_info=True)
+    if removed:
+        perf_instrumentation.log_event('job_sweep', user=user_id, removed=removed)
+    return removed
+
+
+def _maybe_sweep_old_job_rows(user_id: str) -> None:
+    """At most once per interval per user, in the background (never on the request thread)."""
+    now = time.monotonic()
+    with _JOB_SWEEP_LOCK:
+        last = _JOB_SWEEP_LAST.get(user_id)
+        if last is not None and now - last < _JOB_SWEEP_INTERVAL_SECONDS:
+            return
+        _JOB_SWEEP_LAST[user_id] = now
+    threading.Thread(target=_sweep_old_job_rows, args=(user_id,), name='job-sweep', daemon=True).start()
 
 
 def _get_job_row(partition_key: str, job_id: str) -> Optional[Dict]:
@@ -3623,14 +3734,22 @@ def _iter_metadata_rows_for_user(
         kwargs['select'] = select if include_deleted or 'processing_state' in select else [*select, 'processing_state']
     if PHOTO_TABLE_SCAN_PAGE_SIZE > 0:
         kwargs['results_per_page'] = PHOTO_TABLE_SCAN_PAGE_SIZE
-    try:
-        rows_iter = metadata_table_client.query_entities(query, **kwargs)
-    except TypeError:
-        kwargs.pop('results_per_page', None)
+    partition_filter = f"PartitionKey eq '{_escape_odata(user_id)}'"
+    if extra_filter:
+        partition_filter += f' and ({extra_filter})'
+
+    def _query(filter_str, **query_kwargs):
         try:
-            rows_iter = metadata_table_client.query_entities(query, **kwargs)
+            return metadata_table_client.query_entities(filter_str, **query_kwargs)
         except TypeError:
-            rows_iter = metadata_table_client.query_entities(query)
+            query_kwargs.pop('results_per_page', None)
+            try:
+                return metadata_table_client.query_entities(filter_str, **query_kwargs)
+            except TypeError:
+                return metadata_table_client.query_entities(filter_str)
+
+    # Several RowKey ranges are read at once, still in RowKey order (see table_scan.py).
+    rows_iter = table_scan.scan_partition(_query, partition_filter, **kwargs)
     scanned = 0
     for row in rows_iter:
         scanned += 1
@@ -4858,11 +4977,37 @@ def _filename_from_face(user_id: str, face_id: str) -> str:
         return ''
 
 
-def _filenames_for_face_ids(user_id: str, face_ids: List[str]) -> List[str]:
+def _io_pool_map(function, items, workers: int = 12) -> List:
+    """Ordered parallel map for storage round trips (a sequential loop over thousands of faces or
+    files is minutes of latency). Falls back to a plain loop for tiny inputs."""
+    items = list(items)
+    if len(items) <= 1:
+        return [function(item) for item in items]
+    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as executor:
+        return list(executor.map(function, items))
+
+
+def _filenames_for_face_ids(user_id: str, face_ids: List[str], summary: Optional[Dict[str, Dict]] = None) -> List[str]:
+    """Filenames of the given faces, in order, de-duplicated. The (cached) face summary map answers
+    most ids with no storage call; only ids it lacks are point-read, in parallel."""
+    ids = [str(f) for f in face_ids]
+    if summary is None:
+        summary = _load_user_face_summary_by_id(user_id) if ids else {}
+    resolved: Dict[str, str] = {}
+    missing = []
+    for face_id in ids:
+        row = summary.get(face_id)
+        if row is not None and row.get('filename'):
+            resolved[face_id] = str(row.get('filename'))
+        else:
+            missing.append(face_id)
+    if missing:
+        for face_id, name in zip(missing, _io_pool_map(lambda f: _filename_from_face(user_id, f), missing)):
+            resolved[face_id] = name
     filenames = []
     seen = set()
-    for face_id in face_ids:
-        filename = _filename_from_face(user_id, str(face_id))
+    for face_id in ids:
+        filename = resolved.get(face_id, '')
         if filename and filename not in seen:
             filenames.append(filename)
             seen.add(filename)
@@ -5135,14 +5280,8 @@ def _remove_filename_from_albums(user_id: str, filename: str) -> None:
     except Exception:
         rows = []
     for row in rows:
-        try:
-            filenames = json.loads(row.get('filenames', '[]') or '[]')
-        except Exception:
-            filenames = []
-        updated = [item for item in filenames if item != filename]
-        if updated == filenames:
+        if not album_store.remove(row, [filename]):
             continue
-        row['filenames'] = json.dumps(updated)
         try:
             albums_table_client.upsert_entity(row)
         except Exception:
@@ -6642,15 +6781,15 @@ def _rebuild_metadata_faces_for_filenames(
         if value and value not in seen:
             unique_filenames.append(value)
             seen.add(value)
-    results = [
-        _rebuild_metadata_faces_for_filename(
+    results = _io_pool_map(
+        lambda filename: _rebuild_metadata_faces_for_filename(
             user_id,
             filename,
             searchable_person_index=searchable_person_index,
             dry_run=dry_run,
-        )
-        for filename in unique_filenames
-    ]
+        ),
+        unique_filenames,
+    )
     return {
         'affectedFiles': len(unique_filenames),
         'updatedFiles': sum(1 for result in results if result.get('updated')),
@@ -7427,7 +7566,9 @@ def _load_user_face_summary_by_id(user_id: str) -> Dict[str, Dict]:
     def _fetch() -> List[Dict]:
         query = f"PartitionKey eq '{_escape_odata(user_id)}'"
         try:
-            return list(face_table_client.query_entities(query, select=FACE_SUMMARY_COLUMNS))
+            # A library can hold hundreds of thousands of faces; read the partition as several
+            # RowKey ranges at once (table_scan.py).
+            return list(table_scan.scan_partition(face_table_client.query_entities, query, select=FACE_SUMMARY_COLUMNS))
         except TypeError:
             try:
                 return list(face_table_client.query_entities(query))
@@ -7513,8 +7654,14 @@ def _compute_people_suggestions(
 ) -> List[Dict]:
     if person_table_client is None:
         return []
+    # Unnamed clusters are skipped below unless PEOPLE_SUGGEST_INCLUDE_UNNAMED, so only named
+    # people are read (with their embeddings). With tens of thousands of clusters, reading every
+    # row's embedding JSON here was both minutes of work and a memory spike on the extras app.
+    person_filter = f"PartitionKey eq '{_escape_odata(user_id)}'"
+    if not PEOPLE_SUGGEST_INCLUDE_UNNAMED:
+        person_filter += " and name ne ''"
     try:
-        rows = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        rows = list(table_scan.scan_partition(person_table_client.query_entities, person_filter))
     except Exception:
         return []
 
@@ -7963,10 +8110,7 @@ def _load_album_entity(user_id: str, album_id: str) -> Optional[Dict]:
 
 
 def _album_filenames(entity: Dict) -> List[str]:
-    try:
-        return json.loads(entity.get('filenames', '[]') or '[]')
-    except Exception:
-        return []
+    return album_store.all_names(entity)
 
 
 def _save_album_entity(entity: Dict) -> None:
@@ -8017,6 +8161,8 @@ def _hard_delete_album_now(user_id: str, album_id: str, existing: Optional[Dict]
     if existing is None:
         existing = _load_album_entity(user_id, album_id)
     try:
+        if existing:
+            album_store.delete_members(existing)
         albums_table_client.delete_entity(partition_key=user_id, row_key=album_id)
     except Exception:
         app.logger.warning('Album purge failed for %s/%s', user_id, album_id)
@@ -8093,8 +8239,9 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
         filename = row.get('RowKey')
         if not filename:
             continue
-        upload_dt = _metadata_upload_date(row)
-        capture_dt = _metadata_capture_date(row)
+        # Rows read from the local library database carry precomputed datetimes.
+        upload_dt = row.get('_upload_dt') or _metadata_upload_date(row)
+        capture_dt = row.get('_capture_dt') or _metadata_capture_date(row)
 
         if rule == 'location':
             city = str(row.get('locationCity') or '').strip()
@@ -8316,6 +8463,33 @@ class _TimelineSink:
         store_timeline_summary(self.user_id, self.accumulator.summary())
 
 
+def _finalize_library_summaries(user_id: str, db) -> None:
+    """Explore (places/things) and the timeline, computed from the library's finished database --
+    a local pass over its rows, no table scan. Run after a chunked first build and after each
+    compaction."""
+    accumulator = ExploreAccumulator()
+    for row in db.iter_smart_rows():
+        accumulator.add(row)
+    summary = accumulator.finalize(user_id)
+    store_explore_summary(user_id, {
+        'sourceVersion': datetime.now(timezone.utc).isoformat(),
+        'updatedAt': datetime.now(timezone.utc).isoformat(),
+        'places': summary.get('places', []),
+        'things': summary.get('things', []),
+    })
+    store_timeline_summary(user_id, db.timeline_summary())
+
+
+def _refresh_library_summaries(user_id: str) -> None:
+    import search_db
+    try:
+        db = search_db.open_database(user_id)
+        if db is not None:
+            _finalize_library_summaries(user_id, db)
+    except Exception:
+        worker_logger.exception('Library summaries refresh failed for %s', user_id)
+
+
 def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None):
     """The 'lexical' step of the index build, replacing the old full-snapshot
     refresh: ONE streaming pass over the table feeding the listing blob, the
@@ -8334,6 +8508,8 @@ def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None)
 
 
 storage_utils_module.LEXICAL_BUILD_HOOK = _streaming_lexical_build
+import library_build as _library_build_module
+_library_build_module.FINALIZE_HOOK = _finalize_library_summaries
 storage_utils_module.INDEX_BUILD_REQUEST_HOOK = lambda user_id: enqueue_index_build(user_id, reason='serving-process')
 
 
@@ -8629,14 +8805,21 @@ def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = Non
 
 
 def _load_photos_for_filenames(user_id: str, filenames: List[str]) -> List[Dict]:
+    """Photo summaries for ``filenames`` in the given order, trashed/missing ones skipped.
+
+    Rows are read in batches (``RowKey eq .. or ..``, 15 per query, in parallel) and summarised in
+    one pass -- this used to be one sequential point read per photo, so opening a 1,000-photo album
+    was ~1,000 round trips."""
+    names = [str(n) for n in filenames]
+    if not names:
+        return []
     pid_to_name, _ = _load_people_name_index(user_id)
-    photos = []
-    for name in filenames:
-        metadata = _get_metadata_entity(user_id, name)
-        if metadata is None or metadata.get('processing_state') == 'deleted':
-            continue
-        photos.append(_build_photo_summary(user_id, name, metadata, include_props=False, pid_to_name=pid_to_name))
-    return photos
+    fetched = _get_metadata_entities(user_id, names)
+    items = [
+        (name, fetched[name]) for name in names
+        if isinstance(fetched.get(name), dict) and fetched[name].get('processing_state') != 'deleted'
+    ]
+    return _build_photo_summaries_page(user_id, items, pid_to_name)
 
 
 @app.after_request
@@ -9691,6 +9874,8 @@ def _index_build_job_id(user_id: str) -> str:
 
 INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS', '30'))
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
+# The people/albums rebuild reads every cluster and face, so repeated clustering runs coalesce harder.
+INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '600'))
 
 
 def _job_row_fresh_active(key: str, job_id: str) -> bool:
@@ -9754,14 +9939,15 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> 
     key = str(user_id or '').strip()
     if not key:
         return 'unavailable'
-    light = scope == 'light'
-    if _index_build_job_active(key):
+    scope = scope if scope in ('full', 'light', 'people') else 'full'
+    light = scope != 'full'
+    if not light and _index_build_job_active(key):
         return 'already_active'
     if library_ops_queue_client is None:
         return 'unavailable'
     # Light (post-upload sort/access refresh) uses its own job row so it never
     # masks or blocks a full build, and does not show as "library indexing".
-    job_id = _index_build_job_id(key) + ('-light' if light else '')
+    job_id = _index_build_job_id(key) + (f'-{scope}' if light else '')
     if light and _job_row_fresh_active(key, job_id):
         return 'already_active'
     # A build is a full streamed scan of the library, so an upload burst that
@@ -9774,7 +9960,8 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> 
         updated = _parse_iso_date(str(previous.get('updatedAt') or ''))
         if updated is not None:
             elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
-            delay = int(max(0, INDEX_BUILD_MIN_INTERVAL_SECONDS - elapsed))
+            minimum = INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS if scope == 'people' else INDEX_BUILD_MIN_INTERVAL_SECONDS
+            delay = int(max(0, minimum - elapsed))
     _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'queued')
     try:
         library_ops_queue_client.send_message(json.dumps(
@@ -9834,11 +10021,38 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     try:
         with perf_instrumentation.scope(f'index.build.{scope}', user=user_id, job=job_id):
             storage_utils_ensure_sort_current(user_id)  # schema upgrade (full rebuild if stale)
-            if scope == 'light':
-                prime_all_user_indexes_sequentially(user_id, wait=True, kinds=('sort', 'access'))
+            if scope in ('light', 'people'):
+                # Incremental maintenance: cost follows what changed, not library size.
+                kinds = ('sort', 'access') if scope == 'light' else ('people', 'albums')
+                prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                outcome = refresh_user_search_db_incremental(user_id)
+                perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, **{
+                    k: v for k, v in outcome.items() if isinstance(v, (int, str))})
+                if outcome.get('status') == 'needs_full':
+                    # Too much has changed / the log is long: fold it into a fresh base. This reads the
+                    # worker's local database, never the table, so it stays cheap at any library size.
+                    import search_db
+                    if search_db.compact_database(user_id):
+                        _refresh_library_summaries(user_id)
+                    refresh_user_search_db_incremental(user_id)   # catch up whatever changed meanwhile
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
             else:
-                prime_all_user_indexes_sequentially(user_id, on_progress=_index_build_progress_callback(user_id), wait=True)
+                # Full scope = a library with no usable database (new, or a schema upgrade). The
+                # chunked, resumable build makes the search/sort/access indexes in ONE scan; the
+                # remaining kinds are the small ones.
+                import library_build
+                callback = _index_build_progress_callback(user_id)
+                if library_build.bootstrap_needed(user_id):
+                    def _bootstrap_progress(progress: dict) -> None:
+                        _upsert_job_status(
+                            job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running',
+                            result={'indexes': get_user_index_readiness(user_id), 'ready': False, 'bootstrap': progress,
+                                    'elapsedSeconds': int(time.monotonic() - started)})
+                    built = library_build.bootstrap_library_build(user_id, on_progress=_bootstrap_progress)
+                    if built.get('status') == 'conflict':
+                        raise RuntimeError('library build lost a race with another writer; retrying')
+                prime_all_user_indexes_sequentially(
+                    user_id, on_progress=callback, wait=True, kinds=('sort', 'access', 'albums', 'people'))
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')
@@ -9882,7 +10096,9 @@ def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
     if jobs_table_client is None:
         return None
     try:
-        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        rows = list(jobs_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and (status eq 'queued' or status eq 'running')"
+        ))
     except Exception:
         return None
     for row in rows:
@@ -10227,21 +10443,18 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
     except Exception:
         face_ids = []
 
-    filenames = set()
-    faces_updated = 0
-    for face_id in face_ids:
+    def _release_face(face_id):
+        """Returns the face's filename (or '') when the face was released."""
         try:
             face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
             filename = face.get('filename')
-            if filename:
-                filenames.add(filename)
             if face.get('personId') == person_id:
                 face.pop('personId', None)
             face.pop('confirmedByUser', None)
             # Deleting a cluster is explicit user intent to stop tracking these
             # faces. Without marking them rejected, they're simply "unclustered"
             # and the next upload's auto-cluster pass (or a manual recluster)
-            # regroups them by embedding similarity — silently resurrecting the
+            # regroups them by embedding similarity -- silently resurrecting the
             # deleted cluster under a new personId. Reuse the existing
             # rejected/reviewStatus mechanism (already respected by
             # _face_is_clusterable) so released faces stay out of clustering
@@ -10257,13 +10470,22 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
             # popped fields server-side since `face` is the full entity we
             # just fetched, not a partial payload.
             face_table_client.upsert_entity(face, mode=UpdateMode.REPLACE)
-            faces_updated += 1
+            return str(filename or '') or True
         except Exception:
+            return None
+
+    filenames = set()
+    faces_updated = 0
+    # One round trip per face used to run strictly one after another; clusters hold up to thousands.
+    for outcome in _io_pool_map(_release_face, face_ids, workers=12):
+        if outcome is None:
             continue
+        faces_updated += 1
+        if isinstance(outcome, str) and outcome:
+            filenames.add(outcome)
     try:
         person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
-        for face_id in face_ids:
-            _remove_person_member(person_id, face_id)
+        _io_pool_map(lambda fid: _remove_person_member(person_id, fid), face_ids, workers=12)
     except Exception:
         pass
     if rebuild_metadata:
@@ -10271,7 +10493,9 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
     return {'deleted': True, 'facesUpdated': faces_updated, 'filenames': sorted(filenames)}
 
 
-def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Optional[Dict]:
+def _merge_persons_core(
+    user_id: str, person_id: str, merge_ids: List, *, face_summary: Optional[Dict[str, Dict]] = None,
+) -> Optional[Dict]:
     """Reassign faces from ``merge_ids`` into ``person_id`` and delete the source
     person rows. Returns ``{'mergeId': ...}``, or ``None`` if the base person
     doesn't exist.
@@ -10355,21 +10579,18 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
     external_removals: List[Tuple[str, str]] = []
 
     owner_face_ids_by_person: Dict[str, set] = {}
+    face_snapshot: Dict[str, Dict] = {}
     if face_table_client is not None:
-        try:
-            # select= excludes 'embedding' -- only RowKey/personId are read
-            # here, for membership bookkeeping. The actual mutated-and-upserted
-            # face_ent below is a separate, fresh get_entity() per face_id, not
-            # this scan's rows, so dropping embedding here is safe.
-            all_face_rows = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'", select=FACE_SUMMARY_COLUMNS))
-        except Exception:
-            all_face_rows = []
-        for face_row in all_face_rows:
-            fid = str(face_row.get('RowKey') or '')
+        # The shared cached face summary (one scan per cache window, however many merges run --
+        # a 50-pair batch used to do 50 full-table scans) supplies who owns which face. Only
+        # RowKey/personId are read here; each face is re-read fresh below before it is changed.
+        # A caller merging several pairs passes one snapshot: each merge's own face writes
+        # invalidate the shared cache, so without it every pair would rescan the table.
+        face_snapshot = face_summary if face_summary is not None else _load_user_face_summary_by_id(user_id)
+        for fid, face_row in face_snapshot.items():
             owner = str(face_row.get('personId') or '')
-            if not fid or owner not in merge_id_set:
-                continue
-            owner_face_ids_by_person.setdefault(owner, set()).add(fid)
+            if fid and owner in merge_id_set:
+                owner_face_ids_by_person.setdefault(owner, set()).add(fid)
 
     # Captured per source person before its row is deleted below, so the old
     # (mid, faceId) membership rows can be cleared once the merge actually
@@ -10393,13 +10614,23 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
             *sorted(owner_face_ids_by_person.get(str(mid), set())),
         ]))
         mid_face_ids_before_delete[str(mid)] = merged_face_ids
-        for fid in merged_face_ids:
+
+    # Fresh read of every face being moved, fanned out (this was one sequential round trip per face).
+    def _read_face(fid: str):
+        try:
+            return fid, face_table_client.get_entity(partition_key=user_id, row_key=fid)
+        except Exception:
+            return fid, None
+
+    ordered_fids = list(dict.fromkeys(str(f) for ids in mid_face_ids_before_delete.values() for f in ids))
+    fresh_faces = dict(_io_pool_map(_read_face, ordered_fids, workers=16))
+    for mid in merge_ids:
+        for fid in mid_face_ids_before_delete.get(str(mid), []):
             fid = str(fid)
             if fid in face_updates:
                 continue
-            try:
-                face_ent = face_table_client.get_entity(partition_key=user_id, row_key=fid)
-            except Exception:
+            face_ent = fresh_faces.get(fid)
+            if face_ent is None:
                 continue
             if _face_is_rejected(face_ent):
                 continue
@@ -10425,16 +10656,15 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
         _remove_face_from_person(user_id, owner_id, fid)
 
     _batch_upsert_entities(face_table_client, list(face_updates.values()))
-    for fid in face_updates:
-        _add_person_member(user_id, person_id, fid)
+    _io_pool_map(lambda fid: _add_person_member(user_id, person_id, fid), list(face_updates), workers=16)
 
     for mid in merge_ids:
         try:
             person_table_client.delete_entity(partition_key=user_id, row_key=mid)
-            for fid in mid_face_ids_before_delete.get(str(mid), []):
-                _remove_person_member(str(mid), fid)
         except Exception:
-            pass
+            continue
+        _io_pool_map(lambda fid, _m=str(mid): _remove_person_member(_m, fid),
+                     mid_face_ids_before_delete.get(str(mid), []), workers=16)
 
     base_name = str(base.get('name') or '').strip()
     if _is_unnamed_name(base_name):
@@ -10459,7 +10689,10 @@ def _merge_persons_core(user_id: str, person_id: str, merge_ids: List) -> Option
         'faceIds': json.dumps(list(base_face_ids)),
     })
     _update_person_rep_embedding(user_id, person_id)
-    _rebuild_metadata_faces_for_filenames(user_id, _filenames_for_face_ids(user_id, list(base_face_ids)))
+    _rebuild_metadata_faces_for_filenames(
+        user_id,
+        _filenames_for_face_ids(user_id, list(base_face_ids), summary={**face_snapshot, **face_updates}),
+    )
 
     # Finalise the restore record written before the destructive phase: same
     # RowKey (merge_id), now carrying the real faceMap so undo can revert face
@@ -11627,6 +11860,77 @@ def _compute_trash_purge_at(deleted_at: str, retention_days: int = TRASH_RETENTI
     return (parsed + timedelta(days=retention_days)).isoformat()
 
 
+# --- trash index -------------------------------------------------------------------------
+_TRASH_INDEX_INIT_KEY = '__init__'
+
+
+def _trash_index_add(user_id: str, filename: str, deleted_at: str) -> None:
+    if trash_index_table_client is None:
+        return
+    try:
+        trash_index_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, 'deletedAt': deleted_at})
+    except Exception:
+        app.logger.warning('Trash index add failed for %s', filename, exc_info=True)
+
+
+def _trash_index_remove(user_id: str, filenames: List[str]) -> None:
+    if trash_index_table_client is None:
+        return
+    for name in filenames:
+        try:
+            trash_index_table_client.delete_entity(partition_key=user_id, row_key=name)
+        except Exception:
+            pass  # absent (never indexed) or already gone
+
+
+def _trash_index_entries(user_id: str) -> List[Dict]:
+    """[{RowKey, deletedAt}] for every photo in trash, newest first.
+
+    Read from the small trash index. The first call for a library (no init marker) builds the index
+    with ONE scan of the metadata table (the slow filter the index exists to avoid), so every later
+    call is a query over just the trashed rows. Entries can briefly outlive a purge; the listing
+    prunes them when it reads the page. Without a trash index table, the scan is used directly."""
+    def _scan() -> List[Dict]:
+        return [
+            {'RowKey': str(row.get('RowKey') or ''), 'deletedAt': str(row.get('deletedAt') or '')}
+            for row in _iter_metadata_rows_for_user(
+                user_id, select=['RowKey', 'deletedAt', 'processing_state'], include_deleted=True,
+                extra_filter="processing_state eq 'deleted'", purpose='trash.index_backfill',
+            ) if row.get('RowKey')
+        ]
+
+    entries: List[Dict]
+    if trash_index_table_client is None:
+        entries = _scan()
+    else:
+        try:
+            trash_index_table_client.get_entity(partition_key=user_id, row_key=_TRASH_INDEX_INIT_KEY)
+            initialised = True
+        except Exception:
+            initialised = False
+        if not initialised:
+            entries = _scan()
+            try:
+                for entry in entries:
+                    trash_index_table_client.upsert_entity(
+                        {'PartitionKey': user_id, 'RowKey': entry['RowKey'], 'deletedAt': entry['deletedAt']})
+                trash_index_table_client.upsert_entity({
+                    'PartitionKey': user_id, 'RowKey': _TRASH_INDEX_INIT_KEY,
+                    'deletedAt': datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                app.logger.warning('Trash index backfill failed for %s', user_id, exc_info=True)
+        else:
+            entries = [
+                {'RowKey': str(row.get('RowKey') or ''), 'deletedAt': str(row.get('deletedAt') or '')}
+                for row in trash_index_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
+                if row.get('RowKey') and row.get('RowKey') != _TRASH_INDEX_INIT_KEY
+            ]
+    entries.sort(key=lambda e: e['deletedAt'], reverse=True)
+    return entries
+
+
+
 def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[Dict[str, Any]]:
     """Soft-delete a photo row in place: flips it to the trash state every
     read path already guards against (processing_state == 'deleted'), stamps
@@ -11657,6 +11961,7 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
     entity['processing_lease_expires_at'] = ''
     entity['last_processing_update'] = now_iso
     metadata_table_client.upsert_entity(entity)
+    _trash_index_add(user_id, filename, now_iso)
     return entity
 
 
@@ -11684,7 +11989,33 @@ def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any
         entity[status_field] = pre_delete_statuses.get(status_field, 'pending')
     entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
     metadata_table_client.upsert_entity(entity)
+    _trash_index_remove(user_id, [filename])
     return entity
+
+
+def _strip_deleted_people_from_photos(user_id: str, person_ids: set, skip_names: set) -> None:
+    """Remove ``person_ids`` from the peopleIds of every surviving photo (streamed scan)."""
+    try:
+        for row in _iter_metadata_rows_for_user(
+            user_id, select=['PartitionKey', 'RowKey', 'peopleIds'], purpose='photos.hard_delete_person_cleanup',
+        ):
+            name = str(row.get('RowKey') or '')
+            if name in skip_names:
+                continue
+            try:
+                pids = json.loads(row.get('peopleIds', '[]') or '[]')
+            except Exception:
+                continue
+            next_pids = [pid for pid in pids if pid not in person_ids]
+            if len(next_pids) == len(pids):
+                continue
+            row['peopleIds'] = json.dumps(next_pids)
+            try:
+                metadata_table_client.upsert_entity(row)
+            except Exception:
+                pass
+    except Exception:
+        app.logger.warning('Deleted-people cleanup failed for %s', user_id, exc_info=True)
 
 
 def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[str], List[str]]:
@@ -11791,30 +12122,15 @@ def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[st
         app.logger.warning('Batch album cleanup failed for %s: %s', user_id, exc)
 
     if deleted_person_ids and metadata_table_client is not None:
-        try:
-            surviving_rows = _query_metadata_rows_for_user(
-                user_id, select=['PartitionKey', 'RowKey', 'peopleIds'], purpose='photos.hard_delete_person_cleanup',
-            )
-        except Exception:
-            surviving_rows = []
-        for row in surviving_rows:
-            name = str(row.get('RowKey') or '')
-            if name in deleted_names_set:
-                continue
-            try:
-                pids = json.loads(row.get('peopleIds', '[]') or '[]')
-            except Exception:
-                continue
-            next_pids = [pid for pid in pids if pid not in deleted_person_ids]
-            if len(next_pids) == len(pids):
-                continue
-            row['peopleIds'] = json.dumps(next_pids)
-            try:
-                metadata_table_client.upsert_entity(row)
-            except Exception:
-                pass
+        # Defensive cleanup of stale peopleIds on surviving photos. It needs a whole-library read,
+        # so it runs in the background (streamed, never listed) instead of holding this request.
+        threading.Thread(
+            target=_strip_deleted_people_from_photos, args=(user_id, set(deleted_person_ids), set(deleted_names_set)),
+            name='strip-deleted-people', daemon=True,
+        ).start()
 
     if deleted:
+        _trash_index_remove(user_id, deleted)
         _invalidate_metadata_scan_cache(user_id)
         try:
             touch_user_search_indexes_state(user_id, filenames=deleted)
@@ -12216,7 +12532,15 @@ def _batch_remove_faces_for_filenames(user_id: str, names_set: set) -> set:
         # Reconcile shadows BEFORE deleting source rows. A failed operation
         # leaves source rows discoverable for a retry under a dirty generation.
         if removed_face_ids and person_table_client is not None:
-            people = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+            # Only faceIds/name are needed to reconcile (and upsert_entity merges just these columns);
+            # without a projection every cluster's repEmbedding came along -- gigabytes at tens of
+            # thousands of clusters.
+            try:
+                people = list(table_scan.scan_partition(
+                    person_table_client.query_entities, f"PartitionKey eq '{_escape_odata(user_id)}'",
+                    select=PERSON_LIGHT_COLUMNS))
+            except TypeError:
+                people = list(person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
             _renew_face_filename_mutations(user_id, generations)
             for person in people:
                 person_id = str(person.get('RowKey') or '')
@@ -12333,14 +12657,8 @@ def _batch_remove_filenames_from_albums(user_id: str, names_set: set) -> None:
     except Exception:
         return
     for row in rows:
-        try:
-            filenames = json.loads(row.get('filenames', '[]') or '[]')
-        except Exception:
+        if not album_store.remove(row, list(names_set)):
             continue
-        updated = [item for item in filenames if item not in names_set]
-        if len(updated) == len(filenames):
-            continue
-        row['filenames'] = json.dumps(updated)
         try:
             albums_table_client.upsert_entity(row)
         except Exception:
@@ -12889,7 +13207,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         # A clustering run changes people/albums; this (not an upload) is what
         # makes the heavy indexes worth rebuilding.
         try:
-            _trigger_tools_index_rebuild(user_id, reason='clustering-run', scope='full')
+            _trigger_tools_index_rebuild(user_id, reason='clustering-run', scope='people')
         except Exception:
             worker_logger.exception('Post-clustering index rebuild trigger failed for %s', user_id)
 
@@ -13998,11 +14316,12 @@ def _trigger_tools_index_rebuild(user_id: str, reason: str = 'trigger', scope: s
     if not key or (not tools_url and library_ops_queue_client is None):
         return
     now = time.monotonic()
+    cooldown_key = f'{key}|{scope}'   # a light trigger must not swallow a people/full one
     with _TOOLS_REBUILD_TRIGGER_LOCK:
-        last = _TOOLS_REBUILD_TRIGGER_LAST.get(key)
+        last = _TOOLS_REBUILD_TRIGGER_LAST.get(cooldown_key)
         if last is not None and (now - last) < _TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS:
             return
-        _TOOLS_REBUILD_TRIGGER_LAST[key] = now
+        _TOOLS_REBUILD_TRIGGER_LAST[cooldown_key] = now
     # Preferred: queue the build on the worker (see enqueue_index_build). The
     # tools HTTP path below is only the fallback when no queue is configured.
     if library_ops_queue_client is not None:
@@ -14455,7 +14774,7 @@ def _remove_file_quietly(path: str) -> None:
 
 
 # Guard other optional startup helpers to avoid import-time failures
-for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_face_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table'):
+for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_face_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table', 'create_trash_index_table'):
     if _fn in globals() and callable(globals().get(_fn)):
         try:
             globals().get(_fn)()

@@ -74,3 +74,18 @@ def _tests_run_as_an_index_build_role(monkeypatch):
     pretend to be a build role by default; tests/test_index_build_guard.py flips
     it off to pin the serving-process behaviour."""
     monkeypatch.setattr(storage_utils, '_ROLE_MAY_BUILD_INDEXES', True)
+
+
+@pytest.fixture(autouse=True)
+def _sequential_table_scans_by_default(monkeypatch):
+    """Table fakes in most tests only understand the plain partition filter; the parallel
+    RowKey-range scan is covered by tests/test_table_scan.py (explicit workers=)."""
+    import table_scan
+    monkeypatch.setattr(table_scan, 'PARALLELISM', 1)
+
+
+@pytest.fixture(autouse=True)
+def _no_manifest_cache_in_tests(monkeypatch):
+    """Tests publish new manifests and expect the next read to see them."""
+    import search_db
+    monkeypatch.setattr(search_db, 'MANIFEST_TTL_SECONDS', 0)

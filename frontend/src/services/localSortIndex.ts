@@ -24,7 +24,13 @@ export interface SortIndexRow {
     thumb?: string;
 }
 
+/** True once the server said this library is too big for a client-side sort index (it pages instead). */
+let serverPaged = false;
+export const isServerPagedLibrary = (): boolean => serverPaged;
+
 interface SortIndexResponse {
+    reason?: string;
+    rowCount?: number;
     available: boolean;
     indexUrl?: string;
     sourceVersion?: string;
@@ -151,6 +157,10 @@ const fetchLocalSortIndex = async (key: string): Promise<SortIndexRow[] | null> 
     const manifestStarted = perfNow();
     const response: SortIndexResponse = await get('/api/photos/sort-index');
     perf.recordSpan('index.sort.manifest', perfNow() - manifestStarted);
+    if (response?.reason === 'library_too_large') {
+        serverPaged = true;      // nothing to download: the gallery pages from the server
+        return null;
+    }
     if (!response?.available || !response.indexUrl) {
         return null;
     }
@@ -203,6 +213,23 @@ export const getLocalSortIndex = async (): Promise<SortIndexRow[] | null> => {
 // invalidateLocalSearchIndex, so the next gallery load picks up newly-added
 // photos instead of serving a stale in-memory copy for the rest of the tab
 // session.
+// Filename -> thumbnail blob name for the loaded sort index, so any grid can build the same
+// container-token URL the gallery uses (one browser-cache entry per thumbnail, whichever page
+// shows it). Empty until the sort index is loaded.
+let thumbMap: Map<string, string> | null = null;
+let thumbMapSource: SortIndexRow[] | null = null;
+export const getCachedSortThumb = (filename: string): string => {
+    if (!cachedIndex) return '';
+    if (thumbMapSource !== cachedIndex || !thumbMap) {
+        thumbMap = new Map();
+        for (const row of cachedIndex) {
+            if (row.thumb) thumbMap.set(row.filename, row.thumb);
+        }
+        thumbMapSource = cachedIndex;
+    }
+    return thumbMap.get(filename) || '';
+};
+
 export const invalidateLocalSortIndex = (): void => {
     cachedIndex = null;
     cachedKey = null;

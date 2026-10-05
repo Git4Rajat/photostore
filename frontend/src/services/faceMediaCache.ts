@@ -1,6 +1,7 @@
 import { get, getExtras, resolveApiUrl } from './apiClient';
 import { isAuthEnabled } from './authClient';
 import { fetchProtectedBlobUrl } from './imageClient';
+import { faceCropUrlForId, getMediaToken } from './mediaToken';
 
 // The People page can mount 30-200+ face avatars at once (a full cluster grid,
 // or the unpaginated face-list view). Each one used to fire its own crop +
@@ -99,6 +100,17 @@ export const resolveFaceCropUrl = (faceId: string): Promise<string> => {
         return inFlight;
     }
     const promise = limitCrop(async () => {
+        // Direct storage URL from the face-crop token when the crop is already stored: no backend call.
+        const token = await getMediaToken();
+        const direct = token?.cover ? faceCropUrlForId(faceId, token) : '';
+        if (direct && await new Promise<boolean>((resolve) => {
+            const probe = new Image();
+            probe.onload = () => resolve(true);
+            probe.onerror = () => resolve(false);
+            probe.src = direct;
+        })) {
+            return direct;
+        }
         // people_bp -> the dedicated `extras` container app (2026-09-17).
         const result = await getExtras(`/api/faces/crop/${encodeURIComponent(faceId)}`);
         if (typeof result?.url !== 'string' || !result.url) {

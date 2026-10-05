@@ -18,7 +18,8 @@ export interface AlbumIndexRow {
     photoCount: number;
     coverFilename: string;
     updatedAt: string;
-    filenames: string[];
+    /** Not carried by the index any more (albums open from the server); present only in old cached copies. */
+    filenames?: string[];
     isPublic: boolean;
     publicUrl: string;
     publicExpiresAt: string;

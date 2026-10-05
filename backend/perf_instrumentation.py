@@ -20,6 +20,7 @@ import concurrent.futures
 import contextvars
 import logging
 import os
+import hashlib
 import re
 import threading
 import time
@@ -87,7 +88,7 @@ def _io_kind(host: str) -> str:
 
 def _op_label(kind: str, method: str, path: str) -> str:
     """Stable, low-cardinality label: container/table + verb, ids collapsed."""
-    parts = [p for p in path.split('/') if p]
+    parts = [p for p in path.split('?', 1)[0].split('/') if p]
     head = parts[0] if parts else ''
     head = re.sub(r"\(.*\)$", '(..)', head)          # Tables(PartitionKey='x',RowKey='y')
     head = _UUIDISH.sub('{id}', head)
@@ -249,7 +250,13 @@ def install_storage_tracing() -> None:
             try:
                 from urllib.parse import urlsplit
                 parts = urlsplit(request.url)
-                record_io(_io_kind(parts.hostname or ''), str(request.method or 'GET').upper(), parts.path,
+                # Table queries all share one path (/table()); the OData $filter/$select is what
+                # distinguishes them. Fold a short hash of the query into the duplicate key so a
+                # repeat means the *same* query, not just the same table.
+                path = parts.path
+                if parts.query and '$filter' in parts.query:
+                    path = f'{path}?q={hashlib.sha1(parts.query.encode()).hexdigest()[:8]}'
+                record_io(_io_kind(parts.hostname or ''), str(request.method or 'GET').upper(), path,
                           status, (time.perf_counter() - start) * 1000, nbytes)
             except Exception:
                 pass

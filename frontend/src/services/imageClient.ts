@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { resolveApiUrl } from './apiClient';
 import { getAccessToken, isAuthEnabled } from './authClient';
+import { faceCropUrlForId, faceIdFromCropPath, getMediaToken } from './mediaToken';
 
 const DEFAULT_MAX_PROTECTED_IMAGE_REQUESTS = 4;
 
@@ -153,9 +154,19 @@ export const useProtectedBlobUrls = (paths: string[], maxConcurrent = DEFAULT_MA
     const scopedPaths = uniquePaths.filter((path) => !directPaths.includes(path));
     let cursor = 0;
 
+    // Face avatars: with the face-crop token the browser builds each crop's storage URL itself, so a
+    // grid of hundreds of avatars costs no backend calls. A crop that isn't in storage yet fails to
+    // load and takes the old per-face path below (which also generates it).
+    const facePaths = scopedPaths.filter((path) => faceIdFromCropPath(path) !== null);
+    const queue = scopedPaths.filter((path) => faceIdFromCropPath(path) === null);
+    const startWorkers = () => {
+      const workerCount = Math.min(Math.max(1, maxConcurrent), queue.length - cursor);
+      if (workerCount > 0) void Promise.all(Array.from({ length: workerCount }, () => loadNext()));
+    };
+
     const loadNext = async () => {
-      while (active && cursor < scopedPaths.length) {
-        const path = scopedPaths[cursor];
+      while (active && cursor < queue.length) {
+        const path = queue[cursor];
         cursor += 1;
         if (!path || urlsRef.current[path]) {
           continue;
@@ -186,8 +197,39 @@ export const useProtectedBlobUrls = (paths: string[], maxConcurrent = DEFAULT_MA
       }
     };
 
-    const workerCount = Math.min(Math.max(1, maxConcurrent), scopedPaths.length);
-    void Promise.all(Array.from({ length: workerCount }, () => loadNext()));
+    const resolveFaces = async () => {
+      const token = facePaths.length ? await getMediaToken() : null;
+      if (!active) return;
+      if (!token?.cover) {
+        queue.push(...facePaths);
+        startWorkers();
+        return;
+      }
+      await Promise.all(facePaths.map((path) => new Promise<void>((resolve) => {
+        const direct = faceCropUrlForId(faceIdFromCropPath(path) ?? '', token);
+        const probe = new Image();
+        probe.onload = () => {
+          if (active) {
+            setUrls((prev) => {
+              if (prev[path]) return prev;
+              const next = { ...prev, [path]: direct };
+              urlsRef.current = next;
+              return next;
+            });
+          }
+          resolve();
+        };
+        probe.onerror = () => {
+          queue.push(path);   // not warmed yet: generate it through the backend
+          resolve();
+        };
+        probe.src = direct;
+      })));
+      if (active) startWorkers();
+    };
+
+    startWorkers();
+    void resolveFaces();
 
     return () => {
       active = false;

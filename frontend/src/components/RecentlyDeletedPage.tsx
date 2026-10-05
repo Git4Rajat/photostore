@@ -40,10 +40,17 @@ const RecentlyDeletedPage: React.FC = () => {
         setLoading(true);
         setError(null);
         try {
-            const data = await get('/photos/trash?limit=200');
-            const fetched: TrashedPhoto[] = Array.isArray(data?.photos) ? data.photos : [];
+            const fetched: TrashedPhoto[] = [];
+            let reportedTotal = 0;
+            for (;;) {
+                const data = await get(`/photos/trash?limit=200&offset=${fetched.length}`);
+                const page: TrashedPhoto[] = Array.isArray(data?.photos) ? data.photos : [];
+                fetched.push(...page);
+                reportedTotal = Number(data?.total ?? fetched.length);
+                if (page.length < 200 || fetched.length >= reportedTotal) break;
+            }
             setPhotos(fetched);
-            setTotal(Number(data?.total ?? fetched.length));
+            setTotal(reportedTotal);
             resolveAccessForBatch(fetched);
         } catch (err) {
             setError(classifyApiError(err));

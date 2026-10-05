@@ -561,3 +561,28 @@ def test_streaming_merge_drops_deleted_and_appends_new_rows(sort_ctx):
     storage_utils.refresh_user_sort_index('lib-N', source_version='v2')
     rows = storage_utils._load_sort_index_blob('lib-N').rows
     assert [r['RowKey'] for r in rows] == ['a.jpg', 'c.jpg']
+
+
+def test_sort_index_route_tells_huge_libraries_to_page_from_the_server(monkeypatch):
+    from routes import photos
+    import app as app_module
+    monkeypatch.setattr(app_module, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app_module, 'get_index_manifest_summary',
+                        lambda uid, kind: {'source_version': 'v1', 'updated_at': 'v1', 'dirty': False, 'row_count': photos.SORT_INDEX_CLIENT_MAX_ROWS + 1})
+    monkeypatch.setattr(app_module, 'get_sort_index_blob_location', lambda uid: (_ for _ in ()).throw(AssertionError('no SAS for a huge library')))
+    with app_module.app.test_request_context('/api/photos/sort-index'):
+        payload = photos.photos_sort_index().get_json()
+    assert payload == {'available': False, 'reason': 'library_too_large', 'rowCount': photos.SORT_INDEX_CLIENT_MAX_ROWS + 1}
+
+
+def test_sort_index_route_still_serves_libraries_under_the_limit(monkeypatch):
+    from routes import photos
+    import app as app_module
+    monkeypatch.setattr(app_module, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app_module, 'get_index_manifest_summary',
+                        lambda uid, kind: {'source_version': 'v1', 'updated_at': 'v1', 'dirty': False, 'row_count': 5000})
+    monkeypatch.setattr(app_module, 'get_sort_index_blob_location', lambda uid: ('c', 'b'))
+    monkeypatch.setattr(app_module, '_create_stable_read_sas_url', lambda c, b: ('https://x/b?sig=1', 'later'))
+    with app_module.app.test_request_context('/api/photos/sort-index'):
+        payload = photos.photos_sort_index().get_json()
+    assert payload['available'] is True and payload['indexUrl'].startswith('https://x/')

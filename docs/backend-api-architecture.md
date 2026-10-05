@@ -445,3 +445,130 @@ Everything logs as `PERF event=...` lines (backend, worker, and the browser thro
 - Slow builds: `event=scope_summary name=index.build.*`, then drill into `event=step` and `event=stream_scan_split`.
 - Client versus server: join `client_req` and `request` on `rid`. `ms - serverMs` is network plus queueing.
 - Duplicate downloads: `event=client_dup`, grouped by `kind`.
+
+### 15.1 Fixes made from the first production PERF data
+
+- **Job status:** `/api/jobs/status` filters server-side (in-flight or recently updated). Finished rows older than `JOB_RETENTION_DAYS` (14) are swept in the background, at most hourly per user (`event=job_sweep`).
+- **Naming a person:** faces are confirmed with parallel reads and 100-row write transactions. Each step logs `event=step name=label.*`.
+- **Smart albums:** read from the library's local search database (`SearchDatabase.iter_smart_rows`) when a current one exists, and fall back to the table scan otherwise. Groups are the same as the table scan's, except tags: the database keeps only the high-confidence tags.
+- **Parallel partition scan (`table_scan.py`):** the library scan reads RowKey ranges concurrently and still returns rows in RowKey order. Hot prefixes (`IMG_...`) are split on the fly. Settings: `TABLE_SCAN_PARALLELISM` (default 4, 1 = off), `TABLE_SCAN_SPLIT_ROWS`, `TABLE_SCAN_QUEUE_ROWS`.
+  - `event=table_scan` logs rows, ranges and ms. Compare ms per 1000 rows with `TABLE_SCAN_PARALLELISM=1`.
+  - Azure documents a soft target of about 2,000 entities per second per partition, so expect a gain of up to roughly 2x. Watch for 503s on the table when raising the worker count.
+- **Thumbnails:** every grid builds its thumbnail URL from the sort index's blob name and the single container token. A thumbnail loaded on one page is then a browser-cache hit on the others. Album covers use the same path.
+- **Duplicate-call detection:** table queries are keyed by a hash of their `$filter`, so `dup_io` means the same query was repeated.
+- **Not changed:** `finalize-batch` still makes about 12 storage calls per file. That would need a batched finalize across files.
+
+### 15.2 Fixes from the browser smoke test
+
+- **Trash:** membership comes from a small trash index table (`TRASH_INDEX_TABLE`, default `phototrashindex`; PartitionKey = library, RowKey = filename). It is maintained on soft delete, restore and purge. Before this, "list trash" was a server-side filtered scan of the whole library, about 45 s at 130k photos even with an empty trash.
+  - The first call per library builds the index with one scan, then later calls are a query over only the trashed rows.
+  - The listing reads just the requested page fresh and prunes stale index entries.
+- **Gallery pages:** a page's rows are fetched 15 per query (`RowKey eq .. or ..`), in parallel, instead of one point read each. This is about 4 round trips instead of 48.
+- **People:** the face and person scans use the parallel scan. Merge suggestions read only named people instead of every cluster's embedding, which was both minutes of work and a memory risk on the extras app.
+- **Smoke script:** it now retries cold-start gateway errors, warms all three apps first and reports cold-start times separately. It decompresses blobs only when the bytes start with the gzip magic number. The earlier "Failed to fetch" on the index blobs and thumbnails was this script bug, not the app.
+
+### 15.3 Delete and merge paths, reviewed for the same patterns
+
+The smoke test did not call destructive routes. These were read for the patterns it exposed: full-table scans per call, one-at-a-time storage calls, and heavy work inside the request.
+
+| Route | Problem found | Change |
+| --- | --- | --- |
+| `POST /api/persons/<id>/merge` and `/merge/batch` | `_merge_persons_core` scanned the whole face table for every pair, so a 50-pair batch did 50 full scans. It also read every moved face one at a time. | One shared snapshot per batch, parallel face reads, and parallel member-row writes. |
+| `POST /api/persons/<id>/label` | Identity propagation, a full face-table scan, ran inline. | It is queued to the worker like merge, with the inline path only as a fallback. The response now carries `propagateJobId`. |
+| `POST /api/persons/merge/<id>/undo` | Sequential per-face reads and writes. | Parallel. |
+| `POST /api/persons/delete` and `/<id>/delete` | Per-face sequential reads and writes, and clusters deleted one after another. | Faces and clusters are released in parallel. |
+| `POST /api/photos/trash/purge` (hard delete) | Read every cluster's embeddings while reconciling people. It also scanned the whole library in the request to clean stale `peopleIds`. | Projected columns only, parallel scan, and the library-wide cleanup runs in a background thread. |
+| `POST /api/albums/<id>/photos/add` | One sequential point read per photo to check it exists. | Batched queries, about 4 round trips per 50 photos. |
+| `POST /api/photos/delete` and restore | Already parallel point reads and writes. | Trash-index update per photo only. |
+
+Known remaining cost: purge's job-row cleanup still reads the user's jobs partition. The retention sweep (§15.1) keeps that small.
+
+### 15.4 Incremental search database (no full rebuilds for normal change)
+
+A full library rebuild is minutes at 130k photos and does not scale to millions, so ordinary change is now applied as small **deltas**.
+
+- **Worker (`refresh_user_search_db_incremental`):** reads the changed filenames from the `lexical` dirty table and fetches just those rows (15 per query, in parallel). It publishes a delta blob `<key>-searchdelta-NNNNNN.json.gz` of upserted photos and removed filenames, then advances `deltaSeq` in the manifest with a compare-and-swap on its ETag. A concurrent full rebuild therefore cannot be overwritten. Large changes go out in chunks of 5000. A dirty-table outage reports `unavailable`; it is never read as "nothing changed".
+- **Replicas (`search_db.sync_deltas`):** `open_database` compares the manifest's `deltaSeq` with the local copy's `delta_seq` and applies the missing deltas in place, in one WAL transaction each, so readers never block. A joining replica downloads the base file once, then applies the deltas. An updated photo's old FTS entry is removed by re-deriving the exact indexed document. If a delta can't be fetched, the replica keeps serving what it has and retries on a later request.
+- **Compaction:** one full rebuild (`prime ... kinds=('lexical',)`) runs only when the delta log reaches `SEARCH_DB_DELTA_MAX_COUNT` (200), the deltas cover more than `SEARCH_DB_DELTA_MAX_ROW_FRACTION` (25%) of the base, or more than `SEARCH_DB_DELTA_MAX_NAMES` changed at once. A new base resets `deltaSeq` and deletes the old deltas.
+- **Timeline** is computed from the replica's database (`timeline_summary`, cached until the next delta), so it reflects new uploads immediately.
+- **Manifest reads** are cached for 5 s (`SEARCH_DB_MANIFEST_TTL_SECONDS`) instead of one storage call per request.
+
+Build scopes and triggers:
+
+| Scope | Runs | Triggered by |
+| --- | --- | --- |
+| `full` | everything | library never indexed, schema upgrade, compaction request |
+| `light` | sort + access indexes, then the database delta | ipworker queue drain / every 10k files, dirty sort/access observed, Workbench action |
+| `people` | people + albums indexes, then the database delta | a clustering, recluster or propagate job finishing |
+
+Each scope has its own job row and trigger cooldown. `light` and `people` touch different indexes, so ipworker and clustering do not repeat each other's work; whichever runs second finds the dirty set empty and its delta step is a no-op. `people` requests wait at least `INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS` (600) after the previous one.
+
+Still full-rebuild-only: the Explore places/things summary. Still O(library) per light build: the sort and access index files (streamed on the worker, but a million-photo sort index is too big for the browser either way).
+
+### 15.5 Indexing a 1M-photo library
+
+**Targets**
+
+| Target | How it is met |
+| --- | --- |
+| A first build can finish despite restarts, deploys and scale events | `library_build.bootstrap_library_build` is chunked and resumable. The cursor and the delta publish are one atomic manifest update, so a restart loses at most one chunk (20,000 photos). |
+| Search is usable long before the build ends | An empty base database is published first and every chunk is appended as a delta. Responses carry `indexPartial: true` until the build finishes. |
+| One table scan, not four | The same pass produces the search rows, the sort-index rows and the access-index rows (spooled per chunk, then assembled). Before this it was a scan for the sort index, another for access, another for search, and the listing blob had no consumer. |
+| Memory is bounded | O(chunk), about 20-40 MB. |
+| Disk is bounded and checked | The worker holds its local database copy plus one snapshot during compaction, and compaction refuses to start without enough free disk (2.5x the database + 64 MB). The spool is removed when the build ends. |
+| No repeated full rebuilds | Normal change is deltas (§15.4). Compaction folds the delta log into a new base from the worker's local copy and never reads the table. The scan build runs only for a library with no usable database (new, or a schema upgrade). |
+| The first build does not starve live traffic | `LIBRARY_BUILD_MAX_ROWS_PER_SECOND` throttles the scan (0 = unlimited, the default). |
+
+**Compatibility:** `deltaSeq` is global to a lineage; compaction changes the base's `sourceVersion` and `baseSeq` but not the lineage. Readiness (`search_db.is_current`) compares lineages, so a compaction does not make the library look "stale".
+
+**Summaries:** Explore and the timeline are recomputed from the finished database after a first build and after each compaction (`_finalize_library_summaries`), not from another scan.
+
+**Operating it:** PERF events `library_build_started|resumed|progress|done`, `searchdb_delta_published`, `searchdb_compacted` (queries 13-14 in `docs/perf-queries.kql`).
+
+**Known limits at 1M, not yet addressed**
+- **Backend disk:** each backend replica keeps a local copy of the library's database. The 0.5 vCPU backend has about 2 GiB of ephemeral disk and `SEARCH_DB_MAX_CACHE_MB` defaults to 1200. Read `sqlite_mb` from the `searchdb_built` / `searchdb_compact` log lines at 130k and multiply by 7.7. If the result is above about 1.5 GB, give the backend 1 vCPU (4 GiB ephemeral) and raise the cache budget.
+- **Browser sort index:** about 24 MB at 130k photos, so about 180 MB at 1M. The browser cannot download that; the gallery needs server-side paging first.
+- **People and albums indexes** still read every cluster and face for each build.
+- **Sort/access light builds** rewrite their whole file when something changes (a streamed disk pass, about a minute at 1M).
+
+**Measured on a synthetic 1,000,000-photo library** (one worker core, in-memory fake storage, so no network time): the chunked build took 410 s, throughput was flat at about 3,300 photos/s from the first chunk to the last (no super-linear step), peak RSS was 374 MB, and the finished database was 599 MB (75 MB gzipped), with the sort and access indexes at 7 MB and 6 MB gzipped. A search over the whole library took about 0.4 s. In production the table scan (about 1,000 photos/s per sequential read stream) is what dominates, so expect 15-20 minutes at 1M, resumable throughout. The scan was the only thing that was super-linear before. Gallery ordering now uses plain indexed column order, and the upload-time index was added: page 1 went from 124-380 ms to under 1 ms at 1M rows, and a 500k offset from 3.7 s to 1.2 s.
+
+### 15.6 Albums and the gallery at a million photos
+
+**Albums index** (schema `v2`)
+- Covers are chosen by SQL over the library database (`top_rated`), one lookup per album. Building the index no longer loads every photo's sort row into a dict, which was hundreds of MB at 1M photos.
+- The index no longer carries each album's filename list. Rows are `{albumId, name, photoCount, coverFilename, updatedAt, share fields}`, so the download grows with the number of albums, not their size.
+- `GET /api/albums/<id>` serves an album's contents from the server: photo rows are read in batches of 15 (it was one point read per photo) and `?offset=&limit=` returns a window (`total`, `hasMore`). The browser fetches the first 120 photos, shows them, and streams the rest.
+
+**Album size cap (a bug I found).** An album's photo list was one JSON string in a single Table property, which Azure caps at 64 KB, so an album could hold only about 1,500 photos and a larger write failed with a 400. This is likely why smart albums on a big library "didn't work". `album_store.py` now splits the list across `filenames`, `filenames_1` ... `filenames_13`, giving roughly 14,000-20,000 photos per album (about 784 KB of the 1 MB row limit), with the same single row, point read and transaction. Existing rows read back unchanged. An add beyond the limit returns 413 `album_too_large`. A smart album larger than the limit is trimmed to what fits, with a message.
+
+**Gallery paging.** The sort index is a JSON file of every photo, about 24 MB at 130k and about 180 MB at 1M, which a browser can't download and sort. `/api/photos/sort-index` now answers `{available: false, reason: 'library_too_large', rowCount}` above `SORT_INDEX_CLIENT_MAX_ROWS` (200,000), so the browser downloads nothing and does not retry, and the gallery pages from the server (`/api/photos?sort=capture&offset&limit&directMedia=1`).
+- A server page is one indexed SQL page over the library database plus four batched row reads, so it costs the same at 10k or 10M photos. Page size follows the screen.
+- For those libraries the sort index is no longer built, marked dirty or rewritten by light builds (`sort_index_skipped`). Readiness still holds, via a manifest with `skipped: true`.
+- Rating and like edits used to dirty only the sort index, so the search database's rating column went stale. They now also mark the photo for the next delta.
+
+### 15.7 No result caps: search, people, Workbench, trash
+
+The old 200-result limits are gone. Each list now pages, reports an exact total, and keeps the DOM small by infinite scroll.
+
+- **Search.** Ranking runs over a window of the best 4,000 candidates (cached 45s); pages are cut from that window. Matches beyond the window are appended newest-first, so every match is reachable exactly once. `total` is an exact SQL count, `rankedWindow` says how many are ranked, and the UI notes that later results are in date order.
+- **Thumbnails for 200K results.** One container-scoped media token covers every thumbnail. The page returns `directMedia` blob names, the browser builds URLs locally and only fetches the tiles that scroll into view. Result size affects paging and selection, not tokens.
+- **People.** `GET /people/<id>` pages (`offset`, `limit`, `total`, `hasMore`), best faces first, reading the cached face summary instead of the cluster.
+- **Workbench.** The grid lists from `/api/photos` (`sort=date|name`, `nameContains`, infinite scroll). "Select all (N)" asks the server for matching filenames with `idsOnly=1` (5,000 per call, up to 100,000 selected, with a note if more match), so selection does not depend on what has loaded. Deep-linked photos are pinned to the top.
+- **Trash.** The list pages through every trashed photo, 200 per request.
+- `lookup-batch` still takes at most 200 filenames per call; callers chunk, so it is a batch size rather than a result cap.
+
+### 15.8 People index refresh and big albums
+
+- **People index.** A refresh no longer reads every face. After the first full build, the manifest records `builtThrough` (start of the build minus 3 minutes). The next refresh queries only persons and faces written since then (`Timestamp ge ...`), re-derives just those clusters with point reads, drops clusters no longer in the person table (a key-only pass), and renumbers "Unnamed N". Clusters whose cover face was touched are re-derived too, which covers a face that moved without its old cluster's row being rewritten. A full build also runs at least every 24 hours (`PEOPLE_INDEX_FULL_REBUILD_HOURS`), so any drift is bounded. It falls back to the full build when the previous snapshot is missing or stale, the schema changed, or more than `PEOPLE_INDEX_INCREMENTAL_MAX_CHANGED` (3,000) clusters changed. Schema is now `v2`, so each library does one full build on first refresh after deploy.
+- **Albums over about 14,000 photos.** When an album's list no longer fits in its row it moves to the `photoalbummembers` table (PartitionKey = album id, RowKey = filename). The album row keeps `storage='table'` and `photoCount`. Small albums are unchanged. Add/remove touch only the changed rows (batches of 100), counts stay exact, `GET /albums/<id>` pages by walking RowKeys, and share-view membership checks are point reads. Table-backed albums list in filename order and their payload has `filenames: []` with `membersPaged: true`. The table is created at startup like the other tables. Without it, oversized albums still return `album_too_large`.
+
+### 15.9 People avatars: one token instead of one call per face
+
+`GET /api/photos/media-token` now also returns `cover: {baseUrl, sas, prefix}` for the face-crop container (prefix = first 16 hex of sha256(user id) + `/`). The browser builds each avatar URL as `{baseUrl}/{prefix}{faceId}.jpg?{sas}`, so a grid of hundreds of faces costs no extras calls. A crop that isn't stored yet (404) falls back to `/api/faces/crop/<id>`, which generates and stores it, so the next load is direct. The face-crop endpoint is unchanged. The token covers the whole container and has no list permission; crop names are content hashes, the same model as thumbnails. Tokens cached in browser storage before this change have no `cover` and are replaced on next load.
+
+### 15.10 People and album views load as you scroll
+
+- **People.** `GET /api/persons/page?offset&limit&q&ids` cuts a page (named clusters first, 120 by default, max 500) from the backend's cached people index, with `total`, `namedCount`, `unnamedCount` and `hasMore`. The People page loads the first page and fetches more as a sentinel scrolls into view, so the browser no longer downloads the whole people index at session start or renders it through a hand-rolled virtual grid. The merge picker uses `q` (server-side name search) and a deep link to a person outside the loaded pages uses `ids`. The older single-request roster is used only while the server's index is still building.
+- **Albums.** Opening an album loads one page (120 photos); further pages load as the grid scrolls. It used to stream every page back to back.
+- **Search** already paged on scroll (§15.7).

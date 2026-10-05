@@ -145,7 +145,7 @@ def list_albums():
     for row in rows:
         if app._coerce_bool(row.get('deleted')):
             continue
-        cover = app._album_cover_thumbnail_url(user_id, app._album_filenames(row))
+        cover = app._album_cover_thumbnail_url(user_id, app.album_store.sample(row, 50))
         albums.append(app._album_entity_to_payload(row, cover_thumbnail_url=cover))
     return app.jsonify({'albums': albums})
 
@@ -189,11 +189,23 @@ def get_album(album_id: str):
     entity = app._load_album_entity(user_id, album_id)
     if not entity or app._coerce_bool(entity.get('deleted')):
         return app.jsonify({'error': 'Album not found'}), 404
-    filenames = app._album_filenames(entity)
-    cover = app._album_cover_thumbnail_url(user_id, filenames)
+    cover = app._album_cover_thumbnail_url(user_id, app.album_store.sample(entity, 50))
     payload = app._album_entity_to_payload(entity, cover_thumbnail_url=cover)
-    photos = app._load_photos_for_filenames(user_id, payload.get('filenames', []))
-    return app.jsonify({'album': payload, 'photos': photos})
+    # Optional paging: ?offset=&limit= returns just that window of the album (in album order), so a
+    # big album opens on its first screenful instead of after every photo has been looked up.
+    # Without ``limit`` the whole album is returned, as before.
+    try:
+        offset = max(0, int(app.request.args.get('offset', 0)))
+        limit = int(app.request.args.get('limit', 0))
+    except ValueError:
+        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
+    app.g.direct_media = app.request.args.get('directMedia') in ('1', 'true')   # thumbnail blob names, no per-photo URLs
+    window, total = app.album_store.page(entity, offset, limit)
+    photos = app._load_photos_for_filenames(user_id, window)
+    response = {'album': payload, 'photos': photos, 'total': total, 'offset': offset}
+    if limit > 0:
+        response['hasMore'] = offset + limit < total
+    return app.jsonify(response)
 
 @albums_bp.route('/albums/<album_id>/photos/add', methods=['POST'])
 @albums_bp.route('/api/albums/<album_id>/photos/add', methods=['POST'])
@@ -211,22 +223,28 @@ def add_photos_to_album(album_id: str):
     if not isinstance(filenames, list):
         return app.jsonify({'error': 'filenames must be a list'}), 400
 
-    current = set(app._album_filenames(entity))
-    added = []
+    candidates = []
     errors = []
+    valid = []
     for filename in filenames:
         safe = app._validate_media_filename(str(filename))
         if not safe:
             errors.append(f'{filename}: Invalid filename')
-            continue
-        if not app._get_metadata_entity(user_id, safe):
+        else:
+            valid.append((filename, safe))
+    # Existence is checked for the whole selection in a few batched queries (it was one sequential
+    # point read per photo: minutes, and a request timeout, for a few thousand photos).
+    exists = app._get_metadata_entities(user_id, [safe for _, safe in valid])
+    for filename, safe in valid:
+        if not exists.get(safe):
             errors.append(f'{filename}: Not found')
             continue
-        if safe not in current:
-            current.add(safe)
-            added.append(safe)
+        candidates.append(safe)
 
-    entity['filenames'] = app.json.dumps(list(current))
+    try:
+        added = app.album_store.add(entity, candidates)
+    except app.album_store.AlbumTooLarge as exc:
+        return app.jsonify({'error': str(exc), 'code': 'album_too_large'}), 413
     entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
     app._save_album_entity(entity)
     return app.jsonify({'success': True, 'added': added, 'errors': errors, 'album': app._album_entity_to_payload(entity)})
@@ -247,14 +265,7 @@ def remove_photos_from_album(album_id: str):
     if not isinstance(filenames, list):
         return app.jsonify({'error': 'filenames must be a list'}), 400
 
-    current = set(app._album_filenames(entity))
-    removed = []
-    for filename in filenames:
-        if filename in current:
-            current.remove(filename)
-            removed.append(filename)
-
-    entity['filenames'] = app.json.dumps(list(current))
+    removed = app.album_store.remove(entity, [str(f) for f in filenames])
     entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
     app._save_album_entity(entity)
     return app.jsonify({'success': True, 'removed': removed, 'album': app._album_entity_to_payload(entity)})
@@ -371,14 +382,26 @@ def autocreate_albums():
             'rules': sorted(set(app.SMART_ALBUM_RULES.values())),
         }), 400
 
+    # Read the library from the local search database (disk) when this replica has a current
+    # one: grouping 130k photos straight off the table took ~200 s and held a web thread the
+    # whole time. Without a database yet, fall back to the streamed table scan.
+    import search_db
     try:
-        # Streamed, narrow projection: the rules loop over the rows once.
-        metadata_rows = app._iter_metadata_rows_for_user(
-            user_id, select=app.SMART_ALBUM_SELECT, purpose='albums.smart_create',
-        )
-    except Exception as exc:
-        app.app.logger.exception('Smart album metadata read failed')
-        return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
+        db = search_db.open_database(user_id)
+    except Exception:
+        app.app.logger.exception('Could not open the library database for smart albums')
+        db = None
+    if db is not None:
+        metadata_rows = db.iter_smart_rows()
+    else:
+        try:
+            # Streamed, narrow projection: the rules loop over the rows once.
+            metadata_rows = app._iter_metadata_rows_for_user(
+                user_id, select=app.SMART_ALBUM_SELECT, purpose='albums.smart_create',
+            )
+        except Exception as exc:
+            app.app.logger.exception('Smart album metadata read failed')
+            return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
 
     try:
         existing_rows = list(app.albums_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))
@@ -395,7 +418,7 @@ def autocreate_albums():
 
     for candidate in candidates:
         name = candidate.get('name') or ''
-        filenames = candidate.get('filenames') or []
+        filenames, truncated = list(candidate.get('filenames') or []), False
         if name in existing_names:
             continue
         album_id = str(app.uuid.uuid4())
@@ -404,7 +427,6 @@ def autocreate_albums():
             'PartitionKey': user_id,
             'RowKey': album_id,
             'name': name,
-            'filenames': app.json.dumps(filenames),
             'createdAt': now,
             'updatedAt': now,
             'isPublic': False,
@@ -412,13 +434,18 @@ def autocreate_albums():
             'publicExpiresAt': '',
             'accessCode': '',
         }
+        try:
+            app.album_store.set_all(entity, filenames)
+        except app.album_store.AlbumTooLarge:
+            filenames, truncated = app.album_store.fit(filenames)     # no members table: keep what fits
+            app.album_store.write_filenames(entity, filenames)
         app._save_album_entity(entity)
         payload = app._album_entity_to_payload(entity)
-        return app.jsonify({
-            'count': 1,
-            'rule': rule,
-            'album': payload,
-        })
+        response = {'count': 1, 'rule': rule, 'album': payload}
+        if truncated:
+            response['message'] = (f'This group is larger than one album can hold; the first {len(filenames)} '
+                                   'photos were added.')
+        return app.jsonify(response)
 
     return app.jsonify({
         'count': 0,

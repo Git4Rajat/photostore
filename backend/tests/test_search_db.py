@@ -229,9 +229,14 @@ def test_route_without_database_asks_tools_to_build_and_reports_it(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: None)
     nudged = []
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: nudged.append(uid))
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, **kw: nudged.append(uid))
+    monkeypatch.setattr(search_db, 'needs_build', lambda uid: True)
     payload = _search('dog')
     assert payload == {'photos': [], 'total': 0, 'searchIndexBuilding': True} and nudged == ['owner']
+    # a database that exists but could not be opened here (download blip) must not start a rebuild
+    nudged.clear()
+    monkeypatch.setattr(search_db, 'needs_build', lambda uid: False)
+    assert _search('dog')['searchIndexBuilding'] is True and nudged == []
 
 
 def test_route_never_loads_the_lexical_index_or_scans_the_table(monkeypatch, db):
@@ -246,3 +251,149 @@ def test_route_never_loads_the_lexical_index_or_scans_the_table(monkeypatch, db)
 def test_empty_query_short_circuits(monkeypatch):
     with app.app.test_request_context('/photos/search?q='):
         assert search_photos().get_json() == {'photos': [], 'total': 0}
+
+
+# --- smart albums read from the database, same groups as from the table ------------------
+
+def _group_view(candidates):
+    return {c['name']: sorted(c['filenames']) for c in candidates}
+
+
+@pytest.mark.parametrize('rule', ['recent-upload', 'event-window', 'location', 'person', 'tag-object'])
+def test_smart_album_groups_from_the_database_match_the_table_scan(tmp_path, monkeypatch, rule):
+    rows = [
+        {'RowKey': 'a.jpg', 'locationCity': 'Paris', 'locationCountry': 'France', 'uploadDate': '2020-05-01T10:00:00+00:00',
+         'peopleIds': json.dumps(['p1']), 'tags': json.dumps(['dog']), 'subjectTags': json.dumps(['dog']),
+         'exifData': json.dumps({'DateTimeOriginal': '2019:12:25 09:00:00'})},
+        {'RowKey': 'b.jpg', 'locationCity': 'Paris', 'locationCountry': 'France', 'uploadDate': '2020-05-01T11:00:00+00:00',
+         'peopleIds': json.dumps(['p1', 'p2']), 'tags': json.dumps(['dog', 'ball']), 'subjectTags': json.dumps(['dog']),
+         'exifData': json.dumps({'DateTimeOriginal': '2019:12:25 18:00:00'})},
+        {'RowKey': 'c.jpg', 'locationCity': 'Goa', 'uploadDate': '2021-02-03T00:00:00+00:00', 'tags': json.dumps(['beach'])},
+    ]
+    monkeypatch.setattr(app, '_smart_album_person_names', lambda uid: {'p1': 'Asha', 'p2': 'Ravi'})
+    path = str(tmp_path / 's.sqlite')
+    search_db.build_database(rows, path)
+    from_db = app._smart_album_candidates('u', rule, list(search_db.SearchDatabase(path).iter_smart_rows()))
+    from_table = app._smart_album_candidates('u', rule, rows)
+    assert _group_view(from_db) == _group_view(from_table)
+    assert [c['name'] for c in from_db] == [c['name'] for c in from_table]
+
+
+def test_gallery_order_puts_undated_photos_last_with_filename_ties(tmp_path):
+    rows = [
+        {'RowKey': 'b.jpg', 'uploadDate': '2020-01-01T00:00:00+00:00'},
+        {'RowKey': 'a.jpg', 'uploadDate': '2020-01-01T00:00:00+00:00'},          # same upload time as b -> filename order
+        {'RowKey': 'new.jpg', 'uploadDate': '2023-01-01T00:00:00+00:00'},
+        {'RowKey': 'nodate2.jpg'},
+        {'RowKey': 'nodate1.jpg'},
+    ]
+    path = str(tmp_path / 'o.sqlite')
+    search_db.build_database(rows, path)
+    db = search_db.SearchDatabase(path)
+    assert db.list_page(sort='date', limit=10)[0] == ['new.jpg', 'a.jpg', 'b.jpg', 'nodate1.jpg', 'nodate2.jpg']
+    assert db.list_page(sort='capture', limit=10)[0][-2:] == ['nodate1.jpg', 'nodate2.jpg']
+
+
+# --- paging through result sets bigger than the ranked window -------------------------------------
+
+@pytest.fixture
+def big_db(tmp_path):
+    rows = []
+    for i in range(300):
+        rows.append({
+            'RowKey': f'dog{i:04d}.jpg', 'tags': json.dumps(['dog']), 'subjectTags': json.dumps(['dog']),
+            'uploadDate': f'2020-{(i % 12) + 1:02d}-{(i % 27) + 1:02d}T10:00:00+00:00',
+            'exifData': json.dumps({'DateTimeOriginal': f'{2000 + i // 15}:03:04 10:00:00'}),   # 2000..2019, 15 per year
+            'peopleIds': json.dumps(['p1']) if i % 3 == 0 else '[]',
+        })
+    rows.append({'RowKey': 'cat.jpg', 'tags': json.dumps(['cat']), 'subjectTags': json.dumps(['cat'])})
+    path = str(tmp_path / 'big.sqlite')
+    search_db.build_database(rows, path)
+    return search_db.SearchDatabase(path)
+
+
+def _page(query, offset, limit):
+    with app.app.test_request_context(f'/photos/search?q={query}&offset={offset}&limit={limit}'):
+        response = search_photos()
+    return response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
+
+
+def test_every_result_beyond_the_window_is_reachable_exactly_once(monkeypatch, big_db):
+    from routes import photos
+    _route_ctx(monkeypatch, big_db)
+    monkeypatch.setattr(photos, 'SEARCH_WINDOW', 50)
+    photos._SEARCH_WINDOW_CACHE.clear()
+    seen, first = [], None
+    for offset in range(0, 320, 40):
+        payload = _page('dog', offset, 40)
+        first = first or payload
+        seen += [p['filename'] for p in payload['photos']]
+        assert payload['total'] == 300                                   # exact, not capped at the window
+        assert payload['hasMore'] is (offset + 40 < 300)
+    assert len(seen) == 300 and len(set(seen)) == 300                  # no duplicates, nothing skipped
+    assert first['rankedWindow'] == 50
+    window, tail = seen[:50], seen[50:]
+    assert not set(window) & set(tail)
+    tail_dates = [big_db._conn().execute('SELECT capture_ts FROM rows WHERE filename = ?', (n,)).fetchone()[0] for n in tail]
+    assert tail_dates == sorted(tail_dates, reverse=True)               # past the window: newest first
+
+
+def test_a_result_set_that_fits_the_window_is_not_counted_or_tailed(monkeypatch, big_db):
+    from routes import photos
+    _route_ctx(monkeypatch, big_db)
+    photos._SEARCH_WINDOW_CACHE.clear()
+    called = []
+    monkeypatch.setattr(big_db, 'count_matches', lambda *a, **k: called.append(1) or 0)
+    payload = _page('cat', 0, 10)
+    assert payload['total'] == 1 and 'rankedWindow' not in payload and called == []
+
+
+def test_tail_pages_keep_the_person_and_date_filters(monkeypatch, big_db):
+    from routes import photos
+    _route_ctx(monkeypatch, big_db)
+    monkeypatch.setattr(photos, 'SEARCH_WINDOW', 20)
+    photos._SEARCH_WINDOW_CACHE.clear()
+    everyone = []
+    for offset in range(0, 140, 35):
+        payload = _page('alice dog', offset, 35)
+        assert payload['total'] == 100                                   # only the 100 dog photos Alice is in
+        everyone += [p['filename'] for p in payload['photos']]
+    assert len(everyone) == 100 and all(int(n[3:7]) % 3 == 0 for n in everyone)
+    assert _page('dog 2005', 0, 100)['total'] == 15                     # the year narrows the tail too
+
+
+def test_page_size_is_bounded_but_depth_is_not(monkeypatch, big_db):
+    from routes import photos
+    _route_ctx(monkeypatch, big_db)
+    photos._SEARCH_WINDOW_CACHE.clear()
+    assert len(_page('dog', 0, 100000)['photos']) <= photos.SEARCH_MAX_PAGE
+    assert _page('dog', 5000, 40)['photos'] == []                       # past the end: empty, not an error
+
+
+# --- library listing for the Workbench: filename filter, name sort, ids-only paging ------------------
+
+def test_list_page_filters_by_filename_text_and_sorts_by_name(tmp_path):
+    rows = [{'RowKey': n, 'uploadDate': f'2020-01-0{i + 1}T00:00:00+00:00'} for i, n in enumerate(
+        ['IMG_100.jpg', 'beach_a.jpg', 'Beach_B.png', 'trip%1.jpg', 'a_b.jpg', 'axb.jpg'])]
+    path = str(tmp_path / 'l.sqlite')
+    search_db.build_database(rows, path)
+    db = search_db.SearchDatabase(path)
+    assert db.list_page(sort='name', name_contains='beach') == (['beach_a.jpg', 'Beach_B.png'], 2)       # case-insensitive
+    assert db.list_page(sort='name', name_contains='%1')[0] == ['trip%1.jpg']                           # % is literal, not a wildcard
+    assert db.list_page(sort='name', name_contains='a_b')[0] == ['a_b.jpg']                             # so is _
+    names, total = db.list_page(sort='name', limit=2, offset=1)
+    assert total == 6 and names == ['axb.jpg', 'beach_a.jpg'] or names == ['a_b.jpg', 'axb.jpg']
+
+
+def test_list_route_returns_filenames_only_for_select_all(monkeypatch, tmp_path):
+    from routes import photos
+    rows = [{'RowKey': f'p{i:04d}.jpg', 'uploadDate': f'2020-01-01T00:{i // 60:02d}:{i % 60:02d}+00:00'} for i in range(300)]
+    path = str(tmp_path / 'l.sqlite')
+    search_db.build_database(rows, path)
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_open_library_db', lambda uid: search_db.SearchDatabase(path))
+    monkeypatch.setattr(app, '_get_metadata_entities', lambda *a, **k: (_ for _ in ()).throw(AssertionError('ids only must not read rows')))
+    with app.app.test_request_context('/api/photos?idsOnly=1&sort=name&offset=100&limit=5000'):
+        payload = photos.list_photos().get_json()
+    assert payload['total'] == 300 and len(payload['filenames']) == 200 and payload['hasMore'] is False
+    assert payload['filenames'][0] == 'p0100.jpg'

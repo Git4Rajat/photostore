@@ -4,6 +4,7 @@ import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { get, post } from '../../../services/apiClient';
+import { getCachedMediaToken, thumbnailUrlForBlob } from '../../../services/mediaToken';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 import type { Photo } from '../types';
@@ -26,14 +27,20 @@ const mapResult = (b: BackendPhoto): Photo => {
         placeId: null,
         personIds: (b.people ?? []).map((p) => p.personId),
         tags: b.tags ?? [],
-        thumbnailUrl: b.thumbnailUrl,
+        // Token mode: the server sends blob names and the browser builds the (cacheable) URLs.
+        thumbnailUrl: (b.thumbnailBlob ? thumbnailUrlForBlob(b.thumbnailBlob) : '') || b.thumbnailUrl,
         rotation: b.rotation,
         thumbnailRotation: b.thumbnailRotation,
         captureDate: iso,
     };
 };
 
-const SEARCH_PAGE_LIMIT = 200;
+// Results arrive a screenful at a time and keep loading as the user scrolls: there is no cap on how
+// many matches can be reached (the server answers any page of the full result set).
+const SEARCH_PAGE_LIMIT = 120;
+// "Save as album" collects matches up to what one album can hold (the server enforces the real limit).
+const SAVE_AS_ALBUM_MAX = 10000;
+const SAVE_PAGE = 500;
 // A new library's search database is built on the server; poll for up to ~2 minutes.
 const SEARCH_BUILD_RETRIES = 12;
 const SEARCH_BUILD_RETRY_MS = 10000;
@@ -66,6 +73,13 @@ export const AskPage: React.FC = () => {
     const [query, setQuery] = useState(route.params.query ?? '');
     const [results, setResults] = useState<Photo[]>([]);
     const [searching, setSearching] = useState(false);
+    const [total, setTotal] = useState(0);
+    const [hasMore, setHasMore] = useState(false);
+    const [rankedWindow, setRankedWindow] = useState<number | null>(null);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [saving, setSaving] = useState(false);
+    const sentinelRef = useRef<HTMLDivElement>(null);
+    const activeQueryRef = useRef('');
     // True while the server is still building this library's search database
     // (new library / first search after an upgrade); searches retry automatically.
     const [indexBuilding, setIndexBuilding] = useState(false);
@@ -87,6 +101,8 @@ export const AskPage: React.FC = () => {
         if (!query.trim()) {
             seqRef.current += 1;
             setResults([]);
+            setTotal(0);
+            setHasMore(false);
             setSearching(false);
             setIndexBuilding(false);
         }
@@ -103,20 +119,24 @@ export const AskPage: React.FC = () => {
         const seq = ++seqRef.current;
         if (!trimmed) {
             setResults([]);
+            setTotal(0);
+            setHasMore(false);
             setSearching(false);
             setIndexBuilding(false);
             return;
         }
+        activeQueryRef.current = trimmed;
         setSearching(true);
         setIndexBuilding(false);
+        setHasMore(false);
         void (async () => {
             // Backend search. If the library's search database is still being
             // built the server says so (searchIndexBuilding) and we retry for a
             // while instead of showing a misleading empty result.
             for (let attempt = 0; attempt < SEARCH_BUILD_RETRIES; attempt += 1) {
                 try {
-                    const res = await get<{ photos?: BackendPhoto[]; searchIndexBuilding?: boolean }>(
-                        `/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=${SEARCH_PAGE_LIMIT}`,
+                    const res = await get<{ photos?: BackendPhoto[]; searchIndexBuilding?: boolean; total?: number; hasMore?: boolean; rankedWindow?: number }>(
+                        `/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=${SEARCH_PAGE_LIMIT}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
                     );
                     if (seq !== seqRef.current) return;
                     if (res?.searchIndexBuilding && attempt < SEARCH_BUILD_RETRIES - 1) {
@@ -126,9 +146,13 @@ export const AskPage: React.FC = () => {
                         continue;
                     }
                     setIndexBuilding(Boolean(res?.searchIndexBuilding));
-                    setResults(Array.isArray(res?.photos) ? res.photos.map(mapResult) : []);
+                    const first = Array.isArray(res?.photos) ? res.photos.map(mapResult) : [];
+                    setResults(first);
+                    setTotal(typeof res?.total === 'number' ? res.total : first.length);
+                    setHasMore(Boolean(res?.hasMore));
+                    setRankedWindow(typeof res?.rankedWindow === 'number' ? res.rankedWindow : null);
                 } catch {
-                    if (seq === seqRef.current) setResults([]);
+                    if (seq === seqRef.current) { setResults([]); setTotal(0); setHasMore(false); }
                 }
                 break;
             }
@@ -178,12 +202,72 @@ export const AskPage: React.FC = () => {
         setQuery(`${prefix}${label} `);
     };
 
-    const saveAsAlbum = () => {
+    // Next page of the same query, appended. A sequence guard drops it if the user has searched
+    // again (or cleared the box) in the meantime.
+    const loadMore = () => {
+        if (loadingMore || searching || !hasMore) return;
+        const seq = seqRef.current;
+        const q = activeQueryRef.current;
+        setLoadingMore(true);
         void (async () => {
-            const id = await createAlbum(query.trim() || 'Saved search');
-            if (!id) return;
-            addPhotosToAlbum(id, results.map((r) => r.id));
-            navigate('albums', { albumId: id });
+            try {
+                const res = await get<{ photos?: BackendPhoto[]; total?: number; hasMore?: boolean }>(
+                    `/photos/search?q=${encodeURIComponent(q)}&offset=${results.length}&limit=${SEARCH_PAGE_LIMIT}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
+                );
+                if (seq !== seqRef.current) return;
+                const next = Array.isArray(res?.photos) ? res.photos.map(mapResult) : [];
+                setResults((prev) => {
+                    const seen = new Set(prev.map((p) => p.id));
+                    return [...prev, ...next.filter((p) => !seen.has(p.id))];
+                });
+                if (typeof res?.total === 'number') setTotal(res.total);
+                setHasMore(Boolean(res?.hasMore) && next.length > 0);
+            } catch {
+                if (seq === seqRef.current) setHasMore(false);
+            } finally {
+                if (seq === seqRef.current) setLoadingMore(false);
+            }
+        })();
+    };
+
+    // Infinite scroll: load the next page when the bottom sentinel comes into view.
+    useEffect(() => {
+        const node = sentinelRef.current;
+        if (!node || !hasMore) return undefined;
+        const observer = new IntersectionObserver((entries) => {
+            if (entries.some((e) => e.isIntersecting)) loadMore();
+        }, { rootMargin: '600px' });
+        observer.observe(node);
+        return () => observer.disconnect();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [hasMore, results.length, loadingMore, searching]);
+
+    // Saves the matches (as many as one album can hold), not just the pages scrolled so far.
+    const saveAsAlbum = () => {
+        if (saving) return;
+        setSaving(true);
+        void (async () => {
+            try {
+                const id = await createAlbum(query.trim() || 'Saved search');
+                if (!id) return;
+                const q = activeQueryRef.current || query.trim();
+                const names: string[] = results.map((r) => r.id);
+                let more = hasMore;
+                while (more && names.length < SAVE_AS_ALBUM_MAX) {
+                    const res = await get<{ photos?: BackendPhoto[]; hasMore?: boolean }>(
+                        `/photos/search?q=${encodeURIComponent(q)}&offset=${names.length}&limit=${SAVE_PAGE}`,
+                    );
+                    const batch = (res?.photos ?? []).map((p) => p.filename);
+                    if (!batch.length) break;
+                    names.push(...batch);
+                    more = Boolean(res?.hasMore);
+                }
+                const unique = Array.from(new Set(names)).slice(0, SAVE_AS_ALBUM_MAX);
+                for (let i = 0; i < unique.length; i += 2000) addPhotosToAlbum(id, unique.slice(i, i + 2000));
+                navigate('albums', { albumId: id });
+            } finally {
+                setSaving(false);
+            }
         })();
     };
 
@@ -212,7 +296,9 @@ export const AskPage: React.FC = () => {
                     onChange={(e) => setQuery(e.target.value)}
                 />
                 {results.length > 0 && (
-                    <button type="button" className="btn mock-cta" onClick={saveAsAlbum}><PlusIcon className="toolbar-icon" /> Save as album</button>
+                    <button type="button" className="btn mock-cta" onClick={saveAsAlbum} disabled={saving}>
+                        <PlusIcon className="toolbar-icon" /> {saving ? 'Saving…' : 'Save as album'}
+                    </button>
                 )}
             </form>
 
@@ -255,12 +341,17 @@ export const AskPage: React.FC = () => {
                     <div className="pt-menu-label">
                         {searching
                             ? (indexBuilding ? 'Preparing your library for search — this can take a minute…' : 'Searching…')
-                            : `${results.length} result${results.length === 1 ? '' : 's'}`}
+                            : `${total.toLocaleString()} result${total === 1 ? '' : 's'}`}
                     </div>
+                    {!searching && rankedWindow !== null && total > rankedWindow && (
+                        <p className="pt-page-sub">Best matches first; after the top {rankedWindow.toLocaleString()} the rest are newest first.</p>
+                    )}
                     {indexBuilding && !searching && (
                         <p className="pt-page-sub">Your library’s search is still being prepared — try again in a minute.</p>
                     )}
                     <PhotoGrid photos={results} emptyHint={searching ? '' : 'No photos match that search.'} />
+                    {hasMore && <div ref={sentinelRef} className="pt-scroll-sentinel" aria-hidden="true" />}
+                    {loadingMore && <p className="pt-page-sub">Loading more…</p>}
                 </>
             )}
         </div>

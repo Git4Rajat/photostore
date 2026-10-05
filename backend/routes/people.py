@@ -82,6 +82,53 @@ def people_index():
         'updatedAt': people_index_data.get('updated_at'),
     })
 
+PEOPLE_PAGE_MAX = 500
+
+
+@people_bp.route('/api/persons/page', methods=['GET'])
+def people_page():
+    """One page of the people list (named clusters first), cut from the cached people index, so the
+    People page loads a screenful and fetches more as the user scrolls instead of downloading every
+    cluster. ``q`` filters by name (``unnamed`` matches unnamed clusters); ``ids`` returns exactly
+    those clusters (deep links, merge pickers). ``available: false`` while the index is still building."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._people_features_available():
+        return app.jsonify({'available': False})
+    try:
+        offset = max(0, int(app.request.args.get('offset', 0)))
+        limit = max(1, min(PEOPLE_PAGE_MAX, int(app.request.args.get('limit', 120))))
+    except ValueError:
+        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
+    try:
+        data = app.get_user_people_index(user_id, allow_refresh=True, allow_sync_build=False, copy_rows=False)
+    except Exception:
+        data = None
+    if data is None:
+        return app.jsonify({'available': False})
+    rows = data.get('rows') or []
+    named = sum(1 for r in rows if r.get('isNamed'))
+    ids = {i for i in (app.request.args.get('ids') or '').split(',') if i}
+    needle = (app.request.args.get('q') or '').strip().lower()
+    if ids:
+        matches = [r for r in rows if str(r.get('personId')) in ids]
+    elif needle:
+        matches = [r for r in rows if needle in str(r.get('name') or '').lower()]
+    else:
+        matches = rows
+    window = matches[offset:offset + limit]
+    return app.jsonify({
+        'available': True,
+        'rows': [{k: r.get(k) for k in ('personId', 'name', 'isNamed', 'faceCount', 'coverFaceId', 'coverFilename')} for r in window],
+        'total': len(matches),
+        'offset': offset,
+        'hasMore': offset + len(window) < len(matches),
+        'namedCount': named,
+        'unnamedCount': len(rows) - named,
+        'libraryTotal': len(rows),
+    })
+
 @people_bp.route('/api/persons', methods=['GET'])
 def list_persons():
     try:
@@ -284,29 +331,53 @@ def get_person(person_id: str):
     except Exception:
         face_ids = []
 
-    def _fetch_face(fid):
-        try:
-            return fid, app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
-        except Exception:
-            return fid, None
+    # Optional paging: ?offset=&limit= returns that window of the person's faces (best faces first),
+    # so a person with tens of thousands of photos opens on its first screenful. Without ``limit``
+    # every face is returned, as before.
+    try:
+        offset = max(0, int(app.request.args.get('offset', 0)))
+        limit = int(app.request.args.get('limit', 0))
+    except ValueError:
+        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
 
-    faces = []
-    # Independent point-reads, dominated by network I/O -- run them concurrently
-    # rather than one face at a time (same pattern as routes/photos.py's
-    # per-chunk metadata prefetch, via app.DELETE_IO_CONCURRENCY).
-    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
-        fetched = list(executor.map(_fetch_face, face_ids))
-    for fid, face in fetched:
+    # Face rows come from the shared (cached) face summary map -- one scan per cache window, not a
+    # point read per face (a 50,000-face person used to be 50,000 round trips on every open). Only
+    # faces the map lacks are read individually, in parallel.
+    summary = app._load_user_face_summary_by_id(user_id)
+    face_ids = [str(fid) for fid in face_ids]
+    missing = [fid for fid in face_ids if fid not in summary]
+    extra = {}
+    if missing:
+        def _fetch_face(fid):
+            try:
+                return fid, app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
+            except Exception:
+                return fid, None
+        extra = {fid: face for fid, face in app._io_pool_map(_fetch_face, missing) if face is not None}
+
+    active = []
+    for fid in face_ids:
+        face = summary.get(fid) or extra.get(fid)
         if face is None:
             continue
         try:
             if app._face_is_rejected(face) or not app._face_is_owned_by_person(face, person_id):
                 continue
+        except Exception:
+            continue
+        active.append((app._face_preview_priority(face), fid, face))
+    active.sort(key=lambda item: item[0], reverse=True)
+
+    window = active[offset:offset + limit] if limit > 0 else active
+    faces = []
+    for _priority, fid, face in window:
+        try:
+            bbox = face.get('bbox', '{}')
             faces.append({
                 'faceId': fid,
                 'filename': face.get('filename'),
                 'thumbnailUrl': app._face_thumbnail_url(str(face.get('filename') or ''), user_id),
-                'bbox': app.json.loads(face.get('bbox', '{}')),
+                'bbox': app.json.loads(bbox) if isinstance(bbox, str) else (bbox or {}),
                 'imageWidth': int(face.get('imageWidth', 0) or 0),
                 'imageHeight': int(face.get('imageHeight', 0) or 0),
                 'confidence': float(face.get('confidence', 0.0) or 0.0),
@@ -315,13 +386,11 @@ def get_person(person_id: str):
             })
         except Exception:
             continue
-    faces.sort(key=lambda face: app._face_preview_priority(face), reverse=True)
 
-    return app.jsonify({
-        'personId': person_id,
-        'name': name,
-        'faces': faces,
-    })
+    response = {'personId': person_id, 'name': name, 'faces': faces, 'total': len(active), 'offset': offset}
+    if limit > 0:
+        response['hasMore'] = offset + limit < len(active)
+    return app.jsonify(response)
 
 @people_bp.route('/api/persons/suggestions', methods=['GET'])
 def list_person_suggestions():
@@ -381,6 +450,62 @@ def decline_person_suggestion():
         app.app.logger.exception('Decline person suggestion endpoint failed')
         return app.jsonify({'error': 'Decline person suggestion failed'}), 500
 
+def _confirm_faces_for_person(user_id: str, face_ids) -> set:
+    """Mark every face of a just-named person as user-confirmed.
+
+    A named cluster can hold thousands of faces. This used to read and upsert
+    them one at a time (2 sequential storage round trips each, ~125 s p95 for
+    big clusters, holding a web thread the whole time). Now the point reads
+    fan out over a small pool and the writes go out as 100-row transactions
+    (the Table Storage cap), falling back to single upserts if a transaction
+    is rejected."""
+    affected_files = set()
+    ids = [str(f) for f in face_ids if f]
+    if not ids:
+        return affected_files
+
+    def _read_and_confirm(face_id):
+        try:
+            face = app.face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            return None
+        face['confirmedByUser'] = True
+        face['reviewStatus'] = 'confirmed'
+        face['rejected'] = False
+        face.pop('suspiciousReason', None)
+        face.pop('rejectedReason', None)
+        face.pop('rejectedAt', None)
+        face['confidence'] = max(float(face.get('confidence', 0.0) or 0.0), 1.0)
+        return face
+
+    with ThreadPoolExecutor(max_workers=min(16, len(ids))) as executor:
+        faces = [f for f in executor.map(_read_and_confirm, ids) if f is not None]
+    for face in faces:
+        filename = str(face.get('filename') or '')
+        if filename:
+            affected_files.add(filename)
+
+    def _write_chunk(chunk):
+        submit = getattr(app.face_table_client, 'submit_transaction', None)
+        if submit is not None:
+            try:
+                submit([('upsert', face) for face in chunk])
+                return
+            except Exception:
+                app.app.logger.warning('Face confirm transaction failed; falling back to single upserts', exc_info=True)
+        for face in chunk:
+            try:
+                app.face_table_client.upsert_entity(face)
+            except Exception:
+                continue
+
+    chunks = [faces[i:i + 100] for i in range(0, len(faces), 100)]
+    if chunks:
+        with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as executor:
+            list(executor.map(_write_chunk, chunks))
+    return affected_files
+
+
 @people_bp.route('/api/persons/<person_id>/label', methods=['POST'])
 def label_person(person_id: str):
     user_id, error = app._require_user_id()
@@ -400,37 +525,34 @@ def label_person(person_id: str):
         face_ids = app.json.loads(person.get('faceIds', '[]') or '[]')
     except Exception:
         face_ids = []
-    affected_files = set()
-    for face_id in face_ids:
-        try:
-            face = app.face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-            filename = str(face.get('filename') or '')
-            if filename:
-                affected_files.add(filename)
-            face['confirmedByUser'] = True
-            face['reviewStatus'] = 'confirmed'
-            face['rejected'] = False
-            face.pop('suspiciousReason', None)
-            face.pop('rejectedReason', None)
-            face.pop('rejectedAt', None)
-            face['confidence'] = max(float(face.get('confidence', 0.0) or 0.0), 1.0)
-            app.face_table_client.upsert_entity(face)
-        except Exception:
-            continue
-    app._update_person_rep_embedding(user_id, person_id)
-    app._rebuild_metadata_faces_for_filenames(user_id, affected_files)
+    with app.perf_instrumentation.step('label.confirm_faces', faces=len(face_ids)):
+        affected_files = _confirm_faces_for_person(user_id, face_ids)
+    with app.perf_instrumentation.step('label.rep_embedding'):
+        app._update_person_rep_embedding(user_id, person_id)
+    with app.perf_instrumentation.step('label.rebuild_metadata_faces', files=len(affected_files)):
+        app._rebuild_metadata_faces_for_filenames(user_id, affected_files)
 
     # Naming a cluster is a strong identity signal: use its learned rep to pull
     # this person's faces out of unnamed clusters automatically. Best-effort so a
     # propagation hiccup never fails the label action itself.
     auto_assigned = 0
+    propagate_job_id = None
     if name.strip() and not app._is_unnamed_name(name):
-        try:
-            propagation = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
-            auto_assigned = int(propagation.get('autoAssignedCount') or 0)
-        except Exception:
-            app.app.logger.exception('Identity propagation after label failed for %s', person_id)
-    return app.jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': auto_assigned})
+        # Reclaiming this person's faces from unnamed clusters scans the whole face table, so (like
+        # merge) it runs on the queue-scaled worker instead of inside this request. Only without a
+        # worker is it run inline.
+        queued = app._enqueue_propagate_job(user_id, person_id)
+        if queued.get('status') == 'queued':
+            propagate_job_id = queued.get('jobId')
+        else:
+            try:
+                with app.perf_instrumentation.step('label.propagate_identity'):
+                    propagation = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
+                auto_assigned = int(propagation.get('autoAssignedCount') or 0)
+            except Exception:
+                app.app.logger.exception('Identity propagation after label failed for %s', person_id)
+    return app.jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': auto_assigned,
+                        'propagateJobId': propagate_job_id})
 
 @people_bp.route('/api/faces/crop/<face_id>', methods=['GET'])
 def face_crop(face_id: str):
@@ -738,11 +860,12 @@ def delete_person_clusters():
     errors = []
     affected_filenames = set()
     faces_updated = 0
-    for raw_person_id in person_ids:
-        person_id_value = str(raw_person_id or '').strip()
-        if not person_id_value:
-            continue
-        result = app._delete_person_cluster(user_id, person_id_value, rebuild_metadata=False)
+    wanted = [str(raw or '').strip() for raw in person_ids]
+    wanted = [pid for pid in dict.fromkeys(wanted) if pid]
+    # Clusters are independent, so several are removed at once (tens of thousands can be selected).
+    results = app._io_pool_map(
+        lambda pid: app._delete_person_cluster(user_id, pid, rebuild_metadata=False), wanted, workers=6)
+    for person_id_value, result in zip(wanted, results):
         if result.get('deleted'):
             deleted_person_ids.append(person_id_value)
             faces_updated += int(result.get('facesUpdated') or 0)
@@ -832,13 +955,16 @@ def merge_persons_batch():
     results = []
     named_target_ids: app.List[str] = []
     seen_targets = set()
+    # One face-ownership snapshot for the whole batch (every merge's own writes invalidate the
+    # shared cache, which would otherwise force a full face-table rescan per pair).
+    face_summary = app._load_user_face_summary_by_id(user_id)
     for pair in pairs:
         target_id = str((pair or {}).get('targetPersonId') or (pair or {}).get('personId') or '') if isinstance(pair, dict) else ''
         source_ids = pair.get('mergeIds') if isinstance(pair, dict) else None
         if not target_id or not isinstance(source_ids, list) or not source_ids:
             results.append({'targetPersonId': target_id, 'success': False, 'error': 'invalid pair'})
             continue
-        core = app._merge_persons_core(user_id, target_id, source_ids)
+        core = app._merge_persons_core(user_id, target_id, source_ids, face_summary=face_summary)
         if core is None:
             results.append({'targetPersonId': target_id, 'success': False, 'error': 'base person not found'})
             continue
@@ -926,21 +1052,27 @@ def undo_merge(merge_id: str):
     # -- _merge_persons_core's own dual-write moved these rows onto the merge
     # target; undo must move them back, or a future paginated membership
     # reader would disagree with the faceIds just restored above.
+    # Member-row and face writes fan out: each used to be one sequential round trip per face
+    # (thousands of faces for a big merged cluster).
+    member_adds = []
     for entity in ([base] if base.get('RowKey') else []) + [m for m in merged if m.get('RowKey')]:
         restored_person_id = str(entity['RowKey'])
         try:
             restored_face_ids = app.json.loads(entity.get('faceIds', '[]') or '[]')
         except Exception:
             restored_face_ids = []
-        for fid in restored_face_ids:
-            app._add_person_member(user_id, restored_person_id, str(fid))
+        member_adds.extend((restored_person_id, str(fid)) for fid in restored_face_ids)
+    app._io_pool_map(lambda pair: app._add_person_member(user_id, pair[0], pair[1]), member_adds, workers=16)
     base_person_id = str(base.get('RowKey') or '')
     if base_person_id:
-        for fid, original_pid in face_map.items():
-            if str(original_pid or '') != base_person_id:
-                app._remove_person_member(base_person_id, str(fid))
+        app._io_pool_map(
+            lambda fid: app._remove_person_member(base_person_id, fid),
+            [str(fid) for fid, original_pid in face_map.items() if str(original_pid or '') != base_person_id],
+            workers=16,
+        )
 
-    for fid, original_pid in face_map.items():
+    def _restore_face(item):
+        fid, original_pid = item
         try:
             face_ent = app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
             if original_pid:
@@ -956,6 +1088,8 @@ def undo_merge(merge_id: str):
             app.face_table_client.upsert_entity(face_ent)
         except Exception:
             pass
+
+    app._io_pool_map(_restore_face, list(face_map.items()), workers=16)
 
     affected_person_ids = set()
     if base.get('RowKey'):
