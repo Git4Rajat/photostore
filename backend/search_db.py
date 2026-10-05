@@ -648,6 +648,11 @@ def load_manifest(user_id: str) -> Dict:
     return manifest
 
 
+def is_building(user_id: str) -> bool:
+    """True while the library's first build is still indexing (results so far are partial)."""
+    return isinstance(load_manifest(user_id).get('building'), dict)
+
+
 def needs_build(user_id: str) -> bool:
     """True only when the library genuinely has no usable database: no manifest (never built) or
     one on an older schema. A transient storage error, or a current manifest whose database file
@@ -670,7 +675,7 @@ def is_current(user_id: str, lexical_source_version: str) -> bool:
     manifest = load_manifest(user_id)
     return bool(
         manifest.get('sourceVersion')
-        and manifest.get('sourceVersion') == lexical_source_version
+        and _lineage(manifest) == lexical_source_version      # compaction changes the file version, not the lineage
         and manifest.get('schemaVersion') == SCHEMA_VERSION
     )
 
@@ -717,6 +722,7 @@ class SearchDbSink:
             json.dumps({
                 'userId': user_id, 'sourceVersion': self.source_version, 'schemaVersion': SCHEMA_VERSION,
                 'rowCount': count, 'updatedAt': self.updated_at, 'deltaSeq': 0, 'deltaRows': 0,
+                'lineage': self.source_version, 'baseSeq': 0,
             }, separators=(',', ':')).encode('utf-8'),
             overwrite=True, content_settings=ContentSettings(content_type='application/json'),
         )
@@ -746,17 +752,25 @@ def delta_budget_exceeded(manifest: Dict, adding: int) -> bool:
     )
 
 
-def publish_delta(user_id: str, upserts: List[Dict], deletes: List[str]) -> Optional[int]:
+def _lineage(manifest: Dict) -> str:
+    return str(manifest.get('lineage') or manifest.get('sourceVersion') or '')
+
+
+def publish_delta(
+    user_id: str, upserts: List[Dict], deletes: List[str], *, building: Optional[Dict] = None,
+) -> Optional[int]:
     """Append one delta to the library's database. Returns the new sequence number, or None if
     nothing could be published (no base, base replaced meanwhile, storage error).
 
     The delta blob is written first, then the manifest is advanced with a compare-and-swap on its
-    ETag, so a concurrent full rebuild (new base version) or another publisher can never be
-    overwritten: the loser simply discards its delta."""
+    ETag, so a concurrent rebuild or another publisher can never be overwritten: the loser simply
+    discards its delta. ``building`` (a resumable first build) is written in the SAME manifest
+    update, so "this chunk is published" and "the cursor moved past it" are one atomic fact."""
     manifest = load_manifest(user_id)
     base_version = str(manifest.get('sourceVersion') or '')
     if not base_version or manifest.get('schemaVersion') != SCHEMA_VERSION:
         return None
+    lineage = _lineage(manifest)
     seq = int(manifest.get('deltaSeq') or 0) + 1
     delta_client = _blob_client(_delta_blob_name(user_id, seq))
     _, manifest_name = _blob_names(user_id)
@@ -765,37 +779,62 @@ def publish_delta(user_id: str, upserts: List[Dict], deletes: List[str]) -> Opti
         return None
     from azure.storage.blob import ContentSettings
     payload = gzip.compress(json.dumps(
-        {'baseVersion': base_version, 'seq': seq, 'upserts': upserts, 'deletes': deletes},
+        {'lineage': lineage, 'baseVersion': base_version, 'seq': seq, 'upserts': upserts, 'deletes': deletes},
         ensure_ascii=False, separators=(',', ':')).encode('utf-8'), compresslevel=5)
     try:
         with perf_instrumentation.span('searchdb.delta.upload', user=user_id, upserts=len(upserts), deletes=len(deletes)):
             delta_client.upload_blob(payload, overwrite=True, content_settings=ContentSettings(content_type='application/gzip'))
-        # Re-read the manifest *uncached* and swap only if it is still the one we based this on.
+        updated = _cas_update_manifest(
+            user_id, manifest_client,
+            lambda current: (
+                None if _lineage(current) != lineage or int(current.get('deltaSeq') or 0) != seq - 1 else {
+                    **current, 'deltaSeq': seq,
+                    'deltaRows': int(current.get('deltaRows') or 0) + len(upserts) + len(deletes),
+                    'updatedAt': datetime.now(timezone.utc).isoformat(),
+                    **({'building': building} if building is not None else {}),
+                }),
+        )
+    except Exception:
+        _LOGGER.warning('Publishing search DB delta failed for %s', user_id, exc_info=True)
+        return None
+    if updated is None:
+        _LOGGER.info('Search DB delta %s discarded: manifest moved on', seq)
+        return None
+    perf_instrumentation.log_event('searchdb_delta_published', user=user_id, seq=seq, upserts=len(upserts), deletes=len(deletes))
+    return seq
+
+
+def _cas_update_manifest(user_id: str, manifest_client, mutate, attempts: int = 6) -> Optional[Dict]:
+    """Read-modify-write the manifest with an ETag condition. ``mutate(current)`` returns the new
+    manifest, or None to give up (the world changed in a way that makes this update wrong). A lost
+    ETag race just re-reads and re-evaluates, up to ``attempts`` times."""
+    from azure.storage.blob import ContentSettings
+    for _ in range(attempts):
         invalidate_manifest_cache(user_id)
         try:
             props = manifest_client.get_blob_properties()
         except Exception:
             props = None
         current = json.loads(manifest_client.download_blob().readall().decode('utf-8'))
-        if current.get('sourceVersion') != base_version or int(current.get('deltaSeq') or 0) != seq - 1:
-            _LOGGER.info('Search DB delta %s discarded: manifest moved on', seq)
+        updated = mutate(current)
+        if updated is None:
             return None
-        updated = {**current, 'deltaSeq': seq, 'deltaRows': int(current.get('deltaRows') or 0) + len(upserts) + len(deletes),
-                   'updatedAt': datetime.now(timezone.utc).isoformat()}
         kwargs = {}
         etag = getattr(props, 'etag', None)
         if etag:
             from azure.core import MatchConditions
             kwargs = {'etag': etag, 'match_condition': MatchConditions.IfNotModified}
-        manifest_client.upload_blob(
-            json.dumps(updated, separators=(',', ':')).encode('utf-8'), overwrite=True,
-            content_settings=ContentSettings(content_type='application/json'), **kwargs)
-    except Exception:
-        _LOGGER.warning('Publishing search DB delta failed for %s', user_id, exc_info=True)
-        return None
-    invalidate_manifest_cache(user_id)
-    perf_instrumentation.log_event('searchdb_delta_published', user=user_id, seq=seq, upserts=len(upserts), deletes=len(deletes))
-    return seq
+        try:
+            manifest_client.upload_blob(
+                json.dumps(updated, separators=(',', ':')).encode('utf-8'), overwrite=True,
+                content_settings=ContentSettings(content_type='application/json'), **kwargs)
+        except Exception:
+            if not etag:
+                raise
+            continue  # lost the race: re-read and decide again
+        invalidate_manifest_cache(user_id)
+        return updated
+    return None
 
 
 def sync_deltas(user_id: str, db: 'SearchDatabase', manifest: Dict) -> None:
@@ -805,7 +844,6 @@ def sync_deltas(user_id: str, db: 'SearchDatabase', manifest: Dict) -> None:
     target = int(manifest.get('deltaSeq') or 0)
     if db.applied_seq() >= target:
         return
-    base_version = str(manifest.get('sourceVersion') or '')
     with _user_lock(user_id):
         while db.applied_seq() < target:
             seq = db.applied_seq() + 1
@@ -815,12 +853,141 @@ def sync_deltas(user_id: str, db: 'SearchDatabase', manifest: Dict) -> None:
             try:
                 with perf_instrumentation.span('searchdb.delta.apply', user=user_id, seq=seq):
                     delta = json.loads(gzip.decompress(client.download_blob().readall()).decode('utf-8'))
-                    if delta.get('baseVersion') != base_version or int(delta.get('seq') or 0) != seq:
-                        return  # belongs to another base: a rebuild is publishing; next request re-resolves
+                    delta_lineage = str(delta.get('lineage') or delta.get('baseVersion') or '')
+                    if delta_lineage != _lineage(manifest) or int(delta.get('seq') or 0) != seq:
+                        return  # belongs to another lineage: a rebuild is publishing; next request re-resolves
                     db.apply_delta(delta)
             except Exception:
                 _LOGGER.warning('Applying search DB delta %s failed for %s', seq, user_id, exc_info=True)
                 return
+
+
+def _build_dir() -> str:
+    """Scratch space for building/compacting a database (local disk: SQLite needs real locking)."""
+    base = os.getenv('INDEX_BUILD_SQLITE_DIR', '').strip() or os.path.join(tempfile.gettempdir(), 'photostore-index-build')
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _require_disk(path: str, needed_bytes: int, what: str) -> None:
+    free = shutil.disk_usage(path).free
+    if free < needed_bytes:
+        raise RuntimeError(
+            f'Not enough free disk to {what}: need ~{needed_bytes // 1048576} MB, have {free // 1048576} MB in {path}')
+
+
+def _upload_database_file(user_id: str, db_path: str, label: str) -> None:
+    data_name, _ = _blob_names(user_id)
+    data_client = _blob_client(data_name)
+    if data_client is None:
+        raise RuntimeError('search database blob storage is not configured')
+    gz_path = db_path + '.gz'
+    with perf_instrumentation.span(f'searchdb.{label}.gzip', user=user_id):
+        with open(db_path, 'rb') as src, gzip.open(gz_path, 'wb', compresslevel=5) as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+    from azure.storage.blob import ContentSettings
+    try:
+        with perf_instrumentation.span(f'searchdb.{label}.upload', user=user_id, mb=round(os.path.getsize(gz_path) / 1048576, 1)):
+            with open(gz_path, 'rb') as fh:
+                data_client.upload_blob(fh, overwrite=True, content_settings=ContentSettings(content_type='application/gzip'))
+    finally:
+        try:
+            os.remove(gz_path)
+        except OSError:
+            pass
+
+
+def create_empty_base(user_id: str, building: Dict) -> str:
+    """Publish an EMPTY database + manifest for a library that has none, so a resumable first build
+    can append deltas to it and search works (on what has been indexed so far) from the first chunk.
+    Returns the new base version."""
+    version = datetime.now(timezone.utc).isoformat()
+    workdir = tempfile.mkdtemp(prefix='searchdb-empty-', dir=_build_dir())
+    try:
+        path = os.path.join(workdir, 'search.sqlite')
+        DatabaseBuilder(path).finish()
+        _upload_database_file(user_id, path, 'empty')
+        _, manifest_name = _blob_names(user_id)
+        manifest_client = _blob_client(manifest_name)
+        from azure.storage.blob import ContentSettings
+        manifest_client.upload_blob(
+            json.dumps({
+                'userId': user_id, 'sourceVersion': version, 'schemaVersion': SCHEMA_VERSION, 'rowCount': 0,
+                'updatedAt': version, 'deltaSeq': 0, 'deltaRows': 0, 'lineage': version, 'baseSeq': 0,
+                'building': building,
+            }, separators=(',', ':')).encode('utf-8'),
+            overwrite=True, content_settings=ContentSettings(content_type='application/json'))
+        invalidate_manifest_cache(user_id)
+        return version
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def compact_database(user_id: str) -> Optional[Dict]:
+    """Fold the delta log into a fresh base file -- WITHOUT touching the table.
+
+    The worker's own synced local copy already equals base + every delta, so compaction is: snapshot
+    that file (SQLite backup), merge the FTS segments, upload it as the new base, and advance the
+    manifest (compare-and-swap) so replicas download one file instead of replaying the log. Deltas
+    published while this runs keep their sequence numbers and simply sit on top of the new base.
+    Cost follows library size on LOCAL DISK, not table scans. Returns the new manifest, or None."""
+    manifest = load_manifest(user_id)
+    if not manifest.get('sourceVersion') or manifest.get('schemaVersion') != SCHEMA_VERSION:
+        return None
+    db = open_database(user_id)
+    if db is None:
+        return None
+    applied = db.applied_seq()
+    lineage = _lineage(manifest)
+    workdir = tempfile.mkdtemp(prefix='searchdb-compact-', dir=_build_dir())
+    try:
+        _require_disk(workdir, int(os.path.getsize(db.path) * 2.5) + (64 << 20), 'compact the search database')
+        dst_path = os.path.join(workdir, 'search.sqlite')
+        with perf_instrumentation.step('searchdb.compact.snapshot', user=user_id, delta_seq=applied):
+            src = sqlite3.connect(f'file:{db.path}?mode=ro', uri=True)
+            dst = sqlite3.connect(dst_path)
+            try:
+                src.backup(dst)
+                dst.execute('PRAGMA journal_mode=DELETE')
+                dst.execute("INSERT INTO fts(fts) VALUES('optimize')")
+                count = int(dst.execute('SELECT COUNT(*) FROM rows').fetchone()[0])
+                dst.execute("INSERT OR REPLACE INTO meta VALUES('delta_seq', ?)", (str(applied),))
+                dst.commit()
+                dst.execute('VACUUM')
+            finally:
+                dst.close()
+                src.close()
+        _upload_database_file(user_id, dst_path, 'compact')
+        _, manifest_name = _blob_names(user_id)
+        manifest_client = _blob_client(manifest_name)
+        new_version = datetime.now(timezone.utc).isoformat()
+
+        def _mutate(current: Dict) -> Optional[Dict]:
+            current_delta = int(current.get('deltaSeq') or 0)
+            if _lineage(current) != lineage or not (int(current.get('baseSeq') or 0) <= applied <= current_delta):
+                return None
+            remaining = current_delta - applied
+            rows_in_log = int(current.get('deltaRows') or 0)
+            return {**current, 'sourceVersion': new_version, 'rowCount': count, 'baseSeq': applied,
+                    'deltaRows': int(rows_in_log * remaining / max(1, current_delta)),
+                    'updatedAt': new_version}
+
+        updated = _cas_update_manifest(user_id, manifest_client, _mutate)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    if updated is None:
+        _LOGGER.info('Search DB compaction for %s discarded: manifest moved on', user_id)
+        return None
+    # Everything up to `applied` is inside the new base now.
+    for seq in range(1, applied + 1):
+        client = _blob_client(_delta_blob_name(user_id, seq))
+        if client is not None:
+            try:
+                client.delete_blob()
+            except Exception:
+                pass
+    perf_instrumentation.log_event('searchdb_compacted', user=user_id, rows=count, folded_deltas=applied)
+    return updated
 
 
 def write_for_snapshot(user_id: str, snapshot) -> bool:

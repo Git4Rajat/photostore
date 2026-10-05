@@ -504,3 +504,29 @@ Build scopes and triggers:
 Each scope has its own job row and trigger cooldown. `light` and `people` touch different indexes, so ipworker and clustering do not repeat each other's work; whichever runs second finds the dirty set empty and its delta step is a no-op. `people` requests wait at least `INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS` (600) after the previous one.
 
 Still full-rebuild-only: the Explore places/things summary. Still O(library) per light build: the sort and access index files (streamed on the worker, but a million-photo sort index is too big for the browser either way).
+
+### 15.5 Indexing a 1M-photo library
+
+**Targets**
+
+| Target | How it is met |
+| --- | --- |
+| A first build can finish despite restarts, deploys and scale events | `library_build.bootstrap_library_build` is chunked and resumable. The cursor and the delta publish are one atomic manifest update, so a restart loses at most one chunk (20,000 photos). |
+| Search is usable long before the build ends | An empty base database is published first and every chunk is appended as a delta. Responses carry `indexPartial: true` until the build finishes. |
+| One table scan, not four | The same pass produces the search rows, the sort-index rows and the access-index rows (spooled per chunk, then assembled). Before this it was a scan for the sort index, another for access, another for search, and the listing blob had no consumer. |
+| Memory is bounded | O(chunk), about 20-40 MB. |
+| Disk is bounded and checked | The worker holds its local database copy plus one snapshot during compaction, and compaction refuses to start without enough free disk (2.5x the database + 64 MB). The spool is removed when the build ends. |
+| No repeated full rebuilds | Normal change is deltas (§15.4). Compaction folds the delta log into a new base from the worker's local copy and never reads the table. The scan build runs only for a library with no usable database (new, or a schema upgrade). |
+| The first build does not starve live traffic | `LIBRARY_BUILD_MAX_ROWS_PER_SECOND` throttles the scan (0 = unlimited, the default). |
+
+**Compatibility:** `deltaSeq` is global to a lineage; compaction changes the base's `sourceVersion` and `baseSeq` but not the lineage. Readiness (`search_db.is_current`) compares lineages, so a compaction does not make the library look "stale".
+
+**Summaries:** Explore and the timeline are recomputed from the finished database after a first build and after each compaction (`_finalize_library_summaries`), not from another scan.
+
+**Operating it:** PERF events `library_build_started|resumed|progress|done`, `searchdb_delta_published`, `searchdb_compacted` (queries 13-14 in `docs/perf-queries.kql`).
+
+**Known limits at 1M, not yet addressed**
+- **Backend disk:** each backend replica keeps a local copy of the library's database. The 0.5 vCPU backend has about 2 GiB of ephemeral disk and `SEARCH_DB_MAX_CACHE_MB` defaults to 1200. Read `sqlite_mb` from the `searchdb_built` / `searchdb_compact` log lines at 130k and multiply by 7.7. If the result is above about 1.5 GB, give the backend 1 vCPU (4 GiB ephemeral) and raise the cache budget.
+- **Browser sort index:** about 24 MB at 130k photos, so about 180 MB at 1M. The browser cannot download that; the gallery needs server-side paging first.
+- **People and albums indexes** still read every cluster and face for each build.
+- **Sort/access light builds** rewrite their whole file when something changes (a streamed disk pass, about a minute at 1M).

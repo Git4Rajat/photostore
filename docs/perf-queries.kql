@@ -97,3 +97,18 @@ ContainerAppConsoleLogs_CL
 | extend rss = todouble(extract(@"rss_mb=([\d.]+)", 1, Log_s))
 | summarize rss_max = max(rss), rss_p95 = percentile(rss, 95) by ContainerAppName_s, bin(TimeGenerated, 15m)
 | order by TimeGenerated desc
+
+// ---- 13. Chunked first build: progress, speed and resumes ----------------------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=library_build"
+| extend event = extract(@"event=(\S+)", 1, Log_s), rows = tolong(extract(@" rows=(\d+)", 1, Log_s)),
+         chunks = toint(extract(@"chunks=(\d+)", 1, Log_s)), rps = toint(extract(@"rowsPerSecond=(\d+)", 1, Log_s)),
+         cursor = extract(@"cursor=(\S+)", 1, Log_s)
+| project TimeGenerated, event, rows, chunks, rps, cursor
+| order by TimeGenerated desc
+
+// ---- 14. Delta publishing and compaction ------------------------------------------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "searchdb_delta_published" or Log_s has "searchdb_compacted" or Log_s has "search_db_incremental"
+| project TimeGenerated, ContainerAppName_s, Log_s
+| order by TimeGenerated desc

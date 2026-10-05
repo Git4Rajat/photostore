@@ -8465,6 +8465,33 @@ class _TimelineSink:
         store_timeline_summary(self.user_id, self.accumulator.summary())
 
 
+def _finalize_library_summaries(user_id: str, db) -> None:
+    """Explore (places/things) and the timeline, computed from the library's finished database --
+    a local pass over its rows, no table scan. Run after a chunked first build and after each
+    compaction."""
+    accumulator = ExploreAccumulator()
+    for row in db.iter_smart_rows():
+        accumulator.add(row)
+    summary = accumulator.finalize(user_id)
+    store_explore_summary(user_id, {
+        'sourceVersion': datetime.now(timezone.utc).isoformat(),
+        'updatedAt': datetime.now(timezone.utc).isoformat(),
+        'places': summary.get('places', []),
+        'things': summary.get('things', []),
+    })
+    store_timeline_summary(user_id, db.timeline_summary())
+
+
+def _refresh_library_summaries(user_id: str) -> None:
+    import search_db
+    try:
+        db = search_db.open_database(user_id)
+        if db is not None:
+            _finalize_library_summaries(user_id, db)
+    except Exception:
+        worker_logger.exception('Library summaries refresh failed for %s', user_id)
+
+
 def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None):
     """The 'lexical' step of the index build, replacing the old full-snapshot
     refresh: ONE streaming pass over the table feeding the listing blob, the
@@ -8483,6 +8510,8 @@ def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None)
 
 
 storage_utils_module.LEXICAL_BUILD_HOOK = _streaming_lexical_build
+import library_build as _library_build_module
+_library_build_module.FINALIZE_HOOK = _finalize_library_summaries
 storage_utils_module.INDEX_BUILD_REQUEST_HOOK = lambda user_id: enqueue_index_build(user_id, reason='serving-process')
 
 
@@ -9995,11 +10024,30 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                 perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, **{
                     k: v for k, v in outcome.items() if isinstance(v, (int, str))})
                 if outcome.get('status') == 'needs_full':
-                    # Compaction: too much changed (or a long delta log) -- rebuild the base once.
-                    prime_all_user_indexes_sequentially(user_id, wait=True, kinds=('lexical',))
+                    # Too much has changed / the log is long: fold it into a fresh base. This reads the
+                    # worker's local database, never the table, so it stays cheap at any library size.
+                    import search_db
+                    if search_db.compact_database(user_id):
+                        _refresh_library_summaries(user_id)
+                    refresh_user_search_db_incremental(user_id)   # catch up whatever changed meanwhile
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
             else:
-                prime_all_user_indexes_sequentially(user_id, on_progress=_index_build_progress_callback(user_id), wait=True)
+                # Full scope = a library with no usable database (new, or a schema upgrade). The
+                # chunked, resumable build makes the search/sort/access indexes in ONE scan; the
+                # remaining kinds are the small ones.
+                import library_build
+                callback = _index_build_progress_callback(user_id)
+                if library_build.bootstrap_needed(user_id):
+                    def _bootstrap_progress(progress: dict) -> None:
+                        _upsert_job_status(
+                            job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running',
+                            result={'indexes': get_user_index_readiness(user_id), 'ready': False, 'bootstrap': progress,
+                                    'elapsedSeconds': int(time.monotonic() - started)})
+                    built = library_build.bootstrap_library_build(user_id, on_progress=_bootstrap_progress)
+                    if built.get('status') == 'conflict':
+                        raise RuntimeError('library build lost a race with another writer; retrying')
+                prime_all_user_indexes_sequentially(
+                    user_id, on_progress=callback, wait=True, kinds=('sort', 'access', 'albums', 'people'))
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')

@@ -200,7 +200,7 @@ def test_a_delta_never_overwrites_a_manifest_that_moved_on(world, monkeypatch):
         original(self, data, **kw)
         if self.key.endswith('-searchdelta-000001.json.gz'):
             moved = json.loads(svc.store[manifest_key])
-            moved['sourceVersion'] = 'v-rebuilt'                 # a full rebuild published a new base
+            moved['sourceVersion'] = moved['lineage'] = 'v-rebuilt'   # a full rebuild published a new base lineage
             svc.store[manifest_key] = json.dumps(moved).encode()
             svc.etags[manifest_key] = 'changed-by-rebuild'
 
@@ -221,3 +221,59 @@ def test_no_base_means_the_incremental_path_does_nothing(monkeypatch):
 def test_dirty_table_outage_is_not_treated_as_nothing_changed(world, monkeypatch):
     monkeypatch.setitem(storage_utils._CTX, 'search_index_dirty_table_client', None)
     assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'unavailable'
+
+
+def test_compaction_folds_the_log_into_a_new_base_without_touching_the_table(world, monkeypatch, tmp_path):
+    svc, meta, dirty = world
+    monkeypatch.setenv('INDEX_BUILD_SQLITE_DIR', str(tmp_path / 'build'))
+    for i in range(3):
+        _change(meta, _row(f'k{i}.jpg', ['otter']))
+        storage_utils.refresh_user_search_db_incremental('lib')
+    # the table must not be read at all while compacting
+    meta.query_entities = lambda *a, **k: (_ for _ in ()).throw(AssertionError('compaction must not scan the table'))
+    updated = search_db.compact_database('lib')
+    assert updated and updated['baseSeq'] == 3 and updated['deltaSeq'] == 3 and updated['lineage'] == 'v1'
+    assert not any('searchdelta' in k for k in svc.store)                     # folded deltas are gone
+    # a replica joining now downloads ONE file (seq 3 inside it) and has nothing left to replay
+    import shutil
+    search_db._OPEN.clear()
+    shutil.rmtree(search_db.SEARCH_DB_DIR, ignore_errors=True)
+    db = search_db.open_database('lib')
+    assert db.applied_seq() == 3 and _names(db, 'otter') == ['k0.jpg', 'k1.jpg', 'k2.jpg']
+    assert len(_names(db, 'dog')) == 2
+
+
+def test_deltas_published_after_a_compaction_apply_on_top_of_the_new_base(world, monkeypatch, tmp_path):
+    svc, meta, dirty = world
+    monkeypatch.setenv('INDEX_BUILD_SQLITE_DIR', str(tmp_path / 'build'))
+    _change(meta, _row('p1.jpg', ['heron']))
+    storage_utils.refresh_user_search_db_incremental('lib')
+    search_db.compact_database('lib')
+    _change(meta, _row('p2.jpg', ['heron']))
+    outcome = storage_utils.refresh_user_search_db_incremental('lib')
+    assert outcome['status'] == 'delta'
+    import shutil
+    search_db._OPEN.clear()
+    shutil.rmtree(search_db.SEARCH_DB_DIR, ignore_errors=True)
+    db = search_db.open_database('lib')
+    assert db.applied_seq() == 2 and _names(db, 'heron') == ['p1.jpg', 'p2.jpg']
+
+
+def test_compaction_does_not_clobber_a_manifest_from_another_lineage(world, monkeypatch, tmp_path):
+    svc, meta, dirty = world
+    monkeypatch.setenv('INDEX_BUILD_SQLITE_DIR', str(tmp_path / 'build'))
+    _change(meta, _row('q.jpg', ['stoat']))
+    storage_utils.refresh_user_search_db_incremental('lib')
+    key = 'lexical-index/' + search_db._blob_names('lib')[1]
+    real_upload = search_db._upload_database_file
+
+    def upload_then_rebuild_lands(user_id, path, label):
+        real_upload(user_id, path, label)
+        moved = json.loads(svc.store[key])
+        moved['lineage'] = moved['sourceVersion'] = 'rebuilt'
+        svc.store[key] = json.dumps(moved).encode()
+        svc.etags[key] = 'x'
+
+    monkeypatch.setattr(search_db, '_upload_database_file', upload_then_rebuild_lands)
+    assert search_db.compact_database('lib') is None
+    assert json.loads(svc.store[key])['lineage'] == 'rebuilt'

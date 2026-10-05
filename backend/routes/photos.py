@@ -517,7 +517,10 @@ def list_photos():
         pid_to_name,
     )
 
-    return app.jsonify({'photos': photos, 'total': total})
+    payload = {'photos': photos, 'total': total}
+    if search_db.is_building(user_id):
+        payload['indexPartial'] = True       # first build still running: more photos will appear
+    return app.jsonify(payload)
 
 @photos_bp.route('/photos/processing-status', methods=['GET'])
 @photos_bp.route('/photos/processing-status/', methods=['GET'])
@@ -847,6 +850,8 @@ def search_photos():
         response_payload['matchedLocations'] = [app._smart_album_title(term) for term in matched_location_terms]
     if matched_year:
         response_payload['matchedYear'] = matched_year
+    if search_db.is_building(user_id):
+        response_payload['indexPartial'] = True   # first build still running: more photos will appear
     return app.jsonify(response_payload)
 
 @photos_bp.route('/api/photos/search-index', methods=['GET'])

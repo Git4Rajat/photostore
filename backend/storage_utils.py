@@ -4992,6 +4992,14 @@ def _refresh_rows_index_on_disk(
         return None
     blob_client = _get_blob_client(container_name, blob_name) if container_name else None
     dirty = None if force_full else _get_dirty_search_index_filenames(key, kind)
+    if dirty is not None and not dirty and blob_client is not None:
+        # Nothing changed since the last build and the manifest is clean: rewriting the whole file
+        # (a full streamed pass) would only refresh its timestamp.
+        current = (_load_sort_index_manifest if kind == 'sort' else _load_access_index_manifest)(key)
+        if current.get('schemaVersion') == schema_version and current.get('sourceVersion') and not current.get('dirty'):
+            return LexicalIndexSnapshot(
+                user_id=key, source_version=str(current['sourceVersion']), schema_version=schema_version,
+                updated_at=str(current.get('updatedAt') or current['sourceVersion']), rows=[])
     with index_files.workspace() as workdir:
         out_path = os.path.join(workdir, f'{kind}.json.gz')
         header = {'userId': key, 'sourceVersion': source_version, 'schemaVersion': schema_version, 'updatedAt': source_version}

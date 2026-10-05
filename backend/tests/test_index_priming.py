@@ -566,10 +566,12 @@ def test_run_index_build_job_heartbeats_while_a_long_step_runs(monkeypatch):
     monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {'sort': True})
     monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda uid: False)
 
-    def slow_prime(uid, *, on_progress=None, wait=False):
+    def slow_prime(uid, *, on_progress=None, wait=False, kinds=None):
         assert wait is True
         time.sleep(0.2)  # one long single step with no progress callbacks
 
+    import library_build
+    monkeypatch.setattr(library_build, 'bootstrap_needed', lambda uid: False)
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', slow_prime)
     app._run_index_build_job('lib-1', 'index-build-lib-1')
     assert rows[0] == 'running' and rows.count('running') >= 3  # initial + several heartbeats
@@ -713,11 +715,32 @@ def test_people_job_refreshes_people_and_albums_not_the_whole_library(monkeypatc
     assert primed == [('people', 'albums')]
 
 
-def test_only_a_compaction_request_triggers_a_full_search_db_rebuild(monkeypatch):
+def test_a_long_delta_log_is_compacted_from_local_data_never_by_rescanning(monkeypatch):
+    import search_db
     primed, _ = _job_env(monkeypatch)
-    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {'status': 'needs_full', 'dirty': 999})
+    outcomes = iter([{'status': 'needs_full', 'dirty': 999}, {'status': 'noop'}])
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: next(outcomes))
+    compacted, summaries = [], []
+    monkeypatch.setattr(search_db, 'compact_database', lambda uid: compacted.append(uid) or {'ok': True})
+    monkeypatch.setattr(app, '_refresh_library_summaries', lambda uid: summaries.append(uid))
     app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
-    assert primed == [('sort', 'access'), ('lexical',)]
+    assert primed == [('sort', 'access')]                      # no ('lexical',) table-scan rebuild
+    assert compacted == ['lib-1'] and summaries == ['lib-1']
+
+
+def test_full_scope_bootstraps_only_a_library_without_a_database(monkeypatch):
+    import library_build
+    primed, _ = _job_env(monkeypatch)
+    ran = []
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {})
+    monkeypatch.setattr(library_build, 'bootstrap_library_build', lambda uid, **kw: ran.append(uid) or {'status': 'built'})
+    monkeypatch.setattr(library_build, 'bootstrap_needed', lambda uid: True)
+    app._run_index_build_job('lib-1', 'index-build-lib-1', 'full')
+    assert ran == ['lib-1'] and primed == [('sort', 'access', 'albums', 'people')]
+    ran.clear()
+    monkeypatch.setattr(library_build, 'bootstrap_needed', lambda uid: False)
+    app._run_index_build_job('lib-1', 'index-build-lib-1', 'full')
+    assert ran == []
 
 
 def test_each_scope_has_its_own_job_row_and_message(monkeypatch):
