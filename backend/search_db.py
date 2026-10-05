@@ -150,6 +150,39 @@ def _collect_location_terms(into: set, row: Dict) -> None:
             into.add(phrase)
 
 
+def row_record(row: Dict) -> Optional[Dict]:
+    """Everything the database stores for one photo (shared by the full build and by delta
+    updates, so both produce byte-identical rows): the reduced JSON, gallery columns, people ids,
+    the full-text document and the place-name terms. None when the row has no filename."""
+    filename = str(row.get('RowKey') or '').strip()
+    if not filename:
+        return None
+    slim = reduced_row(row)
+    captured = metadata_capture_datetime(row)
+    uploaded = metadata_upload_datetime(row)
+    people: List[str] = []
+    try:
+        people = [str(pid) for pid in json.loads(row.get('peopleIds') or '[]')]
+    except Exception:
+        pass
+    terms: set = set()
+    _collect_location_terms(terms, slim)
+    return {
+        'filename': filename,
+        'row_json': json.dumps(slim, ensure_ascii=False, separators=(',', ':')),
+        'capture_day': captured.astimezone(timezone.utc).date().toordinal() if captured else None,
+        'capture_ts': captured.timestamp() if captured else None,
+        'upload_ts': uploaded.timestamp() if uploaded else None,
+        'capture_year': captured.year if captured else None,
+        'capture_md': captured.month * 100 + captured.day if captured else None,
+        'rating': _as_int(row.get('rating')), 'likes': _as_int(row.get('likes')),
+        'lat': _as_float(row.get('latitude')), 'lon': _as_float(row.get('longitude')),
+        'people': people,
+        'doc': document_text(filename, slim),
+        'terms': sorted(terms),
+    }
+
+
 # --- build --------------------------------------------------------------------
 
 class DatabaseBuilder:
@@ -185,30 +218,18 @@ class DatabaseBuilder:
         )
 
     def add(self, row: Dict) -> None:
-        filename = str(row.get('RowKey') or '').strip()
-        if not filename:
+        record = row_record(row)
+        if record is None:
             return
         self.count += 1
-        slim = reduced_row(row)
-        captured = metadata_capture_datetime(row)
-        day = captured.astimezone(timezone.utc).date().toordinal() if captured else None
-        uploaded = metadata_upload_datetime(row)
         self._rows.append((
-            self.count, filename, day, json.dumps(slim, ensure_ascii=False, separators=(',', ':')),
-            captured.timestamp() if captured else None,
-            uploaded.timestamp() if uploaded else None,
-            captured.year if captured else None,
-            captured.month * 100 + captured.day if captured else None,
-            _as_int(row.get('rating')), _as_int(row.get('likes')),
-            _as_float(row.get('latitude')), _as_float(row.get('longitude')),
+            self.count, record['filename'], record['capture_day'], record['row_json'], record['capture_ts'],
+            record['upload_ts'], record['capture_year'], record['capture_md'], record['rating'], record['likes'],
+            record['lat'], record['lon'],
         ))
-        self._fts.append((self.count, document_text(filename, slim)))
-        try:
-            for pid in json.loads(row.get('peopleIds') or '[]'):
-                self._people.append((str(pid), self.count))
-        except Exception:
-            pass
-        _collect_location_terms(self._terms, slim)
+        self._fts.append((self.count, record['doc']))
+        self._people.extend((pid, self.count) for pid in record['people'])
+        self._terms.update(record['terms'])
         if len(self._rows) >= self.BATCH:
             self._flush()
 
@@ -295,6 +316,8 @@ class SearchDatabase:
         self.path = path
         self._local = threading.local()
         self._location_terms: Optional[List[str]] = None
+        self._seq: Optional[int] = None
+        self._timeline: Optional[Tuple[int, Dict]] = None
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, 'conn', None)
@@ -303,6 +326,111 @@ class SearchDatabase:
             conn.execute('PRAGMA cache_size=-16000')  # ~16MB page cache per thread
             self._local.conn = conn
         return conn
+
+    def applied_seq(self) -> int:
+        """Sequence number of the last delta applied to this local copy (0 = the base as built)."""
+        if self._seq is None:
+            row = self._conn().execute("SELECT value FROM meta WHERE key='delta_seq'").fetchone()
+            self._seq = int(row[0]) if row else 0
+        return self._seq
+
+    def apply_delta(self, delta: Dict) -> None:
+        """Apply one published delta (upserted photos + removed filenames) in place.
+
+        One write transaction on a WAL-mode file, so concurrent readers keep serving the previous
+        snapshot until it commits. A replaced photo's old row is removed from the contentless FTS
+        index by re-deriving the exact document that was indexed for it."""
+        upserts = delta.get('upserts') or []
+        deletes = [str(n) for n in (delta.get('deletes') or [])]
+        conn = sqlite3.connect(self.path, timeout=60)
+        try:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('BEGIN IMMEDIATE')
+            touched = list(dict.fromkeys([*deletes, *(str(u['filename']) for u in upserts)]))
+            for start in range(0, len(touched), 500):
+                chunk = touched[start:start + 500]
+                marks = ','.join('?' * len(chunk))
+                for row_id, filename, row_json in conn.execute(
+                    f'SELECT id, filename, row_json FROM rows WHERE filename IN ({marks})', chunk,
+                ).fetchall():
+                    try:
+                        old_doc = document_text(filename, json.loads(row_json))
+                        conn.execute("INSERT INTO fts(fts, rowid, doc) VALUES('delete', ?, ?)", (row_id, old_doc))
+                    except Exception:
+                        _LOGGER.warning('Could not drop FTS entry for %s', filename, exc_info=True)
+                    conn.execute('DELETE FROM row_people WHERE id = ?', (row_id,))
+                    conn.execute('DELETE FROM rows WHERE id = ?', (row_id,))
+            next_id = int(conn.execute('SELECT COALESCE(MAX(id), 0) + 1 FROM rows').fetchone()[0])
+            terms: set = set()
+            for upsert in upserts:
+                conn.execute(
+                    'INSERT INTO rows(id, filename, capture_day, row_json, capture_ts, upload_ts, capture_year, capture_md, '
+                    'rating, likes, lat, lon) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (next_id, upsert['filename'], upsert.get('capture_day'), upsert['row_json'], upsert.get('capture_ts'),
+                     upsert.get('upload_ts'), upsert.get('capture_year'), upsert.get('capture_md'),
+                     int(upsert.get('rating') or 0), int(upsert.get('likes') or 0), upsert.get('lat'), upsert.get('lon')))
+                conn.execute('INSERT INTO fts(rowid, doc) VALUES(?, ?)', (next_id, upsert['doc']))
+                conn.executemany('INSERT INTO row_people(person_id, id) VALUES(?, ?)',
+                                 [(str(pid), next_id) for pid in upsert.get('people') or []])
+                terms.update(upsert.get('terms') or [])
+                next_id += 1
+            if terms:
+                row = conn.execute("SELECT value FROM meta WHERE key='location_terms'").fetchone()
+                merged = set(json.loads(row[0])) if row else set()
+                merged |= terms
+                conn.execute("INSERT OR REPLACE INTO meta VALUES('location_terms', ?)",
+                             (json.dumps(sorted(merged, key=len, reverse=True)),))
+            conn.execute("INSERT OR REPLACE INTO meta VALUES('delta_seq', ?)", (str(int(delta['seq'])),))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._seq = int(delta['seq'])
+        self._location_terms = None
+        self._timeline = None
+
+    def timeline_summary(self, *, today=None) -> Dict:
+        """Year/month/day photo counts for the timeline, from the stored capture days (same shape
+        and rules as TimelineAccumulator: undated and future-dated photos are counted aside).
+        Cached until the next delta, so it always reflects new uploads."""
+        from datetime import date as _date
+        today = today or datetime.now(timezone.utc).date()
+        seq = self.applied_seq()
+        cached = self._timeline
+        if cached is not None and cached[0] == seq and cached[1].get('today') == today.isoformat():
+            return cached[1]
+        conn = self._conn()
+        total = int(conn.execute('SELECT COUNT(*) FROM rows').fetchone()[0])
+        undated = int(conn.execute('SELECT COUNT(*) FROM rows WHERE capture_day IS NULL').fetchone()[0])
+        years: Dict[str, Dict] = {}
+        future = 0
+        first = last = None
+        for ordinal, count in conn.execute('SELECT capture_day, COUNT(*) FROM rows WHERE capture_day IS NOT NULL GROUP BY capture_day'):
+            day = _date.fromordinal(int(ordinal))
+            if day > today:
+                future += int(count)
+                continue
+            year_bucket = years.setdefault(f'{day.year:04d}', {'count': 0, 'months': {}})
+            month_bucket = year_bucket['months'].setdefault(f'{day.month:02d}', {'count': 0, 'days': {}})
+            year_bucket['count'] += int(count)
+            month_bucket['count'] += int(count)
+            month_bucket['days'][f'{day.day:02d}'] = int(count)
+            first = day if first is None or day < first else first
+            last = day if last is None or day > last else last
+        cumulative: Dict[str, int] = {}
+        running = 0
+        for year_key in sorted(years):
+            running += years[year_key]['count']
+            cumulative[year_key] = running
+        summary = {
+            'years': years, 'cumulativeByYear': cumulative,
+            'firstDate': first.isoformat() if first else None, 'lastDate': last.isoformat() if last else None,
+            'today': today.isoformat(), 'undatedCount': undated, 'futureCount': future, 'totalCount': total,
+        }
+        self._timeline = (seq, summary)
+        return summary
 
     def location_terms(self) -> List[str]:
         if self._location_terms is None:
@@ -474,21 +602,50 @@ def _blob_names(user_id: str) -> Tuple[str, str]:
     return f'{key}-searchdb.sqlite.gz', f'{key}-searchdb.json'
 
 
+def _delta_blob_name(user_id: str, seq: int) -> str:
+    import storage_utils as su
+    return f'{su._vector_index_blob_key(user_id)}-searchdelta-{int(seq):06d}.json.gz'
+
+
 def _blob_client(name: str):
     import storage_utils as su
     return su._get_blob_client(su._lexical_index_container_name(), name)
 
 
+MANIFEST_TTL_SECONDS = float(os.getenv('SEARCH_DB_MANIFEST_TTL_SECONDS', '5'))
+_MANIFEST_CACHE: Dict[str, Tuple[float, Dict]] = {}
+
+
+def invalidate_manifest_cache(user_id: Optional[str] = None) -> None:
+    with _LOCKS_GUARD:
+        if user_id is None:
+            _MANIFEST_CACHE.clear()
+        else:
+            _MANIFEST_CACHE.pop(user_id, None)
+
+
 def load_manifest(user_id: str) -> Dict:
+    """The library's manifest. Every search/list/filter request asks for it, so a successful read
+    is reused for a few seconds (a storage round trip per request otherwise); failures are not
+    cached."""
+    if MANIFEST_TTL_SECONDS > 0:
+        with _LOCKS_GUARD:
+            hit = _MANIFEST_CACHE.get(user_id)
+        if hit is not None and time.monotonic() - hit[0] < MANIFEST_TTL_SECONDS:
+            return hit[1]
     _, manifest_name = _blob_names(user_id)
     client = _blob_client(manifest_name)
     if client is None:
         return {}
     try:
         parsed = json.loads(client.download_blob().readall().decode('utf-8'))
-        return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
+    manifest = parsed if isinstance(parsed, dict) else {}
+    if MANIFEST_TTL_SECONDS > 0 and manifest:
+        with _LOCKS_GUARD:
+            _MANIFEST_CACHE[user_id] = (time.monotonic(), manifest)
+    return manifest
 
 
 def needs_build(user_id: str) -> bool:
@@ -539,6 +696,7 @@ class SearchDbSink:
         user_id = self.user_id
         data_name, manifest_name = _blob_names(user_id)
         data_client, manifest_client = _blob_client(data_name), _blob_client(manifest_name)
+        previous_seq = int(load_manifest(user_id).get('deltaSeq') or 0)
         with perf_instrumentation.span('searchdb.build', user=user_id, rows=self._builder.count):
             count = self._builder.finish()
         if data_client is None or manifest_client is None:
@@ -558,10 +716,111 @@ class SearchDbSink:
         manifest_client.upload_blob(
             json.dumps({
                 'userId': user_id, 'sourceVersion': self.source_version, 'schemaVersion': SCHEMA_VERSION,
-                'rowCount': count, 'updatedAt': self.updated_at,
+                'rowCount': count, 'updatedAt': self.updated_at, 'deltaSeq': 0, 'deltaRows': 0,
             }, separators=(',', ':')).encode('utf-8'),
             overwrite=True, content_settings=ContentSettings(content_type='application/json'),
         )
+        invalidate_manifest_cache(user_id)
+        # A new base absorbs every earlier delta; their blobs are garbage now.
+        for seq in range(1, previous_seq + 1):
+            client = _blob_client(_delta_blob_name(user_id, seq))
+            if client is not None:
+                try:
+                    client.delete_blob()
+                except Exception:
+                    pass
+
+
+# --- incremental updates ----------------------------------------------------------
+
+# Rebuild (compact) instead of appending another delta when the log gets long or large.
+DELTA_MAX_COUNT = int(os.getenv('SEARCH_DB_DELTA_MAX_COUNT', '200'))
+DELTA_MAX_ROW_FRACTION = float(os.getenv('SEARCH_DB_DELTA_MAX_ROW_FRACTION', '0.25'))
+
+
+def delta_budget_exceeded(manifest: Dict, adding: int) -> bool:
+    base_rows = max(1, int(manifest.get('rowCount') or 0))
+    return (
+        int(manifest.get('deltaSeq') or 0) >= DELTA_MAX_COUNT
+        or (int(manifest.get('deltaRows') or 0) + adding) > DELTA_MAX_ROW_FRACTION * base_rows
+    )
+
+
+def publish_delta(user_id: str, upserts: List[Dict], deletes: List[str]) -> Optional[int]:
+    """Append one delta to the library's database. Returns the new sequence number, or None if
+    nothing could be published (no base, base replaced meanwhile, storage error).
+
+    The delta blob is written first, then the manifest is advanced with a compare-and-swap on its
+    ETag, so a concurrent full rebuild (new base version) or another publisher can never be
+    overwritten: the loser simply discards its delta."""
+    manifest = load_manifest(user_id)
+    base_version = str(manifest.get('sourceVersion') or '')
+    if not base_version or manifest.get('schemaVersion') != SCHEMA_VERSION:
+        return None
+    seq = int(manifest.get('deltaSeq') or 0) + 1
+    delta_client = _blob_client(_delta_blob_name(user_id, seq))
+    _, manifest_name = _blob_names(user_id)
+    manifest_client = _blob_client(manifest_name)
+    if delta_client is None or manifest_client is None:
+        return None
+    from azure.storage.blob import ContentSettings
+    payload = gzip.compress(json.dumps(
+        {'baseVersion': base_version, 'seq': seq, 'upserts': upserts, 'deletes': deletes},
+        ensure_ascii=False, separators=(',', ':')).encode('utf-8'), compresslevel=5)
+    try:
+        with perf_instrumentation.span('searchdb.delta.upload', user=user_id, upserts=len(upserts), deletes=len(deletes)):
+            delta_client.upload_blob(payload, overwrite=True, content_settings=ContentSettings(content_type='application/gzip'))
+        # Re-read the manifest *uncached* and swap only if it is still the one we based this on.
+        invalidate_manifest_cache(user_id)
+        try:
+            props = manifest_client.get_blob_properties()
+        except Exception:
+            props = None
+        current = json.loads(manifest_client.download_blob().readall().decode('utf-8'))
+        if current.get('sourceVersion') != base_version or int(current.get('deltaSeq') or 0) != seq - 1:
+            _LOGGER.info('Search DB delta %s discarded: manifest moved on', seq)
+            return None
+        updated = {**current, 'deltaSeq': seq, 'deltaRows': int(current.get('deltaRows') or 0) + len(upserts) + len(deletes),
+                   'updatedAt': datetime.now(timezone.utc).isoformat()}
+        kwargs = {}
+        etag = getattr(props, 'etag', None)
+        if etag:
+            from azure.core import MatchConditions
+            kwargs = {'etag': etag, 'match_condition': MatchConditions.IfNotModified}
+        manifest_client.upload_blob(
+            json.dumps(updated, separators=(',', ':')).encode('utf-8'), overwrite=True,
+            content_settings=ContentSettings(content_type='application/json'), **kwargs)
+    except Exception:
+        _LOGGER.warning('Publishing search DB delta failed for %s', user_id, exc_info=True)
+        return None
+    invalidate_manifest_cache(user_id)
+    perf_instrumentation.log_event('searchdb_delta_published', user=user_id, seq=seq, upserts=len(upserts), deletes=len(deletes))
+    return seq
+
+
+def sync_deltas(user_id: str, db: 'SearchDatabase', manifest: Dict) -> None:
+    """Bring this replica's local copy up to the manifest's delta sequence. Best-effort: if a delta
+    cannot be fetched or applied the replica keeps serving what it has (slightly stale) and retries
+    on a later request."""
+    target = int(manifest.get('deltaSeq') or 0)
+    if db.applied_seq() >= target:
+        return
+    base_version = str(manifest.get('sourceVersion') or '')
+    with _user_lock(user_id):
+        while db.applied_seq() < target:
+            seq = db.applied_seq() + 1
+            client = _blob_client(_delta_blob_name(user_id, seq))
+            if client is None:
+                return
+            try:
+                with perf_instrumentation.span('searchdb.delta.apply', user=user_id, seq=seq):
+                    delta = json.loads(gzip.decompress(client.download_blob().readall()).decode('utf-8'))
+                    if delta.get('baseVersion') != base_version or int(delta.get('seq') or 0) != seq:
+                        return  # belongs to another base: a rebuild is publishing; next request re-resolves
+                    db.apply_delta(delta)
+            except Exception:
+                _LOGGER.warning('Applying search DB delta %s failed for %s', seq, user_id, exc_info=True)
+                return
 
 
 def write_for_snapshot(user_id: str, snapshot) -> bool:
@@ -655,6 +914,8 @@ def open_database(user_id: str, *, allow_download: bool = True) -> Optional[Sear
     with _LOCKS_GUARD:
         existing = _OPEN.get(path)
     if existing is not None and os.path.exists(path):
+        if allow_download:
+            sync_deltas(user_id, existing, manifest)
         return existing
     if not os.path.exists(path):
         if not allow_download:
@@ -669,6 +930,8 @@ def open_database(user_id: str, *, allow_download: bool = True) -> Optional[Sear
         for stale in [p for p in _OPEN if p != path and os.path.basename(p).startswith(f'{_safe(user_id)}-')]:
             _OPEN.pop(stale, None)
     _evict_user(user_id, keep=path)
+    if allow_download:
+        sync_deltas(user_id, db, manifest)
     return db
 
 
@@ -687,6 +950,12 @@ def _download(user_id: str, path: str) -> bool:
         with perf_instrumentation.span('searchdb.unpack', user=user_id):
             with gzip.open(tmp_gz, 'rb') as src, open(tmp_db, 'wb') as dst:
                 shutil.copyfileobj(src, dst, 1024 * 1024)
+        # WAL lets delta updates be applied in place while other threads keep reading.
+        conn = sqlite3.connect(tmp_db)
+        try:
+            conn.execute('PRAGMA journal_mode=WAL')
+        finally:
+            conn.close()
         os.replace(tmp_db, path)
         _enforce_budget(keep=path)
         perf_instrumentation.log_event('searchdb_ready', user=user_id, mb=round(os.path.getsize(path) / 1048576, 1))

@@ -82,3 +82,10 @@ def _sequential_table_scans_by_default(monkeypatch):
     RowKey-range scan is covered by tests/test_table_scan.py (explicit workers=)."""
     import table_scan
     monkeypatch.setattr(table_scan, 'PARALLELISM', 1)
+
+
+@pytest.fixture(autouse=True)
+def _no_manifest_cache_in_tests(monkeypatch):
+    """Tests publish new manifests and expect the next read to see them."""
+    import search_db
+    monkeypatch.setattr(search_db, 'MANIFEST_TTL_SECONDS', 0)

@@ -3992,6 +3992,89 @@ def stream_library_artifacts(user_id: str, source_version: Optional[str], sinks_
     return count
 
 
+SEARCH_DB_DELTA_CHUNK = int(os.getenv('SEARCH_DB_DELTA_CHUNK', '5000'))
+# Above this many changed photos one pass rebuilds the database instead of appending deltas.
+SEARCH_DB_DELTA_MAX_NAMES = int(os.getenv('SEARCH_DB_DELTA_MAX_NAMES', '200000'))
+
+
+def _fetch_rows_by_names(user_id: str, names: List[str], select: List[str]) -> Dict[str, Optional[Dict]]:
+    """Rows for specific filenames: ``RowKey eq .. or ..`` queries of 15 names each (the Table
+    Storage limit), several at a time -- ~N/15 round trips instead of N point reads."""
+    table = _CTX.get('metadata_table_client')
+    if table is None:
+        raise RuntimeError('metadata table not configured')
+    pk = _escape_odata(user_id)
+    batches = [names[i:i + 15] for i in range(0, len(names), 15)]
+
+    def _fetch(batch: List[str]) -> Dict[str, Optional[Dict]]:
+        clause = ' or '.join(f"RowKey eq '{_escape_odata(name)}'" for name in batch)
+        rows = {str(r.get('RowKey') or ''): dict(r)
+                for r in _query_projected(table, f"PartitionKey eq '{pk}' and ({clause})", select)}
+        return {name: rows.get(name) for name in batch}
+
+    out: Dict[str, Optional[Dict]] = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(batches)))) as executor:
+        for part in executor.map(_fetch, batches):
+            out.update(part)
+    return out
+
+
+def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
+    """Bring the library's search database up to date by publishing small DELTAS for the photos
+    whose rows changed, instead of re-scanning and rebuilding the whole library.
+
+    Cost is proportional to what changed (a few round trips per 15 photos), not to the library, so
+    it stays cheap at millions of photos. Replicas apply the deltas to their local copy in place
+    (see search_db.sync_deltas). Returns a status:
+      noop        nothing is dirty
+      delta       one or more deltas were published (``published`` of them)
+      no_base     the library has no database yet (a full build is needed first)
+      needs_full  too much changed, or the delta log is long: caller should rebuild/compact
+      unavailable the dirty-name table cannot be read (never treated as "nothing changed")
+      conflict    a concurrent rebuild/publisher won; nothing is lost, the names stay dirty
+    """
+    import search_db
+    key = str(user_id or '').strip()
+    if not key:
+        return {'status': 'unavailable'}
+    search_db.invalidate_manifest_cache(key)
+    manifest = search_db.load_manifest(key)
+    if not manifest.get('sourceVersion') or manifest.get('schemaVersion') != search_db.SCHEMA_VERSION:
+        return {'status': 'no_base'}
+    dirty = _get_dirty_search_index_filenames(key, 'lexical')
+    if dirty is None:
+        return {'status': 'unavailable'}
+    if not dirty:
+        return {'status': 'noop'}
+    if len(dirty) > SEARCH_DB_DELTA_MAX_NAMES or search_db.delta_budget_exceeded(manifest, len(dirty)):
+        return {'status': 'needs_full', 'dirty': len(dirty)}
+
+    names = sorted(dirty)
+    published = 0
+    upserted = removed = 0
+    with perf_instrumentation.step('searchdb.delta.build', user=key, dirty=len(names)):
+        for start in range(0, len(names), SEARCH_DB_DELTA_CHUNK):
+            chunk = names[start:start + SEARCH_DB_DELTA_CHUNK]
+            rows = _fetch_rows_by_names(key, chunk, _STREAM_SELECT_FIELDS)
+            upserts, deletes = [], []
+            for name in chunk:
+                row = rows.get(name)
+                complete = row is not None and str(row.get('processing_complete')).strip().lower() in ('true', '1')
+                gone = row is None or str(row.get('processing_state') or '').strip().lower() == 'deleted'
+                record = search_db.row_record(row) if (complete and not gone) else None
+                if record is not None:
+                    upserts.append(record)
+                else:
+                    deletes.append(name)
+            if search_db.publish_delta(key, upserts, deletes) is None:
+                return {'status': 'conflict', 'published': published}
+            _clear_dirty_search_index_filenames(key, 'lexical', chunk)
+            published += 1
+            upserted += len(upserts)
+            removed += len(deletes)
+    return {'status': 'delta', 'published': published, 'upserts': upserted, 'deletes': removed}
+
+
 def refresh_user_lexical_artifacts(user_id: str, source_version: Optional[str] = None):
     """What the index primer runs for the 'lexical' kind: the app-level streaming
     build when registered, else the legacy full-snapshot refresh (tests only)."""

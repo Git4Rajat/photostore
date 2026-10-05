@@ -482,3 +482,25 @@ The smoke test did not call destructive routes. These were read for the patterns
 | `POST /api/photos/delete` and restore | Already parallel point reads and writes. | Trash-index update per photo only. |
 
 Known remaining cost: purge's job-row cleanup still reads the user's jobs partition. The retention sweep (§15.1) keeps that small.
+
+### 15.4 Incremental search database (no full rebuilds for normal change)
+
+A full library rebuild is minutes at 130k photos and does not scale to millions, so ordinary change is now applied as small **deltas**.
+
+- **Worker (`refresh_user_search_db_incremental`):** reads the changed filenames from the `lexical` dirty table and fetches just those rows (15 per query, in parallel). It publishes a delta blob `<key>-searchdelta-NNNNNN.json.gz` of upserted photos and removed filenames, then advances `deltaSeq` in the manifest with a compare-and-swap on its ETag. A concurrent full rebuild therefore cannot be overwritten. Large changes go out in chunks of 5000. A dirty-table outage reports `unavailable`; it is never read as "nothing changed".
+- **Replicas (`search_db.sync_deltas`):** `open_database` compares the manifest's `deltaSeq` with the local copy's `delta_seq` and applies the missing deltas in place, in one WAL transaction each, so readers never block. A joining replica downloads the base file once, then applies the deltas. An updated photo's old FTS entry is removed by re-deriving the exact indexed document. If a delta can't be fetched, the replica keeps serving what it has and retries on a later request.
+- **Compaction:** one full rebuild (`prime ... kinds=('lexical',)`) runs only when the delta log reaches `SEARCH_DB_DELTA_MAX_COUNT` (200), the deltas cover more than `SEARCH_DB_DELTA_MAX_ROW_FRACTION` (25%) of the base, or more than `SEARCH_DB_DELTA_MAX_NAMES` changed at once. A new base resets `deltaSeq` and deletes the old deltas.
+- **Timeline** is computed from the replica's database (`timeline_summary`, cached until the next delta), so it reflects new uploads immediately.
+- **Manifest reads** are cached for 5 s (`SEARCH_DB_MANIFEST_TTL_SECONDS`) instead of one storage call per request.
+
+Build scopes and triggers:
+
+| Scope | Runs | Triggered by |
+| --- | --- | --- |
+| `full` | everything | library never indexed, schema upgrade, compaction request |
+| `light` | sort + access indexes, then the database delta | ipworker queue drain / every 10k files, dirty sort/access observed, Workbench action |
+| `people` | people + albums indexes, then the database delta | a clustering, recluster or propagate job finishing |
+
+Each scope has its own job row and trigger cooldown. `light` and `people` touch different indexes, so ipworker and clustering do not repeat each other's work; whichever runs second finds the dirty set empty and its delta step is a no-op. `people` requests wait at least `INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS` (600) after the previous one.
+
+Still full-rebuild-only: the Explore places/things summary. Still O(library) per light build: the sort and access index files (streamed on the worker, but a million-photo sort index is too big for the browser either way).

@@ -104,6 +104,7 @@ from storage_utils import (
     upload_media_file,
     prime_available_vector_indexes,
     refresh_user_vector_index,
+    refresh_user_search_db_incremental,
     get_vector_index_manifest_summary,
     get_vector_index_blob_location,
     invalidate_user_vector_index_cache,
@@ -9839,6 +9840,8 @@ def _index_build_job_id(user_id: str) -> str:
 
 INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS', '30'))
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
+# The people/albums rebuild reads every cluster and face, so repeated clustering runs coalesce harder.
+INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '600'))
 
 
 def _job_row_fresh_active(key: str, job_id: str) -> bool:
@@ -9902,14 +9905,15 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> 
     key = str(user_id or '').strip()
     if not key:
         return 'unavailable'
-    light = scope == 'light'
-    if _index_build_job_active(key):
+    scope = scope if scope in ('full', 'light', 'people') else 'full'
+    light = scope != 'full'
+    if not light and _index_build_job_active(key):
         return 'already_active'
     if library_ops_queue_client is None:
         return 'unavailable'
     # Light (post-upload sort/access refresh) uses its own job row so it never
     # masks or blocks a full build, and does not show as "library indexing".
-    job_id = _index_build_job_id(key) + ('-light' if light else '')
+    job_id = _index_build_job_id(key) + (f'-{scope}' if light else '')
     if light and _job_row_fresh_active(key, job_id):
         return 'already_active'
     # A build is a full streamed scan of the library, so an upload burst that
@@ -9922,7 +9926,8 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> 
         updated = _parse_iso_date(str(previous.get('updatedAt') or ''))
         if updated is not None:
             elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
-            delay = int(max(0, INDEX_BUILD_MIN_INTERVAL_SECONDS - elapsed))
+            minimum = INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS if scope == 'people' else INDEX_BUILD_MIN_INTERVAL_SECONDS
+            delay = int(max(0, minimum - elapsed))
     _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'queued')
     try:
         library_ops_queue_client.send_message(json.dumps(
@@ -9982,8 +9987,16 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     try:
         with perf_instrumentation.scope(f'index.build.{scope}', user=user_id, job=job_id):
             storage_utils_ensure_sort_current(user_id)  # schema upgrade (full rebuild if stale)
-            if scope == 'light':
-                prime_all_user_indexes_sequentially(user_id, wait=True, kinds=('sort', 'access'))
+            if scope in ('light', 'people'):
+                # Incremental maintenance: cost follows what changed, not library size.
+                kinds = ('sort', 'access') if scope == 'light' else ('people', 'albums')
+                prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                outcome = refresh_user_search_db_incremental(user_id)
+                perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, **{
+                    k: v for k, v in outcome.items() if isinstance(v, (int, str))})
+                if outcome.get('status') == 'needs_full':
+                    # Compaction: too much changed (or a long delta log) -- rebuild the base once.
+                    prime_all_user_indexes_sequentially(user_id, wait=True, kinds=('lexical',))
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
             else:
                 prime_all_user_indexes_sequentially(user_id, on_progress=_index_build_progress_callback(user_id), wait=True)
@@ -13147,7 +13160,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         # A clustering run changes people/albums; this (not an upload) is what
         # makes the heavy indexes worth rebuilding.
         try:
-            _trigger_tools_index_rebuild(user_id, reason='clustering-run', scope='full')
+            _trigger_tools_index_rebuild(user_id, reason='clustering-run', scope='people')
         except Exception:
             worker_logger.exception('Post-clustering index rebuild trigger failed for %s', user_id)
 
@@ -14256,11 +14269,12 @@ def _trigger_tools_index_rebuild(user_id: str, reason: str = 'trigger', scope: s
     if not key or (not tools_url and library_ops_queue_client is None):
         return
     now = time.monotonic()
+    cooldown_key = f'{key}|{scope}'   # a light trigger must not swallow a people/full one
     with _TOOLS_REBUILD_TRIGGER_LOCK:
-        last = _TOOLS_REBUILD_TRIGGER_LAST.get(key)
+        last = _TOOLS_REBUILD_TRIGGER_LAST.get(cooldown_key)
         if last is not None and (now - last) < _TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS:
             return
-        _TOOLS_REBUILD_TRIGGER_LAST[key] = now
+        _TOOLS_REBUILD_TRIGGER_LAST[cooldown_key] = now
     # Preferred: queue the build on the worker (see enqueue_index_build). The
     # tools HTTP path below is only the fallback when no queue is configured.
     if library_ops_queue_client is not None:

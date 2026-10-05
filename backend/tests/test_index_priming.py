@@ -689,3 +689,43 @@ def test_light_job_only_primes_sort_and_access(monkeypatch):
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: calls.append(k.get('kinds')))
     app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
     assert calls == [('sort', 'access')]
+
+
+def _job_env(monkeypatch):
+    primed, status = [], []
+    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda uid: None)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: status.append(a[3]))
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(k.get('kinds')))
+    return primed, status
+
+
+def test_light_job_maintains_sort_access_and_the_search_db_incrementally(monkeypatch):
+    primed, status = _job_env(monkeypatch)
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {'status': 'delta', 'published': 1})
+    app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
+    assert primed == [('sort', 'access')] and status[-1] == 'done'
+
+
+def test_people_job_refreshes_people_and_albums_not_the_whole_library(monkeypatch):
+    primed, _ = _job_env(monkeypatch)
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {'status': 'noop'})
+    app._run_index_build_job('lib-1', 'index-build-lib-1-people', 'people')
+    assert primed == [('people', 'albums')]
+
+
+def test_only_a_compaction_request_triggers_a_full_search_db_rebuild(monkeypatch):
+    primed, _ = _job_env(monkeypatch)
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {'status': 'needs_full', 'dirty': 999})
+    app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
+    assert primed == [('sort', 'access'), ('lexical',)]
+
+
+def test_each_scope_has_its_own_job_row_and_message(monkeypatch):
+    q = _FakeQueue()
+    monkeypatch.setattr(app, 'library_ops_queue_client', q)
+    monkeypatch.setattr(app, 'jobs_table_client', None)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
+    for scope in ('light', 'people', 'full'):
+        assert app.enqueue_index_build('lib-1', reason='r', scope=scope) == 'queued'
+    assert [(m['scope'], m['jobId']) for m in q.sent] == [
+        ('light', 'index-build-lib-1-light'), ('people', 'index-build-lib-1-people'), ('full', 'index-build-lib-1')]

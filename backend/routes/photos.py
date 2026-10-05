@@ -666,7 +666,17 @@ def photos_timeline():
     # Serve the PRECOMPUTED summary (built on tools after each index build, see
     # refresh_user_timeline_summary) -- never load the listing index into this
     # process. Cold account: empty timeline now, nudge tools to build it.
-    summary = storage_utils.load_timeline_summary(user_id)
+    # Read from the library database (up to date with every delta); the precomputed blob is the
+    # fallback when no database is available on this replica yet.
+    summary = None
+    try:
+        db = search_db.open_database(user_id)
+        if db is not None:
+            summary = db.timeline_summary()
+    except Exception:
+        app.app.logger.warning('Timeline from the library database failed', exc_info=True)
+    if summary is None:
+        summary = storage_utils.load_timeline_summary(user_id)
     if summary is None:
         try:
             app._trigger_tools_index_rebuild(user_id)
