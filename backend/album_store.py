@@ -11,6 +11,7 @@ read and one transaction, so nothing else about albums changes. Rows written bef
 from __future__ import annotations
 
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
@@ -112,6 +113,10 @@ def fit(filenames: List[str]) -> Tuple[List[str], bool]:
 # filename order and pages by walking RowKeys, so nothing about it is bounded by a row size.
 
 _MEMBERS = None
+# An album bigger than this lives in the members table even though it would still fit in its row: a row
+# holding 10,000+ names is ~0.7 MB that every add/remove rewrites and every index rebuild, photo delete and
+# page read has to fetch and parse. Members rows are touched only for the photos that change.
+INLINE_MAX_PHOTOS = int(os.getenv('ALBUM_INLINE_MAX_PHOTOS', '2000'))
 _MEMBER_LOCK = threading.Lock()
 _BATCH = 100
 _EXISTS_CHUNK = 15            # Table Storage allows 15 comparisons in one filter
@@ -258,6 +263,9 @@ def add(entity: Dict, names: List[str]) -> List[str]:
     have = set(current)
     new = [n for n in names if n not in have]
     combined = current + new
+    if _MEMBERS is not None and len(combined) > INLINE_MAX_PHOTOS:
+        _promote(entity, combined)
+        return new
     try:
         write_filenames(entity, combined)
     except AlbumTooLarge:
@@ -287,6 +295,9 @@ def remove(entity: Dict, names: List[str]) -> List[str]:
 
 def set_all(entity: Dict, names: List[str]) -> None:
     """Replace the whole list on a NEW entity (creation paths)."""
+    if _MEMBERS is not None and len(names) > INLINE_MAX_PHOTOS:
+        _promote(entity, names)
+        return
     try:
         write_filenames(entity, names)
     except AlbumTooLarge:

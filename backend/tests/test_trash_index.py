@@ -95,24 +95,29 @@ def test_a_failing_batch_query_falls_back_to_point_reads(monkeypatch):
     assert app._get_metadata_entities('u1', ['a.jpg', 'b.jpg'])['b.jpg']['rating'] == 2
 
 
-def test_adding_many_photos_to_an_album_checks_existence_in_batches(monkeypatch):
+def test_adding_many_photos_to_an_album_checks_existence_in_the_library_database(monkeypatch):
     from routes import albums
     table = FakeTable()
-    for i in range(40):
+    for i in range(41):                                        # p40 was uploaded seconds ago: only in the table
         table.upsert_entity({'PartitionKey': 'u1', 'RowKey': f'p{i}.jpg'})
-    queries = []
-    real = table.query_entities
-    table.query_entities = lambda f, **k: (queries.append(f), real(f, **k))[1]
+    reads = []
+    real_get, real_query = table.get_entity, table.query_entities
+    table.get_entity = lambda partition_key, row_key: (reads.append(row_key), real_get(partition_key, row_key))[1]
+    table.query_entities = lambda *a, **k: (_ for _ in ()).throw(AssertionError('no OR-filter queries'))
     monkeypatch.setattr(app, 'metadata_table_client', table)
+
+    class FakeDb:
+        def existing_filenames(self, names):
+            return {n for n in names if n.startswith('p') and n != 'p40.jpg'}
+    monkeypatch.setattr(app, '_open_library_db', lambda uid: FakeDb())
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
     monkeypatch.setattr(app, '_albums_table_available', lambda: True)
     entity = {'PartitionKey': 'u1', 'RowKey': 'al', 'filenames': '[]'}
     monkeypatch.setattr(app, '_load_album_entity', lambda uid, aid: entity)
-    saved = []
-    monkeypatch.setattr(app, '_save_album_entity', lambda e: saved.append(e))
+    monkeypatch.setattr(app, '_save_album_entity', lambda e: None)
     monkeypatch.setattr(app, '_album_entity_to_payload', lambda e: {})
-    names = [f'p{i}.jpg' for i in range(40)] + ['ghost.jpg']
+    names = [f'p{i}.jpg' for i in range(41)] + ['ghost.jpg']
     with app.app.test_request_context('/api/albums/al/photos/add', method='POST', json={'filenames': names}):
         payload = albums.add_photos_to_album('al').get_json()
-    assert len(payload['added']) == 40 and payload['errors'] == ['ghost.jpg: Not found']
-    assert len(queries) == 3                                   # ceil(41 / 15), not 41 point reads
+    assert len(payload['added']) == 41 and payload['errors'] == ['ghost.jpg: Not found']
+    assert sorted(reads) == ['ghost.jpg', 'p40.jpg']           # only what the database did not know

@@ -172,3 +172,22 @@ def test_without_a_members_table_oversize_still_raises(monkeypatch):
     monkeypatch.setattr(album_store, '_MEMBERS', None)
     with pytest.raises(album_store.AlbumTooLarge):
         album_store.add({'PartitionKey': 'u', 'RowKey': 'a'}, BIG)
+
+
+def test_albums_above_the_inline_cap_live_in_the_members_table(members, monkeypatch):
+    monkeypatch.setattr(album_store, 'INLINE_MAX_PHOTOS', 50)
+    entity = {'PartitionKey': 'u', 'RowKey': 'alb'}
+    album_store.set_all(entity, [f'a{i}.jpg' for i in range(40)])
+    assert not album_store.is_table_backed(entity)
+    album_store.add(entity, [f'b{i}.jpg' for i in range(20)])          # 60 > 50
+    assert album_store.is_table_backed(entity) and album_store.count(entity) == 60
+    assert all(entity.get(k, '') == '' for k in entity if k.startswith('filenames'))
+
+
+def test_existing_filenames_lookup_on_the_library_database(tmp_path):
+    import search_db
+    path = str(tmp_path / 'l.sqlite')
+    search_db.build_database([{'RowKey': f'p{i}.jpg', 'uploadDate': '2020-01-01T00:00:00+00:00'} for i in range(1200)], path)
+    db = search_db.SearchDatabase(path)
+    names = [f'p{i}.jpg' for i in range(0, 1200, 2)] + ['ghost.jpg']
+    assert db.existing_filenames(names) == {f'p{i}.jpg' for i in range(0, 1200, 2)}
