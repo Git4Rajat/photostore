@@ -240,9 +240,9 @@ def test_get_index_manifest_summary_returns_none_when_never_built(monkeypatch):
 
 def test_get_index_manifest_summary_returns_version_and_dirty(monkeypatch):
     monkeypatch.setattr(storage_utils, '_load_sort_index_manifest',
-                        lambda uid: {'sourceVersion': 'v9', 'updatedAt': '2026-01-01', 'dirty': True})
+                        lambda uid: {'sourceVersion': 'v9', 'updatedAt': '2026-01-01', 'dirty': True, 'rowCount': 12})
     summary = storage_utils.get_index_manifest_summary('u', 'sort')
-    assert summary == {'source_version': 'v9', 'updated_at': '2026-01-01', 'dirty': True}
+    assert summary == {'source_version': 'v9', 'updated_at': '2026-01-01', 'dirty': True, 'row_count': 12}
 
 
 def test_get_user_index_build_state_flags_dirty_as_needs_rebuild(monkeypatch):

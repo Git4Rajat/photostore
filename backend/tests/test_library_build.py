@@ -155,3 +155,35 @@ def test_summaries_come_from_the_finished_database(world, monkeypatch):
     monkeypatch.setattr(library_build, 'FINALIZE_HOOK', lambda uid, db: got.append(db.row_count()))
     library_build.bootstrap_library_build('lib')
     assert got == [95]
+
+
+def test_a_library_past_the_client_limit_skips_the_sort_index_entirely(world, monkeypatch):
+    svc, table = world
+    monkeypatch.setattr(storage_utils, 'SORT_INDEX_MAX_ROWS', 50)               # 97 photos > 50
+    result = library_build.bootstrap_library_build('lib')
+    assert result['status'] == 'built' and result.get('sortSkipped')
+    manifest = json.loads(svc.store['lexical-index/' + storage_utils._sort_index_manifest_blob_name('lib')])
+    assert manifest['skipped'] is True and manifest['rowCount'] == 97
+    assert 'lexical-index/' + storage_utils._sort_index_json_blob_name('lib') not in svc.store
+    assert storage_utils.get_user_index_build_state('lib')['indexes']['sort'] is True      # still counts as ready
+
+    # later maintenance neither rebuilds it nor marks anything dirty for it
+    scans = len(table.calls)
+    storage_utils.refresh_user_sort_index('lib')
+    assert len(table.calls) == scans
+    storage_utils.touch_user_search_indexes_state('lib', filenames=['IMG_0001.jpg'])
+    dirty = storage_utils._CTX['search_index_dirty_table_client']
+    storage_utils._flush_dirty_filename_buffer('lib', 'lexical')
+    assert not any('sort' in row['PartitionKey'] for row in dirty.rows.values())
+
+
+def test_a_rating_edit_reaches_the_search_database_as_a_delta(world):
+    svc, table = world
+    library_build.bootstrap_library_build('lib')
+    row = next(r for r in table.rows if r['RowKey'] == 'IMG_0004.jpg')
+    row['rating'] = 5
+    storage_utils.touch_user_sort_index_dirty('lib', ['IMG_0004.jpg'])         # what the rating route calls
+    outcome = storage_utils.refresh_user_search_db_incremental('lib')
+    assert outcome['status'] == 'delta'
+    db = search_db.open_database('lib')
+    assert 'IMG_0004.jpg' in db.filter_page(min_rating=5)[0]

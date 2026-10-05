@@ -231,6 +231,7 @@ app.logger.setLevel(os.getenv('LOG_LEVEL', 'INFO').upper())
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 worker_logger = logging.getLogger(__name__)
+import album_store
 import perf_instrumentation
 import table_scan
 import storage_utils as storage_utils_module
@@ -2094,11 +2095,7 @@ def _album_cover_thumbnail_url(user_id: str, filenames: List[str]) -> str:
 
 
 def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = None) -> Dict:
-    filenames = []
-    try:
-        filenames = json.loads(entity.get('filenames', '[]') or '[]')
-    except Exception:
-        filenames = []
+    filenames = album_store.read_filenames(entity)
     is_public = _coerce_bool(entity.get('isPublic', False))
     token = entity.get('publicToken') or ''
     has_access_code = bool(str(entity.get('accessCode', '')).strip())
@@ -5275,14 +5272,11 @@ def _remove_filename_from_albums(user_id: str, filename: str) -> None:
     except Exception:
         rows = []
     for row in rows:
-        try:
-            filenames = json.loads(row.get('filenames', '[]') or '[]')
-        except Exception:
-            filenames = []
+        filenames = album_store.read_filenames(row)
         updated = [item for item in filenames if item != filename]
         if updated == filenames:
             continue
-        row['filenames'] = json.dumps(updated)
+        album_store.write_filenames(row, updated)
         try:
             albums_table_client.upsert_entity(row)
         except Exception:
@@ -8111,10 +8105,7 @@ def _load_album_entity(user_id: str, album_id: str) -> Optional[Dict]:
 
 
 def _album_filenames(entity: Dict) -> List[str]:
-    try:
-        return json.loads(entity.get('filenames', '[]') or '[]')
-    except Exception:
-        return []
+    return album_store.read_filenames(entity)
 
 
 def _save_album_entity(entity: Dict) -> None:
@@ -8807,14 +8798,21 @@ def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = Non
 
 
 def _load_photos_for_filenames(user_id: str, filenames: List[str]) -> List[Dict]:
+    """Photo summaries for ``filenames`` in the given order, trashed/missing ones skipped.
+
+    Rows are read in batches (``RowKey eq .. or ..``, 15 per query, in parallel) and summarised in
+    one pass -- this used to be one sequential point read per photo, so opening a 1,000-photo album
+    was ~1,000 round trips."""
+    names = [str(n) for n in filenames]
+    if not names:
+        return []
     pid_to_name, _ = _load_people_name_index(user_id)
-    photos = []
-    for name in filenames:
-        metadata = _get_metadata_entity(user_id, name)
-        if metadata is None or metadata.get('processing_state') == 'deleted':
-            continue
-        photos.append(_build_photo_summary(user_id, name, metadata, include_props=False, pid_to_name=pid_to_name))
-    return photos
+    fetched = _get_metadata_entities(user_id, names)
+    items = [
+        (name, fetched[name]) for name in names
+        if isinstance(fetched.get(name), dict) and fetched[name].get('processing_state') != 'deleted'
+    ]
+    return _build_photo_summaries_page(user_id, items, pid_to_name)
 
 
 @app.after_request
@@ -12652,14 +12650,11 @@ def _batch_remove_filenames_from_albums(user_id: str, names_set: set) -> None:
     except Exception:
         return
     for row in rows:
-        try:
-            filenames = json.loads(row.get('filenames', '[]') or '[]')
-        except Exception:
-            continue
+        filenames = album_store.read_filenames(row)
         updated = [item for item in filenames if item not in names_set]
         if len(updated) == len(filenames):
             continue
-        row['filenames'] = json.dumps(updated)
+        album_store.write_filenames(row, updated)
         try:
             albums_table_client.upsert_entity(row)
         except Exception:

@@ -1,7 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
-import { getLocalSortIndex, patchLocalSortIndexRow, type SortIndexRow } from '../../services/localSortIndex';
+import { getLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import { getLocalPeopleIndex, invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
@@ -49,6 +49,7 @@ const withIndexRetry = async <T,>(fetchIndex: () => Promise<T | null>): Promise<
     for (let attempt = 0; attempt < 3; attempt += 1) {
         const result = await fetchIndex();
         if (result) return result;
+        if (isServerPagedLibrary()) return null;   // too big for a client index: retrying cannot help
         if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 3000));
     }
     return null;
@@ -372,7 +373,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // /api/photos/lookup-batch instead of GET /albums/<id>'s sequential
     // per-photo point-read loop. Empty (album not found here) means the
     // fallback path (GET /albums/<id>) should be used instead.
-    const albumFilenamesRef = useRef<Record<string, string[]>>({});
     const [albumPhotos, setAlbumPhotos] = useState<Record<string, Photo[]>>({});
     // Keyed per album id -- a single shared flag raced when switching albums
     // quickly: a fast fetch for album B finishing after a slow fetch for album
@@ -442,20 +442,22 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const albumById = useCallback((id: string) => albums.find((a) => a.id === id), [albums]);
     const personById = useCallback((id: string) => people.find((p) => p.id === id), [people]);
 
-    // Legacy server-paged fetch (was the only path; now the fallback -- see
-    // fetchPhotos below). Materializes and sorts the whole library
-    // server-side per request, which is the O(library size) cost the
-    // sort-index path exists to avoid; kept only so the gallery degrades
-    // gracefully instead of breaking when the sort-index is unavailable.
+    // Server-paged fetch: the gallery's path for libraries too large for a client-side sort index
+    // (see isServerPagedLibrary) and its fallback whenever the index is unavailable. The backend
+    // answers from the library database with one indexed SQL page plus a few batched row reads, so
+    // a page costs the same at 10k or 10M photos. With the media token, thumbnails are built
+    // client-side from the returned blob names (directMedia), and a page is sized to the screen.
     const fetchPhotosViaLegacyEndpoint = useCallback(async (offset: number, reset: boolean) => {
         const range = captureRangeRef.current;
         const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
+        const token = getCachedMediaToken();
+        const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
         const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
-            `/photos?sort=capture&offset=${offset}&limit=${PAGE_SIZE}${rangeQuery}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
+            `/photos?sort=capture&offset=${offset}&limit=${pageSize}${rangeQuery}${token ? '&directMedia=1' : ''}`,
         );
         const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
         photoOffsetRef.current = offset + list.length;
-        photoHasMoreRef.current = list.length === PAGE_SIZE;
+        photoHasMoreRef.current = list.length === pageSize;
         setHasMorePhotos(photoHasMoreRef.current);
         if (typeof res?.total === 'number') setTotalPhotos(res.total);
         setPhotos((prev) => (reset ? list : [...prev, ...list]));
@@ -718,7 +720,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // on any failure (cold index, network error) so the page never breaks.
     const fetchAlbumsViaLegacyEndpoint = useCallback(async () => {
         const res = await get<{ albums?: Album[] }>('/albums');
-        albumFilenamesRef.current = {};
         setAlbums(Array.isArray(res?.albums) ? res.albums : []);
     }, []);
 
@@ -749,7 +750,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             if (needBatch.length) {
                 (await resolveThumbnailAccessUrls(needBatch)).forEach((url, filename) => covers.set(filename, url));
             }
-            albumFilenamesRef.current = Object.fromEntries(rows.map((r) => [r.albumId, r.filenames]));
             const mapped: Album[] = rows.map((r) => ({
                 id: r.albumId,
                 name: r.name,
@@ -1037,63 +1037,41 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const reloadExplore = useCallback(() => { void fetchExplore(); }, [fetchExplore]);
 
-    // /api/photos/lookup-batch caps a single call at 200 filenames -- chunk
-    // and resolve chunks concurrently rather than sequentially, so a large
-    // album's cost is one round trip's worth of latency, not N.
-    const LOOKUP_BATCH_CHUNK = 200;
-    const lookupPhotosByFilenames = useCallback(async (filenames: string[]): Promise<Photo[]> => {
-        if (filenames.length === 0) return [];
-        const chunks: string[][] = [];
-        for (let i = 0; i < filenames.length; i += LOOKUP_BATCH_CHUNK) {
-            chunks.push(filenames.slice(i, i + LOOKUP_BATCH_CHUNK));
-        }
-        const responses = await Promise.all(
-            chunks.map((chunk) => post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: chunk })),
-        );
-        const byFilename = new Map<string, BackendPhoto>();
-        responses.forEach((res) => (res?.photos ?? []).forEach((p) => byFilename.set(p.filename, p)));
-        // Re-order to match the album's stored order -- lookup-batch may
-        // silently drop a filename deleted since the index was built.
-        return filenames
-            .map((f) => byFilename.get(f))
-            .filter((p): p is BackendPhoto => Boolean(p))
-            .map((p) => mapPhoto(p));
-    }, []);
-
-    // Legacy path: the sequential per-photo point-read GET /albums/<id> does
-    // server-side. Kept only as a fallback for when the album isn't in the
-    // locally-cached index (cold index, network error) so opening an album
-    // never breaks.
-    const openAlbumViaLegacyEndpoint = useCallback(async (id: string) => {
-        const res = await get<{ album?: Album; photos?: BackendPhoto[] }>(`/albums/${encodeURIComponent(id)}`);
-        const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
-        setAlbumPhotos((prev) => ({ ...prev, [id]: list }));
-        if (res?.album) {
-            setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
-        }
-    }, []);
-
+    // Album contents are served by the backend, a screenful at a time: the albums index no longer
+    // carries every album's filename list (it grew with the album sizes and the browser downloaded all
+    // of it). The first page lands immediately; the remaining pages stream in behind it.
+    const ALBUM_PAGE = 120;
+    const albumLoadSeq = useRef<Record<string, number>>({});
     const openAlbum = useCallback(async (id: string) => {
+        const seq = (albumLoadSeq.current[id] ?? 0) + 1;
+        albumLoadSeq.current[id] = seq;
+        const stale = () => albumLoadSeq.current[id] !== seq;
         setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: true }));
         try {
-            const filenames = albumFilenamesRef.current[id];
-            if (filenames === undefined) {
-                // Not in the locally-cached index (cold/unavailable) -- fall
-                // back rather than silently showing an empty album.
-                throw new Error('album not in local index');
+            let offset = 0;
+            let collected: Photo[] = [];
+            for (;;) {
+                const res = await get<{ album?: Album; photos?: BackendPhoto[]; hasMore?: boolean }>(
+                    `/albums/${encodeURIComponent(id)}?offset=${offset}&limit=${ALBUM_PAGE}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
+                );
+                if (stale()) return;
+                const page = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
+                collected = offset === 0 ? page : [...collected, ...page];
+                setAlbumPhotos((prev) => ({ ...prev, [id]: collected }));
+                if (offset === 0) {
+                    if (res?.album) setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
+                    // First screenful is in: stop showing the spinner while the rest streams in.
+                    setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: false }));
+                }
+                if (!res?.hasMore || page.length === 0) break;
+                offset += ALBUM_PAGE;
             }
-            const list = await lookupPhotosByFilenames(filenames);
-            setAlbumPhotos((prev) => ({ ...prev, [id]: list }));
         } catch {
-            try {
-                await openAlbumViaLegacyEndpoint(id);
-            } catch {
-                setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
-            }
+            setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
         } finally {
-            setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: false }));
+            if (!stale()) setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: false }));
         }
-    }, [lookupPhotosByFilenames, openAlbumViaLegacyEndpoint]);
+    }, []);
 
     const albumPhotosById = useCallback((id: string) => albumPhotos[id], [albumPhotos]);
     const isAlbumPhotosLoading = useCallback((id: string) => Boolean(albumPhotosLoadingIds[id]), [albumPhotosLoadingIds]);
@@ -1106,7 +1084,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const created = res?.album;
                 if (created) {
                     setAlbums((prev) => [...prev, created]);
-                    albumFilenamesRef.current = { ...albumFilenamesRef.current, [created.id]: [] };
                     invalidateLocalAlbumsIndex();
                     return created.id;
                 }
@@ -1176,14 +1153,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             void post(`/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids })
                 .then(() => {
                     toast(`Added ${ids.length} to “${album?.name ?? 'album'}”`);
-                    // Keep the cached filename list in step so openAlbum below
-                    // (which reads from this ref) sees the new photos
-                    // immediately instead of the stale pre-add list.
-                    const existing = albumFilenamesRef.current[albumId] ?? [];
-                    albumFilenamesRef.current = {
-                        ...albumFilenamesRef.current,
-                        [albumId]: Array.from(new Set([...existing, ...ids])),
-                    };
                     // Reconcile with the server (cover, ordering). The cache is
                     // already seeded above, so this refresh never shows a spinner.
                     void openAlbum(albumId);

@@ -251,9 +251,15 @@ def _finalize(key: str, build_id: str, spool: str, chunks: int, total_rows: int)
     version = datetime.now(timezone.utc).isoformat()
     result: Dict[str, object] = {'status': 'built', 'rows': total_rows, 'chunks': chunks}
 
-    sort_ok = _assemble_rows_index(
-        'sort', key, spool, chunks, schema_version=su._SORT_INDEX_SCHEMA_VERSION,
-        blob_name=su._sort_index_json_blob_name(key), manifest_blob_name=su._sort_index_manifest_blob_name(key), version=version)
+    if su.SORT_INDEX_MAX_ROWS > 0 and total_rows > su.SORT_INDEX_MAX_ROWS:
+        # Too big for a browser to use: the gallery pages from the server. Record the manifest only.
+        su._publish_skipped_sort_manifest(key, version, total_rows)
+        sort_ok = True
+        result['sortSkipped'] = True
+    else:
+        sort_ok = _assemble_rows_index(
+            'sort', key, spool, chunks, schema_version=su._SORT_INDEX_SCHEMA_VERSION,
+            blob_name=su._sort_index_json_blob_name(key), manifest_blob_name=su._sort_index_manifest_blob_name(key), version=version)
     access_ok = _assemble_rows_index(
         'access', key, spool, chunks, schema_version=su._ACCESS_INDEX_SCHEMA_VERSION,
         blob_name=su._access_index_json_blob_name(key), manifest_blob_name=su._access_index_manifest_blob_name(key), version=version)

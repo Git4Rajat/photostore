@@ -48,6 +48,7 @@ from image_utils import (
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
 from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
+import album_store
 import index_files
 import table_scan
 import maps_utils
@@ -4213,7 +4214,7 @@ def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
             pass
 
 
-def _mark_search_index_dirty_filenames(user_id: str, filenames) -> None:
+def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> None:
     """Buffer filenames as dirty for the vector/lexical/sort indexes'
     incremental rebuilds (kept in separate partitions per index kind so one
     index's rebuild consuming its dirty set doesn't blind the other to the
@@ -4235,12 +4236,15 @@ def _mark_search_index_dirty_filenames(user_id: str, filenames) -> None:
     if not filenames:
         return
     to_flush: List[Tuple[str, str]] = []
+    wanted = tuple(kinds) if kinds is not None else _SEARCH_INDEX_KINDS
+    if 'sort' in wanted and sort_index_skipped(user_id):
+        wanted = tuple(k for k in wanted if k != 'sort')
     with _DIRTY_FILENAME_BUFFER_LOCK:
         for filename in filenames:
             filename = str(filename or '').strip()
             if not filename:
                 continue
-            for kind in _SEARCH_INDEX_KINDS:
+            for kind in wanted:
                 key = (user_id, kind)
                 bucket = _DIRTY_FILENAME_BUFFER.setdefault(key, set())
                 bucket.add(filename)
@@ -4294,6 +4298,37 @@ def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames
             pass
 
 
+# Past this many photos the sort index has no consumer: the browser pages from the server instead of
+# downloading it (see routes/photos.py photos_sort_index) and nothing server-side reads it. So it is
+# not built, not marked dirty, and not rewritten by every light build (a full streamed pass at 1M).
+SORT_INDEX_MAX_ROWS = int(os.getenv('SORT_INDEX_CLIENT_MAX_ROWS', '200000'))
+
+
+def _library_row_count(user_id: str) -> int:
+    try:
+        import search_db
+        return int(search_db.load_manifest(user_id).get('rowCount') or 0)
+    except Exception:
+        return 0
+
+
+def sort_index_skipped(user_id: str) -> bool:
+    return SORT_INDEX_MAX_ROWS > 0 and _library_row_count(user_id) > SORT_INDEX_MAX_ROWS
+
+
+def _publish_skipped_sort_manifest(user_id: str, version: str, row_count: int) -> None:
+    """Record that the sort index is intentionally absent for a huge library (readiness still holds)."""
+    container = _lexical_index_container_name()
+    client = _get_blob_client(container, _sort_index_manifest_blob_name(user_id)) if container else None
+    if client is None:
+        return
+    client.upload_blob(
+        json.dumps({'userId': user_id, 'sourceVersion': version, 'schemaVersion': _SORT_INDEX_SCHEMA_VERSION,
+                    'rowCount': row_count, 'dirty': False, 'skipped': True, 'updatedAt': version},
+                   separators=(',', ':')).encode('utf-8'),
+        overwrite=True, content_settings=BlobContentSettings(content_type='application/json'))
+
+
 def touch_user_search_indexes_state(
     user_id: str, *, embedding_version: Optional[str] = None, filenames=None,
 ) -> None:
@@ -4319,7 +4354,8 @@ def touch_user_search_indexes_state(
     touch_user_vector_index_state(user_id, embedding_version=embedding_version)
     touch_user_lexical_index_state(user_id)
     touch_user_tag_embedding_index_state(user_id)
-    touch_user_sort_index_state(user_id)
+    if not sort_index_skipped(user_id):
+        touch_user_sort_index_state(user_id)
     touch_user_access_index_state(user_id)
     if filenames:
         _mark_search_index_dirty_filenames(user_id, filenames if isinstance(filenames, (list, set, tuple)) else [filenames])
@@ -4786,6 +4822,11 @@ def touch_user_sort_index_dirty(user_id: str, filenames) -> None:
     key = str(user_id or '').strip()
     if not key or not filenames:
         return
+    # The search database stores rating/likes too (filter and gallery order), so the change must
+    # reach it as a delta even though no search *text* changed.
+    _mark_search_index_dirty_filenames(key, [str(f) for f in filenames], kinds=('lexical',))
+    if sort_index_skipped(key):
+        return
     touch_user_sort_index_state(key)
     table = _CTX.get('search_index_dirty_table_client')
     if table is None:
@@ -5106,6 +5147,11 @@ def refresh_user_sort_index(
     key = str(user_id or '').strip()
     if not key:
         return None
+    if sort_index_skipped(key):
+        version = str(source_version or datetime.now(timezone.utc).isoformat())
+        _publish_skipped_sort_manifest(key, version, _library_row_count(key))
+        return LexicalIndexSnapshot(user_id=key, source_version=version, schema_version=_SORT_INDEX_SCHEMA_VERSION,
+                                    updated_at=version, rows=[])
     return _refresh_rows_index_on_disk(
         'sort', key, str(source_version or datetime.now(timezone.utc).isoformat()),
         schema_version=_SORT_INDEX_SCHEMA_VERSION,
@@ -5685,7 +5731,7 @@ def access_index_is_dirty(user_id: str) -> bool:
 # rebuild (re-scan the small album partition + look up cover data from the
 # already-resident sort index) is cheap enough to just always do. Own dirty
 # flag only (no per-album dirty-filenames partition).
-_ALBUMS_INDEX_SCHEMA_VERSION = 'v1'
+_ALBUMS_INDEX_SCHEMA_VERSION = 'v2'  # v2: no per-album filename lists (the browser opens albums from the server)
 _ALBUMS_INDEX_CACHE_LOCK = threading.RLock()
 _ALBUMS_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _ALBUMS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -5913,18 +5959,27 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
         # dirty:false state (see refresh_user_sort_index's identical note).
         return None
 
-    # Best-effort cover data source -- never blocks this build on the sort
-    # index's own cold-build path (allow_sync_build=False): covers just fall
-    # back to "first filename in the album" until the sort index catches up.
-    sort_rows_by_filename: Dict[str, Dict[str, object]] = {}
+    # Covers come from the library database (highest rating, then most likes, then newest): a SQL
+    # lookup per album, so memory does not grow with the library. Without a database yet the first
+    # photo in album order stands in. (This used to load every photo's sort-index row into a dict --
+    # hundreds of MB at a million photos.)
+    import search_db
     try:
-        sort_index = get_user_sort_index(user_id, allow_refresh=True, allow_sync_build=False)
-        if sort_index is not None:
-            sort_rows_by_filename = {
-                str(row.get('RowKey') or ''): row for row in sort_index.get('rows', []) if row.get('RowKey')
-            }
+        library_db = search_db.open_database(user_id)
     except Exception:
-        sort_rows_by_filename = {}
+        library_db = None
+
+    def _cover(names: List[str]) -> str:
+        if not names:
+            return ''
+        if library_db is not None:
+            try:
+                best = library_db.top_rated(names, limit=1)
+                if best:
+                    return best[0]
+            except Exception:
+                _LOGGER.warning('Album cover lookup failed', exc_info=True)
+        return names[0]
 
     trimmed_rows: List[Dict[str, object]] = []
     for row in rows:
@@ -5933,19 +5988,13 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
             continue
         if str(row.get('deleted') or '').strip().lower() in ('true', '1'):
             continue
-        try:
-            filenames = json.loads(row.get('filenames', '[]') or '[]')
-        except Exception:
-            filenames = []
-        if not isinstance(filenames, list):
-            filenames = []
+        filenames = album_store.read_filenames(row)
         trimmed_rows.append({
             'albumId': album_id,
             'name': str(row.get('name') or ''),
             'photoCount': len(filenames),
-            'coverFilename': _pick_album_cover_filename(filenames, sort_rows_by_filename),
+            'coverFilename': _cover(filenames),
             'updatedAt': str(row.get('updatedAt') or ''),
-            'filenames': filenames,
             **_album_share_fields(row),
         })
 
@@ -6823,10 +6872,15 @@ def get_index_manifest_summary(user_id: str, kind: str) -> Optional[Dict[str, ob
     source_version = str(manifest.get('sourceVersion') or '').strip()
     if not source_version:
         return None
+    try:
+        row_count = int(manifest.get('rowCount') or 0)
+    except (TypeError, ValueError):
+        row_count = 0
     return {
         'source_version': source_version,
         'updated_at': manifest.get('updatedAt') or source_version,
         'dirty': bool(manifest.get('dirty')),
+        'row_count': row_count,
     }
 
 

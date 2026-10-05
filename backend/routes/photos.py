@@ -14,6 +14,8 @@ import app
 import search_db
 import storage_utils
 
+SORT_INDEX_CLIENT_MAX_ROWS = int(__import__('os').getenv('SORT_INDEX_CLIENT_MAX_ROWS', '200000'))
+
 photos_bp = Blueprint('photos', __name__)
 
 @photos_bp.route('/api/photos/thumbnail/<path:filename>', methods=['GET'])
@@ -899,6 +901,11 @@ def photos_sort_index():
         sort_summary = None
     if sort_summary is None:
         return app.jsonify({'available': False})
+    # Past this size the file is too big for a browser to download and sort (about 180 MB at a
+    # million photos). Tell the client up front so it pages from the server instead, without
+    # fetching anything or retrying.
+    if sort_summary.get('row_count', 0) > SORT_INDEX_CLIENT_MAX_ROWS:
+        return app.jsonify({'available': False, 'reason': 'library_too_large', 'rowCount': sort_summary['row_count']})
     if sort_summary.get('dirty'):
         app._trigger_tools_index_rebuild(user_id, reason='sort-dirty', scope='light')
     try:

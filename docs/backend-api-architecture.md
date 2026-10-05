@@ -532,3 +532,17 @@ Still full-rebuild-only: the Explore places/things summary. Still O(library) per
 - **Sort/access light builds** rewrite their whole file when something changes (a streamed disk pass, about a minute at 1M).
 
 **Measured on a synthetic 1,000,000-photo library** (one worker core, in-memory fake storage, so no network time): the chunked build took 410 s, throughput was flat at about 3,300 photos/s from the first chunk to the last (no super-linear step), peak RSS was 374 MB, and the finished database was 599 MB (75 MB gzipped), with the sort and access indexes at 7 MB and 6 MB gzipped. A search over the whole library took about 0.4 s. In production the table scan (about 1,000 photos/s per sequential read stream) is what dominates, so expect 15-20 minutes at 1M, resumable throughout. The scan was the only thing that was super-linear before. Gallery ordering now uses plain indexed column order, and the upload-time index was added: page 1 went from 124-380 ms to under 1 ms at 1M rows, and a 500k offset from 3.7 s to 1.2 s.
+
+### 15.6 Albums and the gallery at a million photos
+
+**Albums index** (schema `v2`)
+- Covers are chosen by SQL over the library database (`top_rated`), one lookup per album. Building the index no longer loads every photo's sort row into a dict, which was hundreds of MB at 1M photos.
+- The index no longer carries each album's filename list. Rows are `{albumId, name, photoCount, coverFilename, updatedAt, share fields}`, so the download grows with the number of albums, not their size.
+- `GET /api/albums/<id>` serves an album's contents from the server: photo rows are read in batches of 15 (it was one point read per photo) and `?offset=&limit=` returns a window (`total`, `hasMore`). The browser fetches the first 120 photos, shows them, and streams the rest.
+
+**Album size cap (a bug I found).** An album's photo list was one JSON string in a single Table property, which Azure caps at 64 KB, so an album could hold only about 1,500 photos and a larger write failed with a 400. This is likely why smart albums on a big library "didn't work". `album_store.py` now splits the list across `filenames`, `filenames_1` ... `filenames_13`, giving roughly 14,000-20,000 photos per album (about 784 KB of the 1 MB row limit), with the same single row, point read and transaction. Existing rows read back unchanged. An add beyond the limit returns 413 `album_too_large`. A smart album larger than the limit is trimmed to what fits, with a message.
+
+**Gallery paging.** The sort index is a JSON file of every photo, about 24 MB at 130k and about 180 MB at 1M, which a browser can't download and sort. `/api/photos/sort-index` now answers `{available: false, reason: 'library_too_large', rowCount}` above `SORT_INDEX_CLIENT_MAX_ROWS` (200,000), so the browser downloads nothing and does not retry, and the gallery pages from the server (`/api/photos?sort=capture&offset&limit&directMedia=1`).
+- A server page is one indexed SQL page over the library database plus four batched row reads, so it costs the same at 10k or 10M photos. Page size follows the screen.
+- For those libraries the sort index is no longer built, marked dirty or rewritten by light builds (`sort_index_skipped`). Readiness still holds, via a manifest with `skipped: true`.
+- Rating and like edits used to dirty only the sort index, so the search database's rating column went stale. They now also mark the photo for the next delta.

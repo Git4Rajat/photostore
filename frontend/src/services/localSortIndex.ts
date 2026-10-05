@@ -24,7 +24,13 @@ export interface SortIndexRow {
     thumb?: string;
 }
 
+/** True once the server said this library is too big for a client-side sort index (it pages instead). */
+let serverPaged = false;
+export const isServerPagedLibrary = (): boolean => serverPaged;
+
 interface SortIndexResponse {
+    reason?: string;
+    rowCount?: number;
     available: boolean;
     indexUrl?: string;
     sourceVersion?: string;
@@ -151,6 +157,10 @@ const fetchLocalSortIndex = async (key: string): Promise<SortIndexRow[] | null> 
     const manifestStarted = perfNow();
     const response: SortIndexResponse = await get('/api/photos/sort-index');
     perf.recordSpan('index.sort.manifest', perfNow() - manifestStarted);
+    if (response?.reason === 'library_too_large') {
+        serverPaged = true;      // nothing to download: the gallery pages from the server
+        return null;
+    }
     if (!response?.available || !response.indexUrl) {
         return null;
     }
