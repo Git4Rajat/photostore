@@ -7,6 +7,7 @@ clause]), delete_entity, create_table.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 
 class ResourceNotFound(Exception):
@@ -16,6 +17,8 @@ class ResourceNotFound(Exception):
 class FakeTable:
     def __init__(self) -> None:
         self.rows: dict = {}  # (pk, rk) -> dict
+        self.stamps: dict = {}  # (pk, rk) -> datetime of the last write (the service-side Timestamp)
+        self.clock = None  # tests may set a callable returning a datetime
         self.submit_transaction_calls: list = []  # list of the operations lists passed in
 
     def create_table(self):
@@ -23,6 +26,7 @@ class FakeTable:
 
     def upsert_entity(self, entity, mode=None, **kwargs):
         self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
+        self.stamps[(entity['PartitionKey'], entity['RowKey'])] = self.clock() if self.clock else datetime.now(timezone.utc)
 
     def submit_transaction(self, operations):
         # Real azure-data-tables requires every entity in one transaction to
@@ -62,6 +66,13 @@ class FakeTable:
         # of the partition key value itself. Second alternative covers
         # unquoted OData boolean literals (e.g. "processing_complete eq
         # true"), which don't fit the quoted-string '(.*)' form.
+        m = re.match(r"PartitionKey eq '([^']*)' and Timestamp ge datetime'([^']+)'$", filter_str.strip())
+        if m:
+            pk, since = m.group(1), datetime.strptime(m.group(2), '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            rows = [dict(v) for (p, r), v in self.rows.items() if p == pk and self.stamps.get((p, r), since) >= since]
+            if select:
+                rows = [{k: v[k] for k in select if k in v} for v in rows]
+            return rows
         m = re.match(r"PartitionKey eq '([^']*)' and \((.+)\)$", filter_str.strip())
         if m:
             # "PartitionKey eq 'x' and (a ge 'v' or b eq 'w' or ...)"

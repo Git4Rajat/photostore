@@ -6188,7 +6188,9 @@ def get_user_albums_index(
 # background-rebuild machinery already ensures a burst of writes (e.g. a
 # clustering run reassigning hundreds of faces) triggers at most one real
 # rebuild per idle period, not one per write.
-_PEOPLE_INDEX_SCHEMA_VERSION = 'v1'
+_PEOPLE_INDEX_SCHEMA_VERSION = 'v2'   # v2: rows carry autoName so incremental refresh can renumber "Unnamed N"
+_PEOPLE_INCREMENTAL_MAX_CHANGED = int(os.getenv('PEOPLE_INDEX_INCREMENTAL_MAX_CHANGED', '3000'))
+_PEOPLE_INCREMENTAL_SKEW_SECONDS = 180
 _PEOPLE_INDEX_CACHE_LOCK = threading.RLock()
 _PEOPLE_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _PEOPLE_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -6507,6 +6509,7 @@ def _people_index_rows_from_scan(
 
         trimmed_rows.append({
             'personId': person_id,
+            'autoName': not raw_name,
             'name': name,
             'isNamed': is_named,
             'faceCount': len(active_face_ids),
@@ -6529,13 +6532,105 @@ def _people_index_rows_from_scan(
     )
 
 
+class _PointReadFaces:
+    """face_kv stand-in for the incremental path: nothing is bulk-loaded, so every face
+    is a miss and _people_index_rows_from_scan point-reads just the changed persons' faces."""
+
+    def get_many(self, ids):
+        return {}
+
+
+def _odata_utc(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _incremental_people_index_snapshot(
+    user_id: str, source_version: str, since: str, prev_rows: List[Dict[str, object]],
+) -> Optional[LexicalIndexSnapshot]:
+    """Re-derive only the clusters touched since ``since`` (person rows or face rows written
+    after it) and carry every other row over from the previous snapshot. Costs one key-only
+    pass over the person table plus point reads for the changed clusters, instead of reading
+    every face. Returns None to ask the caller for a full build."""
+    person_table_client = _CTX.get('person_table_client')
+    face_table_client = _CTX.get('face_table_client')
+    if person_table_client is None or face_table_client is None:
+        return None
+    base = f"PartitionKey eq '{_escape_odata(user_id)}'"
+    stamp = f"Timestamp ge datetime'{since}'"
+    try:
+        changed: Dict[str, Dict] = {}
+        for row in _query_projected(person_table_client, f"{base} and {stamp}", _PEOPLE_INDEX_PERSON_COLUMNS):
+            rk = str(row.get('RowKey') or '')
+            if rk:
+                changed[rk] = {k: row.get(k) for k in _PEOPLE_INDEX_PERSON_COLUMNS if k in row}
+        touched: set = set()
+        for row in _query_projected(face_table_client, f"{base} and {stamp}", ['PartitionKey', 'RowKey', 'personId']):
+            pid = str(row.get('personId') or '')
+            if pid:
+                touched.add(pid)
+            if len(touched) + len(changed) > _PEOPLE_INCREMENTAL_MAX_CHANGED:
+                return None
+        existing = {
+            str(row.get('RowKey') or '')
+            for row in _query_projected(person_table_client, base, ['PartitionKey', 'RowKey'])
+        }
+    except Exception:
+        return None
+    existing.discard('')
+    for pid in touched:
+        if pid in existing and pid not in changed:
+            try:
+                changed[pid] = person_table_client.get_entity(partition_key=user_id, row_key=pid)
+            except Exception:
+                return None
+    if len(changed) > _PEOPLE_INCREMENTAL_MAX_CHANGED:
+        return None
+    by_id = {str(r.get('personId')): r for r in prev_rows if isinstance(r, dict)}
+    for pid in list(by_id):
+        if pid not in existing:
+            del by_id[pid]          # deleted or merged away
+    fresh = _people_index_rows_from_scan(
+        user_id, source_version,
+        [changed[k] for k in sorted(changed) if k in existing],
+        _PointReadFaces(), person_table_client, face_table_client,
+    )
+    for pid in changed:
+        by_id.pop(pid, None)        # re-derived below, or dropped if now empty
+    for row in fresh.rows:
+        by_id[str(row['personId'])] = row
+    rows = [by_id[k] for k in sorted(by_id)]
+    counter = 1
+    for row in rows:                # "Unnamed N" is positional, so renumber over the merged list
+        if row.get('autoName'):
+            row['name'] = f'Unnamed {counter}'
+            counter += 1
+    rows.sort(key=lambda r: 0 if r.get('isNamed') else 1)
+    return LexicalIndexSnapshot(
+        user_id=str(user_id), source_version=source_version, schema_version=_PEOPLE_INDEX_SCHEMA_VERSION,
+        updated_at=source_version, rows=rows,
+    )
+
+
 def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+    started = datetime.now(timezone.utc)
 
-    snapshot = _build_user_people_index_snapshot(key, source_version)
+    snapshot = None
+    previous_manifest = _load_people_index_manifest(key)
+    since = str(previous_manifest.get('builtThrough') or '')
+    if since and previous_manifest.get('schemaVersion') == _PEOPLE_INDEX_SCHEMA_VERSION:
+        prev = _load_people_index_blob(key)
+        if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
+                and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
+            snapshot = _incremental_people_index_snapshot(key, source_version, since, prev.rows)
+            perf_instrumentation.log_event(
+                'people_index_incremental', user=key, ok=snapshot is not None,
+                rows=len(snapshot.rows) if snapshot else 0)
+    if snapshot is None:
+        snapshot = _build_user_people_index_snapshot(key, source_version)
     if snapshot is None:
         return None
     container_name = _lexical_index_container_name()
@@ -6558,6 +6653,7 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
             'rowCount': len(snapshot.rows),
             'dirty': False,
             'updatedAt': snapshot.updated_at,
+            'builtThrough': _odata_utc(started - timedelta(seconds=_PEOPLE_INCREMENTAL_SKEW_SECONDS)),
         }
         manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))
         if manifest_client is not None:
