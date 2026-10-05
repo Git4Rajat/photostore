@@ -8,7 +8,7 @@ import type { BrowserProcessingAction } from '../../../components/AppServicesPro
 import { getTools, postTools, postAdmin, getExtras } from '../../../services/apiClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog } from '../../../components/shared/dialogs';
-import type { Photo } from '../types';
+
 
 const TABS = ['Overview', 'Workbench', 'Recovery', 'History', 'Diagnostics'];
 
@@ -63,7 +63,7 @@ interface PeopleDiagnostic {
 
 /** Tools — live pipeline health + a bulk re-run row + recovery/history. */
 export const ToolsPage: React.FC = () => {
-    const { toast, route, photos, navigate } = useStore();
+    const { toast, route, navigate } = useStore();
     const {
         activeJobs, clusteringActive, clusteringStatusLabel, ipworkActive, ipworkStatusLabel,
         startBrowserProcessing, browserProcessingActive, browserAiModelState, loadBrowserAiModel,
@@ -131,13 +131,6 @@ export const ToolsPage: React.FC = () => {
 
     const toggleWbSelect = (id: string) =>
         setWbSelection((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-
-    // Any deep-linked filename not present in the loaded library yet still
-    // needs a minimal record so it can render as a tile.
-    const missingDeepLinked: Photo[] = workbenchFilenames
-        .filter((filename) => !photos.some((p) => p.id === filename))
-        .map((filename) => ({ id: filename, filename, swatch: 's1', dateLabel: '', year: 0, rating: 0, liked: false, placeId: null, personIds: [], tags: [] }));
-    const workbenchLibrary: Photo[] = [...missingDeepLinked, ...photos];
 
     const loadHistory = async () => {
         setHistoryLoading(true);
@@ -324,7 +317,7 @@ export const ToolsPage: React.FC = () => {
                         each tile shows how all 7 steps did and an <InformationCircleIcon className="pt-inline-icon" /> for its EXIF + tags.
                     </div>
                     <WorkbenchGrid
-                        photos={workbenchLibrary}
+                        pinned={workbenchFilenames}
                         selection={wbSelection}
                         onToggleSelect={toggleWbSelect}
                         onSelectMany={setWbSelection}

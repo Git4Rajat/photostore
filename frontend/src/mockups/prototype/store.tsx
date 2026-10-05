@@ -66,7 +66,7 @@ const swatchFor = (filename: string): SwatchKey => {
     return `s${n}` as SwatchKey;
 };
 
-const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMediaToken()): Photo => {
+export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMediaToken()): Photo => {
     const iso = b.captureDate || b.uploadDate || b.lastModified || null;
     const date = iso ? new Date(iso) : null;
     const valid = date && !Number.isNaN(date.getTime()) ? date : null;
@@ -924,16 +924,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const reloadTrash = useCallback(async () => {
         setTrashLoading(true);
         try {
-            const res = await get<{ photos?: (BackendPhoto & { purgeAt?: string })[] }>('/photos/trash?limit=200');
             const now = Date.now();
-            const items: TrashItem[] = Array.isArray(res?.photos)
-                ? res.photos.map((p) => {
+            // Page through the whole trash (200 per request) so nothing past the first page is hidden.
+            const items: TrashItem[] = [];
+            for (;;) {
+                const res = await get<{ photos?: (BackendPhoto & { purgeAt?: string })[]; total?: number }>(`/photos/trash?limit=200&offset=${items.length}`);
+                const page = Array.isArray(res?.photos) ? res.photos : [];
+                items.push(...page.map((p) => {
                     const purgeAt = (p as { purgeAt?: string }).purgeAt;
                     const days = purgeAt ? Math.max(0, Math.ceil((new Date(purgeAt).getTime() - now) / 86400000)) : 30;
                     return { photo: mapPhoto(p), purgesInDays: days };
-                })
-                : [];
-            setTrash(items);
+                }));
+                setTrash(items.slice());
+                if (page.length < 200 || (typeof res?.total === 'number' && items.length >= res.total)) break;
+            }
         } catch {
             // keep the current list on failure
         } finally {

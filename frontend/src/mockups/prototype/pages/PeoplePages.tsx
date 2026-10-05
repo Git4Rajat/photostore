@@ -4,6 +4,7 @@ import { useStore } from '../store';
 import { Swatch, Spinner, SelectionBar } from '../components/bits';
 import { ThumbSizeControl, useTileSize } from '../components/controls';
 import PhotoGrid from '../components/PhotoGrid';
+import ScrollSentinel from '../components/ScrollSentinel';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { confirmDialog } from '../../../components/shared/dialogs';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
@@ -144,22 +145,6 @@ export const PeoplePage: React.FC = () => {
             )}
         </div>
     );
-};
-
-/** Fires ``onVisible`` whenever it scrolls into view (and again after each page lands), for infinite scroll. */
-const ScrollSentinel: React.FC<{ onVisible: () => void; deps: number }> = ({ onVisible, deps }) => {
-    const ref = React.useRef<HTMLDivElement>(null);
-    React.useEffect(() => {
-        const node = ref.current;
-        if (!node) return undefined;
-        const observer = new IntersectionObserver((entries) => {
-            if (entries.some((e) => e.isIntersecting)) onVisible();
-        }, { rootMargin: '600px' });
-        observer.observe(node);
-        return () => observer.disconnect();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [deps]);
-    return <div ref={ref} className="pt-scroll-sentinel" aria-hidden="true" />;
 };
 
 /** Person detail — rename / name, browse their photos, and merge in another cluster. */
