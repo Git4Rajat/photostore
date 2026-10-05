@@ -6191,6 +6191,7 @@ def get_user_albums_index(
 _PEOPLE_INDEX_SCHEMA_VERSION = 'v2'   # v2: rows carry autoName so incremental refresh can renumber "Unnamed N"
 _PEOPLE_INCREMENTAL_MAX_CHANGED = int(os.getenv('PEOPLE_INDEX_INCREMENTAL_MAX_CHANGED', '3000'))
 _PEOPLE_INCREMENTAL_SKEW_SECONDS = 180
+_PEOPLE_FULL_REBUILD_HOURS = float(os.getenv('PEOPLE_INDEX_FULL_REBUILD_HOURS', '24'))   # bounds any drift the incremental path could miss
 _PEOPLE_INDEX_CACHE_LOCK = threading.RLock()
 _PEOPLE_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _PEOPLE_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -6564,10 +6565,12 @@ def _incremental_people_index_snapshot(
             if rk:
                 changed[rk] = {k: row.get(k) for k in _PEOPLE_INDEX_PERSON_COLUMNS if k in row}
         touched: set = set()
+        touched_faces: set = set()
         for row in _query_projected(face_table_client, f"{base} and {stamp}", ['PartitionKey', 'RowKey', 'personId']):
             pid = str(row.get('personId') or '')
             if pid:
                 touched.add(pid)
+            touched_faces.add(str(row.get('RowKey') or ''))
             if len(touched) + len(changed) > _PEOPLE_INCREMENTAL_MAX_CHANGED:
                 return None
         existing = {
@@ -6577,6 +6580,11 @@ def _incremental_people_index_snapshot(
     except Exception:
         return None
     existing.discard('')
+    # A face that moved or was rejected may have left a cluster whose own row was not rewritten:
+    # re-derive any cluster using a touched face as its cover.
+    for row in prev_rows:
+        if isinstance(row, dict) and str(row.get('coverFaceId') or '') in touched_faces:
+            touched.add(str(row.get('personId') or ''))
     for pid in touched:
         if pid in existing and pid not in changed:
             try:
@@ -6621,7 +6629,13 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     snapshot = None
     previous_manifest = _load_people_index_manifest(key)
     since = str(previous_manifest.get('builtThrough') or '')
-    if since and previous_manifest.get('schemaVersion') == _PEOPLE_INDEX_SCHEMA_VERSION:
+    full_at = str(previous_manifest.get('fullBuiltAt') or '')
+    try:
+        full_age_hours = (started - datetime.fromisoformat(full_at)).total_seconds() / 3600 if full_at else None
+    except ValueError:
+        full_age_hours = None
+    incremental_ok = full_age_hours is not None and 0 <= full_age_hours < _PEOPLE_FULL_REBUILD_HOURS
+    if since and incremental_ok and previous_manifest.get('schemaVersion') == _PEOPLE_INDEX_SCHEMA_VERSION:
         prev = _load_people_index_blob(key)
         if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
                 and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
@@ -6629,6 +6643,7 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
             perf_instrumentation.log_event(
                 'people_index_incremental', user=key, ok=snapshot is not None,
                 rows=len(snapshot.rows) if snapshot else 0)
+    full_built_at = str(previous_manifest.get('fullBuiltAt') or '') if snapshot is not None else started.isoformat()
     if snapshot is None:
         snapshot = _build_user_people_index_snapshot(key, source_version)
     if snapshot is None:
@@ -6653,6 +6668,7 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
             'rowCount': len(snapshot.rows),
             'dirty': False,
             'updatedAt': snapshot.updated_at,
+            'fullBuiltAt': full_built_at,
             'builtThrough': _odata_utc(started - timedelta(seconds=_PEOPLE_INCREMENTAL_SKEW_SECONDS)),
         }
         manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))

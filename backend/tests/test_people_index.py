@@ -545,3 +545,37 @@ def test_incremental_refresh_falls_back_to_full_build_when_too_much_changed(peop
     _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1', rejected=False)
     _refresh('lib-A', 'v2')
     assert built == [1]
+
+
+def test_incremental_rederives_cluster_whose_cover_face_moved_without_its_row_changing(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1', 'f2']))
+    _seed_person(person_table, 'lib-A', 'p2', name='B', faceIds=json.dumps(['f3']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='1.jpg', personId='p1', confidence=0.9)
+    _seed_face(face_table, 'lib-A', 'f2', filename='2.jpg', personId='p1', confidence=0.1)
+    _seed_face(face_table, 'lib-A', 'f3', filename='3.jpg', personId='p2')
+    old = datetime.now(timezone.utc) - timedelta(days=1)
+    for t in (person_table, face_table):
+        t.stamps = {k: old for k in t.rows}
+    first = _refresh('lib-A', 'v1')
+    assert {r['personId']: r['faceCount'] for r in first.rows} == {'p1': 2, 'p2': 1}
+    for t in (person_table, face_table):
+        t.stamps = {k: old for k in t.rows}
+    # f1 moves to p2 but p1's person row is (wrongly) left untouched.
+    _seed_face(face_table, 'lib-A', 'f1', filename='1.jpg', personId='p2', confidence=0.9)
+    second = _refresh('lib-A', 'v2')
+    rows = {r['personId']: r for r in second.rows}
+    assert rows['p1']['faceCount'] == 1 and rows['p1']['coverFaceId'] == 'f2'
+
+
+def test_full_rebuild_is_forced_once_the_last_full_build_is_old(people_ctx, monkeypatch):
+    person_table, face_table, blobs = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='A', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _refresh('lib-A', 'v1')
+    monkeypatch.setattr(storage_utils, '_PEOPLE_FULL_REBUILD_HOURS', 0.0)
+    built = []
+    real = storage_utils._build_user_people_index_snapshot
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *a: (built.append(1), real(*a))[1])
+    _refresh('lib-A', 'v2')
+    assert built == [1]
