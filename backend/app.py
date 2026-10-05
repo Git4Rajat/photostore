@@ -508,6 +508,7 @@ FACE_BY_FILENAME_TABLE = os.getenv('FACE_BY_FILENAME_TABLE', 'photofacebyfilenam
 # access path that doesn't require materializing a popular person's entire
 # membership as one string.
 PERSON_MEMBERS_TABLE = os.getenv('PERSON_MEMBERS_TABLE', 'photopersonmembers')
+ALBUM_MEMBERS_TABLE = os.getenv('ALBUM_MEMBERS_TABLE', 'photoalbummembers')   # one row per photo of an album too big for its row
 MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
 # Job status/progress rows: PartitionKey=userId (or libraryId for
 # library_clean/library_download, which any member of a shared library must
@@ -1082,6 +1083,7 @@ embeddings_table_client = None
 face_embeddings_table_client = None
 face_by_filename_table_client = None
 person_members_table_client = None
+album_members_table_client = None
 search_index_dirty_table_client = None
 blob_service_client = None
 albums_table_client = None
@@ -1391,7 +1393,7 @@ def _init_storage_clients():
     global account_name, credential
     global metadata_table_client
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
-    global face_by_filename_table_client, person_members_table_client
+    global face_by_filename_table_client, person_members_table_client, album_members_table_client
     global album_token_index_table_client
     global jobs_table_client
     global workbench_actions_table_client
@@ -1421,6 +1423,7 @@ def _init_storage_clients():
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         face_by_filename_table_client_local = tbl_svc.get_table_client(FACE_BY_FILENAME_TABLE)
         person_members_table_client_local = tbl_svc.get_table_client(PERSON_MEMBERS_TABLE)
+        album_members_table_client_local = tbl_svc.get_table_client(ALBUM_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
@@ -1488,6 +1491,7 @@ def _init_storage_clients():
         person_table_client_local = tbl_svc.get_table_client(PEOPLE_TABLE)
         face_by_filename_table_client_local = tbl_svc.get_table_client(FACE_BY_FILENAME_TABLE)
         person_members_table_client_local = tbl_svc.get_table_client(PERSON_MEMBERS_TABLE)
+        album_members_table_client_local = tbl_svc.get_table_client(ALBUM_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
@@ -1518,6 +1522,8 @@ def _init_storage_clients():
     person_table_client = _InvalidatingTableClient(person_table_client_local, _invalidate_people_scan_cache)
     face_by_filename_table_client = face_by_filename_table_client_local
     person_members_table_client = person_members_table_client_local
+    album_members_table_client = album_members_table_client_local
+    album_store.configure(album_members_table_client)
     merge_table_client = merge_table_client_local
     jobs_table_client = jobs_table_client_local
     workbench_actions_table_client = workbench_actions_table_client_local
@@ -1550,7 +1556,7 @@ def _init_storage_clients():
         lambda t=tbl: t.create_table()
         for tbl in (users_table_client, libraries_table_client, memberships_table_client,
                     invites_table_client, audit_table_client, clean_requests_table_client,
-                    face_by_filename_table_client, person_members_table_client)
+                    face_by_filename_table_client, person_members_table_client, album_members_table_client)
     ] + [
         lambda q=clustering_queue_client: q.create_queue(),
         lambda q=ipwork_queue_client: q.create_queue(),
@@ -2095,7 +2101,8 @@ def _album_cover_thumbnail_url(user_id: str, filenames: List[str]) -> str:
 
 
 def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = None) -> Dict:
-    filenames = album_store.read_filenames(entity)
+    table_backed = album_store.is_table_backed(entity)
+    filenames = [] if table_backed else album_store.read_filenames(entity)   # a big album is paged, never inlined
     is_public = _coerce_bool(entity.get('isPublic', False))
     token = entity.get('publicToken') or ''
     has_access_code = bool(str(entity.get('accessCode', '')).strip())
@@ -2114,8 +2121,9 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
     payload = {
         'id': entity.get('RowKey'),
         'name': entity.get('name', ''),
-        'photoCount': len(filenames),
+        'photoCount': album_store.count(entity),
         'filenames': filenames,
+        'membersPaged': table_backed,
         'isPublic': is_public and not is_expired,
         'publicUrl': public_url,
         'publicExpiresAt': entity.get('publicExpiresAt') or '',
@@ -5272,11 +5280,8 @@ def _remove_filename_from_albums(user_id: str, filename: str) -> None:
     except Exception:
         rows = []
     for row in rows:
-        filenames = album_store.read_filenames(row)
-        updated = [item for item in filenames if item != filename]
-        if updated == filenames:
+        if not album_store.remove(row, [filename]):
             continue
-        album_store.write_filenames(row, updated)
         try:
             albums_table_client.upsert_entity(row)
         except Exception:
@@ -8105,7 +8110,7 @@ def _load_album_entity(user_id: str, album_id: str) -> Optional[Dict]:
 
 
 def _album_filenames(entity: Dict) -> List[str]:
-    return album_store.read_filenames(entity)
+    return album_store.all_names(entity)
 
 
 def _save_album_entity(entity: Dict) -> None:
@@ -8156,6 +8161,8 @@ def _hard_delete_album_now(user_id: str, album_id: str, existing: Optional[Dict]
     if existing is None:
         existing = _load_album_entity(user_id, album_id)
     try:
+        if existing:
+            album_store.delete_members(existing)
         albums_table_client.delete_entity(partition_key=user_id, row_key=album_id)
     except Exception:
         app.logger.warning('Album purge failed for %s/%s', user_id, album_id)
@@ -12650,11 +12657,8 @@ def _batch_remove_filenames_from_albums(user_id: str, names_set: set) -> None:
     except Exception:
         return
     for row in rows:
-        filenames = album_store.read_filenames(row)
-        updated = [item for item in filenames if item not in names_set]
-        if len(updated) == len(filenames):
+        if not album_store.remove(row, list(names_set)):
             continue
-        album_store.write_filenames(row, updated)
         try:
             albums_table_client.upsert_entity(row)
         except Exception:

@@ -38,6 +38,8 @@ class FakeTable:
         for op_type, entity in operations:
             if op_type == 'upsert':
                 self.upsert_entity(entity)
+            elif op_type == 'delete':
+                self.delete_entity(entity['PartitionKey'], entity['RowKey'])
             else:
                 raise ValueError(f'Unsupported fake transaction op: {op_type}')
 

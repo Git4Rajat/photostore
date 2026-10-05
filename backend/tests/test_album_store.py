@@ -119,3 +119,56 @@ def test_album_photos_are_read_in_batches_not_one_by_one(monkeypatch):
     with app.app.test_request_context('/api/albums/al'):
         albums.get_album('al')
     assert len(queries) == 3 and not points                                  # ceil(45 / 15) round trips
+
+
+# --- membership table for albums that outgrow one row --------------------------------------------
+
+class _SortedTable(FakeTable):
+    def query_entities(self, filter_str, select=None, **kw):
+        return sorted(super().query_entities(filter_str, select=select, **kw), key=lambda r: r['RowKey'])
+
+
+@pytest.fixture
+def members(monkeypatch):
+    table = _SortedTable()
+    monkeypatch.setattr(album_store, '_MEMBERS', table)
+    return table
+
+
+BIG = [f'a-fairly-long-original-photo-name-{i:07d}.jpg' for i in range(40000)]
+
+
+def test_oversized_album_is_promoted_and_pages(members):
+    entity = {'PartitionKey': 'u', 'RowKey': 'alb'}
+    album_store.set_all(entity, BIG)
+    assert album_store.is_table_backed(entity) and album_store.count(entity) == 40000
+    assert album_store.read_filenames(entity) == [] and len(members.rows) == 40000
+    names, total = album_store.page(entity, 39990, 50)
+    assert total == 40000 and names == BIG[39990:]
+    assert album_store.contains(entity, BIG[5]) and not album_store.contains(entity, 'nope.jpg')
+
+
+def test_table_backed_add_and_remove_count_only_real_changes(members):
+    entity = {'PartitionKey': 'u', 'RowKey': 'alb'}
+    album_store.set_all(entity, BIG)
+    assert album_store.add(entity, [BIG[0], 'new-1.jpg', 'new-1.jpg', 'new-2.jpg']) == ['new-1.jpg', 'new-2.jpg']
+    assert album_store.count(entity) == 40002
+    assert album_store.remove(entity, ['new-1.jpg', 'missing.jpg']) == ['new-1.jpg']
+    assert album_store.count(entity) == 40001
+    album_store.delete_members(entity)
+    assert not members.rows
+
+
+def test_small_album_growing_past_the_row_limit_promotes(members):
+    entity = {'PartitionKey': 'u', 'RowKey': 'alb'}
+    album_store.set_all(entity, BIG[:100])
+    assert not album_store.is_table_backed(entity)
+    added = album_store.add(entity, BIG[100:])
+    assert len(added) == 39900 and album_store.is_table_backed(entity) and album_store.count(entity) == 40000
+    assert all(entity.get(k, '') == '' for k in entity if k.startswith('filenames'))
+
+
+def test_without_a_members_table_oversize_still_raises(monkeypatch):
+    monkeypatch.setattr(album_store, '_MEMBERS', None)
+    with pytest.raises(album_store.AlbumTooLarge):
+        album_store.add({'PartitionKey': 'u', 'RowKey': 'a'}, BIG)

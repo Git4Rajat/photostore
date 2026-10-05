@@ -5990,11 +5990,11 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
             continue
         if str(row.get('deleted') or '').strip().lower() in ('true', '1'):
             continue
-        filenames = album_store.read_filenames(row)
+        filenames = album_store.sample(row) if album_store.is_table_backed(row) else album_store.read_filenames(row)
         trimmed_rows.append({
             'albumId': album_id,
             'name': str(row.get('name') or ''),
-            'photoCount': len(filenames),
+            'photoCount': album_store.count(row),
             'coverFilename': _cover(filenames),
             'updatedAt': str(row.get('updatedAt') or ''),
             **_album_share_fields(row),

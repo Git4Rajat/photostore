@@ -11,6 +11,8 @@ read and one transaction, so nothing else about albums changes. Rows written bef
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
 CHUNK_UTF16_UNITS = 28000      # < 32K, leaves headroom for escaping
@@ -100,3 +102,200 @@ def fit(filenames: List[str]) -> Tuple[List[str], bool]:
         except AlbumTooLarge:
             high = mid - 1
     return names[:low], True
+
+
+# --- membership table ----------------------------------------------------------------------------
+#
+# An album whose list no longer fits in its row (about 14,000 photos) is "promoted": its photos move to
+# one row each in the members table (PartitionKey = album id, RowKey = filename) and the album row keeps
+# only ``storage='table'`` and ``photoCount``. Small albums never change. A members-table album lists in
+# filename order and pages by walking RowKeys, so nothing about it is bounded by a row size.
+
+_MEMBERS = None
+_MEMBER_LOCK = threading.Lock()
+_BATCH = 100
+_EXISTS_CHUNK = 15            # Table Storage allows 15 comparisons in one filter
+_POOL = 8
+
+
+def configure(members_table) -> None:
+    global _MEMBERS
+    _MEMBERS = members_table
+
+
+def members_available() -> bool:
+    return _MEMBERS is not None
+
+
+def is_table_backed(entity: Dict) -> bool:
+    return str(entity.get('storage') or '') == 'table'
+
+
+def _pk(entity: Dict) -> str:
+    return str(entity['RowKey'])
+
+
+def _quote(text: str) -> str:
+    return str(text).replace("'", "''")
+
+
+def count(entity: Dict) -> int:
+    if is_table_backed(entity):
+        try:
+            return max(0, int(entity.get('photoCount') or 0))
+        except (TypeError, ValueError):
+            return 0
+    return len(read_filenames(entity))
+
+
+def all_names(entity: Dict) -> List[str]:
+    """Every filename, in album order. Streams the members partition for table-backed albums."""
+    if not is_table_backed(entity):
+        return read_filenames(entity)
+    if _MEMBERS is None:
+        return []
+    return [str(r['RowKey']) for r in _MEMBERS.query_entities(f"PartitionKey eq '{_quote(_pk(entity))}'", select=['RowKey'])]
+
+
+def page(entity: Dict, offset: int, limit: int) -> Tuple[List[str], int]:
+    """``limit`` filenames starting at ``offset`` (0 = no limit) and the album's total."""
+    total = count(entity)
+    if not is_table_backed(entity):
+        names = read_filenames(entity)
+        return (names[offset:offset + limit] if limit > 0 else names), total
+    if _MEMBERS is None:
+        return [], total
+    out: List[str] = []
+    stop = offset + limit if limit > 0 else None
+    for index, row in enumerate(_MEMBERS.query_entities(f"PartitionKey eq '{_quote(_pk(entity))}'", select=['RowKey'])):
+        if stop is not None and index >= stop:
+            break
+        if index >= offset:
+            out.append(str(row['RowKey']))
+    return out, total
+
+
+def sample(entity: Dict, limit: int = 2000) -> List[str]:
+    """The first ``limit`` filenames, for picking a cover without reading a huge album."""
+    return page(entity, 0, limit)[0]
+
+
+def _existing(entity: Dict, names: List[str]) -> set:
+    found: set = set()
+    pk = _quote(_pk(entity))
+    chunks = [names[i:i + _EXISTS_CHUNK] for i in range(0, len(names), _EXISTS_CHUNK)]
+
+    def look(chunk):
+        clause = ' or '.join(f"RowKey eq '{_quote(n)}'" for n in chunk)
+        return [str(r['RowKey']) for r in _MEMBERS.query_entities(f"PartitionKey eq '{pk}' and ({clause})", select=['RowKey'])]
+
+    if len(chunks) <= 1:
+        results = [look(c) for c in chunks]
+    else:
+        with ThreadPoolExecutor(max_workers=_POOL) as pool:
+            results = list(pool.map(look, chunks))
+    for result in results:
+        found.update(result)
+    return found
+
+
+def contains(entity: Dict, filename: str) -> bool:
+    if not is_table_backed(entity):
+        return filename in read_filenames(entity)
+    if _MEMBERS is None:
+        return False
+    try:
+        _MEMBERS.get_entity(partition_key=_pk(entity), row_key=filename)
+        return True
+    except Exception:
+        return False
+
+
+def _transact(operations: List[Tuple]) -> None:
+    for start in range(0, len(operations), _BATCH):
+        chunk = operations[start:start + _BATCH]
+        try:
+            _MEMBERS.submit_transaction(chunk)
+        except Exception:
+            for action, row in chunk:                 # transactions are atomic; singles are idempotent
+                if action == 'upsert':
+                    _MEMBERS.upsert_entity(row)
+                else:
+                    try:
+                        _MEMBERS.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+                    except Exception:
+                        pass
+
+
+def _write_members(entity: Dict, names: List[str]) -> None:
+    pk = _pk(entity)
+    _transact([('upsert', {'PartitionKey': pk, 'RowKey': n}) for n in names])
+
+
+def _promote(entity: Dict, names: List[str]) -> None:
+    if _MEMBERS is None:
+        raise AlbumTooLarge(f'An album can hold about {max_photos(names)} photos')
+    _write_members(entity, names)
+    entity['storage'] = 'table'
+    entity['photoCount'] = len(set(names))
+    for index in range(MAX_CHUNKS):
+        if _key(index) in entity:
+            entity[_key(index)] = ''
+
+
+def add(entity: Dict, names: List[str]) -> List[str]:
+    """Add ``names`` (de-duplicated, in order); returns the ones that were new. Mutates ``entity``."""
+    names = list(dict.fromkeys(names))
+    if is_table_backed(entity):
+        if not names or _MEMBERS is None:
+            return []
+        have = _existing(entity, names)
+        new = [n for n in names if n not in have]
+        _write_members(entity, new)
+        entity['photoCount'] = count(entity) + len(new)
+        return new
+    current = read_filenames(entity)
+    have = set(current)
+    new = [n for n in names if n not in have]
+    combined = current + new
+    try:
+        write_filenames(entity, combined)
+    except AlbumTooLarge:
+        _promote(entity, combined)
+    return new
+
+
+def remove(entity: Dict, names: List[str]) -> List[str]:
+    """Remove ``names``; returns the ones that were present. Mutates ``entity``."""
+    names = list(dict.fromkeys(names))
+    if is_table_backed(entity):
+        if not names or _MEMBERS is None:
+            return []
+        present = _existing(entity, names)
+        gone = [n for n in names if n in present]
+        pk = _pk(entity)
+        _transact([('delete', {'PartitionKey': pk, 'RowKey': n}) for n in gone])
+        entity['photoCount'] = max(0, count(entity) - len(gone))
+        return gone
+    current = read_filenames(entity)
+    drop = set(names)
+    gone = [n for n in current if n in drop]
+    if gone:
+        write_filenames(entity, [n for n in current if n not in drop])
+    return gone
+
+
+def set_all(entity: Dict, names: List[str]) -> None:
+    """Replace the whole list on a NEW entity (creation paths)."""
+    try:
+        write_filenames(entity, names)
+    except AlbumTooLarge:
+        _promote(entity, names)
+
+
+def delete_members(entity: Dict) -> None:
+    if not is_table_backed(entity) or _MEMBERS is None:
+        return
+    pk = _pk(entity)
+    rows = [str(r['RowKey']) for r in _MEMBERS.query_entities(f"PartitionKey eq '{_quote(pk)}'", select=['RowKey'])]
+    _transact([('delete', {'PartitionKey': pk, 'RowKey': n}) for n in rows])

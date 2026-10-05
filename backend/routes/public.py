@@ -116,7 +116,7 @@ def public_thumbnail(token: str, filename: str):
     safe_name = app._validate_media_filename(filename)
     if not safe_name:
         return app.jsonify({'error': 'Invalid filename'}), 400
-    if safe_name not in app._album_filenames(entity):
+    if not app.album_store.contains(entity, safe_name):
         return app.jsonify({'error': 'Not found'}), 404
 
     if not app.blob_service_client:
@@ -155,7 +155,7 @@ def public_image(token: str, filename: str):
     safe_name = app._validate_media_filename(filename)
     if not safe_name:
         return app.jsonify({'error': 'Invalid filename'}), 400
-    if safe_name not in app._album_filenames(entity):
+    if not app.album_store.contains(entity, safe_name):
         return app.jsonify({'error': 'Not found'}), 404
 
     owner_id = str(entity.get('PartitionKey') or '')
@@ -201,7 +201,7 @@ def public_photo_share_preview(token: str, filename: str):
     if not app._album_grant_valid(entity, token):
         return app.jsonify({'error': 'Not found'}), 404
     safe_name = app._validate_media_filename(filename)
-    if not safe_name or safe_name not in app._album_filenames(entity):
+    if not safe_name or not app.album_store.contains(entity, safe_name):
         return app.jsonify({'error': 'Not found'}), 404
     try:
         owner_id = str(entity.get('PartitionKey') or '')
@@ -227,7 +227,7 @@ def public_preview(token: str, filename: str):
     safe_name = app._validate_media_filename(filename)
     if not safe_name:
         return app.jsonify({'error': 'Invalid filename'}), 400
-    if safe_name not in app._album_filenames(entity):
+    if not app.album_store.contains(entity, safe_name):
         return app.jsonify({'error': 'Not found'}), 404
 
     if app._filename_requires_backend_preview(safe_name):
@@ -287,7 +287,7 @@ def public_raw_full_preview(token: str, filename: str):
     if not app._album_grant_valid(entity, token):
         return app.jsonify({'error': 'Not found'}), 404
     safe_name = app._validate_media_filename(filename)
-    if not safe_name or safe_name not in app._album_filenames(entity):
+    if not safe_name or not app.album_store.contains(entity, safe_name):
         return app.jsonify({'error': 'Not found'}), 404
 
     ext = safe_name.rsplit('.', 1)[-1].lower() if '.' in safe_name else ''
