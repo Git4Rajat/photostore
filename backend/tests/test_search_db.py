@@ -277,3 +277,18 @@ def test_smart_album_groups_from_the_database_match_the_table_scan(tmp_path, mon
     from_table = app._smart_album_candidates('u', rule, rows)
     assert _group_view(from_db) == _group_view(from_table)
     assert [c['name'] for c in from_db] == [c['name'] for c in from_table]
+
+
+def test_gallery_order_puts_undated_photos_last_with_filename_ties(tmp_path):
+    rows = [
+        {'RowKey': 'b.jpg', 'uploadDate': '2020-01-01T00:00:00+00:00'},
+        {'RowKey': 'a.jpg', 'uploadDate': '2020-01-01T00:00:00+00:00'},          # same upload time as b -> filename order
+        {'RowKey': 'new.jpg', 'uploadDate': '2023-01-01T00:00:00+00:00'},
+        {'RowKey': 'nodate2.jpg'},
+        {'RowKey': 'nodate1.jpg'},
+    ]
+    path = str(tmp_path / 'o.sqlite')
+    search_db.build_database(rows, path)
+    db = search_db.SearchDatabase(path)
+    assert db.list_page(sort='date', limit=10)[0] == ['new.jpg', 'a.jpg', 'b.jpg', 'nodate1.jpg', 'nodate2.jpg']
+    assert db.list_page(sort='capture', limit=10)[0][-2:] == ['nodate1.jpg', 'nodate2.jpg']

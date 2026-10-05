@@ -250,6 +250,7 @@ class DatabaseBuilder:
         conn.execute('CREATE INDEX rows_filename ON rows(filename)')
         conn.execute('CREATE INDEX rows_capture_md ON rows(capture_md)')
         conn.execute('CREATE INDEX rows_capture_ts ON rows(capture_ts)')
+        conn.execute('CREATE INDEX rows_upload_ts ON rows(upload_ts)')
         conn.execute('CREATE INDEX rows_rating ON rows(rating, likes)')
         conn.execute('CREATE INDEX row_people_pid ON row_people(person_id)')
         conn.execute('INSERT INTO meta VALUES(?, ?)', (
@@ -488,11 +489,14 @@ class SearchDatabase:
     _MIN = -1e18  # sorts photos with no known date last, like DATE_MIN
 
     _LIST_ORDER = {
-        'capture': f'COALESCE(capture_ts, {_MIN}) DESC, filename ASC',
+        # Plain column order (NULLs sort smallest, so DESC puts undated photos last -- identical to the
+        # old COALESCE(.., -1e18) form) lets SQLite walk the capture/upload indexes instead of
+        # sorting the whole library on every page (3.7 s vs 1.2 s at a 500k offset, 124 ms vs 0 ms at 0).
+        'capture': 'capture_ts DESC, filename ASC',
         'rating': 'rating DESC, filename ASC',
         'likes': 'likes DESC, filename ASC',
         'location': 'LOWER(filename) ASC, filename ASC',
-        'date': f'COALESCE(upload_ts, {_MIN}) DESC, filename ASC',  # also the default for unknown sorts
+        'date': 'upload_ts DESC, filename ASC',  # also the default for unknown sorts
     }
 
     def list_page(
@@ -530,7 +534,7 @@ class SearchDatabase:
         total = conn.execute(f'SELECT COUNT(*) FROM rows{sql_where}', all_args).fetchone()[0]
         names = [r[0] for r in conn.execute(
             f'SELECT filename FROM rows{sql_where} ORDER BY rating DESC, likes DESC, '
-            f'COALESCE(upload_ts, {self._MIN}) DESC, filename ASC LIMIT ? OFFSET ?',
+            'upload_ts DESC, filename ASC LIMIT ? OFFSET ?',
             [*all_args, int(limit), max(0, int(offset))])]
         return names, int(total)
 
