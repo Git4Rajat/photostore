@@ -688,3 +688,19 @@ def test_person_photos_ignores_faces_that_moved_and_unknown_people(monkeypatch):
     from routes import people as people_routes
     with app.app.test_request_context('/api/persons/nope/photos'):
         assert people_routes.get_person_photos('nope')[1] == 404
+
+
+def test_rebuilding_a_photos_faces_uses_the_filename_index_not_a_library_wide_face_scan(monkeypatch):
+    metadata, faces = FakeTable(), FakeTable()
+    metadata.upsert_entity({'PartitionKey': 'u', 'RowKey': 'a.jpg', 'faces': '[]', 'faceCount': 0, 'peopleIds': '[]'})
+    _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='p1', confidence=0.9, bbox='{}')
+    monkeypatch.setattr(app, 'metadata_table_client', metadata)
+    monkeypatch.setattr(app, 'face_table_client', faces)
+    monkeypatch.setattr(app, 'get_face_ids_for_filename', lambda uid, fn: ['f1'])
+    monkeypatch.setattr(app, '_load_user_face_summary_by_id',
+                        lambda uid: (_ for _ in ()).throw(AssertionError('must not scan every face')))
+    updates = []
+    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda uid, fn, fields: updates.append((fn, fields)))
+    result = app._rebuild_metadata_faces_for_filename('u', 'a.jpg', searchable_person_index={'p1': 'Ann'})
+    assert result['changed'] and result['peopleIdsAfter'] == ['p1']
+    assert updates and updates[0][0] == 'a.jpg' and json.loads(updates[0][1]['peopleIds']) == ['p1']

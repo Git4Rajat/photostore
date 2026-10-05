@@ -6725,8 +6725,25 @@ def _rebuild_metadata_faces_for_filename(
     # every assignment-producing message -- not just multi-face ones --
     # would otherwise force a fresh full-partition rescan here. Falls back
     # to the shared cache when omitted, for any other caller.
-    summary = face_summary if face_summary is not None else _load_user_face_summary_by_id(user_id)
-    rows = [row for row in summary.values() if str(row.get('filename') or '') == filename]
+    rows = None
+    if face_summary is None:
+        # This photo's faces come from the filename -> face-ids index (a point read plus a few face point
+        # reads), not from the whole-library face summary: naming a cluster rebuilds one photo per face, and
+        # scanning every face in the library once per photo was O(faces x photos).
+        try:
+            indexed_ids = get_face_ids_for_filename(user_id, filename)
+        except Exception:
+            indexed_ids = None
+        if indexed_ids is not None:
+            rows = []
+            for face_id in indexed_ids:
+                try:
+                    rows.append(face_table_client.get_entity(partition_key=user_id, row_key=str(face_id)))
+                except Exception:
+                    continue
+    if rows is None:
+        summary = face_summary if face_summary is not None else _load_user_face_summary_by_id(user_id)
+        rows = [row for row in summary.values() if str(row.get('filename') or '') == filename]
     if searchable_person_index is None:
         searchable_person_index = _load_searchable_person_name_index(user_id)
     rows = sorted([row for row in rows if not _face_is_rejected(row)], key=lambda row: str(row.get('RowKey') or ''))
