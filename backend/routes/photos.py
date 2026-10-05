@@ -607,13 +607,25 @@ def photos_media_token():
     except Exception:
         app.app.logger.exception('Failed to mint media token for %s', user_id)
         return app.jsonify({'available': False})
-    response = app.jsonify({
+    payload = {
         'available': True,
         'baseUrl': base_url,
         'sas': sas,
         'expiresAt': expires_at,
         'previewPrefix': 'preview/',
-    })
+    }
+    # Face crops (the People avatars) live in their own container under a per-user prefix; one more
+    # token lets the browser build every avatar URL itself instead of calling /api/faces/crop/<id>.
+    try:
+        cover_base, cover_sas, _ = app._stable_container_read_sas(app.BLOB_COVER_CONTAINER)
+        payload['cover'] = {
+            'baseUrl': cover_base,
+            'sas': cover_sas,
+            'prefix': f"{app.hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:16]}/",
+        }
+    except Exception:
+        app.app.logger.warning('Failed to mint face-crop token for %s', user_id, exc_info=True)
+    response = app.jsonify(payload)
     response.headers['Cache-Control'] = 'private, max-age=3600'
     return response
 

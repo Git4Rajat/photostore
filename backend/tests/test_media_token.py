@@ -22,6 +22,9 @@ def test_media_token_returns_one_container_scoped_token(monkeypatch):
     assert body['available'] and body['baseUrl'].endswith('/' + app.BLOB_THUMBNAIL_CONTAINER)
     assert 'sr=c' in body['sas'] and body['previewPrefix'] == 'preview/'
     assert 'max-age' in resp.headers['Cache-Control']
+    cover = body['cover']
+    assert cover['baseUrl'].endswith('/' + app.BLOB_COVER_CONTAINER) and 'sr=c' in cover['sas']
+    assert cover['prefix'] == app.hashlib.sha256(b'owner').hexdigest()[:16] + '/' and cover['prefix'].endswith('/')
 
 
 def test_media_token_unavailable_in_proxy_mode(monkeypatch):

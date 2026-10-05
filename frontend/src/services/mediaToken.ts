@@ -17,6 +17,8 @@ export interface MediaToken {
     sas: string;
     expiresAt: string;
     previewPrefix: string;
+    /** Face-crop container token (People avatars); absent on older tokens or when unavailable. */
+    cover?: { baseUrl: string; sas: string; prefix: string };
 }
 
 interface MediaTokenResponse extends Partial<MediaToken> {
@@ -43,7 +45,8 @@ const readStored = (key: string): MediaToken | null => {
         const raw = window.localStorage.getItem(`${STORAGE_KEY}:${key}`);
         if (!raw) return null;
         const parsed = JSON.parse(raw) as MediaToken;
-        return isFresh(parsed) ? parsed : null;
+        // Tokens stored before the face-crop token existed have no `cover`: fetch a fresh one.
+        return isFresh(parsed) && parsed.cover ? parsed : null;
     } catch {
         return null;
     }
@@ -81,7 +84,7 @@ export const getMediaToken = async (): Promise<MediaToken | null> => {
                 return null;
             }
             const token: MediaToken = {
-                baseUrl: res.baseUrl, sas: res.sas, expiresAt: res.expiresAt, previewPrefix: res.previewPrefix || 'preview/',
+                baseUrl: res.baseUrl, sas: res.sas, expiresAt: res.expiresAt, previewPrefix: res.previewPrefix || 'preview/', cover: res.cover,
             };
             cached = token;
             writeStored(key, token);
@@ -109,4 +112,17 @@ export const thumbnailUrlForBlob = (blob: string | undefined | null, token: Medi
 /** Direct preview URL (previews live under `preview/` in the same container). */
 export const previewUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => (
     blob && token ? `${token.baseUrl}/${token.previewPrefix}${encodeBlobPath(blob)}.jpg?${token.sas}` : ''
+);
+
+const FACE_CROP_PATH = /^\/api\/faces\/crop\/([^/?#]+)$/;
+
+/** Face id from a `/api/faces/crop/<id>` path, or null. */
+export const faceIdFromCropPath = (path: string): string | null => {
+    const match = FACE_CROP_PATH.exec(path);
+    return match ? decodeURIComponent(match[1]) : null;
+};
+
+/** Direct URL of a face's cached crop (no backend call), or '' when the cover token isn't loaded. */
+export const faceCropUrlForId = (faceId: string, token: MediaToken | null = getCachedMediaToken()): string => (
+    faceId && token?.cover ? `${token.cover.baseUrl}/${token.cover.prefix}${encodeURIComponent(faceId)}.jpg?${token.cover.sas}` : ''
 );
