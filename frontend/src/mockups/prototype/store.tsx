@@ -1,3 +1,4 @@
+import { onIndexReady, reportIndexBuilding } from '../../services/indexBuilding';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
 import { get, getExtras, post } from '../../services/apiClient';
@@ -491,9 +492,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
         const token = getCachedMediaToken();
         const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
-        const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
+        const res = await get<{ photos?: BackendPhoto[]; total?: number; indexBuilding?: boolean; indexPartial?: boolean }>(
             `/photos?sort=capture&offset=${offset}&limit=${pageSize}${rangeQuery}${token ? '&directMedia=1' : ''}`,
         );
+        reportIndexBuilding('gallery', Boolean(res?.indexBuilding || res?.indexPartial));
         const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
         photoOffsetRef.current = offset + list.length;
         photoHasMoreRef.current = list.length === pageSize;
@@ -1298,11 +1300,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setPeopleUnnamedTotal(res.unnamedCount ?? 0);
             setPeopleHasMore(Boolean(res.hasMore));
             setPeopleUnavailable(false);
+            reportIndexBuilding('people', false);
         } catch {
             // Never fall back to fetching every cluster at once: show a "preparing" state and let the
             // user (or the next visit) retry the paged request.
             setPeopleHasMore(false);
             setPeopleUnavailable(true);
+            reportIndexBuilding('people', true);
         } finally {
             setPeopleLoading(false);
         }
@@ -1531,6 +1535,22 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .then(() => toast('Library renamed'))
             .catch(() => { setLibraryName(previous); toast('Couldn’t rename library', undefined, undefined, 'error'); });
     }, [libraryName, toast]);
+
+    // While the people list is unavailable (server still building it), retry quietly every 10 s.
+    useEffect(() => {
+        if (!peopleUnavailable) return undefined;
+        const timer = window.setTimeout(() => { void fetchPeople(); }, 10000);
+        return () => window.clearTimeout(timer);
+    }, [peopleUnavailable, fetchPeople, people.length]);
+
+    // The server finished preparing the library: pull in what was missing while it built.
+    useEffect(() => onIndexReady(() => {
+        reloadPhotos();
+        void fetchTimeline();
+        void fetchPeople();
+        void fetchAlbums();
+        void fetchExplore();
+    }), [reloadPhotos, fetchTimeline, fetchPeople, fetchAlbums, fetchExplore]);
 
     const value = useMemo<Store>(
         () => ({

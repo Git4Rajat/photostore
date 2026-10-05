@@ -580,3 +580,8 @@ A production burst failed with `no such table: meta` / `no such table: rows` bec
 - A download works in its own scratch directory, is **checked for its tables before** being moved into place, and is rejected otherwise.
 - Cleanup deletes only finished `<user>-<digest>.sqlite` files that are not the current one (plus their own sidecars).
 - A local copy that fails to open or raises a database-level error is **discarded** and the request answers "warming up" (`retryable`), so the next request downloads a fresh copy instead of failing until restart.
+
+### 15.12 "Preparing your library" bar and remembered search
+
+- `GET /api/photos/index-status` now also returns `building` (the chunked first build is still running). The browser keeps one shared signal (`services/indexBuilding.ts`): pages report "still building" when the server says so (gallery `indexBuilding`/`indexPartial`, search `searchIndexBuilding`, an unavailable people list, session start), a slim indeterminate bar shows on every page while any source is set, and one poller watches index-status (every 8 s, about 20 minutes at most). When it reports ready, the bar clears and gallery, timeline, people, albums and explore refetch. The bar is a lump sum, not a percentage.
+- The Ask page keeps its last search in memory (query, every page loaded so far, totals, scroll position), keyed by library, and restores it when you come back without a new query. A new query, or a different library, starts fresh.

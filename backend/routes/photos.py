@@ -1046,7 +1046,11 @@ def photos_index_status():
         app.warm_user_index_files_async(user_id)
         # ...and put the search database on this replica's ephemeral disk.
         search_db.warm_async(user_id)
-    return app.jsonify({'ready': ready, 'indexes': indexes})
+    try:
+        building = bool(search_db.is_building(user_id))
+    except Exception:
+        building = False
+    return app.jsonify({'ready': ready, 'indexes': indexes, 'building': building})
 
 @photos_bp.route('/photos/metadata', methods=['POST'])
 @photos_bp.route('/photos/metadata/', methods=['POST'])

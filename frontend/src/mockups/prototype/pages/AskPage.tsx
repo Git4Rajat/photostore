@@ -1,3 +1,4 @@
+import { reportIndexBuilding } from '../../../services/indexBuilding';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Search as MagnifyingGlassIcon, Plus as PlusIcon } from 'lucide-react';
 import { useStore } from '../store';
@@ -6,6 +7,7 @@ import PhotoGrid from '../components/PhotoGrid';
 import { get, post } from '../../../services/apiClient';
 import { getCachedMediaToken, thumbnailUrlForBlob } from '../../../services/mediaToken';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
+import { getActiveLibraryFromToken } from '../../../services/passwordAuthClient';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 import type { Photo } from '../types';
 
@@ -59,6 +61,27 @@ const resolvePhotos = async (filenames: string[]): Promise<Photo[]> => {
         .map(mapResult);
 };
 
+// The last search survives leaving the page: query text, the loaded results (every page fetched so far),
+// totals and scroll position are kept in memory and restored when Ask is opened again without a new
+// query. Keyed by library so a different account/library never sees another's results.
+interface AskSnapshot {
+    library: string;
+    query: string;
+    activeQuery: string;
+    results: Photo[];
+    total: number;
+    hasMore: boolean;
+    rankedWindow: number | null;
+    scrollY: number;
+}
+let askSnapshot: AskSnapshot | null = null;
+const currentLibrary = () => getActiveLibraryFromToken() || '__default__';
+const restorableSnapshot = (incomingQuery: string | undefined): AskSnapshot | null => {
+    const snap = askSnapshot;
+    if (!snap || snap.library !== currentLibrary() || !snap.query.trim()) return null;
+    return incomingQuery === undefined || incomingQuery.trim() === snap.activeQuery ? snap : null;
+};
+
 /**
  * Ask — one search box fused across people / places / things / years. Search
  * runs entirely on the backend (/photos/search over a per-library SQLite
@@ -70,20 +93,38 @@ const resolvePhotos = async (filenames: string[]): Promise<Photo[]> => {
  */
 export const AskPage: React.FC = () => {
     const { people, places, route, createAlbum, addPhotosToAlbum, registerPhotos, navigate } = useStore();
-    const [query, setQuery] = useState(route.params.query ?? '');
-    const [results, setResults] = useState<Photo[]>([]);
+    const restored = useRef(restorableSnapshot(route.params.query)).current;
+    const [query, setQuery] = useState(restored?.query ?? route.params.query ?? '');
+    const [results, setResults] = useState<Photo[]>(restored?.results ?? []);
     const [searching, setSearching] = useState(false);
-    const [total, setTotal] = useState(0);
-    const [hasMore, setHasMore] = useState(false);
-    const [rankedWindow, setRankedWindow] = useState<number | null>(null);
+    const [total, setTotal] = useState(restored?.total ?? 0);
+    const [hasMore, setHasMore] = useState(restored?.hasMore ?? false);
+    const [rankedWindow, setRankedWindow] = useState<number | null>(restored?.rankedWindow ?? null);
     const [loadingMore, setLoadingMore] = useState(false);
     const [saving, setSaving] = useState(false);
     const sentinelRef = useRef<HTMLDivElement>(null);
-    const activeQueryRef = useRef('');
+    const activeQueryRef = useRef(restored?.activeQuery ?? '');
     // True while the server is still building this library's search database
     // (new library / first search after an upgrade); searches retry automatically.
     const [indexBuilding, setIndexBuilding] = useState(false);
     const seqRef = useRef(0);
+
+    // Remember the search for when the user comes back (see AskSnapshot above).
+    useEffect(() => {
+        askSnapshot = {
+            library: currentLibrary(), query, activeQuery: activeQueryRef.current, results, total, hasMore, rankedWindow,
+            scrollY: askSnapshot?.scrollY ?? 0,
+        };
+    }, [query, results, total, hasMore, rankedWindow]);
+    useEffect(() => {
+        if (restored && restored.scrollY > 0) {
+            requestAnimationFrame(() => window.scrollTo(0, restored.scrollY));
+        }
+        return () => {
+            if (askSnapshot) askSnapshot = { ...askSnapshot, scrollY: window.scrollY };
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     // Search results aren't part of the gallery's paginated photo list, so the
     // viewer can't resolve them by id unless they're registered here too --
@@ -141,11 +182,13 @@ export const AskPage: React.FC = () => {
                     if (seq !== seqRef.current) return;
                     if (res?.searchIndexBuilding && attempt < SEARCH_BUILD_RETRIES - 1) {
                         setIndexBuilding(true);
+                        reportIndexBuilding('search', true);
                         await new Promise((resolve) => setTimeout(resolve, SEARCH_BUILD_RETRY_MS));
                         if (seq !== seqRef.current) return;
                         continue;
                     }
                     setIndexBuilding(Boolean(res?.searchIndexBuilding));
+                    if (!res?.searchIndexBuilding) reportIndexBuilding('search', false);
                     const first = Array.isArray(res?.photos) ? res.photos.map(mapResult) : [];
                     setResults(first);
                     setTotal(typeof res?.total === 'number' ? res.total : first.length);
@@ -171,6 +214,7 @@ export const AskPage: React.FC = () => {
     useEffect(() => {
         const incoming = route.params.query;
         if (incoming === undefined) return;
+        if (restored && incoming.trim() === restored.activeQuery) return;   // already showing this search
         setQuery(incoming);
         runSearch(incoming);
         // eslint-disable-next-line react-hooks/exhaustive-deps

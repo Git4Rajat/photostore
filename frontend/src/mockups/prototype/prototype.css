@@ -710,3 +710,11 @@
 
 .pt-public-footer { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 32px; padding: 20px 0 8px; border-top: 1px solid var(--lg-edge); color: var(--muted); font-size: 0.82rem; text-align: center; }
 .pt-public-footer strong { color: var(--text); font-weight: 700; }
+
+/* Library-preparing banner (shown while the server is still building indexes) */
+.pt-index-bar { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--lg-edge); border-radius: var(--r-md); background: var(--lg-surface-wash); }
+.pt-index-bar-track { position: relative; height: 4px; overflow: hidden; border-radius: 999px; background: var(--accent-soft); }
+.pt-index-bar-fill { position: absolute; top: 0; bottom: 0; width: 35%; border-radius: 999px; background: var(--accent); animation: pt-index-slide 1.4s ease-in-out infinite; }
+.pt-index-bar-text { font-size: 0.8rem; color: var(--muted); }
+@keyframes pt-index-slide { 0% { left: -35%; } 100% { left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .pt-index-bar-fill { animation: none; width: 100%; opacity: 0.5; } }
