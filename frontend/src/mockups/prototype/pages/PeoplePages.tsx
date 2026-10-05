@@ -21,7 +21,7 @@ const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.n
  *  "Select" mode lets several clusters be picked and merged into one in a
  *  single action, instead of the one-at-a-time merge on the detail page. */
 export const PeoplePage: React.FC = () => {
-    const { people, peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, loadMorePeople, navigate, mergePeopleBatch, deletePeopleBatch, fetchPeople } = useStore();
+    const { people, peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, navigate, mergePeopleBatch, deletePeopleBatch, fetchPeople } = useStore();
 
     // Loads people when this tab is actually visited, queued behind whatever
     // else is in flight, aborted if the user navigates away before its turn.
@@ -80,6 +80,16 @@ export const PeoplePage: React.FC = () => {
             <div>
                 <div className="pt-toolbar"><div><h1 className="pt-page-title">People</h1></div></div>
                 <Spinner label="Loading people…" />
+            </div>
+        );
+    }
+
+    if (peopleUnavailable && people.length === 0) {
+        return (
+            <div>
+                <div className="pt-toolbar"><div><h1 className="pt-page-title">People</h1></div></div>
+                <p className="pt-grid-empty">Your people are still being prepared. This can take a few minutes for a large library.</p>
+                <button type="button" className="btn" onClick={() => void fetchPeople()}>Try again</button>
             </div>
         );
     }
