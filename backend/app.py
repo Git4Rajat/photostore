@@ -1927,8 +1927,11 @@ def _open_library_db(user_id: str):
     import search_db
     db = search_db.open_database(user_id)
     if db is None:
+        # Only a library that truly has no database is built. A failed download or a blip reading
+        # the manifest must not start a full rebuild (the caller just reports "warming").
         try:
-            _trigger_tools_index_rebuild(user_id)
+            if search_db.needs_build(user_id):
+                _trigger_tools_index_rebuild(user_id, reason='no-search-db')
         except Exception:
             pass
     return db

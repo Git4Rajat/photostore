@@ -218,3 +218,46 @@ def test_serving_process_does_not_scan_person_rows_to_build_the_assignment_index
     app._people_embedding_index_cache.invalidate('lib-3')
     assert app._load_people_embedding_index('lib-3') == []
     assert requested == ['lib-3']
+
+
+# --- a failed download / manifest blip must never start a full rebuild ------------------------
+
+def test_open_library_db_requests_a_build_only_when_none_exists(monkeypatch):
+    import app
+    import search_db
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, **kw: triggered.append(kw.get('reason')))
+    monkeypatch.setattr(search_db, 'open_database', lambda uid, **kw: None)
+
+    monkeypatch.setattr(search_db, 'needs_build', lambda uid: False)        # manifest exists / transient error
+    assert app._open_library_db('u1') is None and triggered == []
+
+    monkeypatch.setattr(search_db, 'needs_build', lambda uid: True)         # genuinely never built
+    assert app._open_library_db('u1') is None and triggered == ['no-search-db']
+
+
+def test_needs_build_distinguishes_absent_from_error(monkeypatch):
+    import search_db
+
+    class _Missing(Exception):
+        pass
+    _Missing.__name__ = 'ResourceNotFoundError'
+
+    class _Client:
+        def __init__(self, exc=None, body=b''):
+            self.exc, self.body = exc, body
+
+        def download_blob(self):
+            if self.exc:
+                raise self.exc
+            return type('D', (), {'readall': lambda s: self.body})()
+
+    monkeypatch.setattr(search_db, '_blob_client', lambda name: _Client(_Missing()))
+    assert search_db.needs_build('u1') is True                               # no manifest at all
+    monkeypatch.setattr(search_db, '_blob_client', lambda name: _Client(RuntimeError('timeout')))
+    assert search_db.needs_build('u1') is False                              # storage blip
+    monkeypatch.setattr(search_db, '_blob_client',
+                        lambda name: _Client(body=('{"sourceVersion":"v1","schemaVersion":"%s"}' % search_db.SCHEMA_VERSION).encode()))
+    assert search_db.needs_build('u1') is False                              # current
+    monkeypatch.setattr(search_db, '_blob_client', lambda name: _Client(body=b'{"sourceVersion":"v1","schemaVersion":"old"}'))
+    assert search_db.needs_build('u1') is True                               # older schema

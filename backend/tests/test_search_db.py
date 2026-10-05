@@ -229,9 +229,14 @@ def test_route_without_database_asks_tools_to_build_and_reports_it(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: None)
     nudged = []
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: nudged.append(uid))
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, **kw: nudged.append(uid))
+    monkeypatch.setattr(search_db, 'needs_build', lambda uid: True)
     payload = _search('dog')
     assert payload == {'photos': [], 'total': 0, 'searchIndexBuilding': True} and nudged == ['owner']
+    # a database that exists but could not be opened here (download blip) must not start a rebuild
+    nudged.clear()
+    monkeypatch.setattr(search_db, 'needs_build', lambda uid: False)
+    assert _search('dog')['searchIndexBuilding'] is True and nudged == []
 
 
 def test_route_never_loads_the_lexical_index_or_scans_the_table(monkeypatch, db):

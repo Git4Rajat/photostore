@@ -147,10 +147,10 @@ def photo_access_url_batch():
         except Exception:
             pass
     else:
-        # No access index yet: have the worker build it; this call uses the
-        # per-filename fallback below.
+        # No access index yet: have the worker build it (sort/access only -- not the whole
+        # library); this call uses the per-filename fallback below.
         try:
-            app._trigger_tools_index_rebuild(user_id)
+            app._trigger_tools_index_rebuild(user_id, reason='no-access-index', scope='light')
         except Exception:
             pass
 
@@ -718,7 +718,8 @@ def search_photos():
     if db is None:
         # No current search database yet (new library / first deploy): have tools
         # build it and tell the client, instead of scanning the library here.
-        app._trigger_tools_index_rebuild(user_id)
+        if search_db.needs_build(user_id):
+            app._trigger_tools_index_rebuild(user_id, reason='no-search-db')
         return app.jsonify({'photos': [], 'total': 0, 'searchIndexBuilding': True})
 
     pid_to_name, name_to_ids = app._load_people_name_index(user_id)

@@ -491,6 +491,24 @@ def load_manifest(user_id: str) -> Dict:
         return {}
 
 
+def needs_build(user_id: str) -> bool:
+    """True only when the library genuinely has no usable database: no manifest (never built) or
+    one on an older schema. A transient storage error, or a current manifest whose database file
+    merely failed to download on this replica, is NOT a reason to rebuild the library -- that
+    would turn a blip into a multi-minute full scan."""
+    _, manifest_name = _blob_names(user_id)
+    client = _blob_client(manifest_name)
+    if client is None:
+        return False
+    try:
+        parsed = json.loads(client.download_blob().readall().decode('utf-8'))
+    except Exception as exc:
+        return type(exc).__name__ == 'ResourceNotFoundError'
+    if not isinstance(parsed, dict) or not parsed.get('sourceVersion'):
+        return True
+    return parsed.get('schemaVersion') != SCHEMA_VERSION
+
+
 def is_current(user_id: str, lexical_source_version: str) -> bool:
     manifest = load_manifest(user_id)
     return bool(
