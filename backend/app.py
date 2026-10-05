@@ -9882,7 +9882,9 @@ def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
     if jobs_table_client is None:
         return None
     try:
-        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+        rows = list(jobs_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and (status eq 'queued' or status eq 'running')"
+        ))
     except Exception:
         return None
     for row in rows:

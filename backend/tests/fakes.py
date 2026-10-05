@@ -62,6 +62,27 @@ class FakeTable:
         # of the partition key value itself. Second alternative covers
         # unquoted OData boolean literals (e.g. "processing_complete eq
         # true"), which don't fit the quoted-string '(.*)' form.
+        m = re.match(r"PartitionKey eq '([^']*)' and \((.+)\)$", filter_str.strip())
+        if m:
+            # "PartitionKey eq 'x' and (a ge 'v' or b eq 'w' or ...)"
+            pk = m.group(1)
+            clauses = []
+            for part in m.group(2).split(' or '):
+                cm = re.match(r"(\w+) (eq|ge|le|gt|lt) '(.*)'$", part.strip())
+                if not cm:
+                    raise ValueError(f'Unsupported filter: {filter_str}')
+                clauses.append(cm.groups())
+            ops = {
+                'eq': lambda a, b: a == b, 'ge': lambda a, b: a >= b, 'le': lambda a, b: a <= b,
+                'gt': lambda a, b: a > b, 'lt': lambda a, b: a < b,
+            }
+            rows = [
+                dict(v) for (p, _), v in self.rows.items()
+                if p == pk and any(ops[op](str(v.get(f, '')), val) for f, op, val in clauses)
+            ]
+            if select:
+                rows = [{k: v[k] for k in select if k in v} for v in rows]
+            return rows
         m = re.match(r"PartitionKey eq '(.*)' and (\w+) eq '(.*)'$", filter_str.strip())
         if m:
             pk, field, value = m.group(1), m.group(2), m.group(3)

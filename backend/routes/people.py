@@ -381,6 +381,62 @@ def decline_person_suggestion():
         app.app.logger.exception('Decline person suggestion endpoint failed')
         return app.jsonify({'error': 'Decline person suggestion failed'}), 500
 
+def _confirm_faces_for_person(user_id: str, face_ids) -> set:
+    """Mark every face of a just-named person as user-confirmed.
+
+    A named cluster can hold thousands of faces. This used to read and upsert
+    them one at a time (2 sequential storage round trips each, ~125 s p95 for
+    big clusters, holding a web thread the whole time). Now the point reads
+    fan out over a small pool and the writes go out as 100-row transactions
+    (the Table Storage cap), falling back to single upserts if a transaction
+    is rejected."""
+    affected_files = set()
+    ids = [str(f) for f in face_ids if f]
+    if not ids:
+        return affected_files
+
+    def _read_and_confirm(face_id):
+        try:
+            face = app.face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            return None
+        face['confirmedByUser'] = True
+        face['reviewStatus'] = 'confirmed'
+        face['rejected'] = False
+        face.pop('suspiciousReason', None)
+        face.pop('rejectedReason', None)
+        face.pop('rejectedAt', None)
+        face['confidence'] = max(float(face.get('confidence', 0.0) or 0.0), 1.0)
+        return face
+
+    with ThreadPoolExecutor(max_workers=min(16, len(ids))) as executor:
+        faces = [f for f in executor.map(_read_and_confirm, ids) if f is not None]
+    for face in faces:
+        filename = str(face.get('filename') or '')
+        if filename:
+            affected_files.add(filename)
+
+    def _write_chunk(chunk):
+        submit = getattr(app.face_table_client, 'submit_transaction', None)
+        if submit is not None:
+            try:
+                submit([('upsert', face) for face in chunk])
+                return
+            except Exception:
+                app.app.logger.warning('Face confirm transaction failed; falling back to single upserts', exc_info=True)
+        for face in chunk:
+            try:
+                app.face_table_client.upsert_entity(face)
+            except Exception:
+                continue
+
+    chunks = [faces[i:i + 100] for i in range(0, len(faces), 100)]
+    if chunks:
+        with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as executor:
+            list(executor.map(_write_chunk, chunks))
+    return affected_files
+
+
 @people_bp.route('/api/persons/<person_id>/label', methods=['POST'])
 def label_person(person_id: str):
     user_id, error = app._require_user_id()
@@ -400,25 +456,12 @@ def label_person(person_id: str):
         face_ids = app.json.loads(person.get('faceIds', '[]') or '[]')
     except Exception:
         face_ids = []
-    affected_files = set()
-    for face_id in face_ids:
-        try:
-            face = app.face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-            filename = str(face.get('filename') or '')
-            if filename:
-                affected_files.add(filename)
-            face['confirmedByUser'] = True
-            face['reviewStatus'] = 'confirmed'
-            face['rejected'] = False
-            face.pop('suspiciousReason', None)
-            face.pop('rejectedReason', None)
-            face.pop('rejectedAt', None)
-            face['confidence'] = max(float(face.get('confidence', 0.0) or 0.0), 1.0)
-            app.face_table_client.upsert_entity(face)
-        except Exception:
-            continue
-    app._update_person_rep_embedding(user_id, person_id)
-    app._rebuild_metadata_faces_for_filenames(user_id, affected_files)
+    with app.perf_instrumentation.step('label.confirm_faces', faces=len(face_ids)):
+        affected_files = _confirm_faces_for_person(user_id, face_ids)
+    with app.perf_instrumentation.step('label.rep_embedding'):
+        app._update_person_rep_embedding(user_id, person_id)
+    with app.perf_instrumentation.step('label.rebuild_metadata_faces', files=len(affected_files)):
+        app._rebuild_metadata_faces_for_filenames(user_id, affected_files)
 
     # Naming a cluster is a strong identity signal: use its learned rep to pull
     # this person's faces out of unnamed clusters automatically. Best-effort so a
@@ -426,7 +469,8 @@ def label_person(person_id: str):
     auto_assigned = 0
     if name.strip() and not app._is_unnamed_name(name):
         try:
-            propagation = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
+            with app.perf_instrumentation.step('label.propagate_identity'):
+                propagation = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
             auto_assigned = int(propagation.get('autoAssignedCount') or 0)
         except Exception:
             app.app.logger.exception('Identity propagation after label failed for %s', person_id)

@@ -730,7 +730,25 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 throw new Error('albums index unavailable');
             }
             const coverFilenames = rows.map((r) => r.coverFilename).filter(Boolean);
-            const covers = coverFilenames.length ? await resolveThumbnailAccessUrls(coverFilenames) : new Map<string, string>();
+            // Covers resolve from the sort index's thumbnail blob names + the one container
+            // token: no backend call, and the same URL the gallery uses, so the browser
+            // cache serves a thumbnail already loaded there. Only covers the sort index
+            // can't name (older rows, other formats) fall back to the per-photo batch call.
+            const [coverSortRows, coverToken] = await Promise.all([
+                getLocalSortIndex().catch(() => null),
+                getMediaToken().catch(() => null),
+            ]);
+            const thumbByName = new Map<string, string>();
+            (coverSortRows ?? []).forEach((r) => { if (r.thumb) thumbByName.set(r.filename, r.thumb); });
+            const covers = new Map<string, string>();
+            const needBatch: string[] = [];
+            coverFilenames.forEach((filename) => {
+                const direct = coverToken ? thumbnailUrlForBlob(thumbByName.get(filename), coverToken) : '';
+                if (direct) covers.set(filename, direct); else needBatch.push(filename);
+            });
+            if (needBatch.length) {
+                (await resolveThumbnailAccessUrls(needBatch)).forEach((url, filename) => covers.set(filename, url));
+            }
             albumFilenamesRef.current = Object.fromEntries(rows.map((r) => [r.albumId, r.filenames]));
             const mapped: Album[] = rows.map((r) => ({
                 id: r.albumId,

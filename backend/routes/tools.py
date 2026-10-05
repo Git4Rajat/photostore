@@ -191,7 +191,14 @@ def jobs_status():
             # _upsert_job_status), so this is a normal scoped partition query,
             # not the fleet-wide 219k+-row scan this used to share with
             # _has_active_clustering_job.
-            rows = list(app.jobs_table_client.query_entities(f"PartitionKey eq '{app._escape_odata(user_id)}'"))
+            # Server-side filter: only what the response can include (in-flight, or
+            # recently updated). The partition holds every job the library ever ran, and
+            # this endpoint is polled continuously -- reading all of it was ~160 storage
+            # pages per call.
+            rows = list(app.jobs_table_client.query_entities(
+                f"PartitionKey eq '{app._escape_odata(user_id)}' and "
+                f"(updatedAt ge '{cutoff}' or status eq 'queued' or status eq 'running')"
+            ))
         except Exception:
             app.app.logger.exception('Failed to query job status rows for %s', user_id)
             return app.jsonify({'jobs': []})
