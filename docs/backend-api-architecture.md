@@ -546,3 +546,14 @@ Still full-rebuild-only: the Explore places/things summary. Still O(library) per
 - A server page is one indexed SQL page over the library database plus four batched row reads, so it costs the same at 10k or 10M photos. Page size follows the screen.
 - For those libraries the sort index is no longer built, marked dirty or rewritten by light builds (`sort_index_skipped`). Readiness still holds, via a manifest with `skipped: true`.
 - Rating and like edits used to dirty only the sort index, so the search database's rating column went stale. They now also mark the photo for the next delta.
+
+### 15.7 No result caps: search, people, Workbench, trash
+
+The old 200-result limits are gone. Each list now pages, reports an exact total, and keeps the DOM small by infinite scroll.
+
+- **Search.** Ranking runs over a window of the best 4,000 candidates (cached 45s); pages are cut from that window. Matches beyond the window are appended newest-first, so every match is reachable exactly once. `total` is an exact SQL count, `rankedWindow` says how many are ranked, and the UI notes that later results are in date order.
+- **Thumbnails for 200K results.** One container-scoped media token covers every thumbnail. The page returns `directMedia` blob names, the browser builds URLs locally and only fetches the tiles that scroll into view. Result size affects paging and selection, not tokens.
+- **People.** `GET /people/<id>` pages (`offset`, `limit`, `total`, `hasMore`), best faces first, reading the cached face summary instead of the cluster.
+- **Workbench.** The grid lists from `/api/photos` (`sort=date|name`, `nameContains`, infinite scroll). "Select all (N)" asks the server for matching filenames with `idsOnly=1` (5,000 per call, up to 100,000 selected, with a note if more match), so selection does not depend on what has loaded. Deep-linked photos are pinned to the top.
+- **Trash.** The list pages through every trashed photo, 200 per request.
+- `lookup-batch` still takes at most 200 filenames per call; callers chunk, so it is a batch size rather than a result cap.
