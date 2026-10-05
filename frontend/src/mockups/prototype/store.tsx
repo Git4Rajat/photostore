@@ -345,6 +345,8 @@ interface Store {
     peopleTotal: number;
     peopleUnnamedTotal: number;
     peopleHasMore: boolean;
+    /** The server's paged people list could not be loaded (index still building, or a network error). */
+    peopleUnavailable: boolean;
     loadMorePeople: () => void;
     /** Server-side name search (not stored in the list). */
     searchPeople: (query: string, limit?: number) => Promise<Person[]>;
@@ -417,6 +419,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [peopleTotal, setPeopleTotal] = useState(0);
     const [peopleUnnamedTotal, setPeopleUnnamedTotal] = useState(0);
     const [peopleHasMore, setPeopleHasMore] = useState(false);
+    const [peopleUnavailable, setPeopleUnavailable] = useState(false);
     const [extraPeople, setExtraPeople] = useState<Record<string, Person>>({});
     const peopleOffsetRef = useRef(0);
     const peopleLoadingMoreRef = useRef(false);
@@ -1278,22 +1281,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, [toast]);
 
-    // Fallback for when the people index is unavailable (cold/failed build):
-    // ONE request for every cluster -- no 200 (or any) page cap, so accounts with
-    // tens of thousands of clusters see them all. The server returns names,
-    // counts and a cover face id only (no per-person thumbnail work).
-    const fetchPeopleViaLegacyEndpoint = useCallback(async () => {
-        const roster = await faceService.listAllPersons();
-        setPeople(roster.map((r): Person => ({
-            id: r.personId,
-            name: r.isNamed && r.name.trim() ? r.name : null,
-            swatch: swatchFor(r.personId),
-            photoIds: [],
-            coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
-            faceCount: r.faceCount,
-        })));
-    }, []);
-
     // Primary path: one server page of clusters (named first), cut from the cached people index, then
     // more as the user scrolls -- the browser never downloads every cluster. Falls back to the legacy
     // single request only while the server's people index is still building.
@@ -1310,17 +1297,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setPeopleTotal(res.total ?? mapped.length);
             setPeopleUnnamedTotal(res.unnamedCount ?? 0);
             setPeopleHasMore(Boolean(res.hasMore));
+            setPeopleUnavailable(false);
         } catch {
-            try {
-                await fetchPeopleViaLegacyEndpoint();
-                setPeopleHasMore(false);
-            } catch {
-                // keep the current list on transient failures
-            }
+            // Never fall back to fetching every cluster at once: show a "preparing" state and let the
+            // user (or the next visit) retry the paged request.
+            setPeopleHasMore(false);
+            setPeopleUnavailable(true);
         } finally {
             setPeopleLoading(false);
         }
-    }, [fetchPeopleViaLegacyEndpoint]);
+    }, []);
 
     const loadMorePeople = useCallback(() => {
         if (peopleLoadingMoreRef.current) return;
@@ -1625,7 +1611,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             deleteAlbums,
             shareAlbum,
             revokeAlbum,
-            peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, loadMorePeople, searchPeople,
+            peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople,
             reloadPeople,
             fetchPeople,
             openPerson,
@@ -1660,7 +1646,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
-            peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
+            peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
             renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],
