@@ -8655,7 +8655,8 @@ def add_cors_headers(response):
             # the origin is echoed only after _origin_is_allowed, never '*'.
             response.headers['Access-Control-Allow-Credentials'] = 'true'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Upload-Id, X-Filename, Content-Range'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Upload-Id, X-Filename, Content-Range, X-Request-ID, X-Client-View, X-Client-Session'
+    response.headers['Access-Control-Expose-Headers'] = 'X-Request-ID, Server-Timing'
     _apply_security_headers(response)
     return response
 
@@ -8688,7 +8689,7 @@ def handle_preflight():
                 resp.headers['Vary'] = 'Origin'
                 resp.headers['Access-Control-Allow-Credentials'] = 'true'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Upload-Id, X-Filename, Content-Range'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Upload-Id, X-Filename, Content-Range, X-Request-ID, X-Client-View, X-Client-Session'
         # Without this, the browser re-preflights every method+headers
         # combination on every call (observed live: OPTIONS was 39% of all
         # backend requests during a bulk upload), doubling load on the same
@@ -9831,7 +9832,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     heartbeat = threading.Thread(target=_heartbeat, name='index-build-heartbeat', daemon=True)
     heartbeat.start()
     try:
-        with perf_instrumentation.span('index.build.job', user=user_id):
+        with perf_instrumentation.scope(f'index.build.{scope}', user=user_id, job=job_id):
             storage_utils_ensure_sort_current(user_id)  # schema upgrade (full rebuild if stale)
             if scope == 'light':
                 prime_all_user_indexes_sequentially(user_id, wait=True, kinds=('sort', 'access'))
@@ -12942,6 +12943,24 @@ def _poll_clustering_queue_once(
 
 def _process_clustering_queue_message(message, queue_client, queue_name, max_retries,
                                       deadletter_queue_client=None, *, dispatch=None):
+    """Instrumented entry: one `scope_summary` line per queue message (wall time,
+    storage round trips, duplicates, peak RSS) tagged with the job type."""
+    job_type, user_id = '?', ''
+    try:
+        body = json.loads(getattr(message, 'content', '') or '{}')
+        if isinstance(body, dict):
+            job_type = str(body.get('type') or '?')
+            user_id = str(body.get('user_id') or body.get('userId') or '')
+    except Exception:
+        pass
+    with perf_instrumentation.scope(f'queue.{queue_name}.{job_type}', user=user_id,
+                                    dequeue=getattr(message, 'dequeue_count', None)):
+        return _process_clustering_queue_message_impl(
+            message, queue_client, queue_name, max_retries, deadletter_queue_client, dispatch=dispatch)
+
+
+def _process_clustering_queue_message_impl(message, queue_client, queue_name, max_retries,
+                                           deadletter_queue_client=None, *, dispatch=None):
     """Existing per-message retry, renewal and success-only ack contract."""
     payload: Dict = {}
     job_id = ''
@@ -13792,6 +13811,11 @@ def _prewarm_ipwork_models() -> None:
 
 
 def _process_ipwork_message(message) -> str:
+    with perf_instrumentation.scope('ipwork.message', dequeue=getattr(message, 'dequeue_count', None)):
+        return _process_ipwork_message_impl(message)
+
+
+def _process_ipwork_message_impl(message) -> str:
     """Runs on a worker thread. Parses one queue message and dispatches it
     through _handle_ipwork_queue_payload, returning the outcome string
     ('done'/'noop'/'lease_busy'/'not_found'/'error'/'retry_exhausted'). Never raises -- any exception here is

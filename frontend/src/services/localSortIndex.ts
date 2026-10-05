@@ -1,4 +1,5 @@
 import { get } from './apiClient';
+import { perf, perfNow } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 
 /**
@@ -108,11 +109,14 @@ const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => 
 };
 
 const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> => {
+    const downloadStarted = perfNow();
     const response = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     if (!response.ok) {
         throw new Error(`Failed to download sort index (${response.status})`);
     }
     const buffer = await response.arrayBuffer();
+    perf.recordSpan('index.sort.blob_download', perfNow() - downloadStarted, { bytes: buffer.byteLength });
+    const parseStarted = perfNow();
     // The blob is stored with Content-Encoding: gzip -- most browsers
     // transparently decompress it before we ever see the bytes, so try
     // parsing directly first and only fall back to manual decompression if
@@ -122,6 +126,7 @@ const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> 
         const text = new TextDecoder().decode(buffer);
         const parsed = JSON.parse(text);
         if (parsed && Array.isArray(parsed.rows)) {
+            perf.recordSpan('index.sort.parse', perfNow() - parseStarted, { rows: parsed.rows.length });
             return normalizeRows(parsed.rows);
         }
     } catch {
@@ -142,22 +147,31 @@ let cachedIndex: SortIndexRow[] | null = null;
 let inFlight: Promise<SortIndexRow[] | null> | null = null;
 
 const fetchLocalSortIndex = async (key: string): Promise<SortIndexRow[] | null> => {
+    const totalStarted = perfNow();
+    const manifestStarted = perfNow();
     const response: SortIndexResponse = await get('/api/photos/sort-index');
+    perf.recordSpan('index.sort.manifest', perfNow() - manifestStarted);
     if (!response?.available || !response.indexUrl) {
         return null;
     }
     const sourceVersion = response.sourceVersion || '';
+    const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
+    perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
     if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
         // Unchanged since the last download for this library -- skip the
         // blob re-fetch entirely, this is the whole point of persisting it.
+        perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
         return stored.rows;
     }
     const rows = await downloadSortIndexBlob(response.indexUrl);
+    const writeStarted = perfNow();
     await idbPutStored(key, { sourceVersion, updatedAt: response.updatedAt || '', rows }).catch(() => {
         // Best-effort persistence -- an in-memory-only session still works,
         // it just re-downloads next reload instead of skipping the fetch.
     });
+    perf.recordSpan('index.sort.idb_write', perfNow() - writeStarted, { rows: rows.length });
+    perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: false, rows: rows.length });
     return rows;
 };
 

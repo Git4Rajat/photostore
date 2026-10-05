@@ -58,3 +58,49 @@ def performance_throughput():
 # THREADS=2 pool -- the same scarce resource the 2026-10-01 crash-loop fix
 # was about. tools has no such contention (no interactive request traffic),
 # so this background polling belongs there instead.
+
+
+_CLIENT_PERF_FIELDS = {
+    'req': ('method', 'path', 'status', 'ms', 'ttfbMs', 'serverMs', 'storageMs', 'bytes', 'rid', 'attempt', 'coalesced', 'queuedMs', 'view', 'ok'),
+    'resource': ('kind', 'host', 'path', 'ms', 'cached', 'bytes', 'n', 'view'),
+    'span': ('name', 'ms', 'view', 'bytes', 'rows', 'cached', 'n'),
+    'dup': ('kind', 'key', 'n', 'windowMs', 'view'),
+    'vital': ('name', 'value', 'view'),
+    'view': ('name', 'ms', 'requests', 'netMs', 'dups', 'bytes', 'resources', 'cachedResources', 'longTasks', 'longTaskMs'),
+    'summary': ('windowMs', 'requests', 'failed', 'dups', 'bytes', 'slowest', 'chattiest', 'dupBlobs', 'resources', 'cachedResources', 'longTasks', 'longTaskMs'),
+}
+_CLIENT_PERF_MAX_EVENTS = 300
+
+
+def _clean_perf_value(value) -> str:
+    text = str(value).replace('\n', ' ').replace('\r', ' ').replace(' ', '_')
+    return text.split('?', 1)[0][:160]  # never log query strings (SAS tokens)
+
+
+@system_bp.route('/api/perf/client', methods=['POST'])
+def client_perf_report():
+    """Browser-side performance events (request timings, duplicate fetches,
+    resource-cache behaviour, view summaries). Logged as `PERF event=client_*`
+    lines next to the backend's own, joinable on `rid`/`sess`. Never fails the
+    caller; unknown fields are dropped and values are length-capped."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    body = app.request.get_json(silent=True) or {}
+    events = body.get('events')
+    if not isinstance(events, list):
+        return app.jsonify({'ok': True, 'accepted': 0})
+    session = _clean_perf_value(body.get('session') or '-')[:16]
+    logger = app.logging.getLogger('perf')
+    accepted = 0
+    for event in events[:_CLIENT_PERF_MAX_EVENTS]:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get('t') or '')
+        fields = _CLIENT_PERF_FIELDS.get(kind)
+        if not fields:
+            continue
+        rendered = ' '.join(f'{name}={_clean_perf_value(event[name])}' for name in fields if event.get(name) is not None)
+        logger.info('PERF event=client_%s user=%s sess=%s %s', kind, _clean_perf_value(user_id), session, rendered)
+        accepted += 1
+    return app.jsonify({'ok': True, 'accepted': accepted})

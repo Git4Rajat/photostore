@@ -2,6 +2,9 @@ import axios, { type AxiosHeaders, type AxiosRequestConfig, type InternalAxiosRe
 import { getAccessToken, isAuthEnabled } from './authClient';
 import { reportBackendReachable, reportBackendUnreachable } from './backendStatus';
 import { classifyApiError, newRequestId } from './apiError';
+import { parseServerTiming, perf, perfEnabled, perfNow, requestKey, stripQuery } from './perf';
+
+const PERF_REPORT_PATH = '/api/perf/client';
 
 const normalizePath = (url: string): string => {
     if (/^https?:\/\//i.test(url)) {
@@ -152,21 +155,56 @@ export const requestJson = async <T = any>(
     // One correlation id for the whole call, shared across cold-start retries,
     // so a user-visible "ref" ties to a single logical request.
     const requestId = newRequestId();
+    const traced = perfEnabled() && !url.includes(PERF_REPORT_PATH);
+    const perfKey = traced ? requestKey(method, normalizePath(url), data) : '';
+    const recordPerf = (
+        started: number, attempt: number, status: number, ok: boolean, rid: string,
+        headers?: Record<string, unknown>, payload?: unknown, coalesced = false,
+    ) => {
+        if (!traced) return;
+        const timing = parseServerTiming(String(headers?.['server-timing'] ?? ''));
+        let bytes = Number(headers?.['content-length'] ?? 0) || 0;
+        if (!bytes && payload !== undefined && payload !== null) {
+            try { bytes = typeof payload === 'string' ? payload.length : JSON.stringify(payload).length; } catch { bytes = 0; }
+        }
+        perf.recordRequest({
+            method: method.toUpperCase(), path: stripQuery(normalizePath(url)), status, ok,
+            ms: perfNow() - started, bytes, rid, attempt, coalesced, view: perf.currentView, at: perfNow(),
+            serverMs: timing.app, storageMs: timing.storage,
+        }, perfKey);
+    };
     const performRequest = async (): Promise<T> => {
         for (let attempt = 0; ; attempt += 1) {
+            // A fresh id per attempt: the backend logs one line per attempt, and a retry that
+            // reused the id would be indistinguishable from a duplicate request.
+            const rid = traced ? perf.nextRequestId() : '';
+            const started = perfNow();
+            const tracedConfig: RequestConfig | undefined = traced
+                ? {
+                    ...config,
+                    headers: {
+                        ...(config?.headers as Record<string, string> | undefined),
+                        'X-Request-ID': rid, 'X-Client-View': perf.currentView, 'X-Client-Session': perf.session,
+                    },
+                }
+                : config;
             try {
                 const response = method === 'get'
-                    ? await client.get<T>(normalizePath(url), config)
+                    ? await client.get<T>(normalizePath(url), tracedConfig)
                     : method === 'post'
-                        ? await client.post<T>(normalizePath(url), data, config)
+                        ? await client.post<T>(normalizePath(url), data, tracedConfig)
                         : method === 'put'
-                            ? await client.put<T>(normalizePath(url), data, config)
-                            : await client.delete<T>(normalizePath(url), config);
+                            ? await client.put<T>(normalizePath(url), data, tracedConfig)
+                            : await client.delete<T>(normalizePath(url), tracedConfig);
+                recordPerf(started, attempt, response.status, true, rid, response.headers as Record<string, unknown>, response.data);
                 // A real response (any status) proves the backend is up; clear
                 // any outstanding "backend unavailable" state immediately.
                 reportBackendReachable();
                 return response.data;
             } catch (error: unknown) {
+                if (axios.isAxiosError(error)) {
+                    recordPerf(started, attempt, error.response?.status ?? 0, false, rid, error.response?.headers as Record<string, unknown> | undefined);
+                }
                 if (!config?.singleAttempt && attempt < COLD_START_RETRIES && isRetriableColdStart(error, method)) {
                     // First sign of trouble: surface the "waking up" banner right
                     // away rather than only after the full ~90s budget below is
@@ -204,6 +242,9 @@ export const requestJson = async <T = any>(
     const dedupeKey = `${client.defaults.baseURL || ''}|${normalizePath(url)}`;
     const existing = inFlightGets.get(dedupeKey);
     if (existing) {
+        // Shared an already in-flight identical GET: no network cost, but record it so
+        // "who asked for this twice at once" is visible.
+        recordPerf(perfNow(), 0, 0, true, '', undefined, undefined, true);
         return existing as Promise<T>;
     }
     const request = performRequest().finally(() => {
