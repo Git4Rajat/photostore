@@ -441,6 +441,12 @@ def list_photos():
 
     app.g.direct_media = app.request.args.get('directMedia') in ('1', 'true')
     capture_start, capture_end = app._parse_capture_range_args()
+    name_contains = (app.request.args.get('nameContains') or '').strip()
+    ids_only = app.request.args.get('idsOnly') in ('1', 'true')
+    # idsOnly returns just filenames (up to 5000 per call) -- how "select every match" walks a huge
+    # result set without loading a photo record for each; otherwise a page stays a sensible size.
+    limit = max(1, min(5000 if ids_only else 1000, limit))
+    offset = max(0, offset)
 
     user_id, error = app._require_user_id()
     if error:
@@ -454,10 +460,13 @@ def list_photos():
         filenames, total = db.list_page(
             sort=sort, offset=offset, limit=limit,
             capture_start_day=app._day_ordinal(capture_start), capture_end_day=app._day_ordinal(capture_end),
+            name_contains=name_contains,
         )
     except Exception:
         app.app.logger.exception('Photo list query failed')
         return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
+    if ids_only:
+        return app.jsonify({'filenames': filenames, 'total': total, 'offset': offset, 'hasMore': offset + limit < total})
 
     fetched = app._get_metadata_entities(user_id, filenames)
     metadata_map = {name: row for name, row in fetched.items() if row and row.get('processing_state') != 'deleted'}

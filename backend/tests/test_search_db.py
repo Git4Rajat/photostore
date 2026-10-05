@@ -368,3 +368,32 @@ def test_page_size_is_bounded_but_depth_is_not(monkeypatch, big_db):
     photos._SEARCH_WINDOW_CACHE.clear()
     assert len(_page('dog', 0, 100000)['photos']) <= photos.SEARCH_MAX_PAGE
     assert _page('dog', 5000, 40)['photos'] == []                       # past the end: empty, not an error
+
+
+# --- library listing for the Workbench: filename filter, name sort, ids-only paging ------------------
+
+def test_list_page_filters_by_filename_text_and_sorts_by_name(tmp_path):
+    rows = [{'RowKey': n, 'uploadDate': f'2020-01-0{i + 1}T00:00:00+00:00'} for i, n in enumerate(
+        ['IMG_100.jpg', 'beach_a.jpg', 'Beach_B.png', 'trip%1.jpg', 'a_b.jpg', 'axb.jpg'])]
+    path = str(tmp_path / 'l.sqlite')
+    search_db.build_database(rows, path)
+    db = search_db.SearchDatabase(path)
+    assert db.list_page(sort='name', name_contains='beach') == (['beach_a.jpg', 'Beach_B.png'], 2)       # case-insensitive
+    assert db.list_page(sort='name', name_contains='%1')[0] == ['trip%1.jpg']                           # % is literal, not a wildcard
+    assert db.list_page(sort='name', name_contains='a_b')[0] == ['a_b.jpg']                             # so is _
+    names, total = db.list_page(sort='name', limit=2, offset=1)
+    assert total == 6 and names == ['axb.jpg', 'beach_a.jpg'] or names == ['a_b.jpg', 'axb.jpg']
+
+
+def test_list_route_returns_filenames_only_for_select_all(monkeypatch, tmp_path):
+    from routes import photos
+    rows = [{'RowKey': f'p{i:04d}.jpg', 'uploadDate': f'2020-01-01T00:{i // 60:02d}:{i % 60:02d}+00:00'} for i in range(300)]
+    path = str(tmp_path / 'l.sqlite')
+    search_db.build_database(rows, path)
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_open_library_db', lambda uid: search_db.SearchDatabase(path))
+    monkeypatch.setattr(app, '_get_metadata_entities', lambda *a, **k: (_ for _ in ()).throw(AssertionError('ids only must not read rows')))
+    with app.app.test_request_context('/api/photos?idsOnly=1&sort=name&offset=100&limit=5000'):
+        payload = photos.list_photos().get_json()
+    assert payload['total'] == 300 and len(payload['filenames']) == 200 and payload['hasMore'] is False
+    assert payload['filenames'][0] == 'p0100.jpg'

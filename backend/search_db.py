@@ -579,16 +579,24 @@ class SearchDatabase:
         'rating': 'rating DESC, filename ASC',
         'likes': 'likes DESC, filename ASC',
         'location': 'LOWER(filename) ASC, filename ASC',
+        'name': 'LOWER(filename) ASC, filename ASC',
         'date': 'upload_ts DESC, filename ASC',  # also the default for unknown sorts
     }
 
     def list_page(
         self, *, sort: str = 'capture', offset: int = 0, limit: int = 24,
         capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,
+        name_contains: str = '',
     ) -> Tuple[List[str], int]:
         """(filenames for one page, total matching) in the gallery's deterministic
-        order -- same semantics as ordering_utils.order_photo_entries."""
+        order -- same semantics as ordering_utils.order_photo_entries. ``name_contains`` keeps only
+        filenames containing that text (case-insensitive)."""
         where, args = _range_clause(capture_start_day, capture_end_day)
+        needle = (name_contains or '').strip()
+        if needle:
+            escaped = needle.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+            where += (' AND ' if where else ' WHERE ') + "filename LIKE ? ESCAPE '\\'"
+            args = [*args, f'%{escaped}%']
         order = self._LIST_ORDER.get(sort, self._LIST_ORDER['date'])
         conn = self._conn()
         total = conn.execute(f'SELECT COUNT(*) FROM rows{where}', args).fetchone()[0]
