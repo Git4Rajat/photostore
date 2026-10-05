@@ -718,3 +718,4 @@
 .pt-index-bar-text { font-size: 0.8rem; color: var(--muted); }
 @keyframes pt-index-slide { 0% { left: -35%; } 100% { left: 100%; } }
 @media (prefers-reduced-motion: reduce) { .pt-index-bar-fill { animation: none; width: 100%; opacity: 0.5; } }
+.pt-ask-progress { margin: 4px 0 8px; }
