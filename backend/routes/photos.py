@@ -464,7 +464,6 @@ def list_photos():
         )
     except Exception as exc:
         app.app.logger.exception('Photo list query failed')
-        import search_db
         search_db.report_failure(db, exc)
         return app.jsonify({'error': 'Unable to read photo metadata.', 'retryable': True}), 503
     if ids_only:
