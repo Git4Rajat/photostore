@@ -146,9 +146,25 @@ export const PeoplePage: React.FC = () => {
     );
 };
 
+/** Fires ``onVisible`` whenever it scrolls into view (and again after each page lands), for infinite scroll. */
+const ScrollSentinel: React.FC<{ onVisible: () => void; deps: number }> = ({ onVisible, deps }) => {
+    const ref = React.useRef<HTMLDivElement>(null);
+    React.useEffect(() => {
+        const node = ref.current;
+        if (!node) return undefined;
+        const observer = new IntersectionObserver((entries) => {
+            if (entries.some((e) => e.isIntersecting)) onVisible();
+        }, { rootMargin: '600px' });
+        observer.observe(node);
+        return () => observer.disconnect();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [deps]);
+    return <div ref={ref} className="pt-scroll-sentinel" aria-hidden="true" />;
+};
+
 /** Person detail — rename / name, browse their photos, and merge in another cluster. */
 export const PersonDetailPage: React.FC = () => {
-    const { route, people, personById, openPerson, personPhotosById, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, fetchPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
+    const { route, people, personById, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, fetchPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
     const personId = route.params.personId;
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
@@ -242,7 +258,7 @@ export const PersonDetailPage: React.FC = () => {
                 </div>
             </div>
             <div className="pt-album-photos-head pt-person-photos-head">
-                <p className="pt-page-sub" style={{ margin: 0 }}>{photos?.length ?? person.faceCount ?? 0} photos</p>
+                <p className="pt-page-sub" style={{ margin: 0 }}>{(personPhotosTotal(person.id) ?? photos?.length ?? person.faceCount ?? 0).toLocaleString()} photos</p>
                 <div className="pt-album-photos-actions">
                     <ThumbSizeControl value={personTile} onChange={setPersonTile} />
                     {photos && photos.length > 0 && (
@@ -258,6 +274,7 @@ export const PersonDetailPage: React.FC = () => {
             ) : (
                 <div style={{ ['--pt-tile-min' as string]: `${personTile}px` } as React.CSSProperties}>
                     <PhotoGrid photos={photos ?? []} emptyHint="No photos for this person yet." />
+                    {personPhotosHasMore(person.id) && <ScrollSentinel onVisible={() => loadMorePersonPhotos(person.id)} deps={photos?.length ?? 0} />}
                 </div>
             )}
 

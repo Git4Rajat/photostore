@@ -284,29 +284,53 @@ def get_person(person_id: str):
     except Exception:
         face_ids = []
 
-    def _fetch_face(fid):
-        try:
-            return fid, app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
-        except Exception:
-            return fid, None
+    # Optional paging: ?offset=&limit= returns that window of the person's faces (best faces first),
+    # so a person with tens of thousands of photos opens on its first screenful. Without ``limit``
+    # every face is returned, as before.
+    try:
+        offset = max(0, int(app.request.args.get('offset', 0)))
+        limit = int(app.request.args.get('limit', 0))
+    except ValueError:
+        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
 
-    faces = []
-    # Independent point-reads, dominated by network I/O -- run them concurrently
-    # rather than one face at a time (same pattern as routes/photos.py's
-    # per-chunk metadata prefetch, via app.DELETE_IO_CONCURRENCY).
-    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
-        fetched = list(executor.map(_fetch_face, face_ids))
-    for fid, face in fetched:
+    # Face rows come from the shared (cached) face summary map -- one scan per cache window, not a
+    # point read per face (a 50,000-face person used to be 50,000 round trips on every open). Only
+    # faces the map lacks are read individually, in parallel.
+    summary = app._load_user_face_summary_by_id(user_id)
+    face_ids = [str(fid) for fid in face_ids]
+    missing = [fid for fid in face_ids if fid not in summary]
+    extra = {}
+    if missing:
+        def _fetch_face(fid):
+            try:
+                return fid, app.face_table_client.get_entity(partition_key=user_id, row_key=fid)
+            except Exception:
+                return fid, None
+        extra = {fid: face for fid, face in app._io_pool_map(_fetch_face, missing) if face is not None}
+
+    active = []
+    for fid in face_ids:
+        face = summary.get(fid) or extra.get(fid)
         if face is None:
             continue
         try:
             if app._face_is_rejected(face) or not app._face_is_owned_by_person(face, person_id):
                 continue
+        except Exception:
+            continue
+        active.append((app._face_preview_priority(face), fid, face))
+    active.sort(key=lambda item: item[0], reverse=True)
+
+    window = active[offset:offset + limit] if limit > 0 else active
+    faces = []
+    for _priority, fid, face in window:
+        try:
+            bbox = face.get('bbox', '{}')
             faces.append({
                 'faceId': fid,
                 'filename': face.get('filename'),
                 'thumbnailUrl': app._face_thumbnail_url(str(face.get('filename') or ''), user_id),
-                'bbox': app.json.loads(face.get('bbox', '{}')),
+                'bbox': app.json.loads(bbox) if isinstance(bbox, str) else (bbox or {}),
                 'imageWidth': int(face.get('imageWidth', 0) or 0),
                 'imageHeight': int(face.get('imageHeight', 0) or 0),
                 'confidence': float(face.get('confidence', 0.0) or 0.0),
@@ -315,13 +339,11 @@ def get_person(person_id: str):
             })
         except Exception:
             continue
-    faces.sort(key=lambda face: app._face_preview_priority(face), reverse=True)
 
-    return app.jsonify({
-        'personId': person_id,
-        'name': name,
-        'faces': faces,
-    })
+    response = {'personId': person_id, 'name': name, 'faces': faces, 'total': len(active), 'offset': offset}
+    if limit > 0:
+        response['hasMore'] = offset + limit < len(active)
+    return app.jsonify(response)
 
 @people_bp.route('/api/persons/suggestions', methods=['GET'])
 def list_person_suggestions():

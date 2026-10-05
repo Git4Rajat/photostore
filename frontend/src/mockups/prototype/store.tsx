@@ -327,6 +327,10 @@ interface Store {
     fetchPeople: () => Promise<void>;
     openPerson: (id: string) => void;
     personPhotosById: (id: string) => Photo[] | undefined;
+    /** Total photos of the person on the server (the list below fills in a screenful at a time). */
+    personPhotosTotal: (id: string) => number | undefined;
+    personPhotosHasMore: (id: string) => boolean;
+    loadMorePersonPhotos: (id: string) => void;
     personPhotosLoading: boolean;
     renamePerson: (id: string, name: string) => void;
     mergePeople: (sourceId: string, targetId: string) => void;
@@ -1280,18 +1284,50 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const reloadPeople = useCallback(() => { void fetchPeople(); }, [fetchPeople]);
 
+    // A person can have tens of thousands of photos: the server returns their faces best-first a page
+    // at a time, and the page appends the next one as the user scrolls (no cap on how many can load).
+    const PERSON_PAGE = 120;
+    const personFaceOffsets = useRef<Record<string, number>>({});
+    const [personPaging, setPersonPaging] = useState<Record<string, { total: number; hasMore: boolean }>>({});
+    const personLoadingMore = useRef<Record<string, boolean>>({});
+    const fetchPersonPage = useCallback(async (id: string, offset: number) => {
+        const res = await get<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
+            `/api/persons/${encodeURIComponent(id)}?offset=${offset}&limit=${PERSON_PAGE}`,
+        );
+        const faces = Array.isArray(res?.faces) ? res.faces : [];
+        personFaceOffsets.current[id] = offset + faces.length;
+        setPersonPaging((prev) => ({ ...prev, [id]: { total: res?.total ?? faces.length, hasMore: Boolean(res?.hasMore) && faces.length > 0 } }));
+        return facesToPhotos(faces);
+    }, []);
+
     const openPerson = useCallback(async (id: string) => {
         setPersonPhotosLoading(true);
         try {
-            const res = await faceService.getPerson(id) as { faces?: PersonFace[]; name?: string; faceCount?: number };
-            const faces = Array.isArray(res?.faces) ? res.faces : [];
-            setPersonPhotos((prev) => ({ ...prev, [id]: facesToPhotos(faces) }));
+            personFaceOffsets.current[id] = 0;
+            const first = await fetchPersonPage(id, 0);
+            setPersonPhotos((prev) => ({ ...prev, [id]: first }));
         } catch {
             setPersonPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
         } finally {
             setPersonPhotosLoading(false);
         }
-    }, []);
+    }, [fetchPersonPage]);
+
+    const loadMorePersonPhotos = useCallback((id: string) => {
+        if (personLoadingMore.current[id] || !personPaging[id]?.hasMore) return;
+        personLoadingMore.current[id] = true;
+        void fetchPersonPage(id, personFaceOffsets.current[id] ?? 0)
+            .then((more) => setPersonPhotos((prev) => {
+                const have = prev[id] ?? [];
+                const seen = new Set(have.map((p) => p.id));
+                return { ...prev, [id]: [...have, ...more.filter((p) => !seen.has(p.id))] };
+            }))
+            .catch(() => setPersonPaging((prev) => ({ ...prev, [id]: { total: prev[id]?.total ?? 0, hasMore: false } })))
+            .finally(() => { personLoadingMore.current[id] = false; });
+    }, [fetchPersonPage, personPaging]);
+
+    const personPhotosTotal = useCallback((id: string) => personPaging[id]?.total, [personPaging]);
+    const personPhotosHasMore = useCallback((id: string) => Boolean(personPaging[id]?.hasMore), [personPaging]);
 
     const personPhotosById = useCallback((id: string) => personPhotos[id], [personPhotos]);
 
@@ -1516,6 +1552,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             fetchPeople,
             openPerson,
             personPhotosById,
+            personPhotosTotal,
+            personPhotosHasMore,
+            loadMorePersonPhotos,
             personPhotosLoading,
             renamePerson,
             mergePeople,
@@ -1543,7 +1582,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
-            peopleLoading, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosLoading,
+            peopleLoading, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
             renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],

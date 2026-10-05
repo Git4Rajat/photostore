@@ -96,3 +96,37 @@ def test_bulk_delete_route_handles_many_clusters_and_unknown_ids(monkeypatch):
         payload = people.delete_person_clusters().get_json()
     assert sorted(payload['deletedPersonIds'] if 'deletedPersonIds' in payload else payload.get('deleted', [])) == ['B', 'C']
     assert [e['personId'] for e in payload.get('errors', [])] == ['nope']
+
+
+def test_person_detail_pages_faces_best_first_without_per_face_reads(monkeypatch):
+    from routes import people
+    persons, faces = FakeTable(), _Faces()
+    ids = [f'f{i:03d}' for i in range(250)]
+    persons.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'P', 'name': 'Asha', 'faceIds': json.dumps(ids)})
+    for i, fid in enumerate(ids):
+        faces.upsert_entity({'PartitionKey': 'u1', 'RowKey': fid, 'filename': f'{fid}.jpg', 'personId': 'P',
+                             'confidence': i / 1000, 'bbox': '{"x":1,"y":2,"width":3,"height":4}', 'imageWidth': 10, 'imageHeight': 10})
+    faces.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'rej', 'filename': 'rej.jpg', 'personId': 'P', 'rejected': True, 'confidence': 0.99})
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(app, 'face_table_client', faces)
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, '_face_thumbnail_url', lambda name, uid='': '')
+    app._face_summary_scan_cache.invalidate('u1')
+    points = []
+    real_get = faces.get_entity
+    faces.get_entity = lambda partition_key, row_key: (points.append(row_key), real_get(partition_key, row_key))[1]
+
+    def page(offset, limit):
+        with app.app.test_request_context(f'/api/persons/P?offset={offset}&limit={limit}'):
+            return people.get_person('P').get_json()
+
+    first, second, last = page(0, 100), page(100, 100), page(200, 100)
+    assert first['total'] == 250 and first['hasMore'] is True and last['hasMore'] is False
+    got = [f['faceId'] for f in first['faces'] + second['faces'] + last['faces']]
+    assert len(got) == 250 and len(set(got)) == 250 and 'rej' not in got
+    assert first['faces'][0]['faceId'] == 'f249'                               # highest-confidence first
+    assert points == []                                                          # no per-face point reads
+    with app.app.test_request_context('/api/persons/P'):
+        everything = people.get_person('P').get_json()
+    assert len(everything['faces']) == 250 and 'hasMore' not in everything
