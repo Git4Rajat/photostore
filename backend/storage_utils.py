@@ -4163,7 +4163,9 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     return source_version
 
 
-_SEARCH_INDEX_KINDS = ('vector', 'lexical', 'sort', 'access')
+# 'vector' is deliberately absent: its rebuild is always a full streaming pass (nothing merges just the
+# changed photos), so a per-photo dirty row for it was a table write per photo that nothing ever used.
+_SEARCH_INDEX_KINDS = ('lexical', 'sort', 'access')
 
 
 def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:

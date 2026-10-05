@@ -92,7 +92,8 @@ def test_touch_marks_both_index_kinds_dirty(ctx):
     storage_utils.touch_user_search_indexes_state('u1', filenames=['a.jpg', 'b.jpg'])
 
     assert storage_utils._get_dirty_search_index_filenames('u1', 'lexical') == {'a.jpg', 'b.jpg'}
-    assert storage_utils._get_dirty_search_index_filenames('u1', 'vector') == {'a.jpg', 'b.jpg'}
+    # The vector index always rebuilds in full, so it keeps no per-photo marks (they were never read).
+    assert storage_utils._get_dirty_search_index_filenames('u1', 'vector') == set()
     # touch_user_search_indexes_state also dirties the sort index (see
     # test_sort_index.py for its independent-dirtying tests) -- this pins
     # that the shared _SEARCH_INDEX_KINDS loop still covers it here too.
@@ -115,8 +116,8 @@ def test_clear_removes_only_named_filenames(ctx):
     storage_utils._clear_dirty_search_index_filenames('u1', 'lexical', {'a.jpg'})
 
     assert storage_utils._get_dirty_search_index_filenames('u1', 'lexical') == {'b.jpg'}
-    # Clearing the lexical partition must not touch the vector one.
-    assert storage_utils._get_dirty_search_index_filenames('u1', 'vector') == {'a.jpg', 'b.jpg'}
+    # Clearing the lexical partition must not touch the other kinds' partitions.
+    assert storage_utils._get_dirty_search_index_filenames('u1', 'sort') == {'a.jpg', 'b.jpg'}
 
 
 # --- dirty-filename write batching (large-upload write volume) --------------
@@ -159,11 +160,10 @@ def test_hitting_the_batch_size_flushes_eagerly_without_a_read(ctx):
 
     storage_utils.touch_user_search_indexes_state('u1', filenames=filenames)
 
-    # One flush per index kind (vector/lexical/sort/access all hit the
-    # threshold together, since every filename dirties all four) -- each
-    # flush is still a single batched transaction covering the whole
-    # partition.
-    assert len(dirty.submit_transaction_calls) == 4
+    # One flush per index kind (lexical/sort/access all hit the threshold together, since every
+    # filename dirties all three) -- each flush is still a single batched transaction covering the
+    # whole partition.
+    assert len(dirty.submit_transaction_calls) == 3
     assert all(len(call) == batch_size for call in dirty.submit_transaction_calls)
     assert storage_utils._DIRTY_FILENAME_BUFFER.get(('u1', 'lexical')) is None
 
