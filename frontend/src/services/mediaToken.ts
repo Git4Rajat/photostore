@@ -26,6 +26,7 @@ interface MediaTokenResponse extends Partial<MediaToken> {
 }
 
 const STORAGE_KEY = 'photostore-media-token';
+const STORED_VERSION = 2;
 const REFRESH_MARGIN_MS = 30 * 60 * 1000;
 
 let cached: MediaToken | null = null;
@@ -45,8 +46,8 @@ const readStored = (key: string): MediaToken | null => {
         const raw = window.localStorage.getItem(`${STORAGE_KEY}:${key}`);
         if (!raw) return null;
         const parsed = JSON.parse(raw) as MediaToken;
-        // Tokens stored before the face-crop token existed have no `cover`: fetch a fresh one.
-        return isFresh(parsed) && parsed.cover ? parsed : null;
+        // Tokens stored before the face-crop token existed carry no version: fetch a fresh one.
+        return isFresh(parsed) && (parsed as MediaToken & { v?: number }).v === STORED_VERSION ? parsed : null;
     } catch {
         return null;
     }
@@ -54,7 +55,7 @@ const readStored = (key: string): MediaToken | null => {
 
 const writeStored = (key: string, token: MediaToken): void => {
     try {
-        window.localStorage.setItem(`${STORAGE_KEY}:${key}`, JSON.stringify(token));
+        window.localStorage.setItem(`${STORAGE_KEY}:${key}`, JSON.stringify({ ...token, v: STORED_VERSION }));
     } catch {
         // storage unavailable (private window, quota) -- memory cache still works
     }
