@@ -1,51 +1,16 @@
-import { reportIndexBuilding } from '../../../services/indexBuilding';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Search as MagnifyingGlassIcon, Plus as PlusIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
 import { get, post } from '../../../services/apiClient';
-import { getCachedMediaToken, thumbnailUrlForBlob } from '../../../services/mediaToken';
-import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
-import { getActiveLibraryFromToken } from '../../../services/passwordAuthClient';
+import { getAskState, loadMoreAsk, mapSearchResult as mapResult, runAskSearch, setAskQuery, setAskScroll, useAskState } from '../askSearchStore';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 import type { Photo } from '../types';
 
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-const mapResult = (b: BackendPhoto): Photo => {
-    const iso = b.captureDate || b.uploadDate || null;
-    const d = iso ? new Date(iso) : null;
-    const valid = d && !Number.isNaN(d.getTime()) ? d : null;
-    return {
-        id: b.filename,
-        filename: b.filename,
-        swatch: 's1',
-        dateLabel: valid ? `${MONTHS[valid.getMonth()]} ${valid.getDate()}, ${valid.getFullYear()}` : '',
-        year: valid ? valid.getFullYear() : 0,
-        rating: b.rating ?? 0,
-        liked: Boolean(b.liked),
-        likes: b.likes,
-        placeId: null,
-        personIds: (b.people ?? []).map((p) => p.personId),
-        tags: b.tags ?? [],
-        // Token mode: the server sends blob names and the browser builds the (cacheable) URLs.
-        thumbnailUrl: (b.thumbnailBlob ? thumbnailUrlForBlob(b.thumbnailBlob) : '') || b.thumbnailUrl,
-        rotation: b.rotation,
-        thumbnailRotation: b.thumbnailRotation,
-        captureDate: iso,
-    };
-};
-
-// Results arrive a screenful at a time and keep loading as the user scrolls: there is no cap on how
-// many matches can be reached (the server answers any page of the full result set).
-const SEARCH_PAGE_LIMIT = 120;
 // "Save as album" collects matches up to what one album can hold (the server enforces the real limit).
 const SAVE_AS_ALBUM_MAX = 10000;
 const SAVE_PAGE = 500;
-// A new library's search database is built on the server; poll for up to ~2 minutes.
-const SEARCH_BUILD_RETRIES = 12;
-const SEARCH_BUILD_RETRY_MS = 10000;
 
 // The local search scores filenames; turn them back into full photo records
 // (thumbnails, ratings, dates, ...) via a point-lookup, preserving the local
@@ -61,27 +26,6 @@ const resolvePhotos = async (filenames: string[]): Promise<Photo[]> => {
         .map(mapResult);
 };
 
-// The last search survives leaving the page: query text, the loaded results (every page fetched so far),
-// totals and scroll position are kept in memory and restored when Ask is opened again without a new
-// query. Keyed by library so a different account/library never sees another's results.
-interface AskSnapshot {
-    library: string;
-    query: string;
-    activeQuery: string;
-    results: Photo[];
-    total: number;
-    hasMore: boolean;
-    rankedWindow: number | null;
-    scrollY: number;
-}
-let askSnapshot: AskSnapshot | null = null;
-const currentLibrary = () => getActiveLibraryFromToken() || '__default__';
-const restorableSnapshot = (incomingQuery: string | undefined): AskSnapshot | null => {
-    const snap = askSnapshot;
-    if (!snap || snap.library !== currentLibrary() || !snap.query.trim()) return null;
-    return incomingQuery === undefined || incomingQuery.trim() === snap.activeQuery ? snap : null;
-};
-
 /**
  * Ask — one search box fused across people / places / things / years. Search
  * runs entirely on the backend (/photos/search over a per-library SQLite
@@ -93,36 +37,19 @@ const restorableSnapshot = (incomingQuery: string | undefined): AskSnapshot | nu
  */
 export const AskPage: React.FC = () => {
     const { people, places, route, createAlbum, addPhotosToAlbum, registerPhotos, navigate } = useStore();
-    const restored = useRef(restorableSnapshot(route.params.query)).current;
-    const [query, setQuery] = useState(restored?.query ?? route.params.query ?? '');
-    const [results, setResults] = useState<Photo[]>(restored?.results ?? []);
-    const [searching, setSearching] = useState(false);
-    const [total, setTotal] = useState(restored?.total ?? 0);
-    const [hasMore, setHasMore] = useState(restored?.hasMore ?? false);
-    const [rankedWindow, setRankedWindow] = useState<number | null>(restored?.rankedWindow ?? null);
-    const [loadingMore, setLoadingMore] = useState(false);
+    const ask = useAskState();
+    const { query, results, total, hasMore, rankedWindow, searching, loadingMore, indexBuilding } = ask;
     const [saving, setSaving] = useState(false);
     const sentinelRef = useRef<HTMLDivElement>(null);
-    const activeQueryRef = useRef(restored?.activeQuery ?? '');
-    // True while the server is still building this library's search database
-    // (new library / first search after an upgrade); searches retry automatically.
-    const [indexBuilding, setIndexBuilding] = useState(false);
-    const seqRef = useRef(0);
+    const setQuery = setAskQuery;
+    const runSearch = runAskSearch;
+    const restoredScroll = useRef(ask.scrollY).current;
 
-    // Remember the search for when the user comes back (see AskSnapshot above).
+    // Coming back to Ask: put the scroll position back, and remember it again on the way out. The
+    // search itself (running or finished) lives in askSearchStore and is untouched by leaving.
     useEffect(() => {
-        askSnapshot = {
-            library: currentLibrary(), query, activeQuery: activeQueryRef.current, results, total, hasMore, rankedWindow,
-            scrollY: askSnapshot?.scrollY ?? 0,
-        };
-    }, [query, results, total, hasMore, rankedWindow]);
-    useEffect(() => {
-        if (restored && restored.scrollY > 0) {
-            requestAnimationFrame(() => window.scrollTo(0, restored.scrollY));
-        }
-        return () => {
-            if (askSnapshot) askSnapshot = { ...askSnapshot, scrollY: window.scrollY };
-        };
+        if (restoredScroll > 0) requestAnimationFrame(() => window.scrollTo(0, restoredScroll));
+        return () => setAskScroll(window.scrollY);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
@@ -133,75 +60,6 @@ export const AskPage: React.FC = () => {
     useEffect(() => {
         registerPhotos(results);
     }, [results, registerPhotos]);
-
-    // Clear reactively as the user backspaces the box to empty (not just on
-    // Enter/route navigation) -- bumps seqRef too, so an in-flight request
-    // for whatever was just cleared can't land afterward and repopulate
-    // results the user already watched disappear.
-    useEffect(() => {
-        if (!query.trim()) {
-            seqRef.current += 1;
-            setResults([]);
-            setTotal(0);
-            setHasMore(false);
-            setSearching(false);
-            setIndexBuilding(false);
-        }
-    }, [query]);
-
-    const runSearch = (queryOverride?: string) => {
-        const trimmed = (queryOverride ?? query).trim();
-        // Bump the sequence even on a no-op/empty search so a response for a
-        // *previous* in-flight request (e.g. one just superseded by the user
-        // clearing the box) can never land after the guard below already
-        // decided this search doesn't need one -- otherwise a late response
-        // could repopulate results/re-toggle "Searching…" after the UI had
-        // already moved on.
-        const seq = ++seqRef.current;
-        if (!trimmed) {
-            setResults([]);
-            setTotal(0);
-            setHasMore(false);
-            setSearching(false);
-            setIndexBuilding(false);
-            return;
-        }
-        activeQueryRef.current = trimmed;
-        setSearching(true);
-        setIndexBuilding(false);
-        setHasMore(false);
-        void (async () => {
-            // Backend search. If the library's search database is still being
-            // built the server says so (searchIndexBuilding) and we retry for a
-            // while instead of showing a misleading empty result.
-            for (let attempt = 0; attempt < SEARCH_BUILD_RETRIES; attempt += 1) {
-                try {
-                    const res = await get<{ photos?: BackendPhoto[]; searchIndexBuilding?: boolean; total?: number; hasMore?: boolean; rankedWindow?: number }>(
-                        `/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=${SEARCH_PAGE_LIMIT}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
-                    );
-                    if (seq !== seqRef.current) return;
-                    if (res?.searchIndexBuilding && attempt < SEARCH_BUILD_RETRIES - 1) {
-                        setIndexBuilding(true);
-                        reportIndexBuilding('search', true);
-                        await new Promise((resolve) => setTimeout(resolve, SEARCH_BUILD_RETRY_MS));
-                        if (seq !== seqRef.current) return;
-                        continue;
-                    }
-                    setIndexBuilding(Boolean(res?.searchIndexBuilding));
-                    if (!res?.searchIndexBuilding) reportIndexBuilding('search', false);
-                    const first = Array.isArray(res?.photos) ? res.photos.map(mapResult) : [];
-                    setResults(first);
-                    setTotal(typeof res?.total === 'number' ? res.total : first.length);
-                    setHasMore(Boolean(res?.hasMore));
-                    setRankedWindow(typeof res?.rankedWindow === 'number' ? res.rankedWindow : null);
-                } catch {
-                    if (seq === seqRef.current) { setResults([]); setTotal(0); setHasMore(false); }
-                }
-                break;
-            }
-            if (seq === seqRef.current) setSearching(false);
-        })();
-    };
 
     // Single effect drives both the input box and the actual search off the
     // same incoming route param, passing it straight to runSearch instead of
@@ -214,8 +72,7 @@ export const AskPage: React.FC = () => {
     useEffect(() => {
         const incoming = route.params.query;
         if (incoming === undefined) return;
-        if (restored && incoming.trim() === restored.activeQuery) return;   // already showing this search
-        setQuery(incoming);
+        if (incoming.trim() === getAskState().activeQuery) return;   // this search is already showing (or running)
         runSearch(incoming);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [route.params.query]);
@@ -246,40 +103,12 @@ export const AskPage: React.FC = () => {
         setQuery(`${prefix}${label} `);
     };
 
-    // Next page of the same query, appended. A sequence guard drops it if the user has searched
-    // again (or cleared the box) in the meantime.
-    const loadMore = () => {
-        if (loadingMore || searching || !hasMore) return;
-        const seq = seqRef.current;
-        const q = activeQueryRef.current;
-        setLoadingMore(true);
-        void (async () => {
-            try {
-                const res = await get<{ photos?: BackendPhoto[]; total?: number; hasMore?: boolean }>(
-                    `/photos/search?q=${encodeURIComponent(q)}&offset=${results.length}&limit=${SEARCH_PAGE_LIMIT}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
-                );
-                if (seq !== seqRef.current) return;
-                const next = Array.isArray(res?.photos) ? res.photos.map(mapResult) : [];
-                setResults((prev) => {
-                    const seen = new Set(prev.map((p) => p.id));
-                    return [...prev, ...next.filter((p) => !seen.has(p.id))];
-                });
-                if (typeof res?.total === 'number') setTotal(res.total);
-                setHasMore(Boolean(res?.hasMore) && next.length > 0);
-            } catch {
-                if (seq === seqRef.current) setHasMore(false);
-            } finally {
-                if (seq === seqRef.current) setLoadingMore(false);
-            }
-        })();
-    };
-
     // Infinite scroll: load the next page when the bottom sentinel comes into view.
     useEffect(() => {
         const node = sentinelRef.current;
         if (!node || !hasMore) return undefined;
         const observer = new IntersectionObserver((entries) => {
-            if (entries.some((e) => e.isIntersecting)) loadMore();
+            if (entries.some((e) => e.isIntersecting)) loadMoreAsk();
         }, { rootMargin: '600px' });
         observer.observe(node);
         return () => observer.disconnect();
@@ -294,7 +123,7 @@ export const AskPage: React.FC = () => {
             try {
                 const id = await createAlbum(query.trim() || 'Saved search');
                 if (!id) return;
-                const q = activeQueryRef.current || query.trim();
+                const q = ask.activeQuery || query.trim();
                 const names: string[] = results.map((r) => r.id);
                 let more = hasMore;
                 while (more && names.length < SAVE_AS_ALBUM_MAX) {
@@ -380,6 +209,11 @@ export const AskPage: React.FC = () => {
                                     </div>
                                 );
                             })}
+                        </div>
+                    )}
+                    {searching && (
+                        <div className="pt-ask-progress" role="status" aria-live="polite">
+                            <div className="pt-index-bar-track" aria-hidden="true"><div className="pt-index-bar-fill" /></div>
                         </div>
                     )}
                     <div className="pt-menu-label">

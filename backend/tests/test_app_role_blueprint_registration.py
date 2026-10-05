@@ -66,7 +66,7 @@ def test_backend_role_does_not_serve_extras_routes():
 
 def test_tools_role_serves_only_tools_routes():
     paths = _rule_paths_for_role('tools')
-    non_static = {p for p in paths if not p.startswith('/static')}
+    non_static = {p for p in paths if not p.startswith('/static') and p != '/health'}   # /health is on every role (warm-up probe)
     assert non_static == {
         '/api/tools/workbench/actions',
         '/api/tools/workbench/actions/<action_id>',
@@ -105,7 +105,7 @@ def test_upload_role_serves_only_upload_routes():
 
 def test_admin_role_serves_only_admin_routes():
     paths = _rule_paths_for_role('admin')
-    non_static = {p for p in paths if not p.startswith('/static')}
+    non_static = {p for p in paths if not p.startswith('/static') and p != '/health'}   # /health is on every role (warm-up probe)
     assert non_static  # non-empty
     assert all(p.startswith(('/admin', '/api/admin')) for p in non_static)
     assert '/api/admin/people/dedupe-faces' in non_static
@@ -114,7 +114,7 @@ def test_admin_role_serves_only_admin_routes():
 
 def test_extras_role_serves_only_extras_routes():
     paths = _rule_paths_for_role('extras')
-    non_static = {p for p in paths if not p.startswith('/static')}
+    non_static = {p for p in paths if not p.startswith('/static') and p != '/health'}   # /health is on every role (warm-up probe)
     assert non_static  # non-empty
     extras_prefixes = ('/api/persons', '/api/faces', '/api/people', '/persons', '/people', '/api/library', '/public', '/api/public')
     assert all(p.startswith(extras_prefixes) for p in non_static)

@@ -182,3 +182,17 @@ def test_typeahead_completes_places_from_the_database_vocabulary(monkeypatch, tm
     monkeypatch.setattr(app, '_cached_metadata_list_rows_for_user', lambda *a, **k: (_ for _ in ()).throw(AssertionError('no listing')))
     labels = {(s['type'], s['label']) for s in app._search_typeahead_suggestions('owner', 'li')}
     assert ('person', 'Liam') in labels and ('place', 'Lisbon') in labels
+
+
+def test_point_reads_mode_never_uses_the_or_filter_query(monkeypatch):
+    import app as app_module
+    from tests.fakes import FakeTable
+    table = FakeTable()
+    for i in range(40):
+        table.upsert_entity({'PartitionKey': 'u', 'RowKey': f'p{i}.jpg', 'rating': i})
+    queried = []
+    original = table.query_entities
+    table.query_entities = lambda *a, **k: (queried.append(a), original(*a, **k))[1]
+    monkeypatch.setattr(app_module, 'metadata_table_client', table)
+    out = app_module._get_metadata_entities('u', [f'p{i}.jpg' for i in range(40)] + ['missing.jpg'], point_reads=True)
+    assert queried == [] and out['p7.jpg']['rating'] == 7 and out['missing.jpg'] is None

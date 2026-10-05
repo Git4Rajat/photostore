@@ -907,7 +907,7 @@ def search_photos():
     # being returned needs the full metadata (rating, likes, rotation, status...),
     # so point-read just these few photos, in parallel.
     with app.perf_instrumentation.span('search.page_metadata', n=len(selected)):
-        fetched = app._get_metadata_entities(user_id, [filename for _, filename, _ in selected])
+        fetched = app._get_metadata_entities(user_id, [filename for _, filename, _ in selected], point_reads=True)
     full_rows = [(filename, fetched.get(filename)) for _, filename, _ in selected]
     page_pairs = [
         (filename, metadata) for filename, metadata in full_rows

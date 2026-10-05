@@ -1897,7 +1897,7 @@ def _parse_capture_range_args() -> Tuple[Optional[datetime], Optional[datetime]]
 _ENTITY_BATCH_KEYS = 15   # Table Storage allows at most 15 discrete comparisons in one filter
 
 
-def _get_metadata_entities(user_id: str, filenames: List[str], workers: int = 8) -> Dict[str, Optional[Dict]]:
+def _get_metadata_entities(user_id: str, filenames: List[str], workers: int = 8, *, point_reads: bool = False) -> Dict[str, Optional[Dict]]:
     """Fresh full metadata rows for one page of filenames. The library-sized queries (search,
     list, filter) run against the local SQLite database and only ever need this for the page
     they return.
@@ -1910,13 +1910,25 @@ def _get_metadata_entities(user_id: str, filenames: List[str], workers: int = 8)
         return {}
     if len(names) == 1 or metadata_table_client is None:
         return {name: _get_metadata_entity(user_id, name) for name in names}
+    if point_reads:
+        # Parallel point reads (PartitionKey+RowKey: always an index lookup). Search results are an
+        # arbitrary scatter of rows, and the OR-filter query was measured at 2-6 s per query there
+        # (vs ~50 ms for gallery pages), so search reads its few rows directly.
+        with ThreadPoolExecutor(max_workers=min(workers, len(names))) as executor:
+            return dict(zip(names, executor.map(lambda n: _get_metadata_entity(user_id, n), names)))
     pk = _escape_odata(user_id)
 
     def _fetch_batch(batch: List[str]) -> Dict[str, Optional[Dict]]:
         clause = ' or '.join(f"RowKey eq '{_escape_odata(name)}'" for name in batch)
+        started = time.monotonic()
         try:
             rows = {str(r.get('RowKey') or ''): dict(r)
                     for r in metadata_table_client.query_entities(f"PartitionKey eq '{pk}' and ({clause})")}
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if elapsed_ms > 800:       # evidence for tuning: how slow, how many rows, how big
+                perf_instrumentation.log_event(
+                    'metadata_batch_slow', names=len(batch), rows=len(rows), ms=round(elapsed_ms),
+                    kb=round(sum(len(json.dumps(r, default=str)) for r in rows.values()) / 1024))
             return {name: rows.get(name) for name in batch}
         except Exception:
             return {name: _get_metadata_entity(user_id, name) for name in batch}
@@ -14856,3 +14868,10 @@ else:
     # real memory/CPU savings.
     for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp):
         app.register_blueprint(_bp)
+
+# Every role answers /health (system_bp only exists on the backend role; upload has its own), so the
+# browser's warm-up probe and any manual check never see a 404 from extras/tools/admin.
+if not any(rule.rule == '/health' for rule in app.url_map.iter_rules()):
+    @app.route('/health', methods=['GET'])
+    def _role_health():
+        return jsonify({'status': 'healthy', 'role': _app_role})
