@@ -46,6 +46,13 @@ def test_iter_can_include_deleted_rows(monkeypatch):
     assert [r['RowKey'] for r in app._iter_metadata_rows_for_user('u1', include_deleted=True)] == ['a']
 
 
+def test_iter_supports_a_small_page_for_bounded_mutations(monkeypatch):
+    table = _RecordingTable(lambda: iter([{'RowKey': 'a'}]))
+    _install(monkeypatch, table)
+    assert len(list(app._iter_metadata_rows_for_user('u1', page_size=11))) == 1
+    assert table.calls[0][1]['results_per_page'] == 11
+
+
 def test_iter_enforces_the_row_ceiling(monkeypatch):
     monkeypatch.setattr(app, 'PHOTO_TABLE_SCAN_MAX_ROWS', 3)
     _install(monkeypatch, _RecordingTable(lambda: ({'RowKey': str(i)} for i in range(10))))
@@ -130,8 +137,9 @@ def test_admin_backfill_streams_two_columns_and_skips_trashed(monkeypatch):
     _install(monkeypatch, table)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     queued = []
-    monkeypatch.setattr(app, '_enqueue_processing_steps', lambda uid, name, steps, force=False: queued.append(name))
-    monkeypatch.setattr(app, '_queue_ipwork_processing', lambda *a, **k: None)
+    monkeypatch.setattr(app, 'PROCESSING_MODE', 'browser')
+    monkeypatch.setattr(app, '_enqueue_processing_steps', lambda uid, name, steps, force=False: queued.append(name) or {step: {'status': 'queued'} for step in steps})
+    monkeypatch.setattr(app, '_queue_ipwork_processing', lambda *a, **k: {'status': 'skipped'})
     monkeypatch.setattr(app, '_invalidate_metadata_scan_cache', lambda uid: None)
     payload = _call(admin.admin_backfill_photos, '/api/admin/backfill/photos', method='POST',
                     json={'repair': True, 'confirm': 'BACKFILL_ALL_PHOTOS'})

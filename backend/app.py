@@ -3728,6 +3728,7 @@ def _cached_sorted_metadata_list_rows_for_user(user_id: str, purpose: str) -> Li
 def _iter_metadata_rows_for_user(
     user_id: str, select: Optional[List[str]] = None, include_deleted: bool = False,
     extra_filter: str = '', purpose: str = 'metadata',
+    page_size: Optional[int] = None,
 ):
     """Stream a library's metadata rows one at a time (lazily paged -- the table
     pager never holds more than a page). Use this, never a list, for anything
@@ -3744,8 +3745,9 @@ def _iter_metadata_rows_for_user(
     kwargs = {}
     if select:
         kwargs['select'] = select if include_deleted or 'processing_state' in select else [*select, 'processing_state']
-    if PHOTO_TABLE_SCAN_PAGE_SIZE > 0:
-        kwargs['results_per_page'] = PHOTO_TABLE_SCAN_PAGE_SIZE
+    effective_page_size = PHOTO_TABLE_SCAN_PAGE_SIZE if page_size is None else max(1, int(page_size))
+    if effective_page_size > 0:
+        kwargs['results_per_page'] = effective_page_size
     partition_filter = f"PartitionKey eq '{_escape_odata(user_id)}'"
     if extra_filter:
         partition_filter += f' and ({extra_filter})'
@@ -3761,7 +3763,11 @@ def _iter_metadata_rows_for_user(
                 return metadata_table_client.query_entities(filter_str)
 
     # Several RowKey ranges are read at once, still in RowKey order (see table_scan.py).
-    rows_iter = table_scan.scan_partition(_query, partition_filter, **kwargs)
+    # Explicit small pages are used by bounded mutations: avoid parallel range
+    # prefetching the library when the caller only needs a handful of rows.
+    rows_iter = table_scan.scan_partition(
+        _query, partition_filter, workers=1 if page_size is not None else None, **kwargs,
+    )
     scanned = 0
     for row in rows_iter:
         scanned += 1

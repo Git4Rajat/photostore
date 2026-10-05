@@ -159,7 +159,7 @@ def admin_repair_stale_people_memberships():
 def admin_backfill_photos():
     """Re-queue existing photos through the processing pipeline.
 
-    Marks processing steps as 'queued' (force=True) for every non-deleted,
+    Marks processing steps as 'queued' (force=True) for each non-deleted,
     non-video photo in the user's library. The browser's background scheduler
     picks them up via /upload/processing/pending and re-runs them — identical
     to what happens for a freshly uploaded photo. When PROCESSING_MODE is
@@ -171,6 +171,11 @@ def admin_backfill_photos():
     tagging, and face detection). Pass a 'steps' list in the body to scope the
     re-queue to a subset, e.g. {"steps": ["ocr"]} to re-run OCR only, across
     every photo in the library.
+
+    Each request visits at most 10 metadata rows. Repeat with the returned
+    continuation cursor until complete=True; never hold an HTTP request open
+    while enqueueing an entire library. Table rows are ordered by RowKey
+    within the user's partition, so a strict keyset cursor avoids rescanning.
     """
     user_id, error = app._require_user_id()
     if error:
@@ -189,51 +194,70 @@ def admin_backfill_photos():
         invalid_steps = [step for step in requested_steps if step not in all_steps]
         if invalid_steps:
             return app.jsonify({'error': f'invalid steps: {invalid_steps}', 'code': 'invalid_steps'}), 400
-        steps_to_run = requested_steps
+        steps_to_run = list(dict.fromkeys(requested_steps))
+
+    cursor = data.get('continuation')
+    if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 1024):
+        return app.jsonify({'error': 'invalid continuation cursor', 'code': 'invalid_continuation'}), 400
+    if app.PROCESSING_MODE != 'browser' and app.ipwork_queue_client is None:
+        return app.jsonify({'error': 'Backend processing queue is unavailable', 'code': 'ipwork_unavailable'}), 503
 
     # Streamed with a two-column projection: this only needs each filename and
     # whether it is trashed, never the whole library in memory.
+    queued = 0
+    skipped = 0
+    failed = 0
+    visited = 0
+    continuation = None
+    complete = True
     try:
         metadata_rows = app._iter_metadata_rows_for_user(
             user_id, select=['RowKey', 'processing_state'], include_deleted=True, purpose='admin.backfill',
+            extra_filter=f"RowKey gt '{app._escape_odata(cursor)}'" if cursor else '',
+            page_size=11,
         )
-    except Exception as exc:
+        for row in metadata_rows:
+            if visited >= 10:
+                complete = False
+                break
+            visited += 1
+            # Keep the exact key for pagination, including whitespace.
+            filename = str(row.get('RowKey') or '')
+            continuation = filename
+            if not filename or str(row.get('processing_state') or '').strip().lower() == 'deleted' or app.is_video_file(filename):
+                skipped += 1
+                continue
+            try:
+                results = app._enqueue_processing_steps(user_id, filename, steps_to_run, force=True)
+                if not results or any(result.get('status') != 'queued' for result in results.values()):
+                    raise RuntimeError('Failed to reset processing steps')
+                queue_result = app._queue_ipwork_processing(user_id, filename, steps=steps_to_run)
+                expected_status = 'skipped' if app.PROCESSING_MODE == 'browser' else 'queued'
+                if queue_result.get('status') != expected_status:
+                    raise RuntimeError(f"Processing queue returned {queue_result.get('status')}")
+                queued += 1
+            except Exception:
+                app.app.logger.exception('Backfill: failed to enqueue steps for %s/%s', user_id, filename)
+                failed += 1
+    except Exception:
+        # The table iterator is lazy: query/page errors occur during iteration,
+        # not when the generator is constructed. Preserve partial counts.
         app.app.logger.exception('Backfill: failed to load metadata for %s', user_id)
-        return app.jsonify({'error': 'Failed to load photo metadata'}), 503
-
-    queued = 0
-    skipped = 0
-    for row in metadata_rows:
-        filename = str(row.get('RowKey') or '').strip()
-        if not filename:
-            continue
-        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
-            skipped += 1
-            continue
-        if app.is_video_file(filename):
-            skipped += 1
-            continue
-        try:
-            app._enqueue_processing_steps(user_id, filename, steps_to_run, force=True)
-            # Bulk/background reprocessing of an already-uploaded library is
-            # one of the two reasons ipworker exists (see the ipworker plan) --
-            # without this, backend/both mode would only ever reach ipworker
-            # for brand-new uploads (_queue_upload_processing), and this
-            # admin action would silently do nothing beyond flipping table
-            # status columns nothing consumes.
-            app._queue_ipwork_processing(user_id, filename, steps=steps_to_run)
-            queued += 1
-        except Exception:
-            app.app.logger.exception('Backfill: failed to enqueue steps for %s/%s', user_id, filename)
-            skipped += 1
+        return app.jsonify({'error': 'Failed to load photo metadata', 'queued': queued,
+                            'skipped': skipped, 'failed': failed, 'complete': False}), 503
 
     app._invalidate_metadata_scan_cache(user_id)
-    app.app.logger.info('Backfill queued %d photos (steps=%s), skipped %d for user %s', queued, steps_to_run, skipped, user_id)
+    app.app.logger.info('Backfill batch queued %d photos (steps=%s), skipped %d, failed %d, complete=%s for user %s',
+                        queued, steps_to_run, skipped, failed, complete, user_id)
     return app.jsonify({
         'queued': queued,
         'skipped': skipped,
-        'total': queued + skipped,
+        'failed': failed,
+        'total': queued + skipped + failed,
         'steps': steps_to_run,
+        'continuation': None if complete else continuation,
+        'complete': complete,
+        'processingMode': app.PROCESSING_MODE,
     })
 
 @admin_bp.route('/api/admin/ipwork/enqueue', methods=['POST'])
