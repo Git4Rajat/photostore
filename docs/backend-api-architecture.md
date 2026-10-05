@@ -572,3 +572,11 @@ The old 200-result limits are gone. Each list now pages, reports an exact total,
 - **People.** `GET /api/persons/page?offset&limit&q&ids` cuts a page (named clusters first, 120 by default, max 500) from the backend's cached people index, with `total`, `namedCount`, `unnamedCount` and `hasMore`. The People page loads the first page and fetches more as a sentinel scrolls into view, so the browser no longer downloads the whole people index at session start or renders it through a hand-rolled virtual grid. The merge picker uses `q` (server-side name search) and a deep link to a person outside the loaded pages uses `ids`. The older single-request roster is used only while the server's index is still building.
 - **Albums.** Opening an album loads one page (120 photos); further pages load as the grid scrolls. It used to stream every page back to back.
 - **Search** already paged on scroll (§15.7).
+
+### 15.11 Local search database: safe with several processes on one disk
+
+A production burst failed with `no such table: meta` / `no such table: rows` because two worker processes on one replica downloaded the library database at the same moment. One process's cleanup (`_evict_user`) deleted the other's in-progress scratch files (and would also have removed the live database's `-wal`/`-shm` sidecars); the other process then recreated an empty file at the scratch path and moved it over the good database (`searchdb_ready mb=0.0`). Now:
+- Downloads and delta application take a **cross-process file lock** (`.<user>.lock` in `SEARCH_DB_DIR`) as well as the thread lock.
+- A download works in its own scratch directory, is **checked for its tables before** being moved into place, and is rejected otherwise.
+- Cleanup deletes only finished `<user>-<digest>.sqlite` files that are not the current one (plus their own sidecars).
+- A local copy that fails to open or raises a database-level error is **discarded** and the request answers "warming up" (`retryable`), so the next request downloads a fresh copy instead of failing until restart.

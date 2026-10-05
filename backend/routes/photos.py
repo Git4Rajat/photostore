@@ -462,9 +462,11 @@ def list_photos():
             capture_start_day=app._day_ordinal(capture_start), capture_end_day=app._day_ordinal(capture_end),
             name_contains=name_contains,
         )
-    except Exception:
+    except Exception as exc:
         app.app.logger.exception('Photo list query failed')
-        return app.jsonify({'error': 'Unable to read photo metadata.'}), 503
+        import search_db
+        search_db.report_failure(db, exc)
+        return app.jsonify({'error': 'Unable to read photo metadata.', 'retryable': True}), 503
     if ids_only:
         return app.jsonify({'filenames': filenames, 'total': total, 'offset': offset, 'hasMore': offset + limit < total})
 

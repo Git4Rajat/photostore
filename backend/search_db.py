@@ -30,6 +30,8 @@ in production, tempdir otherwise).
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import gzip
 import hashlib
 import json
@@ -939,7 +941,8 @@ def sync_deltas(user_id: str, db: 'SearchDatabase', manifest: Dict) -> None:
     target = int(manifest.get('deltaSeq') or 0)
     if db.applied_seq() >= target:
         return
-    with _user_lock(user_id):
+    with _download_lock(user_id):
+        db._seq = None          # another process may have applied deltas since this one last looked
         while db.applied_seq() < target:
             seq = db.applied_seq() + 1
             client = _blob_client(_delta_blob_name(user_id, seq))
@@ -1126,22 +1129,35 @@ def _local_path(user_id: str, source_version: str) -> str:
     return os.path.join(SEARCH_DB_DIR, f'{_safe(user_id)}-{digest}.sqlite')
 
 
+_DB_FILE = re.compile(r'^(?P<prefix>.+-[0-9a-f]{12})\.sqlite$')
+
+
+def _remove_database_files(path: str) -> None:
+    """Delete one finished database and its SQLite sidecars."""
+    for suffix in ('', '-wal', '-shm', '-journal'):
+        try:
+            os.remove(path + suffix)
+        except OSError:
+            pass
+
+
 def _evict_user(user_id: str, keep: Optional[str] = None) -> None:
+    """Remove this user's OLDER database files. Only finished ``<user>-<digest>.sqlite`` files (and
+    their sidecars) are touched: another process's in-progress download, or the sidecars of the
+    database being kept, must never be deleted from under it."""
     prefix = f'{_safe(user_id)}-'
     try:
         for name in os.listdir(SEARCH_DB_DIR):
-            if name.startswith(prefix) and os.path.join(SEARCH_DB_DIR, name) != keep:
-                try:
-                    os.remove(os.path.join(SEARCH_DB_DIR, name))
-                except OSError:
-                    pass
+            full = os.path.join(SEARCH_DB_DIR, name)
+            if name.startswith(prefix) and _DB_FILE.match(name) and full != keep:
+                _remove_database_files(full)
     except OSError:
         pass
 
 
 def _enforce_budget(keep: str) -> None:
     try:
-        files = [os.path.join(SEARCH_DB_DIR, n) for n in os.listdir(SEARCH_DB_DIR) if n.endswith('.sqlite')]
+        files = [os.path.join(SEARCH_DB_DIR, n) for n in os.listdir(SEARCH_DB_DIR) if _DB_FILE.match(n)]
         files.sort(key=lambda p: os.path.getmtime(p))
         total = sum(os.path.getsize(p) for p in files)
         for path in files:
@@ -1149,7 +1165,7 @@ def _enforce_budget(keep: str) -> None:
                 break
             if path != keep:
                 total -= os.path.getsize(path)
-                os.remove(path)
+                _remove_database_files(path)
     except OSError:
         pass
 
@@ -1164,10 +1180,46 @@ def _user_lock(user_id: str) -> threading.Lock:
         return _LOCKS.setdefault(user_id, threading.Lock())
 
 
+@contextlib.contextmanager
+def _download_lock(user_id: str):
+    """Serialises a download across threads AND worker processes. The server runs several processes
+    (and briefly overlaps a recycled worker with its replacement) that share this disk, so a thread
+    lock alone let two processes unpack and swap the same database at once."""
+    with _user_lock(user_id):
+        os.makedirs(SEARCH_DB_DIR, exist_ok=True)
+        handle = open(os.path.join(SEARCH_DB_DIR, f'.{_safe(user_id)}.lock'), 'a+')
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+def _is_usable(path: str) -> bool:
+    """True when ``path`` is a real library database (has its tables), not an empty or partial file."""
+    try:
+        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+        try:
+            conn.execute("SELECT value FROM meta WHERE key='delta_seq'").fetchone()
+            conn.execute('SELECT 1 FROM rows LIMIT 1').fetchone()
+            return True
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+_VERIFIED: set = set()
+
+
 def open_database(user_id: str, *, allow_download: bool = True) -> Optional[SearchDatabase]:
     """The library's current search DB on local ephemeral disk, downloading and
     unpacking it (streamed, never fully in memory) if this replica lacks the
-    current version. None if no current DB exists yet."""
+    current version. None if no current DB exists yet (or this replica's copy was unusable and has
+    been discarded: the next request downloads a fresh one)."""
     manifest = load_manifest(user_id)
     version = str(manifest.get('sourceVersion') or '')
     if not version or manifest.get('schemaVersion') != SCHEMA_VERSION:
@@ -1177,15 +1229,25 @@ def open_database(user_id: str, *, allow_download: bool = True) -> Optional[Sear
         existing = _OPEN.get(path)
     if existing is not None and os.path.exists(path):
         if allow_download:
-            sync_deltas(user_id, existing, manifest)
+            try:
+                sync_deltas(user_id, existing, manifest)
+            except sqlite3.DatabaseError:
+                _discard(path)
+                return None
         return existing
     if not os.path.exists(path):
         if not allow_download:
             return None
-        with _user_lock(user_id):
+        with _download_lock(user_id):
             if not os.path.exists(path):
                 if not _download(user_id, path):
                     return None
+    if path not in _VERIFIED:
+        if not _is_usable(path):
+            _LOGGER.error('Local search DB %s is unusable; discarding it', path)
+            _discard(path)
+            return None
+        _VERIFIED.add(path)
     db = SearchDatabase(path)
     with _LOCKS_GUARD:
         _OPEN[path] = db
@@ -1193,18 +1255,41 @@ def open_database(user_id: str, *, allow_download: bool = True) -> Optional[Sear
             _OPEN.pop(stale, None)
     _evict_user(user_id, keep=path)
     if allow_download:
-        sync_deltas(user_id, db, manifest)
+        try:
+            sync_deltas(user_id, db, manifest)
+        except sqlite3.DatabaseError:
+            _discard(path)
+            return None
     return db
 
 
+def report_failure(db: Optional['SearchDatabase'], exc: BaseException) -> None:
+    """Call when a query on ``db`` raised. A database-level error (missing tables, corruption) means this
+    replica's local copy is bad: drop it so the next request downloads a fresh one instead of failing forever."""
+    if db is not None and isinstance(exc, sqlite3.DatabaseError):
+        _LOGGER.error('Discarding local search DB after %r', exc)
+        _discard(db.path)
+
+
+def _discard(path: str) -> None:
+    with _LOCKS_GUARD:
+        _OPEN.pop(path, None)
+    _VERIFIED.discard(path)
+    _remove_database_files(path)
+
+
 def _download(user_id: str, path: str) -> bool:
+    """Fetch and unpack the base database to ``path`` (caller holds the download lock). Work happens in
+    a private scratch directory so no other process's cleanup can touch it, and the file is only moved
+    into place once it has been checked to be a real database."""
     data_name, _ = _blob_names(user_id)
     client = _blob_client(data_name)
     if client is None:
         return False
     os.makedirs(SEARCH_DB_DIR, exist_ok=True)
-    tmp_gz = f'{path}.{os.getpid()}.{threading.get_ident()}.gz.tmp'
-    tmp_db = f'{path}.{os.getpid()}.{threading.get_ident()}.db.tmp'
+    scratch = tempfile.mkdtemp(prefix='dl-', dir=SEARCH_DB_DIR)
+    tmp_gz = os.path.join(scratch, 'db.gz')
+    tmp_db = os.path.join(scratch, 'db.sqlite')
     try:
         with perf_instrumentation.span('searchdb.download', user=user_id):
             with open(tmp_gz, 'wb') as fh:
@@ -1212,8 +1297,10 @@ def _download(user_id: str, path: str) -> bool:
         with perf_instrumentation.span('searchdb.unpack', user=user_id):
             with gzip.open(tmp_gz, 'rb') as src, open(tmp_db, 'wb') as dst:
                 shutil.copyfileobj(src, dst, 1024 * 1024)
+        if not _is_usable(tmp_db):
+            raise RuntimeError('downloaded search database has no tables')
         # WAL lets delta updates be applied in place while other threads keep reading.
-        conn = sqlite3.connect(tmp_db)
+        conn = sqlite3.connect(f'file:{tmp_db}?mode=rw', uri=True)
         try:
             conn.execute('PRAGMA journal_mode=WAL')
         finally:
@@ -1226,11 +1313,7 @@ def _download(user_id: str, path: str) -> bool:
         _LOGGER.exception('Search DB download failed for user %s', user_id)
         return False
     finally:
-        for tmp in (tmp_gz, tmp_db):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 _WARM_LAST: Dict[str, float] = {}
