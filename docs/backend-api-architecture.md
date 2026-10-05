@@ -438,7 +438,7 @@ Everything logs as `PERF event=...` lines (backend, worker, and the browser thro
 - `event=client_view` summarises each page: requests, network time, duplicates, resources, cache hits and long tasks. `event=client_span` covers the index preload phases for sort, albums and people (manifest, IndexedDB read, blob download, parse, IndexedDB write, total, cached or not) and the media token. Web vitals are logged as `client_vital`.
 - In the browser console, `photostorePerf.report()` prints slowest, chattiest and duplicate tables, plus `summary()` and `events()`.
 
-**Starting queries (KQL, `ContainerAppConsoleLogs_CL | where Log_s has "PERF event="`)**
+**Starting queries**: ready-made KQL for all of the below is in `docs/perf-queries.kql` (Log Analytics, `ContainerAppConsoleLogs_CL`).
 - Slowest endpoints: `event=request`, order by `ms`. Compare `io_ms` with `ms` to see whether time is storage or app work.
 - Chatty endpoints: `event=request`, sort by `io_calls`.
 - Duplicate storage work: `event=dup_io`, grouped by `call`.

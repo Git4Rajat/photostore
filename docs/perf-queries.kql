@@ -1,0 +1,99 @@
+// Log Analytics queries for the PERF instrumentation (see docs/backend-api-architecture.md §15).
+// Run against the workspace attached to the Container Apps environment. Each block is independent.
+// Common prefix: parse "key=value" PERF lines into columns.
+
+// ---- 1. Slowest endpoints, and whether the time is storage or app work -------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=request"
+| extend path = extract(@"path=(\S+)", 1, Log_s), method = extract(@"method=(\S+)", 1, Log_s),
+         ms = todouble(extract(@" ms=([\d.]+)", 1, Log_s)),
+         io_ms = todouble(extract(@"io_ms=([\d.]+)", 1, Log_s)),
+         io_calls = toint(extract(@"io_calls=(\d+)", 1, Log_s)),
+         bytes = tolong(extract(@" bytes=(\d+)", 1, Log_s))
+| summarize n = count(), p50 = percentile(ms, 50), p95 = percentile(ms, 95), storage_p95 = percentile(io_ms, 95),
+            calls_avg = avg(io_calls), kb_avg = avg(bytes) / 1024 by method, path, ContainerAppName_s
+| order by p95 desc
+
+// ---- 2. Chatty endpoints: many storage round trips per request ---------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=request"
+| extend path = extract(@"path=(\S+)", 1, Log_s), io_calls = toint(extract(@"io_calls=(\d+)", 1, Log_s))
+| summarize requests = count(), calls_p95 = percentile(io_calls, 95), calls_total = sum(io_calls) by path
+| order by calls_total desc
+
+// ---- 3. Duplicate storage work (same call repeated inside one request/job) ---------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=dup_io"
+| extend scope = extract(@"scope=(.+?) method=", 1, Log_s), call = extract(@"call=(\S+)", 1, Log_s), times = toint(extract(@"times=(\d+)", 1, Log_s))
+| summarize occurrences = count(), worst = max(times) by scope, call
+| order by occurrences desc
+
+// ---- 4. Index builds: wall time, storage, memory, slowest phases --------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=scope_summary" and Log_s has "name=index.build"
+| extend name = extract(@"name=(\S+)", 1, Log_s), ms = todouble(extract(@" ms=([\d.]+)", 1, Log_s)),
+         io_calls = toint(extract(@"io_calls=(\d+)", 1, Log_s)), io_mb = todouble(extract(@"io_mb=([\d.]+)", 1, Log_s)),
+         rss_peak_mb = todouble(extract(@"rss_peak_mb=([\d.]+)", 1, Log_s)),
+         spans = extract(@"spans=(\S+)", 1, Log_s), io_top = extract(@"io_top=(\S+)", 1, Log_s)
+| project TimeGenerated, name, ms, io_calls, io_mb, rss_peak_mb, spans, io_top
+| order by TimeGenerated desc
+
+// ---- 5. Per-phase cost of builds (storage calls inside each step) -------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=step"
+| extend name = extract(@"name=(\S+)", 1, Log_s), io_calls = toint(extract(@"io_calls=(\d+)", 1, Log_s)),
+         io_ms = todouble(extract(@"io_ms=([\d.]+)", 1, Log_s)), io_mb = todouble(extract(@"io_mb=([\d.]+)", 1, Log_s))
+| summarize runs = count(), calls = avg(io_calls), io_ms = avg(io_ms), io_mb = avg(io_mb) by name
+| order by io_ms desc
+
+// ---- 6. Library scan: table fetch vs each sink -------------------------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "event=stream_scan_split"
+| project TimeGenerated, Log_s
+
+// ---- 7. Client vs server for the same request (joined on rid) -------------------------------------
+let server = ContainerAppConsoleLogs_CL | where Log_s has "PERF event=request"
+  | extend rid = extract(@"rid=(\S+)", 1, Log_s), server_ms = todouble(extract(@" ms=([\d.]+)", 1, Log_s)), path = extract(@"path=(\S+)", 1, Log_s);
+let client = ContainerAppConsoleLogs_CL | where Log_s has "PERF event=client_req"
+  | extend rid = extract(@"rid=(\S+)", 1, Log_s), client_ms = todouble(extract(@" ms=([\d.]+)", 1, Log_s));
+client | join kind=inner server on rid
+| extend network_and_queue_ms = client_ms - server_ms
+| summarize n = count(), client_p95 = percentile(client_ms, 95), server_p95 = percentile(server_ms, 95), overhead_p95 = percentile(network_and_queue_ms, 95) by path
+| order by overhead_p95 desc
+
+// ---- 8. Duplicate fetches seen by the browser (requests and blobs) --------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=client_dup"
+| extend kind = extract(@"kind=(\S+)", 1, Log_s), key = extract(@"key=(\S+)", 1, Log_s), n = toint(extract(@" n=(\d+)", 1, Log_s)), view = extract(@"view=(\S+)", 1, Log_s)
+| summarize occurrences = count(), worst = max(n) by kind, key, view
+| order by occurrences desc
+
+// ---- 9. Time per page view: requests, network, duplicates, long tasks ------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=client_view"
+| extend name = extract(@"name=(\S+)", 1, Log_s), requests = toint(extract(@"requests=(\d+)", 1, Log_s)),
+         netMs = todouble(extract(@"netMs=([\d.]+)", 1, Log_s)), dups = toint(extract(@"dups=(\d+)", 1, Log_s)),
+         longTaskMs = todouble(extract(@"longTaskMs=([\d.]+)", 1, Log_s))
+| summarize views = count(), requests_avg = avg(requests), net_ms_avg = avg(netMs), dups_avg = avg(dups), long_task_ms_avg = avg(longTaskMs) by name
+| order by net_ms_avg desc
+
+// ---- 10. Index preload phases in the browser (sort/albums/people/media token) -----------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=client_span"
+| extend name = extract(@"name=(\S+)", 1, Log_s), ms = todouble(extract(@" ms=([\d.]+)", 1, Log_s)), cached = extract(@"cached=(\S+)", 1, Log_s)
+| summarize n = count(), p50 = percentile(ms, 50), p95 = percentile(ms, 95) by name, cached
+| order by p95 desc
+
+// ---- 11. Thumbnail/blob cache behaviour in the browser ------------------------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=client_resource"
+| extend kind = extract(@"kind=(\S+)", 1, Log_s), n = toint(extract(@" n=(\d+)", 1, Log_s)), cached = toint(extract(@"cached=(\d+)", 1, Log_s)), ms = todouble(extract(@" ms=([\d.]+)", 1, Log_s))
+| summarize loaded = sum(n), from_cache = sum(cached), avg_ms = avg(ms) by kind
+| extend cache_hit_pct = round(100.0 * from_cache / loaded, 1)
+
+// ---- 12. Memory headroom per app (spot OOM risk) ---------------------------------------------------------
+ContainerAppConsoleLogs_CL
+| where Log_s has "PERF event=mem "
+| extend rss = todouble(extract(@"rss_mb=([\d.]+)", 1, Log_s))
+| summarize rss_max = max(rss), rss_p95 = percentile(rss, 95) by ContainerAppName_s, bin(TimeGenerated, 15m)
+| order by TimeGenerated desc
