@@ -587,3 +587,7 @@ A production burst failed with `no such table: meta` / `no such table: rows` bec
 - The Ask page keeps its last search in memory (query, every page loaded so far, totals, scroll position), keyed by library, and restores it when you come back without a new query. A new query, or a different library, starts fresh.
 
 The Ask search now lives in `mockups/prototype/askSearchStore.ts` (outside React): leaving the page no longer drops an in-flight search or its results, further pages keep loading into the store, and a slim progress bar shows on Ask while a search (or the library's search preparation after a backend start) is running.
+
+### 15.13 A person's photos come from the people index
+
+The library database already has an index of which photos each person is in (`row_people`, kept current by the same deltas as everything else). `GET /api/photos?personId=<id>` (backend role, same paged/`directMedia` path as the gallery) now serves a person's photos from it: exact total, newest first, driven by the person's own rows so cost follows the person, not the library. The person page uses it for its first page and for scrolling, so opening a person no longer scans the face table or touches `extras` for photos. `GET /api/persons/<id>` (best faces first) remains for face-level tools.

@@ -11,7 +11,7 @@ import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
-import type { PersonFace, PersonSummary } from '../../types/people';
+import type { PersonSummary } from '../../types/people';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
 import type {
     Album,
@@ -175,29 +175,6 @@ const mapThing = (g: ExploreGroup): ThingTag => ({
 });
 
 // Build the set of distinct photos a person appears in, from their face list.
-const facesToPhotos = (faces: PersonFace[]): Photo[] => {
-    const seen = new Set<string>();
-    const out: Photo[] = [];
-    for (const face of faces) {
-        const filename = face.filename;
-        if (!filename || seen.has(filename)) continue;
-        seen.add(filename);
-        out.push({
-            id: filename,
-            filename,
-            swatch: swatchFor(filename),
-            dateLabel: '',
-            year: 0,
-            rating: 0,
-            liked: false,
-            placeId: null,
-            personIds: [],
-            tags: [],
-            thumbnailUrl: face.thumbnailUrl,
-        });
-    }
-    return out;
-};
 
 interface ViewerState {
     ids: string[];
@@ -1360,15 +1337,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const personFaceOffsets = useRef<Record<string, number>>({});
     const [personPaging, setPersonPaging] = useState<Record<string, { total: number; hasMore: boolean }>>({});
     const personLoadingMore = useRef<Record<string, boolean>>({});
+    // A person's photos come from the library database's people index (the same paged, token-based path
+    // the gallery uses): exact total, newest first, no face-table scan and no per-face work.
     const fetchPersonPage = useCallback(async (id: string, offset: number) => {
-        // people_bp lives on the extras app, not the backend: /api/persons/<id> 404s on the backend host.
-        const res = await getExtras<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
-            `/api/persons/${encodeURIComponent(id)}?offset=${offset}&limit=${PERSON_PAGE}`,
+        const token = getCachedMediaToken();
+        const res = await get<{ photos?: BackendPhoto[]; total?: number }>(
+            `/photos?personId=${encodeURIComponent(id)}&sort=capture&offset=${offset}&limit=${PERSON_PAGE}${token ? '&directMedia=1' : ''}`,
         );
-        const faces = Array.isArray(res?.faces) ? res.faces : [];
-        personFaceOffsets.current[id] = offset + faces.length;
-        setPersonPaging((prev) => ({ ...prev, [id]: { total: res?.total ?? faces.length, hasMore: Boolean(res?.hasMore) && faces.length > 0 } }));
-        return facesToPhotos(faces);
+        const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
+        const total = typeof res?.total === 'number' ? res.total : offset + list.length;
+        personFaceOffsets.current[id] = offset + PERSON_PAGE;
+        setPersonPaging((prev) => ({ ...prev, [id]: { total, hasMore: offset + PERSON_PAGE < total } }));
+        return list;
     }, []);
 
     const openPerson = useCallback(async (id: string) => {
