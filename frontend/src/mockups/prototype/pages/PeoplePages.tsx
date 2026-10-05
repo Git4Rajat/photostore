@@ -156,7 +156,7 @@ export const PeoplePage: React.FC = () => {
 
 /** Person detail — rename / name, browse their photos, and merge in another cluster. */
 export const PersonDetailPage: React.FC = () => {
-    const { route, personById, searchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, fetchPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
+    const { route, personById, searchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
     const personId = route.params.personId;
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
@@ -164,6 +164,8 @@ export const PersonDetailPage: React.FC = () => {
     const [mergeQuery, setMergeQuery] = useState('');
     const [mergeResults, setMergeResults] = useState<Person[]>([]);
     const [chosenMerge, setChosenMerge] = useState<Person | null>(null);
+    // The merge picker only searches once it is used (typing or focus), not on every person that is opened.
+    const [mergeActive, setMergeActive] = useState(false);
     const [personTile, setPersonTile] = useTileSize('photostore.personTileSize');
     const headCover = useProtectedBlobUrls(person?.coverThumbnailUrl ? [person.coverThumbnailUrl] : []);
 
@@ -172,27 +174,17 @@ export const PersonDetailPage: React.FC = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [personId]);
 
-    // personById reads from the SAME people list the People tab's own mount
-    // effect populates -- a direct deep link to a person's detail page
-    // (shared link, browser back/forward) without ever visiting the People
-    // tab would otherwise find nobody and render the empty-state below even
-    // though the person exists. Queued/aborted same as every other tab
-    // fetch; redundant (and cheap, queue-deduped by nothing in particular
-    // but harmless) if People was already visited this session.
-    useEffect(() => {
-        const controller = new AbortController();
-        void enqueueBackgroundRequest(() => fetchPeople(), { signal: controller.signal }).catch(() => {});
-        return () => controller.abort();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    // A deep link to a person outside the loaded pages is resolved by openPerson (ensurePerson fetches just
+    // that cluster), so opening a person never reloads the whole people list.
 
     useEffect(() => {
+        if (!mergeActive && !mergeQuery.trim()) return undefined;
         let active = true;
         const timer = setTimeout(() => {
             void searchPeople(mergeQuery.trim(), MERGE_PICKER_MAX_OPTIONS).then((rows) => { if (active) setMergeResults(rows); });
         }, 250);
         return () => { active = false; clearTimeout(timer); };
-    }, [mergeQuery, searchPeople]);
+    }, [mergeQuery, mergeActive, searchPeople]);
 
     useEffect(() => {
         setDraft(person?.name ?? '');
@@ -281,10 +273,11 @@ export const PersonDetailPage: React.FC = () => {
                         type="search"
                         value={mergeQuery}
                         onChange={(e) => setMergeQuery(e.target.value)}
+                        onFocus={() => setMergeActive(true)}
                         placeholder="Search people by name…"
                         aria-label="Search people to merge"
                     />
-                    <select className="field field-select" value={mergeId} onChange={(e) => { setMergeId(e.target.value); setChosenMerge(mergeResults.find((p) => p.id === e.target.value) ?? null); }} aria-label="Person to merge">
+                    <select className="field field-select" onFocus={() => setMergeActive(true)} value={mergeId} onChange={(e) => { setMergeId(e.target.value); setChosenMerge(mergeResults.find((p) => p.id === e.target.value) ?? null); }} aria-label="Person to merge">
                         <option value="">Choose a person…</option>
                         {mergeOptions.map((o) => (
                             <option key={o.id} value={o.id}>{o.name ?? 'Unnamed'} · {o.faceCount ?? 0} photos</option>
