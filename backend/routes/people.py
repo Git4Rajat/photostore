@@ -97,7 +97,8 @@ def people_page():
     if error:
         return error
     if not app._people_features_available():
-        return app.jsonify({'available': False})
+        app.app.logger.warning('people_page unavailable: people tables not configured on this role')
+        return app.jsonify({'available': False, 'reason': 'features-unavailable'})
     try:
         offset = max(0, int(app.request.args.get('offset', 0)))
         limit = max(1, min(PEOPLE_PAGE_MAX, int(app.request.args.get('limit', 120))))
@@ -106,9 +107,26 @@ def people_page():
     try:
         data = app.get_user_people_index(user_id, allow_refresh=True, allow_sync_build=False, copy_rows=False)
     except Exception:
+        app.app.logger.warning('people_page index read failed for %s', user_id, exc_info=True)
         data = None
     if data is None:
-        return app.jsonify({'available': False})
+        # No people index yet. A library with no people at all (new, or nothing processed yet) has
+        # nothing to build: answer "empty" instead of "still preparing" forever. If people exist, ask
+        # the worker for the missing index.
+        try:
+            first = next(iter(app.person_table_client.query_entities(
+                f"PartitionKey eq '{app._escape_odata(user_id)}'", select=['RowKey'])), None)
+        except Exception:
+            first = 'unknown'
+        if first is None:
+            return app.jsonify({'available': True, 'rows': [], 'total': 0, 'offset': 0, 'hasMore': False,
+                                'namedCount': 0, 'unnamedCount': 0, 'libraryTotal': 0})
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='people-index-missing', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not request a people index build for %s', user_id, exc_info=True)
+        app.app.logger.warning('people_page index-missing for %s (build requested)', user_id)
+        return app.jsonify({'available': False, 'reason': 'index-missing'})
     rows = data.get('rows') or []
     named = sum(1 for r in rows if r.get('isNamed'))
     ids = {i for i in (app.request.args.get('ids') or '').split(',') if i}

@@ -47,7 +47,7 @@ from image_utils import (
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
-from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
+from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
 import album_store
 import index_files
 import table_scan
@@ -3134,6 +3134,7 @@ def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True)
 # the cached result back is pure numpy, so backend can do that part fine.
 _TAG_EMBEDDING_INDEX_CACHE_LOCK = threading.RLock()
 _TAG_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = _BoundedCache(1)
+_TAG_EMBEDDING_INDEX_SCHEMA_VERSION = 'v2'  # v2: excludes reverse-geocoded/GPS pseudo-tags
 
 
 def _tag_embedding_index_container_name() -> str:
@@ -3193,6 +3194,7 @@ def touch_user_tag_embedding_index_state(user_id: str) -> str:
     manifest = {
         'userId': key,
         'sourceVersion': source_version,
+        'schemaVersion': _TAG_EMBEDDING_INDEX_SCHEMA_VERSION,
         'embeddingVersion': vision_utils.get_text_embedding_version(),
         'dirty': True,
         'updatedAt': source_version,
@@ -3275,8 +3277,7 @@ def _serialize_tag_embedding_index(snapshot: TagEmbeddingIndexSnapshot) -> bytes
 
 _TAG_META_COLUMNS = [
     'PartitionKey', 'RowKey', 'subjectTags', 'peopleNames', 'tags', 'objects', 'backgroundTags',
-    'processing_metadata', 'locationCity', 'locationRegion', 'locationCountry', 'address',
-    'latitude', 'longitude', 'exifData', 'faceCount', 'aiPersonLabel',
+    'processing_metadata', 'faceCount', 'aiPersonLabel',
 ]
 
 
@@ -3347,6 +3348,7 @@ def refresh_user_tag_embedding_index(user_id: str, *, source_version: Optional[s
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
+            'schemaVersion': _TAG_EMBEDDING_INDEX_SCHEMA_VERSION,
             'embeddingVersion': snapshot.embedding_version,
             'tagCount': len(snapshot.tags),
             'dirty': False,
@@ -3380,7 +3382,7 @@ def get_user_tag_embedding_index(user_id: str, *, allow_refresh: bool = True) ->
 
     manifest = _load_tag_embedding_index_manifest(key)
     manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
-    manifest_dirty = bool(manifest.get('dirty'))
+    manifest_dirty = bool(manifest.get('dirty')) or manifest.get('schemaVersion') != _TAG_EMBEDDING_INDEX_SCHEMA_VERSION
     current_embedding_version = vision_utils.get_text_embedding_version()
 
     with _TAG_EMBEDDING_INDEX_CACHE_LOCK:
@@ -3694,9 +3696,10 @@ def get_user_listing_index(
 # Browser-index size knobs. Everything here only affects the slim BROWSER blob;
 # the full lexical blob (server-side fallback search) is untouched.
 SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '400'))
-# AI tags are already curated at write time (AI_TAG_MIN_CONFIDENCE, 0.24); the
-# browser index keeps only the confident ones. User-added/stored tags always stay.
-SEARCH_INDEX_TAG_MIN_CONFIDENCE = float(os.getenv('SEARCH_INDEX_TAG_MIN_CONFIDENCE', '0.45'))
+# AI tags are already curated at write time (AI_TAG_MIN_CONFIDENCE); the index keeps the same ones.
+# Stored confidences are raw CLIP cosine scores (~0.25-0.35), so a stricter floor (it was 0.45) drops
+# every AI tag and tag search finds nothing. User-added/stored tags always stay.
+SEARCH_INDEX_TAG_MIN_CONFIDENCE = float(os.getenv('SEARCH_INDEX_TAG_MIN_CONFIDENCE', str(AI_TAG_MIN_CONFIDENCE)))
 SEARCH_INDEX_MAX_TAGS = int(os.getenv('SEARCH_INDEX_MAX_TAGS', '20'))
 # Raw AI-vision predictions (up to 160 per photo, >=0.2) used to be shipped
 # verbatim; now only the top few confident labels, as bare strings.
@@ -4060,9 +4063,9 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
             upserts, deletes = [], []
             for name in chunk:
                 row = rows.get(name)
-                complete = row is not None and str(row.get('processing_complete')).strip().lower() in ('true', '1')
+                # Unprocessed photos are listed too (see library_build): only deleted/missing rows are dropped.
                 gone = row is None or str(row.get('processing_state') or '').strip().lower() == 'deleted'
-                record = search_db.row_record(row) if (complete and not gone) else None
+                record = search_db.row_record(row) if not gone else None
                 if record is not None:
                     upserts.append(record)
                 else:
@@ -4074,6 +4077,52 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
             upserted += len(upserts)
             removed += len(deletes)
     return {'status': 'delta', 'published': published, 'upserts': upserted, 'deletes': removed}
+
+
+SEARCH_DB_RECONCILE_MIN_SECONDS = float(os.getenv('SEARCH_DB_RECONCILE_MIN_SECONDS', '600'))
+SEARCH_DB_RECONCILE_MAX_NAMES = int(os.getenv('SEARCH_DB_RECONCILE_MAX_NAMES', '20000'))
+_RECONCILE_LAST: Dict[str, float] = {}
+
+
+def reconcile_search_db(user_id: str, *, force: bool = False) -> Dict[str, object]:
+    """Self-heal: photos that exist in the metadata table but not in the library database (dirty
+    marks lost to a restart, a database built from a half-processed table, ...) are marked dirty so
+    the next delta publishes them. Reads only RowKeys (no payloads) and the local database's
+    filenames, so it is cheap; rate-limited per library."""
+    import search_db
+    key = str(user_id or '').strip()
+    table = _CTX.get('metadata_table_client')
+    if not key or table is None:
+        return {'status': 'unavailable'}
+    now = time.monotonic()
+    if not force and now - _RECONCILE_LAST.get(key, -1e9) < SEARCH_DB_RECONCILE_MIN_SECONDS:
+        return {'status': 'skipped'}
+    _RECONCILE_LAST[key] = now
+    db = search_db.open_database(key)
+    if db is None:
+        return {'status': 'no_db'}
+    try:
+        known = db.all_filenames()
+        missing: List[str] = []
+        pk = _escape_odata(key)
+        for row in table_scan.scan_partition(
+                table.query_entities, f"PartitionKey eq '{pk}'", select=['RowKey', 'processing_state']):
+            name = str(row.get('RowKey') or '')
+            if not name or name in known:
+                continue
+            if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+                continue
+            missing.append(name)
+            if len(missing) >= SEARCH_DB_RECONCILE_MAX_NAMES:
+                break
+    except Exception:
+        _LOGGER.warning('Library reconcile failed for %s', key, exc_info=True)
+        return {'status': 'unavailable'}
+    if missing:
+        _mark_search_index_dirty_filenames(key, missing, kinds=('lexical',))
+        _flush_dirty_filename_buffer(key, 'lexical')
+    perf_instrumentation.log_event('search_db_reconcile', user=key, missing=len(missing), known=len(known))
+    return {'status': 'ok', 'missing': len(missing)}
 
 
 def refresh_user_lexical_artifacts(user_id: str, source_version: Optional[str] = None):
@@ -4169,7 +4218,9 @@ _SEARCH_INDEX_KINDS = ('lexical', 'sort', 'access')
 
 
 def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
-    return f'{user_id}#{index_kind}'
+    # '#' (like '/' and '?') is rejected by Azure Table Storage as a key character: every mark written
+    # under 'user#kind' failed with OutOfRangeInput, was swallowed, and no dirty set ever reached the worker.
+    return f'{user_id}:{index_kind}'
 
 
 # Azure Table Storage's own cap on operations per submit_transaction call --
@@ -4177,6 +4228,38 @@ def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
 _DIRTY_FILENAME_BATCH_SIZE = 100
 _DIRTY_FILENAME_BUFFER: Dict[Tuple[str, str], Set[str]] = {}
 _DIRTY_FILENAME_BUFFER_LOCK = threading.Lock()
+# Marks are written by one process (upload, ipworker, backend) and consumed by ANOTHER (the worker that builds
+# the indexes), so they must reach the table on their own. Waiting for 100 filenames meant a library that adds
+# fewer than 100 photos at a time (a new library, a phone upload) never published a mark: the worker saw
+# nothing dirty and never put the photos in the library database. A short timer flushes whatever is buffered.
+DIRTY_FLUSH_DELAY_SECONDS = float(os.getenv('DIRTY_FLUSH_DELAY_SECONDS', '3'))
+_DIRTY_FLUSH_TIMER: Optional[threading.Timer] = None
+
+
+def flush_all_dirty_filename_buffers() -> None:
+    """Write every buffered dirty mark now (timer, and before a process exits)."""
+    global _DIRTY_FLUSH_TIMER
+    with _DIRTY_FILENAME_BUFFER_LOCK:
+        _DIRTY_FLUSH_TIMER = None
+        keys = list(_DIRTY_FILENAME_BUFFER.keys())
+    for flush_user_id, flush_kind in keys:
+        try:
+            _flush_dirty_filename_buffer(flush_user_id, flush_kind)
+        except Exception:
+            _LOGGER.warning('Dirty-mark flush failed for %s/%s', flush_user_id, flush_kind, exc_info=True)
+
+
+def _schedule_dirty_flush() -> None:
+    global _DIRTY_FLUSH_TIMER
+    if DIRTY_FLUSH_DELAY_SECONDS <= 0:
+        return
+    with _DIRTY_FILENAME_BUFFER_LOCK:
+        if _DIRTY_FLUSH_TIMER is not None:
+            return
+        timer = threading.Timer(DIRTY_FLUSH_DELAY_SECONDS, flush_all_dirty_filename_buffers)
+        timer.daemon = True
+        _DIRTY_FLUSH_TIMER = timer
+    timer.start()
 
 
 def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
@@ -4213,7 +4296,7 @@ def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
             # Best-effort, same as before batching -- these filenames' dirty
             # state is lost for this cycle; the next real change to any of
             # them re-marks it dirty (see _mark_search_index_dirty_filenames).
-            pass
+            _LOGGER.warning('Dirty-mark write failed partition=%s names=%d', partition_key, len(chunk), exc_info=True)
 
 
 def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> None:
@@ -4254,6 +4337,7 @@ def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> N
                     to_flush.append(key)
     for flush_user_id, flush_kind in to_flush:
         _flush_dirty_filename_buffer(flush_user_id, flush_kind)
+    _schedule_dirty_flush()
 
 
 def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional[Set[str]]:
@@ -6307,12 +6391,17 @@ def _load_people_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
     try:
         payload = blob_client.download_blob().readall()
     except Exception:
+        _LOGGER.warning('People index data download failed user=%s', user_id, exc_info=True)
         return None
     try:
-        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        # Azure SDK decompresses Content-Encoding:gzip by default. Shared
+        # write-through files contain the original gzip bytes instead. Both
+        # representations are valid; never decompress already-decoded JSON.
+        raw = gzip.decompress(payload) if payload.startswith(b'\x1f\x8b') else payload
+        parsed = json.loads(raw.decode('utf-8'))
         rows = parsed.get('rows')
-        if not isinstance(rows, list):
-            return None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('People index rows must be a list of objects')
         return LexicalIndexSnapshot(
             user_id=str(user_id),
             source_version=str(parsed.get('sourceVersion') or ''),
@@ -6321,6 +6410,7 @@ def _load_people_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
             rows=rows,
         )
     except Exception:
+        _LOGGER.warning('People index data decode failed user=%s', user_id, exc_info=True)
         return None
 
 
@@ -6354,6 +6444,10 @@ def _people_index_person_is_named(person: Dict) -> bool:
 
 def _people_index_face_is_rejected(face: Dict) -> bool:
     return _index_coerce_bool(face.get('rejected', False)) or str(face.get('reviewStatus') or '').lower() == 'rejected'
+
+
+def _people_index_face_source_deleted(face: Dict) -> bool:
+    return _index_coerce_bool(face.get('sourceDeleted', False))
 
 
 def _people_index_face_is_owned_by_person(face: Optional[Dict], person_id: str) -> bool:
@@ -6472,6 +6566,7 @@ def _people_index_rows_from_scan(
         cover_bbox: Dict[str, object] = {}
         cover_score: Optional[Tuple[int, float, int]] = None
         indeterminate = False
+        source_deleted_seen = False
 
         if face_ids:
             # Known faces resolve from the bulk map with no pool at all; only the
@@ -6493,6 +6588,9 @@ def _people_index_rows_from_scan(
                     continue
                 if _people_index_face_is_rejected(face) or not _people_index_face_is_owned_by_person(face, person_id):
                     continue
+                if _people_index_face_source_deleted(face):
+                    source_deleted_seen = True
+                    continue
                 active_face_ids.append(face_id)
                 score = _people_index_face_preview_priority(face)
                 if cover_score is None or score > cover_score:
@@ -6507,6 +6605,8 @@ def _people_index_rows_from_scan(
         # Phase B cleanup exactly, just run for every person instead of only
         # the requested page slice.
         if not active_face_ids and not indeterminate and not is_named:
+            if source_deleted_seen:
+                continue
             try:
                 person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
             except Exception:
@@ -6658,17 +6758,18 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     if snapshot is None:
         return None
     container_name = _lexical_index_container_name()
-    if container_name:
-        blob_client = _get_blob_client(container_name, _people_index_json_blob_name(key))
-        if blob_client is not None:
-            try:
-                blob_client.upload_blob(
-                    _serialize_people_index(snapshot),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
-                )
-            except Exception:
-                _LOGGER.exception('Failed to upload people index data blob for user %s', key)
+    blob_client = _get_blob_client(container_name, _people_index_json_blob_name(key))
+    manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))
+    if blob_client is None or manifest_client is None:
+        raise RuntimeError('People index blob storage is unavailable')
+    try:
+        # Publish data before advertising readiness. Failures must reach the
+        # queue worker; a process-local cache cannot make other roles ready.
+        blob_client.upload_blob(
+            _serialize_people_index(snapshot),
+            overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+        )
         _clear_manifest_dirty_flag(key, 'people')
         manifest = {
             'userId': key,
@@ -6680,16 +6781,14 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
             'fullBuiltAt': full_built_at,
             'builtThrough': _odata_utc(started - timedelta(seconds=_PEOPLE_INCREMENTAL_SKEW_SECONDS)),
         }
-        manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))
-        if manifest_client is not None:
-            try:
-                manifest_client.upload_blob(
-                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json'),
-                )
-            except Exception:
-                _LOGGER.exception('Failed to upload people index manifest blob for user %s', key)
+        manifest_client.upload_blob(
+            json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+            overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json'),
+        )
+    except Exception:
+        _LOGGER.exception('Failed to publish people index for user %s', key)
+        raise
     with _PEOPLE_INDEX_CACHE_LOCK:
         _PEOPLE_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
@@ -6829,8 +6928,10 @@ def prime_all_user_indexes_sequentially(
     on_progress: Optional[Callable[[Dict[str, bool], bool], None]] = None,
     wait: bool = False,
     kinds: Optional[Sequence[str]] = None,
-) -> None:
-    """Build all four derived indexes for a user, one at a time (``kinds``
+) -> List[str]:
+    """Returns (wait=True) the kinds whose build raised or produced nothing, else [].
+
+    Build all four derived indexes for a user, one at a time (``kinds``
     restricts it to a subset, e.g. the cheap sort/access pair after uploads).
 
     on_progress (optional) is invoked with (readiness_dict, building) at the
@@ -6861,8 +6962,9 @@ def prime_all_user_indexes_sequentially(
     starvation issue --timeout 600 / the frontend's 600s client timeout were
     already sized to cover a full cold-account build."""
     key = str(user_id or '').strip()
+    failed: List[str] = []
     if not key:
-        return
+        return failed
     lock = _INDEX_PRIME_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
         if wait:
@@ -6873,13 +6975,17 @@ def prime_all_user_indexes_sequentially(
             # here would just redundantly redo the work that just finished.
             lock.acquire(blocking=True)
             lock.release()
-        return
+        return failed
 
     def _emit(building: bool) -> None:
         if on_progress is None:
             return
         try:
-            on_progress(get_user_index_readiness(key), building)
+            readiness = get_user_index_readiness(key)
+            # Old manifests may still exist after a failed refresh. They must
+            # not turn this failed build's final progress into a ready event.
+            readiness.update({kind: False for kind in failed})
+            on_progress(readiness, building)
         except Exception:
             _LOGGER.exception('Index prime progress callback failed user=%s', key)
 
@@ -6909,9 +7015,14 @@ def prime_all_user_indexes_sequentially(
                     continue
                 try:
                     with perf_instrumentation.step(f'index.prime.{kind}', user=key):
-                        refresh_fn(key, source_version=source_version)
-                    _mark_index_rebuild_completed(key, kind)
+                        result = refresh_fn(key, source_version=source_version)
+                    if result is None and kind in ('albums', 'people'):
+                        failed.append(kind)
+                        _LOGGER.error('Index priming produced no %s index user=%s', kind, key)
+                    else:
+                        _mark_index_rebuild_completed(key, kind)
                 except Exception:
+                    failed.append(kind)
                     _LOGGER.exception('Sequential index priming failed kind=%s user=%s', kind, key)
                 finally:
                     kind_lock.release()
@@ -6924,6 +7035,7 @@ def prime_all_user_indexes_sequentially(
         _worker()
     else:
         threading.Thread(target=_worker, name='index-prime-sequential', daemon=True).start()
+    return failed
 
 
 def index_prime_in_progress(user_id: str) -> bool:
@@ -10059,5 +10171,3 @@ def reset_upload_tracking_and_reserve_blobs_batch(
             except Exception:
                 pass
     return anonymous_blob_names
-
-

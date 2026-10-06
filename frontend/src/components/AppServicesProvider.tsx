@@ -254,6 +254,9 @@ interface AppServicesContextValue {
     retryPersistedUploadSession: () => Promise<void>;
     discardPersistedUploadSession: () => Promise<void>;
     registerUploadCompletionHandler: (handler: () => void | Promise<void>) => () => void;
+    /** Called (debounced) when server-side work finished that changes what the library shows: photo
+     *  processing, index builds, people grouping. Pages re-read their indexes/lists. */
+    registerDataRefreshHandler: (handler: () => void | Promise<void>) => () => void;
     registerUploadErrorHandler: (handler: (message: string | null) => void) => () => void;
     releaseKnownHashesForFilenames: (filenames: string[]) => void;
     startBrowserProcessing: (options?: BrowserProcessingStartOptions) => Promise<number>;
@@ -1154,6 +1157,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const browserAiModelStateRef = useRef<SharedBrowserAiModelState>(browserAiModelState);
     const browserAiLoadInFlightRef = useRef<boolean>(false);
     const uploadCompletionHandlersRef = useRef<Set<() => void | Promise<void>>>(new Set());
+    const dataRefreshHandlersRef = useRef<Set<() => void | Promise<void>>>(new Set());
+    const dataRefreshTimerRef = useRef<number | null>(null);
     const uploadErrorHandlerRef = useRef<((message: string | null) => void) | null>(null);
     const browserProcessingStartInFlightRef = useRef<boolean>(false);
     const browserProcessingCancelRef = useRef<boolean>(false);
@@ -1231,6 +1236,20 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // IPWORK_PROCESSING_FINALIZE_QUIET_MS).
     const ipworkProcessingFinalizeTimerRef = useRef<number | null>(null);
 
+    // Server-side work (photo processing, index builds, people grouping) finished: the indexes the
+    // browser downloaded at session start are now stale. Bursts of completions collapse into one refresh.
+    const scheduleDataRefresh = useCallback((delayMs = 3000) => {
+        if (dataRefreshTimerRef.current !== null) {
+            window.clearTimeout(dataRefreshTimerRef.current);
+        }
+        dataRefreshTimerRef.current = window.setTimeout(() => {
+            dataRefreshTimerRef.current = null;
+            Array.from(dataRefreshHandlersRef.current).forEach((handler) => {
+                void Promise.resolve(handler()).catch(() => undefined);
+            });
+        }, delayMs);
+    }, []);
+
     const flushClusterCompletions = useCallback(() => {
         if (clusterFlushTimerRef.current !== null) {
             window.clearTimeout(clusterFlushTimerRef.current);
@@ -1306,6 +1325,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const inFlight: JobStatusRecord[] = [];
             let active = false;
             let changed = false;
+            let finishedServerWork = false;
             for (const job of jobs) {
                 if (!TERMINAL_JOB_STATUSES.has(job.status)) {
                     active = true;
@@ -1324,6 +1344,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     || (Date.now() - finishedAt) <= JOB_NOTIFY_WINDOW_MS;
                 if (!isRecent) {
                     continue;
+                }
+                if (job.kind !== 'preview' && job.status !== 'failed') {
+                    finishedServerWork = true;
                 }
                 const detail = job.message || (job.status === 'failed' ? 'Something went wrong.' : '');
                 if (CLUSTERING_JOB_KINDS.has(job.kind)) {
@@ -1358,6 +1381,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (changed) {
                 persistSeenJobIds(seen);
             }
+            if (finishedServerWork) {
+                scheduleDataRefresh();
+            }
             const ipworkInFlightNow = inFlight.some((job) => job.kind === 'ipwork');
             if (ipworkInFlightNow) {
                 // Real activity -- cancel any debounced "finished" finalize so it
@@ -1381,6 +1407,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         title: 'Server processing finished',
                         details: 'Server-side photo processing finished.',
                     });
+                    // The library indexes are rebuilt right after processing: refresh now, and once more
+                    // shortly after (the index-build job may finish after this poller has gone idle).
+                    scheduleDataRefresh();
+                    window.setTimeout(() => scheduleDataRefresh(), 45000);
                     if (ipworkProcessingNotificationIdRef.current === notificationId) {
                         ipworkProcessingNotificationIdRef.current = null;
                     }
@@ -1402,7 +1432,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         } finally {
             jobPollInFlightRef.current = false;
         }
-    }, [addNotification, updateNotification, scheduleClusterFlush]);
+    }, [addNotification, updateNotification, scheduleClusterFlush, scheduleDataRefresh]);
 
     const stopJobPolling = useCallback(() => {
         if (jobPollTimerRef.current !== null) {
@@ -1613,6 +1643,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const notifyUploadComplete = useCallback(async () => {
         invalidatePhotoCache();
+        await postTools('/api/tools/indexes/build', {
+            scope: 'light',
+            reason: 'upload-complete',
+            force: true,
+            wait: true,
+            waitSeconds: 90,
+        }).catch(() => null);
         // Finalizing a photo with faces enqueues a clustering job server-side;
         // wake the job poller so the "Grouping people…" indicator can appear.
         requestJobPoll();
@@ -1626,6 +1663,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             uploadCompletionHandlersRef.current.delete(handler);
         };
     }, []);
+
+    const registerDataRefreshHandler = useCallback((handler: () => void | Promise<void>) => {
+        dataRefreshHandlersRef.current.add(handler);
+        return () => {
+            dataRefreshHandlersRef.current.delete(handler);
+        };
+    }, []);
+
 
     const registerUploadErrorHandler = useCallback((handler: (message: string | null) => void) => {
         uploadErrorHandlerRef.current = handler;
@@ -4643,6 +4688,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         retryPersistedUploadSession,
         discardPersistedUploadSession,
         registerUploadCompletionHandler,
+        registerDataRefreshHandler,
         registerUploadErrorHandler,
         releaseKnownHashesForFilenames,
         startBrowserProcessing,
@@ -4677,6 +4723,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         retryPersistedUploadSession,
         discardPersistedUploadSession,
         registerUploadCompletionHandler,
+        registerDataRefreshHandler,
         registerUploadErrorHandler,
         releaseKnownHashesForFilenames,
         startBrowserProcessing,

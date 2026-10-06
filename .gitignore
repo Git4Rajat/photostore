@@ -18,6 +18,7 @@ frontend/.vite/
 # OS / editor
 **/.DS_Store
 **/.claude
+codex-memory/
 
 # Backfill scripts
 backend/scripts/backfill_face_by_filename_table.py

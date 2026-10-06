@@ -134,6 +134,17 @@ def test_build_snapshot_excludes_rejected_and_reassigned_faces(people_ctx):
     assert row['coverFilename'] == 'c.jpg'
 
 
+def test_build_snapshot_hides_faces_whose_source_photo_is_deleted_without_deleting_cluster(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1', sourceDeleted=True)
+
+    snapshot = storage_utils._build_user_people_index_snapshot('lib-A', 'v1')
+
+    assert snapshot.rows == []
+    assert ('lib-A', 'p1') in person_table.rows  # preserve assignment for restore
+
+
 def test_build_snapshot_auto_deletes_empty_unnamed_cluster(people_ctx):
     """Mirrors list_persons's Phase B cleanup: an unnamed cluster whose faces
     are all definitively inactive gets deleted, not just excluded."""
@@ -235,6 +246,95 @@ def test_refresh_then_get_round_trips_through_the_fake_blob_service(people_ctx):
 
 def test_get_user_people_index_returns_none_without_refresh_when_never_built(people_ctx):
     assert storage_utils.get_user_people_index('lib-never-built', allow_refresh=False) is None
+
+
+@pytest.mark.parametrize('decoded_by_sdk', [False, True])
+def test_people_page_reads_published_index_from_a_cold_process(people_ctx, monkeypatch, decoded_by_sdk):
+    from routes.people import people_page
+
+    persons, _, blobs = people_ctx
+    user = 'lib-cold-reader'
+    _seed_person(persons, user, 'p1', name='Alice')
+    storage_utils.refresh_user_people_index(user, source_version='v1')
+    data_key = f'lexical-index/{storage_utils._people_index_json_blob_name(user)}'
+    if decoded_by_sdk:
+        # Azure Blob download_blob defaults to decompress=True for gzip
+        # Content-Encoding; share write-through can instead return raw gzip.
+        blobs.blobs[data_key] = gzip.decompress(blobs.blobs[data_key])
+    storage_utils.invalidate_user_people_index_cache(user)
+    monkeypatch.setattr(app, '_require_user_id', lambda: (user, None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(storage_utils, '_rebuild_people_index_in_background', lambda *a: None)
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *a, **kw: None)
+    with app.app.test_request_context('/api/persons/page'):
+        payload = people_page().get_json()
+    assert payload['available'] is True
+    assert payload['rows'][0]['personId'] == 'p1'
+
+
+@pytest.mark.parametrize('failed_kind', ['data', 'manifest'])
+def test_people_publication_failure_propagates_without_blessing_cache(people_ctx, monkeypatch, failed_kind):
+    persons, _, blobs = people_ctx
+    user = 'lib-failed-publish'
+    _seed_person(persons, user, 'p1', name='Alice')
+    storage_utils.invalidate_user_people_index_cache(user)
+    storage_utils._INDEX_MANIFEST_DIRTY_FLAGS[(user, 'people')] = True
+    failing_name = (storage_utils._people_index_json_blob_name(user) if failed_kind == 'data'
+                    else storage_utils._people_index_manifest_blob_name(user))
+    original = blobs.get_blob_client
+
+    def client(container, blob):
+        result = original(container, blob)
+        if blob == failing_name:
+            def fail(*args, **kwargs):
+                raise RuntimeError('upload unavailable')
+            result.upload_blob = fail
+        return result
+
+    monkeypatch.setattr(blobs, 'get_blob_client', client)
+    with pytest.raises(RuntimeError, match='upload unavailable'):
+        storage_utils.refresh_user_people_index(user, source_version='v1')
+    assert user not in storage_utils._PEOPLE_INDEX_CACHE
+    if failed_kind == 'data':
+        assert f'lexical-index/{storage_utils._people_index_manifest_blob_name(user)}' not in blobs.blobs
+        assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS[(user, 'people')] is True
+    else:
+        # A failed manifest publication must permit subsequent dirty touches.
+        assert (user, 'people') not in storage_utils._INDEX_MANIFEST_DIRTY_FLAGS
+
+
+def test_failed_people_prime_does_not_emit_ready_from_an_old_manifest(people_ctx, monkeypatch):
+    monkeypatch.setattr(storage_utils, 'get_user_index_readiness', lambda uid: {'people': True})
+    monkeypatch.setattr(storage_utils, 'refresh_user_people_index', lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('upload unavailable')))
+    completed = []
+    monkeypatch.setattr(storage_utils, '_mark_index_rebuild_completed', lambda *a: completed.append(a))
+    progress = []
+    failed = storage_utils.prime_all_user_indexes_sequentially(
+        'lib-failed-prime', wait=True, kinds=['people'],
+        on_progress=lambda readiness, building: progress.append((readiness, building)),
+    )
+    assert failed == ['people']
+    assert progress[-1] == ({'people': False}, False)
+    assert completed == []
+
+
+def test_people_publish_requires_durable_storage(people_ctx, monkeypatch):
+    persons, _, _ = people_ctx
+    _seed_person(persons, 'lib-no-publish-client', 'p1', name='Alice')
+    monkeypatch.setattr(storage_utils, '_get_blob_client', lambda *a: None)
+    with pytest.raises(RuntimeError, match='blob storage is unavailable'):
+        storage_utils.refresh_user_people_index('lib-no-publish-client', source_version='v1')
+    assert 'lib-no-publish-client' not in storage_utils._PEOPLE_INDEX_CACHE
+
+
+@pytest.mark.parametrize('payload', [b'not JSON', b'\x1f\x8bcorrupted', b'{"rows":["bad row"]}'])
+def test_people_blob_decode_failure_is_logged(people_ctx, caplog, payload):
+    _, _, blobs = people_ctx
+    user = 'lib-corrupt-people'
+    blobs.blobs[f'lexical-index/{storage_utils._people_index_json_blob_name(user)}'] = payload
+    assert storage_utils._load_people_index_blob(user) is None
+    assert 'People index data decode failed' in caplog.text
 
 
 def test_get_user_people_index_builds_on_first_call_with_allow_refresh(people_ctx):
@@ -680,6 +780,18 @@ def test_person_photos_hydrates_legacy_member_rows_once_then_reads_only_the_memb
     assert reads == []                                                  # no face reads the second time
 
 
+def test_person_photos_ignores_deleted_source_photos(monkeypatch):
+    persons, faces, members = _members_ctx(monkeypatch)
+    _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='p1', confidence=0.9, sourceDeleted=True)
+    members.upsert_entity({'PartitionKey': 'p1', 'RowKey': 'f1', 'userId': 'u'})
+
+    status, body = _call_photos('limit=10')
+
+    assert status == 200
+    assert body['filenames'] == [] and body['total'] == 0
+    assert members.rows[('p1', 'f1')]['sourceDeleted'] == '1'
+
+
 def test_person_photos_ignores_faces_that_moved_and_unknown_people(monkeypatch):
     persons, faces, members = _members_ctx(monkeypatch)
     _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='someone-else', confidence=0.9)
@@ -688,6 +800,35 @@ def test_person_photos_ignores_faces_that_moved_and_unknown_people(monkeypatch):
     from routes import people as people_routes
     with app.app.test_request_context('/api/persons/nope/photos'):
         assert people_routes.get_person_photos('nope')[1] == 404
+
+
+def test_soft_delete_marks_face_and_member_rows_hidden_then_restore_clears_them(monkeypatch):
+    import person_photos
+    persons, faces, members = FakeTable(), FakeTable(), FakeTable()
+    _seed_person(persons, 'u', 'p1', name='', faceIds=json.dumps(['f1']))
+    _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='p1', confidence=0.9)
+    members.upsert_entity({'PartitionKey': 'p1', 'RowKey': 'f1', 'userId': 'u', 'filename': 'a.jpg'})
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(app, 'face_table_client', faces)
+    monkeypatch.setattr(app, 'person_members_table_client', members)
+    monkeypatch.setattr(app, 'get_face_ids_for_filename', lambda uid, name: ['f1'])
+    touched = []
+    monkeypatch.setattr(app, 'touch_user_people_index_state', lambda uid: touched.append(uid) or 'v')
+
+    hidden = app._set_faces_source_deleted_for_filenames('u', ['a.jpg'], True)
+
+    assert hidden == {'facesUpdated': 1, 'membersUpdated': 1, 'personsTouched': 1}
+    assert faces.rows[('u', 'f1')]['sourceDeleted'] is True
+    assert members.rows[('p1', 'f1')]['sourceDeleted'] == '1'
+    assert persons.rows[('u', 'p1')]['sourceVisibilityUpdatedAt']
+    assert touched == ['u']
+
+    visible = app._set_faces_source_deleted_for_filenames('u', ['a.jpg'], False)
+
+    assert visible['facesUpdated'] == 1
+    assert faces.rows[('u', 'f1')]['sourceDeleted'] is False
+    assert members.rows[('p1', 'f1')]['sourceDeleted'] == ''
+    person_photos._CACHE.clear()
 
 
 def test_rebuilding_a_photos_faces_uses_the_filename_index_not_a_library_wide_face_scan(monkeypatch):
@@ -704,3 +845,21 @@ def test_rebuilding_a_photos_faces_uses_the_filename_index_not_a_library_wide_fa
     result = app._rebuild_metadata_faces_for_filename('u', 'a.jpg', searchable_person_index={'p1': 'Ann'})
     assert result['changed'] and result['peopleIdsAfter'] == ['p1']
     assert updates and updates[0][0] == 'a.jpg' and json.loads(updates[0][1]['peopleIds']) == ['p1']
+
+
+def test_people_page_for_a_library_with_no_people_is_empty_not_preparing_forever(monkeypatch):
+    from routes import people as people_routes
+    persons = FakeTable()
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(app, 'get_user_people_index', lambda uid, **kw: None)
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, reason='', scope='full': triggered.append((reason, scope)))
+    with app.app.test_request_context('/api/persons/page?offset=0&limit=120'):
+        body = people_routes.people_page().get_json()
+    assert body['available'] is True and body['rows'] == [] and body['total'] == 0 and not triggered
+    _seed_person(persons, 'u', 'p1', name='', faceIds='[]')            # people exist but no index yet
+    with app.app.test_request_context('/api/persons/page?offset=0&limit=120'):
+        body = people_routes.people_page().get_json()
+    assert body['available'] is False and triggered == [('people-index-missing', 'people')]

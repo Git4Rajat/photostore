@@ -117,6 +117,32 @@ const provisionalPhoto = (row: SortIndexRow, token: MediaToken | null): Photo =>
     };
 };
 
+const sortRowsForGallery = (rows: SortIndexRow[], mode: PhotoSortMode): SortIndexRow[] => (
+    [...rows].sort((a, b) => {
+        const ar = Number(a.rating) || 0;
+        const br = Number(b.rating) || 0;
+        const al = Number(a.likes) || 0;
+        const bl = Number(b.likes) || 0;
+        const rawAt = a.captureDate ? new Date(a.captureDate).getTime() : 0;
+        const rawBt = b.captureDate ? new Date(b.captureDate).getTime() : 0;
+        const at = Number.isFinite(rawAt) ? rawAt : 0;
+        const bt = Number.isFinite(rawBt) ? rawBt : 0;
+        if (mode === 'rating') {
+            if (ar !== br) return br - ar;
+            if (al !== bl) return bl - al;
+        } else if (mode === 'likes') {
+            if (al !== bl) return bl - al;
+            if (ar !== br) return br - ar;
+        }
+        if (at !== bt) return bt - at;
+        return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
+    })
+);
+
+const backendSortParam = (mode: PhotoSortMode): string => (
+    mode === 'rating' ? 'rating' : mode === 'likes' ? 'likes' : 'capture'
+);
+
 interface PeoplePageRow { personId: string; name: string; isNamed: boolean; faceCount: number; coverFaceId?: string }
 interface PeoplePageResponse {
     available?: boolean; rows?: PeoplePageRow[]; total?: number; hasMore?: boolean;
@@ -210,6 +236,7 @@ interface ViewerState {
 }
 
 export type MediaFilter = 'all' | 'photo' | 'video';
+export type PhotoSortMode = 'date' | 'rating' | 'likes';
 
 export interface CaptureRange {
     // Inclusive ISO date bounds (yyyy-mm-dd) passed to /photos as
@@ -264,6 +291,8 @@ interface Store {
     // gallery filters / timeline
     mediaFilter: MediaFilter;
     setMediaFilter: (filter: MediaFilter) => void;
+    photoSortMode: PhotoSortMode;
+    setPhotoSortMode: (mode: PhotoSortMode) => void;
     captureRange: CaptureRange | null;
     setCaptureRange: (range: CaptureRange | null) => void;
     timeline: TimelineSummary | null;
@@ -394,9 +423,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [hasMorePhotos, setHasMorePhotos] = useState<boolean>(true);
     const [totalPhotos, setTotalPhotos] = useState<number | null>(null);
     const [mediaFilter, setMediaFilterState] = useState<MediaFilter>('all');
+    const [photoSortMode, setPhotoSortModeState] = useState<PhotoSortMode>('date');
     const [captureRange, setCaptureRangeState] = useState<CaptureRange | null>(null);
     const [timeline, setTimeline] = useState<TimelineSummary | null>(null);
     const captureRangeRef = useRef<CaptureRange | null>(null);
+    const photoSortModeRef = useRef<PhotoSortMode>('date');
     const photoOffsetRef = useRef(0);
     const photoLoadingRef = useRef(false);
     const photoHasMoreRef = useRef(true);
@@ -491,10 +522,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const fetchPhotosViaLegacyEndpoint = useCallback(async (offset: number, reset: boolean) => {
         const range = captureRangeRef.current;
         const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
+        const sort = backendSortParam(photoSortModeRef.current);
         const token = getCachedMediaToken();
         const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
         const res = await get<{ photos?: BackendPhoto[]; total?: number; indexBuilding?: boolean; indexPartial?: boolean }>(
-            `/photos?sort=capture&offset=${offset}&limit=${pageSize}${rangeQuery}${token ? '&directMedia=1' : ''}`,
+            `/photos?sort=${sort}&offset=${offset}&limit=${pageSize}${rangeQuery}${token ? '&directMedia=1' : ''}`,
         );
         reportIndexBuilding('gallery', Boolean(res?.indexBuilding || res?.indexPartial));
         const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
@@ -542,14 +574,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     if (endMs !== null && t > endMs) return false;
                     return true;
                 });
-            // captureDate desc, filename tie-break -- matches the backend's
-            // own default order (see app.py's _cached_sorted_metadata_list_rows_for_user).
-            const sorted = [...filtered].sort((a, b) => {
-                const at = a.captureDate ? new Date(a.captureDate).getTime() : 0;
-                const bt = b.captureDate ? new Date(b.captureDate).getTime() : 0;
-                if (at !== bt) return bt - at;
-                return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
-            });
+            const sorted = sortRowsForGallery(filtered, photoSortModeRef.current);
             const total = sorted.length;
             // With the media token, thumbnails cost no backend calls, so load as
             // many tiles as the screen needs (a few viewports' worth) per step.
@@ -654,6 +679,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, [fetchPhotos]);
 
     const setMediaFilter = useCallback((filter: MediaFilter) => setMediaFilterState(filter), []);
+
+    const setPhotoSortMode = useCallback((mode: PhotoSortMode) => {
+        if (photoSortModeRef.current === mode) return;
+        photoSortModeRef.current = mode;
+        setPhotoSortModeState(mode);
+        photoOffsetRef.current = 0;
+        photoHasMoreRef.current = true;
+        void fetchPhotos(true);
+    }, [fetchPhotos]);
 
     // The id sequence a gallery-backed viewer slides through: the loaded photos
     // in the current media filter. It grows as more pages load.
@@ -1285,14 +1319,19 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, [toast]);
 
     // Primary path: one server page of clusters (named first), cut from the cached people index, then
-    // more as the user scrolls -- the browser never downloads every cluster. Falls back to the legacy
-    // single request only while the server's people index is still building.
+    // more as the user scrolls -- the browser never downloads every cluster. If the index is not
+    // available yet, show the preparing state and retry this paged route instead of falling back to
+    // the legacy full-list endpoint.
     const fetchPeople = useCallback(async () => {
         setPeopleLoading(true);
         try {
             const res = await getExtras<PeoplePageResponse>(`/api/persons/page?offset=0&limit=${PEOPLE_PAGE}`);
             if (!res?.available || !Array.isArray(res.rows)) {
-                throw new Error('people index unavailable');
+                // The server answered "index not ready": show the preparing bar and let it retry.
+                setPeopleHasMore(false);
+                setPeopleUnavailable(true);
+                reportIndexBuilding('people', true);
+                return;
             }
             const mapped = res.rows.map(mapPersonRow);
             peopleOffsetRef.current = mapped.length;
@@ -1305,9 +1344,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         } catch {
             // Never fall back to fetching every cluster at once: show a "preparing" state and let the
             // user (or the next visit) retry the paged request.
+            // A failed request (404/5xx/network) is not "building": don't claim the library is being prepared.
+            console.warn('people page request failed');
             setPeopleHasMore(false);
             setPeopleUnavailable(true);
-            reportIndexBuilding('people', true);
+            reportIndexBuilding('people', false);
         } finally {
             setPeopleLoading(false);
         }
@@ -1603,6 +1644,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             reloadPhotos,
             mediaFilter,
             setMediaFilter,
+            photoSortMode,
+            setPhotoSortMode,
             captureRange,
             setCaptureRange,
             timeline,
@@ -1680,7 +1723,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
             placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, selectMode, viewer, toasts,
             photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
-            mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
+            mediaFilter, setMediaFilter, photoSortMode, setPhotoSortMode, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore, fetchExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
             clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,

@@ -220,7 +220,7 @@ export const ToolsPage: React.FC = () => {
         setBusy(true);
         try {
             await postAdmin(path, body);
-            recordAction([], 'library', undefined, label);
+            recordAction([label], 'library', undefined, label);
             toast(`${label} started`);
         } catch {
             toast(`Couldn’t start ${label.toLowerCase()}`, undefined, undefined, 'error');

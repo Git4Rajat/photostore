@@ -69,6 +69,7 @@ from search_utils import (
     parse_json_list,
     parse_tags,
     parse_search_query,
+    visible_tags,
 )
 from storage_utils import (
     configure_storage,
@@ -110,6 +111,7 @@ from storage_utils import (
     invalidate_user_vector_index_cache,
     delete_user_vector_index_data,
     touch_user_search_indexes_state,
+    flush_all_dirty_filename_buffers,
     metadata_updates_affect_search_indexes,
     _photo_processing_complete,
     metadata_updates_affect_sort_index,
@@ -471,7 +473,7 @@ EMBEDDINGS_TABLE = os.getenv('EMBEDDINGS_TABLE', 'photoembeddings')
 # _extract_and_store_face_embedding.
 FACE_EMBEDDINGS_TABLE = os.getenv('FACE_EMBEDDINGS_TABLE', 'photofaceembeddings')
 # Dirty-set tracking for incremental search-index rebuilds: PartitionKey=
-# f"{user_id}#vector" or f"{user_id}#lexical", RowKey=filename. The vector and
+# f"{user_id}:vector" or f"{user_id}:lexical", RowKey=filename. The vector and
 # lexical indexes used to be rebuilt as an all-or-nothing full re-scan/re-embed
 # of the whole library on ANY single-photo edit (a rating change on 1 photo
 # re-embedded the other 35,999). Each edit now marks just its own filename
@@ -2382,7 +2384,7 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'rating': metadata.get('rating', 0),
         'likes': metadata.get('likes', 0),
         'liked': user_id in liked_by,
-        'tags': json.loads(metadata.get('tags', '[]') or '[]'),
+        'tags': visible_tags(metadata),
         'rotation': _normalize_rotation(metadata.get('rotation', 0)),
         'thumbnailRotation': thumbnail_rotation,
         'location': _location_from_metadata(metadata, exif_data),
@@ -9910,7 +9912,7 @@ def _index_build_job_id(user_id: str) -> str:
 INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS', '30'))
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
 # The people/albums rebuild reads every cluster and face, so repeated clustering runs coalesce harder.
-INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '600'))
+INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '180'))
 
 
 def _job_row_fresh_active(key: str, job_id: str) -> bool:
@@ -9960,7 +9962,7 @@ def light_index_build_needed(user_id: str) -> bool:
     return bool(_load_sort_index_manifest(key).get('dirty')) or access_index_is_dirty(key)
 
 
-def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> str:
+def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, coalesce: bool = True) -> str:
     """Queue the library's index build on the always-awake `worker` role (library-
     ops queue). Returns 'queued', 'already_active' or 'unavailable'.
 
@@ -9991,13 +9993,16 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> 
     # instead (the queued job row dedupes everything that arrives meanwhile).
     delay = 0
     previous = _get_job_row(key, job_id) if jobs_table_client is not None else None
-    if previous and str(previous.get('status') or '').lower() == 'done':
+    if coalesce and previous and str(previous.get('status') or '').lower() == 'done':
         updated = _parse_iso_date(str(previous.get('updatedAt') or ''))
         if updated is not None:
             elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
             minimum = INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS if scope == 'people' else INDEX_BUILD_MIN_INTERVAL_SECONDS
             delay = int(max(0, minimum - elapsed))
-    _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'queued')
+    _upsert_job_status(
+        job_id, key, INDEX_BUILD_JOB_TYPE, 'queued',
+        result={'delayedSeconds': int(delay), 'reason': reason, 'scope': scope} if delay else None,
+    )
     try:
         library_ops_queue_client.send_message(json.dumps(
             {'type': 'index_build', 'userId': key, 'jobId': job_id, 'reason': reason, 'scope': scope},
@@ -10059,7 +10064,13 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             if scope in ('light', 'people'):
                 # Incremental maintenance: cost follows what changed, not library size.
                 kinds = ('sort', 'access') if scope == 'light' else ('people', 'albums')
-                prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                bad = prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                if bad:
+                    raise RuntimeError(f'index build produced no {", ".join(bad)} index')
+                try:
+                    storage_utils_module.reconcile_search_db(user_id)
+                except Exception:
+                    worker_logger.warning('Library reconcile failed for %s', user_id, exc_info=True)
                 outcome = refresh_user_search_db_incremental(user_id)
                 perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, **{
                     k: v for k, v in outcome.items() if isinstance(v, (int, str))})
@@ -10086,8 +10097,10 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     built = library_build.bootstrap_library_build(user_id, on_progress=_bootstrap_progress)
                     if built.get('status') == 'conflict':
                         raise RuntimeError('library build lost a race with another writer; retrying')
-                prime_all_user_indexes_sequentially(
+                bad = prime_all_user_indexes_sequentially(
                     user_id, on_progress=callback, wait=True, kinds=('sort', 'access', 'albums', 'people'))
+                if bad:
+                    raise RuntimeError(f'index build produced no {", ".join(bad)} index')
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')
@@ -11998,6 +12011,100 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
     metadata_table_client.upsert_entity(entity)
     _trash_index_add(user_id, filename, now_iso)
     return entity
+
+
+def _set_faces_source_deleted_for_filenames(user_id: str, filenames, deleted: bool) -> Dict[str, int]:
+    """Hide/show a soft-deleted photo's faces from derived People views without
+    destroying the face/person assignment, so restore can make them visible
+    again. Bounded by the selected filenames via the face-by-filename index."""
+    if face_table_client is None:
+        return {'facesUpdated': 0, 'membersUpdated': 0, 'personsTouched': 0}
+    names = [str(name or '').strip() for name in filenames if str(name or '').strip()]
+    if not names:
+        return {'facesUpdated': 0, 'membersUpdated': 0, 'personsTouched': 0}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    touched_people = set()
+    faces_updated = 0
+    members_updated = 0
+
+    def _face_ids(filename: str) -> List[str]:
+        try:
+            ids = get_face_ids_for_filename(user_id, filename)
+        except Exception:
+            ids = None
+        if ids is not None:
+            return ids
+        try:
+            return [
+                str(row.get('RowKey') or '') for row in face_table_client.query_entities(
+                    f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'",
+                    select=['RowKey'],
+                ) if row.get('RowKey')
+            ]
+        except Exception:
+            return []
+
+    def _update_one(item) -> Tuple[int, int, str]:
+        filename, face_id = item
+        try:
+            face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            return 0, 0, ''
+        if str(face.get('filename') or '') != filename:
+            return 0, 0, ''
+        if deleted:
+            face['sourceDeleted'] = True
+            face['sourceDeletedAt'] = now_iso
+        else:
+            face['sourceDeleted'] = False
+            face['sourceDeletedAt'] = ''
+        try:
+            face_table_client.upsert_entity(face, mode=UpdateMode.MERGE)
+        except Exception:
+            return 0, 0, ''
+        person_id = str(face.get('personId') or '')
+        member_updated = 0
+        if person_id and person_members_table_client is not None:
+            try:
+                person_members_table_client.upsert_entity({
+                    'PartitionKey': person_id,
+                    'RowKey': face_id,
+                    'filename': filename,
+                    'sourceDeleted': '1' if deleted else '',
+                }, mode=UpdateMode.MERGE)
+                member_updated = 1
+            except Exception:
+                member_updated = 0
+            try:
+                import person_photos
+                person_photos.invalidate(user_id, person_id)
+            except Exception:
+                pass
+        return 1, member_updated, person_id
+
+    work = [(name, fid) for name in names for fid in _face_ids(name)]
+    for face_delta, member_delta, person_id in _io_pool_map(_update_one, work, workers=12):
+        faces_updated += face_delta
+        members_updated += member_delta
+        if person_id:
+            touched_people.add(person_id)
+    if person_table_client is not None:
+        def _touch_person(person_id: str) -> bool:
+            try:
+                person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+                person['sourceVisibilityUpdatedAt'] = now_iso
+                person_table_client.upsert_entity(person, mode=UpdateMode.MERGE)
+                return True
+            except Exception:
+                return False
+
+        _io_pool_map(_touch_person, sorted(touched_people), workers=12)
+    if touched_people:
+        try:
+            touch_user_people_index_state(user_id)
+        except Exception:
+            pass
+    return {'facesUpdated': faces_updated, 'membersUpdated': members_updated, 'personsTouched': len(touched_people)}
 
 
 def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any]]:
@@ -14164,8 +14271,11 @@ def _prewarm_ipwork_models() -> None:
 
 
 def _process_ipwork_message(message) -> str:
-    with perf_instrumentation.scope('ipwork.message', dequeue=getattr(message, 'dequeue_count', None)):
-        return _process_ipwork_message_impl(message)
+    try:
+        with perf_instrumentation.scope('ipwork.message', dequeue=getattr(message, 'dequeue_count', None)):
+            return _process_ipwork_message_impl(message)
+    finally:
+        flush_all_dirty_filename_buffers()      # the worker that builds the indexes is another process: publish the marks now
 
 
 def _process_ipwork_message_impl(message) -> str:
@@ -14374,7 +14484,7 @@ def _trigger_tools_index_rebuild(user_id: str, reason: str = 'trigger', scope: s
             token = _issue_session_for(key)
             requests.post(
                 f"{tools_url.rstrip('/')}/api/tools/indexes/build",
-                json={},
+                json={'scope': scope, 'reason': reason},
                 headers={'Authorization': f'Bearer {token}'},
                 timeout=float(os.getenv('TOOLS_INDEX_REBUILD_TIMEOUT_SECONDS', '600')),
             )
@@ -14796,6 +14906,7 @@ def run_ipworker() -> None:
         # silently represented as successful/complete latency observations.
         close_wave_if_drained()
         throughput.log(len(in_flight), force=True, oldest_task_seconds=oldest_task_seconds())
+    flush_all_dirty_filename_buffers()      # marks buffered in this process must reach the table before it exits
     if grace_exhausted:
         os._exit(exit_code)
 

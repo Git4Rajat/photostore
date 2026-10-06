@@ -91,3 +91,30 @@ def test_lookup_batch_sets_direct_flag_from_body(monkeypatch):
                                       json={'filenames': ['a.jpg', 'b.jpg'], 'directMedia': True}):
         photos = lookup_photos_batch().get_json()['photos']
     assert [p['thumbnailBlob'] for p in photos] == ['uuid-1', 'uuid-1']
+
+
+def test_index_status_diagnostics_reports_queue_depths_and_processing_mode(monkeypatch):
+    from routes.photos import photos_index_status
+
+    class Q:
+        def __init__(self, n): self.n = n
+        def get_queue_properties(self):
+            class P: approximate_message_count = self.n
+            return P()
+
+    class Broken:
+        def get_queue_properties(self): raise RuntimeError('denied')
+
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {'sort': True})
+    monkeypatch.setattr(app, 'ipwork_queue_client', Q(25))
+    monkeypatch.setattr(app, 'clustering_queue_client', Broken())
+    monkeypatch.setattr(app, 'library_ops_queue_client', None)
+    monkeypatch.setattr(app, 'PROCESSING_MODE', 'backend')
+    monkeypatch.setattr(storage_utils.search_db if hasattr(storage_utils, 'search_db') else __import__('search_db'), 'load_manifest', lambda uid: {})
+    with app.app.test_request_context('/api/photos/index-status?diagnostics=1'):
+        body = photos_index_status().get_json()
+    assert body['diagnostics'] == {'processingMode': 'backend',
+                                   'queues': {'ipwork': 25, 'clustering': 'error: RuntimeError', 'libraryOps': None}}
+    with app.app.test_request_context('/api/photos/index-status'):
+        assert 'diagnostics' not in photos_index_status().get_json()

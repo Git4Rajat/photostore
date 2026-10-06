@@ -164,6 +164,7 @@ def test_readers_keep_working_while_a_delta_is_applied(world):
 def test_too_much_change_asks_for_a_compacting_rebuild(world, monkeypatch):
     svc, meta, dirty = world
     monkeypatch.setattr(search_db, 'DELTA_MAX_ROW_FRACTION', 0.5)             # 3 base rows -> at most 1 changed row
+    monkeypatch.setattr(search_db, 'DELTA_MIN_ROW_BUDGET', 0)
     _change(meta, _row('x.jpg', ['dog']))
     _change(meta, _row('y.jpg', ['dog']))
     assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'needs_full'
@@ -277,3 +278,55 @@ def test_compaction_does_not_clobber_a_manifest_from_another_lineage(world, monk
     monkeypatch.setattr(search_db, '_upload_database_file', upload_then_rebuild_lands)
     assert search_db.compact_database('lib') is None
     assert json.loads(svc.store[key])['lineage'] == 'rebuilt'
+
+
+def test_a_photo_still_being_processed_is_listed_right_away(world):
+    svc, meta, dirty = world
+    _change(meta, {**_row('new.jpg', []), 'processing_complete': False, 'thumbnail_status': 'done'})   # just uploaded
+    assert storage_utils.refresh_user_search_db_incremental('lib')['upserts'] == 1
+    db = search_db.open_database('lib')
+    names, total = db.list_page(sort='capture', offset=0, limit=10)
+    assert 'new.jpg' in names and total == 4                    # visible to the gallery/Workbench/covers before OCR/faces finish
+
+
+def test_marks_reach_the_table_without_a_reader_in_the_same_process(world, monkeypatch):
+    """The process that marks a photo (upload, ipworker) is not the one that builds the index (worker): a
+    handful of marks must be written out on their own, not only once 100 pile up or a reader in the same
+    process asks."""
+    svc, meta, dirty = world
+    storage_utils._DIRTY_FILENAME_BUFFER.clear()
+    storage_utils.touch_user_search_indexes_state('lib', filenames=['n1.jpg', 'n2.jpg'])        # 2 << batch of 100
+    assert not [r for r in dirty.rows if r[0].endswith('lexical')]                              # still only in memory
+    storage_utils.flush_all_dirty_filename_buffers()
+    assert {r[1] for r in dirty.rows if 'lexical' in r[0]} == {'n1.jpg', 'n2.jpg'}
+
+
+def test_a_timer_flushes_small_batches(world, monkeypatch):
+    import time as _time
+    svc, meta, dirty = world
+    storage_utils._DIRTY_FILENAME_BUFFER.clear()
+    monkeypatch.setattr(storage_utils, 'DIRTY_FLUSH_DELAY_SECONDS', 0.05)
+    monkeypatch.setattr(storage_utils, '_DIRTY_FLUSH_TIMER', None)
+    storage_utils.touch_user_search_indexes_state('lib', filenames=['t1.jpg'])
+    deadline = _time.time() + 3
+    while _time.time() < deadline and not [r for r in dirty.rows if 'lexical' in r[0]]:
+        _time.sleep(0.02)
+    assert {r[1] for r in dirty.rows if 'lexical' in r[0]} == {'t1.jpg'}
+
+
+def test_reconcile_publishes_photos_whose_dirty_marks_were_lost(world):
+    svc, meta, dirty = world
+    meta.upsert_entity(_row('lost.jpg', ['fox']))                             # no dirty mark ever written
+    meta.upsert_entity({**_row('gone.jpg', ['fox']), 'processing_state': 'deleted'})
+    assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'noop'
+
+    assert storage_utils.reconcile_search_db('lib', force=True) == {'status': 'ok', 'missing': 1}
+    assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'delta'
+    assert _names(search_db.open_database('lib'), 'fox') == ['lost.jpg']
+    assert storage_utils.reconcile_search_db('lib')['status'] == 'skipped'    # rate limited
+
+
+def test_small_changes_against_an_empty_base_still_fit_in_a_delta():
+    empty = {'rowCount': 0, 'deltaSeq': 0, 'deltaRows': 0}
+    assert not search_db.delta_budget_exceeded(empty, 12)
+    assert search_db.delta_budget_exceeded(empty, search_db.DELTA_MIN_ROW_BUDGET + 1)

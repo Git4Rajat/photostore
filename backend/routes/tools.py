@@ -122,17 +122,66 @@ def tools_build_indexes():
     user_id, error = app._require_user_id()
     if error:
         return error
-    state = app.get_user_index_build_state(user_id)
+    data = app.request.get_json(silent=True) or {}
+    requested_scope = str(data.get('scope') or '').strip().lower()
+    wait_seconds = 0.0
+    try:
+        wait_seconds = max(0.0, min(90.0, float(data.get('waitSeconds') or 0)))
+    except Exception:
+        wait_seconds = 0.0
+    if data.get('wait') is True and wait_seconds <= 0:
+        wait_seconds = 60.0
+
     outcome = 'not_needed'
+    scope = 'none'
     if app.index_build_needed(user_id):
-        outcome = app.enqueue_index_build(user_id, reason='client')
+        scope = 'full'
+        outcome = app.enqueue_index_build(user_id, reason=str(data.get('reason') or 'client'))
+    elif requested_scope in ('', 'auto', 'light') and app.light_index_build_needed(user_id):
+        scope = 'light'
+        outcome = app.enqueue_index_build(
+            user_id,
+            reason=str(data.get('reason') or 'client-light'),
+            scope='light',
+            coalesce=not bool(data.get('force') or data.get('forceImmediate')),
+        )
+
+    wait_result = None
+    if wait_seconds > 0 and outcome in ('queued', 'already_active') and scope != 'none':
+        wait_result = _wait_for_index_build(user_id, scope, wait_seconds)
+    state = app.get_user_index_build_state(user_id)
+    building = outcome in ('queued', 'already_active')
+    if wait_result and wait_result.get('status') in ('done', 'failed', 'skipped'):
+        building = False
     return app.jsonify({
         'ok': True,
         'ready': state['ready'],
-        'building': outcome in ('queued', 'already_active'),
+        'building': building,
         'queued': outcome,
+        'scope': scope,
+        'wait': wait_result,
         'indexes': state['indexes'],
     })
+
+
+def _wait_for_index_build(user_id: str, scope: str, timeout_seconds: float):
+    """One-shot long wait used by upload completion. The browser makes one
+    request, then refreshes its cached index after this returns."""
+    if app.jobs_table_client is None:
+        return {'status': 'unavailable'}
+    scope = scope if scope in ('full', 'light', 'people') else 'full'
+    job_id = app._index_build_job_id(user_id) + (f'-{scope}' if scope != 'full' else '')
+    deadline = app.time.monotonic() + max(0.0, timeout_seconds)
+    last_status = ''
+    while True:
+        row = app._get_job_row(user_id, job_id) or {}
+        last_status = str(row.get('status') or '').lower()
+        if last_status in ('done', 'failed', 'skipped'):
+            return {'jobId': job_id, 'status': last_status, 'completed': last_status == 'done'}
+        remaining = deadline - app.time.monotonic()
+        if remaining <= 0:
+            return {'jobId': job_id, 'status': last_status or 'unknown', 'completed': False, 'timedOut': True}
+        app.time.sleep(min(1.0, remaining))
 
 
 @tools_bp.route('/api/tools/indexes/status', methods=['GET'])

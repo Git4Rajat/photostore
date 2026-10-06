@@ -6,6 +6,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# No background flush timer in unit tests (they flush explicitly or through the reader).
+os.environ.setdefault('DIRTY_FLUSH_DELAY_SECONDS', '0')
+
 # app.py registers only a subset of blueprints per-process, keyed off the
 # APP_ROLE env var (tools/upload/admin/extras each get their own slim
 # container app in production; a bare/unset role -- what a bare `pytest` run

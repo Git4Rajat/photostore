@@ -599,3 +599,17 @@ Not used for this: the library database's `row_people` index only contains **nam
 - **Adding photos** checks which photos exist with the library database (`SearchDatabase.existing_filenames`, one indexed lookup per 500 names) instead of ~1 scattered table query per 15 photos; only names the database does not know yet (just uploaded) are checked in the table with point reads. Adding 15,000 photos is a few SQL lookups plus the member-row writes.
 - **Albums above 2,000 photos** (`ALBUM_INLINE_MAX_PHOTOS`) live in the members table, not in the album row. A row holding 10,000+ names is ~0.7 MB that every add/remove rewrites and every albums-index rebuild, photo delete and page read has to fetch and parse; member rows are touched only for the photos that change. Smaller albums are unchanged.
 - The albums index is still rebuilt in full after an album change: with a handful of albums (each now a small row plus a 2,000-name sample for its cover) that is cheap, so it was not made incremental.
+
+### 15.15 Unprocessed photos are in the library database
+
+The library database used to contain only photos whose seven processing steps had all finished (`processing_complete`). A fresh upload therefore stayed out of the database (and out of the Workbench, album covers and the server-paged gallery) until OCR, vision, geo and face processing finished, and never appeared at all if a step stalled. The full build and the delta path now include every non-deleted photo; only deleted or missing rows are dropped. Search over a photo that is still processing can only match its filename and metadata so far; its tags and text are added as each step lands (each step marks the photo for the next delta).
+
+### 15.16 The browser refreshes when the server finishes
+
+The browser reads the sort and albums indexes once per session and re-reads them only after an upload completes (which is before the server has processed the photos). Server-side processing and the index builds that follow finish later, and nothing told the browser. `AppServicesProvider` now notices finished server work (any newly finished job except previews/failures, and the end of ipworker processing, with one follow-up 45 s later for the index build that follows it) and calls the registered data-refresh handlers after a 3 s debounce. `DataRefreshBridge` (in `PrototypeApp`) registers one that drops the cached sort and albums indexes and reloads photos, albums, people and Explore.
+
+### 15.17 Dirty marks reach the table on their own
+
+A photo is added to the library database only if the worker finds it in the dirty-marks table (`photosearchdirty`). Marks are buffered in memory by whichever process changed the photo (upload, ipworker, backend) and used to be written only when 100 filenames piled up, or when a reader in the SAME process asked. The worker that builds the indexes is a different process, so a library that adds fewer than 100 photos at a time (a new library, a phone upload) never published a mark: the worker saw nothing dirty, and the Workbench, album covers and search stayed empty. Marks are now flushed 3 s after the first one (`DIRTY_FLUSH_DELAY_SECONDS`, 0 disables), after every ipworker message, and before a worker/ipworker process exits.
+
+Photos whose marks were lost before this fix are not in the database. Re-queueing their processing (the admin backfill endpoints in `routes/admin.py`, or a Workbench re-run once they are listed) marks them again.

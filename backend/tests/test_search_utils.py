@@ -13,8 +13,13 @@ from __future__ import annotations
 
 from search_utils import (
     build_semantic_text,
+    build_semantic_layers,
+    effective_tags,
+    gps_presence_tags,
+    location_tags,
     lexical_search_score,
     parse_search_query,
+    visible_tags,
     _normalize_token,
 )
 
@@ -39,6 +44,24 @@ def test_location_query_with_filler_word_matches_same_as_without():
     without_filler = lexical_search_score(parse_search_query('dog at beach'), 'photo.jpg', metadata, {})
     assert with_filler == without_filler
     assert with_filler > 0
+
+
+def test_location_metadata_does_not_become_tags():
+    metadata = {
+        'tags': '["dog", "sweden", "gps tagged"]',
+        'subjectTags': '["dog", "malmo"]',
+        'locationCity': 'Malmo',
+        'locationRegion': 'Skane',
+        'locationCountry': 'Sweden',
+        'address': 'Stortorget 1',
+        'exifData': '{"GPS.GPSLatitude": "55.6050"}',
+    }
+
+    assert location_tags(metadata) == []
+    assert gps_presence_tags(metadata) == []
+    assert visible_tags(metadata) == ['dog']
+    assert effective_tags(metadata) == ['dog']
+    assert build_semantic_layers('photo.jpg', metadata)['locations'] == []
 
 
 def test_region_only_location_match():

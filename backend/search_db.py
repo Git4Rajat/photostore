@@ -52,7 +52,7 @@ from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 'sqlite-v2'  # v2: gallery columns (capture/upload time, rating, likes, coordinates, month-day)
+SCHEMA_VERSION = 'sqlite-v5'  # v2: gallery columns; v3: AI tag floor; v4: sort order indexes; v5: no location pseudo-tags
 SEARCH_DB_DIR = os.getenv('SEARCH_DB_DIR', '').strip() or os.path.join(tempfile.gettempdir(), 'photostore-search')
 # Cap on candidates pulled per query (bm25-ranked); the scorer then ranks them.
 CANDIDATE_LIMIT = int(os.getenv('SEARCH_DB_CANDIDATE_LIMIT', '4000'))
@@ -254,6 +254,9 @@ class DatabaseBuilder:
         conn.execute('CREATE INDEX rows_capture_ts ON rows(capture_ts)')
         conn.execute('CREATE INDEX rows_upload_ts ON rows(upload_ts)')
         conn.execute('CREATE INDEX rows_rating ON rows(rating, likes)')
+        conn.execute('CREATE INDEX rows_rating_order ON rows(rating DESC, likes DESC, capture_ts DESC, filename ASC)')
+        conn.execute('CREATE INDEX rows_likes_order ON rows(likes DESC, rating DESC, capture_ts DESC, filename ASC)')
+        conn.execute('CREATE INDEX rows_capture_range_order ON rows(capture_day, capture_ts DESC, filename ASC)')
         conn.execute('CREATE INDEX row_people_pid ON row_people(person_id)')
         conn.execute('INSERT INTO meta VALUES(?, ?)', (
             'location_terms', json.dumps(sorted(self._terms, key=len, reverse=True))))
@@ -578,8 +581,8 @@ class SearchDatabase:
         # old COALESCE(.., -1e18) form) lets SQLite walk the capture/upload indexes instead of
         # sorting the whole library on every page (3.7 s vs 1.2 s at a 500k offset, 124 ms vs 0 ms at 0).
         'capture': 'capture_ts DESC, filename ASC',
-        'rating': 'rating DESC, filename ASC',
-        'likes': 'likes DESC, filename ASC',
+        'rating': 'rating DESC, likes DESC, capture_ts DESC, filename ASC',
+        'likes': 'likes DESC, rating DESC, capture_ts DESC, filename ASC',
         'location': 'LOWER(filename) ASC, filename ASC',
         'name': 'LOWER(filename) ASC, filename ASC',
         'date': 'upload_ts DESC, filename ASC',  # also the default for unknown sorts
@@ -611,6 +614,10 @@ class SearchDatabase:
         names = [r[0] for r in conn.execute(
             f'SELECT filename FROM {source}{where} ORDER BY {order} LIMIT ? OFFSET ?', [*args, int(limit), max(0, int(offset))])]
         return names, int(total)
+
+    def all_filenames(self) -> set:
+        """Every filename in the library database (used to reconcile against the metadata table)."""
+        return {r[0] for r in self._conn().execute('SELECT filename FROM rows')}
 
     def existing_filenames(self, filenames: Sequence[str]) -> set:
         """The subset of ``filenames`` that are in the library (one indexed SQL lookup per 500 names)."""
@@ -856,13 +863,16 @@ class SearchDbSink:
 # Rebuild (compact) instead of appending another delta when the log gets long or large.
 DELTA_MAX_COUNT = int(os.getenv('SEARCH_DB_DELTA_MAX_COUNT', '200'))
 DELTA_MAX_ROW_FRACTION = float(os.getenv('SEARCH_DB_DELTA_MAX_ROW_FRACTION', '0.25'))
+# Floor for the fraction rule: against an empty or tiny base it allowed no delta at all, so a new library's
+# photos could never be added (every attempt asked for a rebuild that compacted the same empty base).
+DELTA_MIN_ROW_BUDGET = int(os.getenv('SEARCH_DB_DELTA_MIN_ROW_BUDGET', '5000'))
 
 
 def delta_budget_exceeded(manifest: Dict, adding: int) -> bool:
     base_rows = max(1, int(manifest.get('rowCount') or 0))
     return (
         int(manifest.get('deltaSeq') or 0) >= DELTA_MAX_COUNT
-        or (int(manifest.get('deltaRows') or 0) + adding) > DELTA_MAX_ROW_FRACTION * base_rows
+        or (int(manifest.get('deltaRows') or 0) + adding) > max(DELTA_MIN_ROW_BUDGET, DELTA_MAX_ROW_FRACTION * base_rows)
     )
 
 

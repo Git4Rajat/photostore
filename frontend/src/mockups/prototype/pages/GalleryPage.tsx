@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
-import type { CaptureRange, MediaFilter } from '../store';
+import type { CaptureRange, MediaFilter, PhotoSortMode } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
@@ -13,6 +13,12 @@ const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
     { value: 'photo', label: 'Photos' },
     { value: 'video', label: 'Videos' },
+];
+
+const SORT_MODES: { value: PhotoSortMode; label: string }[] = [
+    { value: 'date', label: 'Date' },
+    { value: 'rating', label: 'Rating' },
+    { value: 'likes', label: 'Likes' },
 ];
 
 type ZoomLevel = 'days' | 'months' | 'years';
@@ -28,7 +34,7 @@ const clampGalleryTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(GALLER
 export const GalleryPage: React.FC = () => {
     const {
         photos, navigate, selectMany, photosLoading, hasMorePhotos,
-        loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, captureRange, setCaptureRange, timeline,
+        loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, photoSortMode, setPhotoSortMode, captureRange, setCaptureRange, timeline,
         route, focusPhoto, selectMode, setSelectMode,
     } = useStore();
     const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
@@ -226,6 +232,15 @@ export const GalleryPage: React.FC = () => {
                     <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
                 </div>
                 <div className="pt-toolbar-actions">
+                    {level === 'days' && (
+                        <div className="mock-seg pt-sort-mode" role="group" aria-label="Sort photos">
+                            {SORT_MODES.map((mode) => (
+                                <button key={mode.value} type="button" className={photoSortMode === mode.value ? 'active' : undefined} onClick={() => setPhotoSortMode(mode.value)}>
+                                    {mode.label}
+                                </button>
+                            ))}
+                        </div>
+                    )}
                     {level === 'days' && (
                         <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
                             {MEDIA_FILTERS.map((f) => (
