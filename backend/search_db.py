@@ -52,7 +52,7 @@ from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 'sqlite-v2'  # v2: gallery columns (capture/upload time, rating, likes, coordinates, month-day)
+SCHEMA_VERSION = 'sqlite-v3'  # v2: gallery columns (capture/upload time, rating, likes, coordinates, month-day); v3: AI tags below 0.45 are indexed
 SEARCH_DB_DIR = os.getenv('SEARCH_DB_DIR', '').strip() or os.path.join(tempfile.gettempdir(), 'photostore-search')
 # Cap on candidates pulled per query (bm25-ranked); the scorer then ranks them.
 CANDIDATE_LIMIT = int(os.getenv('SEARCH_DB_CANDIDATE_LIMIT', '4000'))

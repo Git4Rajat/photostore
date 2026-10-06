@@ -47,7 +47,7 @@ from image_utils import (
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
-from search_utils import MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
+from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
 import album_store
 import index_files
 import table_scan
@@ -3694,9 +3694,10 @@ def get_user_listing_index(
 # Browser-index size knobs. Everything here only affects the slim BROWSER blob;
 # the full lexical blob (server-side fallback search) is untouched.
 SEARCH_INDEX_OCR_MAX_CHARS = int(os.getenv('SEARCH_INDEX_OCR_MAX_CHARS', '400'))
-# AI tags are already curated at write time (AI_TAG_MIN_CONFIDENCE, 0.24); the
-# browser index keeps only the confident ones. User-added/stored tags always stay.
-SEARCH_INDEX_TAG_MIN_CONFIDENCE = float(os.getenv('SEARCH_INDEX_TAG_MIN_CONFIDENCE', '0.45'))
+# AI tags are already curated at write time (AI_TAG_MIN_CONFIDENCE); the index keeps the same ones.
+# Stored confidences are raw CLIP cosine scores (~0.25-0.35), so a stricter floor (it was 0.45) drops
+# every AI tag and tag search finds nothing. User-added/stored tags always stay.
+SEARCH_INDEX_TAG_MIN_CONFIDENCE = float(os.getenv('SEARCH_INDEX_TAG_MIN_CONFIDENCE', str(AI_TAG_MIN_CONFIDENCE)))
 SEARCH_INDEX_MAX_TAGS = int(os.getenv('SEARCH_INDEX_MAX_TAGS', '20'))
 # Raw AI-vision predictions (up to 160 per photo, >=0.2) used to be shipped
 # verbatim; now only the top few confident labels, as bare strings.

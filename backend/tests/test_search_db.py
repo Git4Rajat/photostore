@@ -24,7 +24,7 @@ def _big_row():
         'tagMetadata': json.dumps([
             {'tag': 'dog', 'source': 'ai_tag', 'confidence': 0.9},
             {'tag': 'grass', 'source': 'ai_tag', 'confidence': 0.6},
-            {'tag': 'blurry', 'source': 'ai_tag', 'confidence': 0.26},
+            {'tag': 'blurry', 'source': 'ai_tag', 'confidence': 0.2},
         ]),
         'caption': 'a dog', 'locationCity': 'Paris', 'faceCount': 1,
         'latitude': '48.856614', 'longitude': '2.352222',
@@ -45,7 +45,7 @@ def test_reduced_row_is_scorer_compatible_and_much_smaller():
     full = _big_row()
     slim = search_db.reduced_row(full)
     assert json.loads(slim['subjectTags']) == ['dog']
-    assert json.loads(slim['tags']) == ['grass', 'ball']  # 'blurry' (0.26) filtered, objects/background merged
+    assert json.loads(slim['tags']) == ['grass', 'ball']  # 'blurry' (0.2) filtered, objects/background merged
     assert search_utils.prediction_tags(slim) == ['cat']
     assert slim['latitude'] == slim['longitude'] == '1' and slim['uploadDate'] == '2020-01-02T00:00:00+00:00'
     for dropped in ('weakTags', 'faces', 'tagMetadata', 'objects', 'backgroundTags', 'PartitionKey'):
