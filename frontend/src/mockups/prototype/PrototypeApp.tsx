@@ -1,4 +1,6 @@
 import IndexBuildBar from './components/IndexBuildBar';
+import { invalidateLocalSortIndex } from '../../services/localSortIndex';
+import { invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
@@ -318,6 +320,22 @@ const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
     );
 };
 
+/** Re-reads what the library shows when the server finishes work that changes it (photo processing, index
+ *  builds, people grouping). Without this the indexes downloaded at session start stay as they were. */
+const DataRefreshBridge: React.FC = () => {
+    const { registerDataRefreshHandler } = useAppServices();
+    const { reloadPhotos, reloadAlbums, reloadPeople, reloadExplore } = useStore();
+    useEffect(() => registerDataRefreshHandler(() => {
+        invalidateLocalSortIndex();
+        invalidateLocalAlbumsIndex();
+        reloadPhotos();
+        reloadAlbums();
+        reloadPeople();
+        reloadExplore();
+    }), [registerDataRefreshHandler, reloadPhotos, reloadAlbums, reloadPeople, reloadExplore]);
+    return null;
+};
+
 const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
     const [theme, setTheme] = useState<Theme>('system');
     useEffect(() => applyTheme(theme), [theme]);
@@ -331,6 +349,7 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
                         <div className="mock-body pt-body">
                             <UploadPausedBanner />
                             <IndexBuildBar />
+                            <DataRefreshBridge />
                             <Page />
                         </div>
                         <MobileTabbar />

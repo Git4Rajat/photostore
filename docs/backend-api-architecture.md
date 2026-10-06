@@ -603,3 +603,7 @@ Not used for this: the library database's `row_people` index only contains **nam
 ### 15.15 Unprocessed photos are in the library database
 
 The library database used to contain only photos whose seven processing steps had all finished (`processing_complete`). A fresh upload therefore stayed out of the database (and out of the Workbench, album covers and the server-paged gallery) until OCR, vision, geo and face processing finished, and never appeared at all if a step stalled. The full build and the delta path now include every non-deleted photo; only deleted or missing rows are dropped. Search over a photo that is still processing can only match its filename and metadata so far; its tags and text are added as each step lands (each step marks the photo for the next delta).
+
+### 15.16 The browser refreshes when the server finishes
+
+The browser reads the sort and albums indexes once per session and re-reads them only after an upload completes (which is before the server has processed the photos). Server-side processing and the index builds that follow finish later, and nothing told the browser. `AppServicesProvider` now notices finished server work (any newly finished job except previews/failures, and the end of ipworker processing, with one follow-up 45 s later for the index build that follows it) and calls the registered data-refresh handlers after a 3 s debounce. `DataRefreshBridge` (in `PrototypeApp`) registers one that drops the cached sort and albums indexes and reloads photos, albums, people and Explore.
