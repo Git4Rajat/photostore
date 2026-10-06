@@ -1063,7 +1063,23 @@ def photos_index_status():
         }
     except Exception:
         library_db = None
-    return app.jsonify({'ready': ready, 'indexes': indexes, 'building': building, 'libraryDb': library_db})
+    payload = {'ready': ready, 'indexes': indexes, 'building': building, 'libraryDb': library_db}
+    if app.request.args.get('diagnostics') in ('1', 'true'):
+        # For environments without a log workspace: how many messages are waiting in each work queue, and
+        # which processing mode this app is running, so "is anything reaching ipworker?" can be answered
+        # from the browser (GET /api/photos/index-status?diagnostics=1).
+        queues = {}
+        for label, client in (('ipwork', app.ipwork_queue_client), ('clustering', app.clustering_queue_client),
+                              ('libraryOps', app.library_ops_queue_client)):
+            if client is None:
+                queues[label] = None
+                continue
+            try:
+                queues[label] = int(client.get_queue_properties().approximate_message_count)
+            except Exception as exc:
+                queues[label] = f'error: {type(exc).__name__}'
+        payload['diagnostics'] = {'processingMode': app.PROCESSING_MODE, 'queues': queues}
+    return app.jsonify(payload)
 
 @photos_bp.route('/photos/metadata', methods=['POST'])
 @photos_bp.route('/photos/metadata/', methods=['POST'])
