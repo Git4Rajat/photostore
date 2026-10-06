@@ -9911,7 +9911,7 @@ def _index_build_job_id(user_id: str) -> str:
 INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS', '30'))
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
 # The people/albums rebuild reads every cluster and face, so repeated clustering runs coalesce harder.
-INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '600'))
+INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '180'))
 
 
 def _job_row_fresh_active(key: str, job_id: str) -> bool:
@@ -9998,7 +9998,10 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> 
             elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
             minimum = INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS if scope == 'people' else INDEX_BUILD_MIN_INTERVAL_SECONDS
             delay = int(max(0, minimum - elapsed))
-    _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'queued')
+    _upsert_job_status(
+        job_id, key, INDEX_BUILD_JOB_TYPE, 'queued',
+        result={'delayedSeconds': int(delay), 'reason': reason, 'scope': scope} if delay else None,
+    )
     try:
         library_ops_queue_client.send_message(json.dumps(
             {'type': 'index_build', 'userId': key, 'jobId': job_id, 'reason': reason, 'scope': scope},
@@ -10060,7 +10063,13 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             if scope in ('light', 'people'):
                 # Incremental maintenance: cost follows what changed, not library size.
                 kinds = ('sort', 'access') if scope == 'light' else ('people', 'albums')
-                prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                bad = prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                if bad:
+                    raise RuntimeError(f'index build produced no {", ".join(bad)} index')
+                try:
+                    storage_utils_module.reconcile_search_db(user_id)
+                except Exception:
+                    worker_logger.warning('Library reconcile failed for %s', user_id, exc_info=True)
                 outcome = refresh_user_search_db_incremental(user_id)
                 perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, **{
                     k: v for k, v in outcome.items() if isinstance(v, (int, str))})

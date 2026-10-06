@@ -1292,7 +1292,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         try {
             const res = await getExtras<PeoplePageResponse>(`/api/persons/page?offset=0&limit=${PEOPLE_PAGE}`);
             if (!res?.available || !Array.isArray(res.rows)) {
-                throw new Error('people index unavailable');
+                // The server answered "index not ready": show the preparing bar and let it retry.
+                setPeopleHasMore(false);
+                setPeopleUnavailable(true);
+                reportIndexBuilding('people', true);
+                return;
             }
             const mapped = res.rows.map(mapPersonRow);
             peopleOffsetRef.current = mapped.length;
@@ -1305,9 +1309,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         } catch {
             // Never fall back to fetching every cluster at once: show a "preparing" state and let the
             // user (or the next visit) retry the paged request.
+            // A failed request (404/5xx/network) is not "building": don't claim the library is being prepared.
+            console.warn('people page request failed');
             setPeopleHasMore(false);
             setPeopleUnavailable(true);
-            reportIndexBuilding('people', true);
+            reportIndexBuilding('people', false);
         } finally {
             setPeopleLoading(false);
         }

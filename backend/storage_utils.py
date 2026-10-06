@@ -4076,6 +4076,52 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
     return {'status': 'delta', 'published': published, 'upserts': upserted, 'deletes': removed}
 
 
+SEARCH_DB_RECONCILE_MIN_SECONDS = float(os.getenv('SEARCH_DB_RECONCILE_MIN_SECONDS', '600'))
+SEARCH_DB_RECONCILE_MAX_NAMES = int(os.getenv('SEARCH_DB_RECONCILE_MAX_NAMES', '20000'))
+_RECONCILE_LAST: Dict[str, float] = {}
+
+
+def reconcile_search_db(user_id: str, *, force: bool = False) -> Dict[str, object]:
+    """Self-heal: photos that exist in the metadata table but not in the library database (dirty
+    marks lost to a restart, a database built from a half-processed table, ...) are marked dirty so
+    the next delta publishes them. Reads only RowKeys (no payloads) and the local database's
+    filenames, so it is cheap; rate-limited per library."""
+    import search_db
+    key = str(user_id or '').strip()
+    table = _CTX.get('metadata_table_client')
+    if not key or table is None:
+        return {'status': 'unavailable'}
+    now = time.monotonic()
+    if not force and now - _RECONCILE_LAST.get(key, -1e9) < SEARCH_DB_RECONCILE_MIN_SECONDS:
+        return {'status': 'skipped'}
+    _RECONCILE_LAST[key] = now
+    db = search_db.open_database(key)
+    if db is None:
+        return {'status': 'no_db'}
+    try:
+        known = db.all_filenames()
+        missing: List[str] = []
+        pk = _escape_odata(key)
+        for row in table_scan.scan_partition(
+                table.query_entities, f"PartitionKey eq '{pk}'", select=['RowKey', 'processing_state']):
+            name = str(row.get('RowKey') or '')
+            if not name or name in known:
+                continue
+            if str(row.get('processing_state') or '').strip().lower() == 'deleted':
+                continue
+            missing.append(name)
+            if len(missing) >= SEARCH_DB_RECONCILE_MAX_NAMES:
+                break
+    except Exception:
+        _LOGGER.warning('Library reconcile failed for %s', key, exc_info=True)
+        return {'status': 'unavailable'}
+    if missing:
+        _mark_search_index_dirty_filenames(key, missing, kinds=('lexical',))
+        _flush_dirty_filename_buffer(key, 'lexical')
+    perf_instrumentation.log_event('search_db_reconcile', user=key, missing=len(missing), known=len(known))
+    return {'status': 'ok', 'missing': len(missing)}
+
+
 def refresh_user_lexical_artifacts(user_id: str, source_version: Optional[str] = None):
     """What the index primer runs for the 'lexical' kind: the app-level streaming
     build when registered, else the legacy full-snapshot refresh (tests only)."""
@@ -6862,8 +6908,10 @@ def prime_all_user_indexes_sequentially(
     on_progress: Optional[Callable[[Dict[str, bool], bool], None]] = None,
     wait: bool = False,
     kinds: Optional[Sequence[str]] = None,
-) -> None:
-    """Build all four derived indexes for a user, one at a time (``kinds``
+) -> List[str]:
+    """Returns (wait=True) the kinds whose build raised or produced nothing, else [].
+
+    Build all four derived indexes for a user, one at a time (``kinds``
     restricts it to a subset, e.g. the cheap sort/access pair after uploads).
 
     on_progress (optional) is invoked with (readiness_dict, building) at the
@@ -6894,8 +6942,9 @@ def prime_all_user_indexes_sequentially(
     starvation issue --timeout 600 / the frontend's 600s client timeout were
     already sized to cover a full cold-account build."""
     key = str(user_id or '').strip()
+    failed: List[str] = []
     if not key:
-        return
+        return failed
     lock = _INDEX_PRIME_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
         if wait:
@@ -6906,7 +6955,7 @@ def prime_all_user_indexes_sequentially(
             # here would just redundantly redo the work that just finished.
             lock.acquire(blocking=True)
             lock.release()
-        return
+        return failed
 
     def _emit(building: bool) -> None:
         if on_progress is None:
@@ -6942,9 +6991,13 @@ def prime_all_user_indexes_sequentially(
                     continue
                 try:
                     with perf_instrumentation.step(f'index.prime.{kind}', user=key):
-                        refresh_fn(key, source_version=source_version)
+                        result = refresh_fn(key, source_version=source_version)
+                    if result is None and kind in ('albums', 'people'):
+                        failed.append(kind)
+                        _LOGGER.error('Index priming produced no %s index user=%s', kind, key)
                     _mark_index_rebuild_completed(key, kind)
                 except Exception:
+                    failed.append(kind)
                     _LOGGER.exception('Sequential index priming failed kind=%s user=%s', kind, key)
                 finally:
                     kind_lock.release()
@@ -6957,6 +7010,7 @@ def prime_all_user_indexes_sequentially(
         _worker()
     else:
         threading.Thread(target=_worker, name='index-prime-sequential', daemon=True).start()
+    return failed
 
 
 def index_prime_in_progress(user_id: str) -> bool:
