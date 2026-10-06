@@ -860,13 +860,16 @@ class SearchDbSink:
 # Rebuild (compact) instead of appending another delta when the log gets long or large.
 DELTA_MAX_COUNT = int(os.getenv('SEARCH_DB_DELTA_MAX_COUNT', '200'))
 DELTA_MAX_ROW_FRACTION = float(os.getenv('SEARCH_DB_DELTA_MAX_ROW_FRACTION', '0.25'))
+# Floor for the fraction rule: against an empty or tiny base it allowed no delta at all, so a new library's
+# photos could never be added (every attempt asked for a rebuild that compacted the same empty base).
+DELTA_MIN_ROW_BUDGET = int(os.getenv('SEARCH_DB_DELTA_MIN_ROW_BUDGET', '5000'))
 
 
 def delta_budget_exceeded(manifest: Dict, adding: int) -> bool:
     base_rows = max(1, int(manifest.get('rowCount') or 0))
     return (
         int(manifest.get('deltaSeq') or 0) >= DELTA_MAX_COUNT
-        or (int(manifest.get('deltaRows') or 0) + adding) > DELTA_MAX_ROW_FRACTION * base_rows
+        or (int(manifest.get('deltaRows') or 0) + adding) > max(DELTA_MIN_ROW_BUDGET, DELTA_MAX_ROW_FRACTION * base_rows)
     )
 
 

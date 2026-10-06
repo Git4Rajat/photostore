@@ -164,6 +164,7 @@ def test_readers_keep_working_while_a_delta_is_applied(world):
 def test_too_much_change_asks_for_a_compacting_rebuild(world, monkeypatch):
     svc, meta, dirty = world
     monkeypatch.setattr(search_db, 'DELTA_MAX_ROW_FRACTION', 0.5)             # 3 base rows -> at most 1 changed row
+    monkeypatch.setattr(search_db, 'DELTA_MIN_ROW_BUDGET', 0)
     _change(meta, _row('x.jpg', ['dog']))
     _change(meta, _row('y.jpg', ['dog']))
     assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'needs_full'
@@ -323,3 +324,9 @@ def test_reconcile_publishes_photos_whose_dirty_marks_were_lost(world):
     assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'delta'
     assert _names(search_db.open_database('lib'), 'fox') == ['lost.jpg']
     assert storage_utils.reconcile_search_db('lib')['status'] == 'skipped'    # rate limited
+
+
+def test_small_changes_against_an_empty_base_still_fit_in_a_delta():
+    empty = {'rowCount': 0, 'deltaSeq': 0, 'deltaRows': 0}
+    assert not search_db.delta_budget_exceeded(empty, 12)
+    assert search_db.delta_budget_exceeded(empty, search_db.DELTA_MIN_ROW_BUDGET + 1)
