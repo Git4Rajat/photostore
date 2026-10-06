@@ -134,6 +134,17 @@ def test_build_snapshot_excludes_rejected_and_reassigned_faces(people_ctx):
     assert row['coverFilename'] == 'c.jpg'
 
 
+def test_build_snapshot_hides_faces_whose_source_photo_is_deleted_without_deleting_cluster(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='', faceIds=json.dumps(['f1']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1', sourceDeleted=True)
+
+    snapshot = storage_utils._build_user_people_index_snapshot('lib-A', 'v1')
+
+    assert snapshot.rows == []
+    assert ('lib-A', 'p1') in person_table.rows  # preserve assignment for restore
+
+
 def test_build_snapshot_auto_deletes_empty_unnamed_cluster(people_ctx):
     """Mirrors list_persons's Phase B cleanup: an unnamed cluster whose faces
     are all definitively inactive gets deleted, not just excluded."""
@@ -769,6 +780,18 @@ def test_person_photos_hydrates_legacy_member_rows_once_then_reads_only_the_memb
     assert reads == []                                                  # no face reads the second time
 
 
+def test_person_photos_ignores_deleted_source_photos(monkeypatch):
+    persons, faces, members = _members_ctx(monkeypatch)
+    _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='p1', confidence=0.9, sourceDeleted=True)
+    members.upsert_entity({'PartitionKey': 'p1', 'RowKey': 'f1', 'userId': 'u'})
+
+    status, body = _call_photos('limit=10')
+
+    assert status == 200
+    assert body['filenames'] == [] and body['total'] == 0
+    assert members.rows[('p1', 'f1')]['sourceDeleted'] == '1'
+
+
 def test_person_photos_ignores_faces_that_moved_and_unknown_people(monkeypatch):
     persons, faces, members = _members_ctx(monkeypatch)
     _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='someone-else', confidence=0.9)
@@ -777,6 +800,35 @@ def test_person_photos_ignores_faces_that_moved_and_unknown_people(monkeypatch):
     from routes import people as people_routes
     with app.app.test_request_context('/api/persons/nope/photos'):
         assert people_routes.get_person_photos('nope')[1] == 404
+
+
+def test_soft_delete_marks_face_and_member_rows_hidden_then_restore_clears_them(monkeypatch):
+    import person_photos
+    persons, faces, members = FakeTable(), FakeTable(), FakeTable()
+    _seed_person(persons, 'u', 'p1', name='', faceIds=json.dumps(['f1']))
+    _seed_face(faces, 'u', 'f1', filename='a.jpg', personId='p1', confidence=0.9)
+    members.upsert_entity({'PartitionKey': 'p1', 'RowKey': 'f1', 'userId': 'u', 'filename': 'a.jpg'})
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(app, 'face_table_client', faces)
+    monkeypatch.setattr(app, 'person_members_table_client', members)
+    monkeypatch.setattr(app, 'get_face_ids_for_filename', lambda uid, name: ['f1'])
+    touched = []
+    monkeypatch.setattr(app, 'touch_user_people_index_state', lambda uid: touched.append(uid) or 'v')
+
+    hidden = app._set_faces_source_deleted_for_filenames('u', ['a.jpg'], True)
+
+    assert hidden == {'facesUpdated': 1, 'membersUpdated': 1, 'personsTouched': 1}
+    assert faces.rows[('u', 'f1')]['sourceDeleted'] is True
+    assert members.rows[('p1', 'f1')]['sourceDeleted'] == '1'
+    assert persons.rows[('u', 'p1')]['sourceVisibilityUpdatedAt']
+    assert touched == ['u']
+
+    visible = app._set_faces_source_deleted_for_filenames('u', ['a.jpg'], False)
+
+    assert visible['facesUpdated'] == 1
+    assert faces.rows[('u', 'f1')]['sourceDeleted'] is False
+    assert members.rows[('p1', 'f1')]['sourceDeleted'] == ''
+    person_photos._CACHE.clear()
 
 
 def test_rebuilding_a_photos_faces_uses_the_filename_index_not_a_library_wide_face_scan(monkeypatch):

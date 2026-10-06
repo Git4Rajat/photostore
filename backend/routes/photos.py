@@ -1197,7 +1197,15 @@ def delete_multiple_photos():
     if deleted:
         app._invalidate_metadata_scan_cache(user_id)
         try:
+            app._set_faces_source_deleted_for_filenames(user_id, deleted, True)
+        except Exception:
+            app.app.logger.warning('Could not mark deleted-photo faces hidden for %s', user_id, exc_info=True)
+        try:
             app.touch_user_search_indexes_state(user_id, filenames=deleted)
+        except Exception:
+            pass
+        try:
+            app.touch_user_people_index_state(user_id)
         except Exception:
             pass
 
@@ -1282,7 +1290,15 @@ def restore_trashed_photos():
     if restored:
         app._invalidate_metadata_scan_cache(user_id)
         try:
+            app._set_faces_source_deleted_for_filenames(user_id, restored, False)
+        except Exception:
+            app.app.logger.warning('Could not mark restored-photo faces visible for %s', user_id, exc_info=True)
+        try:
             app.touch_user_search_indexes_state(user_id, filenames=restored)
+        except Exception:
+            pass
+        try:
+            app.touch_user_people_index_state(user_id)
         except Exception:
             pass
 
@@ -1315,7 +1331,15 @@ def restore_all_trashed_photos():
     if restored:
         app._invalidate_metadata_scan_cache(user_id)
         try:
+            app._set_faces_source_deleted_for_filenames(user_id, restored, False)
+        except Exception:
+            app.app.logger.warning('Could not mark restored-photo faces visible for %s', user_id, exc_info=True)
+        try:
             app.touch_user_search_indexes_state(user_id, filenames=restored)
+        except Exception:
+            pass
+        try:
+            app.touch_user_people_index_state(user_id)
         except Exception:
             pass
 
@@ -1513,7 +1537,7 @@ def get_photo_metadata(filename: str):
             'rating': metadata.get('rating', 0),
             'likes': metadata.get('likes', 0),
             'liked': user_id in liked_by,
-            'tags': app.json.loads(metadata.get('tags', '[]')),
+            'tags': app.visible_tags(metadata),
             'rotation': app._normalize_rotation(metadata.get('rotation', 0)),
             'objects': app.parse_json_list(metadata.get('objects', '[]')),
             'ocrText': metadata.get('ocrText', ''),

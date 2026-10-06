@@ -69,6 +69,7 @@ from search_utils import (
     parse_json_list,
     parse_tags,
     parse_search_query,
+    visible_tags,
 )
 from storage_utils import (
     configure_storage,
@@ -2383,7 +2384,7 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'rating': metadata.get('rating', 0),
         'likes': metadata.get('likes', 0),
         'liked': user_id in liked_by,
-        'tags': json.loads(metadata.get('tags', '[]') or '[]'),
+        'tags': visible_tags(metadata),
         'rotation': _normalize_rotation(metadata.get('rotation', 0)),
         'thumbnailRotation': thumbnail_rotation,
         'location': _location_from_metadata(metadata, exif_data),
@@ -9961,7 +9962,7 @@ def light_index_build_needed(user_id: str) -> bool:
     return bool(_load_sort_index_manifest(key).get('dirty')) or access_index_is_dirty(key)
 
 
-def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> str:
+def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, coalesce: bool = True) -> str:
     """Queue the library's index build on the always-awake `worker` role (library-
     ops queue). Returns 'queued', 'already_active' or 'unavailable'.
 
@@ -9992,7 +9993,7 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full') -> 
     # instead (the queued job row dedupes everything that arrives meanwhile).
     delay = 0
     previous = _get_job_row(key, job_id) if jobs_table_client is not None else None
-    if previous and str(previous.get('status') or '').lower() == 'done':
+    if coalesce and previous and str(previous.get('status') or '').lower() == 'done':
         updated = _parse_iso_date(str(previous.get('updatedAt') or ''))
         if updated is not None:
             elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
@@ -12010,6 +12011,100 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
     metadata_table_client.upsert_entity(entity)
     _trash_index_add(user_id, filename, now_iso)
     return entity
+
+
+def _set_faces_source_deleted_for_filenames(user_id: str, filenames, deleted: bool) -> Dict[str, int]:
+    """Hide/show a soft-deleted photo's faces from derived People views without
+    destroying the face/person assignment, so restore can make them visible
+    again. Bounded by the selected filenames via the face-by-filename index."""
+    if face_table_client is None:
+        return {'facesUpdated': 0, 'membersUpdated': 0, 'personsTouched': 0}
+    names = [str(name or '').strip() for name in filenames if str(name or '').strip()]
+    if not names:
+        return {'facesUpdated': 0, 'membersUpdated': 0, 'personsTouched': 0}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    touched_people = set()
+    faces_updated = 0
+    members_updated = 0
+
+    def _face_ids(filename: str) -> List[str]:
+        try:
+            ids = get_face_ids_for_filename(user_id, filename)
+        except Exception:
+            ids = None
+        if ids is not None:
+            return ids
+        try:
+            return [
+                str(row.get('RowKey') or '') for row in face_table_client.query_entities(
+                    f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'",
+                    select=['RowKey'],
+                ) if row.get('RowKey')
+            ]
+        except Exception:
+            return []
+
+    def _update_one(item) -> Tuple[int, int, str]:
+        filename, face_id = item
+        try:
+            face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except Exception:
+            return 0, 0, ''
+        if str(face.get('filename') or '') != filename:
+            return 0, 0, ''
+        if deleted:
+            face['sourceDeleted'] = True
+            face['sourceDeletedAt'] = now_iso
+        else:
+            face['sourceDeleted'] = False
+            face['sourceDeletedAt'] = ''
+        try:
+            face_table_client.upsert_entity(face, mode=UpdateMode.MERGE)
+        except Exception:
+            return 0, 0, ''
+        person_id = str(face.get('personId') or '')
+        member_updated = 0
+        if person_id and person_members_table_client is not None:
+            try:
+                person_members_table_client.upsert_entity({
+                    'PartitionKey': person_id,
+                    'RowKey': face_id,
+                    'filename': filename,
+                    'sourceDeleted': '1' if deleted else '',
+                }, mode=UpdateMode.MERGE)
+                member_updated = 1
+            except Exception:
+                member_updated = 0
+            try:
+                import person_photos
+                person_photos.invalidate(user_id, person_id)
+            except Exception:
+                pass
+        return 1, member_updated, person_id
+
+    work = [(name, fid) for name in names for fid in _face_ids(name)]
+    for face_delta, member_delta, person_id in _io_pool_map(_update_one, work, workers=12):
+        faces_updated += face_delta
+        members_updated += member_delta
+        if person_id:
+            touched_people.add(person_id)
+    if person_table_client is not None:
+        def _touch_person(person_id: str) -> bool:
+            try:
+                person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+                person['sourceVisibilityUpdatedAt'] = now_iso
+                person_table_client.upsert_entity(person, mode=UpdateMode.MERGE)
+                return True
+            except Exception:
+                return False
+
+        _io_pool_map(_touch_person, sorted(touched_people), workers=12)
+    if touched_people:
+        try:
+            touch_user_people_index_state(user_id)
+        except Exception:
+            pass
+    return {'facesUpdated': faces_updated, 'membersUpdated': members_updated, 'personsTouched': len(touched_people)}
 
 
 def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any]]:
@@ -14389,7 +14484,7 @@ def _trigger_tools_index_rebuild(user_id: str, reason: str = 'trigger', scope: s
             token = _issue_session_for(key)
             requests.post(
                 f"{tools_url.rstrip('/')}/api/tools/indexes/build",
-                json={},
+                json={'scope': scope, 'reason': reason},
                 headers={'Authorization': f'Bearer {token}'},
                 timeout=float(os.getenv('TOOLS_INDEX_REBUILD_TIMEOUT_SECONDS', '600')),
             )

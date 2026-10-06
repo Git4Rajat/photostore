@@ -43,6 +43,7 @@ def attributes_for_face(face: Dict) -> Dict[str, object]:
         'filename': str(face.get('filename') or ''),
         'confidence': _as_float(face.get('confidence')),
         'confirmed': '1' if confirmed else '',
+        'sourceDeleted': '1' if _truthy(face.get('sourceDeleted')) else '',
     }
 
 
@@ -81,7 +82,7 @@ def ranked_filenames(user_id: str, person_id: str, members_table, face_table, *,
                 if attrs:
                     row.update(attrs)
     ranked = sorted(
-        (r for r in rows if r.get('filename')),
+        (r for r in rows if r.get('filename') and not _truthy(r.get('sourceDeleted'))),
         key=lambda r: (0 if _truthy(r.get('confirmed')) else 1, -_as_float(r.get('confidence')), str(r['filename'])),
     )
     seen = set()

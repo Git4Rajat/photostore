@@ -321,6 +321,7 @@ def test_tools_build_does_not_prime_when_all_built_and_clean(monkeypatch, route_
     monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
         {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=False))
     monkeypatch.setattr(app, 'index_build_needed', lambda uid: False)
+    monkeypatch.setattr(app, 'light_index_build_needed', lambda uid: False)
     queued = []
     monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': queued.append(uid) or 'queued')
 
@@ -351,6 +352,31 @@ def test_tools_build_enqueues_when_any_index_missing(monkeypatch, route_ctx):
     assert payload['ok'] is True and payload['ready'] is False
     assert payload['building'] is True and payload['queued'] == 'queued'
     assert payload['indexes']['lexical'] is False
+
+
+def test_tools_build_enqueues_light_for_upload_dirty_indexes(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
+        {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=True))
+    monkeypatch.setattr(app, 'index_build_needed', lambda uid: False)
+    monkeypatch.setattr(app, 'light_index_build_needed', lambda uid: True)
+    queued = []
+
+    def enqueue(uid, reason='', scope='full', *, coalesce=True):
+        queued.append((uid, reason, scope, coalesce))
+        return 'queued'
+
+    monkeypatch.setattr(app, 'enqueue_index_build', enqueue)
+
+    with app.app.test_request_context('/api/tools/indexes/build', method='POST', json={
+        'scope': 'light',
+        'reason': 'upload-complete',
+        'force': True,
+    }):
+        payload = tools_build_indexes().get_json()
+
+    assert queued == [('owner', 'upload-complete', 'light', False)]
+    assert payload['scope'] == 'light'
+    assert payload['ready'] is True and payload['building'] is True and payload['queued'] == 'queued'
 
 
 def test_tools_build_enqueues_when_built_but_dirty_without_blocking_the_gate(monkeypatch, route_ctx):
@@ -663,6 +689,21 @@ def test_enqueue_delays_a_rebuild_that_follows_a_finished_one(monkeypatch):
     long_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
     monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': long_ago})
     assert app.enqueue_index_build('lib-1') == 'queued' and queue.delays[-1] is None  # immediate
+
+
+def test_enqueue_can_bypass_delay_for_explicit_upload_refresh(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    queue = _FakeQueue()
+    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
+    monkeypatch.setattr(app, 'jobs_table_client', object())
+    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
+    monkeypatch.setattr(app, 'INDEX_BUILD_MIN_INTERVAL_SECONDS', 120)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
+    finished = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': finished})
+
+    assert app.enqueue_index_build('lib-1', scope='light', coalesce=False) == 'queued'
+    assert queue.delays[-1] is None
 
 
 def test_dirty_after_uploads_alone_does_not_need_a_full_build(monkeypatch):

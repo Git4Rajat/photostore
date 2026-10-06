@@ -1643,6 +1643,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const notifyUploadComplete = useCallback(async () => {
         invalidatePhotoCache();
+        await postTools('/api/tools/indexes/build', {
+            scope: 'light',
+            reason: 'upload-complete',
+            force: true,
+            wait: true,
+            waitSeconds: 90,
+        }).catch(() => null);
         // Finalizing a photo with faces enqueues a clustering job server-side;
         // wake the job poller so the "Grouping people…" indicator can appear.
         requestJobPoll();

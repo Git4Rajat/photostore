@@ -3134,6 +3134,7 @@ def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True)
 # the cached result back is pure numpy, so backend can do that part fine.
 _TAG_EMBEDDING_INDEX_CACHE_LOCK = threading.RLock()
 _TAG_EMBEDDING_INDEX_CACHE: Dict[str, Dict[str, object]] = _BoundedCache(1)
+_TAG_EMBEDDING_INDEX_SCHEMA_VERSION = 'v2'  # v2: excludes reverse-geocoded/GPS pseudo-tags
 
 
 def _tag_embedding_index_container_name() -> str:
@@ -3193,6 +3194,7 @@ def touch_user_tag_embedding_index_state(user_id: str) -> str:
     manifest = {
         'userId': key,
         'sourceVersion': source_version,
+        'schemaVersion': _TAG_EMBEDDING_INDEX_SCHEMA_VERSION,
         'embeddingVersion': vision_utils.get_text_embedding_version(),
         'dirty': True,
         'updatedAt': source_version,
@@ -3275,8 +3277,7 @@ def _serialize_tag_embedding_index(snapshot: TagEmbeddingIndexSnapshot) -> bytes
 
 _TAG_META_COLUMNS = [
     'PartitionKey', 'RowKey', 'subjectTags', 'peopleNames', 'tags', 'objects', 'backgroundTags',
-    'processing_metadata', 'locationCity', 'locationRegion', 'locationCountry', 'address',
-    'latitude', 'longitude', 'exifData', 'faceCount', 'aiPersonLabel',
+    'processing_metadata', 'faceCount', 'aiPersonLabel',
 ]
 
 
@@ -3347,6 +3348,7 @@ def refresh_user_tag_embedding_index(user_id: str, *, source_version: Optional[s
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
+            'schemaVersion': _TAG_EMBEDDING_INDEX_SCHEMA_VERSION,
             'embeddingVersion': snapshot.embedding_version,
             'tagCount': len(snapshot.tags),
             'dirty': False,
@@ -3380,7 +3382,7 @@ def get_user_tag_embedding_index(user_id: str, *, allow_refresh: bool = True) ->
 
     manifest = _load_tag_embedding_index_manifest(key)
     manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
-    manifest_dirty = bool(manifest.get('dirty'))
+    manifest_dirty = bool(manifest.get('dirty')) or manifest.get('schemaVersion') != _TAG_EMBEDDING_INDEX_SCHEMA_VERSION
     current_embedding_version = vision_utils.get_text_embedding_version()
 
     with _TAG_EMBEDDING_INDEX_CACHE_LOCK:
@@ -6444,6 +6446,10 @@ def _people_index_face_is_rejected(face: Dict) -> bool:
     return _index_coerce_bool(face.get('rejected', False)) or str(face.get('reviewStatus') or '').lower() == 'rejected'
 
 
+def _people_index_face_source_deleted(face: Dict) -> bool:
+    return _index_coerce_bool(face.get('sourceDeleted', False))
+
+
 def _people_index_face_is_owned_by_person(face: Optional[Dict], person_id: str) -> bool:
     if not face or not person_id:
         return False
@@ -6560,6 +6566,7 @@ def _people_index_rows_from_scan(
         cover_bbox: Dict[str, object] = {}
         cover_score: Optional[Tuple[int, float, int]] = None
         indeterminate = False
+        source_deleted_seen = False
 
         if face_ids:
             # Known faces resolve from the bulk map with no pool at all; only the
@@ -6581,6 +6588,9 @@ def _people_index_rows_from_scan(
                     continue
                 if _people_index_face_is_rejected(face) or not _people_index_face_is_owned_by_person(face, person_id):
                     continue
+                if _people_index_face_source_deleted(face):
+                    source_deleted_seen = True
+                    continue
                 active_face_ids.append(face_id)
                 score = _people_index_face_preview_priority(face)
                 if cover_score is None or score > cover_score:
@@ -6595,6 +6605,8 @@ def _people_index_rows_from_scan(
         # Phase B cleanup exactly, just run for every person instead of only
         # the requested page slice.
         if not active_face_ids and not indeterminate and not is_named:
+            if source_deleted_seen:
+                continue
             try:
                 person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
             except Exception:
@@ -10159,5 +10171,3 @@ def reset_upload_tracking_and_reserve_blobs_batch(
             except Exception:
                 pass
     return anonymous_blob_names
-
-

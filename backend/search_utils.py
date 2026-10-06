@@ -4,8 +4,6 @@ import re
 import unicodedata
 from typing import Dict, List, Optional
 
-from exif_utils import parse_exif_data
-
 MAX_TAG_LENGTH = int(os.getenv('MAX_TAG_LENGTH', '48'))
 MAX_TAGS_STORED = int(os.getenv('MAX_TAGS_STORED', '40'))
 MAX_WEAK_TAGS_STORED = int(os.getenv('MAX_WEAK_TAGS_STORED', '40'))
@@ -458,28 +456,35 @@ def prediction_tags(metadata: Dict) -> List[str]:
 
 
 def location_tags(metadata: Dict) -> List[str]:
-    return normalize_tags([
+    # Location is factual metadata, not a visual/user tag. Keep the raw
+    # location fields searchable elsewhere, but do not let reverse-geocoded
+    # city/region/country/address values become chips, semantic tags, or tag
+    # embedding vocabulary.
+    return []
+
+
+def _location_metadata_tag_set(metadata: Dict) -> set:
+    return set(normalize_tags([
         str(metadata.get('locationCity', '')),
         str(metadata.get('locationRegion', '')),
         str(metadata.get('locationCountry', '')),
         str(metadata.get('address', '')),
-    ])
+    ])) | {'gps tagged', 'location metadata'}
 
 
 def gps_presence_tags(metadata: Dict) -> List[str]:
-    exif = parse_exif_data(metadata.get('exifData', '{}'))
-    gps_present = ('GPSInfo' in exif) or any(str(key).startswith('GPS.') for key in exif.keys())
-    has_readable_location = bool(
-        str(metadata.get('latitude', '')).strip() and str(metadata.get('longitude', '')).strip()
-    ) or bool(
-        str(metadata.get('locationCity', '')).strip() or
-        str(metadata.get('locationCountry', '')).strip() or
-        str(metadata.get('address', '')).strip()
-    )
-
-    if gps_present and not has_readable_location:
-        return ['gps tagged', 'location metadata']
     return []
+
+
+def strip_location_metadata_tags(tags: List[str], metadata: Dict) -> List[str]:
+    location_values = _location_metadata_tag_set(metadata)
+    if not location_values:
+        return normalize_tags(tags)
+    return [tag for tag in normalize_tags(tags) if tag not in location_values]
+
+
+def visible_tags(metadata: Dict) -> List[str]:
+    return strip_location_metadata_tags(parse_tags(metadata.get('tags', '[]')), metadata)
 
 
 def face_presence_tags(metadata: Dict) -> List[str]:
@@ -507,12 +512,12 @@ def face_presence_tags(metadata: Dict) -> List[str]:
 
 
 def effective_tags(metadata: Dict) -> List[str]:
-    subjects = parse_json_list(metadata.get('subjectTags', '[]'))
+    subjects = strip_location_metadata_tags(parse_json_list(metadata.get('subjectTags', '[]')), metadata)
     people = parse_json_list(metadata.get('peopleNames', '[]'))
-    stored = parse_tags(metadata.get('tags', '[]'))
-    objects = parse_json_list(metadata.get('objects', '[]'))
-    background = parse_json_list(metadata.get('backgroundTags', '[]'))
-    prediction = prediction_tags(metadata)
+    stored = visible_tags(metadata)
+    objects = strip_location_metadata_tags(parse_json_list(metadata.get('objects', '[]')), metadata)
+    background = strip_location_metadata_tags(parse_json_list(metadata.get('backgroundTags', '[]')), metadata)
+    prediction = strip_location_metadata_tags(prediction_tags(metadata), metadata)
     location = location_tags(metadata)
     face = face_presence_tags(metadata)
     gps = gps_presence_tags(metadata)
