@@ -612,6 +612,10 @@ class SearchDatabase:
             f'SELECT filename FROM {source}{where} ORDER BY {order} LIMIT ? OFFSET ?', [*args, int(limit), max(0, int(offset))])]
         return names, int(total)
 
+    def all_filenames(self) -> set:
+        """Every filename in the library database (used to reconcile against the metadata table)."""
+        return {r[0] for r in self._conn().execute('SELECT filename FROM rows')}
+
     def existing_filenames(self, filenames: Sequence[str]) -> set:
         """The subset of ``filenames`` that are in the library (one indexed SQL lookup per 500 names)."""
         names = list(dict.fromkeys(str(n) for n in filenames))

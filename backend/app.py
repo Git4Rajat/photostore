@@ -10057,7 +10057,13 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             if scope in ('light', 'people'):
                 # Incremental maintenance: cost follows what changed, not library size.
                 kinds = ('sort', 'access') if scope == 'light' else ('people', 'albums')
-                prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                bad = prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                if bad:
+                    raise RuntimeError(f'index build produced no {", ".join(bad)} index')
+                try:
+                    storage_utils_module.reconcile_search_db(user_id)
+                except Exception:
+                    worker_logger.warning('Library reconcile failed for %s', user_id, exc_info=True)
                 outcome = refresh_user_search_db_incremental(user_id)
                 perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, **{
                     k: v for k, v in outcome.items() if isinstance(v, (int, str))})

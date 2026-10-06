@@ -311,3 +311,15 @@ def test_a_timer_flushes_small_batches(world, monkeypatch):
     while _time.time() < deadline and not [r for r in dirty.rows if 'lexical' in r[0]]:
         _time.sleep(0.02)
     assert {r[1] for r in dirty.rows if 'lexical' in r[0]} == {'t1.jpg'}
+
+
+def test_reconcile_publishes_photos_whose_dirty_marks_were_lost(world):
+    svc, meta, dirty = world
+    meta.upsert_entity(_row('lost.jpg', ['fox']))                             # no dirty mark ever written
+    meta.upsert_entity({**_row('gone.jpg', ['fox']), 'processing_state': 'deleted'})
+    assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'noop'
+
+    assert storage_utils.reconcile_search_db('lib', force=True) == {'status': 'ok', 'missing': 1}
+    assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'delta'
+    assert _names(search_db.open_database('lib'), 'fox') == ['lost.jpg']
+    assert storage_utils.reconcile_search_db('lib')['status'] == 'skipped'    # rate limited
