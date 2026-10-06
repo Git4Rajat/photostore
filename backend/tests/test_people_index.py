@@ -704,3 +704,21 @@ def test_rebuilding_a_photos_faces_uses_the_filename_index_not_a_library_wide_fa
     result = app._rebuild_metadata_faces_for_filename('u', 'a.jpg', searchable_person_index={'p1': 'Ann'})
     assert result['changed'] and result['peopleIdsAfter'] == ['p1']
     assert updates and updates[0][0] == 'a.jpg' and json.loads(updates[0][1]['peopleIds']) == ['p1']
+
+
+def test_people_page_for_a_library_with_no_people_is_empty_not_preparing_forever(monkeypatch):
+    from routes import people as people_routes
+    persons = FakeTable()
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(app, 'get_user_people_index', lambda uid, **kw: None)
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, reason='', scope='full': triggered.append((reason, scope)))
+    with app.app.test_request_context('/api/persons/page?offset=0&limit=120'):
+        body = people_routes.people_page().get_json()
+    assert body['available'] is True and body['rows'] == [] and body['total'] == 0 and not triggered
+    _seed_person(persons, 'u', 'p1', name='', faceIds='[]')            # people exist but no index yet
+    with app.app.test_request_context('/api/persons/page?offset=0&limit=120'):
+        body = people_routes.people_page().get_json()
+    assert body['available'] is False and triggered == [('people-index-missing', 'people')]

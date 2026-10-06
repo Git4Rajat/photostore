@@ -4060,9 +4060,9 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
             upserts, deletes = [], []
             for name in chunk:
                 row = rows.get(name)
-                complete = row is not None and str(row.get('processing_complete')).strip().lower() in ('true', '1')
+                # Unprocessed photos are listed too (see library_build): only deleted/missing rows are dropped.
                 gone = row is None or str(row.get('processing_state') or '').strip().lower() == 'deleted'
-                record = search_db.row_record(row) if (complete and not gone) else None
+                record = search_db.row_record(row) if not gone else None
                 if record is not None:
                     upserts.append(record)
                 else:

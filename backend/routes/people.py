@@ -108,6 +108,21 @@ def people_page():
     except Exception:
         data = None
     if data is None:
+        # No people index yet. A library with no people at all (new, or nothing processed yet) has
+        # nothing to build: answer "empty" instead of "still preparing" forever. If people exist, ask
+        # the worker for the missing index.
+        try:
+            first = next(iter(app.person_table_client.query_entities(
+                f"PartitionKey eq '{app._escape_odata(user_id)}'", select=['RowKey'])), None)
+        except Exception:
+            first = 'unknown'
+        if first is None:
+            return app.jsonify({'available': True, 'rows': [], 'total': 0, 'offset': 0, 'hasMore': False,
+                                'namedCount': 0, 'unnamedCount': 0, 'libraryTotal': 0})
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='people-index-missing', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not request a people index build for %s', user_id, exc_info=True)
         return app.jsonify({'available': False})
     rows = data.get('rows') or []
     named = sum(1 for r in rows if r.get('isNamed'))
