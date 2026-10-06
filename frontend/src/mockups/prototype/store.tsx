@@ -1285,8 +1285,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, [toast]);
 
     // Primary path: one server page of clusters (named first), cut from the cached people index, then
-    // more as the user scrolls -- the browser never downloads every cluster. Falls back to the legacy
-    // single request only while the server's people index is still building.
+    // more as the user scrolls -- the browser never downloads every cluster. If the index is not
+    // available yet, show the preparing state and retry this paged route instead of falling back to
+    // the legacy full-list endpoint.
     const fetchPeople = useCallback(async () => {
         setPeopleLoading(true);
         try {

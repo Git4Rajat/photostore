@@ -3,9 +3,23 @@
 // unchanged.
 import { getExtras as get, postExtras as post } from './apiClient';
 
-type PersonListResponse = {
-    persons?: unknown[];
+type PeoplePageRow = {
+    personId?: string;
+    name?: string;
+    isNamed?: boolean;
+    faceCount?: number;
+    coverFaceId?: string;
+    coverFilename?: string;
+};
+
+type PeoplePageResponse = {
+    available?: boolean;
+    rows?: PeoplePageRow[];
     total?: number;
+    hasMore?: boolean;
+    namedCount?: number;
+    unnamedCount?: number;
+    libraryTotal?: number;
 };
 
 type MergeListResponse = {
@@ -73,12 +87,32 @@ const assignUnclusteredFaces = async () => {
     return await post('/api/people/assign-unclustered', {});
 };
 
+const mapPeoplePageRow = (row: PeoplePageRow) => ({
+    personId: String(row.personId || ''),
+    name: typeof row.name === 'string' ? row.name : '',
+    isNamed: Boolean(row.isNamed),
+    faceCount: Number(row.faceCount) || 0,
+    representativeFace: row.coverFaceId
+        ? {
+            faceId: String(row.coverFaceId),
+            filename: typeof row.coverFilename === 'string' ? row.coverFilename : '',
+        }
+        : undefined,
+});
+
 const listPersons = async (q?: string, offset = 0, limit = 15) => {
     const params = new URLSearchParams();
     if (q) params.set('q', q);
     params.set('offset', String(offset));
     params.set('limit', String(limit));
-    return await get<PersonListResponse>(`/api/persons?${params.toString()}`);
+    const res = await get<PeoplePageResponse>(`/api/persons/page?${params.toString()}`);
+    if (!res?.available || !Array.isArray(res.rows)) {
+        return { persons: [], total: 0 };
+    }
+    return {
+        persons: res.rows.map(mapPeoplePageRow).filter((person) => person.personId),
+        total: res.total ?? res.rows.length,
+    };
 };
 
 // Cheap id+name listing (no thumbnails, no pagination) covering every person in
@@ -86,9 +120,23 @@ const listPersons = async (q?: string, offset = 0, limit = 15) => {
 // screen, e.g. a merge-target picker, as opposed to listPersons' paginated,
 // thumbnail-bearing page data.
 const listPersonNames = async (q?: string) => {
-    const params = new URLSearchParams({ namesOnly: '1' });
-    if (q) params.set('q', q);
-    return await get<PersonListResponse>(`/api/persons?${params.toString()}`);
+    const persons: ReturnType<typeof mapPeoplePageRow>[] = [];
+    let offset = 0;
+    const limit = 500;
+    for (;;) {
+        const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+        if (q) params.set('q', q);
+        const res = await get<PeoplePageResponse>(`/api/persons/page?${params.toString()}`);
+        if (!res?.available || !Array.isArray(res.rows) || res.rows.length === 0) {
+            break;
+        }
+        persons.push(...res.rows.map(mapPeoplePageRow).filter((person) => person.personId));
+        offset += res.rows.length;
+        if (!res.hasMore || res.rows.length < limit) {
+            break;
+        }
+    }
+    return { persons, total: persons.length };
 };
 
 export interface PersonRosterEntry {
@@ -105,8 +153,27 @@ export interface PersonRosterEntry {
 // id from the in-memory face map, with no per-person lookups or thumbnail
 // signing (that per-page work is what listPersons does, and why it pages).
 const listAllPersons = async (): Promise<PersonRosterEntry[]> => {
-    const res = await get<{ persons?: PersonRosterEntry[] }>('/api/persons?namesOnly=1&covers=1');
-    return Array.isArray(res?.persons) ? res.persons : [];
+    const out: PersonRosterEntry[] = [];
+    let offset = 0;
+    const limit = 500;
+    for (;;) {
+        const res = await get<PeoplePageResponse>(`/api/persons/page?offset=${offset}&limit=${limit}`);
+        if (!res?.available || !Array.isArray(res.rows) || res.rows.length === 0) {
+            break;
+        }
+        out.push(...res.rows.map((row) => ({
+            personId: String(row.personId || ''),
+            name: typeof row.name === 'string' ? row.name : '',
+            isNamed: Boolean(row.isNamed),
+            faceCount: Number(row.faceCount) || 0,
+            coverFaceId: row.coverFaceId || null,
+        })).filter((person) => person.personId));
+        offset += res.rows.length;
+        if (!res.hasMore || res.rows.length < limit) {
+            break;
+        }
+    }
+    return out;
 };
 
 const getPerson = async (personId: string) => {

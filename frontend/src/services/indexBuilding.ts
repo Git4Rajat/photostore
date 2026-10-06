@@ -4,10 +4,11 @@ import { get } from './apiClient';
 /**
  * "Your library is being prepared" signal shared by every page that has to wait for the server's
  * indexes (gallery, search, people, albums, explore). Any page that sees the server say "still
- * building" calls ``reportIndexBuilding(source, true)``; one banner shows while any source is set, and a
- * single poller watches /api/photos/index-status until the build is finished, then clears the
- * poll-driven sources and tells listeners (pages refetch). The bar is deliberately a lump sum: no
- * percentages, just "working on it".
+ * building" calls ``reportIndexBuilding(source, true)``; one banner shows while any source is set.
+ * A single poller watches /api/photos/index-status for the index-status-backed sources, then clears
+ * those sources and tells listeners (pages refetch). People is retried by its own paged route, so it
+ * contributes to the banner but is not cleared by the shared poller. The bar is deliberately a lump
+ * sum: no percentages, just "working on it".
  */
 type Listener = () => void;
 

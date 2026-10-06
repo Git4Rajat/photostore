@@ -7,10 +7,10 @@ import { getActiveLibraryFromToken } from './passwordAuthClient';
  * get_user_people_index in storage_utils.py): a whole-library
  * {personId, name, isNamed, faceCount, coverFaceId, coverFilename,
  * coverBbox, updatedAt} projection downloaded once per session, used to
- * render the People grid without routes/people.py:list_persons's hardcoded
- * single page (the live frontend calls listPersons(undefined, 0, 200) --
- * anyone with 201+ clusters silently never sees the rest). Mirrors
- * localAlbumsIndex.ts's shape exactly.
+ * render the People grid without routes/people.py:list_persons's table scan.
+ * The live frontend now uses /api/persons/page, which reads this same server
+ * index a page at a time; this browser-side loader is kept for views that want
+ * a local full-list copy. Mirrors localAlbumsIndex.ts's shape exactly.
  *
  * Uses getExtras, not the default get -- /api/persons/index (like the rest
  * of routes/people.py) is only registered on the 'extras' role, a separate
