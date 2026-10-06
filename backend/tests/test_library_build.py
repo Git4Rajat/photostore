@@ -70,10 +70,10 @@ def test_first_build_makes_all_three_indexes_from_one_scan(world):
     assert len(table.calls) - scans_before == 1                                              # ONE pass for everything
 
     manifest = _manifest(svc)
-    assert 'building' not in manifest and manifest['baseSeq'] == 5 and manifest['rowCount'] == 95
+    assert 'building' not in manifest and manifest['baseSeq'] == 5 and manifest['rowCount'] == 96
     db = search_db.open_database('lib')
     assert len(_names(db, 'dog')) == 47 and len(_names(db, 'cat')) == 48
-    assert db.row_count() == 95                                                              # trashed + still-processing excluded
+    assert db.row_count() == 96                                                              # trashed + still-processing excluded
 
     sort_rows = _blob_rows(svc, storage_utils._sort_index_json_blob_name('lib'))
     access_rows = _blob_rows(svc, storage_utils._access_index_json_blob_name('lib'))
@@ -110,7 +110,7 @@ def test_a_restart_resumes_from_the_cursor_and_ends_identical(world, monkeypatch
     result = library_build.bootstrap_library_build('lib')
     assert result['status'] == 'built'
     assert "RowKey gt 'IMG_0039.jpg'" in table.calls[scans]                                   # did not rescan what was done
-    assert search_db.open_database('lib').row_count() == 95
+    assert search_db.open_database('lib').row_count() == 96
     assert len(_blob_rows(svc, storage_utils._sort_index_json_blob_name('lib'))) == 96
     assert len(_blob_rows(svc, storage_utils._access_index_json_blob_name('lib'))) == 97
 
@@ -154,7 +154,7 @@ def test_summaries_come_from_the_finished_database(world, monkeypatch):
     got = []
     monkeypatch.setattr(library_build, 'FINALIZE_HOOK', lambda uid, db: got.append(db.row_count()))
     library_build.bootstrap_library_build('lib')
-    assert got == [95]
+    assert got == [96]
 
 
 def test_a_library_past_the_client_limit_skips_the_sort_index_entirely(world, monkeypatch):

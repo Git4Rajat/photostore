@@ -202,10 +202,11 @@ def bootstrap_library_build(
                 sort_row = su._sort_index_row(dict(row))
                 if sort_row is not None:
                     sort_rows.append(sort_row)
-                if _is_true(row.get('processing_complete')):
-                    record = search_db.row_record(row)
-                    if record is not None:
-                        upserts.append(record)
+                # Every non-deleted photo is listed, processed or not: the gallery/Workbench/album covers
+                # read this database, and a just-uploaded photo must show up before its OCR/face steps finish.
+                record = search_db.row_record(row)
+                if record is not None:
+                    upserts.append(record)
             if scanned >= CHUNK_ROWS and not _flush():
                 return {'status': 'conflict', 'rows': total_rows}
         if not _flush():

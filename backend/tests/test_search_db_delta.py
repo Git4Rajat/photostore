@@ -277,3 +277,12 @@ def test_compaction_does_not_clobber_a_manifest_from_another_lineage(world, monk
     monkeypatch.setattr(search_db, '_upload_database_file', upload_then_rebuild_lands)
     assert search_db.compact_database('lib') is None
     assert json.loads(svc.store[key])['lineage'] == 'rebuilt'
+
+
+def test_a_photo_still_being_processed_is_listed_right_away(world):
+    svc, meta, dirty = world
+    _change(meta, {**_row('new.jpg', []), 'processing_complete': False, 'thumbnail_status': 'done'})   # just uploaded
+    assert storage_utils.refresh_user_search_db_incremental('lib')['upserts'] == 1
+    db = search_db.open_database('lib')
+    names, total = db.list_page(sort='capture', offset=0, limit=10)
+    assert 'new.jpg' in names and total == 4                    # visible to the gallery/Workbench/covers before OCR/faces finish
