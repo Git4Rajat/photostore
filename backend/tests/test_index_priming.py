@@ -752,3 +752,16 @@ def test_each_scope_has_its_own_job_row_and_message(monkeypatch):
         assert app.enqueue_index_build('lib-1', reason='r', scope=scope) == 'queued'
     assert [(m['scope'], m['jobId']) for m in q.sent] == [
         ('light', 'index-build-lib-1-light'), ('people', 'index-build-lib-1-people'), ('full', 'index-build-lib-1')]
+
+
+@pytest.mark.parametrize('scope', ['people', 'full'])
+def test_failed_people_publication_fails_job_instead_of_ready(monkeypatch, scope):
+    import library_build
+
+    _, statuses = _job_env(monkeypatch)
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda *a, **kw: ['people'])
+    monkeypatch.setattr(library_build, 'bootstrap_needed', lambda uid: False)
+    with pytest.raises(RuntimeError, match='people'):
+        app._run_index_build_job('lib-publish-failure', 'index-build-lib-publish-failure', scope)
+    assert statuses[-1] == 'failed'
+    assert 'done' not in statuses

@@ -10096,8 +10096,10 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     built = library_build.bootstrap_library_build(user_id, on_progress=_bootstrap_progress)
                     if built.get('status') == 'conflict':
                         raise RuntimeError('library build lost a race with another writer; retrying')
-                prime_all_user_indexes_sequentially(
+                bad = prime_all_user_indexes_sequentially(
                     user_id, on_progress=callback, wait=True, kinds=('sort', 'access', 'albums', 'people'))
+                if bad:
+                    raise RuntimeError(f'index build produced no {", ".join(bad)} index')
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')

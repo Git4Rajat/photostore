@@ -237,6 +237,95 @@ def test_get_user_people_index_returns_none_without_refresh_when_never_built(peo
     assert storage_utils.get_user_people_index('lib-never-built', allow_refresh=False) is None
 
 
+@pytest.mark.parametrize('decoded_by_sdk', [False, True])
+def test_people_page_reads_published_index_from_a_cold_process(people_ctx, monkeypatch, decoded_by_sdk):
+    from routes.people import people_page
+
+    persons, _, blobs = people_ctx
+    user = 'lib-cold-reader'
+    _seed_person(persons, user, 'p1', name='Alice')
+    storage_utils.refresh_user_people_index(user, source_version='v1')
+    data_key = f'lexical-index/{storage_utils._people_index_json_blob_name(user)}'
+    if decoded_by_sdk:
+        # Azure Blob download_blob defaults to decompress=True for gzip
+        # Content-Encoding; share write-through can instead return raw gzip.
+        blobs.blobs[data_key] = gzip.decompress(blobs.blobs[data_key])
+    storage_utils.invalidate_user_people_index_cache(user)
+    monkeypatch.setattr(app, '_require_user_id', lambda: (user, None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(storage_utils, '_rebuild_people_index_in_background', lambda *a: None)
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *a, **kw: None)
+    with app.app.test_request_context('/api/persons/page'):
+        payload = people_page().get_json()
+    assert payload['available'] is True
+    assert payload['rows'][0]['personId'] == 'p1'
+
+
+@pytest.mark.parametrize('failed_kind', ['data', 'manifest'])
+def test_people_publication_failure_propagates_without_blessing_cache(people_ctx, monkeypatch, failed_kind):
+    persons, _, blobs = people_ctx
+    user = 'lib-failed-publish'
+    _seed_person(persons, user, 'p1', name='Alice')
+    storage_utils.invalidate_user_people_index_cache(user)
+    storage_utils._INDEX_MANIFEST_DIRTY_FLAGS[(user, 'people')] = True
+    failing_name = (storage_utils._people_index_json_blob_name(user) if failed_kind == 'data'
+                    else storage_utils._people_index_manifest_blob_name(user))
+    original = blobs.get_blob_client
+
+    def client(container, blob):
+        result = original(container, blob)
+        if blob == failing_name:
+            def fail(*args, **kwargs):
+                raise RuntimeError('upload unavailable')
+            result.upload_blob = fail
+        return result
+
+    monkeypatch.setattr(blobs, 'get_blob_client', client)
+    with pytest.raises(RuntimeError, match='upload unavailable'):
+        storage_utils.refresh_user_people_index(user, source_version='v1')
+    assert user not in storage_utils._PEOPLE_INDEX_CACHE
+    if failed_kind == 'data':
+        assert f'lexical-index/{storage_utils._people_index_manifest_blob_name(user)}' not in blobs.blobs
+        assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS[(user, 'people')] is True
+    else:
+        # A failed manifest publication must permit subsequent dirty touches.
+        assert (user, 'people') not in storage_utils._INDEX_MANIFEST_DIRTY_FLAGS
+
+
+def test_failed_people_prime_does_not_emit_ready_from_an_old_manifest(people_ctx, monkeypatch):
+    monkeypatch.setattr(storage_utils, 'get_user_index_readiness', lambda uid: {'people': True})
+    monkeypatch.setattr(storage_utils, 'refresh_user_people_index', lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('upload unavailable')))
+    completed = []
+    monkeypatch.setattr(storage_utils, '_mark_index_rebuild_completed', lambda *a: completed.append(a))
+    progress = []
+    failed = storage_utils.prime_all_user_indexes_sequentially(
+        'lib-failed-prime', wait=True, kinds=['people'],
+        on_progress=lambda readiness, building: progress.append((readiness, building)),
+    )
+    assert failed == ['people']
+    assert progress[-1] == ({'people': False}, False)
+    assert completed == []
+
+
+def test_people_publish_requires_durable_storage(people_ctx, monkeypatch):
+    persons, _, _ = people_ctx
+    _seed_person(persons, 'lib-no-publish-client', 'p1', name='Alice')
+    monkeypatch.setattr(storage_utils, '_get_blob_client', lambda *a: None)
+    with pytest.raises(RuntimeError, match='blob storage is unavailable'):
+        storage_utils.refresh_user_people_index('lib-no-publish-client', source_version='v1')
+    assert 'lib-no-publish-client' not in storage_utils._PEOPLE_INDEX_CACHE
+
+
+@pytest.mark.parametrize('payload', [b'not JSON', b'\x1f\x8bcorrupted', b'{"rows":["bad row"]}'])
+def test_people_blob_decode_failure_is_logged(people_ctx, caplog, payload):
+    _, _, blobs = people_ctx
+    user = 'lib-corrupt-people'
+    blobs.blobs[f'lexical-index/{storage_utils._people_index_json_blob_name(user)}'] = payload
+    assert storage_utils._load_people_index_blob(user) is None
+    assert 'People index data decode failed' in caplog.text
+
+
 def test_get_user_people_index_builds_on_first_call_with_allow_refresh(people_ctx):
     person_table, face_table, _ = people_ctx
     _seed_person(person_table, 'lib-C', 'p1', name='Alice')

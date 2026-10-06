@@ -6386,12 +6386,17 @@ def _load_people_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
     try:
         payload = blob_client.download_blob().readall()
     except Exception:
+        _LOGGER.warning('People index data download failed user=%s', user_id, exc_info=True)
         return None
     try:
-        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        # Azure SDK decompresses Content-Encoding:gzip by default. Shared
+        # write-through files contain the original gzip bytes instead. Both
+        # representations are valid; never decompress already-decoded JSON.
+        raw = gzip.decompress(payload) if payload.startswith(b'\x1f\x8b') else payload
+        parsed = json.loads(raw.decode('utf-8'))
         rows = parsed.get('rows')
-        if not isinstance(rows, list):
-            return None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('People index rows must be a list of objects')
         return LexicalIndexSnapshot(
             user_id=str(user_id),
             source_version=str(parsed.get('sourceVersion') or ''),
@@ -6400,6 +6405,7 @@ def _load_people_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
             rows=rows,
         )
     except Exception:
+        _LOGGER.warning('People index data decode failed user=%s', user_id, exc_info=True)
         return None
 
 
@@ -6737,17 +6743,18 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     if snapshot is None:
         return None
     container_name = _lexical_index_container_name()
-    if container_name:
-        blob_client = _get_blob_client(container_name, _people_index_json_blob_name(key))
-        if blob_client is not None:
-            try:
-                blob_client.upload_blob(
-                    _serialize_people_index(snapshot),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
-                )
-            except Exception:
-                _LOGGER.exception('Failed to upload people index data blob for user %s', key)
+    blob_client = _get_blob_client(container_name, _people_index_json_blob_name(key))
+    manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))
+    if blob_client is None or manifest_client is None:
+        raise RuntimeError('People index blob storage is unavailable')
+    try:
+        # Publish data before advertising readiness. Failures must reach the
+        # queue worker; a process-local cache cannot make other roles ready.
+        blob_client.upload_blob(
+            _serialize_people_index(snapshot),
+            overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+        )
         _clear_manifest_dirty_flag(key, 'people')
         manifest = {
             'userId': key,
@@ -6759,16 +6766,14 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
             'fullBuiltAt': full_built_at,
             'builtThrough': _odata_utc(started - timedelta(seconds=_PEOPLE_INCREMENTAL_SKEW_SECONDS)),
         }
-        manifest_client = _get_blob_client(container_name, _people_index_manifest_blob_name(key))
-        if manifest_client is not None:
-            try:
-                manifest_client.upload_blob(
-                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json'),
-                )
-            except Exception:
-                _LOGGER.exception('Failed to upload people index manifest blob for user %s', key)
+        manifest_client.upload_blob(
+            json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+            overwrite=True,
+            content_settings=BlobContentSettings(content_type='application/json'),
+        )
+    except Exception:
+        _LOGGER.exception('Failed to publish people index for user %s', key)
+        raise
     with _PEOPLE_INDEX_CACHE_LOCK:
         _PEOPLE_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
@@ -6961,7 +6966,11 @@ def prime_all_user_indexes_sequentially(
         if on_progress is None:
             return
         try:
-            on_progress(get_user_index_readiness(key), building)
+            readiness = get_user_index_readiness(key)
+            # Old manifests may still exist after a failed refresh. They must
+            # not turn this failed build's final progress into a ready event.
+            readiness.update({kind: False for kind in failed})
+            on_progress(readiness, building)
         except Exception:
             _LOGGER.exception('Index prime progress callback failed user=%s', key)
 
@@ -6995,7 +7004,8 @@ def prime_all_user_indexes_sequentially(
                     if result is None and kind in ('albums', 'people'):
                         failed.append(kind)
                         _LOGGER.error('Index priming produced no %s index user=%s', kind, key)
-                    _mark_index_rebuild_completed(key, kind)
+                    else:
+                        _mark_index_rebuild_completed(key, kind)
                 except Exception:
                     failed.append(kind)
                     _LOGGER.exception('Sequential index priming failed kind=%s user=%s', kind, key)
