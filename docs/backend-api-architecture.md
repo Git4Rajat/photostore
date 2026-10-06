@@ -607,3 +607,9 @@ The library database used to contain only photos whose seven processing steps ha
 ### 15.16 The browser refreshes when the server finishes
 
 The browser reads the sort and albums indexes once per session and re-reads them only after an upload completes (which is before the server has processed the photos). Server-side processing and the index builds that follow finish later, and nothing told the browser. `AppServicesProvider` now notices finished server work (any newly finished job except previews/failures, and the end of ipworker processing, with one follow-up 45 s later for the index build that follows it) and calls the registered data-refresh handlers after a 3 s debounce. `DataRefreshBridge` (in `PrototypeApp`) registers one that drops the cached sort and albums indexes and reloads photos, albums, people and Explore.
+
+### 15.17 Dirty marks reach the table on their own
+
+A photo is added to the library database only if the worker finds it in the dirty-marks table (`photosearchdirty`). Marks are buffered in memory by whichever process changed the photo (upload, ipworker, backend) and used to be written only when 100 filenames piled up, or when a reader in the SAME process asked. The worker that builds the indexes is a different process, so a library that adds fewer than 100 photos at a time (a new library, a phone upload) never published a mark: the worker saw nothing dirty, and the Workbench, album covers and search stayed empty. Marks are now flushed 3 s after the first one (`DIRTY_FLUSH_DELAY_SECONDS`, 0 disables), after every ipworker message, and before a worker/ipworker process exits.
+
+Photos whose marks were lost before this fix are not in the database. Re-queueing their processing (the admin backfill endpoints in `routes/admin.py`, or a Workbench re-run once they are listed) marks them again.

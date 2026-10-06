@@ -286,3 +286,28 @@ def test_a_photo_still_being_processed_is_listed_right_away(world):
     db = search_db.open_database('lib')
     names, total = db.list_page(sort='capture', offset=0, limit=10)
     assert 'new.jpg' in names and total == 4                    # visible to the gallery/Workbench/covers before OCR/faces finish
+
+
+def test_marks_reach_the_table_without_a_reader_in_the_same_process(world, monkeypatch):
+    """The process that marks a photo (upload, ipworker) is not the one that builds the index (worker): a
+    handful of marks must be written out on their own, not only once 100 pile up or a reader in the same
+    process asks."""
+    svc, meta, dirty = world
+    storage_utils._DIRTY_FILENAME_BUFFER.clear()
+    storage_utils.touch_user_search_indexes_state('lib', filenames=['n1.jpg', 'n2.jpg'])        # 2 << batch of 100
+    assert not [r for r in dirty.rows if r[0].endswith('lexical')]                              # still only in memory
+    storage_utils.flush_all_dirty_filename_buffers()
+    assert {r[1] for r in dirty.rows if 'lexical' in r[0]} == {'n1.jpg', 'n2.jpg'}
+
+
+def test_a_timer_flushes_small_batches(world, monkeypatch):
+    import time as _time
+    svc, meta, dirty = world
+    storage_utils._DIRTY_FILENAME_BUFFER.clear()
+    monkeypatch.setattr(storage_utils, 'DIRTY_FLUSH_DELAY_SECONDS', 0.05)
+    monkeypatch.setattr(storage_utils, '_DIRTY_FLUSH_TIMER', None)
+    storage_utils.touch_user_search_indexes_state('lib', filenames=['t1.jpg'])
+    deadline = _time.time() + 3
+    while _time.time() < deadline and not [r for r in dirty.rows if 'lexical' in r[0]]:
+        _time.sleep(0.02)
+    assert {r[1] for r in dirty.rows if 'lexical' in r[0]} == {'t1.jpg'}

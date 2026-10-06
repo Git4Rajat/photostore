@@ -110,6 +110,7 @@ from storage_utils import (
     invalidate_user_vector_index_cache,
     delete_user_vector_index_data,
     touch_user_search_indexes_state,
+    flush_all_dirty_filename_buffers,
     metadata_updates_affect_search_indexes,
     _photo_processing_complete,
     metadata_updates_affect_sort_index,
@@ -14164,8 +14165,11 @@ def _prewarm_ipwork_models() -> None:
 
 
 def _process_ipwork_message(message) -> str:
-    with perf_instrumentation.scope('ipwork.message', dequeue=getattr(message, 'dequeue_count', None)):
-        return _process_ipwork_message_impl(message)
+    try:
+        with perf_instrumentation.scope('ipwork.message', dequeue=getattr(message, 'dequeue_count', None)):
+            return _process_ipwork_message_impl(message)
+    finally:
+        flush_all_dirty_filename_buffers()      # the worker that builds the indexes is another process: publish the marks now
 
 
 def _process_ipwork_message_impl(message) -> str:
@@ -14796,6 +14800,7 @@ def run_ipworker() -> None:
         # silently represented as successful/complete latency observations.
         close_wave_if_drained()
         throughput.log(len(in_flight), force=True, oldest_task_seconds=oldest_task_seconds())
+    flush_all_dirty_filename_buffers()      # marks buffered in this process must reach the table before it exits
     if grace_exhausted:
         os._exit(exit_code)
 
