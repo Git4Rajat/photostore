@@ -4177,6 +4177,38 @@ def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
 _DIRTY_FILENAME_BATCH_SIZE = 100
 _DIRTY_FILENAME_BUFFER: Dict[Tuple[str, str], Set[str]] = {}
 _DIRTY_FILENAME_BUFFER_LOCK = threading.Lock()
+# Marks are written by one process (upload, ipworker, backend) and consumed by ANOTHER (the worker that builds
+# the indexes), so they must reach the table on their own. Waiting for 100 filenames meant a library that adds
+# fewer than 100 photos at a time (a new library, a phone upload) never published a mark: the worker saw
+# nothing dirty and never put the photos in the library database. A short timer flushes whatever is buffered.
+DIRTY_FLUSH_DELAY_SECONDS = float(os.getenv('DIRTY_FLUSH_DELAY_SECONDS', '3'))
+_DIRTY_FLUSH_TIMER: Optional[threading.Timer] = None
+
+
+def flush_all_dirty_filename_buffers() -> None:
+    """Write every buffered dirty mark now (timer, and before a process exits)."""
+    global _DIRTY_FLUSH_TIMER
+    with _DIRTY_FILENAME_BUFFER_LOCK:
+        _DIRTY_FLUSH_TIMER = None
+        keys = list(_DIRTY_FILENAME_BUFFER.keys())
+    for flush_user_id, flush_kind in keys:
+        try:
+            _flush_dirty_filename_buffer(flush_user_id, flush_kind)
+        except Exception:
+            _LOGGER.warning('Dirty-mark flush failed for %s/%s', flush_user_id, flush_kind, exc_info=True)
+
+
+def _schedule_dirty_flush() -> None:
+    global _DIRTY_FLUSH_TIMER
+    if DIRTY_FLUSH_DELAY_SECONDS <= 0:
+        return
+    with _DIRTY_FILENAME_BUFFER_LOCK:
+        if _DIRTY_FLUSH_TIMER is not None:
+            return
+        timer = threading.Timer(DIRTY_FLUSH_DELAY_SECONDS, flush_all_dirty_filename_buffers)
+        timer.daemon = True
+        _DIRTY_FLUSH_TIMER = timer
+    timer.start()
 
 
 def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
@@ -4254,6 +4286,7 @@ def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> N
                     to_flush.append(key)
     for flush_user_id, flush_kind in to_flush:
         _flush_dirty_filename_buffer(flush_user_id, flush_kind)
+    _schedule_dirty_flush()
 
 
 def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional[Set[str]]:
