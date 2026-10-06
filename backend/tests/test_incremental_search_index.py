@@ -140,8 +140,8 @@ def test_reading_dirty_filenames_flushes_the_buffer(ctx):
 
     assert result == {'a.jpg', 'b.jpg'}
     assert dirty.rows == {
-        ('u1#lexical', 'a.jpg'): dirty.rows[('u1#lexical', 'a.jpg')],
-        ('u1#lexical', 'b.jpg'): dirty.rows[('u1#lexical', 'b.jpg')],
+        ('u1:lexical', 'a.jpg'): dirty.rows[('u1:lexical', 'a.jpg')],
+        ('u1:lexical', 'b.jpg'): dirty.rows[('u1:lexical', 'b.jpg')],
     }
     # Coalesced into one transaction covering both filenames, not one
     # upsert_entity call per filename.

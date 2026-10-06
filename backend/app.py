@@ -472,7 +472,7 @@ EMBEDDINGS_TABLE = os.getenv('EMBEDDINGS_TABLE', 'photoembeddings')
 # _extract_and_store_face_embedding.
 FACE_EMBEDDINGS_TABLE = os.getenv('FACE_EMBEDDINGS_TABLE', 'photofaceembeddings')
 # Dirty-set tracking for incremental search-index rebuilds: PartitionKey=
-# f"{user_id}#vector" or f"{user_id}#lexical", RowKey=filename. The vector and
+# f"{user_id}:vector" or f"{user_id}:lexical", RowKey=filename. The vector and
 # lexical indexes used to be rebuilt as an all-or-nothing full re-scan/re-embed
 # of the whole library on ANY single-photo edit (a rating change on 1 photo
 # re-embedded the other 35,999). Each edit now marks just its own filename

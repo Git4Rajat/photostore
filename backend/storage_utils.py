@@ -4215,7 +4215,9 @@ _SEARCH_INDEX_KINDS = ('lexical', 'sort', 'access')
 
 
 def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
-    return f'{user_id}#{index_kind}'
+    # '#' (like '/' and '?') is rejected by Azure Table Storage as a key character: every mark written
+    # under 'user#kind' failed with OutOfRangeInput, was swallowed, and no dirty set ever reached the worker.
+    return f'{user_id}:{index_kind}'
 
 
 # Azure Table Storage's own cap on operations per submit_transaction call --
@@ -4291,7 +4293,7 @@ def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
             # Best-effort, same as before batching -- these filenames' dirty
             # state is lost for this cycle; the next real change to any of
             # them re-marks it dirty (see _mark_search_index_dirty_filenames).
-            pass
+            _LOGGER.warning('Dirty-mark write failed partition=%s names=%d', partition_key, len(chunk), exc_info=True)
 
 
 def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> None:
