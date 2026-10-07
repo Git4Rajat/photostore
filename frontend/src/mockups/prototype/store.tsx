@@ -412,6 +412,7 @@ interface Store {
     mergePeopleBatch: (targetId: string, sourceIds: string[]) => void;
     deletePerson: (id: string) => void;
     deletePeopleBatch: (ids: string[]) => void;
+    applyExternalPeopleRemoval: (ids: string[]) => void;
 
     // members / sharing (server-backed shared libraries)
     reloadMembers: () => void;
@@ -1845,6 +1846,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             // Optimistically drop the source cluster; the target absorbs it.
             const removed = people.find((p) => p.id === sourceId) ?? extraPeople[sourceId];
             const movedPhotos = personPhotos[sourceId] ?? [];
+            deletedPeopleRef.current.add(sourceId);
             setPeople((prev) => prev.filter((p) => p.id !== sourceId));
             setExtraPeople((prev) => {
                 const next = { ...prev };
@@ -1873,11 +1875,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, [sourceId])
                 .then(() => {
-                    publishLibraryChange('people-merged', ['people'], { itemCount: 2 });
+                    publishLibraryChange('people-merged', ['people'], { itemCount: 2, entityIds: [sourceId] });
                     toast('People merged');
                     void fetchPeople();
                 })
                 .catch(() => {
+                    deletedPeopleRef.current.delete(sourceId);
                     if (removed) setPeople((prev) => [...prev, removed]);
                     invalidateLocalPeopleIndex();
                     toast('Couldn’t merge people', undefined, undefined, 'error');
@@ -1897,6 +1900,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const removedSet = new Set(ids);
             const removed = people.filter((p) => removedSet.has(p.id));
             const movedCount = removed.reduce((sum, p) => sum + (p.faceCount ?? 0), 0);
+            ids.forEach((id) => deletedPeopleRef.current.add(id));
             setPeople((prev) => prev.filter((p) => !removedSet.has(p.id)));
             setExtraPeople((prev) => {
                 const next = { ...prev };
@@ -1930,11 +1934,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, ids)
                 .then(() => {
-                    publishLibraryChange('people-merged', ['people'], { itemCount: ids.length + 1 });
+                    publishLibraryChange('people-merged', ['people'], { itemCount: ids.length + 1, entityIds: ids });
                     toast(`Merged ${ids.length + 1} people`);
                     void fetchPeople();
                 })
                 .catch(() => {
+                    ids.forEach((id) => deletedPeopleRef.current.delete(id));
                     if (removed.length) setPeople((prev) => [...prev, ...removed]);
                     invalidateLocalPeopleIndex();
                     toast('Couldn’t merge people', undefined, undefined, 'error');
@@ -1969,7 +1974,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         invalidateLocalPeopleIndex();
         void faceService.deletePersons([id])
             .then(() => {
-                publishLibraryChange('person-deleted', ['people'], { itemCount: 1 });
+                publishLibraryChange('person-deleted', ['people'], { itemCount: 1, entityIds: [id] });
                 toast('Person deleted');
             })
             .catch(() => {
@@ -2020,7 +2025,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         invalidateLocalPeopleIndex();
         void faceService.deletePersons(ids)
             .then(() => {
-                publishLibraryChange('people-deleted', ['people'], { itemCount: ids.length });
+                publishLibraryChange('people-deleted', ['people'], { itemCount: ids.length, entityIds: ids });
                 toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`);
             })
             .catch(() => {
@@ -2032,6 +2037,35 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 toast('Couldn’t delete people', undefined, undefined, 'error');
             });
     }, [people, extraPeople, toast]);
+
+    const applyExternalPeopleRemoval = useCallback((ids: string[]) => {
+        if (!ids.length) return;
+        const removed = new Set(ids);
+        ids.forEach((id) => deletedPeopleRef.current.add(id));
+        setPeople((prev) => prev.filter((person) => !removed.has(person.id)));
+        setExtraPeople((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const id of ids) {
+                if (id in next) {
+                    delete next[id];
+                    changed = true;
+                }
+            }
+            return changed ? next : prev;
+        });
+        setPersonPhotos((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const id of ids) {
+                if (id in next) {
+                    delete next[id];
+                    changed = true;
+                }
+            }
+            return changed ? next : prev;
+        });
+    }, []);
 
     const fetchMembers = useCallback(async () => {
         setMembersLoading(true);
@@ -2201,6 +2235,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             mergePeopleBatch,
             deletePerson,
             deletePeopleBatch,
+            applyExternalPeopleRemoval,
             reloadMembers,
             fetchMembers,
             invite,
@@ -2223,7 +2258,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
-            renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, reloadMembers, fetchMembers, invite, revokeInvite,
+            renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, applyExternalPeopleRemoval, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],
     );

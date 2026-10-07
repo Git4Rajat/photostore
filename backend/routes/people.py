@@ -951,6 +951,14 @@ def merge_persons(person_id: str):
     if core is None:
         return app.jsonify({'error': 'base person not found'}), 404
     merge_id = core['mergeId']
+    try:
+        app.touch_user_people_index_state(user_id)
+    except Exception:
+        app.app.logger.warning('Could not dirty People index after merge %s', merge_id, exc_info=True)
+    try:
+        app._trigger_tools_index_rebuild(user_id, reason='people-merge', scope='people')
+    except Exception:
+        app.app.logger.warning('Could not queue People index rebuild after merge %s', merge_id, exc_info=True)
 
     # If the merged-into person is named, reuse its strengthened rep to reclaim
     # matching faces still sitting in unnamed clusters. That scans the entire face
@@ -1041,6 +1049,16 @@ def merge_persons_batch():
                     auto_assigned_total += int(propagation.get('autoAssignedCount') or 0)
                 except Exception:
                     app.app.logger.exception('Identity propagation after batch merge failed for %s', target_id)
+
+    if any(result.get('success') for result in results):
+        try:
+            app.touch_user_people_index_state(user_id)
+        except Exception:
+            app.app.logger.warning('Could not dirty People index after batch merge', exc_info=True)
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='people-merge-batch', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not queue People index rebuild after batch merge', exc_info=True)
 
     return app.jsonify({
         'success': all(r.get('success') for r in results),

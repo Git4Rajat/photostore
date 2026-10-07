@@ -150,6 +150,7 @@
 .pt-filter-button.active,
 .pt-like-filter.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .pt-date-jump {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -163,13 +164,17 @@
   padding: 7px 10px;
 }
 .pt-date-jump input {
-  min-width: 0;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   border: 0;
   outline: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
+  opacity: 0;
+  cursor: pointer;
 }
+.pt-date-jump:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pt-date-jump input::-webkit-calendar-picker-indicator { position: absolute; inset: 0; width: 100%; height: 100%; cursor: pointer; }
 .pt-filter-menu > .pt-menu-panel {
   width: min(320px, calc(100vw - 24px));
   max-height: min(420px, calc(100dvh - 24px));

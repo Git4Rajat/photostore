@@ -23,6 +23,13 @@ type ZoomLevel = 'days' | 'months' | 'years';
 // Months too early, so the Gallery gets its own, much smaller floor.
 const GALLERY_TILE_MIN = 24;
 const clampGalleryTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(GALLERY_TILE_MIN, n));
+const formatDateJumpLabel = (value: string): string => {
+    if (!value) return 'Jump to date';
+    const [year, month, day] = value.split('-').map(Number);
+    if (!year || !month || !day) return 'Jump to date';
+    return new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+        .format(new Date(year, month - 1, day));
+};
 
 /** Gallery — the populated grid + drag-and-drop upload + the empty first-run state. */
 export const GalleryPage: React.FC = () => {
@@ -250,6 +257,7 @@ export const GalleryPage: React.FC = () => {
             </button>
             <label className="pt-date-jump">
                 <CalendarSearchIcon className="toolbar-icon" aria-hidden="true" />
+                <span>{formatDateJumpLabel(dateJump)}</span>
                 <input
                     type="date"
                     aria-label="Jump to date"

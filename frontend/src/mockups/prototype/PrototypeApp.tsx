@@ -326,7 +326,7 @@ const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
  *  builds, people grouping). Without this the indexes downloaded at session start stay as they were. */
 const DataRefreshBridge: React.FC = () => {
     const { registerDataRefreshHandler } = useAppServices();
-    const { reloadPhotos, reloadAlbums, reloadPeople, reloadExplore, reloadTrash, applyExternalPhotoDeleteCount } = useStore();
+    const { reloadPhotos, reloadAlbums, reloadPeople, reloadExplore, reloadTrash, applyExternalPhotoDeleteCount, applyExternalPeopleRemoval } = useStore();
     useEffect(() => registerDataRefreshHandler(() => {
         invalidateLocalSortIndex();
         invalidateLocalAlbumsIndex();
@@ -351,12 +351,15 @@ const DataRefreshBridge: React.FC = () => {
             reloadAlbums();
         }
         if (domains.has('people')) {
+            if (change.entityIds?.length && (change.operation === 'person-deleted' || change.operation === 'people-deleted' || change.operation === 'people-merged')) {
+                applyExternalPeopleRemoval(change.entityIds);
+            }
             invalidateLocalPeopleIndex();
             reloadPeople();
         }
         if (domains.has('explore')) reloadExplore();
         if (domains.has('trash')) void reloadTrash();
-    }), [reloadPhotos, reloadAlbums, reloadPeople, reloadExplore, reloadTrash, applyExternalPhotoDeleteCount]);
+    }), [reloadPhotos, reloadAlbums, reloadPeople, reloadExplore, reloadTrash, applyExternalPhotoDeleteCount, applyExternalPeopleRemoval]);
     return null;
 };
 

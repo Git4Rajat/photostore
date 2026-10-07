@@ -7,6 +7,7 @@ export type LibraryChange = {
     domains: LibraryChangeDomain[];
     itemCount?: number;
     jobId?: string;
+    entityIds?: string[];
 };
 
 const CHANNEL_NAME = 'photostore.library-changes.v1';
@@ -54,7 +55,7 @@ const install = (): void => {
 export const publishLibraryChange = (
     operation: string,
     domains: LibraryChangeDomain[],
-    options: { itemCount?: number; jobId?: string; notifyCurrentTab?: boolean } = {},
+    options: { itemCount?: number; jobId?: string; entityIds?: string[]; notifyCurrentTab?: boolean } = {},
 ): LibraryChange => {
     install();
     const change: LibraryChange = {
@@ -64,6 +65,7 @@ export const publishLibraryChange = (
         domains: Array.from(new Set(domains)),
         itemCount: options.itemCount,
         jobId: options.jobId,
+        entityIds: options.entityIds,
     };
     channel?.postMessage(change);
     try {
