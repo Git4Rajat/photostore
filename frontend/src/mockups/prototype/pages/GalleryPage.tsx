@@ -39,7 +39,6 @@ export const GalleryPage: React.FC = () => {
     const [level, setLevel] = useState<ZoomLevel>('days');
     const [focusYear, setFocusYear] = useState<string | null>(null);
     const [dateJump, setDateJump] = useState('');
-    const [filtersOpen, setFiltersOpen] = useState(false);
 
     const depth = useRef(0);
     const gridRef = useRef<HTMLDivElement>(null);
@@ -103,10 +102,6 @@ export const GalleryPage: React.FC = () => {
         setFocusYear(null);
         if (captureRangeStoreRef.current) setCaptureRange(null);
     }, [route, setCaptureRange]);
-    useEffect(() => {
-        if (level !== 'days') setFiltersOpen(false);
-    }, [level]);
-
     // Refresh the grid whenever an upload session finishes so new photos
     // appear. The cached sort-index (see localSortIndex.ts) must be dropped
     // first -- otherwise reloadPhotos would re-sort/paginate the same stale
@@ -324,27 +319,28 @@ export const GalleryPage: React.FC = () => {
                 </div>
                 <div className="pt-toolbar-actions">
                     {level === 'days' && (
-                        <div className="pt-filter-inline">
-                            {renderFilterControls()}
-                        </div>
-                    )}
-                    {level === 'days' && (
-                        <div className="pt-filter-menu">
-                            <button
-                                type="button"
-                                className={`btn pt-filter-button${activeFilterCount > 0 ? ' active' : ''}`}
-                                aria-haspopup="true"
-                                aria-expanded={filtersOpen}
-                                onClick={() => setFiltersOpen((open) => !open)}
-                            >
-                                <FilterIcon className="toolbar-icon" /> Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
-                            </button>
-                            {filtersOpen && (
-                                <div className="pt-filter-popover">
+                        <Menu
+                            className="pt-filter-menu"
+                            align="right"
+                            renderTrigger={(toggle, open) => (
+                                <button
+                                    type="button"
+                                    className={`btn pt-filter-button${activeFilterCount > 0 ? ' active' : ''}`}
+                                    aria-haspopup="menu"
+                                    aria-expanded={open}
+                                    onClick={toggle}
+                                >
+                                    <FilterIcon className="toolbar-icon" /> Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
+                                    <ChevronDownIcon className="pt-filter-chevron" />
+                                </button>
+                            )}
+                        >
+                            {() => (
+                                <div className="pt-filter-popover-content">
                                     {renderFilterControls()}
                                 </div>
                             )}
-                        </div>
+                        </Menu>
                     )}
                     {zoomControl}
                     {level === 'days' && (

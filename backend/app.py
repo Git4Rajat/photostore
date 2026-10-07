@@ -12092,6 +12092,10 @@ def _soft_delete_photos_now(
             touch_user_people_index_state(user_id)
         except Exception:
             pass
+        try:
+            _trigger_tools_index_rebuild(user_id, reason='photo-delete', scope='people')
+        except Exception:
+            app.logger.warning('Could not trigger People index rebuild after photo delete for %s', user_id, exc_info=True)
     return {'deleted': deleted, 'errors': errors, 'success': bool(deleted)}
 
 

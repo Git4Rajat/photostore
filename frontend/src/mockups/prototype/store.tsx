@@ -300,6 +300,7 @@ interface Store {
     totalPhotos: number | null;
     loadMorePhotos: () => void;
     reloadPhotos: () => void;
+    applyExternalPhotoDeleteCount: (count: number) => void;
 
     // gallery filters / timeline
     mediaFilter: MediaFilter;
@@ -437,6 +438,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [photosLoading, setPhotosLoading] = useState<boolean>(true);
     const [hasMorePhotos, setHasMorePhotos] = useState<boolean>(true);
     const [totalPhotos, setTotalPhotos] = useState<number | null>(null);
+    // A delete is authoritative before the derived gallery index catches up.
+    // Never let a stale refresh raise the visible count above this ceiling.
+    const photoCountCeilingRef = useRef<number | null>(null);
     const [mediaFilter, setMediaFilterState] = useState<MediaFilter>('all');
     const [galleryFilters, setGalleryFiltersState] = useState<GalleryFilters>({ rating: 0, likedOnly: false });
     const [captureRange, setCaptureRangeState] = useState<CaptureRange | null>(null);
@@ -471,6 +475,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [extraPeople, setExtraPeople] = useState<Record<string, Person>>({});
     const peopleOffsetRef = useRef(0);
     const peopleLoadingMoreRef = useRef(false);
+    // Photo deletion updates loaded person counts immediately. Keep the
+    // resulting upper bound until the People index publishes a count at or
+    // below it, so an older snapshot cannot put the deleted face back.
+    const peopleFaceCountCeilingsRef = useRef<Map<string, number>>(new Map());
+    const peopleFaceCountsRef = useRef<Map<string, number>>(new Map());
+    // Successful person deletes are immediately authoritative in the person
+    // table, but the paged People index can remain stale while its replacement
+    // is being published. Keep those ids hidden so a refresh cannot resurrect
+    // a tile whose next delete would correctly return 404.
+    const deletedPeopleRef = useRef<Set<string>>(new Set());
     const [personPhotos, setPersonPhotos] = useState<Record<string, Photo[]>>({});
     const [personPhotosLoading, setPersonPhotosLoading] = useState<boolean>(false);
     const [members, setMembers] = useState<LibraryMember[]>([]);
@@ -527,7 +541,51 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [photoIndex],
     );
     const albumById = useCallback((id: string) => albums.find((a) => a.id === id), [albums]);
-    const personById = useCallback((id: string) => people.find((p) => p.id === id) ?? extraPeople[id], [people, extraPeople]);
+    const personById = useCallback((id: string) => (
+        deletedPeopleRef.current.has(id) ? undefined : people.find((p) => p.id === id) ?? extraPeople[id]
+    ), [people, extraPeople]);
+
+    useEffect(() => {
+        const counts = new Map<string, number>();
+        for (const person of people) counts.set(person.id, Math.max(0, person.faceCount ?? 0));
+        for (const person of Object.values(extraPeople)) counts.set(person.id, Math.max(0, person.faceCount ?? 0));
+        peopleFaceCountsRef.current = counts;
+    }, [people, extraPeople]);
+
+    const applyPhotoDeleteCount = useCallback((count: number) => {
+        const amount = Math.max(0, Math.floor(Number(count) || 0));
+        if (!amount) return;
+        setTotalPhotos((current) => {
+            if (current === null) return current;
+            const next = Math.max(0, current - amount);
+            photoCountCeilingRef.current = photoCountCeilingRef.current === null
+                ? next
+                : Math.min(photoCountCeilingRef.current, next);
+            return next;
+        });
+    }, []);
+
+    const applyPhotoRestoreCount = useCallback((count: number) => {
+        const amount = Math.max(0, Math.floor(Number(count) || 0));
+        if (!amount) return;
+        setTotalPhotos((current) => {
+            if (current === null) return current;
+            const next = current + amount;
+            if (photoCountCeilingRef.current !== null) photoCountCeilingRef.current += amount;
+            return next;
+        });
+    }, []);
+
+    const applyServerPhotoTotal = useCallback((serverTotal: number) => {
+        const total = Math.max(0, Math.floor(Number(serverTotal) || 0));
+        const ceiling = photoCountCeilingRef.current;
+        if (ceiling !== null && total > ceiling) {
+            setTotalPhotos(ceiling);
+            return;
+        }
+        photoCountCeilingRef.current = null;
+        setTotalPhotos(total);
+    }, []);
 
     // Server-paged fetch: the gallery's path for libraries too large for a client-side sort index
     // (see isServerPagedLibrary) and its fallback whenever the index is unavailable. The backend
@@ -549,9 +607,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         photoOffsetRef.current = offset + list.length;
         photoHasMoreRef.current = list.length === pageSize;
         setHasMorePhotos(photoHasMoreRef.current);
-        if (typeof res?.total === 'number') setTotalPhotos(res.total);
+        if (typeof res?.total === 'number') applyServerPhotoTotal(res.total);
         setPhotos((prev) => (reset ? list : [...prev, ...list]));
-    }, []);
+    }, [applyServerPhotoTotal]);
 
     // Server-paged photo fetch. Primary path: download the whole-library
     // sort-index once per session (see localSortIndex.ts), sort/paginate it
@@ -600,7 +658,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             photoOffsetRef.current = offset + pageFilenames.length;
             photoHasMoreRef.current = offset + pageFilenames.length < total;
             setHasMorePhotos(photoHasMoreRef.current);
-            setTotalPhotos(total);
+            applyServerPhotoTotal(total);
             if (token && pageRows.length) {
                 // 1) Backend-free paint of the whole window.
                 const provisional = pageRows.map((row) => provisionalPhoto(row, token));
@@ -649,7 +707,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             photoLoadingRef.current = false;
             setPhotosLoading(false);
         }
-    }, [fetchPhotosViaLegacyEndpoint]);
+    }, [applyServerPhotoTotal, fetchPhotosViaLegacyEndpoint]);
 
     // Queued (not called directly) so this doesn't race fetchTimeline below
     // for the same backend -- both used to fire in the same mount tick.
@@ -774,7 +832,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             photoOffsetRef.current = offset + pageFilenames.length;
             photoHasMoreRef.current = offset + pageFilenames.length < sorted.length;
             setHasMorePhotos(photoHasMoreRef.current);
-            setTotalPhotos(sorted.length);
+            applyServerPhotoTotal(sorted.length);
 
             if (token && pageRows.length) {
                 setPhotos(pageRows.map((row) => provisionalPhoto(row, token)));
@@ -832,7 +890,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             photoLoadingRef.current = false;
             setPhotosLoading(false);
         }
-    }, [fetchPhotosViaLegacyEndpoint]);
+    }, [applyServerPhotoTotal, fetchPhotosViaLegacyEndpoint]);
 
     // The id sequence a gallery-backed viewer slides through: the loaded photos
     // in the current media filter. It grows as more pages load.
@@ -1082,6 +1140,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             for (const personId of personIds) counts.set(personId, (counts.get(personId) ?? 0) + delta);
         }
         if (!counts.size) return;
+        counts.forEach((change, personId) => {
+            const current = peopleFaceCountsRef.current.get(personId);
+            if (current === undefined) return;
+            const next = Math.max(0, current + change);
+            peopleFaceCountsRef.current.set(personId, next);
+            const ceiling = peopleFaceCountCeilingsRef.current.get(personId);
+            if (change < 0) {
+                peopleFaceCountCeilingsRef.current.set(personId, ceiling === undefined ? next : Math.min(ceiling, next));
+            } else if (ceiling !== undefined) {
+                peopleFaceCountCeilingsRef.current.set(personId, ceiling + change);
+            }
+        });
         const patch = (person: Person): Person => {
             const change = counts.get(person.id) ?? 0;
             if (!change) return person;
@@ -1098,6 +1168,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             }
             return changed ? next : prev;
         });
+    }, []);
+
+    const reconcilePersonFaceCount = useCallback((person: Person): Person => {
+        const serverCount = Math.max(0, person.faceCount ?? 0);
+        const ceiling = peopleFaceCountCeilingsRef.current.get(person.id);
+        if (ceiling === undefined || serverCount <= ceiling) {
+            if (ceiling !== undefined) peopleFaceCountCeilingsRef.current.delete(person.id);
+            peopleFaceCountsRef.current.set(person.id, serverCount);
+            return person;
+        }
+        peopleFaceCountsRef.current.set(person.id, ceiling);
+        return { ...person, faceCount: ceiling };
     }, []);
 
     const removeFromEverywhere = useCallback((ids: string[]) => {
@@ -1145,18 +1227,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         invalidateLocalPeopleIndex();
         invalidateLocalAlbumsIndex();
         adjustPeopleCountsForPhotos(moved, 1);
-        if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : prev + moved.length));
+        applyPhotoRestoreCount(moved.length);
         void post('/photos/trash/restore', { filenames: ids }).then(() => {
             publishLibraryChange('photos-restored', ['photos', 'people', 'albums', 'explore', 'trash'], { itemCount: ids.length });
         }).catch(() => {
             const movedSet = new Set(moved.map((p) => p.id));
             setPhotos((cur) => cur.filter((p) => !movedSet.has(p.id)));
             adjustPeopleCountsForPhotos(moved, -1);
-            if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : Math.max(0, prev - moved.length)));
+            applyPhotoDeleteCount(moved.length);
             setTrash((prev) => [...moved.map((photo) => ({ photo, purgesInDays: 30 })), ...prev]);
             toast('Couldn’t restore photos', undefined, undefined, 'error');
         });
-    }, [adjustPeopleCountsForPhotos, photosByIds, toast, trash]);
+    }, [adjustPeopleCountsForPhotos, photosByIds, toast, trash, applyPhotoDeleteCount, applyPhotoRestoreCount]);
 
     const deletePhotos = useCallback(
         (ids: string[]) => {
@@ -1168,7 +1250,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             invalidateLocalAlbumsIndex();
             adjustPeopleCountsForPhotos(doomed, -1);
             removeFromEverywhere(ids);
-            setTotalPhotos((prev) => (prev === null ? prev : Math.max(0, prev - ids.length)));
+            applyPhotoDeleteCount(ids.length);
             setSelection([]);
             void post<{ jobId?: string; status?: string }>('/photos/delete', { filenames: ids }).then((response) => {
                 if (response?.status === 'queued') {
@@ -1191,11 +1273,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 setPhotos((cur) => [...doomed, ...cur]);
                 invalidateLocalSortIndex();
                 adjustPeopleCountsForPhotos(doomed, 1);
-                setTotalPhotos((prev) => (prev === null ? prev : prev + ids.length));
+                applyPhotoRestoreCount(ids.length);
                 toast('Couldn’t delete photos', undefined, undefined, 'error');
             });
         },
-        [photosByIds, adjustPeopleCountsForPhotos, removeFromEverywhere, toast, restorePhotos],
+        [photosByIds, adjustPeopleCountsForPhotos, removeFromEverywhere, toast, restorePhotos, applyPhotoDeleteCount, applyPhotoRestoreCount],
     );
 
     const reloadTrash = useCallback(async () => {
@@ -1231,16 +1313,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         invalidateLocalPeopleIndex();
         invalidateLocalAlbumsIndex();
         adjustPeopleCountsForPhotos(moved, 1);
-        if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : prev + moved.length));
+        applyPhotoRestoreCount(moved.length);
         void post('/photos/trash/restore-all', {})
             .then(() => toast('Restored everything from Recently Deleted'))
             .catch(() => {
                 setTrash(snapshot);
                 adjustPeopleCountsForPhotos(moved, -1);
-                if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : Math.max(0, prev - moved.length)));
+                applyPhotoDeleteCount(moved.length);
                 toast('Couldn’t restore everything', undefined, undefined, 'error');
             });
-    }, [adjustPeopleCountsForPhotos, trash, toast]);
+    }, [adjustPeopleCountsForPhotos, trash, toast, applyPhotoDeleteCount, applyPhotoRestoreCount]);
 
     const purgePhoto = useCallback((id: string) => {
         const snapshot = trash;
@@ -1546,6 +1628,33 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // more as the user scrolls -- the browser never downloads every cluster. If the index is not
     // available yet, show the preparing state and retry this paged route instead of falling back to
     // the legacy full-list endpoint.
+    const reconcileDeletedPeople = useCallback(async (): Promise<{
+        complete: boolean;
+        indexed: Map<string, PeoplePageRow>;
+    }> => {
+        const ids = Array.from(deletedPeopleRef.current);
+        const indexed = new Map<string, PeoplePageRow>();
+        if (!ids.length) return { complete: true, indexed };
+        try {
+            // Keep URLs comfortably below proxy limits when a large selection
+            // was deleted. The endpoint returns exact ids from the same index
+            // snapshot used by the People page.
+            for (let start = 0; start < ids.length; start += 50) {
+                const chunk = ids.slice(start, start + 50);
+                const encoded = encodeURIComponent(chunk.join(','));
+                const res = await getExtras<PeoplePageResponse>(`/api/persons/page?ids=${encoded}&limit=${chunk.length}`);
+                if (!res?.available || !Array.isArray(res.rows)) return { complete: false, indexed };
+                for (const row of res.rows) indexed.set(row.personId, row);
+            }
+        } catch {
+            return { complete: false, indexed };
+        }
+        // Keep successful tombstones for this StoreProvider's lifetime. Person
+        // UUIDs are never reused, and page/id reads can briefly hit different
+        // replicas while a new index is being published.
+        return { complete: true, indexed };
+    }, []);
+
     const fetchPeople = useCallback(async () => {
         setPeopleLoading(true);
         try {
@@ -1557,11 +1666,22 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 reportIndexBuilding('people', true);
                 return;
             }
-            const mapped = res.rows.map(mapPersonRow);
-            peopleOffsetRef.current = mapped.length;
+            const reconciliation = await reconcileDeletedPeople();
+            const mapped = res.rows
+                .filter((row) => !deletedPeopleRef.current.has(row.personId))
+                .map(mapPersonRow)
+                .map(reconcilePersonFaceCount)
+                .filter((person) => person.name || (person.faceCount ?? 0) > 0);
+            // Offset tracks rows consumed from the server, including hidden
+            // tombstones, otherwise load-more would request overlapping rows.
+            peopleOffsetRef.current = res.rows.length;
             setPeople(mapped);
-            setPeopleTotal(res.total ?? mapped.length);
-            setPeopleUnnamedTotal(res.unnamedCount ?? 0);
+            if (reconciliation.complete) {
+                const indexedDeleted = Array.from(reconciliation.indexed.values());
+                const deletedUnnamed = indexedDeleted.filter((row) => !row.isNamed).length;
+                setPeopleTotal(Math.max(0, (res.total ?? mapped.length) - indexedDeleted.length));
+                setPeopleUnnamedTotal(Math.max(0, (res.unnamedCount ?? 0) - deletedUnnamed));
+            }
             setPeopleHasMore(Boolean(res.hasMore));
             setPeopleUnavailable(false);
             reportIndexBuilding('people', false);
@@ -1576,44 +1696,59 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         } finally {
             setPeopleLoading(false);
         }
-    }, []);
+    }, [reconcileDeletedPeople, reconcilePersonFaceCount]);
 
     const loadMorePeople = useCallback(() => {
         if (peopleLoadingMoreRef.current) return;
         peopleLoadingMoreRef.current = true;
         void getExtras<PeoplePageResponse>(`/api/persons/page?offset=${peopleOffsetRef.current}&limit=${PEOPLE_PAGE}`)
             .then((res) => {
-                const rows = Array.isArray(res?.rows) ? res.rows.map(mapPersonRow) : [];
-                peopleOffsetRef.current += rows.length;
+                const rawRows = Array.isArray(res?.rows) ? res.rows : [];
+                const rows = rawRows
+                    .filter((row) => !deletedPeopleRef.current.has(row.personId))
+                    .map(mapPersonRow)
+                    .map(reconcilePersonFaceCount)
+                    .filter((person) => person.name || (person.faceCount ?? 0) > 0);
+                peopleOffsetRef.current += rawRows.length;
                 setPeople((prev) => {
                     const seen = new Set(prev.map((p) => p.id));
                     return [...prev, ...rows.filter((p) => !seen.has(p.id))];
                 });
-                setPeopleHasMore(Boolean(res?.hasMore) && rows.length > 0);
+                setPeopleHasMore(Boolean(res?.hasMore) && rawRows.length > 0);
             })
             .catch(() => setPeopleHasMore(false))
             .finally(() => { peopleLoadingMoreRef.current = false; });
-    }, []);
+    }, [reconcilePersonFaceCount]);
 
     const searchPeople = useCallback(async (query: string, limit = 50): Promise<Person[]> => {
         try {
             const res = await getExtras<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
-            return Array.isArray(res?.rows) ? res.rows.map(mapPersonRow) : [];
+            return Array.isArray(res?.rows)
+                ? res.rows
+                    .filter((row) => !deletedPeopleRef.current.has(row.personId))
+                    .map(mapPersonRow)
+                    .map(reconcilePersonFaceCount)
+                    .filter((person) => person.name || (person.faceCount ?? 0) > 0)
+                : [];
         } catch {
             return [];
         }
-    }, []);
+    }, [reconcilePersonFaceCount]);
 
     // A deep link to a person who isn't in the loaded pages: fetch just that cluster.
     const ensurePerson = useCallback(async (id: string) => {
+        if (deletedPeopleRef.current.has(id)) return;
         try {
             const res = await getExtras<PeoplePageResponse>(`/api/persons/page?ids=${encodeURIComponent(id)}&limit=1`);
             const row = Array.isArray(res?.rows) ? res.rows[0] : undefined;
-            if (row) setExtraPeople((prev) => ({ ...prev, [row.personId]: mapPersonRow(row) }));
+            if (row && !deletedPeopleRef.current.has(row.personId)) {
+                const person = reconcilePersonFaceCount(mapPersonRow(row));
+                setExtraPeople((prev) => ({ ...prev, [row.personId]: person }));
+            }
         } catch {
             // the page shows "no longer exists"
         }
-    }, []);
+    }, [reconcilePersonFaceCount]);
 
     // No longer fetched unconditionally on app mount -- see the fetchAlbums
     // comment above; PeoplePage's own mount effect enqueues this instead.
@@ -1813,7 +1948,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // cluster's faces into another rather than dropping them.
     const deletePerson = useCallback((id: string) => {
         const removed = people.find((p) => p.id === id) ?? extraPeople[id];
+        deletedPeopleRef.current.add(id);
         setPeople((prev) => prev.filter((p) => p.id !== id));
+        if (removed) {
+            setPeopleTotal((prev) => Math.max(0, prev - 1));
+            if (!removed.name) setPeopleUnnamedTotal((prev) => Math.max(0, prev - 1));
+        }
         setExtraPeople((prev) => {
             if (!prev[id]) return prev;
             const next = { ...prev };
@@ -1833,7 +1973,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 toast('Person deleted');
             })
             .catch(() => {
+                deletedPeopleRef.current.delete(id);
                 if (removed) setPeople((prev) => [...prev, removed]);
+                if (removed) {
+                    setPeopleTotal((prev) => prev + 1);
+                    if (!removed.name) setPeopleUnnamedTotal((prev) => prev + 1);
+                }
                 invalidateLocalPeopleIndex();
                 toast('Couldn’t delete person', undefined, undefined, 'error');
             });
@@ -1842,8 +1987,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const deletePeopleBatch = useCallback((ids: string[]) => {
         if (!ids.length) return;
         const idSet = new Set(ids);
-        const removed = people.filter((p) => idSet.has(p.id));
+        const removed = ids
+            .map((id) => people.find((p) => p.id === id) ?? extraPeople[id])
+            .filter((person): person is Person => Boolean(person));
+        idSet.forEach((id) => deletedPeopleRef.current.add(id));
         setPeople((prev) => prev.filter((p) => !idSet.has(p.id)));
+        setPeopleTotal((prev) => Math.max(0, prev - removed.length));
+        const removedUnnamed = removed.filter((person) => !person.name).length;
+        if (removedUnnamed) setPeopleUnnamedTotal((prev) => Math.max(0, prev - removedUnnamed));
         setExtraPeople((prev) => {
             let changed = false;
             const next = { ...prev };
@@ -1873,11 +2024,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`);
             })
             .catch(() => {
+                idSet.forEach((id) => deletedPeopleRef.current.delete(id));
                 if (removed.length) setPeople((prev) => [...prev, ...removed]);
+                setPeopleTotal((prev) => prev + removed.length);
+                if (removedUnnamed) setPeopleUnnamedTotal((prev) => prev + removedUnnamed);
                 invalidateLocalPeopleIndex();
                 toast('Couldn’t delete people', undefined, undefined, 'error');
             });
-    }, [people, toast]);
+    }, [people, extraPeople, toast]);
 
     const fetchMembers = useCallback(async () => {
         setMembersLoading(true);
@@ -1976,6 +2130,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             totalPhotos,
             loadMorePhotos,
             reloadPhotos,
+            applyExternalPhotoDeleteCount: applyPhotoDeleteCount,
             mediaFilter,
             setMediaFilter,
             galleryFilters,
@@ -2058,7 +2213,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [
             route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
             placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, selectMode, viewer, toasts,
-            photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
+            photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos, applyPhotoDeleteCount,
             mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore, fetchExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,

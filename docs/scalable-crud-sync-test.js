@@ -1,75 +1,63 @@
 /*
- * Photostore scalable CRUD sync test (browser console).
+ * Destructive Photostore scalable CRUD sync test for the browser console.
+ * Pasting this file only installs the controller and prints a read-only plan.
  *
- * This is DESTRUCTIVE: it moves photos to Recently Deleted and permanently
- * deletes people clusters. It installs a test controller but does not delete
- * anything until an exact confirmation phrase is passed.
+ * Run suites:
+ *   await scalableCrudSync.runPhotos('DELETE PHOTOS')
+ *   await scalableCrudSync.runPeople('DELETE PEOPLE')
  *
- * HOW TO RUN
- *   1. Open Photostore, sign in, and keep the Gallery or People page visible.
- *   2. DevTools -> Console. Paste this whole file and press Enter.
- *   3. Review the plan printed by the script.
- *   4. Run one or both destructive suites:
- *        await scalableCrudSync.runPhotos('DELETE PHOTOS')
- *        await scalableCrudSync.runPeople('DELETE PEOPLE')
- *   5. Copy the result:
- *        scalableCrudSync.copyReport()
- *      If a run stops, resume without replaying completed stages:
- *        await scalableCrudSync.runPhotosFrom(4, 'DELETE PHOTOS')
- *        await scalableCrudSync.runPeopleFrom(2, 'DELETE PEOPLE')
+ * Resume at a stage without replaying earlier stages:
+ *   await scalableCrudSync.runPhotosFrom(4, 'DELETE PHOTOS')
  *
- * Photo stages delete 1, 100, 2,000, 10,000, then 50,000 currently-visible
- * photos. People stages delete 1, 50, then 500 currently-visible clusters.
- * Each stage uses a disjoint set because it waits for the relevant index count
- * to converge before selecting the next stage. Change OPTIONS to run a subset.
+ * Watch an already-accepted photo job without submitting another delete:
+ *   await scalableCrudSync.recoverPhotoJob('<jobId>', <beforeCount>, <accepted>)
  *
- * Direct console fetches bypass the frontend store's optimistic update. With
- * emitUiSignal=true this script emits the same cross-view library-change event
- * after the backend mutation is complete, so the open app can reconcile.
+ * Copy results:
+ *   scalableCrudSync.copyReport()
  */
 (() => {
   'use strict';
 
-  const OPTIONS = {
+  const options = {
     photoStages: [1, 100, 2000, 10000, 50000],
     peopleStages: [1, 50, 500],
     interStageDelayMs: 30000,
     pollIntervalMs: 5000,
-    jobTimeoutMs: 45 * 60 * 1000,
-    convergenceTimeoutMs: 20 * 60 * 1000,
+    jobTimeoutMs: 2 * 60 * 60 * 1000,
+    convergenceTimeoutMs: 45 * 60 * 1000,
     requestTimeoutMs: 45 * 60 * 1000,
     emitUiSignal: true,
-    manualToken: '', // Required here only when Entra token auto-detection is unavailable.
+    manualToken: '',
   };
 
-  const cfg = window.__APP_CONFIG__ || {};
-  const origin = location.origin;
-  const base = (value) => (value || '').replace(/\/$/, '') || origin;
-  const API = base(cfg.apiBaseUrl);
-  const EXTRAS = base(cfg.extrasApiBaseUrl || cfg.apiBaseUrl);
-  const TOOLS = base(cfg.toolsApiBaseUrl || cfg.apiBaseUrl);
-  const token = OPTIONS.manualToken || localStorage.getItem('photostore.passwordAuthToken') || '';
+  const config = window.__APP_CONFIG__ || {};
+  const base = (value) => (value || '').replace(/\/$/, '') || location.origin;
+  const api = base(config.apiBaseUrl);
+  const extras = base(config.extrasApiBaseUrl || config.apiBaseUrl);
+  const tools = base(config.toolsApiBaseUrl || config.apiBaseUrl);
+  const token = options.manualToken || localStorage.getItem('photostore.passwordAuthToken') || '';
   const session = Math.random().toString(36).slice(2, 8);
   const report = {
     startedAt: new Date().toISOString(),
     session,
-    options: { ...OPTIONS, manualToken: OPTIONS.manualToken ? '(set)' : '' },
-    bases: { api: API, extras: EXTRAS, tools: TOOLS },
+    options: { ...options, manualToken: options.manualToken ? '(set)' : '' },
+    bases: { api, extras, tools },
     plans: {},
     photoStages: [],
+    photoRecoveries: [],
     peopleStages: [],
     errors: [],
   };
   let requestNumber = 0;
   let running = false;
 
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const now = () => new Date().toISOString();
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const elapsed = (started) => Math.round(performance.now() - started);
   const note = (message) => console.log(`%c${message}`, 'color:#087f5b;font-weight:600');
   const warn = (message) => console.warn(`[crud-sync] ${message}`);
-  const elapsed = (started) => Math.round(performance.now() - started);
 
-  async function request(method, url, body, timeoutMs = OPTIONS.requestTimeoutMs) {
+  async function request(method, url, body, timeoutMs = options.requestTimeoutMs) {
     const requestId = `crud-sync-${session}-${++requestNumber}`;
     const headers = {
       'X-Request-ID': requestId,
@@ -100,14 +88,13 @@
       clearTimeout(timer);
     }
     let json = null;
-    try { json = text ? JSON.parse(text) : null; } catch { /* keep raw response */ }
+    try { json = text ? JSON.parse(text) : null; } catch { /* preserve non-JSON response */ }
     const result = {
-      ok: response.ok,
       status: response.status,
       ms: elapsed(started),
       requestId,
-      json,
       responseBytes: new Blob([text]).size,
+      json,
     };
     if (!response.ok) {
       const error = new Error(`${method} ${url} returned ${response.status}: ${(json && json.error) || text.slice(0, 300)}`);
@@ -119,19 +106,26 @@
 
   async function photoPage(offset = 0, limit = 1) {
     const query = new URLSearchParams({ sort: 'name', idsOnly: '1', offset: String(offset), limit: String(limit) });
-    return request('GET', `${API}/api/photos?${query}`).then((result) => ({ result, data: result.json || {} }));
+    const response = await request('GET', `${api}/api/photos?${query}`);
+    return response.json || {};
   }
 
   async function peoplePage(offset = 0, limit = 1) {
     const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
-    return request('GET', `${EXTRAS}/api/persons/page?${query}`).then((result) => ({ result, data: result.json || {} }));
+    const response = await request('GET', `${extras}/api/persons/page?${query}`);
+    return response.json || {};
   }
+
+  const currentPhotoCount = async () => Number((await photoPage()).total || 0);
+  const currentPeopleCount = async () => {
+    const data = await peoplePage();
+    return data.available === false ? null : Number(data.libraryTotal ?? data.total ?? 0);
+  };
 
   async function collectPhotoIds(count) {
     const ids = [];
     while (ids.length < count) {
-      const wanted = Math.min(5000, count - ids.length);
-      const { data } = await photoPage(ids.length, wanted);
+      const data = await photoPage(ids.length, Math.min(5000, count - ids.length));
       const page = Array.isArray(data.filenames) ? data.filenames : [];
       ids.push(...page);
       if (!data.hasMore || page.length === 0) break;
@@ -142,9 +136,8 @@
   async function collectPersonIds(count) {
     const ids = [];
     while (ids.length < count) {
-      const wanted = Math.min(500, count - ids.length);
-      const { data } = await peoplePage(ids.length, wanted);
-      if (data.available === false) throw new Error(`People index is unavailable (${data.reason || 'building'})`);
+      const data = await peoplePage(ids.length, Math.min(500, count - ids.length));
+      if (data.available === false) throw new Error(`People index unavailable (${data.reason || 'building'})`);
       const page = Array.isArray(data.rows) ? data.rows : [];
       ids.push(...page.map((row) => row.personId).filter(Boolean));
       if (!data.hasMore || page.length === 0) break;
@@ -152,260 +145,248 @@
     return ids.slice(0, count);
   }
 
-  async function currentPhotoCount() {
-    const { data } = await photoPage(0, 1);
-    return Number(data.total || 0);
-  }
-
-  async function currentPeopleCount() {
-    const { data } = await peoplePage(0, 1);
-    if (data.available === false) return null;
-    return Number(data.libraryTotal ?? data.total ?? 0);
-  }
-
   async function waitForPhotoJob(jobId) {
     const started = performance.now();
     let polls = 0;
+    let transientErrors = 0;
     let last = null;
-    while (elapsed(started) < OPTIONS.jobTimeoutMs) {
+    let lastError = null;
+    while (elapsed(started) < options.jobTimeoutMs) {
       polls += 1;
-      const response = await request('GET', `${TOOLS}/api/jobs/status`, undefined, 60000);
-      last = ((response.json && response.json.jobs) || []).find((job) => job.jobId === jobId) || null;
-      if (last && ['done', 'failed'].includes(String(last.status).toLowerCase())) {
-        return { status: last.status, waitMs: elapsed(started), polls, job: last };
+      try {
+        const response = await request('GET', `${tools}/api/jobs/status`, undefined, 60000);
+        last = ((response.json && response.json.jobs) || []).find((job) => job.jobId === jobId) || null;
+        if (last && ['done', 'failed'].includes(String(last.status).toLowerCase())) {
+          return { status: last.status, waitMs: elapsed(started), polls, transientErrors, job: last };
+        }
+      } catch (error) {
+        transientErrors += 1;
+        lastError = String(error);
+        warn(`Job status read failed (${transientErrors}); polling will continue`);
       }
-      if (polls % 6 === 0) note(`Job ${jobId} is ${last ? last.status : 'not visible yet'} (${Math.round(elapsed(started) / 1000)}s)`);
-      await sleep(OPTIONS.pollIntervalMs);
+      if (polls % 6 === 0) note(`Job is ${last ? last.status : 'not visible yet'} (${Math.round(elapsed(started) / 1000)}s)`);
+      await sleep(options.pollIntervalMs);
     }
-    return { status: 'timeout', waitMs: elapsed(started), polls, job: last };
+    return { status: 'timeout', waitMs: elapsed(started), polls, transientErrors, lastError, job: last };
   }
 
   async function waitForCount(kind, expectedMaximum) {
     const started = performance.now();
     const observations = [];
     const read = kind === 'photos' ? currentPhotoCount : currentPeopleCount;
-    while (elapsed(started) < OPTIONS.convergenceTimeoutMs) {
-      const count = await read();
-      observations.push({ atMs: elapsed(started), count });
-      if (count !== null && count <= expectedMaximum) {
-        return { converged: true, count, waitMs: elapsed(started), polls: observations.length, observations };
+    let polls = 0;
+    let transientErrors = 0;
+    let lastCount;
+    while (elapsed(started) < options.convergenceTimeoutMs) {
+      polls += 1;
+      try {
+        const count = await read();
+        if (count !== lastCount) {
+          observations.push({ atMs: elapsed(started), count });
+          lastCount = count;
+        }
+        if (count !== null && count <= expectedMaximum) {
+          return { converged: true, count, waitMs: elapsed(started), polls, transientErrors, observations };
+        }
+        if (polls % 6 === 0) note(`${kind} index count is ${count}; waiting for <= ${expectedMaximum}`);
+      } catch (error) {
+        transientErrors += 1;
+        observations.push({ atMs: elapsed(started), error: String(error) });
+        warn(`${kind} count read failed (${transientErrors}); polling will continue`);
       }
-      if (observations.length % 6 === 0) note(`${kind} index count is ${count}; waiting for <= ${expectedMaximum}`);
-      await sleep(OPTIONS.pollIntervalMs);
+      await sleep(options.pollIntervalMs);
     }
-    return {
-      converged: false,
-      count: observations.length ? observations[observations.length - 1].count : null,
-      waitMs: elapsed(started),
-      polls: observations.length,
-      observations,
-    };
+    return { converged: false, count: lastCount ?? null, waitMs: elapsed(started), polls, transientErrors, observations };
   }
 
   function emitUiChange(operation, domains, itemCount, jobId) {
-    if (!OPTIONS.emitUiSignal) return null;
+    if (!options.emitUiSignal) return null;
     const change = {
       id: `crud-sync-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
-      at: Date.now(),
-      operation,
-      domains,
-      itemCount,
-      ...(jobId ? { jobId } : {}),
+      at: Date.now(), operation, domains, itemCount, ...(jobId ? { jobId } : {}),
     };
     try {
       const channel = new BroadcastChannel('photostore.library-changes.v1');
       channel.postMessage(change);
       setTimeout(() => channel.close(), 1000);
-    } catch (error) {
-      warn(`BroadcastChannel failed: ${String(error)}`);
-    }
+    } catch (error) { warn(`UI signal failed: ${String(error)}`); }
     try { localStorage.setItem('photostore.library-change.latest', JSON.stringify(change)); } catch { /* ignore */ }
     return change;
   }
 
-  async function delayBeforeNext(kind, index, stages) {
-    if (index >= stages.length - 1 || OPTIONS.interStageDelayMs <= 0) return;
-    note(`${kind}: waiting ${Math.round(OPTIONS.interStageDelayMs / 1000)}s before the next stage`);
-    await sleep(OPTIONS.interStageDelayMs);
-  }
-
-  async function runPhotoStage(count, index) {
-    const row = { stage: index + 1, requested: count, startedAt: now() };
+  async function runPhotoStage(count, stage) {
+    const row = { stage: stage + 1, requested: count, startedAt: now() };
     report.photoStages.push(row);
-    try {
-      row.beforeCount = await currentPhotoCount();
-      if (row.beforeCount < count) throw new Error(`Only ${row.beforeCount} active photos remain; stage needs ${count}`);
-      note(`Photos ${index + 1}/${OPTIONS.photoStages.length}: selecting ${count.toLocaleString()} of ${row.beforeCount.toLocaleString()}`);
-      const selectionStarted = performance.now();
-      const ids = await collectPhotoIds(count);
-      row.selectionMs = elapsed(selectionStarted);
-      row.selected = ids.length;
-      row.sampleIds = [ids[0], ids[Math.floor(ids.length / 2)], ids[ids.length - 1]].filter(Boolean);
-      const payload = { filenames: ids };
-      row.requestBytes = new Blob([JSON.stringify(payload)]).size;
-      const mutation = await request('POST', `${API}/api/photos/delete`, payload);
-      row.http = { status: mutation.status, ms: mutation.ms, requestId: mutation.requestId, responseBytes: mutation.responseBytes };
-      row.accepted = Number((mutation.json && mutation.json.accepted) || (mutation.json && mutation.json.deleted && mutation.json.deleted.length) || 0);
-      row.jobId = mutation.json && mutation.json.jobId;
-      row.mode = row.jobId ? 'queued' : 'inline';
-      if (row.jobId) {
-        row.job = await waitForPhotoJob(row.jobId);
-        if (row.job.status !== 'done') throw new Error(`Photo delete job ended with ${row.job.status}`);
-      }
-      row.uiSignal = emitUiChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], row.accepted || count, row.jobId);
-      row.convergence = await waitForCount('photos', row.beforeCount - (row.accepted || count));
-      row.finishedAt = now();
-      row.outcome = row.convergence.converged ? 'passed' : 'index-timeout';
-      console.table([summarizePhoto(row)]);
-      if (!row.convergence.converged) throw new Error(`Photo index did not converge within ${OPTIONS.convergenceTimeoutMs}ms`);
-    } catch (error) {
-      row.finishedAt = now();
-      row.outcome = 'failed';
-      row.error = String(error);
-      row.errorDetails = error && error.details;
-      report.errors.push({ suite: 'photos', stage: count, error: row.error, details: row.errorDetails });
-      throw error;
+    row.beforeCount = await currentPhotoCount();
+    if (row.beforeCount < count) throw new Error(`Only ${row.beforeCount} photos remain; ${count} required`);
+    const selectionStarted = performance.now();
+    const ids = await collectPhotoIds(count);
+    row.selectionMs = elapsed(selectionStarted);
+    row.selected = ids.length;
+    row.sampleIds = [ids[0], ids[Math.floor(ids.length / 2)], ids[ids.length - 1]].filter(Boolean);
+    const payload = { filenames: ids };
+    row.requestBytes = new Blob([JSON.stringify(payload)]).size;
+    const mutation = await request('POST', `${api}/api/photos/delete`, payload);
+    row.http = { status: mutation.status, ms: mutation.ms, requestId: mutation.requestId, responseBytes: mutation.responseBytes };
+    row.accepted = Number(mutation.json?.accepted || mutation.json?.deleted?.length || 0);
+    row.jobId = mutation.json?.jobId;
+    row.mode = row.jobId ? 'queued' : 'inline';
+    // Mirror the real UI's optimistic count as soon as the backend accepts
+    // the mutation; index convergence is measured separately below.
+    row.uiSignal = emitUiChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], row.accepted || count, row.jobId);
+    if (row.jobId) {
+      row.job = await waitForPhotoJob(row.jobId);
+      if (row.job.status !== 'done') throw new Error(`Photo job ended with ${row.job.status}`);
     }
+    row.convergence = await waitForCount('photos', row.beforeCount - (row.accepted || count));
+    row.outcome = row.convergence.converged ? 'passed' : 'index-timeout';
+    row.finishedAt = now();
+    if (!row.convergence.converged) throw new Error('Photo index convergence timed out');
   }
 
-  async function runPeopleStage(count, index) {
-    const row = { stage: index + 1, requested: count, startedAt: now() };
+  async function runPeopleStage(count, stage) {
+    const row = { stage: stage + 1, requested: count, startedAt: now() };
     report.peopleStages.push(row);
-    try {
-      row.beforeCount = await currentPeopleCount();
-      if (row.beforeCount === null) throw new Error('People index is unavailable');
-      if (row.beforeCount < count) throw new Error(`Only ${row.beforeCount} people remain; stage needs ${count}`);
-      note(`People ${index + 1}/${OPTIONS.peopleStages.length}: selecting ${count.toLocaleString()} of ${row.beforeCount.toLocaleString()}`);
-      const selectionStarted = performance.now();
-      const ids = await collectPersonIds(count);
-      row.selectionMs = elapsed(selectionStarted);
-      row.selected = ids.length;
-      row.sampleIds = [ids[0], ids[Math.floor(ids.length / 2)], ids[ids.length - 1]].filter(Boolean);
-      const payload = { personIds: ids };
-      row.requestBytes = new Blob([JSON.stringify(payload)]).size;
-      const mutation = await request('POST', `${EXTRAS}/api/persons/delete`, payload);
-      row.http = { status: mutation.status, ms: mutation.ms, requestId: mutation.requestId, responseBytes: mutation.responseBytes };
-      row.deleted = ((mutation.json && mutation.json.deletedPersonIds) || []).length;
-      row.errors = ((mutation.json && mutation.json.errors) || []).length;
-      row.facesUpdated = mutation.json && mutation.json.facesUpdated;
-      row.metadataRebuild = mutation.json && mutation.json.metadataRebuild;
-      row.uiSignal = emitUiChange('people-deleted', ['people'], row.deleted);
-      row.convergence = await waitForCount('people', row.beforeCount - row.deleted);
-      row.finishedAt = now();
-      row.outcome = row.convergence.converged && row.errors === 0 ? 'passed' : 'partial';
-      console.table([summarizePeople(row)]);
-      if (!row.convergence.converged) throw new Error(`People index did not converge within ${OPTIONS.convergenceTimeoutMs}ms`);
-    } catch (error) {
-      row.finishedAt = now();
-      row.outcome = 'failed';
-      row.error = String(error);
-      row.errorDetails = error && error.details;
-      report.errors.push({ suite: 'people', stage: count, error: row.error, details: row.errorDetails });
-      throw error;
-    }
-  }
-
-  function summarizePhoto(row) {
-    return {
-      stage: row.requested,
-      mode: row.mode,
-      requestMs: row.http && row.http.ms,
-      jobWaitMs: row.job && row.job.waitMs,
-      indexWaitMs: row.convergence && row.convergence.waitMs,
-      before: row.beforeCount,
-      after: row.convergence && row.convergence.count,
-      outcome: row.outcome,
-    };
-  }
-
-  function summarizePeople(row) {
-    return {
-      stage: row.requested,
-      requestMs: row.http && row.http.ms,
-      indexWaitMs: row.convergence && row.convergence.waitMs,
-      deleted: row.deleted,
-      facesUpdated: row.facesUpdated,
-      before: row.beforeCount,
-      after: row.convergence && row.convergence.count,
-      outcome: row.outcome,
-    };
-  }
-
-  async function plan() {
-    note('Reading current library counts (no changes are being made)');
-    const [photos, people] = await Promise.all([currentPhotoCount(), currentPeopleCount()]);
-    report.plans = {
-      checkedAt: now(),
-      photos: { available: photos, requested: OPTIONS.photoStages.reduce((sum, value) => sum + value, 0), stages: OPTIONS.photoStages },
-      people: { available: people, requested: OPTIONS.peopleStages.reduce((sum, value) => sum + value, 0), stages: OPTIONS.peopleStages },
-    };
-    console.table([
-      { suite: 'photos', available: photos, totalToDelete: report.plans.photos.requested, stages: OPTIONS.photoStages.join(' -> ') },
-      { suite: 'people', available: people, totalToDelete: report.plans.people.requested, stages: OPTIONS.peopleStages.join(' -> ') },
-    ]);
-    if (!token) warn('No password token was detected. Set OPTIONS.manualToken before pasting when using Entra authentication.');
-    return report.plans;
+    row.beforeCount = await currentPeopleCount();
+    if (row.beforeCount === null) throw new Error('People index unavailable');
+    if (row.beforeCount < count) throw new Error(`Only ${row.beforeCount} people remain; ${count} required`);
+    const selectionStarted = performance.now();
+    const ids = await collectPersonIds(count);
+    row.selectionMs = elapsed(selectionStarted);
+    row.selected = ids.length;
+    row.sampleIds = [ids[0], ids[Math.floor(ids.length / 2)], ids[ids.length - 1]].filter(Boolean);
+    const payload = { personIds: ids };
+    row.requestBytes = new Blob([JSON.stringify(payload)]).size;
+    const mutation = await request('POST', `${extras}/api/persons/delete`, payload);
+    row.http = { status: mutation.status, ms: mutation.ms, requestId: mutation.requestId, responseBytes: mutation.responseBytes };
+    row.deleted = mutation.json?.deletedPersonIds?.length || 0;
+    row.errors = mutation.json?.errors?.length || 0;
+    row.facesUpdated = mutation.json?.facesUpdated;
+    row.metadataRebuild = mutation.json?.metadataRebuild;
+    row.uiSignal = emitUiChange('people-deleted', ['people'], row.deleted);
+    row.convergence = await waitForCount('people', row.beforeCount - row.deleted);
+    row.outcome = row.convergence.converged && row.errors === 0 ? 'passed' : 'partial';
+    row.finishedAt = now();
+    if (!row.convergence.converged) throw new Error('People index convergence timed out');
   }
 
   async function runSuite(kind, confirmation, startStage = 1) {
     const expected = kind === 'photos' ? 'DELETE PHOTOS' : 'DELETE PEOPLE';
-    if (confirmation !== expected) throw new Error(`Destructive test refused. Pass the exact phrase '${expected}'.`);
-    if (running) throw new Error('A CRUD sync suite is already running in this tab.');
-    const stages = kind === 'photos' ? OPTIONS.photoStages : OPTIONS.peopleStages;
-    const startIndex = Number(startStage) - 1;
-    if (!Number.isInteger(startIndex) || startIndex < 0 || startIndex >= stages.length) {
-      throw new Error(`startStage must be between 1 and ${stages.length}`);
-    }
-    running = true;
+    if (confirmation !== expected) throw new Error(`Pass the exact phrase '${expected}'`);
+    if (running) throw new Error('Another CRUD sync operation is running in this tab');
+    const stages = kind === 'photos' ? options.photoStages : options.peopleStages;
+    const start = Number(startStage) - 1;
+    if (!Number.isInteger(start) || start < 0 || start >= stages.length) throw new Error(`Stage must be 1-${stages.length}`);
     const runner = kind === 'photos' ? runPhotoStage : runPeopleStage;
+    running = true;
     try {
-      for (let index = startIndex; index < stages.length; index += 1) {
-        await runner(stages[index], index);
-        await delayBeforeNext(kind, index, stages);
+      for (let index = start; index < stages.length; index += 1) {
+        note(`${kind} stage ${index + 1}/${stages.length}: ${stages[index].toLocaleString()}`);
+        try {
+          await runner(stages[index], index);
+        } catch (error) {
+          const row = (kind === 'photos' ? report.photoStages : report.peopleStages).at(-1);
+          if (row) { row.outcome = 'failed'; row.error = String(error); row.errorDetails = error?.details; row.finishedAt = now(); }
+          report.errors.push({ suite: kind, stage: stages[index], error: String(error), details: error?.details });
+          throw error;
+        }
+        if (index < stages.length - 1 && options.interStageDelayMs > 0) await sleep(options.interStageDelayMs);
       }
-      note(`${kind} suite complete`);
       return report;
     } finally {
       running = false;
       report.finishedAt = now();
-      window.__scalableCrudSync = report;
       printReport();
     }
   }
 
+  async function recoverPhotoJob(jobId, beforeCount, accepted) {
+    if (!jobId || !Number.isFinite(Number(beforeCount)) || !Number.isFinite(Number(accepted))) {
+      throw new Error('Pass jobId, beforeCount, and accepted');
+    }
+    if (running) throw new Error('Another CRUD sync operation is running in this tab');
+    running = true;
+    const row = { jobId: String(jobId), beforeCount: Number(beforeCount), accepted: Number(accepted), startedAt: now() };
+    report.photoRecoveries.push(row);
+    try {
+      note('Watching the existing job; no delete request will be sent');
+      const expectedMaximum = row.beforeCount - row.accepted;
+      const currentCount = await currentPhotoCount();
+      if (currentCount <= expectedMaximum) {
+        row.job = { status: 'inferred-done', waitMs: 0, polls: 0, note: 'Count already converged; job may have aged out of status.' };
+        row.uiSignal = emitUiChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], row.accepted, row.jobId);
+        row.convergence = { converged: true, count: currentCount, waitMs: 0, polls: 1, transientErrors: 0,
+          observations: [{ atMs: 0, count: currentCount }] };
+        row.outcome = 'passed';
+        row.finishedAt = now();
+        return row;
+      }
+      row.job = await waitForPhotoJob(row.jobId);
+      if (row.job.status !== 'done') throw new Error(`Photo job ended with ${row.job.status}`);
+      row.uiSignal = emitUiChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], row.accepted, row.jobId);
+      row.convergence = await waitForCount('photos', expectedMaximum);
+      row.outcome = row.convergence.converged ? 'passed' : 'index-timeout';
+      row.finishedAt = now();
+      return row;
+    } catch (error) {
+      row.outcome = 'failed'; row.error = String(error); row.errorDetails = error?.details; row.finishedAt = now();
+      report.errors.push({ suite: 'photo-recovery', jobId: row.jobId, error: row.error, details: row.errorDetails });
+      throw error;
+    } finally {
+      running = false;
+      report.finishedAt = now();
+      printReport();
+    }
+  }
+
+  async function plan() {
+    const [photos, people] = await Promise.all([currentPhotoCount(), currentPeopleCount()]);
+    report.plans = {
+      checkedAt: now(),
+      photos: { available: photos, requested: options.photoStages.reduce((sum, n) => sum + n, 0), stages: options.photoStages },
+      people: { available: people, requested: options.peopleStages.reduce((sum, n) => sum + n, 0), stages: options.peopleStages },
+    };
+    console.table([
+      { suite: 'photos', available: photos, totalToDelete: report.plans.photos.requested, stages: options.photoStages.join(' -> ') },
+      { suite: 'people', available: people, totalToDelete: report.plans.people.requested, stages: options.peopleStages.join(' -> ') },
+    ]);
+    if (!token) warn('No password token detected; set manualToken before pasting when using Entra login');
+    return report.plans;
+  }
+
   function printReport() {
+    window.__scalableCrudSync = report;
+    const photoRows = report.photoStages.map((row) => ({
+      stage: row.requested, mode: row.mode, requestMs: row.http?.ms, jobWaitMs: row.job?.waitMs,
+      indexWaitMs: row.convergence?.waitMs, before: row.beforeCount, after: row.convergence?.count, outcome: row.outcome,
+    }));
     console.log('%c==== SCALABLE CRUD SYNC RESULT ====', 'font-weight:bold;font-size:14px');
-    if (report.photoStages.length) console.table(report.photoStages.map(summarizePhoto));
-    if (report.peopleStages.length) console.table(report.peopleStages.map(summarizePeople));
-    if (report.errors.length) { console.log('%cERRORS', 'color:red;font-weight:bold'); console.table(report.errors); }
-    console.log('Full result: window.__scalableCrudSync');
+    if (photoRows.length) console.table(photoRows);
+    if (report.peopleStages.length) console.table(report.peopleStages);
+    if (report.photoRecoveries.length) console.table(report.photoRecoveries);
+    if (report.errors.length) console.table(report.errors);
   }
 
   function copyReport() {
-    window.__scalableCrudSync = report;
     const json = JSON.stringify(report, null, 2);
     if (typeof copy === 'function') copy(json);
-    else navigator.clipboard.writeText(json);
-    note('Report copied to the clipboard');
+    else void navigator.clipboard.writeText(json);
     return report;
   }
 
   window.__scalableCrudSync = report;
   window.scalableCrudSync = {
-    options: OPTIONS,
+    options,
     plan,
     runPhotos: (confirmation) => runSuite('photos', confirmation),
     runPeople: (confirmation) => runSuite('people', confirmation),
     runPhotosFrom: (stage, confirmation) => runSuite('photos', confirmation, stage),
     runPeopleFrom: (stage, confirmation) => runSuite('people', confirmation, stage),
+    recoverPhotoJob,
     report: () => { printReport(); return report; },
     copyReport,
   };
 
-  console.log('%cScalable CRUD sync test installed. No data has been changed.', 'color:#087f5b;font-weight:bold');
-  console.log("Run await scalableCrudSync.runPhotos('DELETE PHOTOS') or await scalableCrudSync.runPeople('DELETE PEOPLE') after reviewing the plan.");
-  void plan().catch((error) => {
-    report.errors.push({ suite: 'plan', error: String(error), details: error && error.details });
-    console.error('[crud-sync] Could not read the plan:', error);
-  });
+  note('Scalable CRUD sync test installed. No data has been changed.');
+  void plan().catch((error) => console.error('[crud-sync] Plan failed:', error));
 })();

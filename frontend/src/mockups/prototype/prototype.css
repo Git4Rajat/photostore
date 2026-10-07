@@ -121,8 +121,7 @@
 .pt-toolbar-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .pt-zoom { display: inline-flex; gap: 4px; }
 .pt-zoom .btn { padding: 6px 8px; min-width: 44px; min-height: 44px; }
-.pt-filter-inline { display: contents; }
-.pt-filter-menu { display: none; position: relative; }
+.pt-filter-menu { display: inline-flex; }
 .pt-media-filter { flex: 0 0 auto; }
 .pt-rating-filter { flex: 0 0 auto; }
 .pt-rating-filter .pt-filter-button { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -171,30 +170,20 @@
   color: inherit;
   font: inherit;
 }
-.pt-filter-popover {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 6px);
-  z-index: 20;
-  display: grid;
-  gap: 8px;
+.pt-filter-menu > .pt-menu-panel {
   width: min(320px, calc(100vw - 24px));
   max-height: min(420px, calc(100dvh - 24px));
   box-sizing: border-box;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 10px;
-  border: 1px solid var(--lg-edge);
-  border-radius: 8px;
-  background: var(--surface);
-  box-shadow: var(--shadow-soft);
 }
-.pt-filter-popover .mock-seg { width: 100%; }
-.pt-filter-popover .mock-seg button { flex: 1 1 0; padding-left: 9px; padding-right: 9px; }
-.pt-filter-popover .pt-rating-filter { display: grid; width: 100%; }
-.pt-filter-popover .pt-rating-filter .pt-menu-panel { position: static; width: 100%; box-sizing: border-box; margin-top: 6px; }
-.pt-filter-popover .btn,
-.pt-filter-popover .pt-date-jump { width: 100%; justify-content: center; }
+.pt-filter-popover-content { display: grid; gap: 8px; }
+.pt-filter-popover-content .mock-seg { width: 100%; }
+.pt-filter-popover-content .mock-seg button { flex: 1 1 0; padding-left: 9px; padding-right: 9px; }
+.pt-filter-popover-content .pt-rating-filter { display: grid; width: 100%; }
+.pt-filter-popover-content .pt-rating-filter .pt-menu-panel { position: static; width: 100%; box-sizing: border-box; margin-top: 6px; }
+.pt-filter-popover-content .btn,
+.pt-filter-popover-content .pt-date-jump { width: 100%; justify-content: center; }
 
 /* ---- gallery timeline scrubber (year -> month -> day) ---- */
 .pt-timeline-wrap { margin-bottom: 12px; }
@@ -212,9 +201,7 @@
 @media (max-width: 620px) {
   .pt-toolbar { flex-direction: column; align-items: flex-start; }
   .pt-toolbar-actions { width: 100%; }
-  .pt-filter-inline { display: none; }
-  .pt-filter-menu { display: block; }
-  .pt-filter-popover { left: 0; right: auto; }
+  .pt-filter-menu > .pt-menu-panel.right { left: 0; right: auto; }
   .pt-person-head { flex-wrap: wrap; }
   .pt-person-name-row { width: 100%; }
 }

@@ -1309,6 +1309,10 @@ def restore_trashed_photos():
             app.touch_user_people_index_state(user_id)
         except Exception:
             pass
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='photo-restore', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not trigger People index rebuild after photo restore for %s', user_id, exc_info=True)
 
     return app.jsonify({'restored': restored, 'errors': errors, 'success': len(restored) > 0})
 
@@ -1350,6 +1354,10 @@ def restore_all_trashed_photos():
             app.touch_user_people_index_state(user_id)
         except Exception:
             pass
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='photo-restore-all', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not trigger People index rebuild after restoring trash for %s', user_id, exc_info=True)
 
     return app.jsonify({'restored': restored, 'errors': errors, 'success': len(restored) > 0})
 
