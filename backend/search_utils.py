@@ -169,6 +169,52 @@ VISUAL_MODIFIERS = {
 }
 SEARCH_STOP_WORDS = {'in', 'at', 'near', 'from', 'by', 'with', 'wearing', 'holding', 'beside', 'next', 'to', 'and', 'the', 'a', 'an'}
 MODIFIER_FILLER_WORDS = {'color', 'colour'}
+# Labels that should never be produced by automatic visual tagging. Generic
+# person concepts stay allowed for people/face workflows; this list blocks
+# inferred names and demographic/cultural/race labels.
+SENSITIVE_AUTO_TAG_LABELS = {
+    'aaron', 'aboriginal', 'adam', 'adrian', 'afghan', 'african', 'afro', 'albanian',
+    'albert', 'alexander', 'alfred', 'algerian', 'allen', 'american', 'amir', 'amish',
+    'anderson', 'andrew', 'anna', 'anne', 'anthony', 'antony', 'arab', 'arabia',
+    'arabian', 'arabic', 'armenian', 'arnold', 'arthur', 'asian', 'aussie', 'australian',
+    'austrian', 'balkan', 'bart', 'bengal', 'bengali', 'benjamin', 'bernard', 'beth',
+    'billy', 'black', 'blair', 'blake', 'bobby', 'brad', 'bradford', 'bradley',
+    'brent', 'british', 'bruce', 'bruno', 'bryan', 'buddhist', 'burmese', 'butler',
+    'byron', 'calvin', 'cambodian', 'canadian', 'carlo', 'carter', 'catherine', 'caucasian',
+    'celtic', 'chilean', 'chinese', 'christianity', 'christie', 'christopher', 'chuck', 'clarence',
+    'clark', 'clyde', 'cole', 'collin', 'colombian', 'conrad', 'cuban', 'culture',
+    'cynthia', 'dale', 'dalton', 'damon', 'dana', 'daniel', 'david', 'dawson',
+    'dean', 'devon', 'dewey', 'diana', 'dirk', 'dominic', 'donna', 'dori',
+    'drew', 'duncan', 'dutch', 'dylan', 'earl', 'eddy', 'edgar', 'edward',
+    'edwin', 'egyptian', 'elijah', 'eliot', 'elizabeth', 'english', 'ernst', 'ethnic',
+    'ethnicity', 'eugene', 'european', 'evan', 'fay', 'frank', 'franklin', 'frederick',
+    'french', 'gabriel', 'gary', 'george', 'german', 'gill', 'glen', 'glenn',
+    'graham', 'greek', 'gregory', 'gypsy', 'hamilton', 'hank', 'harvey', 'hawaiian',
+    'hector', 'helen', 'henry', 'herbert', 'herman', 'hillary', 'hindi', 'hindu',
+    'hispanic', 'howard', 'hume', 'indian', 'indigenous', 'ira', 'irish', 'irving',
+    'isaac', 'islam', 'islamic', 'italian', 'jack', 'jacob', 'jan', 'japanese',
+    'jason', 'jay', 'jean', 'jerome', 'jerry', 'jewish', 'jimmy', 'jock',
+    'joel', 'john', 'johnny', 'jonathan', 'jong', 'jordan', 'joseph', 'joshua',
+    'joyce', 'judith', 'julian', 'june', 'karen', 'kelly', 'kelvin', 'ken',
+    'kent', 'kirk', 'korean', 'lance', 'latino', 'lawrence', 'lea', 'lee',
+    'leigh', 'leo', 'leon', 'leonard', 'lin', 'lindsay', 'liza', 'lloyd',
+    'lorraine', 'lowell', 'luke', 'mac', 'mann', 'mara', 'marc', 'marcel',
+    'maria', 'marsh', 'martin', 'mary', 'matthew', 'mexican', 'michael', 'mick',
+    'mickey', 'mike', 'mitchell', 'molly', 'morton', 'murray', 'muslim', 'nancy',
+    'naomi', 'native', 'nick', 'norm', 'norma', 'norman', 'oliver', 'olivier',
+    'owen', 'pakistani', 'pandora', 'pascal', 'patrick', 'patty', 'paul', 'perry',
+    'persian', 'peter', 'philip', 'pierre', 'polish', 'presley', 'race', 'racial',
+    'raphael', 'rebecca', 'reid', 'ricardo', 'richard', 'rick', 'robbin', 'robert',
+    'robin', 'rod', 'rodger', 'roger', 'ron', 'ross', 'rupert', 'russell',
+    'russian', 'ruth', 'sally', 'samuel', 'sarah', 'saul', 'scandinavian', 'scott',
+    'semitic', 'seth', 'seymour', 'shannon', 'shaw', 'shawn', 'sherman', 'sidney',
+    'sikh', 'simon', 'sofia', 'somali', 'sonny', 'spanish', 'spencer', 'stanley',
+    'stephen', 'steven', 'stewart', 'stuart', 'sue', 'swedish', 'syrian', 'tad',
+    'tai', 'tamil', 'tammy', 'teresa', 'terry', 'thai', 'tibetan', 'timothy',
+    'toby', 'todd', 'tracy', 'trent', 'trey', 'troy', 'turkish', 'tyler',
+    'ukrainian', 'victor', 'victoria', 'vietnamese', 'wade', 'walter', 'warren', 'wayne',
+    'white', 'william', 'wilson', 'zionist',
+}
 # Recalibrated alongside AI_TAG_MIN_CONFIDENCE above for raw-cosine-similarity
 # scores; deliberately looser than that stricter storage-time filter since
 # this only screens raw predictions for search-time consideration, not final
@@ -253,6 +299,10 @@ def normalize_tags(tags: List[str]) -> List[str]:
         if len(normalized) >= MAX_TAGS_STORED:
             break
     return normalized
+
+
+def is_sensitive_auto_tag_label(label: str) -> bool:
+    return _normalize_token(label) in SENSITIVE_AUTO_TAG_LABELS
 
 
 def _coerce_confidence(value, source: str) -> float:
@@ -340,6 +390,8 @@ def curate_tag_records(records: List[Dict], *, max_tags: int = MAX_TAGS_STORED) 
         if not record:
             continue
         protected = record['source'] in {'user', 'stored'}
+        if not protected and is_sensitive_auto_tag_label(record['tag']):
+            continue
         if (
             not protected
             and (
@@ -451,7 +503,10 @@ def prediction_tags(metadata: Dict) -> List[str]:
             score = 0.0
         if score < PREDICTION_TAG_MIN_SCORE:
             continue
-        labels.append(str(item.get('label') or ''))
+        label = str(item.get('label') or '')
+        if is_sensitive_auto_tag_label(label):
+            continue
+        labels.append(label)
     return normalize_tags(labels)
 
 
@@ -476,11 +531,37 @@ def gps_presence_tags(metadata: Dict) -> List[str]:
     return []
 
 
+def _protected_sensitive_tag_set(metadata: Dict) -> set:
+    raw = metadata.get('tagMetadata', '[]')
+    try:
+        parsed = json.loads(raw or '[]') if isinstance(raw, str) else raw
+    except Exception:
+        parsed = []
+    protected = set()
+    for item in parsed if isinstance(parsed, list) else []:
+        if not isinstance(item, dict):
+            continue
+        tag = _normalize_token(str(item.get('tag') or item.get('label') or ''))
+        source = str(item.get('source') or '').strip()
+        if tag and source in {'user', 'stored'}:
+            protected.add(tag)
+    return protected
+
+
+def strip_sensitive_auto_tags(tags: List[str], metadata: Dict) -> List[str]:
+    protected = _protected_sensitive_tag_set(metadata)
+    return [
+        tag for tag in normalize_tags(tags)
+        if not is_sensitive_auto_tag_label(tag) or tag in protected
+    ]
+
+
 def strip_location_metadata_tags(tags: List[str], metadata: Dict) -> List[str]:
     location_values = _location_metadata_tag_set(metadata)
+    normalized = normalize_tags(tags)
     if not location_values:
-        return normalize_tags(tags)
-    return [tag for tag in normalize_tags(tags) if tag not in location_values]
+        return strip_sensitive_auto_tags(normalized, metadata)
+    return strip_sensitive_auto_tags([tag for tag in normalized if tag not in location_values], metadata)
 
 
 def visible_tags(metadata: Dict) -> List[str]:
@@ -505,7 +586,7 @@ def face_presence_tags(metadata: Dict) -> List[str]:
         tags.extend(['people', 'group', 'family', 'crowd'])
 
     ai_person_label = _normalize_token(str(metadata.get('aiPersonLabel') or ''))
-    if ai_person_label:
+    if ai_person_label and not is_sensitive_auto_tag_label(ai_person_label):
         tags.append(ai_person_label)
 
     return normalize_tags(tags)
@@ -528,7 +609,7 @@ def effective_tags(metadata: Dict) -> List[str]:
 
 
 def build_semantic_text(filename: str, metadata: Dict) -> str:
-    subject_tags = parse_json_list(metadata.get('subjectTags', '[]'))
+    subject_tags = strip_location_metadata_tags(parse_json_list(metadata.get('subjectTags', '[]')), metadata)
     location = location_tags(metadata)
     semantic_candidates = set(normalize_tags(subject_tags + location))
 
@@ -560,10 +641,10 @@ def build_semantic_text(filename: str, metadata: Dict) -> str:
 
 
 def build_semantic_layers(filename: str, metadata: Dict) -> Dict[str, List[str]]:
-    subject_tags = parse_json_list(metadata.get('subjectTags', '[]'))
+    subject_tags = strip_location_metadata_tags(parse_json_list(metadata.get('subjectTags', '[]')), metadata)
     if not subject_tags:
         subject_tags = effective_tags(metadata)
-    background_tags = parse_json_list(metadata.get('backgroundTags', '[]'))
+    background_tags = strip_location_metadata_tags(parse_json_list(metadata.get('backgroundTags', '[]')), metadata)
     weak_payload = []
     if isinstance(metadata.get('weakTags'), str):
         try:
@@ -577,10 +658,10 @@ def build_semantic_layers(filename: str, metadata: Dict) -> Dict[str, List[str]]
         if isinstance(item, dict)
     ]
     return {
-        'subjects': normalize_tags(subject_tags),
+        'subjects': strip_sensitive_auto_tags(subject_tags, metadata),
         'locations': location_tags(metadata),
-        'backgrounds': normalize_tags(background_tags),
-        'weak': normalize_tags(weak_tags),
+        'backgrounds': strip_sensitive_auto_tags(background_tags, metadata),
+        'weak': strip_sensitive_auto_tags(weak_tags, metadata),
     }
 
 

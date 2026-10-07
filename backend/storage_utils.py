@@ -47,7 +47,7 @@ from image_utils import (
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
-from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, normalize_tags
+from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, is_sensitive_auto_tag_label, normalize_tags
 import album_store
 import index_files
 import table_scan
@@ -3758,6 +3758,8 @@ def _confident_tag_filter(row: Dict):
 
     def keep(tag: str) -> bool:
         found = meta.get(tag)
+        if is_sensitive_auto_tag_label(tag):
+            return bool(found and found[1] in _PROTECTED_TAG_SOURCES)
         if found is None:
             return True
         conf, source = found
@@ -3816,7 +3818,12 @@ def _search_prediction_labels(raw, already: set) -> List[str]:
         except Exception:
             continue
         label = str(item.get('label') or '').strip()
-        if label and score >= SEARCH_INDEX_PREDICTION_MIN_SCORE and label not in already:
+        if (
+            label
+            and score >= SEARCH_INDEX_PREDICTION_MIN_SCORE
+            and label not in already
+            and not is_sensitive_auto_tag_label(label)
+        ):
             scored.append((score, label))
     scored.sort(key=lambda x: -x[0])
     out: List[str] = []
@@ -7821,6 +7828,8 @@ def _sanitize_client_predictions(value) -> List[Dict]:
         label = _normalize_tag_list([item.get('label')], limit=1)
         if not label:
             continue
+        if is_sensitive_auto_tag_label(label[0]):
+            continue
         try:
             score = float(item.get('score') or 0)
         except Exception:
@@ -8868,12 +8877,15 @@ def _apply_client_processing_results(
                 **ai_model_provenance,
             })
         elif ai_result.get('hasData') is True and model_ready:
-            tags = _normalize_tag_list(ai_result.get('tags'))
-            objects = _normalize_tag_list(ai_result.get('objects') or tags)
+            tags = [tag for tag in _normalize_tag_list(ai_result.get('tags')) if not is_sensitive_auto_tag_label(tag)]
+            objects = [tag for tag in _normalize_tag_list(ai_result.get('objects') or tags) if not is_sensitive_auto_tag_label(tag)]
             caption = _sanitize_client_text(ai_result.get('caption'), 512)
             ocr_text = _sanitize_client_text(ai_result.get('ocrText'), 2048)
             predictions = _sanitize_client_predictions(ai_result.get('predictions'))
-            person_label = _normalize_tag_list([ai_result.get('aiPersonLabel')], limit=1)
+            person_label = [
+                tag for tag in _normalize_tag_list([ai_result.get('aiPersonLabel')], limit=1)
+                if not is_sensitive_auto_tag_label(tag)
+            ]
             try:
                 person_score = float(ai_result.get('aiPersonScore') or 0)
             except Exception:
