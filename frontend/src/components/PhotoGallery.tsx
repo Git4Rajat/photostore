@@ -218,6 +218,58 @@ const getCanvasReadbackContext = (canvas: HTMLCanvasElement): CanvasRenderingCon
     canvas.getContext('2d', CANVAS_2D_READBACK_OPTIONS)
 );
 
+type DateFilterButtonProps = {
+    id: string;
+    label: string;
+    placeholder: string;
+    value: string;
+    onChange: (value: string) => void;
+};
+
+const formatDateFilterValue = (value: string): string => {
+    if (!value) return '';
+    const [year, month, day] = value.split('-');
+    if (!year || !month || !day) return value;
+    return `${day}/${month}/${year}`;
+};
+
+const DateFilterButton: React.FC<DateFilterButtonProps> = ({ id, label, placeholder, value, onChange }) => {
+    const inputRef = useRef<HTMLInputElement | null>(null);
+    const openPicker = () => {
+        const input = inputRef.current;
+        if (!input) return;
+        try {
+            input.showPicker?.();
+        } catch {
+            input.click();
+        }
+    };
+
+    return (
+        <div className="date-filter-button-wrap">
+            <button
+                type="button"
+                className="date-filter-button"
+                onClick={openPicker}
+                aria-label={label}
+            >
+                <CalendarDaysIcon className="toolbar-icon" />
+                <span>{formatDateFilterValue(value) || placeholder}</span>
+            </button>
+            <input
+                ref={inputRef}
+                id={id}
+                type="date"
+                className="date-filter-native"
+                value={value}
+                onChange={(e) => onChange(e.target.value)}
+                tabIndex={-1}
+                aria-hidden="true"
+            />
+        </div>
+    );
+};
+
 const configureTensorFlowCanvasReadback = (runtime: any) => {
     if (!runtime || typeof runtime !== 'object') {
         return;
@@ -5511,22 +5563,22 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
                                     </div>
                                     <div className="gallery-filter-field">
                                         <label className="gallery-menu-label" htmlFor="capture-start">Captured from</label>
-                                        <input
+                                        <DateFilterButton
                                             id="capture-start"
-                                            type="date"
-                                            className="field field-date"
+                                            label="Captured from"
+                                            placeholder="Choose start"
                                             value={captureStartDate}
-                                            onChange={(e) => setCaptureStartDate(e.target.value)}
+                                            onChange={setCaptureStartDate}
                                         />
                                     </div>
                                     <div className="gallery-filter-field">
                                         <label className="gallery-menu-label" htmlFor="capture-end">Captured to</label>
-                                        <input
+                                        <DateFilterButton
                                             id="capture-end"
-                                            type="date"
-                                            className="field field-date"
+                                            label="Captured to"
+                                            placeholder="Choose end"
                                             value={captureEndDate}
-                                            onChange={(e) => setCaptureEndDate(e.target.value)}
+                                            onChange={setCaptureEndDate}
                                         />
                                     </div>
                                     <div className="gallery-menu-row">

@@ -3367,6 +3367,51 @@ html[data-theme='light'] .notification-item.unread {
   width: 165px;
 }
 
+.date-filter-button-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.date-filter-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--tap-min);
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-lg);
+  background: var(--lg-surface-strong);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.date-filter-button:focus-visible {
+  outline: none;
+  border-color: rgba(30, 106, 225, 0.4);
+  box-shadow: var(--focus-ring);
+}
+
+.date-filter-button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.date-filter-native {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  border: 0;
+  pointer-events: none;
+}
+
 .album-controls {
   gap: 6px;
 }

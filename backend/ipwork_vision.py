@@ -27,7 +27,7 @@ import numpy as np
 
 import vision_utils
 from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
-from search_utils import PERSON_SCORE_THRESHOLD
+from search_utils import PERSON_SCORE_THRESHOLD, is_sensitive_auto_tag_label
 
 # Same vocabulary file the browser fetches at runtime (manifest.tagVocabularyUrl,
 # default frontend/public/models/browser-ai/vocab/tag-vocabulary.v1.json) --
@@ -118,7 +118,13 @@ def process_vision(user_id: str, filename: str, image_bytes: bytes) -> Optional[
     # change.
     scores = _vocab_embeddings @ image_vec
     top_k = min(DEFAULT_VOCAB_TOP_K, len(_vocab_labels))
-    top_indices = np.argsort(-scores)[:top_k]
+    top_indices = []
+    for idx in np.argsort(-scores):
+        if is_sensitive_auto_tag_label(_vocab_labels[int(idx)]):
+            continue
+        top_indices.append(int(idx))
+        if len(top_indices) >= top_k:
+            break
     predictions = [{'label': _vocab_labels[i], 'score': float(max(0.0, scores[i]))} for i in top_indices]
     tags = [p['label'] for p in predictions]
 
