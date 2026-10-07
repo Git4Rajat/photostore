@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
-import type { CaptureRange, MediaFilter, PhotoSortMode } from '../store';
+import type { CaptureRange, MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
@@ -13,12 +13,6 @@ const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
     { value: 'photo', label: 'Photos' },
     { value: 'video', label: 'Videos' },
-];
-
-const SORT_MODES: { value: PhotoSortMode; label: string }[] = [
-    { value: 'date', label: 'Date' },
-    { value: 'rating', label: 'Rating' },
-    { value: 'likes', label: 'Likes' },
 ];
 
 type ZoomLevel = 'days' | 'months' | 'years';
@@ -34,7 +28,7 @@ const clampGalleryTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(GALLER
 export const GalleryPage: React.FC = () => {
     const {
         photos, navigate, selectMany, photosLoading, hasMorePhotos,
-        loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, photoSortMode, setPhotoSortMode, captureRange, setCaptureRange, timeline,
+        loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,
         route, focusPhoto, selectMode, setSelectMode,
     } = useStore();
     const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
@@ -44,11 +38,14 @@ export const GalleryPage: React.FC = () => {
     // Months, then Years (replaces the old timeline rail).
     const [level, setLevel] = useState<ZoomLevel>('days');
     const [focusYear, setFocusYear] = useState<string | null>(null);
+    const [dateJump, setDateJump] = useState('');
+    const [filtersOpen, setFiltersOpen] = useState(false);
 
     const depth = useRef(0);
     const gridRef = useRef<HTMLDivElement>(null);
     const sentinelRef = useRef<HTMLDivElement>(null);
     const pinchRef = useRef<{ dist: number; tile: number } | null>(null);
+    const pendingScrollIdRef = useRef<string | null>(null);
 
     // Zoom-out steps: shrink tiles until the floor, then Days → Months → Years.
     const zoomOut = () => {
@@ -106,6 +103,9 @@ export const GalleryPage: React.FC = () => {
         setFocusYear(null);
         if (captureRangeStoreRef.current) setCaptureRange(null);
     }, [route, setCaptureRange]);
+    useEffect(() => {
+        if (level !== 'days') setFiltersOpen(false);
+    }, [level]);
 
     // Refresh the grid whenever an upload session finishes so new photos
     // appear. The cached sort-index (see localSortIndex.ts) must be dropped
@@ -133,6 +133,23 @@ export const GalleryPage: React.FC = () => {
         observer.observe(node);
         return () => observer.disconnect();
     }, [hasMorePhotos, loadMorePhotos, photos.length, level]);
+
+    const scrollToTile = (filename: string | null) => {
+        if (!filename || !gridRef.current) return;
+        const tile = Array.from(gridRef.current.querySelectorAll<HTMLElement>('[data-tile-id]'))
+            .find((el) => el.dataset.tileId === filename);
+        if (tile) {
+            tile.scrollIntoView({ block: 'start', behavior: 'smooth' });
+            pendingScrollIdRef.current = null;
+        }
+    };
+
+    useEffect(() => {
+        const target = pendingScrollIdRef.current;
+        if (!target || !gridRef.current) return;
+        const frame = window.requestAnimationFrame(() => scrollToTile(target));
+        return () => window.cancelAnimationFrame(frame);
+    }, [photos]);
 
     const onDrop = (e: React.DragEvent) => {
         e.preventDefault();
@@ -167,10 +184,23 @@ export const GalleryPage: React.FC = () => {
     const openYear = (y: string) => { setFocusYear(y); setLevel('months'); };
     const openMonth = (range: CaptureRange, y: string) => { setFocusYear(y); setCaptureRange(range); setLevel('days'); };
     const resetToTop = () => { setLevel('days'); setFocusYear(null); setCaptureRange(null); };
+    const handleDateJump = (value: string) => {
+        setDateJump(value);
+        if (!value) return;
+        setLevel('days');
+        setFocusYear(null);
+        void jumpToGalleryDate(value).then((filename) => {
+            pendingScrollIdRef.current = filename;
+            window.requestAnimationFrame(() => scrollToTile(filename));
+        });
+    };
 
     const countLabel = totalPhotos !== null
         ? `${totalPhotos.toLocaleString()} photo${totalPhotos === 1 ? '' : 's'}`
         : `${photos.length}${hasMorePhotos ? '+' : ''} photos`;
+    const activeFilterCount = (galleryFilters.rating > 0 ? 1 : 0)
+        + (galleryFilters.likedOnly ? 1 : 0)
+        + (mediaFilter !== 'all' ? 1 : 0);
 
     const zoomControl = (
         <div className="pt-zoom" role="group" aria-label="Zoom level">
@@ -181,6 +211,37 @@ export const GalleryPage: React.FC = () => {
                 <MagnifyingGlassPlusIcon className="toolbar-icon" />
             </button>
         </div>
+    );
+
+    const renderFilterControls = () => (
+        <>
+            <div className="mock-seg pt-rating-filter" role="group" aria-label="Rating">
+                {[0, 1, 2, 3, 4, 5].map((rating) => (
+                    <button key={rating} type="button" className={galleryFilters.rating === rating ? 'active' : undefined} onClick={() => setGalleryRating(rating)}>
+                        {rating === 0 ? 'All' : <><StarIcon className="seg-icon" fill="currentColor" /> {rating}</>}
+                    </button>
+                ))}
+            </div>
+            <button type="button" className={`btn pt-like-filter${galleryFilters.likedOnly ? ' active' : ''}`} aria-pressed={galleryFilters.likedOnly} onClick={() => setGalleryLikedOnly(!galleryFilters.likedOnly)}>
+                <HeartIcon className="toolbar-icon" fill={galleryFilters.likedOnly ? 'currentColor' : 'none'} /> Likes
+            </button>
+            <input
+                className="pt-date-jump"
+                type="date"
+                aria-label="Jump to date"
+                value={dateJump}
+                min={timeline?.firstDate ?? undefined}
+                max={timeline?.lastDate ?? undefined}
+                onChange={(e) => handleDateJump(e.target.value)}
+            />
+            <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
+                {MEDIA_FILTERS.map((f) => (
+                    <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} onClick={() => setMediaFilter(f.value)}>
+                        {f.label}
+                    </button>
+                ))}
+            </div>
+        </>
     );
 
     const scopeCrumbs = (level !== 'days' || captureRange) ? (
@@ -233,21 +294,26 @@ export const GalleryPage: React.FC = () => {
                 </div>
                 <div className="pt-toolbar-actions">
                     {level === 'days' && (
-                        <div className="mock-seg pt-sort-mode" role="group" aria-label="Sort photos">
-                            {SORT_MODES.map((mode) => (
-                                <button key={mode.value} type="button" className={photoSortMode === mode.value ? 'active' : undefined} onClick={() => setPhotoSortMode(mode.value)}>
-                                    {mode.label}
-                                </button>
-                            ))}
+                        <div className="pt-filter-inline">
+                            {renderFilterControls()}
                         </div>
                     )}
                     {level === 'days' && (
-                        <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
-                            {MEDIA_FILTERS.map((f) => (
-                                <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} onClick={() => setMediaFilter(f.value)}>
-                                    {f.label}
-                                </button>
-                            ))}
+                        <div className="pt-filter-menu">
+                            <button
+                                type="button"
+                                className={`btn pt-filter-button${activeFilterCount > 0 ? ' active' : ''}`}
+                                aria-haspopup="true"
+                                aria-expanded={filtersOpen}
+                                onClick={() => setFiltersOpen((open) => !open)}
+                            >
+                                <FilterIcon className="toolbar-icon" /> Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
+                            </button>
+                            {filtersOpen && (
+                                <div className="pt-filter-popover">
+                                    {renderFilterControls()}
+                                </div>
+                            )}
                         </div>
                     )}
                     {zoomControl}

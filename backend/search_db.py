@@ -52,7 +52,7 @@ from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 'sqlite-v5'  # v2: gallery columns; v3: AI tag floor; v4: sort order indexes; v5: no location pseudo-tags
+SCHEMA_VERSION = 'sqlite-v5'  # v2: gallery columns; v3: AI tag floor; v4: sort order indexes; v5: no location pseudo-tags + gallery filters
 SEARCH_DB_DIR = os.getenv('SEARCH_DB_DIR', '').strip() or os.path.join(tempfile.gettempdir(), 'photostore-search')
 # Cap on candidates pulled per query (bm25-ranked); the scorer then ranks them.
 CANDIDATE_LIMIT = int(os.getenv('SEARCH_DB_CANDIDATE_LIMIT', '4000'))
@@ -257,6 +257,8 @@ class DatabaseBuilder:
         conn.execute('CREATE INDEX rows_rating_order ON rows(rating DESC, likes DESC, capture_ts DESC, filename ASC)')
         conn.execute('CREATE INDEX rows_likes_order ON rows(likes DESC, rating DESC, capture_ts DESC, filename ASC)')
         conn.execute('CREATE INDEX rows_capture_range_order ON rows(capture_day, capture_ts DESC, filename ASC)')
+        conn.execute('CREATE INDEX rows_rating_capture_order ON rows(rating, capture_ts DESC, filename ASC)')
+        conn.execute('CREATE INDEX rows_likes_capture_order ON rows(likes, capture_ts DESC, filename ASC)')
         conn.execute('CREATE INDEX row_people_pid ON row_people(person_id)')
         conn.execute('INSERT INTO meta VALUES(?, ?)', (
             'location_terms', json.dumps(sorted(self._terms, key=len, reverse=True))))
@@ -591,7 +593,7 @@ class SearchDatabase:
     def list_page(
         self, *, sort: str = 'capture', offset: int = 0, limit: int = 24,
         capture_start_day: Optional[int] = None, capture_end_day: Optional[int] = None,
-        name_contains: str = '', person_id: str = '',
+        name_contains: str = '', person_id: str = '', rating: int = 0, min_rating: int = 0, min_likes: int = 0,
     ) -> Tuple[List[str], int]:
         """(filenames for one page, total matching) in the gallery's deterministic
         order -- same semantics as ordering_utils.order_photo_entries. ``name_contains`` keeps only
@@ -608,12 +610,51 @@ class SearchDatabase:
             escaped = needle.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
             where += (' AND ' if where else ' WHERE ') + "filename LIKE ? ESCAPE '\\'"
             args = [*args, f'%{escaped}%']
+        if int(rating or 0) > 0:
+            where += (' AND ' if where else ' WHERE ') + 'rating = ?'
+            args = [*args, int(rating)]
+        elif int(min_rating or 0) > 0:
+            where += (' AND ' if where else ' WHERE ') + 'rating >= ?'
+            args = [*args, int(min_rating)]
+        if int(min_likes or 0) > 0:
+            where += (' AND ' if where else ' WHERE ') + 'likes >= ?'
+            args = [*args, int(min_likes)]
         order = self._LIST_ORDER.get(sort, self._LIST_ORDER['date'])
         conn = self._conn()
         total = conn.execute(f'SELECT COUNT(*) FROM {source}{where}', args).fetchone()[0]
         names = [r[0] for r in conn.execute(
             f'SELECT filename FROM {source}{where} ORDER BY {order} LIMIT ? OFFSET ?', [*args, int(limit), max(0, int(offset))])]
         return names, int(total)
+
+    def capture_date_position(
+        self, *, date_end_ts: float, rating: int = 0, min_rating: int = 0, min_likes: int = 0,
+    ) -> Tuple[int, int, str]:
+        """Offset and filename of the first capture-ordered row at or before
+        ``date_end_ts``. Used by the gallery date picker as a scroll target, not
+        as a date filter."""
+        where = ''
+        args: List[object] = []
+        if int(rating or 0) > 0:
+            where += (' AND ' if where else ' WHERE ') + 'rating = ?'
+            args.append(int(rating))
+        elif int(min_rating or 0) > 0:
+            where += (' AND ' if where else ' WHERE ') + 'rating >= ?'
+            args.append(int(min_rating))
+        if int(min_likes or 0) > 0:
+            where += (' AND ' if where else ' WHERE ') + 'likes >= ?'
+            args.append(int(min_likes))
+        conn = self._conn()
+        total = int(conn.execute(f'SELECT COUNT(*) FROM rows{where}', args).fetchone()[0])
+        if total <= 0:
+            return 0, 0, ''
+        before_where = (where + ' AND ' if where else ' WHERE ') + 'capture_ts > ?'
+        offset = int(conn.execute(f'SELECT COUNT(*) FROM rows{before_where}', [*args, float(date_end_ts)]).fetchone()[0])
+        offset = max(0, min(offset, total - 1))
+        row = conn.execute(
+            f'SELECT filename FROM rows{where} ORDER BY capture_ts DESC, filename ASC LIMIT 1 OFFSET ?',
+            [*args, offset],
+        ).fetchone()
+        return offset, total, str(row[0] if row else '')
 
     def all_filenames(self) -> set:
         """Every filename in the library database (used to reconcile against the metadata table)."""
