@@ -7,6 +7,7 @@ the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, time, timezone
 
 from flask import Blueprint
 
@@ -436,6 +437,9 @@ def list_photos():
         sort = app.request.args.get('sort', 'capture')
         offset = int(app.request.args.get('offset', '0'))
         limit = int(app.request.args.get('limit', '24'))
+        rating = max(0, min(5, int(app.request.args.get('rating', 0))))
+        min_rating = max(0, min(5, int(app.request.args.get('minRating', 0))))
+        min_likes = max(0, int(app.request.args.get('minLikes', 0)))
     except ValueError:
         return app.jsonify({'error': 'Invalid paging parameters.'}), 400
 
@@ -461,7 +465,7 @@ def list_photos():
         filenames, total = db.list_page(
             sort=sort, offset=offset, limit=limit,
             capture_start_day=app._day_ordinal(capture_start), capture_end_day=app._day_ordinal(capture_end),
-            name_contains=name_contains, person_id=person_id,
+            name_contains=name_contains, person_id=person_id, rating=rating, min_rating=min_rating, min_likes=min_likes,
         )
     except Exception as exc:
         app.app.logger.exception('Photo list query failed')
@@ -534,6 +538,38 @@ def list_photos():
     if search_db.is_building(user_id):
         payload['indexPartial'] = True       # first build still running: more photos will appear
     return app.jsonify(payload)
+
+
+@photos_bp.route('/photos/date-position', methods=['GET'])
+@photos_bp.route('/photos/date-position/', methods=['GET'])
+@photos_bp.route('/api/photos/date-position', methods=['GET'])
+@photos_bp.route('/api/photos/date-position/', methods=['GET'])
+def photo_date_position():
+    try:
+        raw_date = (app.request.args.get('date') or '').strip()
+        day = date.fromisoformat(raw_date)
+        rating = max(0, min(5, int(app.request.args.get('rating', 0))))
+        min_rating = max(0, min(5, int(app.request.args.get('minRating', 0))))
+        min_likes = max(0, int(app.request.args.get('minLikes', 0)))
+    except ValueError:
+        return app.jsonify({'error': 'Invalid date or filter parameters.'}), 400
+
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    db = app._open_library_db(user_id)
+    if db is None:
+        return app.jsonify({'offset': 0, 'filename': '', 'total': 0, 'indexBuilding': True})
+    try:
+        end_ts = datetime.combine(day, time.max, tzinfo=timezone.utc).timestamp()
+        offset, total, filename = db.capture_date_position(
+            date_end_ts=end_ts, rating=rating, min_rating=min_rating, min_likes=min_likes,
+        )
+    except Exception as exc:
+        app.app.logger.exception('Photo date-position query failed')
+        search_db.report_failure(db, exc)
+        return app.jsonify({'error': 'Unable to read photo metadata.', 'retryable': True}), 503
+    return app.jsonify({'offset': offset, 'filename': filename, 'total': total})
 
 @photos_bp.route('/photos/processing-status', methods=['GET'])
 @photos_bp.route('/photos/processing-status/', methods=['GET'])

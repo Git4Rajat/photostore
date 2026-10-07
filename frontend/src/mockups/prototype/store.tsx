@@ -2,9 +2,10 @@ import { onIndexReady, reportIndexBuilding } from '../../services/indexBuilding'
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
 import { get, getExtras, post } from '../../services/apiClient';
-import { getLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, type SortIndexRow } from '../../services/localSortIndex';
+import { getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
+import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
 import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/gridCapacity';
@@ -117,30 +118,26 @@ const provisionalPhoto = (row: SortIndexRow, token: MediaToken | null): Photo =>
     };
 };
 
-const sortRowsForGallery = (rows: SortIndexRow[], mode: PhotoSortMode): SortIndexRow[] => (
-    [...rows].sort((a, b) => {
-        const ar = Number(a.rating) || 0;
-        const br = Number(b.rating) || 0;
-        const al = Number(a.likes) || 0;
-        const bl = Number(b.likes) || 0;
-        const rawAt = a.captureDate ? new Date(a.captureDate).getTime() : 0;
-        const rawBt = b.captureDate ? new Date(b.captureDate).getTime() : 0;
-        const at = Number.isFinite(rawAt) ? rawAt : 0;
-        const bt = Number.isFinite(rawBt) ? rawBt : 0;
-        if (mode === 'rating') {
-            if (ar !== br) return br - ar;
-            if (al !== bl) return bl - al;
-        } else if (mode === 'likes') {
-            if (al !== bl) return bl - al;
-            if (ar !== br) return br - ar;
-        }
-        if (at !== bt) return bt - at;
-        return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
+const rowCaptureTime = (row: SortIndexRow): number => {
+    const raw = row.captureDate ? new Date(row.captureDate).getTime() : 0;
+    return Number.isFinite(raw) ? raw : 0;
+};
+
+const filterRowsForGallery = (rows: SortIndexRow[], filters: GalleryFilters): SortIndexRow[] => (
+    rows.filter((row) => {
+        if (filters.rating > 0 && (Number(row.rating) || 0) !== filters.rating) return false;
+        if (filters.likedOnly && (Number(row.likes) || 0) <= 0) return false;
+        return true;
     })
 );
 
-const backendSortParam = (mode: PhotoSortMode): string => (
-    mode === 'rating' ? 'rating' : mode === 'likes' ? 'likes' : 'capture'
+const sortRowsForGallery = (rows: SortIndexRow[]): SortIndexRow[] => (
+    [...rows].sort((a, b) => {
+        const at = rowCaptureTime(a);
+        const bt = rowCaptureTime(b);
+        if (at !== bt) return bt - at;
+        return a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0;
+    })
 );
 
 interface PeoplePageRow { personId: string; name: string; isNamed: boolean; faceCount: number; coverFaceId?: string }
@@ -236,7 +233,11 @@ interface ViewerState {
 }
 
 export type MediaFilter = 'all' | 'photo' | 'video';
-export type PhotoSortMode = 'date' | 'rating' | 'likes';
+
+export interface GalleryFilters {
+    rating: number;
+    likedOnly: boolean;
+}
 
 export interface CaptureRange {
     // Inclusive ISO date bounds (yyyy-mm-dd) passed to /photos as
@@ -291,8 +292,10 @@ interface Store {
     // gallery filters / timeline
     mediaFilter: MediaFilter;
     setMediaFilter: (filter: MediaFilter) => void;
-    photoSortMode: PhotoSortMode;
-    setPhotoSortMode: (mode: PhotoSortMode) => void;
+    galleryFilters: GalleryFilters;
+    setGalleryRating: (rating: number) => void;
+    setGalleryLikedOnly: (likedOnly: boolean) => void;
+    jumpToGalleryDate: (date: string) => Promise<string | null>;
     captureRange: CaptureRange | null;
     setCaptureRange: (range: CaptureRange | null) => void;
     timeline: TimelineSummary | null;
@@ -423,11 +426,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [hasMorePhotos, setHasMorePhotos] = useState<boolean>(true);
     const [totalPhotos, setTotalPhotos] = useState<number | null>(null);
     const [mediaFilter, setMediaFilterState] = useState<MediaFilter>('all');
-    const [photoSortMode, setPhotoSortModeState] = useState<PhotoSortMode>('date');
+    const [galleryFilters, setGalleryFiltersState] = useState<GalleryFilters>({ rating: 0, likedOnly: false });
     const [captureRange, setCaptureRangeState] = useState<CaptureRange | null>(null);
     const [timeline, setTimeline] = useState<TimelineSummary | null>(null);
     const captureRangeRef = useRef<CaptureRange | null>(null);
-    const photoSortModeRef = useRef<PhotoSortMode>('date');
+    const galleryFiltersRef = useRef<GalleryFilters>({ rating: 0, likedOnly: false });
     const photoOffsetRef = useRef(0);
     const photoLoadingRef = useRef(false);
     const photoHasMoreRef = useRef(true);
@@ -522,11 +525,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const fetchPhotosViaLegacyEndpoint = useCallback(async (offset: number, reset: boolean) => {
         const range = captureRangeRef.current;
         const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
-        const sort = backendSortParam(photoSortModeRef.current);
+        const filters = galleryFiltersRef.current;
+        const filterQuery = `${filters.rating > 0 ? `&rating=${filters.rating}` : ''}${filters.likedOnly ? '&minLikes=1' : ''}`;
         const token = getCachedMediaToken();
         const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
         const res = await get<{ photos?: BackendPhoto[]; total?: number; indexBuilding?: boolean; indexPartial?: boolean }>(
-            `/photos?sort=${sort}&offset=${offset}&limit=${pageSize}${rangeQuery}${token ? '&directMedia=1' : ''}`,
+            `/photos?sort=capture&offset=${offset}&limit=${pageSize}${rangeQuery}${filterQuery}${token ? '&directMedia=1' : ''}`,
         );
         reportIndexBuilding('gallery', Boolean(res?.indexBuilding || res?.indexPartial));
         const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
@@ -564,7 +568,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const range = captureRangeRef.current;
             const startMs = range?.start ? new Date(range.start).getTime() : null;
             const endMs = range?.end ? new Date(range.end).getTime() : null;
-            const filtered = (startMs === null && endMs === null)
+            const rangeFiltered = (startMs === null && endMs === null)
                 ? sortIndex
                 : sortIndex.filter((row) => {
                     if (!row.captureDate) return false;
@@ -574,7 +578,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     if (endMs !== null && t > endMs) return false;
                     return true;
                 });
-            const sorted = sortRowsForGallery(filtered, photoSortModeRef.current);
+            const sorted = sortRowsForGallery(filterRowsForGallery(rangeFiltered, galleryFiltersRef.current));
             const total = sorted.length;
             // With the media token, thumbnails cost no backend calls, so load as
             // many tiles as the screen needs (a few viewports' worth) per step.
@@ -680,14 +684,122 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const setMediaFilter = useCallback((filter: MediaFilter) => setMediaFilterState(filter), []);
 
-    const setPhotoSortMode = useCallback((mode: PhotoSortMode) => {
-        if (photoSortModeRef.current === mode) return;
-        photoSortModeRef.current = mode;
-        setPhotoSortModeState(mode);
+    const setGalleryFilters = useCallback((filters: GalleryFilters) => {
+        galleryFiltersRef.current = filters;
+        setGalleryFiltersState(filters);
         photoOffsetRef.current = 0;
         photoHasMoreRef.current = true;
         void fetchPhotos(true);
     }, [fetchPhotos]);
+
+    const setGalleryRating = useCallback((rating: number) => {
+        const next = Math.max(0, Math.min(5, Math.floor(Number(rating) || 0)));
+        if (galleryFiltersRef.current.rating === next) return;
+        setGalleryFilters({ ...galleryFiltersRef.current, rating: next });
+    }, [setGalleryFilters]);
+
+    const setGalleryLikedOnly = useCallback((likedOnly: boolean) => {
+        if (galleryFiltersRef.current.likedOnly === likedOnly) return;
+        setGalleryFilters({ ...galleryFiltersRef.current, likedOnly });
+    }, [setGalleryFilters]);
+
+    const jumpToGalleryDate = useCallback(async (date: string): Promise<string | null> => {
+        const clean = String(date || '').trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(clean)) return null;
+        const endMs = new Date(`${clean}T23:59:59.999Z`).getTime();
+        if (!Number.isFinite(endMs)) return null;
+        if (photoLoadingRef.current) return null;
+
+        captureRangeRef.current = null;
+        setCaptureRangeState(null);
+        photoOffsetRef.current = 0;
+        photoHasMoreRef.current = true;
+        photoLoadingRef.current = true;
+        setPhotosLoading(true);
+
+        try {
+            const pageSize = pageSizeForCapacity(measureGridCapacity());
+            const [sortIndex, token] = await Promise.all([
+                withIndexRetry(getLocalSortIndex),
+                getMediaToken().catch(() => null),
+            ]);
+            if (!sortIndex) throw new Error('sort index unavailable');
+
+            const sorted = sortRowsForGallery(filterRowsForGallery(sortIndex, galleryFiltersRef.current));
+            if (!sorted.length) {
+                setPhotos([]);
+                setTotalPhotos(0);
+                photoHasMoreRef.current = false;
+                setHasMorePhotos(false);
+                return null;
+            }
+            let offset = sorted.findIndex((row) => rowCaptureTime(row) <= endMs);
+            if (offset < 0) offset = sorted.length - 1;
+            const pageRows = sorted.slice(offset, offset + pageSize);
+            const pageFilenames = pageRows.map((row) => row.filename);
+            const target = pageRows[0]?.filename ?? null;
+            photoOffsetRef.current = offset + pageFilenames.length;
+            photoHasMoreRef.current = offset + pageFilenames.length < sorted.length;
+            setHasMorePhotos(photoHasMoreRef.current);
+            setTotalPhotos(sorted.length);
+
+            if (token && pageRows.length) {
+                setPhotos(pageRows.map((row) => provisionalPhoto(row, token)));
+                await Promise.all(chunk(pageFilenames, ENRICH_CHUNK).map(async (names) => {
+                    const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: true })
+                        .catch(() => null);
+                    if (!res) return;
+                    const byFilename = new Map((res?.photos ?? []).map((p) => [p.filename, p]));
+                    const enriched = new Map<string, Photo>();
+                    for (const f of names) {
+                        const b = byFilename.get(f);
+                        if (b) enriched.set(f, mapPhoto(b, token));
+                    }
+                    const nameSet = new Set(names);
+                    setPhotos((prev) => prev
+                        .filter((p) => !nameSet.has(p.id) || enriched.has(p.id))
+                        .map((p) => enriched.get(p.id) ?? p));
+                }));
+            } else {
+                const lookupRes = pageFilenames.length
+                    ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames })
+                    : { photos: [] };
+                const byFilename = new Map((lookupRes?.photos ?? []).map((p) => [p.filename, p]));
+                setPhotos(pageFilenames
+                    .map((f) => byFilename.get(f))
+                    .filter((p): p is BackendPhoto => Boolean(p))
+                    .map((p) => mapPhoto(p, null)));
+            }
+            return target;
+        } catch {
+            try {
+                const filters = galleryFiltersRef.current;
+                const token = getCachedMediaToken();
+                const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
+                const res = await get<{ offset?: number; filename?: string; total?: number; indexBuilding?: boolean; indexPartial?: boolean }>(
+                    `/photos/date-position?date=${encodeURIComponent(clean)}${filters.rating > 0 ? `&rating=${filters.rating}` : ''}${filters.likedOnly ? '&minLikes=1' : ''}`,
+                );
+                reportIndexBuilding('gallery', Boolean(res?.indexBuilding || res?.indexPartial));
+                if (typeof res?.total === 'number' && res.total <= 0) {
+                    setPhotos([]);
+                    setTotalPhotos(0);
+                    photoHasMoreRef.current = false;
+                    setHasMorePhotos(false);
+                    return null;
+                }
+                const offset = Math.max(0, Number(res?.offset) || 0);
+                await fetchPhotosViaLegacyEndpoint(offset, true);
+                photoHasMoreRef.current = offset + pageSize < (res?.total ?? photoOffsetRef.current);
+                setHasMorePhotos(photoHasMoreRef.current);
+                return res?.filename ?? null;
+            } catch {
+                return null;
+            }
+        } finally {
+            photoLoadingRef.current = false;
+            setPhotosLoading(false);
+        }
+    }, [fetchPhotosViaLegacyEndpoint]);
 
     // The id sequence a gallery-backed viewer slides through: the loaded photos
     // in the current media filter. It grows as more pages load.
@@ -930,9 +1042,45 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         });
     }, []);
 
+    const adjustPeopleCountsForPhotos = useCallback((list: Photo[], delta: number) => {
+        const counts = new Map<string, number>();
+        for (const photo of list) {
+            const personIds = Array.from(new Set(photo.personIds ?? []));
+            for (const personId of personIds) counts.set(personId, (counts.get(personId) ?? 0) + delta);
+        }
+        if (!counts.size) return;
+        const patch = (person: Person): Person => {
+            const change = counts.get(person.id) ?? 0;
+            if (!change) return person;
+            return { ...person, faceCount: Math.max(0, (person.faceCount ?? 0) + change) };
+        };
+        setPeople((prev) => prev.map(patch).filter((p) => p.name || (p.faceCount ?? 0) > 0));
+        setExtraPeople((prev) => {
+            let changed = false;
+            const next: Record<string, Person> = {};
+            for (const [id, person] of Object.entries(prev)) {
+                const patched = patch(person);
+                if (patched !== person) changed = true;
+                if (patched.name || (patched.faceCount ?? 0) > 0) next[id] = patched;
+            }
+            return changed ? next : prev;
+        });
+    }, []);
+
     const removeFromEverywhere = useCallback((ids: string[]) => {
         const set = new Set(ids);
         setPhotos((prev) => prev.filter((p) => !set.has(p.id)));
+        setExtraPhotos((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const id of ids) {
+                if (id in next) {
+                    delete next[id];
+                    changed = true;
+                }
+            }
+            return changed ? next : prev;
+        });
         // Albums are server-managed (deletion cascades server-side); just prune
         // the client-side album-photos cache so open albums reflect the removal.
         setAlbumPhotos((prev) => {
@@ -956,26 +1104,36 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const set = new Set(ids);
         // Optimistically move the photos back from the local trash cache; roll
         // back if the server rejects the restore.
-        let moved: Photo[] = [];
-        setTrash((prev) => {
-            moved = prev.filter((t) => set.has(t.photo.id)).map((t) => t.photo);
-            if (moved.length) setPhotos((cur) => [...moved, ...cur]);
-            return prev.filter((t) => !set.has(t.photo.id));
-        });
+        const trashed = trash.filter((t) => set.has(t.photo.id)).map((t) => t.photo);
+        const moved = trashed.length ? trashed : photosByIds(ids);
+        if (moved.length) setPhotos((cur) => [...moved, ...cur]);
+        setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
+        invalidateLocalSortIndex();
+        invalidateLocalPeopleIndex();
+        invalidateLocalAlbumsIndex();
+        adjustPeopleCountsForPhotos(moved, 1);
+        if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : prev + moved.length));
         void post('/photos/trash/restore', { filenames: ids }).catch(() => {
             const movedSet = new Set(moved.map((p) => p.id));
             setPhotos((cur) => cur.filter((p) => !movedSet.has(p.id)));
+            adjustPeopleCountsForPhotos(moved, -1);
+            if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : Math.max(0, prev - moved.length)));
             setTrash((prev) => [...moved.map((photo) => ({ photo, purgesInDays: 30 })), ...prev]);
             toast('Couldn’t restore photos', undefined, undefined, 'error');
         });
-    }, [toast]);
+    }, [adjustPeopleCountsForPhotos, photosByIds, toast, trash]);
 
     const deletePhotos = useCallback(
         (ids: string[]) => {
             if (!ids.length) return;
             const doomed = photosByIds(ids);
             setTrash((prev) => [...doomed.map((photo) => ({ photo, purgesInDays: 30 })), ...prev]);
+            removeLocalSortIndexRows(ids);
+            invalidateLocalPeopleIndex();
+            invalidateLocalAlbumsIndex();
+            adjustPeopleCountsForPhotos(doomed, -1);
             removeFromEverywhere(ids);
+            setTotalPhotos((prev) => (prev === null ? prev : Math.max(0, prev - ids.length)));
             setSelection([]);
             toast(
                 `Deleted ${ids.length} photo${ids.length > 1 ? 's' : ''}`,
@@ -987,10 +1145,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const set = new Set(ids);
                 setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
                 setPhotos((cur) => [...doomed, ...cur]);
+                invalidateLocalSortIndex();
+                adjustPeopleCountsForPhotos(doomed, 1);
+                setTotalPhotos((prev) => (prev === null ? prev : prev + ids.length));
                 toast('Couldn’t delete photos', undefined, undefined, 'error');
             });
         },
-        [photosByIds, removeFromEverywhere, toast, restorePhotos],
+        [photosByIds, adjustPeopleCountsForPhotos, removeFromEverywhere, toast, restorePhotos],
     );
 
     const reloadTrash = useCallback(async () => {
@@ -1020,14 +1181,22 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const restoreAllTrash = useCallback(() => {
         const snapshot = trash;
         setTrash([]);
-        setPhotos((cur) => [...snapshot.map((t) => t.photo), ...cur]);
+        const moved = snapshot.map((t) => t.photo);
+        setPhotos((cur) => [...moved, ...cur]);
+        invalidateLocalSortIndex();
+        invalidateLocalPeopleIndex();
+        invalidateLocalAlbumsIndex();
+        adjustPeopleCountsForPhotos(moved, 1);
+        if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : prev + moved.length));
         void post('/photos/trash/restore-all', {})
             .then(() => toast('Restored everything from Recently Deleted'))
             .catch(() => {
                 setTrash(snapshot);
+                adjustPeopleCountsForPhotos(moved, -1);
+                if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : Math.max(0, prev - moved.length)));
                 toast('Couldn’t restore everything', undefined, undefined, 'error');
             });
-    }, [trash, toast]);
+    }, [adjustPeopleCountsForPhotos, trash, toast]);
 
     const purgePhoto = useCallback((id: string) => {
         const snapshot = trash;
@@ -1470,8 +1639,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const previous = people.find((p) => p.id === id)?.name ?? null;
         setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: trimmed || null } : p)));
         setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: trimmed || null } } : prev));
+        invalidateLocalPeopleIndex();
         void faceService.labelPerson(id, trimmed).catch(() => {
             setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: previous } : p)));
+            setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: previous } } : prev));
+            invalidateLocalPeopleIndex();
             toast('Couldn’t save name', undefined, undefined, 'error');
         });
     }, [people, toast]);
@@ -1479,8 +1651,34 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const mergePeople = useCallback(
         (sourceId: string, targetId: string) => {
             // Optimistically drop the source cluster; the target absorbs it.
-            const removed = people.find((p) => p.id === sourceId);
+            const removed = people.find((p) => p.id === sourceId) ?? extraPeople[sourceId];
+            const movedPhotos = personPhotos[sourceId] ?? [];
             setPeople((prev) => prev.filter((p) => p.id !== sourceId));
+            setExtraPeople((prev) => {
+                const next = { ...prev };
+                delete next[sourceId];
+                if (next[targetId] && removed) next[targetId] = { ...next[targetId], faceCount: (next[targetId].faceCount ?? 0) + (removed.faceCount ?? 0) };
+                return next;
+            });
+            setPeople((prev) => prev.map((p) => (p.id === targetId && removed ? { ...p, faceCount: (p.faceCount ?? 0) + (removed.faceCount ?? 0) } : p)));
+            if (movedPhotos.length) {
+                setPersonPhotos((prev) => {
+                    const target = prev[targetId] ?? [];
+                    const seen = new Set(target.map((p) => p.id));
+                    const merged = [...target, ...movedPhotos.filter((p) => !seen.has(p.id))];
+                    const next = { ...prev, [targetId]: merged };
+                    delete next[sourceId];
+                    return next;
+                });
+            } else {
+                setPersonPhotos((prev) => {
+                    if (!(sourceId in prev)) return prev;
+                    const next = { ...prev };
+                    delete next[sourceId];
+                    return next;
+                });
+            }
+            invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, [sourceId])
                 .then(() => {
                     toast('People merged');
@@ -1488,10 +1686,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 })
                 .catch(() => {
                     if (removed) setPeople((prev) => [...prev, removed]);
+                    invalidateLocalPeopleIndex();
                     toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
         },
-        [people, fetchPeople, toast],
+        [people, extraPeople, personPhotos, fetchPeople, toast],
     );
 
     // Multi-select merge from the People grid: several source clusters into
@@ -1504,7 +1703,38 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             if (!ids.length) return;
             const removedSet = new Set(ids);
             const removed = people.filter((p) => removedSet.has(p.id));
+            const movedCount = removed.reduce((sum, p) => sum + (p.faceCount ?? 0), 0);
             setPeople((prev) => prev.filter((p) => !removedSet.has(p.id)));
+            setExtraPeople((prev) => {
+                const next = { ...prev };
+                for (const id of ids) delete next[id];
+                if (next[targetId]) next[targetId] = { ...next[targetId], faceCount: (next[targetId].faceCount ?? 0) + movedCount };
+                return next;
+            });
+            if (movedCount) setPeople((prev) => prev.map((p) => (p.id === targetId ? { ...p, faceCount: (p.faceCount ?? 0) + movedCount } : p)));
+            setPersonPhotos((prev) => {
+                let changed = false;
+                const next = { ...prev };
+                const target = next[targetId] ?? [];
+                const seen = new Set(target.map((p) => p.id));
+                const merged = [...target];
+                for (const id of ids) {
+                    const sourcePhotos = next[id] ?? [];
+                    for (const photo of sourcePhotos) {
+                        if (!seen.has(photo.id)) {
+                            seen.add(photo.id);
+                            merged.push(photo);
+                        }
+                    }
+                    if (id in next) {
+                        delete next[id];
+                        changed = true;
+                    }
+                }
+                if (changed && merged.length) next[targetId] = merged;
+                return changed ? next : prev;
+            });
+            invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, ids)
                 .then(() => {
                     toast(`Merged ${ids.length + 1} people`);
@@ -1512,6 +1742,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 })
                 .catch(() => {
                     if (removed.length) setPeople((prev) => [...prev, ...removed]);
+                    invalidateLocalPeopleIndex();
                     toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
         },
@@ -1522,25 +1753,63 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // deleted) -- distinct from mergePeople/mergePeopleBatch, which fold one
     // cluster's faces into another rather than dropping them.
     const deletePerson = useCallback((id: string) => {
-        const removed = people.find((p) => p.id === id);
+        const removed = people.find((p) => p.id === id) ?? extraPeople[id];
         setPeople((prev) => prev.filter((p) => p.id !== id));
+        setExtraPeople((prev) => {
+            if (!prev[id]) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+        });
+        setPersonPhotos((prev) => {
+            if (!prev[id]) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+        });
+        invalidateLocalPeopleIndex();
         void faceService.deletePersons([id])
             .then(() => toast('Person deleted'))
             .catch(() => {
                 if (removed) setPeople((prev) => [...prev, removed]);
+                invalidateLocalPeopleIndex();
                 toast('Couldn’t delete person', undefined, undefined, 'error');
             });
-    }, [people, toast]);
+    }, [people, extraPeople, toast]);
 
     const deletePeopleBatch = useCallback((ids: string[]) => {
         if (!ids.length) return;
         const idSet = new Set(ids);
         const removed = people.filter((p) => idSet.has(p.id));
         setPeople((prev) => prev.filter((p) => !idSet.has(p.id)));
+        setExtraPeople((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const id of ids) {
+                if (id in next) {
+                    delete next[id];
+                    changed = true;
+                }
+            }
+            return changed ? next : prev;
+        });
+        setPersonPhotos((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const id of ids) {
+                if (id in next) {
+                    delete next[id];
+                    changed = true;
+                }
+            }
+            return changed ? next : prev;
+        });
+        invalidateLocalPeopleIndex();
         void faceService.deletePersons(ids)
             .then(() => toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`))
             .catch(() => {
                 if (removed.length) setPeople((prev) => [...prev, ...removed]);
+                invalidateLocalPeopleIndex();
                 toast('Couldn’t delete people', undefined, undefined, 'error');
             });
     }, [people, toast]);
@@ -1644,8 +1913,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             reloadPhotos,
             mediaFilter,
             setMediaFilter,
-            photoSortMode,
-            setPhotoSortMode,
+            galleryFilters,
+            setGalleryRating,
+            setGalleryLikedOnly,
+            jumpToGalleryDate,
             captureRange,
             setCaptureRange,
             timeline,
@@ -1723,7 +1994,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
             placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, selectMode, viewer, toasts,
             photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos,
-            mediaFilter, setMediaFilter, photoSortMode, setPhotoSortMode, captureRange, setCaptureRange, timeline,
+            mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore, fetchExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
             clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,

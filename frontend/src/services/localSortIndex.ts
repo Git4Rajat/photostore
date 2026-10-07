@@ -235,6 +235,29 @@ export const invalidateLocalSortIndex = (): void => {
     cachedKey = null;
 };
 
+// Optimistic local remove after a delete/purge. The backend dirty-marks and
+// rebuilds its own sort index, but the already-open tab should not keep paging
+// through filenames it just removed.
+export const removeLocalSortIndexRows = (filenames: string[]): void => {
+    if (!cachedIndex || !filenames.length) return;
+    const doomed = new Set(filenames);
+    const key = cachedKey;
+    cachedIndex = cachedIndex.filter((row) => !doomed.has(row.filename));
+    thumbMap = null;
+    thumbMapSource = null;
+    if (key) {
+        idbGetStored(key)
+            .then((stored) => {
+                if (!stored) return;
+                return idbPutStored(key, { ...stored, rows: stored.rows.filter((row) => !doomed.has(row.filename)) });
+            })
+            .catch(() => {
+                // Best-effort -- the in-memory removal is what fixes the
+                // current tab; IndexedDB just prevents stale reloads.
+            });
+    }
+};
+
 // Optimistic local patch after a rating/like edit -- store.tsx already
 // patches its own `photos` page-state array immediately on edit; this keeps
 // the whole-library sort-index in step too, so a re-sort/re-scroll within
