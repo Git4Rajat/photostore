@@ -952,6 +952,25 @@ def delta_budget_exceeded(manifest: Dict, adding: int) -> bool:
     )
 
 
+def available_delta_row_capacity(manifest: Dict, max_rows_per_delta: int) -> int:
+    """Rows that may be appended before the delta log must be compacted.
+
+    The caller can consume part of a large dirty set up to this limit, compact
+    that progress into the base, then continue. This keeps the existing
+    count/fraction bounds without making an oversized import an all-or-nothing
+    operation.
+    """
+    remaining_deltas = DELTA_MAX_COUNT - int(manifest.get('deltaSeq') or 0)
+    if remaining_deltas <= 0:
+        return 0
+    base_rows = max(1, int(manifest.get('rowCount') or 0))
+    row_limit = int(max(DELTA_MIN_ROW_BUDGET, DELTA_MAX_ROW_FRACTION * base_rows))
+    remaining_rows = row_limit - int(manifest.get('deltaRows') or 0)
+    if remaining_rows <= 0:
+        return 0
+    return min(remaining_rows, remaining_deltas * max(1, int(max_rows_per_delta)))
+
+
 def _lineage(manifest: Dict) -> str:
     return str(manifest.get('lineage') or manifest.get('sourceVersion') or '')
 

@@ -161,15 +161,18 @@ def test_readers_keep_working_while_a_delta_is_applied(world):
     assert errors == [] and db.applied_seq() == 5
 
 
-def test_too_much_change_asks_for_a_compacting_rebuild(world, monkeypatch):
+def test_too_much_change_consumes_available_capacity_before_compaction(world, monkeypatch):
     svc, meta, dirty = world
     monkeypatch.setattr(search_db, 'DELTA_MAX_ROW_FRACTION', 0.5)             # 3 base rows -> at most 1 changed row
     monkeypatch.setattr(search_db, 'DELTA_MIN_ROW_BUDGET', 0)
     _change(meta, _row('x.jpg', ['dog']))
     _change(meta, _row('y.jpg', ['dog']))
-    assert storage_utils.refresh_user_search_db_incremental('lib')['status'] == 'needs_full'
-    # nothing was lost: the names are still dirty for the rebuild
-    assert storage_utils._get_dirty_search_index_filenames('lib', 'lexical') >= {'x.jpg', 'y.jpg'}
+    outcome = storage_utils.refresh_user_search_db_incremental('lib')
+    assert outcome['status'] == 'needs_full'
+    assert outcome['upserts'] == 1 and outcome['remaining'] == 1
+    # Published progress was consumed; only the remainder stays dirty for the
+    # next pass after compaction.
+    assert len(storage_utils._get_dirty_search_index_filenames('lib', 'lexical') & {'x.jpg', 'y.jpg'}) == 1
 
 
 def test_a_full_rebuild_replaces_the_base_and_discards_old_deltas(world):
@@ -330,3 +333,10 @@ def test_small_changes_against_an_empty_base_still_fit_in_a_delta():
     empty = {'rowCount': 0, 'deltaSeq': 0, 'deltaRows': 0}
     assert not search_db.delta_budget_exceeded(empty, 12)
     assert search_db.delta_budget_exceeded(empty, search_db.DELTA_MIN_ROW_BUDGET + 1)
+
+
+def test_available_delta_capacity_bounds_a_100k_import_without_rejecting_progress():
+    manifest = {'rowCount': 130000, 'deltaSeq': 0, 'deltaRows': 0}
+    assert search_db.available_delta_row_capacity(manifest, 5000) == 32500
+    assert search_db.available_delta_row_capacity({**manifest, 'deltaRows': 32000}, 5000) == 500
+    assert search_db.available_delta_row_capacity({**manifest, 'deltaSeq': 200}, 5000) == 0

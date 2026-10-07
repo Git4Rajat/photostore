@@ -9930,6 +9930,10 @@ INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS',
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
 # The people/albums rebuild reads every cluster and face, so repeated clustering runs coalesce harder.
 INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '180'))
+# Safety ceiling for progressive search-database maintenance. Each pass must
+# either publish dirty rows or compact a non-empty delta log; reaching this
+# limit means forward progress is not converging and should be queue-retried.
+INDEX_BUILD_INCREMENTAL_MAX_PASSES = int(os.getenv('INDEX_BUILD_INCREMENTAL_MAX_PASSES', '100'))
 
 
 def _job_row_fresh_active(key: str, job_id: str) -> bool:
@@ -10052,6 +10056,34 @@ def _index_build_progress_callback(user_id: str):
     return _cb
 
 
+def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
+    """Consume all currently dirty search rows using bounded delta periods."""
+    import search_db
+
+    compacted = False
+    for pass_number in range(1, INDEX_BUILD_INCREMENTAL_MAX_PASSES + 1):
+        outcome = refresh_user_search_db_incremental(user_id)
+        perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, pass_number=pass_number, **{
+            k: v for k, v in outcome.items() if isinstance(v, (int, str))})
+        status = str(outcome.get('status') or '')
+        if status in ('noop', 'delta'):
+            if compacted:
+                # open_database applies any final deltas before deriving these,
+                # so summaries include the complete progressively-drained set.
+                _refresh_library_summaries(user_id)
+            return outcome
+        if status == 'more':
+            continue
+        if status == 'needs_full':
+            if search_db.compact_database(user_id) is None:
+                raise RuntimeError('search database compaction made no progress')
+            compacted = True
+            continue
+        raise RuntimeError(f'incremental search database refresh returned {status or "an empty status"}')
+    raise RuntimeError(
+        f'incremental search database refresh did not converge after {INDEX_BUILD_INCREMENTAL_MAX_PASSES} passes')
+
+
 def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None:
     """Worker-side body of an index_build message. A heartbeat thread keeps the
     job row's updatedAt fresh while a long single step (full table scan,
@@ -10088,16 +10120,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     storage_utils_module.reconcile_search_db(user_id)
                 except Exception:
                     worker_logger.warning('Library reconcile failed for %s', user_id, exc_info=True)
-                outcome = refresh_user_search_db_incremental(user_id)
-                perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, **{
-                    k: v for k, v in outcome.items() if isinstance(v, (int, str))})
-                if outcome.get('status') == 'needs_full':
-                    # Too much has changed / the log is long: fold it into a fresh base. This reads the
-                    # worker's local database, never the table, so it stays cheap at any library size.
-                    import search_db
-                    if search_db.compact_database(user_id):
-                        _refresh_library_summaries(user_id)
-                    refresh_user_search_db_incremental(user_id)   # catch up whatever changed meanwhile
+                _drain_incremental_search_db(user_id, scope)
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
             else:
                 # Full scope = a library with no usable database (new, or a schema upgrade). The

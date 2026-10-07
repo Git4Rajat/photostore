@@ -4004,7 +4004,8 @@ def stream_library_artifacts(user_id: str, source_version: Optional[str], sinks_
 
 
 SEARCH_DB_DELTA_CHUNK = int(os.getenv('SEARCH_DB_DELTA_CHUNK', '5000'))
-# Above this many changed photos one pass rebuilds the database instead of appending deltas.
+# Bound one call's table reads and in-memory row map. Larger dirty sets return
+# `more` and are consumed by another worker pass without forcing compaction.
 SEARCH_DB_DELTA_MAX_NAMES = int(os.getenv('SEARCH_DB_DELTA_MAX_NAMES', '200000'))
 
 
@@ -4040,7 +4041,8 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
       noop        nothing is dirty
       delta       one or more deltas were published (``published`` of them)
       no_base     the library has no database yet (a full build is needed first)
-      needs_full  too much changed, or the delta log is long: caller should rebuild/compact
+      more        this bounded pass made progress; call again without compacting
+      needs_full  this pass filled the delta budget; compact, then call again
       unavailable the dirty-name table cannot be read (never treated as "nothing changed")
       conflict    a concurrent rebuild/publisher won; nothing is lost, the names stay dirty
     """
@@ -4057,10 +4059,16 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
         return {'status': 'unavailable'}
     if not dirty:
         return {'status': 'noop'}
-    if len(dirty) > SEARCH_DB_DELTA_MAX_NAMES or search_db.delta_budget_exceeded(manifest, len(dirty)):
-        return {'status': 'needs_full', 'dirty': len(dirty)}
+    capacity = search_db.available_delta_row_capacity(manifest, SEARCH_DB_DELTA_CHUNK)
+    if capacity <= 0:
+        return {'status': 'needs_full', 'dirty': len(dirty), 'remaining': len(dirty)}
 
-    names = sorted(dirty)
+    # Consume bounded progress even when the complete dirty set is too large
+    # for one delta period. The worker compacts after this capacity is used and
+    # calls us again, so a 100k import cannot remain permanently dirty merely
+    # because it is larger than 25% of the current base.
+    pass_limit = min(capacity, max(1, SEARCH_DB_DELTA_MAX_NAMES))
+    names = sorted(dirty)[:pass_limit]
     published = 0
     upserted = removed = 0
     with perf_instrumentation.step('searchdb.delta.build', user=key, dirty=len(names)):
@@ -4083,7 +4091,16 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
             published += 1
             upserted += len(upserts)
             removed += len(deletes)
-    return {'status': 'delta', 'published': published, 'upserts': upserted, 'deletes': removed}
+    remaining = max(0, len(dirty) - len(names))
+    if remaining:
+        # Hitting capacity requires compaction. Hitting only the per-pass
+        # safety cap can continue immediately against the same delta period.
+        status = 'needs_full' if len(names) >= capacity else 'more'
+        return {
+            'status': status, 'published': published, 'upserts': upserted,
+            'deletes': removed, 'dirty': len(dirty), 'remaining': remaining,
+        }
+    return {'status': 'delta', 'published': published, 'upserts': upserted, 'deletes': removed, 'remaining': 0}
 
 
 SEARCH_DB_RECONCILE_MIN_SECONDS = float(os.getenv('SEARCH_DB_RECONCILE_MIN_SECONDS', '600'))
