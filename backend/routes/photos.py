@@ -1197,55 +1197,27 @@ def delete_multiple_photos():
     deleted = []
     if not valid_names:
         return app.jsonify({'deleted': deleted, 'errors': errors, 'success': False})
+    if len(valid_names) > app.BULK_MUTATION_MAX_ITEMS:
+        return app.jsonify({
+            'error': f'Too many photos; maximum is {app.BULK_MUTATION_MAX_ITEMS}',
+            'success': False,
+        }), 413
 
-    names_set = set(valid_names)
+    if len(valid_names) >= app.BULK_MUTATION_ASYNC_THRESHOLD:
+        queued = app._enqueue_photo_soft_delete_job(user_id, valid_names)
+        if queued.get('status') != 'queued':
+            return app.jsonify({'error': 'Could not queue photo delete', **queued, 'success': False}), 503
+        return app.jsonify({
+            **queued,
+            'accepted': len(valid_names),
+            'deleted': [],
+            'errors': errors,
+            'success': True,
+        }), 202
 
-    # Point-reads only (no partition scan) -- see _hard_delete_photos_now's
-    # sibling comment for why that mattered on large accounts.
-    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
-        metadata_results = list(executor.map(lambda n: (n, app._get_metadata_entity(user_id, n)), valid_names))
-    own_rows_by_name = {name: metadata for name, metadata in metadata_results if metadata is not None}
-    temp_removed_names = app._batch_delete_upload_temp_files(names_set)
-
-    def _soft_delete_one_file(safe_name: str) -> app.Tuple[str, str, str]:
-        """Returns (safe_name, outcome, detail); outcome one of 'deleted',
-        'not_found', 'error'. A photo with no metadata row yet (still
-        mid-upload) has nothing to trash -- clearing its temp file, same as
-        before, is as far as "delete" goes for it."""
-        if safe_name not in own_rows_by_name:
-            return (safe_name, 'deleted', '') if safe_name in temp_removed_names else (safe_name, 'not_found', '')
-        entity = app._mark_processing_deleted_for_file(user_id, safe_name)
-        if entity is None:
-            return safe_name, 'error', 'metadata: soft-delete failed'
-        return safe_name, 'deleted', ''
-
-    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
-        file_results = list(executor.map(_soft_delete_one_file, valid_names))
-
-    for safe_name, outcome, detail in file_results:
-        if outcome == 'deleted':
-            deleted.append(safe_name)
-        elif outcome == 'not_found':
-            errors.append(f'{safe_name}: Not found')
-        else:
-            errors.append(f'{safe_name}: {detail}')
-
-    if deleted:
-        app._invalidate_metadata_scan_cache(user_id)
-        try:
-            app._set_faces_source_deleted_for_filenames(user_id, deleted, True)
-        except Exception:
-            app.app.logger.warning('Could not mark deleted-photo faces hidden for %s', user_id, exc_info=True)
-        try:
-            app.touch_user_search_indexes_state(user_id, filenames=deleted)
-        except Exception:
-            pass
-        try:
-            app.touch_user_people_index_state(user_id)
-        except Exception:
-            pass
-
-    return app.jsonify({'deleted': deleted, 'errors': errors, 'success': len(deleted) > 0})
+    result = app._soft_delete_photos_now(user_id, valid_names)
+    result['errors'] = errors + list(result.get('errors') or [])
+    return app.jsonify(result)
 
 
 @photos_bp.route('/photos/trash', methods=['GET'])

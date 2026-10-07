@@ -39,6 +39,7 @@ import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 import { getUnattendedConcurrencyBonus, reportBrowserProcessingOutcome } from '../services/unattendedProcessingScaler';
 import { showToast } from '../services/toast';
+import { publishLibraryChange } from '../services/libraryChanges';
 import {
     isFileSystemAccessSupported,
     isFileSystemFileHandle,
@@ -1326,6 +1327,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             let active = false;
             let changed = false;
             let finishedServerWork = false;
+            let bulkMutationFinished = false;
             for (const job of jobs) {
                 if (!TERMINAL_JOB_STATUSES.has(job.status)) {
                     active = true;
@@ -1347,6 +1349,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
                 if (job.kind !== 'preview' && job.status !== 'failed') {
                     finishedServerWork = true;
+                }
+                if (job.kind === 'bulk_mutation' && job.status !== 'failed') {
+                    bulkMutationFinished = true;
                 }
                 const detail = job.message || (job.status === 'failed' ? 'Something went wrong.' : '');
                 if (CLUSTERING_JOB_KINDS.has(job.kind)) {
@@ -1383,6 +1388,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             if (finishedServerWork) {
                 scheduleDataRefresh();
+            }
+            if (bulkMutationFinished) {
+                publishLibraryChange('bulk-mutation-complete', ['photos', 'people', 'albums', 'explore', 'trash']);
             }
             const ipworkInFlightNow = inFlight.some((job) => job.kind === 'ipwork');
             if (ipworkInFlightNow) {
@@ -1653,6 +1661,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // Finalizing a photo with faces enqueues a clustering job server-side;
         // wake the job poller so the "Grouping people…" indicator can appear.
         requestJobPoll();
+        publishLibraryChange('upload-complete', ['photos', 'albums', 'people', 'explore']);
         const handlers = Array.from(uploadCompletionHandlersRef.current);
         await Promise.all(handlers.map((handler) => Promise.resolve(handler()).catch(() => undefined)));
     }, [invalidatePhotoCache]);

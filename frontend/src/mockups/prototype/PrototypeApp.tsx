@@ -1,6 +1,8 @@
 import IndexBuildBar from './components/IndexBuildBar';
 import { invalidateLocalSortIndex } from '../../services/localSortIndex';
 import { invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
+import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
+import { subscribeLibraryChanges } from '../../services/libraryChanges';
 import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
@@ -324,15 +326,34 @@ const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
  *  builds, people grouping). Without this the indexes downloaded at session start stay as they were. */
 const DataRefreshBridge: React.FC = () => {
     const { registerDataRefreshHandler } = useAppServices();
-    const { reloadPhotos, reloadAlbums, reloadPeople, reloadExplore } = useStore();
+    const { reloadPhotos, reloadAlbums, reloadPeople, reloadExplore, reloadTrash } = useStore();
     useEffect(() => registerDataRefreshHandler(() => {
         invalidateLocalSortIndex();
         invalidateLocalAlbumsIndex();
+        invalidateLocalPeopleIndex();
         reloadPhotos();
         reloadAlbums();
         reloadPeople();
         reloadExplore();
     }), [registerDataRefreshHandler, reloadPhotos, reloadAlbums, reloadPeople, reloadExplore]);
+
+    useEffect(() => subscribeLibraryChanges((change) => {
+        const domains = new Set(change.domains);
+        if (domains.has('photos')) {
+            invalidateLocalSortIndex();
+            reloadPhotos();
+        }
+        if (domains.has('albums')) {
+            invalidateLocalAlbumsIndex();
+            reloadAlbums();
+        }
+        if (domains.has('people')) {
+            invalidateLocalPeopleIndex();
+            reloadPeople();
+        }
+        if (domains.has('explore')) reloadExplore();
+        if (domains.has('trash')) void reloadTrash();
+    }), [reloadPhotos, reloadAlbums, reloadPeople, reloadExplore, reloadTrash]);
     return null;
 };
 

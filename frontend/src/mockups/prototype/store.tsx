@@ -8,6 +8,8 @@ import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/
 import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
+import { requestJobPoll } from '../../services/jobNotifications';
+import { publishLibraryChange } from '../../services/libraryChanges';
 import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/gridCapacity';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
@@ -1113,7 +1115,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         invalidateLocalAlbumsIndex();
         adjustPeopleCountsForPhotos(moved, 1);
         if (moved.length) setTotalPhotos((prev) => (prev === null ? prev : prev + moved.length));
-        void post('/photos/trash/restore', { filenames: ids }).catch(() => {
+        void post('/photos/trash/restore', { filenames: ids }).then(() => {
+            publishLibraryChange('photos-restored', ['photos', 'people', 'albums', 'explore', 'trash'], { itemCount: ids.length });
+        }).catch(() => {
             const movedSet = new Set(moved.map((p) => p.id));
             setPhotos((cur) => cur.filter((p) => !movedSet.has(p.id)));
             adjustPeopleCountsForPhotos(moved, -1);
@@ -1135,12 +1139,21 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             removeFromEverywhere(ids);
             setTotalPhotos((prev) => (prev === null ? prev : Math.max(0, prev - ids.length)));
             setSelection([]);
-            toast(
-                `Deleted ${ids.length} photo${ids.length > 1 ? 's' : ''}`,
-                'Undo',
-                () => restorePhotos(ids),
-            );
-            void post('/photos/delete', { filenames: ids }).catch(() => {
+            void post<{ jobId?: string; status?: string }>('/photos/delete', { filenames: ids }).then((response) => {
+                if (response?.status === 'queued') {
+                    toast(`Moving ${ids.length} photos to Recently Deleted`);
+                    requestJobPoll();
+                } else {
+                    toast(
+                        `Deleted ${ids.length} photo${ids.length > 1 ? 's' : ''}`,
+                        'Undo',
+                        () => restorePhotos(ids),
+                    );
+                    publishLibraryChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], {
+                        itemCount: ids.length,
+                    });
+                }
+            }).catch(() => {
                 // Roll back the optimistic removal on failure.
                 const set = new Set(ids);
                 setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
@@ -1349,6 +1362,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 if (created) {
                     setAlbums((prev) => [...prev, created]);
                     invalidateLocalAlbumsIndex();
+                    publishLibraryChange('album-created', ['albums'], { itemCount: 1 });
                     return created.id;
                 }
             } catch {
@@ -1371,6 +1385,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 if (count > 0 && created) {
                     setAlbums((prev) => (prev.some((a) => a.id === created.id) ? prev : [created, ...prev]));
                     invalidateLocalAlbumsIndex();
+                    publishLibraryChange('album-created', ['albums'], { itemCount: 1 });
                     return { albumId: created.id, count };
                 }
                 return { albumId: '', count: 0, message: res?.message };
@@ -1388,7 +1403,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const previous = albums.find((a) => a.id === id)?.name;
         setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: trimmed } : a)));
         invalidateLocalAlbumsIndex();
-        void post(`/albums/${encodeURIComponent(id)}/rename`, { name: trimmed }).catch(() => {
+        void post(`/albums/${encodeURIComponent(id)}/rename`, { name: trimmed }).then(() => {
+            publishLibraryChange('album-renamed', ['albums'], { itemCount: 1 });
+        }).catch(() => {
             setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: previous ?? a.name } : a)));
             toast('Couldn’t rename album', undefined, undefined, 'error');
         });
@@ -1416,6 +1433,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             invalidateLocalAlbumsIndex();
             void post(`/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids })
                 .then(() => {
+                    publishLibraryChange('album-photos-added', ['albums'], { itemCount: ids.length });
                     toast(`Added ${ids.length} to “${album?.name ?? 'album'}”`);
                     // Reconcile with the server (cover, ordering). The cache is
                     // already seeded above, so this refresh never shows a spinner.
@@ -1437,7 +1455,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setAlbums((prev) => prev.filter((a) => a.id !== id));
         invalidateLocalAlbumsIndex();
         void post('/albums/delete-multiple', { albumIds: [id] })
-            .then(() => toast(`Deleted “${removed?.name ?? 'album'}”`))
+            .then(() => {
+                publishLibraryChange('album-deleted', ['albums'], { itemCount: 1 });
+                toast(`Deleted “${removed?.name ?? 'album'}”`);
+            })
             .catch(() => {
                 if (removed) setAlbums((prev) => [...prev, removed]);
                 toast('Couldn’t delete album', undefined, undefined, 'error');
@@ -1451,7 +1472,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setAlbums((prev) => prev.filter((a) => !idSet.has(a.id)));
         invalidateLocalAlbumsIndex();
         void post('/albums/delete-multiple', { albumIds: ids })
-            .then(() => toast(`Deleted ${removed.length} album${removed.length === 1 ? '' : 's'}`))
+            .then(() => {
+                publishLibraryChange('albums-deleted', ['albums'], { itemCount: ids.length });
+                toast(`Deleted ${removed.length} album${removed.length === 1 ? '' : 's'}`);
+            })
             .catch(() => {
                 if (removed.length) setAlbums((prev) => [...prev, ...removed]);
                 toast('Couldn’t delete albums', undefined, undefined, 'error');
@@ -1640,7 +1664,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: trimmed || null } : p)));
         setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: trimmed || null } } : prev));
         invalidateLocalPeopleIndex();
-        void faceService.labelPerson(id, trimmed).catch(() => {
+        void faceService.labelPerson(id, trimmed).then(() => {
+            publishLibraryChange('person-renamed', ['people'], { itemCount: 1 });
+        }).catch(() => {
             setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: previous } : p)));
             setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: previous } } : prev));
             invalidateLocalPeopleIndex();
@@ -1681,6 +1707,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, [sourceId])
                 .then(() => {
+                    publishLibraryChange('people-merged', ['people'], { itemCount: 2 });
                     toast('People merged');
                     void fetchPeople();
                 })
@@ -1737,6 +1764,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             invalidateLocalPeopleIndex();
             void faceService.mergePersons(targetId, ids)
                 .then(() => {
+                    publishLibraryChange('people-merged', ['people'], { itemCount: ids.length + 1 });
                     toast(`Merged ${ids.length + 1} people`);
                     void fetchPeople();
                 })
@@ -1769,7 +1797,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         });
         invalidateLocalPeopleIndex();
         void faceService.deletePersons([id])
-            .then(() => toast('Person deleted'))
+            .then(() => {
+                publishLibraryChange('person-deleted', ['people'], { itemCount: 1 });
+                toast('Person deleted');
+            })
             .catch(() => {
                 if (removed) setPeople((prev) => [...prev, removed]);
                 invalidateLocalPeopleIndex();
@@ -1806,7 +1837,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         });
         invalidateLocalPeopleIndex();
         void faceService.deletePersons(ids)
-            .then(() => toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`))
+            .then(() => {
+                publishLibraryChange('people-deleted', ['people'], { itemCount: ids.length });
+                toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`);
+            })
             .catch(() => {
                 if (removed.length) setPeople((prev) => [...prev, ...removed]);
                 invalidateLocalPeopleIndex();
