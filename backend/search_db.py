@@ -52,7 +52,7 @@ from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 'sqlite-v5'  # v2: gallery columns; v3: AI tag floor; v4: sort order indexes; v5: no location pseudo-tags + gallery filters
+SCHEMA_VERSION = 'sqlite-v6'  # v6: indexed representative covers for timeline periods
 SEARCH_DB_DIR = os.getenv('SEARCH_DB_DIR', '').strip() or os.path.join(tempfile.gettempdir(), 'photostore-search')
 # Cap on candidates pulled per query (bm25-ranked); the scorer then ranks them.
 CANDIDATE_LIMIT = int(os.getenv('SEARCH_DB_CANDIDATE_LIMIT', '4000'))
@@ -140,6 +140,11 @@ def _as_float(value) -> Optional[float]:
         return None
 
 
+def _cover_rank(filename: str) -> int:
+    """Stable pseudo-random ordering for period covers across rebuilds/replicas."""
+    return int.from_bytes(hashlib.sha256(filename.encode('utf-8')).digest()[:8], 'big') & 0x7fffffffffffffff
+
+
 def _collect_location_terms(into: set, row: Dict) -> None:
     for field in ('locationCity', 'locationRegion', 'locationCountry', 'address'):
         phrase = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(row.get(field) or '').lower())).strip()
@@ -178,6 +183,8 @@ def row_record(row: Dict) -> Optional[Dict]:
         'capture_year': captured.year if captured else None,
         'capture_md': captured.month * 100 + captured.day if captured else None,
         'rating': _as_int(row.get('rating')), 'likes': _as_int(row.get('likes')),
+        'has_likes': 1 if _as_int(row.get('likes')) > 0 else 0,
+        'cover_rank': _cover_rank(filename),
         'lat': _as_float(row.get('latitude')), 'lon': _as_float(row.get('longitude')),
         'people': people,
         'doc': document_text(filename, slim),
@@ -210,7 +217,8 @@ class DatabaseBuilder:
             CREATE TABLE rows(
                 id INTEGER PRIMARY KEY, filename TEXT NOT NULL, capture_day INTEGER, row_json TEXT NOT NULL,
                 capture_ts REAL, upload_ts REAL, capture_year INTEGER, capture_md INTEGER,
-                rating INTEGER NOT NULL DEFAULT 0, likes INTEGER NOT NULL DEFAULT 0, lat REAL, lon REAL
+                rating INTEGER NOT NULL DEFAULT 0, likes INTEGER NOT NULL DEFAULT 0,
+                has_likes INTEGER NOT NULL DEFAULT 0, cover_rank INTEGER NOT NULL DEFAULT 0, lat REAL, lon REAL
             );
             CREATE TABLE row_people(person_id TEXT NOT NULL, id INTEGER NOT NULL);
             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
@@ -226,7 +234,7 @@ class DatabaseBuilder:
         self.count += 1
         self._rows.append((
             self.count, record['filename'], record['capture_day'], record['row_json'], record['capture_ts'],
-            record['upload_ts'], record['capture_year'], record['capture_md'], record['rating'], record['likes'],
+            record['upload_ts'], record['capture_year'], record['capture_md'], record['rating'], record['likes'], record['has_likes'], record['cover_rank'],
             record['lat'], record['lon'],
         ))
         self._fts.append((self.count, record['doc']))
@@ -238,8 +246,8 @@ class DatabaseBuilder:
     def _flush(self) -> None:
         if self._rows:
             self._conn.executemany(
-                'INSERT INTO rows(id, filename, capture_day, row_json, capture_ts, upload_ts, capture_year, capture_md, rating, likes, lat, lon) '
-                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', self._rows)
+                'INSERT INTO rows(id, filename, capture_day, row_json, capture_ts, upload_ts, capture_year, capture_md, rating, likes, has_likes, cover_rank, lat, lon) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', self._rows)
             self._conn.executemany('INSERT INTO fts(rowid, doc) VALUES(?,?)', self._fts)
         if self._people:
             self._conn.executemany('INSERT INTO row_people(person_id, id) VALUES(?,?)', self._people)
@@ -259,6 +267,8 @@ class DatabaseBuilder:
         conn.execute('CREATE INDEX rows_capture_range_order ON rows(capture_day, capture_ts DESC, filename ASC)')
         conn.execute('CREATE INDEX rows_rating_capture_order ON rows(rating, capture_ts DESC, filename ASC)')
         conn.execute('CREATE INDEX rows_likes_capture_order ON rows(likes, capture_ts DESC, filename ASC)')
+        conn.execute('CREATE INDEX rows_period_cover ON rows(capture_year, capture_md, has_likes DESC, cover_rank)')
+        conn.execute('CREATE INDEX rows_year_cover ON rows(capture_year, has_likes DESC, cover_rank)')
         conn.execute('CREATE INDEX row_people_pid ON row_people(person_id)')
         conn.execute('INSERT INTO meta VALUES(?, ?)', (
             'location_terms', json.dumps(sorted(self._terms, key=len, reverse=True))))
@@ -373,10 +383,12 @@ class SearchDatabase:
             for upsert in upserts:
                 conn.execute(
                     'INSERT INTO rows(id, filename, capture_day, row_json, capture_ts, upload_ts, capture_year, capture_md, '
-                    'rating, likes, lat, lon) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    'rating, likes, has_likes, cover_rank, lat, lon) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (next_id, upsert['filename'], upsert.get('capture_day'), upsert['row_json'], upsert.get('capture_ts'),
                      upsert.get('upload_ts'), upsert.get('capture_year'), upsert.get('capture_md'),
-                     int(upsert.get('rating') or 0), int(upsert.get('likes') or 0), upsert.get('lat'), upsert.get('lon')))
+                     int(upsert.get('rating') or 0), int(upsert.get('likes') or 0), int(upsert.get('has_likes') or 0),
+                     int(upsert.get('cover_rank') or 0),
+                     upsert.get('lat'), upsert.get('lon')))
                 conn.execute('INSERT INTO fts(rowid, doc) VALUES(?, ?)', (next_id, upsert['doc']))
                 conn.executemany('INSERT INTO row_people(person_id, id) VALUES(?, ?)',
                                  [(str(pid), next_id) for pid in upsert.get('people') or []])
@@ -432,6 +444,29 @@ class SearchDatabase:
         for year_key in sorted(years):
             running += years[year_key]['count']
             cumulative[year_key] = running
+        # Representative covers are point-like reads over period-prefixed
+        # indexes. Positive likes win; cover_rank then picks a stable,
+        # pseudo-random photo so unliked periods do not all show their first
+        # filename and covers do not reshuffle between replicas.
+        today_ordinal = today.toordinal()
+        for year_key, year_bucket in years.items():
+            year = int(year_key)
+            row = conn.execute(
+                'SELECT filename FROM rows WHERE capture_year = ? AND capture_day <= ? '
+                'ORDER BY has_likes DESC, cover_rank LIMIT 1',
+                (year, today_ordinal),
+            ).fetchone()
+            if row:
+                year_bucket['coverFilename'] = str(row[0])
+            for month_key, month_bucket in year_bucket['months'].items():
+                month = int(month_key)
+                row = conn.execute(
+                    'SELECT filename FROM rows WHERE capture_year = ? AND capture_md BETWEEN ? AND ? '
+                    'AND capture_day <= ? ORDER BY has_likes DESC, cover_rank LIMIT 1',
+                    (year, month * 100 + 1, month * 100 + 31, today_ordinal),
+                ).fetchone()
+                if row:
+                    month_bucket['coverFilename'] = str(row[0])
         summary = {
             'years': years, 'cumulativeByYear': cumulative,
             'firstDate': first.isoformat() if first else None, 'lastDate': last.isoformat() if last else None,

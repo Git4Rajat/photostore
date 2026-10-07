@@ -96,3 +96,16 @@ def test_empty_input_returns_empty_summary_without_error():
     assert summary['undatedCount'] == 0
     assert summary['futureCount'] == 0
     assert summary['totalCount'] == 0
+
+
+def test_period_covers_prefer_a_liked_photo_and_are_stable():
+    rows = [
+        {'RowKey': 'plain-a.jpg', 'uploadDate': '2024-03-01T10:00:00+00:00', 'likes': 0},
+        {'RowKey': 'favorite.jpg', 'uploadDate': '2024-03-02T10:00:00+00:00', 'likes': 1},
+        {'RowKey': 'plain-b.jpg', 'uploadDate': '2024-03-03T10:00:00+00:00', 'likes': 0},
+    ]
+    first = timeline_metadata.build_timeline_summary(rows)
+    second = timeline_metadata.build_timeline_summary(reversed(rows))
+    assert first['years']['2024']['coverFilename'] == 'favorite.jpg'
+    assert first['years']['2024']['months']['03']['coverFilename'] == 'favorite.jpg'
+    assert second['years']['2024']['months']['03']['coverFilename'] == 'favorite.jpg'

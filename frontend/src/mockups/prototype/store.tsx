@@ -252,7 +252,17 @@ export interface CaptureRange {
 // Shape of GET /photos/timeline (see backend build_timeline_summary): a nested
 // year -> month -> day count tree the gallery's timeline rail is built from.
 export interface TimelineSummary {
-    years: Record<string, { count: number; months: Record<string, { count: number; days: Record<string, number> }> }>;
+    years: Record<string, {
+        count: number;
+        coverFilename?: string;
+        coverThumbnailUrl?: string;
+        months: Record<string, {
+            count: number;
+            days: Record<string, number>;
+            coverFilename?: string;
+            coverThumbnailUrl?: string;
+        }>;
+    }>;
     firstDate: string | null;
     lastDate: string | null;
     undatedCount: number;
@@ -663,7 +673,28 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const fetchTimeline = useCallback(async () => {
         try {
             const res = await get<TimelineSummary>('/photos/timeline');
-            if (res && typeof res === 'object' && res.years) setTimeline(res);
+            if (!res || typeof res !== 'object' || !res.years) return;
+            setTimeline(res);
+            const coverNames = new Set<string>();
+            Object.values(res.years).forEach((year) => {
+                if (year.coverFilename) coverNames.add(year.coverFilename);
+                Object.values(year.months).forEach((month) => {
+                    if (month.coverFilename) coverNames.add(month.coverFilename);
+                });
+            });
+            if (!coverNames.size) return;
+            const coverUrls = new Map<string, string>();
+            const batches = await Promise.all(
+                chunk(Array.from(coverNames), 500).map((names) => resolveThumbnailAccessUrls(names)),
+            );
+            batches.forEach((batch) => batch.forEach((url, filename) => coverUrls.set(filename, url)));
+            Object.values(res.years).forEach((year) => {
+                if (year.coverFilename) year.coverThumbnailUrl = coverUrls.get(year.coverFilename) || undefined;
+                Object.values(year.months).forEach((month) => {
+                    if (month.coverFilename) month.coverThumbnailUrl = coverUrls.get(month.coverFilename) || undefined;
+                });
+            });
+            setTimeline((current) => (current === res ? { ...res, years: { ...res.years } } : current));
         } catch {
             // timeline rail simply stays hidden on failure
         }

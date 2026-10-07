@@ -30,6 +30,7 @@ export const TimelineBrowser: React.FC<{
             <div className="pt-period-grid" role="group" aria-label="Years">
                 {years.map((y, i) => (
                     <button key={y} type="button" className={`pt-period-card mock-swatch s${(i % 8) + 1}`} onClick={() => onOpenYear(y)}>
+                        {timeline.years[y].coverThumbnailUrl && <img className="pt-period-cover" src={timeline.years[y].coverThumbnailUrl} alt="" loading="lazy" />}
                         <span className="pt-period-label">{y}</span>
                         <span className="pt-period-count">{timeline.years[y].count.toLocaleString()} photo{timeline.years[y].count === 1 ? '' : 's'}</span>
                     </button>
@@ -40,21 +41,25 @@ export const TimelineBrowser: React.FC<{
     }
 
     const yearsToShow = focusYear ? (timeline.years[focusYear] ? [focusYear] : []) : years;
-    const entries: { y: string; m: string; count: number }[] = [];
+    const entries: { y: string; m: string; count: number; coverThumbnailUrl?: string }[] = [];
     for (const y of yearsToShow) {
         const months = Object.keys(timeline.years[y].months).sort().reverse();
-        for (const m of months) entries.push({ y, m, count: timeline.years[y].months[m].count });
+        for (const m of months) {
+            const month = timeline.years[y].months[m];
+            entries.push({ y, m, count: month.count, coverThumbnailUrl: month.coverThumbnailUrl });
+        }
     }
 
     return (
         <div className="pt-period-grid" role="group" aria-label="Months">
-            {entries.map(({ y, m, count }, i) => (
+            {entries.map(({ y, m, count, coverThumbnailUrl }, i) => (
                 <button
                     key={`${y}-${m}`}
                     type="button"
                     className={`pt-period-card mock-swatch s${(i % 8) + 1}`}
                     onClick={() => onOpenMonth(monthRange(y, m), y)}
                 >
+                    {coverThumbnailUrl && <img className="pt-period-cover" src={coverThumbnailUrl} alt="" loading="lazy" />}
                     <span className="pt-period-label">{MONTHS[Number(m) - 1]}{focusYear ? '' : ` ${y}`}</span>
                     <span className="pt-period-count">{count.toLocaleString()} photo{count === 1 ? '' : 's'}</span>
                 </button>

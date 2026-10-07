@@ -1,12 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange, MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
-import { Spinner } from '../components/bits';
+import { Menu, Spinner } from '../components/bits';
 import { useTileSize, TILE_RANGE, TILE_STEP } from '../components/controls';
 
 const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
@@ -215,25 +215,55 @@ export const GalleryPage: React.FC = () => {
 
     const renderFilterControls = () => (
         <>
-            <div className="mock-seg pt-rating-filter" role="group" aria-label="Rating">
-                {[0, 1, 2, 3, 4, 5].map((rating) => (
-                    <button key={rating} type="button" className={galleryFilters.rating === rating ? 'active' : undefined} onClick={() => setGalleryRating(rating)}>
-                        {rating === 0 ? 'All' : <><StarIcon className="seg-icon" fill="currentColor" /> {rating}</>}
+            <Menu
+                className="pt-rating-filter"
+                align="left"
+                renderTrigger={(toggle, open) => (
+                    <button
+                        type="button"
+                        className={`btn pt-filter-button${galleryFilters.rating > 0 ? ' active' : ''}`}
+                        aria-haspopup="menu"
+                        aria-expanded={open}
+                        onClick={toggle}
+                    >
+                        <StarIcon className="toolbar-icon" fill={galleryFilters.rating > 0 ? 'currentColor' : 'none'} />
+                        {galleryFilters.rating > 0 ? `${galleryFilters.rating} star${galleryFilters.rating === 1 ? '' : 's'}` : 'Rating'}
+                        <ChevronDownIcon className="pt-filter-chevron" />
                     </button>
-                ))}
-            </div>
+                )}
+            >
+                {(close) => (
+                    <div className="pt-rating-options" aria-label="Filter by rating">
+                        {[0, 1, 2, 3, 4, 5].map((rating) => (
+                            <button
+                                key={rating}
+                                type="button"
+                                role="menuitemradio"
+                                aria-checked={galleryFilters.rating === rating}
+                                className={galleryFilters.rating === rating ? 'active' : undefined}
+                                onClick={() => { setGalleryRating(rating); close(); }}
+                            >
+                                <StarIcon className="toolbar-icon" fill={rating > 0 ? 'currentColor' : 'none'} />
+                                {rating === 0 ? 'All ratings' : `${rating} star${rating === 1 ? '' : 's'}`}
+                            </button>
+                        ))}
+                    </div>
+                )}
+            </Menu>
             <button type="button" className={`btn pt-like-filter${galleryFilters.likedOnly ? ' active' : ''}`} aria-pressed={galleryFilters.likedOnly} onClick={() => setGalleryLikedOnly(!galleryFilters.likedOnly)}>
                 <HeartIcon className="toolbar-icon" fill={galleryFilters.likedOnly ? 'currentColor' : 'none'} /> Likes
             </button>
-            <input
-                className="pt-date-jump"
-                type="date"
-                aria-label="Jump to date"
-                value={dateJump}
-                min={timeline?.firstDate ?? undefined}
-                max={timeline?.lastDate ?? undefined}
-                onChange={(e) => handleDateJump(e.target.value)}
-            />
+            <label className="pt-date-jump">
+                <CalendarSearchIcon className="toolbar-icon" aria-hidden="true" />
+                <input
+                    type="date"
+                    aria-label="Jump to date"
+                    value={dateJump}
+                    min={timeline?.firstDate ?? undefined}
+                    max={timeline?.lastDate ?? undefined}
+                    onChange={(e) => handleDateJump(e.target.value)}
+                />
+            </label>
             <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
                 {MEDIA_FILTERS.map((f) => (
                     <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} onClick={() => setMediaFilter(f.value)}>

@@ -97,6 +97,18 @@ def test_location_vocabulary_is_stored(db):
     assert {'paris', 'france', 'goa'} <= set(db.location_terms())
 
 
+def test_timeline_period_cover_prefers_liked_photo(tmp_path):
+    path = str(tmp_path / 'covers.sqlite')
+    rows = [
+        {'RowKey': 'plain.jpg', 'uploadDate': '2024-03-01T00:00:00+00:00', 'likes': 0},
+        {'RowKey': 'liked.jpg', 'uploadDate': '2024-03-02T00:00:00+00:00', 'likes': 2},
+    ]
+    assert search_db.build_database(rows, path) == 2
+    summary = search_db.SearchDatabase(path).timeline_summary(today=date(2026, 1, 1))
+    assert summary['years']['2024']['coverFilename'] == 'liked.jpg'
+    assert summary['years']['2024']['months']['03']['coverFilename'] == 'liked.jpg'
+
+
 def test_hostile_query_text_cannot_break_the_fts_expression():
     terms = search_db.match_terms({'all': ['a"b', 'x* OR y', 'ok"; DROP TABLE rows;--']})
     assert terms and all(t.isalnum() for t in terms)  # quotes/operators never reach the MATCH expression
