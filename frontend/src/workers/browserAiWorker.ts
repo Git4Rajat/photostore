@@ -89,7 +89,8 @@ const PERSON_LABELS = new Set([
 ]);
 
 // Automatic tagging may say "person"/"face" for workflow routing, but should
-// not infer names, ethnicity, culture, or race as photo tags.
+// not infer names, sensitive identity/status attributes, or subjective
+// judgments as photo tags. Must stay aligned with backend/search_utils.py.
 const SENSITIVE_AUTO_TAG_LABELS = new Set([
     'aaron', 'aboriginal', 'adam', 'adrian', 'afghan', 'african', 'afro', 'albanian',
     'albert', 'alexander', 'alfred', 'algerian', 'allen', 'american', 'amir', 'amish',
@@ -133,9 +134,61 @@ const SENSITIVE_AUTO_TAG_LABELS = new Set([
     'ukrainian', 'victor', 'victoria', 'vietnamese', 'wade', 'walter', 'warren', 'wayne',
     'white', 'william', 'wilson', 'zionist',
 ]);
+[
+    // Religion, belief, and ideology.
+    'allah', 'anglican', 'atheism', 'atheist', 'baptist', 'bible', 'catholic',
+    'catholicism', 'chapel', 'christ', 'christian', 'church', 'clergy', 'cleric',
+    'hinduism', 'judaism', 'mosque', 'prayer', 'religion', 'religious', 'scripture',
+    'sect', 'sectarian', 'secular', 'sharia', 'shia', 'shrine', 'sunni', 'synagogue',
+    'temple', 'theology', 'torah', 'vatican', 'worship',
+    // Nationality, citizenship, immigration, and displacement status.
+    'asylum', 'citizenship', 'foreigner', 'immigrant', 'immigration', 'nationality',
+    'refugee', 'undocumented',
+    // Political affiliation, activism, and extremism.
+    'activist', 'anarchist', 'authoritarian', 'communist', 'confederate', 'congressman',
+    'conservative', 'democrat', 'extremist', 'fascist', 'liberal', 'nationalist',
+    'nazi', 'politician', 'politics', 'republican', 'secession', 'senator',
+    'socialist', 'suffrage', 'supremacist', 'tory', 'vote', 'voter', 'voting',
+    // Sexual orientation and gender identity/presentation.
+    'bisexual', 'cis', 'gay', 'gender', 'heterosexual', 'homosexual', 'lesbian',
+    'lgbt', 'lgbtq', 'man', 'non binary', 'nonbinary', 'queer', 'sex', 'sexual',
+    'sexuality', 'sexism', 'sexist', 'straight', 'transgender', 'transsexual',
+    'woman',
+    // Age/minor status and family/relationship inference.
+    'adolescent', 'adult', 'aunt', 'auntie', 'baby', 'boy', 'boyfriend', 'bride',
+    'bridegroom', 'brother', 'child', 'daughter', 'elderly', 'father', 'girl',
+    'girlfriend', 'groom', 'husband', 'infant', 'maternity', 'mother', 'old',
+    'pregnancy', 'senior', 'sister', 'son', 'spouse', 'teen', 'teenager',
+    'toddler', 'uncle', 'wife', 'young',
+    // Disability, medical, mental-health, substance-use, and pregnancy status.
+    'addict', 'addiction', 'adhd', 'alcoholic', 'alcoholism', 'anxiety', 'asthma',
+    'autism', 'autistic', 'bipolar', 'blind', 'blindness', 'cancer', 'chemotherapy',
+    'deaf', 'dementia', 'depressed', 'depression', 'disability', 'disabled',
+    'disease', 'illness', 'medical', 'overdose', 'pregnant', 'schizophrenia',
+    'sick', 'sickness', 'syndrome', 'symptom', 'therapeutic', 'therapist',
+    'therapy', 'tumor', 'tumour', 'wheelchair',
+    // Criminality, threat, and trustworthiness judgments.
+    'abduction', 'accused', 'arrest', 'assassin', 'assassination', 'assault',
+    'attacker', 'burglar', 'burglary', 'crime', 'criminal', 'dangerous', 'gang',
+    'gangster', 'illegal', 'killer', 'murderer', 'robber', 'robbery', 'shooter',
+    'shooting', 'smuggling', 'sniper', 'stalker', 'stalking', 'suspect',
+    'suspicious', 'terrorism', 'theft', 'thief', 'thug', 'vandalism', 'vigilante',
+    // Socioeconomic status.
+    'affluent', 'begging', 'billionaire', 'elite', 'homeless', 'poor', 'poverty',
+    'rich', 'slum', 'unemployed', 'unemployment', 'wealth', 'wealthy', 'welfare',
+    // Body, attractiveness, sexualized, personality, and intelligence judgments.
+    'aggression', 'arrogance', 'attractive', 'attractiveness', 'beauty', 'bikini',
+    'blond', 'blonde', 'body', 'booty', 'bra', 'brave', 'breast', 'brown',
+    'brunette', 'butt', 'cleavage', 'colored', 'coward', 'cute', 'dumb', 'fat',
+    'friendly', 'handsome', 'hot', 'idiot', 'intellectual', 'intelligence',
+    'lazy', 'obese', 'obesity', 'overweight', 'personality', 'pretty',
+    'professional', 'sexy', 'short', 'skinny', 'smart', 'stupid', 'stupidity',
+    'tall', 'thin', 'thinner', 'trustworthy', 'ugly', 'uneducated', 'unfriendly',
+    'unprofessional', 'weirdo',
+].forEach((label) => SENSITIVE_AUTO_TAG_LABELS.add(label));
 
 const isSensitiveAutoTagLabel = (label: string): boolean => (
-    SENSITIVE_AUTO_TAG_LABELS.has(String(label || '').trim().toLowerCase())
+    SENSITIVE_AUTO_TAG_LABELS.has(String(label || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, ' '))
 );
 
 const CLOTHING_LABEL_KEYWORDS = [

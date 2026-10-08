@@ -169,9 +169,10 @@ VISUAL_MODIFIERS = {
 }
 SEARCH_STOP_WORDS = {'in', 'at', 'near', 'from', 'by', 'with', 'wearing', 'holding', 'beside', 'next', 'to', 'and', 'the', 'a', 'an'}
 MODIFIER_FILLER_WORDS = {'color', 'colour'}
-# Labels that should never be produced by automatic visual tagging. Generic
-# person concepts stay allowed for people/face workflows; this list blocks
-# inferred names and demographic/cultural/race labels.
+# Labels that should never be produced by automatic visual tagging. This blocks
+# inferred names, sensitive identity/status attributes, and subjective judgments.
+# User-entered/stored tags stay protected elsewhere so explicit user curation is
+# not erased.
 SENSITIVE_AUTO_TAG_LABELS = {
     'aaron', 'aboriginal', 'adam', 'adrian', 'afghan', 'african', 'afro', 'albanian',
     'albert', 'alexander', 'alfred', 'algerian', 'allen', 'american', 'amir', 'amish',
@@ -215,6 +216,58 @@ SENSITIVE_AUTO_TAG_LABELS = {
     'ukrainian', 'victor', 'victoria', 'vietnamese', 'wade', 'walter', 'warren', 'wayne',
     'white', 'william', 'wilson', 'zionist',
 }
+SENSITIVE_AUTO_TAG_LABELS.update({
+    # Religion, belief, and ideology.
+    'allah', 'anglican', 'atheism', 'atheist', 'baptist', 'bible', 'catholic',
+    'catholicism', 'chapel', 'christ', 'christian', 'church', 'clergy', 'cleric',
+    'hinduism', 'judaism', 'mosque', 'prayer', 'religion', 'religious', 'scripture',
+    'sect', 'sectarian', 'secular', 'sharia', 'shia', 'shrine', 'sunni', 'synagogue',
+    'temple', 'theology', 'torah', 'vatican', 'worship',
+    # Nationality, citizenship, immigration, and displacement status.
+    'asylum', 'citizenship', 'foreigner', 'immigrant', 'immigration', 'nationality',
+    'refugee', 'undocumented',
+    # Political affiliation, activism, and extremism.
+    'activist', 'anarchist', 'authoritarian', 'communist', 'confederate', 'congressman',
+    'conservative', 'democrat', 'extremist', 'fascist', 'liberal', 'nationalist',
+    'nazi', 'politician', 'politics', 'republican', 'secession', 'senator',
+    'socialist', 'suffrage', 'supremacist', 'tory', 'vote', 'voter', 'voting',
+    # Sexual orientation and gender identity/presentation.
+    'bisexual', 'cis', 'gay', 'gender', 'heterosexual', 'homosexual', 'lesbian',
+    'lgbt', 'lgbtq', 'man', 'non binary', 'nonbinary', 'queer', 'sex', 'sexual',
+    'sexuality', 'sexism', 'sexist', 'straight', 'transgender', 'transsexual',
+    'woman',
+    # Age/minor status and family/relationship inference.
+    'adolescent', 'adult', 'aunt', 'auntie', 'baby', 'boy', 'boyfriend', 'bride',
+    'bridegroom', 'brother', 'child', 'daughter', 'elderly', 'father', 'girl',
+    'girlfriend', 'groom', 'husband', 'infant', 'maternity', 'mother', 'old',
+    'pregnancy', 'senior', 'sister', 'son', 'spouse', 'teen', 'teenager',
+    'toddler', 'uncle', 'wife', 'young',
+    # Disability, medical, mental-health, substance-use, and pregnancy status.
+    'addict', 'addiction', 'adhd', 'alcoholic', 'alcoholism', 'anxiety', 'asthma',
+    'autism', 'autistic', 'bipolar', 'blind', 'blindness', 'cancer', 'chemotherapy',
+    'deaf', 'dementia', 'depressed', 'depression', 'disability', 'disabled',
+    'disease', 'illness', 'medical', 'overdose', 'pregnant', 'schizophrenia',
+    'sick', 'sickness', 'syndrome', 'symptom', 'therapeutic', 'therapist',
+    'therapy', 'tumor', 'tumour', 'wheelchair',
+    # Criminality, threat, and trustworthiness judgments.
+    'abduction', 'accused', 'arrest', 'assassin', 'assassination', 'assault',
+    'attacker', 'burglar', 'burglary', 'crime', 'criminal', 'dangerous', 'gang',
+    'gangster', 'illegal', 'killer', 'murderer', 'robber', 'robbery', 'shooter',
+    'shooting', 'smuggling', 'sniper', 'stalker', 'stalking', 'suspect',
+    'suspicious', 'terrorism', 'theft', 'thief', 'thug', 'vandalism', 'vigilante',
+    # Socioeconomic status.
+    'affluent', 'begging', 'billionaire', 'elite', 'homeless', 'poor', 'poverty',
+    'rich', 'slum', 'unemployed', 'unemployment', 'wealth', 'wealthy', 'welfare',
+    # Body, attractiveness, sexualized, personality, and intelligence judgments.
+    'aggression', 'arrogance', 'attractive', 'attractiveness', 'beauty', 'bikini',
+    'blindness', 'blond', 'blonde', 'body', 'booty', 'bra', 'brave', 'breast',
+    'brown', 'brunette', 'butt', 'cleavage', 'colored', 'coward', 'cute', 'dumb',
+    'fat', 'friendly', 'handsome', 'hot', 'idiot', 'intellectual', 'intelligence',
+    'lazy', 'obese', 'obesity', 'overweight', 'personality', 'pretty',
+    'professional', 'sexy', 'short', 'skinny', 'smart', 'stupid', 'stupidity',
+    'tall', 'thin', 'thinner', 'trustworthy', 'ugly', 'uneducated', 'unfriendly',
+    'unprofessional', 'weirdo',
+})
 # Recalibrated alongside AI_TAG_MIN_CONFIDENCE above for raw-cosine-similarity
 # scores; deliberately looser than that stricter storage-time filter since
 # this only screens raw predictions for search-time consideration, not final
