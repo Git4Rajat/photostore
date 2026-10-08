@@ -13,6 +13,21 @@ from typing import Dict, List, Optional
 from ordering_utils import metadata_capture_datetime
 
 
+def _stable_cover_rank(filename: str) -> int:
+    value = 2166136261
+    for byte in filename.encode('utf-8'):
+        value = ((value ^ byte) * 16777619) & 0xffffffff
+    return value
+
+
+def _cover_score(row: Dict, filename: str):
+    try:
+        liked = int(float(row.get('likes') or 0)) > 0
+    except (TypeError, ValueError):
+        liked = False
+    return (0 if liked else 1, _stable_cover_rank(filename), filename)
+
+
 class TimelineAccumulator:
     """Streaming form of build_timeline_summary: feed rows one at a time with
     add() and call summary() at the end -- constant memory (a few counters per
@@ -26,6 +41,8 @@ class TimelineAccumulator:
         self._total = 0
         self._min: Optional[date] = None
         self._max: Optional[date] = None
+        self._year_covers: Dict[str, tuple] = {}
+        self._month_covers: Dict[tuple, tuple] = {}
 
     def add(self, row: Dict) -> None:
         self._total += 1
@@ -37,18 +54,36 @@ class TimelineAccumulator:
         if day > self._today:
             self._future += 1
             return
-        year_bucket = self._years.setdefault(f'{day.year:04d}', {'count': 0, 'months': {}})
-        month_bucket = year_bucket['months'].setdefault(f'{day.month:02d}', {'count': 0, 'days': {}})
+        year_key = f'{day.year:04d}'
+        month_key = f'{day.month:02d}'
+        year_bucket = self._years.setdefault(year_key, {'count': 0, 'months': {}})
+        month_bucket = year_bucket['months'].setdefault(month_key, {'count': 0, 'days': {}})
         year_bucket['count'] += 1
         month_bucket['count'] += 1
         day_key = f'{day.day:02d}'
         month_bucket['days'][day_key] = month_bucket['days'].get(day_key, 0) + 1
+        filename = str(row.get('RowKey') or '').strip()
+        if filename:
+            score = _cover_score(row, filename)
+            if score < self._year_covers.get(year_key, (2, 0, '')):
+                self._year_covers[year_key] = score
+            period_key = (year_key, month_key)
+            if score < self._month_covers.get(period_key, (2, 0, '')):
+                self._month_covers[period_key] = score
         if self._min is None or day < self._min:
             self._min = day
         if self._max is None or day > self._max:
             self._max = day
 
     def summary(self) -> Dict:
+        for year_key, year_bucket in self._years.items():
+            cover = self._year_covers.get(year_key)
+            if cover:
+                year_bucket['coverFilename'] = cover[2]
+            for month_key, month_bucket in year_bucket['months'].items():
+                cover = self._month_covers.get((year_key, month_key))
+                if cover:
+                    month_bucket['coverFilename'] = cover[2]
         cumulative_by_year: Dict[str, int] = {}
         running = 0
         for year_key in sorted(self._years.keys()):

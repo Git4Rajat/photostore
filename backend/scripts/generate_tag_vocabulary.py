@@ -41,7 +41,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from search_utils import _normalize_token  # noqa: E402
+from search_utils import SENSITIVE_AUTO_TAG_LABELS, _normalize_token  # noqa: E402
 
 VOCAB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -112,7 +112,11 @@ def build_vocabulary(target: int) -> list[str]:
     existing = {_normalize_token(label) for label in _load_existing_labels() if _normalize_token(label)}
     candidates = _candidate_nouns() | existing
 
-    blocked = {w for w in candidates if any(bad in w.split(' ') for bad in PROFANITY_BLOCKLIST)}
+    blocked = {
+        w for w in candidates
+        if any(bad in w.split(' ') for bad in PROFANITY_BLOCKLIST)
+        or _normalize_token(w) in SENSITIVE_AUTO_TAG_LABELS
+    }
     candidates -= blocked
 
     ranked = sorted(

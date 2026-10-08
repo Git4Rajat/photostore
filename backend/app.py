@@ -520,6 +520,15 @@ MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
 # scan and Python-filter the whole thing (213k+ rows, 17-33s/call). See
 # _upsert_job_status.
 JOBS_TABLE = os.getenv('JOBS_TABLE', 'photojobs')
+# CRUD requests below this size finish on the request thread. Larger requests
+# are persisted as blob-backed jobs so queue messages stay far below Azure
+# Queue Storage's message-size limit and workers can make bounded progress.
+BULK_MUTATION_ASYNC_THRESHOLD = int(os.getenv('BULK_MUTATION_ASYNC_THRESHOLD', '2000'))
+BULK_MUTATION_CHUNK_SIZE = max(1, int(os.getenv('BULK_MUTATION_CHUNK_SIZE', '500')))
+BULK_MUTATION_MAX_ITEMS = max(
+    BULK_MUTATION_ASYNC_THRESHOLD,
+    int(os.getenv('BULK_MUTATION_MAX_ITEMS', '100000')),
+)
 # One row per user-triggered Workbench processing run (action, steps, scope,
 # filename count/list, timestamp) -- durable history, modeled on MERGE_TABLE.
 WORKBENCH_ACTIONS_TABLE = os.getenv('WORKBENCH_ACTIONS_TABLE', 'workbenchactions')
@@ -3112,6 +3121,14 @@ def _humanize_job(row: Dict) -> Dict:
             message = 'Your library index finished building.'
         elif status == 'failed':
             title = 'Library index build failed'
+    elif job_type == 'photo_soft_delete':
+        kind = 'bulk_mutation'
+        count = int(result.get('deleted') or row.get('totalItems') or 0)
+        if status == 'done':
+            title = 'Photos moved to trash'
+            message = f"{_plural(count, 'photo')} moved to Recently Deleted."
+        elif status == 'failed':
+            title = 'Could not finish deleting photos'
     elif job_type == 'clustering':
         recluster_keys = {'peopleAlbums', 'detectedFaces', 'candidateFaces', 'skippedConfirmedFaces', 'assignments'}
         cluster_keys = {'createdPeople', 'clusterCount', 'faceCount'}
@@ -9913,6 +9930,10 @@ INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS',
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
 # The people/albums rebuild reads every cluster and face, so repeated clustering runs coalesce harder.
 INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '180'))
+# Safety ceiling for progressive search-database maintenance. Each pass must
+# either publish dirty rows or compact a non-empty delta log; reaching this
+# limit means forward progress is not converging and should be queue-retried.
+INDEX_BUILD_INCREMENTAL_MAX_PASSES = int(os.getenv('INDEX_BUILD_INCREMENTAL_MAX_PASSES', '100'))
 
 
 def _job_row_fresh_active(key: str, job_id: str) -> bool:
@@ -10035,6 +10056,34 @@ def _index_build_progress_callback(user_id: str):
     return _cb
 
 
+def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
+    """Consume all currently dirty search rows using bounded delta periods."""
+    import search_db
+
+    compacted = False
+    for pass_number in range(1, INDEX_BUILD_INCREMENTAL_MAX_PASSES + 1):
+        outcome = refresh_user_search_db_incremental(user_id)
+        perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, pass_number=pass_number, **{
+            k: v for k, v in outcome.items() if isinstance(v, (int, str))})
+        status = str(outcome.get('status') or '')
+        if status in ('noop', 'delta'):
+            if compacted:
+                # open_database applies any final deltas before deriving these,
+                # so summaries include the complete progressively-drained set.
+                _refresh_library_summaries(user_id)
+            return outcome
+        if status == 'more':
+            continue
+        if status == 'needs_full':
+            if search_db.compact_database(user_id) is None:
+                raise RuntimeError('search database compaction made no progress')
+            compacted = True
+            continue
+        raise RuntimeError(f'incremental search database refresh returned {status or "an empty status"}')
+    raise RuntimeError(
+        f'incremental search database refresh did not converge after {INDEX_BUILD_INCREMENTAL_MAX_PASSES} passes')
+
+
 def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None:
     """Worker-side body of an index_build message. A heartbeat thread keeps the
     job row's updatedAt fresh while a long single step (full table scan,
@@ -10071,16 +10120,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     storage_utils_module.reconcile_search_db(user_id)
                 except Exception:
                     worker_logger.warning('Library reconcile failed for %s', user_id, exc_info=True)
-                outcome = refresh_user_search_db_incremental(user_id)
-                perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, **{
-                    k: v for k, v in outcome.items() if isinstance(v, (int, str))})
-                if outcome.get('status') == 'needs_full':
-                    # Too much has changed / the log is long: fold it into a fresh base. This reads the
-                    # worker's local database, never the table, so it stays cheap at any library size.
-                    import search_db
-                    if search_db.compact_database(user_id):
-                        _refresh_library_summaries(user_id)
-                    refresh_user_search_db_incremental(user_id)   # catch up whatever changed meanwhile
+                _drain_incremental_search_db(user_id, scope)
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
             else:
                 # Full scope = a library with no usable database (new, or a schema upgrade). The
@@ -11994,6 +12034,11 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
         entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
     except Exception:
         return None
+    # Queue redelivery may replay a chunk after the worker was interrupted.
+    # Preserve the original pre-delete statuses and timestamp in that case so
+    # a later restore remains lossless.
+    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+        return entity
     now_iso = datetime.now(timezone.utc).isoformat()
     # Snapshot the real per-step statuses before overwriting them, so restore
     # can put them back exactly instead of forcing a wasteful full re-run of
@@ -12011,6 +12056,134 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
     metadata_table_client.upsert_entity(entity)
     _trash_index_add(user_id, filename, now_iso)
     return entity
+
+
+def _soft_delete_photos_now(
+    user_id: str,
+    filenames,
+    *,
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> Dict[str, object]:
+    """Soft-delete a bounded list and dirty derived indexes once at the end.
+
+    The same implementation serves the request path and the background worker,
+    preventing large jobs from developing subtly different delete semantics.
+    """
+    valid_names = [str(name or '').strip() for name in filenames if str(name or '').strip()]
+    deleted: List[str] = []
+    errors: List[str] = []
+    total = len(valid_names)
+
+    for start in range(0, total, BULK_MUTATION_CHUNK_SIZE):
+        chunk = valid_names[start:start + BULK_MUTATION_CHUNK_SIZE]
+        names_set = set(chunk)
+        with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+            metadata_results = list(executor.map(
+                lambda name: (name, _get_metadata_entity(user_id, name)), chunk,
+            ))
+        own_rows = {name for name, metadata in metadata_results if metadata is not None}
+        temp_removed = _batch_delete_upload_temp_files(names_set)
+
+        def _delete_one(name: str) -> Tuple[str, str]:
+            if name not in own_rows:
+                return name, 'deleted' if name in temp_removed else 'not_found'
+            return name, 'deleted' if _mark_processing_deleted_for_file(user_id, name) is not None else 'error'
+
+        with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+            outcomes = list(executor.map(_delete_one, chunk))
+        deleted_chunk = [name for name, outcome in outcomes if outcome == 'deleted']
+        deleted.extend(deleted_chunk)
+        errors.extend(
+            f"{name}: {'Not found' if outcome == 'not_found' else 'metadata: soft-delete failed'}"
+            for name, outcome in outcomes if outcome != 'deleted'
+        )
+        if deleted_chunk:
+            try:
+                _set_faces_source_deleted_for_filenames(user_id, deleted_chunk, True)
+            except Exception:
+                app.logger.warning('Could not hide deleted-photo faces for %s', user_id, exc_info=True)
+        if progress is not None:
+            progress(min(start + len(chunk), total), total)
+
+    if deleted:
+        _invalidate_metadata_scan_cache(user_id)
+        try:
+            touch_user_search_indexes_state(user_id, filenames=deleted)
+        except Exception:
+            pass
+        try:
+            touch_user_people_index_state(user_id)
+        except Exception:
+            pass
+        try:
+            _trigger_tools_index_rebuild(user_id, reason='photo-delete', scope='people')
+        except Exception:
+            app.logger.warning('Could not trigger People index rebuild after photo delete for %s', user_id, exc_info=True)
+    return {'deleted': deleted, 'errors': errors, 'success': bool(deleted)}
+
+
+def _enqueue_photo_soft_delete_job(user_id: str, filenames) -> Dict[str, str]:
+    """Persist a large filename list in Blob Storage and queue only its pointer."""
+    job_id = f"photo-delete:{user_id}:{uuid.uuid4().hex}"
+    blob_name = f'bulk-mutations/{user_id}/{job_id}.json'
+    payload = json.dumps({'filenames': list(filenames)}, separators=(',', ':')).encode('utf-8')
+    try:
+        upload_file_to_blob(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name, payload, 'application/json')
+        _upsert_job_status(
+            job_id, user_id, 'photo_soft_delete', 'queued',
+            totalItems=len(filenames), processedItems=0, payloadBlobName=blob_name,
+        )
+        if library_ops_queue_client is None:
+            raise RuntimeError('library operations queue is unavailable')
+        library_ops_queue_client.send_message(json.dumps({
+            'type': 'photo_soft_delete',
+            'userId': user_id,
+            'user_id': user_id,
+            'jobId': job_id,
+            'payloadBlobName': blob_name,
+        }, separators=(',', ':')))
+        return {'status': 'queued', 'jobId': job_id}
+    except Exception:
+        app.logger.exception('Failed to queue bulk photo delete %s', job_id)
+        _upsert_job_status(job_id, user_id, 'photo_soft_delete', 'failed', error='Failed to queue photo delete')
+        _delete_blob_if_present(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
+        return {'status': 'failed', 'jobId': job_id}
+
+
+def _run_photo_soft_delete_job(user_id: str, job_id: str, payload_blob_name: str) -> None:
+    if not payload_blob_name:
+        raise ValueError('bulk photo delete payload is missing')
+    raw = download_file_from_blob(BLOB_MERGE_PAYLOADS_CONTAINER, payload_blob_name)
+    payload = json.loads(raw.decode('utf-8'))
+    filenames = payload.get('filenames') if isinstance(payload, dict) else None
+    if not isinstance(filenames, list) or not filenames:
+        raise ValueError('bulk photo delete payload has no filenames')
+
+    _upsert_job_status(
+        job_id, user_id, 'photo_soft_delete', 'running',
+        totalItems=len(filenames), processedItems=0, payloadBlobName=payload_blob_name,
+    )
+
+    def _progress(processed: int, total: int) -> None:
+        _upsert_job_status(
+            job_id, user_id, 'photo_soft_delete', 'running',
+            totalItems=total, processedItems=processed, payloadBlobName=payload_blob_name,
+        )
+
+    try:
+        result = _soft_delete_photos_now(user_id, filenames, progress=_progress)
+        _upsert_job_status(
+            job_id, user_id, 'photo_soft_delete', 'done',
+            totalItems=len(filenames), processedItems=len(filenames),
+            result={'deleted': len(result['deleted']), 'errors': len(result['errors'])},
+        )
+        _delete_blob_if_present(BLOB_MERGE_PAYLOADS_CONTAINER, payload_blob_name)
+    except Exception:
+        _upsert_job_status(
+            job_id, user_id, 'photo_soft_delete', 'failed',
+            totalItems=len(filenames), error='Bulk photo delete failed',
+        )
+        raise
 
 
 def _set_faces_source_deleted_for_filenames(user_id: str, filenames, deleted: bool) -> Dict[str, int]:
@@ -13123,6 +13296,18 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
 
     if job_type == 'index_build':
         _run_index_build_job(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
+        return
+
+    if job_type == 'photo_soft_delete':
+        try:
+            _run_photo_soft_delete_job(
+                user_id,
+                job_id,
+                str(payload.get('payloadBlobName') or ''),
+            )
+        except Exception:
+            worker_logger.exception('Bulk photo delete failed for %s', user_id)
+            raise
         return
 
     if job_type == 'library_delete_purge':

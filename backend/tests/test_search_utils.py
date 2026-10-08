@@ -14,11 +14,14 @@ from __future__ import annotations
 from search_utils import (
     build_semantic_text,
     build_semantic_layers,
+    curate_tag_records,
     effective_tags,
     gps_presence_tags,
+    is_sensitive_auto_tag_label,
     location_tags,
     lexical_search_score,
     parse_search_query,
+    prediction_tags,
     visible_tags,
     _normalize_token,
 )
@@ -93,3 +96,65 @@ def test_color_object_query_still_scores_via_tags():
     metadata = {'tags': '["red", "car"]', 'subjectTags': '[]'}
     tokens = parse_search_query('red car')
     assert lexical_search_score(tokens, 'photo.jpg', metadata, {}) > 0
+
+
+def test_sensitive_auto_tag_labels_are_not_curated_or_predicted():
+    curated = curate_tag_records([
+        {'label': 'Aaron', 'source': 'ai_prediction', 'confidence': 0.99},
+        {'label': 'Asian', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'Christian', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'pregnant', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'criminal', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'poor', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'smart', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'woman', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'sexuality', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'brown', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'dog', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'Aaron', 'source': 'user', 'confidence': 1.0},
+    ])
+
+    assert is_sensitive_auto_tag_label('Aaron')
+    assert is_sensitive_auto_tag_label('Asian')
+    assert is_sensitive_auto_tag_label('Christian')
+    assert is_sensitive_auto_tag_label('pregnant')
+    assert is_sensitive_auto_tag_label('criminal')
+    assert is_sensitive_auto_tag_label('poor')
+    assert is_sensitive_auto_tag_label('smart')
+    assert is_sensitive_auto_tag_label('woman')
+    assert is_sensitive_auto_tag_label('sexuality')
+    assert is_sensitive_auto_tag_label('brown')
+    assert not is_sensitive_auto_tag_label('person')
+    assert not is_sensitive_auto_tag_label('face')
+    assert curated['tags'] == ['aaron', 'dog']
+
+    metadata = {
+        'processing_metadata': (
+            '{"client_ai_vision":{"predictions":['
+            '{"label":"Asian","score":0.99},'
+            '{"label":"Christian","score":0.99},'
+            '{"label":"pregnant","score":0.99},'
+            '{"label":"dog","score":0.99}'
+            ']}}'
+        )
+    }
+    assert prediction_tags(metadata) == ['dog']
+
+
+def test_existing_sensitive_ai_tags_are_hidden_but_user_tags_stay_visible():
+    metadata = {
+        'tags': '["asian","aaron","dog"]',
+        'subjectTags': '["asian","dog"]',
+        'backgroundTags': '["aaron","beach"]',
+        'tagMetadata': (
+            '['
+            '{"tag":"asian","source":"ai_tag","confidence":0.99},'
+            '{"tag":"aaron","source":"user","confidence":1.0},'
+            '{"tag":"dog","source":"ai_tag","confidence":0.99}'
+            ']'
+        ),
+    }
+
+    assert visible_tags(metadata) == ['aaron', 'dog']
+    assert effective_tags(metadata) == ['dog', 'aaron', 'beach']
+    assert build_semantic_layers('photo.jpg', metadata)['subjects'] == ['dog']

@@ -311,6 +311,22 @@ def test_backend_index_status_ready_true_when_all_built(monkeypatch, route_ctx):
     assert response.get_json()['ready'] is True
 
 
+def test_backend_index_status_treats_empty_library_as_ready(monkeypatch, route_ctx):
+    from tests.fakes import FakeTable
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
+        'sort': False, 'lexical': False, 'albums': False, 'people': False,
+    })
+    monkeypatch.setattr(app, 'metadata_table_client', FakeTable())
+
+    with app.app.test_request_context('/api/photos/index-status'):
+        response = photos_index_status()
+
+    payload = response.get_json()
+    assert payload['ready'] is True
+    assert payload['emptyLibrary'] is True
+    assert payload['indexes'] == {'sort': False, 'lexical': False, 'albums': False, 'people': False}
+
+
 # --- POST /api/tools/indexes/build (tools: the actual builder) ----------------
 
 def _build_state(indexes, needs_rebuild):
@@ -756,17 +772,49 @@ def test_people_job_refreshes_people_and_albums_not_the_whole_library(monkeypatc
     assert primed == [('people', 'albums')]
 
 
-def test_a_long_delta_log_is_compacted_from_local_data_never_by_rescanning(monkeypatch):
+def test_an_oversized_dirty_set_is_progressively_compacted_until_drained(monkeypatch):
     import search_db
     primed, _ = _job_env(monkeypatch)
-    outcomes = iter([{'status': 'needs_full', 'dirty': 999}, {'status': 'noop'}])
+    outcomes = iter([
+        {'status': 'needs_full', 'dirty': 100000, 'remaining': 67500, 'published': 7},
+        {'status': 'needs_full', 'dirty': 67500, 'remaining': 26875, 'published': 9},
+        {'status': 'delta', 'published': 6, 'remaining': 0},
+    ])
     monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: next(outcomes))
     compacted, summaries = [], []
     monkeypatch.setattr(search_db, 'compact_database', lambda uid: compacted.append(uid) or {'ok': True})
     monkeypatch.setattr(app, '_refresh_library_summaries', lambda uid: summaries.append(uid))
     app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
     assert primed == [('sort', 'access')]                      # no ('lexical',) table-scan rebuild
-    assert compacted == ['lib-1'] and summaries == ['lib-1']
+    assert compacted == ['lib-1', 'lib-1'] and summaries == ['lib-1']
+
+
+def test_incremental_build_fails_instead_of_reporting_done_when_compaction_stalls(monkeypatch):
+    import search_db
+    _, statuses = _job_env(monkeypatch)
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {
+        'status': 'needs_full', 'dirty': 100000, 'remaining': 100000,
+    })
+    monkeypatch.setattr(search_db, 'compact_database', lambda uid: None)
+    with pytest.raises(RuntimeError, match='compaction made no progress'):
+        app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
+    assert statuses[-1] == 'failed'
+    assert 'done' not in statuses
+
+
+def test_incremental_build_continues_a_bounded_pass_without_unneeded_compaction(monkeypatch):
+    import search_db
+    _, statuses = _job_env(monkeypatch)
+    outcomes = iter([
+        {'status': 'more', 'dirty': 300000, 'remaining': 100000, 'published': 40},
+        {'status': 'delta', 'published': 20, 'remaining': 0},
+    ])
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: next(outcomes))
+    compacted = []
+    monkeypatch.setattr(search_db, 'compact_database', lambda uid: compacted.append(uid))
+    app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
+    assert compacted == []
+    assert statuses[-1] == 'done'
 
 
 def test_full_scope_bootstraps_only_a_library_without_a_database(monkeypatch):

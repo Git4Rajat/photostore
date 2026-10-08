@@ -19,6 +19,26 @@ SORT_INDEX_CLIENT_MAX_ROWS = int(__import__('os').getenv('SORT_INDEX_CLIENT_MAX_
 
 photos_bp = Blueprint('photos', __name__)
 
+def _library_has_metadata_rows(user_id: str):
+    """Return True/False when a cheap one-row metadata probe can tell whether
+    this library has photos; None means "unknown, preserve the building path"."""
+    if app.metadata_table_client is None:
+        return None
+    try:
+        rows = app.metadata_table_client.query_entities(
+            f"PartitionKey eq '{app._escape_odata(user_id)}'",
+            select=['RowKey'],
+            results_per_page=1,
+        )
+        page_iter = rows.by_page() if hasattr(rows, 'by_page') else iter([rows])
+        for page in page_iter:
+            return next(iter(page), None) is not None
+        return False
+    except Exception:
+        app.app.logger.warning('Could not probe library emptiness for %s', user_id, exc_info=True)
+        return None
+
+
 @photos_bp.route('/api/photos/thumbnail/<path:filename>', methods=['GET'])
 def proxy_thumbnail(filename: str):
     """Serve a thumbnail blob or a placeholder when the blob is missing."""
@@ -460,6 +480,8 @@ def list_photos():
     # database (flat memory); only the returned page is read fresh from the table.
     db = app._open_library_db(user_id)
     if db is None:
+        if _library_has_metadata_rows(user_id) is False:
+            return app.jsonify({'photos': [], 'total': 0})
         return app.jsonify({'photos': [], 'total': 0, 'indexBuilding': True})
     try:
         filenames, total = db.list_page(
@@ -559,6 +581,8 @@ def photo_date_position():
         return error
     db = app._open_library_db(user_id)
     if db is None:
+        if _library_has_metadata_rows(user_id) is False:
+            return app.jsonify({'offset': 0, 'filename': '', 'total': 0})
         return app.jsonify({'offset': 0, 'filename': '', 'total': 0, 'indexBuilding': True})
     try:
         end_ts = datetime.combine(day, time.max, tzinfo=timezone.utc).timestamp()
@@ -1099,7 +1123,13 @@ def photos_index_status():
         }
     except Exception:
         library_db = None
+    empty_library = False
+    if not ready and not building and _library_has_metadata_rows(user_id) is False:
+        empty_library = True
+        ready = True
     payload = {'ready': ready, 'indexes': indexes, 'building': building, 'libraryDb': library_db}
+    if empty_library:
+        payload['emptyLibrary'] = True
     if app.request.args.get('diagnostics') in ('1', 'true'):
         # For environments without a log workspace: how many messages are waiting in each work queue, and
         # which processing mode this app is running, so "is anything reaching ipworker?" can be answered
@@ -1197,55 +1227,27 @@ def delete_multiple_photos():
     deleted = []
     if not valid_names:
         return app.jsonify({'deleted': deleted, 'errors': errors, 'success': False})
+    if len(valid_names) > app.BULK_MUTATION_MAX_ITEMS:
+        return app.jsonify({
+            'error': f'Too many photos; maximum is {app.BULK_MUTATION_MAX_ITEMS}',
+            'success': False,
+        }), 413
 
-    names_set = set(valid_names)
+    if len(valid_names) >= app.BULK_MUTATION_ASYNC_THRESHOLD:
+        queued = app._enqueue_photo_soft_delete_job(user_id, valid_names)
+        if queued.get('status') != 'queued':
+            return app.jsonify({'error': 'Could not queue photo delete', **queued, 'success': False}), 503
+        return app.jsonify({
+            **queued,
+            'accepted': len(valid_names),
+            'deleted': [],
+            'errors': errors,
+            'success': True,
+        }), 202
 
-    # Point-reads only (no partition scan) -- see _hard_delete_photos_now's
-    # sibling comment for why that mattered on large accounts.
-    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
-        metadata_results = list(executor.map(lambda n: (n, app._get_metadata_entity(user_id, n)), valid_names))
-    own_rows_by_name = {name: metadata for name, metadata in metadata_results if metadata is not None}
-    temp_removed_names = app._batch_delete_upload_temp_files(names_set)
-
-    def _soft_delete_one_file(safe_name: str) -> app.Tuple[str, str, str]:
-        """Returns (safe_name, outcome, detail); outcome one of 'deleted',
-        'not_found', 'error'. A photo with no metadata row yet (still
-        mid-upload) has nothing to trash -- clearing its temp file, same as
-        before, is as far as "delete" goes for it."""
-        if safe_name not in own_rows_by_name:
-            return (safe_name, 'deleted', '') if safe_name in temp_removed_names else (safe_name, 'not_found', '')
-        entity = app._mark_processing_deleted_for_file(user_id, safe_name)
-        if entity is None:
-            return safe_name, 'error', 'metadata: soft-delete failed'
-        return safe_name, 'deleted', ''
-
-    with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
-        file_results = list(executor.map(_soft_delete_one_file, valid_names))
-
-    for safe_name, outcome, detail in file_results:
-        if outcome == 'deleted':
-            deleted.append(safe_name)
-        elif outcome == 'not_found':
-            errors.append(f'{safe_name}: Not found')
-        else:
-            errors.append(f'{safe_name}: {detail}')
-
-    if deleted:
-        app._invalidate_metadata_scan_cache(user_id)
-        try:
-            app._set_faces_source_deleted_for_filenames(user_id, deleted, True)
-        except Exception:
-            app.app.logger.warning('Could not mark deleted-photo faces hidden for %s', user_id, exc_info=True)
-        try:
-            app.touch_user_search_indexes_state(user_id, filenames=deleted)
-        except Exception:
-            pass
-        try:
-            app.touch_user_people_index_state(user_id)
-        except Exception:
-            pass
-
-    return app.jsonify({'deleted': deleted, 'errors': errors, 'success': len(deleted) > 0})
+    result = app._soft_delete_photos_now(user_id, valid_names)
+    result['errors'] = errors + list(result.get('errors') or [])
+    return app.jsonify(result)
 
 
 @photos_bp.route('/photos/trash', methods=['GET'])
@@ -1337,6 +1339,10 @@ def restore_trashed_photos():
             app.touch_user_people_index_state(user_id)
         except Exception:
             pass
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='photo-restore', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not trigger People index rebuild after photo restore for %s', user_id, exc_info=True)
 
     return app.jsonify({'restored': restored, 'errors': errors, 'success': len(restored) > 0})
 
@@ -1378,6 +1384,10 @@ def restore_all_trashed_photos():
             app.touch_user_people_index_state(user_id)
         except Exception:
             pass
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='photo-restore-all', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not trigger People index rebuild after restoring trash for %s', user_id, exc_info=True)
 
     return app.jsonify({'restored': restored, 'errors': errors, 'success': len(restored) > 0})
 
@@ -1615,6 +1625,8 @@ def filter_photos():
 
     db = app._open_library_db(user_id)
     if db is None:
+        if _library_has_metadata_rows(user_id) is False:
+            return app.jsonify({'photos': [], 'total': 0, 'offset': offset, 'limit': limit})
         return app.jsonify({'photos': [], 'total': 0, 'offset': offset, 'limit': limit, 'indexBuilding': True})
 
     try:

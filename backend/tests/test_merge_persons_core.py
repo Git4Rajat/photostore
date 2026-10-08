@@ -90,12 +90,30 @@ def test_delete_cluster_releases_every_face_and_reports_filenames(monkeypatch):
 def test_bulk_delete_route_handles_many_clusters_and_unknown_ids(monkeypatch):
     from routes import people
     persons, faces = _world(monkeypatch)
+    rebuilds = []
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *args, **kwargs: rebuilds.append((args, kwargs)))
     with app.app.test_request_context('/api/persons/delete', method='POST', json={'personIds': ['B', 'C', 'B', 'nope']}):
         payload = people.delete_person_clusters().get_json()
     assert sorted(payload['deletedPersonIds'] if 'deletedPersonIds' in payload else payload.get('deleted', [])) == ['B', 'C']
     assert [e['personId'] for e in payload.get('errors', [])] == ['nope']
+    assert rebuilds == [(('u1',), {'reason': 'people-delete', 'scope': 'people'})]
+
+
+def test_single_delete_route_triggers_people_index_rebuild(monkeypatch):
+    from routes import people
+    _world(monkeypatch)
+    rebuilds = []
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *args, **kwargs: rebuilds.append((args, kwargs)))
+
+    with app.app.test_request_context('/api/persons/B/delete', method='POST'):
+        response = people.delete_person_cluster('B')
+
+    assert response.get_json()['success'] is True
+    assert rebuilds == [(('u1',), {'reason': 'person-delete', 'scope': 'people'})]
 
 
 def test_person_detail_pages_faces_best_first_without_per_face_reads(monkeypatch):

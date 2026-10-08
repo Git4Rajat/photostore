@@ -1,6 +1,8 @@
 import IndexBuildBar from './components/IndexBuildBar';
 import { invalidateLocalSortIndex } from '../../services/localSortIndex';
 import { invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
+import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
+import { subscribeLibraryChanges } from '../../services/libraryChanges';
 import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
@@ -324,15 +326,40 @@ const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
  *  builds, people grouping). Without this the indexes downloaded at session start stay as they were. */
 const DataRefreshBridge: React.FC = () => {
     const { registerDataRefreshHandler } = useAppServices();
-    const { reloadPhotos, reloadAlbums, reloadPeople, reloadExplore } = useStore();
+    const { reloadPhotos, reloadAlbums, reloadPeople, reloadExplore, reloadTrash, applyExternalPhotoDeleteCount, applyExternalPeopleRemoval } = useStore();
     useEffect(() => registerDataRefreshHandler(() => {
         invalidateLocalSortIndex();
         invalidateLocalAlbumsIndex();
+        invalidateLocalPeopleIndex();
         reloadPhotos();
         reloadAlbums();
         reloadPeople();
         reloadExplore();
     }), [registerDataRefreshHandler, reloadPhotos, reloadAlbums, reloadPeople, reloadExplore]);
+
+    useEffect(() => subscribeLibraryChanges((change) => {
+        const domains = new Set(change.domains);
+        if (domains.has('photos')) {
+            if (change.operation === 'photos-deleted' && change.itemCount) {
+                applyExternalPhotoDeleteCount(change.itemCount);
+            }
+            invalidateLocalSortIndex();
+            reloadPhotos();
+        }
+        if (domains.has('albums')) {
+            invalidateLocalAlbumsIndex();
+            reloadAlbums();
+        }
+        if (domains.has('people')) {
+            if (change.entityIds?.length && (change.operation === 'person-deleted' || change.operation === 'people-deleted' || change.operation === 'people-merged')) {
+                applyExternalPeopleRemoval(change.entityIds);
+            }
+            invalidateLocalPeopleIndex();
+            reloadPeople();
+        }
+        if (domains.has('explore')) reloadExplore();
+        if (domains.has('trash')) void reloadTrash();
+    }), [reloadPhotos, reloadAlbums, reloadPeople, reloadExplore, reloadTrash, applyExternalPhotoDeleteCount, applyExternalPeopleRemoval]);
     return null;
 };
 

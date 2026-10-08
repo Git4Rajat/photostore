@@ -881,6 +881,13 @@ def delete_person_cluster(person_id: str):
     result = app._delete_person_cluster(user_id, person_id)
     if not result.get('deleted'):
         return app.jsonify({'error': 'person not found'}), 404
+    # The table-client wrapper marks the People manifest dirty, but serving
+    # roles cannot rebuild it themselves. Queue the narrow people/albums job
+    # now instead of waiting for a later page read to request a full rebuild.
+    try:
+        app._trigger_tools_index_rebuild(user_id, reason='person-delete', scope='people')
+    except Exception:
+        app.app.logger.warning('Could not queue People index rebuild after deleting %s', person_id, exc_info=True)
     return app.jsonify({'success': True, 'personId': person_id, **result})
 
 @people_bp.route('/api/persons/delete', methods=['POST'])
@@ -913,6 +920,13 @@ def delete_person_clusters():
             errors.append({'personId': person_id_value, 'error': 'person not found'})
 
     metadata_rebuild = app._rebuild_metadata_faces_for_filenames(user_id, affected_filenames)
+    if deleted_person_ids:
+        # One coalesced trigger for the whole request. Large batches must not
+        # enqueue one index job per cluster.
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='people-delete', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not queue People index rebuild after batch delete', exc_info=True)
     return app.jsonify({
         'success': len(errors) == 0,
         'deletedPersonIds': deleted_person_ids,
@@ -937,6 +951,14 @@ def merge_persons(person_id: str):
     if core is None:
         return app.jsonify({'error': 'base person not found'}), 404
     merge_id = core['mergeId']
+    try:
+        app.touch_user_people_index_state(user_id)
+    except Exception:
+        app.app.logger.warning('Could not dirty People index after merge %s', merge_id, exc_info=True)
+    try:
+        app._trigger_tools_index_rebuild(user_id, reason='people-merge', scope='people')
+    except Exception:
+        app.app.logger.warning('Could not queue People index rebuild after merge %s', merge_id, exc_info=True)
 
     # If the merged-into person is named, reuse its strengthened rep to reclaim
     # matching faces still sitting in unnamed clusters. That scans the entire face
@@ -1027,6 +1049,16 @@ def merge_persons_batch():
                     auto_assigned_total += int(propagation.get('autoAssignedCount') or 0)
                 except Exception:
                     app.app.logger.exception('Identity propagation after batch merge failed for %s', target_id)
+
+    if any(result.get('success') for result in results):
+        try:
+            app.touch_user_people_index_state(user_id)
+        except Exception:
+            app.app.logger.warning('Could not dirty People index after batch merge', exc_info=True)
+        try:
+            app._trigger_tools_index_rebuild(user_id, reason='people-merge-batch', scope='people')
+        except Exception:
+            app.app.logger.warning('Could not queue People index rebuild after batch merge', exc_info=True)
 
     return app.jsonify({
         'success': all(r.get('success') for r in results),
