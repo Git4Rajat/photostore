@@ -98,6 +98,12 @@ def _run_one_poll(monkeypatch, queue_client, library_ops_queue_client=None) -> N
         app, 'queue_service_client',
         _FakeQueueServiceClient(queue_client, library_ops_queue_client),
     )
+    # These tests exercise per-message dispatch/retry correctness, not the
+    # accumulate-until-idle batching feature (test_clustering_batch_accumulation.py
+    # covers that) -- force the legacy single-page path so one poll cycle
+    # dispatches exactly what's queued right now instead of waiting out
+    # CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS for more messages to arrive.
+    monkeypatch.setenv('CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS', '0')
 
     def _stop(_seconds):
         raise _StopLoop()

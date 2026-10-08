@@ -13628,45 +13628,221 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
     return True
 
 
-def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
-                                      deadletter_queue_client=None, *, batch_size=8):
-    """Bounded intake; renew queued messages until handed to the single handler.
+def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_size,
+                                  idle_timeout_seconds, visibility_timeout, poll_seconds,
+                                  shutdown_requested=None):
+    """Pool messages across possibly many receive_messages calls (Azure Queue
+    Storage caps a single call at 32 -- page_size stays within that), so a
+    caller can accumulate far more than one page before grouping/processing.
 
-    Only adjacent incremental jobs for the same library share a Blob lease.
-    Maintenance, malformed and exhausted jobs retain the original dispatcher.
+    Stops once the pool reaches target_size, or once idle_timeout_seconds
+    have passed since the last message arrived. idle_timeout_seconds<=0
+    disables waiting entirely: exactly one receive_messages call is made and
+    whatever it returns (including nothing) is the result -- this matches
+    the previous single-page poll's behavior.
+
+    Starts the lease-renewal thread as soon as the first message arrives
+    (rather than after one fixed-size page) so nothing already held lapses
+    its visibility timeout while later pages are still being fetched.
+
+    Returns (messages, holders, lock, stop_event, renew_thread, stopped_reason,
+    receive_ms). holders are [message, pending] pairs; a caller mutates
+    holder[1] to False via take(i) once a message is handed to its final
+    handler/ack path -- the renewer skips any holder already marked done.
     """
-    if not 1 <= batch_size <= 32:
-        raise ValueError('batch_size must be between 1 and 32')
-    whole_batch_started = time.monotonic()
-    receive_started = whole_batch_started
-    messages = list(queue_client.receive_messages(
-        messages_per_page=batch_size, max_messages=batch_size,
-        visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS))
-    receive_ms = int((time.monotonic() - receive_started) * 1000)
-    if not messages:
-        return False
-    worker_logger.info('clustering batch receive queue=%s receive_ms=%d messages=%d',
-                       queue_name, receive_ms, len(messages))
-    holders = [[message, True] for message in messages]
+    holders: List[List] = []
     lock = threading.Lock()
     stop = threading.Event()
 
     def renew_pending():
         while not stop.wait(CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS):
-            for holder in holders:
-                # Hold through renewal/handoff so the handler always gets the
-                # newest receipt and never competes with this pending renewer.
+            with lock:
+                snapshot = list(holders)
+            for holder in snapshot:
                 with lock:
                     if not holder[1]:
                         continue
-                    try:
-                        holder[0] = queue_client.update_message(
-                            holder[0], visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS)
-                    except Exception:
-                        worker_logger.exception('Failed to renew pending %s batch message', queue_name)
+                try:
+                    renewed = queue_client.update_message(
+                        holder[0], visibility_timeout=visibility_timeout)
+                except Exception:
+                    worker_logger.exception('Failed to renew pending %s batch message', queue_name)
+                    continue
+                with lock:
+                    if holder[1]:
+                        holder[0] = renewed
 
     thread = threading.Thread(target=renew_pending, daemon=True)
     thread.start()
+
+    started = time.monotonic()
+    if idle_timeout_seconds <= 0:
+        page = list(queue_client.receive_messages(
+            messages_per_page=page_size, max_messages=page_size,
+            visibility_timeout=visibility_timeout))
+        with lock:
+            for message in page:
+                holders.append([message, True])
+        receive_ms = int((time.monotonic() - started) * 1000)
+        return page, holders, lock, stop, thread, 'single_page', receive_ms
+
+    messages: List = []
+    last_received = started
+    stopped_reason = 'idle_timeout'
+    while True:
+        if shutdown_requested is not None and shutdown_requested.is_set():
+            stopped_reason = 'shutdown'
+            break
+        page = list(queue_client.receive_messages(
+            messages_per_page=page_size, max_messages=page_size,
+            visibility_timeout=visibility_timeout))
+        now = time.monotonic()
+        if page:
+            with lock:
+                for message in page:
+                    messages.append(message)
+                    holders.append([message, True])
+            last_received = now
+            if len(messages) >= target_size:
+                stopped_reason = 'target_reached'
+                break
+        if now - last_received > idle_timeout_seconds:
+            stopped_reason = 'idle_timeout'
+            break
+        if not page:
+            time.sleep(poll_seconds)
+    receive_ms = int((time.monotonic() - started) * 1000)
+    return messages, holders, lock, stop, thread, stopped_reason, receive_ms
+
+
+def _process_clustering_user_group(user, indices, messages, take, queue_client, queue_name,
+                                   max_retries, deadletter_queue_client):
+    """Prepare every message's pending face ids, then run staged FAISS
+    batches chunked to <=256 unique faces each -- the cap assigner.batch()
+    itself already enforces for a single call. A group accumulated from
+    many messages for one busy user must not be forced into one oversized
+    staged call; this greedily splits it into as few chunks as fit instead.
+    """
+
+    def prepare(i):
+        try:
+            return _prepare_incremental_assignment(json.loads(messages[i].content), user)
+        except Exception as error:
+            return error
+
+    concurrency = _get_live_faiss_assigner().config.io_concurrency
+    prepare_started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        preparations = dict(zip(indices, pool.map(prepare, indices)))
+    prepare_ms = int((time.monotonic() - prepare_started) * 1000)
+    worker_logger.info('clustering batch prepare user=%s messages=%d prepare_ms=%d concurrency=%d',
+                       user, len(indices), prepare_ms, concurrency)
+
+    assigner = _get_live_faiss_assigner()
+    staged_ok = getattr(assigner.config, 'coalesce_writes', False)
+
+    chunks: List[List[int]] = []
+    current: List[int] = []
+    current_ids: set = set()
+    for i in indices:
+        prepared = preparations[i]
+        ids = prepared[1] if not isinstance(prepared, Exception) else []
+        projected = current_ids | set(ids)
+        if current and len(projected) > 256:
+            chunks.append(current)
+            current, current_ids = [], set(ids)
+        else:
+            current_ids = projected
+        current.append(i)
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        all_ids = [fid for i in chunk for fid in
+                   (preparations[i][1] if not isinstance(preparations[i], Exception) else [])]
+        staged = staged_ok and len(set(all_ids)) <= 256
+        try:
+            if staged:
+                completed = []
+                batch_started = time.monotonic()
+                worker_logger.info('clustering staged batch started user=%s messages=%d input_faces=%d',
+                                   user, len(chunk), len(set(all_ids)))
+                # Keep ALL receipts with the pending renewer until flush,
+                # projections and lease checks finish. No early acknowledgement.
+                with assigner.batch(user, all_ids, staged=True) as assign:
+                    for i in chunk:
+                        prepared = preparations[i]
+                        if isinstance(prepared, Exception):
+                            worker_logger.warning('FAISS batch preparation failed user=%s error=%s',
+                                                  user, type(prepared).__name__)
+                            continue
+                        filename, face_ids = prepared
+                        if filename:
+                            if face_ids:
+                                assign(filename, face_ids)
+                            # Owned-face retries still need projection;
+                            # duplicate filenames project only once.
+                            assign.project(filename)
+                        completed.append((i, filename))
+                acknowledged = 0
+                for i, filename in completed:
+                    if filename in assign.metadata_errors:
+                        continue
+                    try:
+                        queue_client.delete_message(take(i))
+                        acknowledged += 1
+                    except Exception:
+                        worker_logger.exception('Failed to delete completed %s batch message', queue_name)
+                worker_logger.info('clustering staged batch done user=%s messages=%d acknowledged=%d '
+                                   'metadata_failures=%d elapsed_ms=%d', user, len(chunk), acknowledged,
+                                   len(assign.metadata_errors), int((time.monotonic() - batch_started) * 1000))
+                continue
+            with assigner.batch(user, all_ids) as assign:
+                for i in chunk:
+                    prepared = preparations[i]
+                    def dispatch(payload, job_id, user_id, job_type, prepared=prepared):
+                        if isinstance(prepared, Exception):
+                            raise prepared
+                        _handle_clustering_queue_payload(payload, job_id, user_id, job_type,
+                                                         incremental_assign=assign, prepared=prepared)
+                    _process_clustering_queue_message(take(i), queue_client, queue_name,
+                                                      max_retries, deadletter_queue_client,
+                                                      dispatch=dispatch)
+        except Exception:
+            # Setup/lease/prefetch failures acknowledge nothing not already
+            # completed. Visibility expiry redelivers the remaining jobs.
+            worker_logger.exception('FAISS microbatch failed user=%s messages=%d', user, len(chunk))
+
+
+def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
+                                      deadletter_queue_client=None, *, batch_size=8,
+                                      target_size=None, idle_timeout_seconds=0.0,
+                                      poll_seconds=2.0, shutdown_requested=None):
+    """Accumulate messages (possibly across many receive_messages calls --
+    see _accumulate_clustering_batch) then group by user ACROSS THE WHOLE
+    accumulated pool, not just adjacent positions, so same-user jobs
+    separated by other users' messages still share one staged Blob lease
+    and batched table write instead of falling back to the slow per-face
+    serial path.
+
+    Maintenance, malformed and exhausted jobs retain the original dispatcher.
+    """
+    if not 1 <= batch_size <= 32:
+        raise ValueError('batch_size must be between 1 and 32')
+    target_size = target_size if target_size is not None else batch_size
+    messages, holders, lock, stop, thread, stopped_reason, receive_ms = _accumulate_clustering_batch(
+        queue_client, queue_name, page_size=batch_size, target_size=target_size,
+        idle_timeout_seconds=idle_timeout_seconds,
+        visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
+        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested)
+    if not messages:
+        stop.set()
+        thread.join(timeout=5)
+        return False
+    whole_batch_started = time.monotonic()
+    worker_logger.info(
+        'clustering batch accumulated queue=%s messages=%d receive_ms=%d stopped_reason=%s',
+        queue_name, len(messages), receive_ms, stopped_reason)
 
     def take(index):
         with lock:
@@ -13684,90 +13860,26 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
             return None
 
     try:
-        index = 0
-        while index < len(messages):
-            user = identity(messages[index]) if PEOPLE_ASSIGNMENT_ENGINE == 'faiss' else None
-            end = index + 1
-            if user:
-                while end < len(messages) and identity(messages[end]) == user:
-                    end += 1
-            if not user or end - index == 1:
-                _process_clustering_queue_message(take(index), queue_client, queue_name,
-                                                  max_retries, deadletter_queue_client)
-                index = end
+        groups: Dict[object, List[int]] = {}
+        order: List[object] = []
+        for i in range(len(messages)):
+            user = identity(messages[i]) if PEOPLE_ASSIGNMENT_ENGINE == 'faiss' else None
+            key = user if user else ('__singleton__', i)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(i)
+
+        for key in order:
+            indices = groups[key]
+            user = key if isinstance(key, str) else None
+            if not user or len(indices) == 1:
+                for i in indices:
+                    _process_clustering_queue_message(take(i), queue_client, queue_name,
+                                                      max_retries, deadletter_queue_client)
                 continue
-
-            group = list(range(index, end))
-
-            def prepare(i):
-                try:
-                    return _prepare_incremental_assignment(json.loads(messages[i].content), user)
-                except Exception as error:
-                    return error
-
-            concurrency = _get_live_faiss_assigner().config.io_concurrency
-            prepare_started = time.monotonic()
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                preparations = list(pool.map(prepare, group))
-            prepare_ms = int((time.monotonic() - prepare_started) * 1000)
-            worker_logger.info('clustering batch prepare user=%s messages=%d prepare_ms=%d concurrency=%d',
-                               user, len(group), prepare_ms, concurrency)
-            all_ids = [fid for item in preparations if not isinstance(item, Exception)
-                       for fid in item[1]]
-            assigner = _get_live_faiss_assigner()
-            staged = (getattr(assigner.config, 'coalesce_writes', False)
-                      and len(set(all_ids)) <= 256)
-            try:
-                if staged:
-                    completed = []
-                    batch_started = time.monotonic()
-                    worker_logger.info('clustering staged batch started user=%s messages=%d input_faces=%d',
-                                       user, len(group), len(set(all_ids)))
-                    # Keep ALL receipts with the pending renewer until flush,
-                    # projections and lease checks finish. No early acknowledgement.
-                    with assigner.batch(user, all_ids, staged=True) as assign:
-                        for i, prepared in zip(group, preparations):
-                            if isinstance(prepared, Exception):
-                                worker_logger.warning('FAISS batch preparation failed user=%s error=%s',
-                                                      user, type(prepared).__name__)
-                                continue
-                            filename, face_ids = prepared
-                            if filename:
-                                if face_ids:
-                                    assign(filename, face_ids)
-                                # Owned-face retries still need projection;
-                                # duplicate filenames project only once.
-                                assign.project(filename)
-                            completed.append((i, filename))
-                    acknowledged = 0
-                    for i, filename in completed:
-                        if filename in assign.metadata_errors:
-                            continue
-                        try:
-                            queue_client.delete_message(take(i))
-                            acknowledged += 1
-                        except Exception:
-                            worker_logger.exception('Failed to delete completed %s batch message', queue_name)
-                    worker_logger.info('clustering staged batch done user=%s messages=%d acknowledged=%d '
-                                       'metadata_failures=%d elapsed_ms=%d', user, len(group), acknowledged,
-                                       len(assign.metadata_errors), int((time.monotonic() - batch_started) * 1000))
-                    index = end
-                    continue
-                with assigner.batch(user, all_ids) as assign:
-                    for i, prepared in zip(group, preparations):
-                        def dispatch(payload, job_id, user_id, job_type, prepared=prepared):
-                            if isinstance(prepared, Exception):
-                                raise prepared
-                            _handle_clustering_queue_payload(payload, job_id, user_id, job_type,
-                                                             incremental_assign=assign, prepared=prepared)
-                        _process_clustering_queue_message(take(i), queue_client, queue_name,
-                                                          max_retries, deadletter_queue_client,
-                                                          dispatch=dispatch)
-            except Exception:
-                # Setup/lease/prefetch failures acknowledge nothing not already
-                # completed. Visibility expiry redelivers the remaining jobs.
-                worker_logger.exception('FAISS microbatch failed user=%s messages=%d', user, len(group))
-            index = end
+            _process_clustering_user_group(user, indices, messages, take, queue_client,
+                                           queue_name, max_retries, deadletter_queue_client)
     finally:
         stop.set()
         thread.join(timeout=5)
@@ -13787,6 +13899,17 @@ def run_clustering_worker() -> None:
     batch_size = int(os.getenv('CLUSTERING_WORKER_BATCH_SIZE', '1'))
     if not 1 <= batch_size <= 32:
         raise ValueError('CLUSTERING_WORKER_BATCH_SIZE must be between 1 and 32')
+    # Outer accumulation goal/cutoff -- batch_size above is just the inner
+    # per-receive_messages-call page size (capped at Azure's real 32-per-call
+    # ceiling). target_batch_size is how many messages to pool across
+    # possibly many such calls before grouping/processing; idle_timeout_seconds
+    # is how long to keep waiting for more once the pool stops growing.
+    target_batch_size = int(os.getenv('CLUSTERING_WORKER_TARGET_BATCH_SIZE', '500'))
+    if not 1 <= target_batch_size <= 5000:
+        raise ValueError('CLUSTERING_WORKER_TARGET_BATCH_SIZE must be between 1 and 5000')
+    idle_timeout_seconds = float(os.getenv('CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS', '300'))
+    if not 0 <= idle_timeout_seconds <= 3600:
+        raise ValueError('CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS must be between 0 and 3600')
     queue_service_client_local = queue_service_client
     if queue_service_client_local is None:
         _init_storage_clients()
@@ -13853,14 +13976,16 @@ def run_clustering_worker() -> None:
                 library_ops_deadletter_client,
             )
             if not processed_any and not shutdown_requested.is_set():
-                if batch_size == 1:
+                if batch_size == 1 and target_batch_size <= 1:
                     processed_any = _poll_clustering_queue_once(
                         queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
                         clustering_deadletter_client)
                 else:
                     processed_any = _poll_clustering_queue_batch_once(
                         queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
-                        clustering_deadletter_client, batch_size=batch_size)
+                        clustering_deadletter_client, batch_size=batch_size,
+                        target_size=target_batch_size, idle_timeout_seconds=idle_timeout_seconds,
+                        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested)
             if not processed_any and not shutdown_requested.is_set():
                 time.sleep(poll_seconds)
         except Exception:
