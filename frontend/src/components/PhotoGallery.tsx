@@ -20,7 +20,7 @@ import {
 import { ARC_FACE_5POINT_TEMPLATE, solveSimilarityTransform } from '../services/faceAlignment';
 import { loadFaceApiRuntimeBundle } from '../services/faceApiRuntime';
 import { preloadYoloFaceModel, detectFacesWithYolo, resetYoloFaceModelStateForTests } from '../services/yoloFaceDetectionRuntime';
-import { getFileExtension, isHeicFilename, isJxlFilename, isRawFilename, isVideoFilename, shouldOffloadPreviewToClient } from '../utils/photoDisplay';
+import { getFileExtension, isHeicFilename, isJxlFilename, isRawFilename, isVideoFilename } from '../utils/photoDisplay';
 import { plural } from '../utils/format';
 import { confirmDialog, promptDialog } from './shared/dialogs';
 import { downloadPhotosAsZip } from '../utils/downloadPhotos';
@@ -3273,7 +3273,7 @@ export const runBrowserProcessing = async (
         // 'thumbnail') -- skip computing it entirely rather than computing it
         // and discarding the result, and push no report row so the backend
         // never sees a false "checked, nothing there" signal for it.
-    } else if (processingMode === 'backend' && !shouldOffloadPreviewToClient(file)) {
+    } else if (processingMode === 'backend') {
         clientProcessingReport.push(makeClientReport(clientAssetId, 'preview', 'skipped', 'backend_processing_mode', previewStartedAt, {
             runtime: 'canvas',
             ...sourceFields,

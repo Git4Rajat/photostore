@@ -341,7 +341,7 @@ def finalize_direct_upload():
     except Exception:
         pass
     try:
-        timed_call('enqueues', app._queue_upload_processing, user_id, final_name, total_size)
+        timed_call('enqueues', app._queue_upload_processing, user_id, final_name)
     except Exception:
         app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
     try:
@@ -501,7 +501,7 @@ def finalize_upload_batch():
         except Exception:
             pass
         try:
-            timed_call('enqueues', app._queue_upload_processing, user_id, final_name, total_size)
+            timed_call('enqueues', app._queue_upload_processing, user_id, final_name)
         except Exception:
             app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
         try:

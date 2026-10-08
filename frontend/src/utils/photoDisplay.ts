@@ -57,28 +57,6 @@ export const requiresBackendPreview = (filename: string): boolean => (
     BACKEND_PREVIEW_EXTENSIONS.has(getFileExtension(filename))
 );
 
-// Size past which a plain JPEG/HEIC/PNG original is big enough that letting
-// ipworker download + decode it is worth avoiding -- picked from measured
-// forenkladev numbers (2026-10-08): a 150-300MB RAW original cost 3000-4700ms
-// just to download (even parallelized), scaling down roughly linearly this
-// lands non-RAW files around 500-700ms of download+decode at this size,
-// clearing the bar where doing it client-side (zero network for bytes the
-// browser already has locally) wins over the extra ~1-1.3MB base64 preview
-// upload this adds. Ordinary phone JPEG/HEIC stays well under this even at
-// the highest megapixel counts, so this only catches outlier-large
-// originals (pro mirrorless full-quality JPEG, uncompressed exports, etc).
-export const CLIENT_PREVIEW_OFFLOAD_MIN_BYTES = 20 * 1024 * 1024;
-
-// True when this file is worth generating+uploading its own preview for
-// client-side, bypassing PROCESSING_MODE='backend' (which otherwise leaves
-// 'preview' to ipworker) -- always for RAW (its embedded-JPEG byte-scan is
-// cheap and the backend would otherwise pay for a full RAW download+demosaic),
-// and for any other format once it's large enough that backend download+decode
-// time is worth avoiding (see CLIENT_PREVIEW_OFFLOAD_MIN_BYTES above).
-export const shouldOffloadPreviewToClient = (file: { name: string; size: number }): boolean => (
-    isRawFilename(file.name) || file.size >= CLIENT_PREVIEW_OFFLOAD_MIN_BYTES
-);
-
 // A forced re-run of preview/thumbnail exists to replace a bad stored
 // preview/thumbnail blob (e.g. Tools > Force re-run after a RAW-preview bug
 // fix). Fetching "the current converted preview" mid-force-rerun fetches

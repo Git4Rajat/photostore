@@ -53,7 +53,6 @@ from image_utils import (
     BROWSER_UNVIEWABLE_EXTENSIONS,
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
-    RAW_EXTENSIONS_TIFF_CONTAINER,
     allowed_file,
     convert_image_to_jpeg,
     crop_face_thumbnail,
@@ -10920,31 +10919,7 @@ def _create_scoped_blob_url(container_name: str, filename: str, *, minutes: int 
     )
 
 
-# Mirrors frontend/src/utils/photoDisplay.ts's CLIENT_PREVIEW_OFFLOAD_MIN_BYTES
-# -- keep the two in sync. Used only to decide whether ipworker's 'preview'
-# step gets a head-start delay below (see IPWORK_PREVIEW_RACE_BIAS_SECONDS);
-# it is not a correctness gate (a browser that never reports still gets its
-# preview from ipworker once the delay elapses).
-CLIENT_PREVIEW_OFFLOAD_MIN_BYTES = 20 * 1024 * 1024
-_RAW_EXTENSIONS_FOR_PREVIEW_OFFLOAD = RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | RAW_EXTENSIONS_TIFF_CONTAINER
-# Long enough to cover the browser's local byte-scan + canvas resize + one
-# small (~1-1.3MB) upload for a freshly-finalized file; short enough that a
-# browser tab closed mid-upload (or one that never ran this kickoff at all --
-# an old cached frontend build, a non-browser uploader) doesn't meaningfully
-# delay that photo's preview. ipworker's claim still re-checks preview_status
-# itself, so a browser report that lands late (or never) just means this
-# delay was pure waiting, not a correctness risk either way.
-IPWORK_PREVIEW_RACE_BIAS_SECONDS = max(0, int(os.getenv('IPWORK_PREVIEW_RACE_BIAS_SECONDS', '8')))
-
-
-def _client_offloads_preview(filename: str, size: Optional[int]) -> bool:
-    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    if ext in _RAW_EXTENSIONS_FOR_PREVIEW_OFFLOAD:
-        return True
-    return bool(size) and size >= CLIENT_PREVIEW_OFFLOAD_MIN_BYTES
-
-
-def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None, size: Optional[int] = None) -> Dict[str, str]:
+def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None) -> Dict[str, str]:
     """Send a real queue message so ipworker (also) processes this upload.
 
     No-op in 'browser' mode (the default) -- ipworker never needs to be
@@ -10956,67 +10931,37 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
     only want a subset re-processed (e.g. the admin backfill endpoint scoped
     to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
     silently redo more than was asked.
-
-    `size` (the just-finalized file's byte count, when the caller has it
-    handy from finalize) biases the 'preview' step's race against the
-    browser's own kickoff (AppServicesProvider.tsx's kickOffThumbnailForFile,
-    gated the same way via shouldOffloadPreviewToClient): for RAW/large
-    files, 'preview' is sent as its own message with
-    IPWORK_PREVIEW_RACE_BIAS_SECONDS of visibility delay instead of going out
-    immediately with the rest, giving the browser's (usually faster, since it
-    pays no network cost for the original) local extraction a head start.
-    Without this, ipworker would routinely win that race purely on queue
-    latency and pay for the full RAW download+demosaic the browser kickoff
-    exists to avoid.
     """
     if PROCESSING_MODE == 'browser':
         return {'status': 'skipped', 'reason': 'browser_only_processing'}
     requested_steps = [s for s in (steps if steps is not None else IPWORK_STEPS) if s in IPWORK_STEPS]
     if not requested_steps:
         return {'status': 'skipped', 'reason': 'no_ipwork_steps_requested'}
+    job_id = f'ipwork:{user_id}:{uuid.uuid4().hex}'
     if ipwork_queue_client is None:
-        job_id = f'ipwork:{user_id}:{uuid.uuid4().hex}'
         app.logger.warning('ipwork queue client is unavailable; job %s was not enqueued', job_id)
         return {'status': 'unavailable', 'jobId': job_id}
-
-    delayed_steps: List[str] = []
-    if ('preview' in requested_steps and IPWORK_PREVIEW_RACE_BIAS_SECONDS > 0
-            and _client_offloads_preview(filename, size)):
-        requested_steps = [s for s in requested_steps if s != 'preview']
-        delayed_steps = ['preview']
-
-    def _send(steps_batch: List[str], *, visibility_timeout: Optional[int] = None) -> str:
-        batch_job_id = f'ipwork:{user_id}:{uuid.uuid4().hex}'
-        message = {
-            'jobId': batch_job_id,
-            'correlationId': batch_job_id,
-            'user_id': user_id,
-            'filename': filename,
-            'steps': steps_batch,
-        }
-        kwargs = {'visibility_timeout': visibility_timeout} if visibility_timeout else {}
-        ipwork_queue_client.send_message(json.dumps(message, separators=(',', ':')), **kwargs)
-        _upsert_job_status(batch_job_id, user_id, 'ipwork', 'queued')
-        return batch_job_id
-
-    job_id = ''
+    message = {
+        'jobId': job_id,
+        'correlationId': job_id,
+        'user_id': user_id,
+        'filename': filename,
+        'steps': requested_steps,
+    }
     try:
-        if requested_steps:
-            job_id = _send(requested_steps)
-        if delayed_steps:
-            delayed_job_id = _send(delayed_steps, visibility_timeout=IPWORK_PREVIEW_RACE_BIAS_SECONDS)
-            job_id = job_id or delayed_job_id
+        ipwork_queue_client.send_message(json.dumps(message, separators=(',', ':')))
     except Exception:
-        app.logger.exception('Failed to enqueue ipwork job(s) for %s/%s', user_id, filename)
+        app.logger.exception('Failed to enqueue ipwork job %s', job_id)
         return {'status': 'failed', 'jobId': job_id}
+    _upsert_job_status(job_id, user_id, 'ipwork', 'queued')
     return {'status': 'queued', 'jobId': job_id}
 
 
-def _queue_upload_processing(user_id: str, final_name: str, size: Optional[int] = None) -> None:
+def _queue_upload_processing(user_id: str, final_name: str) -> None:
     if is_video_file(final_name):
         return
     _enqueue_processing_steps(user_id, final_name, ['face'])
-    _queue_ipwork_processing(user_id, final_name, size=size)
+    _queue_ipwork_processing(user_id, final_name)
 
 
 def _verify_face_filename_indexes(user_id: str, filenames: List[str]) -> Dict:
