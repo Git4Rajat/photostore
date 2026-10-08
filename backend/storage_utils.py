@@ -4444,17 +4444,45 @@ def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames
     never yet written to the table. Deleting straight from the table without
     flushing first would silently no-op on that filename -- its buffered
     copy would survive and get flushed later, resurrecting a mark this call
-    was meant to clear."""
+    was meant to clear.
+
+    Batched the same way _flush_dirty_filename_buffer writes dirty marks
+    (submit_transaction, chunked to _DIRTY_FILENAME_BATCH_SIZE/100 -- Azure
+    Table's own transaction-size cap) instead of one delete_entity call per
+    filename -- a full index_build was measured spending 75% of its wall
+    time (768 individual deletes, ~7.5s) clearing exactly this table after a
+    large upload."""
     table = _CTX.get('search_index_dirty_table_client')
     if table is None or not filenames:
         return
     _flush_dirty_filename_buffer(user_id, index_kind)
     partition_key = _search_index_dirty_partition_key(user_id, index_kind)
-    for filename in filenames:
+    filenames_list = list(filenames)
+    submit_transaction = getattr(table, 'submit_transaction', None)
+    for start in range(0, len(filenames_list), _DIRTY_FILENAME_BATCH_SIZE):
+        chunk = filenames_list[start:start + _DIRTY_FILENAME_BATCH_SIZE]
         try:
-            table.delete_entity(partition_key=partition_key, row_key=filename)
+            if submit_transaction is not None:
+                submit_transaction([
+                    ('delete', {'PartitionKey': partition_key, 'RowKey': filename})
+                    for filename in chunk
+                ])
+            else:
+                for filename in chunk:
+                    table.delete_entity(partition_key=partition_key, row_key=filename)
         except Exception:
-            pass
+            # Best-effort, same tolerance as before batching -- a filename
+            # that fails to clear here just gets re-scanned as still-dirty
+            # next time (see _get_dirty_search_index_filenames), not wrong
+            # results, and a transaction failing on one already-deleted row
+            # (e.g. a retry) must not block the rest of the chunk from
+            # clearing -- fall back to per-filename deletes for this chunk
+            # only, each independently tolerant of a 404.
+            for filename in chunk:
+                try:
+                    table.delete_entity(partition_key=partition_key, row_key=filename)
+                except Exception:
+                    pass
 
 
 # Past this many photos the sort index has no consumer: the browser pages from the server instead of
@@ -7053,15 +7081,26 @@ def prime_all_user_indexes_sequentially(
             lock.release()
         return failed
 
+    # Fetched once (when anyone's actually listening) instead of inside _emit
+    # -- that used to call get_user_index_readiness fresh on every call (once
+    # before the loop, once after each of up to 4 kinds, once at the end: up
+    # to 6 calls x 4 manifest blobs each). Each kind's own loop iteration
+    # already knows whether it just succeeded or failed, so it can update
+    # this in-memory snapshot directly instead of re-reading from blob
+    # storage to "discover" what this exact call just did. Measured live
+    # (forenkladev, 2026-10-08): 6-8 real network reads of the same manifest
+    # blob per build, accounting for the bulk of a light build's io_calls.
+    readiness: Dict[str, bool] = get_user_index_readiness(key) if on_progress is not None else {}
+
     def _emit(building: bool) -> None:
         if on_progress is None:
             return
         try:
-            readiness = get_user_index_readiness(key)
+            snapshot = dict(readiness)
             # Old manifests may still exist after a failed refresh. They must
             # not turn this failed build's final progress into a ready event.
-            readiness.update({kind: False for kind in failed})
-            on_progress(readiness, building)
+            snapshot.update({kind: False for kind in failed})
+            on_progress(snapshot, building)
         except Exception:
             _LOGGER.exception('Index prime progress callback failed user=%s', key)
 
@@ -7097,6 +7136,8 @@ def prime_all_user_indexes_sequentially(
                         _LOGGER.error('Index priming produced no %s index user=%s', kind, key)
                     else:
                         _mark_index_rebuild_completed(key, kind)
+                        if kind in readiness:
+                            readiness[kind] = True
                 except Exception:
                     failed.append(kind)
                     _LOGGER.exception('Sequential index priming failed kind=%s user=%s', kind, key)
