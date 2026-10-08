@@ -14137,7 +14137,10 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     # ran against a real stale-embedding-version backlog).
     reprocessing = False
     if 'face' in steps and 'face' not in runnable_steps:
-        entity = _get_metadata_entity(user_id, filename) or {}
+        # Reuse the row claim_processing_lease already fetched (and just
+        # wrote) above instead of a second get_entity for the same
+        # PartitionKey/RowKey -- see claim_processing_lease's 'entity' field.
+        entity = lease.get('entity') or {}
         if _browser_processing_face_version_stale(entity):
             runnable_steps.append('face')
             reprocessing = True

@@ -44,6 +44,7 @@ from image_utils import (
     is_video_file,
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
+    RAW_EXTENSIONS_TIFF_CONTAINER,
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
@@ -1996,7 +1997,14 @@ def download_file_from_blob(container_name: str, filename: str) -> bytes:
     blob_client = _get_blob_client(container_name, filename)
     if blob_client is None:
         raise ResourceNotFoundError('Blob storage is not configured')
-    return blob_client.download_blob().readall()
+    # max_concurrency=1 (the SDK default) fetches a large blob's chunks one
+    # HTTP range-GET at a time -- fine for thumbnails, but measured at
+    # 3000-4700ms of mostly-serial network time for 100-150MP medium-format
+    # RAW originals (forenkladev, 2026-10-08: Phase One IQ4 150MP, Fujifilm
+    # GFX100, Hasselblad X2D). Parallelizing those range-GETs is the fix;
+    # harmless for small files since the whole-blob-in-one-request path below
+    # that threshold doesn't chunk at all.
+    return blob_client.download_blob(max_concurrency=4).readall()
 
 
 def get_blob_properties(container_name: str, filename: str):
@@ -3547,10 +3555,35 @@ def invalidate_user_listing_index_cache(user_id: str) -> None:
         _LISTING_INDEX_CACHE.pop(key, None)
 
 
+# TEMPORARY (2026-10-08): dup_io on worker showed each of
+# sort/lexical/albums/people's own data blob read 6-8x within one
+# index.build.full, but every refresh_user_*_index function only reads its
+# own blob once -- the actual repeat caller wasn't findable by reading code.
+# This logs who's calling, gated so it costs nothing once
+# INDEX_BLOB_READ_TRACE isn't set. Remove this and the four call sites below
+# once the real caller is identified from live logs.
+_INDEX_BLOB_READ_TRACE = os.getenv('INDEX_BLOB_READ_TRACE', '').strip() == '1'
+
+
+def _trace_index_blob_read(kind: str, user_id: str) -> None:
+    if not _INDEX_BLOB_READ_TRACE:
+        return
+    import sys
+    frame = sys._getframe(2)  # caller of the _load_*_index_blob wrapper
+    chain = []
+    for _ in range(4):
+        if frame is None:
+            break
+        chain.append(frame.f_code.co_name)
+        frame = frame.f_back
+    _LOGGER.warning('INDEX_BLOB_READ_TRACE kind=%s user=%s callers=%s', kind, user_id, '<-'.join(chain))
+
+
 def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['LexicalIndexSnapshot']:
     """Shared, instrumented loader for the gzip+JSON index blobs (lexical,
     listing, sort). Separate spans for download / gunzip / json-parse so the
     PERF log shows which phase dominates and how much RSS each one adds."""
+    _trace_index_blob_read(kind, user_id)
     if blob_client is None:
         return None
     try:
@@ -5522,6 +5555,7 @@ def _load_access_index_manifest(user_id: str) -> Dict[str, str]:
 
 
 def _load_access_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    _trace_index_blob_read('access', user_id)
     blob_client = _access_index_blob_client(_access_index_json_blob_name(user_id))
     if blob_client is None:
         return None
@@ -5944,6 +5978,7 @@ def _load_albums_index_manifest(user_id: str) -> Dict[str, str]:
 
 
 def _load_albums_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    _trace_index_blob_read('albums', user_id)
     blob_client = _albums_index_blob_client(_albums_index_json_blob_name(user_id))
     if blob_client is None:
         return None
@@ -6409,6 +6444,7 @@ def _load_people_index_manifest(user_id: str) -> Dict[str, str]:
 
 
 def _load_people_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
+    _trace_index_blob_read('people', user_id)
     blob_client = _people_index_blob_client(_people_index_json_blob_name(user_id))
     if blob_client is None:
         return None
@@ -7787,11 +7823,12 @@ def _create_server_thumbnail_for_upload(image_bytes: bytes, filename: str) -> Op
         if not _looks_like_jpeg_bytes(preview_bytes):
             return None
         return create_thumbnail_data(preview_bytes)
-    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
+    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA or ext in RAW_EXTENSIONS_TIFF_CONTAINER:
         # RAW thumbnails are normally produced in-browser, but the browser cannot
         # decode every RAW (e.g. DNG that stores its raw data as a lossless JPEG),
         # so generate one server-side too. extract_raw_preview_bytes tries the
         # embedded JPEG, then rawpy/exiftool, yielding a decodable preview.
+        # .tif/.tiff included here too -- see RAW_EXTENSIONS_TIFF_CONTAINER.
         preview_bytes = extract_raw_preview_bytes(image_bytes, filename)
         if not preview_bytes or not _looks_like_jpeg_bytes(preview_bytes):
             return None
@@ -9593,6 +9630,15 @@ def claim_processing_lease(
         'ownerId': owner_id,
         'leaseExpiresAt': entity.get('processing_lease_expires_at', ''),
         'statuses': {f'{step}Status': entity.get(f'{step}_status', 'pending') for step in PROCESSING_STEPS},
+        # The full row this call already paid for, exactly as left after the
+        # update_entity merge above -- callers that need more than the
+        # trimmed 'statuses' shape (e.g. ipworker's face-embedding-version
+        # staleness recheck, app.py's run_ipworker) can reuse this instead of
+        # a second get_entity on the same row they just caused to be written.
+        # Safe to reuse as-is: nothing past this point in this function
+        # mutates fields other than the lease/status ones already reflected
+        # here.
+        'entity': entity,
     }
 
 

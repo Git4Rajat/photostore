@@ -41,6 +41,23 @@ PILLOW_NATIVE = {
     'webp', 'heic', 'heif', 'bmp', 'gif', 'jxl',
 }
 
+# .tif/.tiff is PILLOW_NATIVE for upload validation/browser-display purposes
+# (most TIFFs really are plain images), but it's also the container legacy
+# digital backs/prototype DSLRs used for raw sensor dumps before camera
+# makers settled on dedicated RAW extensions -- found 2026-10-08 on
+# forenkladev: 16 files from Kodak DCS-series, Canon EOS-1D/1Ds/D2000C, and
+# Phase One P20+/P25/P30/P45/H25 all failed preview generation because their
+# CFA-tagged TIFF structure makes PIL's TiffImagePlugin raise, and since
+# convert_image_to_jpeg only tries extract_raw_preview_bytes (exiftool/
+# rawpy/libraw) as a fallback *after* that PIL attempt, any of these whose
+# PIL.Image.open() doesn't happen to raise would decode as a plain TIFF into
+# a garbled preview from raw mosaic data instead of ever reaching the RAW
+# extractors. Kept separate from RAW_EXTENSIONS_RAWPY (which also drives
+# verify_image's header check and the frontend's browser-unviewable list)
+# since ordinary TIFFs should keep going through those paths unchanged --
+# this only reorders convert_image_to_jpeg to try RAW extraction first.
+RAW_EXTENSIONS_TIFF_CONTAINER = {'tif', 'tiff'}
+
 VIDEO_EXTENSIONS = {
     'mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv',
     '3gp', '3g2', 'mts', 'm2ts', 'mpg', 'mpeg', 'wmv',
@@ -743,7 +760,7 @@ def extract_raw_preview_bytes(image_bytes: bytes, filename: str = '') -> Optiona
 
 def convert_image_to_jpeg(image_bytes: bytes, filename: str = '') -> bytes:
     ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
-    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
+    if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA or ext in RAW_EXTENSIONS_TIFF_CONTAINER:
         preview = extract_raw_preview_bytes(image_bytes, filename)
         if preview:
             return _encode_preview_for_browser(preview) or preview
