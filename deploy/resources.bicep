@@ -692,6 +692,16 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // WorkingSetBytes/p90 latency for OOM or 502/503 recurrence; if
             // it reappears, these two are the first places to look before
             // reverting to 1.0/2Gi.
+            //
+            // 2026-10-08: people_bp (person/face CRUD, merges) joined this
+            // role, moved off 'extras' -- see that resource's comment for
+            // why this was judged safe (get_person's request-path full-
+            // account scan was replaced with a bounded per-person fetch;
+            // merge's own full-account scan is accepted as low-frequency/
+            // explicit, unlike a scroll/list endpoint). Not pre-emptively
+            // bumped for this move -- watch real post-move WorkingSetBytes/
+            // CpuPercentage (same methodology as every dated resize above)
+            // and resize only if a measurement, not a guess, calls for it.
             cpu: json('0.5')
             memory: '1Gi'
           }
@@ -1064,6 +1074,20 @@ resource admin 'Microsoft.App/containerApps@2024-03-01' = {
 // does real per-partition Table scans for the People page (already
 // server-side paginated -- see people-page-server-side-pagination memory --
 // but real work all the same, unlike tools' pure history logging).
+//
+// 2026-10-08: people_bp moved back to 'backend' (app.py's role-dispatch
+// block). Its one request-path full-account scan (get_person's old call
+// into _load_user_face_summary_by_id) was replaced with a bounded fetch
+// scoped to each person's own faceIds (_load_face_rows_by_ids) -- the thing
+// that made it unsafe to share backend's thin 0.5vCPU/1Gi tier. merge's own
+// full-account scan (resolving personId ownership, which Table Storage
+// can't index) is left as-is and accepted on backend: it's a low-frequency,
+// explicit, user-initiated cost, not a scroll/list-shaped one like
+// get_person's old path was. Four endpoints with zero callers in the live
+// frontend (list_persons, list_faces, the suggestions pair) were deleted
+// outright rather than carried along, since they were the only genuinely
+// unbounded-by-design reads in this blueprint. 'extras' now carries only
+// library/public.
 resource extras 'Microsoft.App/containerApps@2024-03-01' = {
   name: extrasAppName
   location: location
@@ -1104,6 +1128,12 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
           // reverting into a still-open landmine the way worker's would be.
           // Watch WorkingSetBytes/OOMKilled on a real library_export run;
           // raise back to 1.0/2Gi if it recurs.
+          //
+          // 2026-10-08: people_bp left this app (moved to 'backend', see the
+          // comment above this resource). Not pre-emptively downsized here --
+          // the 40%/13% figures above already predate people's departure and
+          // were measured with it present, so this size has slack to spare,
+          // not a gap to fill. Re-measure before cutting further.
           resources: {
             cpu: json('0.5')
             memory: '1Gi'

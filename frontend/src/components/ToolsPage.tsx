@@ -20,7 +20,7 @@ import {
     UsersIcon,
     XMarkIcon,
 } from '@heroicons/react/24/outline';
-import { get, post, getTools, postTools, getUpload, getAdmin, postAdmin, getExtras } from '../services/apiClient';
+import { get, post, getTools, postTools, getUpload, getAdmin, postAdmin } from '../services/apiClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import { requestJobPoll } from '../services/jobNotifications';
 import { queuePhotoBackfill } from '../services/photoBackfill';
@@ -498,7 +498,7 @@ const ToolsPage: React.FC = () => {
         setDiagnosticLoading(true);
         setDiagnosticError('');
         try {
-            const response = await getExtras('/api/people/diagnostic');
+            const response = await get('/api/people/diagnostic');
             setDiagnostic(response as PeopleDiagnostic);
         } catch (err) {
             setDiagnosticError(String(err));

@@ -1,7 +1,7 @@
 import { onIndexReady, reportIndexBuilding } from '../../services/indexBuilding';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
-import { get, getExtras, post } from '../../services/apiClient';
+import { get, post } from '../../services/apiClient';
 import { getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
@@ -1659,7 +1659,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const fetchPeople = useCallback(async () => {
         setPeopleLoading(true);
         try {
-            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?offset=0&limit=${PEOPLE_PAGE}`);
+            const res = await get<PeoplePageResponse>(`/api/persons/page?offset=0&limit=${PEOPLE_PAGE}`);
             if (!res?.available || !Array.isArray(res.rows)) {
                 // The server answered "index not ready": show the preparing bar and let it retry.
                 setPeopleHasMore(false);
@@ -1702,7 +1702,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const loadMorePeople = useCallback(() => {
         if (peopleLoadingMoreRef.current) return;
         peopleLoadingMoreRef.current = true;
-        void getExtras<PeoplePageResponse>(`/api/persons/page?offset=${peopleOffsetRef.current}&limit=${PEOPLE_PAGE}`)
+        void get<PeoplePageResponse>(`/api/persons/page?offset=${peopleOffsetRef.current}&limit=${PEOPLE_PAGE}`)
             .then((res) => {
                 const rawRows = Array.isArray(res?.rows) ? res.rows : [];
                 const rows = rawRows
@@ -1723,6 +1723,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const searchPeople = useCallback(async (query: string, limit = 50): Promise<Person[]> => {
         try {
+<<<<<<< HEAD
             const res = await getExtras<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
             return Array.isArray(res?.rows)
                 ? res.rows
@@ -1731,6 +1732,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     .map(reconcilePersonFaceCount)
                     .filter((person) => person.name || (person.faceCount ?? 0) > 0)
                 : [];
+=======
+            const res = await get<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
+            return Array.isArray(res?.rows) ? res.rows.map(mapPersonRow) : [];
+>>>>>>> b371e5f (Move people_bp (person/face CRUD, merges) from extras back to backend)
         } catch {
             return [];
         }
@@ -1740,7 +1745,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const ensurePerson = useCallback(async (id: string) => {
         if (deletedPeopleRef.current.has(id)) return;
         try {
-            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?ids=${encodeURIComponent(id)}&limit=1`);
+            const res = await get<PeoplePageResponse>(`/api/persons/page?ids=${encodeURIComponent(id)}&limit=1`);
             const row = Array.isArray(res?.rows) ? res.rows[0] : undefined;
             if (row && !deletedPeopleRef.current.has(row.personId)) {
                 const person = reconcilePersonFaceCount(mapPersonRow(row));
@@ -1768,7 +1773,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // person's face list so the page is never empty when the person has faces.
     const fetchPersonPage = useCallback(async (id: string, offset: number) => {
         try {
-            const page = await getExtras<{ filenames?: string[]; total?: number; hasMore?: boolean }>(
+            const page = await get<{ filenames?: string[]; total?: number; hasMore?: boolean }>(
                 `/api/persons/${encodeURIComponent(id)}/photos?offset=${offset}&limit=${PERSON_PAGE}`,
             );
             const names = Array.isArray(page?.filenames) ? page.filenames : [];
@@ -1784,7 +1789,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         } catch {
             // fall through to the face list
         }
-        const res = await getExtras<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
+        const res = await get<{ faces?: PersonFace[]; total?: number; hasMore?: boolean }>(
             `/api/persons/${encodeURIComponent(id)}?offset=${offset}&limit=${PERSON_PAGE}`,
         );
         const faces = Array.isArray(res?.faces) ? res.faces : [];

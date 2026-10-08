@@ -5,7 +5,7 @@ import WorkbenchGrid from '../components/WorkbenchGrid';
 import { Spinner } from '../components/bits';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import type { BrowserProcessingAction } from '../../../components/AppServicesProvider';
-import { getTools, postTools, postAdmin, getExtras } from '../../../services/apiClient';
+import { get, getTools, postTools, postAdmin } from '../../../services/apiClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog } from '../../../components/shared/dialogs';
 
@@ -115,7 +115,7 @@ export const ToolsPage: React.FC = () => {
     const loadDiagnostic = async () => {
         setDiagnosticLoading(true);
         try {
-            const res = await getExtras<PeopleDiagnostic>('/api/people/diagnostic');
+            const res = await get<PeopleDiagnostic>('/api/people/diagnostic');
             setDiagnostic(res ?? null);
         } catch {
             setDiagnostic(null);

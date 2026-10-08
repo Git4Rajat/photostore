@@ -52,16 +52,28 @@ def test_backend_role_does_not_serve_admin_routes():
 
 
 def test_backend_role_does_not_serve_extras_routes():
-    """2026-09-17: people/library/public moved to their own 'extras' role so
-    backend can shrink to a 0.5vCPU/1Gi everyday-browsing tier -- see
-    backend-cpu-optimization-2026-09 memory."""
+    """2026-09-17: library/public moved to their own 'extras' role so backend can
+    shrink to a 0.5vCPU/1Gi everyday-browsing tier. people_bp moved back to
+    'backend' 2026-10-08 once get_person's request-path full-account scan was
+    replaced with a bounded per-person fetch -- see app.py's 'extras' branch
+    comment -- so backend DOES serve people_bp now; only library/public don't."""
     paths = _rule_paths_for_role(None)
-    assert '/api/persons' not in paths
-    assert '/api/faces' not in paths
+    assert '/api/persons/page' in paths  # people_bp moved here 2026-10-08
+    assert '/api/faces/delete' in paths
     assert '/api/library/mine' not in paths
     assert '/public/albums/<token>' not in paths
     assert '/api/photos' in paths  # sanity: other groups still registered
     assert '/health' in paths  # system_bp stays on backend -- see app.py's comment
+
+
+def test_extras_role_does_not_serve_people_routes():
+    """people_bp left 'extras' 2026-10-08 -- pin that it's actually gone, not
+    just that backend gained a copy (blueprints could in principle be
+    registered on both)."""
+    paths = _rule_paths_for_role('extras')
+    assert '/api/persons/page' not in paths
+    assert '/api/faces/delete' not in paths
+    assert '/api/library/mine' in paths  # sanity: extras still serves its own routes
 
 
 def test_tools_role_serves_only_tools_routes():
@@ -113,11 +125,12 @@ def test_admin_role_serves_only_admin_routes():
 
 
 def test_extras_role_serves_only_extras_routes():
+    """people_bp moved to 'backend' 2026-10-08 -- extras now carries only
+    library/public (see app.py's 'extras' branch comment)."""
     paths = _rule_paths_for_role('extras')
     non_static = {p for p in paths if not p.startswith('/static') and p != '/health'}   # /health is on every role (warm-up probe)
     assert non_static  # non-empty
-    extras_prefixes = ('/api/persons', '/api/faces', '/api/people', '/persons', '/people', '/api/library', '/public', '/api/public')
+    extras_prefixes = ('/api/library', '/public', '/api/public')
     assert all(p.startswith(extras_prefixes) for p in non_static)
-    assert '/api/persons' in non_static
     assert '/api/library/mine' in non_static
     assert '/public/albums/<token>' in non_static

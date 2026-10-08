@@ -50,13 +50,19 @@ const TOOLS_BASE_URL = toolsUrl || '';
 const ADMIN_BASE_URL = adminUrl || '';
 const EXTRAS_BASE_URL = extrasUrl || '';
 
-// Path prefixes exclusively owned by the `extras` container app (people/
-// faces, library, public share-link routes -- see routes/people.py|
-// library.py|public.py's APP_ROLE=extras split). resolveApiUrl uses this so
-// callers that already have a raw path (e.g. a face-crop cover URL, or a
-// public album's thumbnail URL) resolve to the right origin without every
-// call site having to know which service serves which prefix.
-const EXTRAS_PATH_PREFIXES = ['/api/persons', '/api/faces', '/api/people', '/persons', '/people', '/api/library', '/public', '/api/public'];
+// Path prefixes exclusively owned by the `extras` container app (library,
+// public share-link routes -- see library.py|public.py's APP_ROLE=extras
+// split). resolveApiUrl uses this so callers that already have a raw path
+// (e.g. a public album's thumbnail URL) resolve to the right origin without
+// every call site having to know which service serves which prefix.
+//
+// people/faces ('/api/persons', '/api/faces', '/api/people', '/persons',
+// '/people') moved off this list 2026-10-08 -- routes/people.py's
+// APP_ROLE=extras split was undone (people_bp moved back to 'backend'), so
+// those paths now resolve to API_BASE_URL via the plain get/post, not
+// getExtras/postExtras. See faceService.ts, store.tsx, localPeopleIndex.ts,
+// faceMediaCache.ts for the call sites that switched off getExtras/postExtras.
+const EXTRAS_PATH_PREFIXES = ['/api/library', '/public', '/api/public'];
 
 export const resolveApiUrl = (url?: string): string => {
     if (!url) {

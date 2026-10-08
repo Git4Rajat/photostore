@@ -1,7 +1,8 @@
-// people_bp moved to the dedicated `extras` container app (2026-09-17, see
-// app.py's APP_ROLE=extras split) -- aliased so every call site below stays
-// unchanged.
-import { getExtras as get, postExtras as post } from './apiClient';
+// people_bp moved back to the 'backend' role 2026-10-08 (app.py's
+// APP_ROLE=extras split was undone for people -- see deploy/resources.bicep's
+// 'extras' resource comment) -- plain get/post (API_BASE_URL) now, not
+// getExtras/postExtras.
+import { get, post } from './apiClient';
 
 type PeoplePageRow = {
     personId?: string;

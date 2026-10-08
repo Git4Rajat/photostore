@@ -122,13 +122,3 @@ def test_library_streaming_scan_uses_the_parallel_reader(monkeypatch):
     names = [r['RowKey'] for r in storage_utils.iter_library_rows('u')]
     assert names == sorted(k for k in keys if k != 'trashed.jpg')
     assert len(table.calls) > 1
-
-
-def test_person_suggestions_only_read_named_people(monkeypatch):
-    seen = []
-    monkeypatch.setattr(table_scan, 'scan_partition', lambda qe, flt, **kw: seen.append(flt) or iter([]))
-    import app
-    monkeypatch.setattr(app, 'person_table_client', type('T', (), {'query_entities': None})())
-    monkeypatch.setattr(app, 'PEOPLE_SUGGEST_INCLUDE_UNNAMED', False)
-    assert app._compute_people_suggestions('u1') == []
-    assert seen and seen[0].endswith("and name ne ''")

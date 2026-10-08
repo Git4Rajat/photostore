@@ -865,20 +865,6 @@ if PEOPLE_ASSIGNMENT_ENGINE not in ('faiss', 'legacy'):
     raise ValueError('PEOPLE_ASSIGNMENT_ENGINE must be faiss or legacy')
 _live_faiss_assigner = None
 _live_faiss_clients = None
-# Hard floor for merge suggestions shown to users. Suggestions are user-reviewed
-# (not auto-applied), so this can sit a touch below the auto-merge floor to
-# surface plausible same-person candidates for confirmation.
-MIN_PEOPLE_SUGGEST_THRESHOLD = float(os.getenv('MIN_PEOPLE_SUGGEST_THRESHOLD', '0.62'))
-PEOPLE_SUGGEST_THRESHOLD = max(float(os.getenv('PEOPLE_SUGGEST_THRESHOLD', '0.70')), MIN_PEOPLE_SUGGEST_THRESHOLD)
-PEOPLE_SUGGEST_LIMIT = int(os.getenv('PEOPLE_SUGGEST_LIMIT', '20'))
-PEOPLE_SUGGEST_PER_PERSON = int(os.getenv('PEOPLE_SUGGEST_PER_PERSON', '2'))
-# Suggestion quality guardrails: only trusted clusters participate in merge
-# suggestions to avoid obvious non-face false positives (e.g. flowers) from
-# polluting representative embeddings.
-PEOPLE_SUGGEST_INCLUDE_UNNAMED = os.getenv('PEOPLE_SUGGEST_INCLUDE_UNNAMED', 'false').lower() in ('1', 'true', 'yes')
-PEOPLE_SUGGEST_MIN_FACES = int(os.getenv('PEOPLE_SUGGEST_MIN_FACES', '2'))
-PEOPLE_SUGGEST_MIN_CONFIRMED_FACES = int(os.getenv('PEOPLE_SUGGEST_MIN_CONFIRMED_FACES', '1'))
-PEOPLE_SUGGEST_MIN_REP_FACE_CONFIDENCE = float(os.getenv('PEOPLE_SUGGEST_MIN_REP_FACE_CONFIDENCE', '0.85'))
 
 # Identity propagation: once a person cluster is named/merged, use its learned
 # representative embedding to pull that person's faces out of *unnamed* clusters.
@@ -7635,6 +7621,31 @@ def _load_user_face_summary_by_id(user_id: str) -> Dict[str, Dict]:
     return {str(row.get('RowKey') or ''): row for row in rows if row.get('RowKey')}
 
 
+def _load_face_rows_by_ids(user_id: str, face_ids: List[str]) -> Dict[str, Dict]:
+    """Fetch exactly these face rows via chunked RowKey-OR-filter queries -- a targeted
+    multi-key fetch, not a partition scan -- for callers that already know their bounded
+    face_id set (e.g. one person's faceIds). Unlike _load_user_face_summary_by_id, cost
+    scales with len(face_ids), not with the account's total face count."""
+    if face_table_client is None or not face_ids:
+        return {}
+    unique_ids = [str(fid) for fid in dict.fromkeys(face_ids) if str(fid)]
+    out: Dict[str, Dict] = {}
+    CHUNK = 100  # stay well under Table Storage's URL-length/filter-complexity ceiling
+    for i in range(0, len(unique_ids), CHUNK):
+        chunk = unique_ids[i:i + CHUNK]
+        clauses = ' or '.join(f"RowKey eq '{_escape_odata(fid)}'" for fid in chunk)
+        query = f"PartitionKey eq '{_escape_odata(user_id)}' and ({clauses})"
+        try:
+            rows = list(face_table_client.query_entities(query, select=FACE_SUMMARY_COLUMNS))
+        except Exception:
+            rows = []
+        for row in rows:
+            rk = str(row.get('RowKey') or '')
+            if rk:
+                out[rk] = row
+    return out
+
+
 def _scan_person_and_face_rows(user_id: str) -> Tuple[List[Dict], Dict[str, Dict]]:
     """Shared cheap scan used by list_persons/list_faces: every person row (sorted
     by RowKey) plus the bulk face-summary map. Neither call does per-item work
@@ -7697,183 +7708,6 @@ def _face_preview_priority(face: Dict) -> Tuple[int, float, int]:
     confirmed = 1 if _coerce_bool(face.get('confirmedByUser', False)) or str(face.get('reviewStatus') or '').lower() == 'confirmed' else 0
     rejected = 1 if _face_is_rejected(face) else 0
     return (confirmed, confidence, -rejected)
-
-
-def _compute_people_suggestions(
-    user_id: str,
-    *,
-    threshold: float = PEOPLE_SUGGEST_THRESHOLD,
-    limit: int = PEOPLE_SUGGEST_LIMIT,
-    per_person: int = PEOPLE_SUGGEST_PER_PERSON,
-) -> List[Dict]:
-    if person_table_client is None:
-        return []
-    # Unnamed clusters are skipped below unless PEOPLE_SUGGEST_INCLUDE_UNNAMED, so only named
-    # people are read (with their embeddings). With tens of thousands of clusters, reading every
-    # row's embedding JSON here was both minutes of work and a memory spike on the extras app.
-    person_filter = f"PartitionKey eq '{_escape_odata(user_id)}'"
-    if not PEOPLE_SUGGEST_INCLUDE_UNNAMED:
-        person_filter += " and name ne ''"
-    try:
-        rows = list(table_scan.scan_partition(person_table_client.query_entities, person_filter))
-    except Exception:
-        return []
-
-    face_by_id = _load_user_face_summary_by_id(user_id)
-    people = []
-    for row in rows:
-        person_id = str(row.get('RowKey') or '')
-        person_name = str(row.get('name', '') or '')
-        if not person_id:
-            continue
-        if not PEOPLE_SUGGEST_INCLUDE_UNNAMED and _is_unnamed_name(person_name):
-            continue
-        try:
-            rep = json.loads(row.get('repEmbedding', '[]') or '[]')
-        except Exception:
-            rep = []
-        if not rep:
-            continue
-        try:
-            face_ids = json.loads(row.get('faceIds', '[]') or '[]')
-        except Exception:
-            face_ids = []
-        active_face_ids = []
-        confirmed_face_count = 0
-        rep_face = None
-        rep_face_score = None
-        for face_id in face_ids:
-            try:
-                face = face_by_id.get(str(face_id))
-                if face is None and face_table_client is not None:
-                    face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
-                if (
-                    face
-                    and _face_is_owned_by_person(face, person_id)
-                    and not _face_is_rejected(face)
-                ):
-                    active_face_ids.append(face_id)
-                    if _face_is_confirmed(face):
-                        confirmed_face_count += 1
-                    score = _face_preview_priority(face)
-                    if rep_face is None or rep_face_score is None or score > rep_face_score:
-                        rep_face = _face_summary_for_person_list(str(face_id), face, user_id)
-                        rep_face_score = score
-            except Exception:
-                continue
-        if len(active_face_ids) < PEOPLE_SUGGEST_MIN_FACES:
-            continue
-        if confirmed_face_count < PEOPLE_SUGGEST_MIN_CONFIRMED_FACES:
-            continue
-        if rep_face is None:
-            continue
-        try:
-            rep_confidence = float(rep_face.get('confidence', 0.0) or 0.0)
-        except Exception:
-            rep_confidence = 0.0
-        if rep_confidence < PEOPLE_SUGGEST_MIN_REP_FACE_CONFIDENCE:
-            continue
-        try:
-            declined = json.loads(row.get('declinedSuggestions', '[]') or '[]')
-            declined = {str(pid) for pid in declined} if isinstance(declined, list) else set()
-        except Exception:
-            declined = set()
-        people.append({
-            'personId': person_id,
-            'name': person_name,
-            'faceCount': len(active_face_ids),
-            'confirmedFaceCount': confirmed_face_count,
-            'repEmbedding': rep,
-            'representativeFace': rep_face,
-            'declined': declined,
-        })
-
-    if len(people) < 2:
-        return []
-
-    try:
-        import numpy as np
-    except Exception:
-        return []
-
-    X = np.asarray([p['repEmbedding'] for p in people], dtype=_embedding_precision_dtype(np))
-    if X.ndim != 2 or X.shape[0] < 2:
-        return []
-    norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
-    Xn = X / norms
-    sim = Xn @ Xn.T
-    np.fill_diagonal(sim, -1.0)
-
-    suggestions = []
-    used_pairs = set()
-    per_counts = {p['personId']: 0 for p in people}
-
-    for i, person in enumerate(people):
-        if per_counts.get(person['personId'], 0) >= per_person:
-            continue
-        ranked = np.argsort(-sim[i])
-        for j in ranked:
-            score = float(sim[i, j])
-            if score < threshold:
-                break
-            other = people[int(j)]
-            if str(other['personId']) in person['declined'] or str(person['personId']) in other['declined']:
-                continue
-            pair_key = "::".join(sorted([str(person['personId']), str(other['personId'])]))
-            if pair_key in used_pairs:
-                continue
-            target = _pick_merge_target(person, other)
-            source = other if target is person else person
-            if per_counts.get(source['personId'], 0) >= per_person:
-                continue
-            used_pairs.add(pair_key)
-            per_counts[source['personId']] = per_counts.get(source['personId'], 0) + 1
-            per_counts[target['personId']] = per_counts.get(target['personId'], 0) + 1
-            suggestions.append({
-                'sourcePersonId': source.get('personId'),
-                'sourceName': source.get('name', ''),
-                'sourceFaceCount': source.get('faceCount', 0),
-                'sourceFace': source.get('representativeFace'),
-                'targetPersonId': target.get('personId'),
-                'targetName': target.get('name', ''),
-                'targetFaceCount': target.get('faceCount', 0),
-                'targetFace': target.get('representativeFace'),
-                'similarity': score,
-            })
-            if len(suggestions) >= limit:
-                break
-        if len(suggestions) >= limit:
-            break
-
-    suggestions.sort(key=lambda s: s.get('similarity', 0.0), reverse=True)
-    return suggestions
-
-
-def _add_declined_suggestion(user_id: str, person_id: str, other_person_id: str) -> bool:
-    """Record that ``person_id`` should no longer be suggested to merge with
-    ``other_person_id``. The declined partner list is stored on the person
-    entity so declined pairs stay hidden across future suggestion recomputes."""
-    if person_table_client is None or not person_id or not other_person_id:
-        return False
-    try:
-        entity = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
-    except Exception:
-        return False
-    try:
-        declined = json.loads(entity.get('declinedSuggestions', '[]') or '[]')
-        if not isinstance(declined, list):
-            declined = []
-    except Exception:
-        declined = []
-    declined = [str(pid) for pid in declined]
-    if str(other_person_id) not in declined:
-        declined.append(str(other_person_id))
-    entity['declinedSuggestions'] = json.dumps(declined)
-    try:
-        person_table_client.upsert_entity(entity)
-        return True
-    except Exception:
-        return False
 
 
 def _person_declined_face_ids(person: Dict) -> set:
@@ -15167,25 +15001,29 @@ elif _app_role == 'admin':
     # auth were ever bypassed there.
     app.register_blueprint(admin_bp)
 elif _app_role == 'extras':
-    # 2026-09-17: people/library/public split off the core 'backend' role so
-    # backend itself can shrink to a 0.5vCPU/1Gi tier sized for just the
-    # everyday gallery loop (auth+photos+albums+system) -- see
-    # backend-cpu-optimization-2026-09 memory. These three carry the heavier
-    # secondary features (People page's own per-partition face/embedding-
-    # index scans, library export/clean orchestration, and public share-link
-    # media streaming) that day-to-day browsing doesn't touch. Bundled
-    # together on one app rather than three, since none of them are hot
-    # enough individually to justify their own bicep/scaling footprint --
-    # revisit only if one of them needs independent scaling from the others.
-    for _bp in (people_bp, library_bp, public_bp):
+    # 2026-09-17: library/public split off the core 'backend' role so backend
+    # itself can shrink to a 0.5vCPU/1Gi tier sized for just the everyday
+    # gallery loop. These two carry the heavier secondary features (library
+    # export/clean orchestration and public share-link media streaming) that
+    # day-to-day browsing doesn't touch. people_bp moved back to 'backend'
+    # (2026-10-08) once its one request-path full-account scan (get_person's
+    # old call into _load_user_face_summary_by_id) was replaced with a
+    # bounded fetch scoped to each person's own faceIds (_load_face_rows_by_ids)
+    # -- the remaining unbounded scan (merge's personId-ownership resolution)
+    # is accepted as a low-frequency, explicit, user-initiated cost, not a
+    # scroll/list-shaped one. See the removed list_persons/list_faces/
+    # suggestions routes' history for the two endpoints that were deleted
+    # outright rather than brought along (zero callers in the live frontend).
+    for _bp in (library_bp, public_bp):
         app.register_blueprint(_bp)
 else:
     # system_bp stays here rather than moving to 'extras' -- it's negligible
     # weight (a handful of point lookups, including /health) and Container
     # Apps' default TCP probe doesn't need it, but losing a friendly
     # same-origin /health on backend specifically wasn't worth it for zero
-    # real memory/CPU savings.
-    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp):
+    # real memory/CPU savings. people_bp joined this role 2026-10-08 (see the
+    # 'extras' branch's comment above).
+    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp):
         app.register_blueprint(_bp)
 
 # Every role answers /health (system_bp only exists on the backend role; upload has its own), so the

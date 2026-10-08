@@ -1,4 +1,4 @@
-import { getExtras } from './apiClient';
+import { get } from './apiClient';
 import { perf, perfNow } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 
@@ -7,15 +7,15 @@ import { getActiveLibraryFromToken } from './passwordAuthClient';
  * get_user_people_index in storage_utils.py): a whole-library
  * {personId, name, isNamed, faceCount, coverFaceId, coverFilename,
  * coverBbox, updatedAt} projection downloaded once per session, used to
- * render the People grid without routes/people.py:list_persons's table scan.
+ * render the People grid without a full account-wide face-table scan.
  * The live frontend now uses /api/persons/page, which reads this same server
  * index a page at a time; this browser-side loader is kept for views that want
  * a local full-list copy. Mirrors localAlbumsIndex.ts's shape exactly.
  *
- * Uses getExtras, not the default get -- /api/persons/index (like the rest
- * of routes/people.py) is only registered on the 'extras' role, a separate
- * container app from 'backend' (which serves /photos, /albums). See
- * app.py's blueprint-registration block (APP_ROLE == 'extras').
+ * Uses the plain get (API_BASE_URL) -- /api/persons/index (like the rest of
+ * routes/people.py) moved back onto the 'backend' role 2026-10-08, the same
+ * container app that serves /photos, /albums. See app.py's
+ * blueprint-registration block.
  */
 export interface PersonIndexRow {
     personId: string;
@@ -143,7 +143,7 @@ let inFlight: Promise<PersonIndexRow[] | null> | null = null;
 const fetchLocalPeopleIndex = async (key: string): Promise<PersonIndexRow[] | null> => {
     const totalStarted = perfNow();
     const manifestStarted = perfNow();
-    const response: PeopleIndexResponse = await getExtras('/api/persons/index');
+    const response: PeopleIndexResponse = await get('/api/persons/index');
     perf.recordSpan('index.people.manifest', perfNow() - manifestStarted);
     if (!response?.available || !response.indexUrl) {
         return null;
