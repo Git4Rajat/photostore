@@ -1643,7 +1643,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             for (let start = 0; start < ids.length; start += 50) {
                 const chunk = ids.slice(start, start + 50);
                 const encoded = encodeURIComponent(chunk.join(','));
-                const res = await getExtras<PeoplePageResponse>(`/api/persons/page?ids=${encoded}&limit=${chunk.length}`);
+                const res = await get<PeoplePageResponse>(`/api/persons/page?ids=${encoded}&limit=${chunk.length}`);
                 if (!res?.available || !Array.isArray(res.rows)) return { complete: false, indexed };
                 for (const row of res.rows) indexed.set(row.personId, row);
             }
@@ -1723,8 +1723,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const searchPeople = useCallback(async (query: string, limit = 50): Promise<Person[]> => {
         try {
-<<<<<<< HEAD
-            const res = await getExtras<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
+            const res = await get<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
             return Array.isArray(res?.rows)
                 ? res.rows
                     .filter((row) => !deletedPeopleRef.current.has(row.personId))
@@ -1732,10 +1731,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     .map(reconcilePersonFaceCount)
                     .filter((person) => person.name || (person.faceCount ?? 0) > 0)
                 : [];
-=======
-            const res = await get<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
-            return Array.isArray(res?.rows) ? res.rows.map(mapPersonRow) : [];
->>>>>>> b371e5f (Move people_bp (person/face CRUD, merges) from extras back to backend)
         } catch {
             return [];
         }
