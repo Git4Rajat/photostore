@@ -13,7 +13,8 @@ import pytest
 import app
 import ordering_utils
 import search_db
-from routes.photos import filter_photos, list_photos
+from routes.photos import filter_photos, list_photos, photo_date_position
+from tests.fakes import FakeTable
 
 
 def _rows(n=60, seed=7):
@@ -153,10 +154,27 @@ def test_filter_route_uses_sql_and_reports_total(monkeypatch, built):
 
 
 def test_list_and_filter_report_index_building_when_no_database_yet(monkeypatch):
+    table = FakeTable()
+    table.upsert_entity({'PartitionKey': 'owner', 'RowKey': 'p1.jpg'})
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, '_open_library_db', lambda uid: None)
+    monkeypatch.setattr(app, 'metadata_table_client', table)
     assert _get(list_photos, '/api/photos')['indexBuilding'] is True
     assert _get(filter_photos, '/api/photos/filter')['indexBuilding'] is True
+
+
+def test_missing_database_routes_settle_empty_library_without_building(monkeypatch):
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_open_library_db', lambda uid: None)
+    monkeypatch.setattr(app, 'metadata_table_client', FakeTable())
+
+    listed = _get(list_photos, '/api/photos')
+    filtered = _get(filter_photos, '/api/photos/filter?offset=3&limit=9')
+    positioned = _get(photo_date_position, '/api/photos/date-position?date=2026-10-08')
+
+    assert listed == {'photos': [], 'total': 0}
+    assert filtered == {'photos': [], 'total': 0, 'offset': 3, 'limit': 9}
+    assert positioned == {'offset': 0, 'filename': '', 'total': 0}
 
 
 def test_on_this_day_picks_the_best_past_year_from_sql(monkeypatch, tmp_path):

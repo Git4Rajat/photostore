@@ -19,6 +19,26 @@ SORT_INDEX_CLIENT_MAX_ROWS = int(__import__('os').getenv('SORT_INDEX_CLIENT_MAX_
 
 photos_bp = Blueprint('photos', __name__)
 
+def _library_has_metadata_rows(user_id: str):
+    """Return True/False when a cheap one-row metadata probe can tell whether
+    this library has photos; None means "unknown, preserve the building path"."""
+    if app.metadata_table_client is None:
+        return None
+    try:
+        rows = app.metadata_table_client.query_entities(
+            f"PartitionKey eq '{app._escape_odata(user_id)}'",
+            select=['RowKey'],
+            results_per_page=1,
+        )
+        page_iter = rows.by_page() if hasattr(rows, 'by_page') else iter([rows])
+        for page in page_iter:
+            return next(iter(page), None) is not None
+        return False
+    except Exception:
+        app.app.logger.warning('Could not probe library emptiness for %s', user_id, exc_info=True)
+        return None
+
+
 @photos_bp.route('/api/photos/thumbnail/<path:filename>', methods=['GET'])
 def proxy_thumbnail(filename: str):
     """Serve a thumbnail blob or a placeholder when the blob is missing."""
@@ -460,6 +480,8 @@ def list_photos():
     # database (flat memory); only the returned page is read fresh from the table.
     db = app._open_library_db(user_id)
     if db is None:
+        if _library_has_metadata_rows(user_id) is False:
+            return app.jsonify({'photos': [], 'total': 0})
         return app.jsonify({'photos': [], 'total': 0, 'indexBuilding': True})
     try:
         filenames, total = db.list_page(
@@ -559,6 +581,8 @@ def photo_date_position():
         return error
     db = app._open_library_db(user_id)
     if db is None:
+        if _library_has_metadata_rows(user_id) is False:
+            return app.jsonify({'offset': 0, 'filename': '', 'total': 0})
         return app.jsonify({'offset': 0, 'filename': '', 'total': 0, 'indexBuilding': True})
     try:
         end_ts = datetime.combine(day, time.max, tzinfo=timezone.utc).timestamp()
@@ -1099,7 +1123,13 @@ def photos_index_status():
         }
     except Exception:
         library_db = None
+    empty_library = False
+    if not ready and not building and _library_has_metadata_rows(user_id) is False:
+        empty_library = True
+        ready = True
     payload = {'ready': ready, 'indexes': indexes, 'building': building, 'libraryDb': library_db}
+    if empty_library:
+        payload['emptyLibrary'] = True
     if app.request.args.get('diagnostics') in ('1', 'true'):
         # For environments without a log workspace: how many messages are waiting in each work queue, and
         # which processing mode this app is running, so "is anything reaching ipworker?" can be answered
@@ -1595,6 +1625,8 @@ def filter_photos():
 
     db = app._open_library_db(user_id)
     if db is None:
+        if _library_has_metadata_rows(user_id) is False:
+            return app.jsonify({'photos': [], 'total': 0, 'offset': offset, 'limit': limit})
         return app.jsonify({'photos': [], 'total': 0, 'offset': offset, 'limit': limit, 'indexBuilding': True})
 
     try:

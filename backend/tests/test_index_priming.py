@@ -311,6 +311,22 @@ def test_backend_index_status_ready_true_when_all_built(monkeypatch, route_ctx):
     assert response.get_json()['ready'] is True
 
 
+def test_backend_index_status_treats_empty_library_as_ready(monkeypatch, route_ctx):
+    from tests.fakes import FakeTable
+    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
+        'sort': False, 'lexical': False, 'albums': False, 'people': False,
+    })
+    monkeypatch.setattr(app, 'metadata_table_client', FakeTable())
+
+    with app.app.test_request_context('/api/photos/index-status'):
+        response = photos_index_status()
+
+    payload = response.get_json()
+    assert payload['ready'] is True
+    assert payload['emptyLibrary'] is True
+    assert payload['indexes'] == {'sort': False, 'lexical': False, 'albums': False, 'people': False}
+
+
 # --- POST /api/tools/indexes/build (tools: the actual builder) ----------------
 
 def _build_state(indexes, needs_rebuild):
