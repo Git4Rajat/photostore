@@ -1858,10 +1858,18 @@ class _ShareBackedBlob:
             cached = self._cached_bytes()
         if cached is not None:
             perf_instrumentation.log_event('index_share_hit', blob=self._kind, mb=round(len(cached) / 1048576, 1))
+            _trace_index_blob_read(self._kind, '', outcome='share_hit', bytes_=len(cached))
             return _Bytes(cached)
         downloader = self._inner.download_blob()
         payload = downloader.readall()
         etag = getattr(getattr(downloader, 'properties', None), 'etag', None)
+        # TEMPORARY (2026-10-08): _write() silently no-ops (via _forget()) for
+        # anything under INDEX_DISK_CACHE_MIN_BYTES (64KB default) -- on a
+        # library small enough that these gzipped index blobs fall under that,
+        # every single call here is a real network GET, never a cache hit.
+        # Logged so a real index_build.full run shows whether that's actually
+        # happening, not just theorized from reading _write()'s code.
+        _trace_index_blob_read(self._kind, '', outcome='share_miss_downloaded', bytes_=len(payload))
         self._write(payload, str(etag) if etag else None)
         return _Bytes(payload)
 
@@ -3560,23 +3568,31 @@ def invalidate_user_listing_index_cache(user_id: str) -> None:
 # index.build.full, but every refresh_user_*_index function only reads its
 # own blob once -- the actual repeat caller wasn't findable by reading code.
 # This logs who's calling, gated so it costs nothing once
-# INDEX_BLOB_READ_TRACE isn't set. Remove this and the four call sites below
+# INDEX_BLOB_READ_TRACE isn't set. Remove this and all its call sites
+# (the four _load_*_index_blob wrappers below, plus _ShareBackedBlob.
+# download_blob above -- the lower-level choke point every one of those
+# wrappers' real HTTP reads passes through, added after the first pass of
+# this diagnostic covered only the wrappers and still came up empty-handed)
 # once the real caller is identified from live logs.
 _INDEX_BLOB_READ_TRACE = os.getenv('INDEX_BLOB_READ_TRACE', '').strip() == '1'
+_INDEX_BLOB_READ_TRACE_DEPTH = 8
 
 
-def _trace_index_blob_read(kind: str, user_id: str) -> None:
+def _trace_index_blob_read(kind: str, user_id: str, *, outcome: str = 'call', bytes_: Optional[int] = None) -> None:
     if not _INDEX_BLOB_READ_TRACE:
         return
     import sys
-    frame = sys._getframe(2)  # caller of the _load_*_index_blob wrapper
+    frame = sys._getframe(1)  # immediate caller of this function
     chain = []
-    for _ in range(4):
+    for _ in range(_INDEX_BLOB_READ_TRACE_DEPTH):
         if frame is None:
             break
         chain.append(frame.f_code.co_name)
         frame = frame.f_back
-    _LOGGER.warning('INDEX_BLOB_READ_TRACE kind=%s user=%s callers=%s', kind, user_id, '<-'.join(chain))
+    _LOGGER.warning(
+        'INDEX_BLOB_READ_TRACE kind=%s user=%s outcome=%s bytes=%s callers=%s',
+        kind, user_id, outcome, bytes_ if bytes_ is not None else '-', '<-'.join(chain),
+    )
 
 
 def _load_gz_json_index_blob(kind: str, user_id: str, blob_client) -> Optional['LexicalIndexSnapshot']:
