@@ -891,6 +891,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     useEffect(() => {
         pendingUploadSessionRef.current = pendingUploadSession;
     }, [pendingUploadSession]);
+    const setPendingUploadSessionLive = useCallback((session: PersistedUploadSession | null) => {
+        pendingUploadSessionRef.current = session;
+        setPendingUploadSession(session);
+    }, []);
     const [browserAiModelState, setBrowserAiModelState] = useState<SharedBrowserAiModelState>({
         status: 'checking',
         modelAvailability: 'skipped',
@@ -3017,7 +3021,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // processing pass -- a large batch can take long enough for the laptop
         // to autolock mid-transfer otherwise.
         keepAliveRef.current?.start();
-        setPendingUploadSession(null);
+        setPendingUploadSessionLive(null);
         const totalCount = session.files.length;
         let totalUploaded = session.files.filter((file) => file.status === 'done').length;
         let totalFailed = 0;
@@ -3702,7 +3706,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 const latest = uploadSessionRef.current || normalized;
                 await cleanupUnfinishedUploadArtifacts(latest);
                 await clearPersistedSession();
-                setPendingUploadSession(null);
+                setPendingUploadSessionLive(null);
                 updateNotification(notificationId, {
                     title: 'Upload stopped',
                     details: `Stopped after uploading ${totalUploaded}/${plural(totalCount, 'file')}.`,
@@ -3722,7 +3726,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const hasPending = (latest?.files || []).some((file) => file.status !== 'done');
             if (!hasPending) {
                 await clearPersistedSession();
-                setPendingUploadSession(null);
+                setPendingUploadSessionLive(null);
             }
 
             if (totalFailed === 0 && !hasPending) {
@@ -3733,7 +3737,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 setUploadError(null);
             } else {
                 if (latest) {
-                    setPendingUploadSession(latest);
+                    setPendingUploadSessionLive(latest);
                 }
                 updateNotification(notificationId, {
                     title: 'Upload paused',
@@ -3751,7 +3755,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 const latest = uploadSessionRef.current || session;
                 await cleanupUnfinishedUploadArtifacts(latest);
                 await clearPersistedSession();
-                setPendingUploadSession(null);
+                setPendingUploadSessionLive(null);
                 updateNotification(notificationId, {
                     title: 'Upload stopped',
                     details: `Stopped after uploading ${totalUploaded}/${plural(totalCount, 'file')}.`,
@@ -3773,7 +3777,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             });
             const latest = uploadSessionRef.current;
             if (latest && latest.files.some((file) => file.status !== 'done')) {
-                setPendingUploadSession(latest);
+                setPendingUploadSessionLive(latest);
             }
             setUploadError(message);
         } finally {
@@ -3797,6 +3801,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clearPersistedSession,
         notifyUploadComplete,
         persistSession,
+        setPendingUploadSessionLive,
         setUploadError,
         updateNotification,
         updatePersistedFile,
@@ -3909,9 +3914,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const matchedCount = matchedPairs.length;
         const latest = uploadSessionRef.current || session;
         persistSession(latest);
-        setPendingUploadSession(latest);
+        setPendingUploadSessionLive(latest);
         return { matchedCount, unmatchedFiles };
-    }, [loadPersistedSession, pendingUploadSession, persistSession, updatePersistedFile]);
+    }, [loadPersistedSession, pendingUploadSession, persistSession, setPendingUploadSessionLive, updatePersistedFile]);
 
     const retryPersistedUploadSession = useCallback(async () => {
         const session = pendingUploadSession || loadPersistedSession();
@@ -3973,10 +3978,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             await cleanupUnfinishedUploadArtifacts(session);
         }
         await clearPersistedSession();
-        setPendingUploadSession(null);
+        setPendingUploadSessionLive(null);
         setUploadError(null);
         addNotification('Upload discarded', 'Paused upload files were removed.');
-    }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, pendingUploadSession, setUploadError, uploading]);
+    }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, pendingUploadSession, setPendingUploadSessionLive, setUploadError, uploading]);
 
     const stopActiveUpload = useCallback(() => {
         if (!uploading && !uploadStartInProgressRef.current) {
@@ -4570,13 +4575,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
 
         persistSession(restored);
-        setPendingUploadSession(restored);
+        setPendingUploadSessionLive(restored);
         addNotification('Upload paused', `${plural(restored.files.filter((file) => file.status !== 'done').length, 'file')} need retry approval.`);
         if (!autoResumeAttemptedRef.current) {
             autoResumeAttemptedRef.current = true;
             void retryPersistedUploadSession();
         }
-    }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, persistSession]);
+    }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, persistSession, setPendingUploadSessionLive]);
 
     // Keep the backend warm only for browser-side processing, not for uploads.
     // Uploads are already direct-to-blob (see uploadFileInChunks) -- the backend
