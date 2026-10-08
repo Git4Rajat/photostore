@@ -33,7 +33,7 @@ import {
     isConstrainedUploadDevice,
     isUploadStoppedError,
 } from './browserAiShared';
-import { FILE_ACCEPT_FILTER, requiresBackendPreview, shouldSkipConvertedRawPreview } from '../utils/photoDisplay';
+import { FILE_ACCEPT_FILTER, requiresBackendPreview, shouldOffloadPreviewToClient, shouldSkipConvertedRawPreview } from '../utils/photoDisplay';
 import { plural } from '../utils/format';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
@@ -3111,7 +3111,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const parallelThumbnailTasks = new Set<Promise<void>>();
 
             const kickOffThumbnailForFile = (file: File, filename: string, blobName?: string) => {
-                if (getRuntimeConfig().processingMode === 'backend') {
+                const backendMode = getRuntimeConfig().processingMode === 'backend';
+                // 'backend' mode normally leaves everything (including preview) to
+                // ipworker -- but for RAW/large-original files the backend would
+                // otherwise pay to download the full original just to shrink it,
+                // so this one step still runs client-side regardless of mode (see
+                // shouldOffloadPreviewToClient). thumbnail/ocr/face/ai_vision stay
+                // ipworker's job in this mode either way.
+                const previewOnlyOffload = backendMode && shouldOffloadPreviewToClient(file);
+                if (backendMode && !previewOnlyOffload) {
                     // ipworker owns thumbnails entirely in this mode (queued
                     // automatically by the upload finalize call, same as its
                     // other steps) -- don't claim the lease client-side just to
@@ -3120,21 +3128,29 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     return;
                 }
                 const task: Promise<void> = (async () => {
-                    let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null;
-                    try {
-                        // blobName: the blob THIS file's bytes actually landed on
-                        // (from its own /upload/init response), echoed the same way
-                        // finalize does -- see the matching comment there. Without
-                        // it, the backend re-derives the thumbnail-upload blob from
-                        // the shared (user, filename) row, which a same-named file
-                        // uploaded around the same time can have already moved on,
-                        // pointing this direct thumbnail PUT at a different photo's
-                        // (already correct) thumbnail blob and silently corrupting it.
-                        claim = await runGatedProcessingCall(() => postUpload('/upload/processing/claim', { filename, steps: ['thumbnail'], blobName }));
-                    } catch {
-                        return;
+                    let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null = null;
+                    if (!previewOnlyOffload) {
+                        try {
+                            // blobName: the blob THIS file's bytes actually landed on
+                            // (from its own /upload/init response), echoed the same way
+                            // finalize does -- see the matching comment there. Without
+                            // it, the backend re-derives the thumbnail-upload blob from
+                            // the shared (user, filename) row, which a same-named file
+                            // uploaded around the same time can have already moved on,
+                            // pointing this direct thumbnail PUT at a different photo's
+                            // (already correct) thumbnail blob and silently corrupting it.
+                            claim = await runGatedProcessingCall(() => postUpload('/upload/processing/claim', { filename, steps: ['thumbnail'], blobName }));
+                        } catch {
+                            return;
+                        }
+                        if (!claim?.claimed) return;
                     }
-                    if (!claim?.claimed) return;
+                    // previewOnlyOffload skips the claim above entirely: /upload/
+                    // client-processing never checks lease ownership (only
+                    // apply_client_processing_results_for_file + claimedSteps, which
+                    // just governs cleanup of *other* steps, see
+                    // _apply_client_report_statuses), and 'preview' doesn't need the
+                    // claim response's thumbnailUploadUrl the way 'thumbnail' does.
                     const processingStartedAt = performance.now();
                     // Same reasoning as the drain-loop path above: a successful
                     // /upload/client-processing call already releases the lease
@@ -3151,17 +3167,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         // freshlyUploadedFilenamesRef's comment).
                         const convertedPreview: Blob | undefined = undefined;
                         // requestedSteps restricts this call to actually computing just
-                        // 'thumbnail' -- this claim only ever asked for 'thumbnail'
-                        // (see /upload/processing/claim above), so there is no point
-                        // running (and discarding) OCR/face/ai_vision/exif/map here;
-                        // the drain loop's own pass picks those up later for real. This
-                        // used to run the full pipeline and filter the result down to
-                        // 'thumbnail' afterward, which both wasted real inference time
-                        // (tesseract/CLIP/face models, tens of seconds combined) and
-                        // fed the bug described where the resulting thumbnail-only
-                        // report made the backend think every other step had been
-                        // checked and found nothing (see claimedSteps below).
-                        const kickoffRequestedSteps = new Set(['thumbnail']);
+                        // 'thumbnail' (or, for previewOnlyOffload, just 'preview') --
+                        // this claim only ever asked for that one step, so there is no
+                        // point running (and discarding) OCR/face/ai_vision/exif/map
+                        // here; the drain loop's own pass picks those up later for
+                        // real. This used to run the full pipeline and filter the
+                        // result down to 'thumbnail' afterward, which both wasted real
+                        // inference time (tesseract/CLIP/face models, tens of seconds
+                        // combined) and fed the bug described where the resulting
+                        // thumbnail-only report made the backend think every other
+                        // step had been checked and found nothing (see claimedSteps
+                        // below).
+                        const kickoffRequestedSteps = new Set([previewOnlyOffload ? 'preview' : 'thumbnail']);
                         const result = await runBrowserProcessing(
                             file,
                             `browser-${filename}`,
@@ -3172,7 +3189,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         );
                         const filteredResult = filterBrowserProcessingResult(result, kickoffRequestedSteps);
                         let thumbnailAlreadyUploaded = false;
-                        if (filteredResult?.clientProcessing?.thumbnail) {
+                        if (!previewOnlyOffload && filteredResult?.clientProcessing?.thumbnail) {
                             try {
                                 thumbnailAlreadyUploaded = await uploadBrowserThumbnailDirectly(
                                     filename,
@@ -3208,11 +3225,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             clientAssetId: `browser-${filename}`,
                             uploadId: `browser-${filename}`,
                             thumbnailAlreadyUploaded,
-                            // Tells the backend this report only ever covered 'thumbnail'
-                            // -- without this it can't distinguish "we checked every
-                            // other step and found nothing" from "we only checked
-                            // thumbnail," and used to permanently mark every other step
-                            // no_data the moment this landed (see
+                            // Tells the backend this report only ever covered this one
+                            // step -- without this it can't distinguish "we checked
+                            // every other step and found nothing" from "we only
+                            // checked this one," and used to permanently mark every
+                            // other step no_data the moment this landed (see
                             // _apply_client_report_statuses in storage_utils.py).
                             claimedSteps: Array.from(kickoffRequestedSteps),
                         });
@@ -3220,7 +3237,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     } catch (err) {
                         console.warn(`Parallel thumbnail generation failed for ${filename}.`, err);
                     } finally {
-                        if (!leaseReleasedByReport) {
+                        if (!leaseReleasedByReport && claim) {
                             await postUpload('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
                         }
                     }
