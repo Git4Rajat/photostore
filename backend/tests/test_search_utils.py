@@ -108,6 +108,8 @@ def test_sensitive_auto_tag_labels_are_not_curated_or_predicted():
         {'label': 'poor', 'source': 'ai_tag', 'confidence': 0.99},
         {'label': 'smart', 'source': 'ai_tag', 'confidence': 0.99},
         {'label': 'woman', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'sexuality', 'source': 'ai_tag', 'confidence': 0.99},
+        {'label': 'brown', 'source': 'ai_tag', 'confidence': 0.99},
         {'label': 'dog', 'source': 'ai_tag', 'confidence': 0.99},
         {'label': 'Aaron', 'source': 'user', 'confidence': 1.0},
     ])
@@ -120,6 +122,8 @@ def test_sensitive_auto_tag_labels_are_not_curated_or_predicted():
     assert is_sensitive_auto_tag_label('poor')
     assert is_sensitive_auto_tag_label('smart')
     assert is_sensitive_auto_tag_label('woman')
+    assert is_sensitive_auto_tag_label('sexuality')
+    assert is_sensitive_auto_tag_label('brown')
     assert not is_sensitive_auto_tag_label('person')
     assert not is_sensitive_auto_tag_label('face')
     assert curated['tags'] == ['aaron', 'dog']

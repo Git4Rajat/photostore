@@ -26,8 +26,8 @@
   "assets": [
     {
       "path": "vocab/tag-vocabulary-embeddings.v1.bin",
-      "bytes": 19388416,
-      "sha256": "5fff628ac902e0f3138463c5f968811cce18e50c1195cc11c5d6c66566f5818e"
+      "bytes": 19378176,
+      "sha256": "982bea330d80b22e5ba1e175d65e5332d870ee013c91323d50ea433067374858"
     },
     {
       "path": "runtime/ort-wasm.wasm",
