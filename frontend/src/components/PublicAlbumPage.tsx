@@ -322,11 +322,20 @@ const PublicAlbumPage: React.FC = () => {
     // before the container finishes booting. Ping /health every 20s -- well
     // under the observed idle window -- for as long as the code screen is up,
     // so archive stays warm for the POST.
+    //
+    // No AbortSignal here: a real cold start is 20-30s+ (see httpClient.ts),
+    // and a canceled request is deliberately excluded from the cold-start
+    // retry loop there, so a short client-side timeout made every ping abort
+    // mid-boot and never observe a successful wake -- the ping always
+    // "failed" even though archive was coming up fine. Letting the ping run
+    // through requestJson's own ~90s cold-start retry (and its GET dedup,
+    // which coalesces a still-in-flight ping with the next interval's call
+    // instead of stacking a second one) gives it a real chance to land.
     useEffect(() => {
         if (!codeRequired) {
             return undefined;
         }
-        const ping = () => { void get('/health', { signal: AbortSignal.timeout(8000) }).catch(() => undefined); };
+        const ping = () => { void get('/health').catch(() => undefined); };
         const timer = window.setInterval(ping, 20000);
         return () => window.clearInterval(timer);
     }, [codeRequired]);
