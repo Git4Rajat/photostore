@@ -40,6 +40,9 @@
     "react-router-dom": "^6.15.0",
     "tesseract.js": "^2.1.5"
   },
+  "overrides": {
+    "sharp": "0.35.5"
+  },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@testing-library/react": "^16.1.0",
