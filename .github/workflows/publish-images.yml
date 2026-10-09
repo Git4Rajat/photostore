@@ -98,6 +98,8 @@ jobs:
       # push to GHCR with "unknown blob".
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
       # GHCR on some personal accounts refuses to let the auto GITHUB_TOKEN
       # *create* a brand-new package (denied: write_package). Authenticate with
