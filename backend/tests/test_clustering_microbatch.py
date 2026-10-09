@@ -151,7 +151,7 @@ def real_staged(monkeypatch):
     monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'faiss')
     monkeypatch.setattr(app, '_get_live_faiss_assigner', lambda: h.assigner)
     monkeypatch.setattr(app, '_prepare_incremental_assignment',
-                        lambda payload, user: (payload['filename'], [payload['filename']]))
+                        lambda payload, user: [(payload['filename'], [payload['filename']])])
     yield h
     faiss_assignment.invalidate()
 

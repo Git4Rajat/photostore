@@ -562,7 +562,7 @@ def test_live_upload_queue_schedules_assignment_but_never_maintenance(monkeypatc
     enqueue = Mock()
     due = Mock(side_effect=AssertionError('live engine checked DBSCAN maintenance'))
     maintenance = Mock(side_effect=AssertionError('live engine queued DBSCAN maintenance'))
-    monkeypatch.setattr(app, '_enqueue_incremental_assign_job', enqueue)
+    monkeypatch.setattr(app, '_buffer_incremental_assign_filename', enqueue)
     monkeypatch.setattr(app, '_clustering_maintenance_due', due)
     monkeypatch.setattr(app, '_enqueue_clustering_job', maintenance)
 

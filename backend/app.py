@@ -3496,15 +3496,17 @@ def _enqueue_library_purge_job(library_id: str) -> bool:
     return True
 
 
-def _enqueue_incremental_assign_job(user_id: str, filename: str) -> Dict[str, str]:
-    """Queue asynchronous face-to-person assignment for one just-processed
-    photo, run by the standalone clustering worker instead of inline in the
-    upload request path (see _queue_people_clustering_after_face_processing
-    for why: this used to run synchronously in-process, and moving it here
-    was what made /upload/finalize and /upload/client-processing responses
-    balloon from ms to tens-of-seconds under a large burst -- an unvectorized
-    per-photo embedding-index rebuild competing for the same GIL as every
-    other concurrent upload request on the replica).
+def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[str, str]:
+    """Queue asynchronous face-to-person assignment for a batch of
+    just-processed photos (one filename, or many -- see
+    _buffer_incremental_assign_filename), run by the standalone clustering
+    worker instead of inline in the upload request path (see
+    _queue_people_clustering_after_face_processing for why: this used to run
+    synchronously in-process, and moving it here was what made
+    /upload/finalize and /upload/client-processing responses balloon from ms
+    to tens-of-seconds under a large burst -- an unvectorized per-photo
+    embedding-index rebuild competing for the same GIL as every other
+    concurrent upload request on the replica).
 
     Deliberately skips _enqueue_clustering_job's active-job de-dupe and
     _upsert_job_status bookkeeping: that guard exists so a slow full-library
@@ -3515,20 +3517,100 @@ def _enqueue_incremental_assign_job(user_id: str, filename: str) -> Dict[str, st
     request path. No jobId means the worker's own status/coalesced-rerun
     bookkeeping (which all key off a truthy job_id) is a no-op for these.
     """
+    if not filenames:
+        return {'status': 'noop'}
     if clustering_queue_client is None:
-        app.logger.warning('Clustering queue client is unavailable; incremental-assign for %s/%s was not enqueued', user_id, filename)
+        app.logger.warning('Clustering queue client is unavailable; incremental-assign for %s/%s filenames (user=%s) was not enqueued',
+                           len(filenames), filenames[0], user_id)
         return {'status': 'unavailable'}
     message = {
         'user_id': user_id,
         'type': 'people_incremental_assign',
-        'filename': filename,
+        'filenames': filenames,
     }
     try:
         clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
     except Exception:
-        app.logger.exception('Failed to enqueue incremental-assign job for %s/%s', user_id, filename)
+        app.logger.exception('Failed to enqueue incremental-assign job for %s filenames (user=%s, first=%s)',
+                             len(filenames), user_id, filenames[0])
         return {'status': 'failed'}
     return {'status': 'queued'}
+
+
+IPWORK_CLUSTER_BATCH_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_MAX_FILENAMES', '1500'))
+IPWORK_CLUSTER_BATCH_FLUSH_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_FLUSH_SECONDS', '60'))
+
+# Per-user in-memory buffer of filenames awaiting an incremental-assign
+# flush. _queue_people_clustering_after_face_processing runs inside
+# IPWORKER_CONCURRENCY worker threads, so mutation is lock-protected; the
+# actual send_message call happens outside the lock.
+_cluster_batch_lock = threading.Lock()
+_cluster_batch_buffers: Dict[str, List[str]] = {}
+_cluster_batch_started_at: Dict[str, float] = {}
+
+
+def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
+    """Accumulate one photo's filename into its user's pending batch instead
+    of sending it as its own queue message immediately -- cuts queue PUT/
+    DELETE traffic from one-per-photo to roughly one-per-
+    IPWORK_CLUSTER_BATCH_MAX_FILENAMES (time-flushed via a background thread
+    in run_ipworker, or on shutdown via _flush_all_incremental_assign_buffers,
+    so a slow trickle or a scaling-to-zero replica never strands filenames)."""
+    to_flush: Optional[List[str]] = None
+    with _cluster_batch_lock:
+        buffer = _cluster_batch_buffers.setdefault(user_id, [])
+        if not buffer:
+            _cluster_batch_started_at[user_id] = time.monotonic()
+        buffer.append(filename)
+        if len(buffer) >= IPWORK_CLUSTER_BATCH_MAX_FILENAMES:
+            to_flush = buffer
+            _cluster_batch_buffers[user_id] = []
+            _cluster_batch_started_at.pop(user_id, None)
+    if to_flush:
+        _enqueue_incremental_assign_job(user_id, to_flush)
+
+
+def _flush_stale_incremental_assign_buffers() -> None:
+    """Flush any user's buffer that's been waiting longer than
+    IPWORK_CLUSTER_BATCH_FLUSH_SECONDS, even though it hasn't reached the
+    count cap -- otherwise a slow trickle of photos for one user could sit
+    buffered (and un-clustered) indefinitely."""
+    now = time.monotonic()
+    to_flush: List[Tuple[str, List[str]]] = []
+    with _cluster_batch_lock:
+        for user_id, started_at in list(_cluster_batch_started_at.items()):
+            if now - started_at >= IPWORK_CLUSTER_BATCH_FLUSH_SECONDS:
+                buffer = _cluster_batch_buffers.get(user_id)
+                if buffer:
+                    to_flush.append((user_id, buffer))
+                _cluster_batch_buffers[user_id] = []
+                _cluster_batch_started_at.pop(user_id, None)
+    for user_id, filenames in to_flush:
+        _enqueue_incremental_assign_job(user_id, filenames)
+
+
+def _flush_all_incremental_assign_buffers() -> None:
+    """Flush every remaining non-empty buffer regardless of age -- called on
+    ipworker shutdown so a scale-to-zero replica never strands filenames
+    that were waiting on either the count cap or the time-based flush."""
+    with _cluster_batch_lock:
+        pending = [(user_id, filenames) for user_id, filenames in _cluster_batch_buffers.items() if filenames]
+        _cluster_batch_buffers.clear()
+        _cluster_batch_started_at.clear()
+    for user_id, filenames in pending:
+        _enqueue_incremental_assign_job(user_id, filenames)
+
+
+def _run_incremental_assign_flush_loop(shutdown_requested: threading.Event) -> None:
+    """Background daemon loop started once in run_ipworker; polls at
+    roughly a third of the flush interval so the real worst-case wait for a
+    stale buffer never exceeds ~1.33x IPWORK_CLUSTER_BATCH_FLUSH_SECONDS."""
+    interval = max(1.0, IPWORK_CLUSTER_BATCH_FLUSH_SECONDS / 3)
+    while not shutdown_requested.wait(interval):
+        try:
+            _flush_stale_incremental_assign_buffers()
+        except Exception:
+            worker_logger.exception('Incremental-assign time-based flush failed')
 
 
 def _enqueue_propagate_job(user_id: str, person_id: str) -> Dict[str, str]:
@@ -11110,7 +11192,7 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
         return None
 
     try:
-        _enqueue_incremental_assign_job(user_id, filename)
+        _buffer_incremental_assign_filename(user_id, filename)
     except Exception:
         app.logger.exception('Failed to queue incremental face-to-person assignment for %s/%s', user_id, filename)
 
@@ -13110,22 +13192,28 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         # returned.
         if prepared is None:
             prepared = _prepare_incremental_assignment(payload, user_id)
-        filename, face_ids = prepared
-        if not filename:
-            return
-        try:
-            if face_ids:
-                if incremental_assign is None:
-                    _assign_faces_to_people_incrementally(user_id, filename, face_ids)
-                else:
-                    incremental_assign(filename, face_ids)
-            elif PEOPLE_ASSIGNMENT_ENGINE == 'faiss':
-                # A prior attempt may have stamped all faces then failed its
-                # projection. Redelivery must finish that remaining work.
-                _live_faiss_metadata_update(user_id, filename)
-        except Exception:
-            worker_logger.exception('Incremental face-to-person assignment failed for %s/%s', user_id, filename)
-            raise
+        # prepared is a list -- a message may carry many filenames (see
+        # _buffer_incremental_assign_filename). An exception on any one
+        # filename re-raises immediately, same as before this could ever
+        # batch: the whole message (now possibly many filenames) survives
+        # for redelivery rather than being falsely acked. Already-assigned
+        # filenames from this same attempt are idempotent on retry --
+        # _prepare_incremental_assignment re-derives face_ids fresh and
+        # finds nothing left to do for them.
+        for filename, face_ids in prepared:
+            try:
+                if face_ids:
+                    if incremental_assign is None:
+                        _assign_faces_to_people_incrementally(user_id, filename, face_ids)
+                    else:
+                        incremental_assign(filename, face_ids)
+                elif PEOPLE_ASSIGNMENT_ENGINE == 'faiss':
+                    # A prior attempt may have stamped all faces then failed its
+                    # projection. Redelivery must finish that remaining work.
+                    _live_faiss_metadata_update(user_id, filename)
+            except Exception:
+                worker_logger.exception('Incremental face-to-person assignment failed for %s/%s', user_id, filename)
+                raise
         return
 
     if job_type == 'index_build':
@@ -13373,19 +13461,54 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             worker_logger.exception('Post-clustering index rebuild trigger failed for %s', user_id)
 
 
-def _prepare_incremental_assignment(payload, user_id):
-    """Fresh per-photo preparation; independent reads may overlap in a batch."""
+def _clustering_log_filename_summary(payload) -> str:
+    """Single display value for log lines that historically assumed one
+    filename per message -- a people_incremental_assign message may now
+    carry many (see _buffer_incremental_assign_filename)."""
+    if not isinstance(payload, dict):
+        return ''
+    if payload.get('type') == 'people_incremental_assign':
+        filenames = _incremental_assign_message_filenames(payload)
+        if not filenames:
+            return ''
+        if len(filenames) == 1:
+            return filenames[0]
+        return f'{filenames[0]} (+{len(filenames) - 1} more)'
+    return str(payload.get('filename') or '')
+
+
+def _incremental_assign_message_filenames(payload) -> List[str]:
+    """Back-compat message parsing: the producer now buffers many filenames
+    per message (see _buffer_incremental_assign_filename) and sends
+    'filenames' (a list), but an ipworker replica still on an older deploy
+    during a rolling rollout may send the legacy single 'filename'."""
+    raw = payload.get('filenames')
+    if isinstance(raw, list) and raw:
+        return [str(f) for f in raw if f]
+    legacy = str(payload.get('filename') or '').strip()
+    return [legacy] if legacy else []
+
+
+def _prepare_incremental_assignment(payload, user_id) -> List[Tuple[str, List[str]]]:
+    """Fresh per-photo preparation for every filename this message carries
+    (one, or many -- see _incremental_assign_message_filenames); independent
+    reads may overlap in a batch. Filenames that fail validation or aren't
+    in a clusterable state are silently omitted from the result, matching
+    this function's previous single-filename behavior."""
     if not _people_features_available():
-        return '', []
-    filename = _validate_media_filename(str(payload.get('filename') or ''))
-    if not filename:
-        return '', []
-    metadata = _get_metadata_entity(user_id, filename)
-    if (not isinstance(metadata, dict)
-            or str(metadata.get('processing_state') or '').strip().lower() == 'deleted'
-            or str(metadata.get('face_status') or '').strip().lower() != 'done'):
-        return '', []
-    return filename, _face_ids_awaiting_person_assignment(user_id, filename)
+        return []
+    prepared: List[Tuple[str, List[str]]] = []
+    for raw_filename in _incremental_assign_message_filenames(payload):
+        filename = _validate_media_filename(raw_filename)
+        if not filename:
+            continue
+        metadata = _get_metadata_entity(user_id, filename)
+        if (not isinstance(metadata, dict)
+                or str(metadata.get('processing_state') or '').strip().lower() == 'deleted'
+                or str(metadata.get('face_status') or '').strip().lower() != 'done'):
+            continue
+        prepared.append((filename, _face_ids_awaiting_person_assignment(user_id, filename)))
+    return prepared
 
 
 def _poll_clustering_queue_once(
@@ -13571,20 +13694,20 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
             )
             worker_logger.info(
                 'clustering message started job_type=%s filename=%s user=%s dequeue_count=%s backlog_age_s=%.1f',
-                job_type or 'people_incremental_assign', payload.get('filename') or '', user_id, dequeue_count,
+                job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id, dequeue_count,
                 backlog_age_s,
             )
             (dispatch or _handle_clustering_queue_payload)(payload, job_id, user_id, job_type)
             worker_logger.info(
                 'clustering message done job_type=%s filename=%s user=%s elapsed_ms=%d',
-                job_type or 'people_incremental_assign', payload.get('filename') or '', user_id,
+                job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id,
                 int((time.monotonic() - start_time) * 1000),
             )
         succeeded = True
     except Exception as exc:
         worker_logger.info(
             'clustering message failed job_type=%s filename=%s user=%s elapsed_ms=%d',
-            job_type or 'people_incremental_assign', payload.get('filename') if isinstance(payload, dict) else '', user_id,
+            job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id,
             int((time.monotonic() - start_time) * 1000),
         )
         if job_id and user_id:
@@ -13628,6 +13751,21 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
     return True
 
 
+def _clustering_message_work_units(message) -> int:
+    """How much 'work' one queue message represents for the accumulation
+    target -- a people_incremental_assign message may carry many filenames
+    (see _buffer_incremental_assign_filename), so count those explicitly;
+    every other job type is a single unit of work, same as a raw message
+    count would give."""
+    try:
+        payload = json.loads(message.content or '{}')
+    except Exception:
+        return 1
+    if not isinstance(payload, dict) or payload.get('type') != 'people_incremental_assign':
+        return 1
+    return max(1, len(_incremental_assign_message_filenames(payload)))
+
+
 def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_size,
                                   idle_timeout_seconds, visibility_timeout, poll_seconds,
                                   shutdown_requested=None):
@@ -13635,8 +13773,12 @@ def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_
     Storage caps a single call at 32 -- page_size stays within that), so a
     caller can accumulate far more than one page before grouping/processing.
 
-    Stops once the pool reaches target_size, or once idle_timeout_seconds
-    have passed since the last message arrived. idle_timeout_seconds<=0
+    Stops once the pool reaches target_size -- measured in work units, not
+    raw message count, since one people_incremental_assign message can now
+    carry many filenames (see _buffer_incremental_assign_filename); every
+    other job type counts as one unit, same as a raw message count would
+    give -- or once idle_timeout_seconds have passed since the last message
+    arrived. idle_timeout_seconds<=0
     disables waiting entirely: exactly one receive_messages call is made and
     whatever it returns (including nothing) is the result -- this matches
     the previous single-page poll's behavior.
@@ -13689,6 +13831,7 @@ def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_
     messages: List = []
     last_received = started
     stopped_reason = 'idle_timeout'
+    work_units = 0
     while True:
         if shutdown_requested is not None and shutdown_requested.is_set():
             stopped_reason = 'shutdown'
@@ -13703,7 +13846,8 @@ def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_
                     messages.append(message)
                     holders.append([message, True])
             last_received = now
-            if len(messages) >= target_size:
+            work_units += sum(_clustering_message_work_units(m) for m in page)
+            if work_units >= target_size:
                 stopped_reason = 'target_reached'
                 break
         if now - last_received > idle_timeout_seconds:
@@ -13717,11 +13861,14 @@ def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_
 
 def _process_clustering_user_group(user, indices, messages, take, queue_client, queue_name,
                                    max_retries, deadletter_queue_client):
-    """Prepare every message's pending face ids, then run staged FAISS
-    batches chunked to <=256 unique faces each -- the cap assigner.batch()
-    itself already enforces for a single call. A group accumulated from
-    many messages for one busy user must not be forced into one oversized
-    staged call; this greedily splits it into as few chunks as fit instead.
+    """Prepare every message's pending filenames, flatten them into
+    individual (message_index, filename, face_ids) work items -- one fat
+    message can carry many filenames, see _buffer_incremental_assign_filename
+    -- then run FAISS batches chunked to <=256 unique faces each (the cap
+    assigner.batch() itself already enforces for a single call). A single
+    message's filenames can span multiple chunks, so remaining[i] tracks how
+    many of message i's work items are still outstanding across chunks; the
+    message is only acked once every chunk touching it has succeeded.
     """
 
     def prepare(i):
@@ -13735,18 +13882,31 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         preparations = dict(zip(indices, pool.map(prepare, indices)))
     prepare_ms = int((time.monotonic() - prepare_started) * 1000)
-    worker_logger.info('clustering batch prepare user=%s messages=%d prepare_ms=%d concurrency=%d',
-                       user, len(indices), prepare_ms, concurrency)
+    total_filenames = sum(len(p) for p in preparations.values() if not isinstance(p, Exception))
+    worker_logger.info('clustering batch prepare user=%s messages=%d filenames=%d prepare_ms=%d concurrency=%d',
+                       user, len(indices), total_filenames, prepare_ms, concurrency)
 
     assigner = _get_live_faiss_assigner()
     staged_ok = getattr(assigner.config, 'coalesce_writes', False)
 
+    def message_ids(i) -> List[str]:
+        prepared = preparations[i]
+        if isinstance(prepared, Exception):
+            return []
+        return [fid for _filename, face_ids in prepared for fid in face_ids]
+
+    # Each message (however many filenames it carries -- see
+    # _buffer_incremental_assign_filename) stays one atomic chunking/acking
+    # unit, same as before this could ever batch filenames: its weight for
+    # the 256-face cap is the union of face ids across ALL its filenames,
+    # not just one. A single message whose own filenames already exceed the
+    # cap simply never qualifies as staged -- it falls back to the
+    # non-staged path below for whichever chunk it lands in.
     chunks: List[List[int]] = []
     current: List[int] = []
     current_ids: set = set()
     for i in indices:
-        prepared = preparations[i]
-        ids = prepared[1] if not isinstance(prepared, Exception) else []
+        ids = message_ids(i)
         projected = current_ids | set(ids)
         if current and len(projected) > 256:
             chunks.append(current)
@@ -13758,15 +13918,15 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
         chunks.append(current)
 
     for chunk in chunks:
-        all_ids = [fid for i in chunk for fid in
-                   (preparations[i][1] if not isinstance(preparations[i], Exception) else [])]
+        all_ids = [fid for i in chunk for fid in message_ids(i)]
         staged = staged_ok and len(set(all_ids)) <= 256
+        chunk_filenames = sum(len(preparations[i]) for i in chunk if not isinstance(preparations[i], Exception))
         try:
             if staged:
                 completed = []
                 batch_started = time.monotonic()
-                worker_logger.info('clustering staged batch started user=%s messages=%d input_faces=%d',
-                                   user, len(chunk), len(set(all_ids)))
+                worker_logger.info('clustering staged batch started user=%s messages=%d filenames=%d input_faces=%d',
+                                   user, len(chunk), chunk_filenames, len(set(all_ids)))
                 # Keep ALL receipts with the pending renewer until flush,
                 # projections and lease checks finish. No early acknowledgement.
                 with assigner.batch(user, all_ids, staged=True) as assign:
@@ -13776,25 +13936,25 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
                             worker_logger.warning('FAISS batch preparation failed user=%s error=%s',
                                                   user, type(prepared).__name__)
                             continue
-                        filename, face_ids = prepared
-                        if filename:
+                        for filename, face_ids in prepared:
                             if face_ids:
                                 assign(filename, face_ids)
                             # Owned-face retries still need projection;
                             # duplicate filenames project only once.
                             assign.project(filename)
-                        completed.append((i, filename))
+                        completed.append(i)
                 acknowledged = 0
-                for i, filename in completed:
-                    if filename in assign.metadata_errors:
+                for i in completed:
+                    filenames = [filename for filename, _ids in preparations[i]]
+                    if any(filename in assign.metadata_errors for filename in filenames):
                         continue
                     try:
                         queue_client.delete_message(take(i))
                         acknowledged += 1
                     except Exception:
                         worker_logger.exception('Failed to delete completed %s batch message', queue_name)
-                worker_logger.info('clustering staged batch done user=%s messages=%d acknowledged=%d '
-                                   'metadata_failures=%d elapsed_ms=%d', user, len(chunk), acknowledged,
+                worker_logger.info('clustering staged batch done user=%s messages=%d filenames=%d acknowledged=%d '
+                                   'metadata_failures=%d elapsed_ms=%d', user, len(chunk), chunk_filenames, acknowledged,
                                    len(assign.metadata_errors), int((time.monotonic() - batch_started) * 1000))
                 continue
             with assigner.batch(user, all_ids) as assign:
@@ -13811,7 +13971,8 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
         except Exception:
             # Setup/lease/prefetch failures acknowledge nothing not already
             # completed. Visibility expiry redelivers the remaining jobs.
-            worker_logger.exception('FAISS microbatch failed user=%s messages=%d', user, len(chunk))
+            worker_logger.exception('FAISS microbatch failed user=%s messages=%d filenames=%d',
+                                    user, len(chunk), chunk_filenames)
 
 
 def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
@@ -14732,6 +14893,16 @@ def run_ipworker() -> None:
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
     executor = ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork')
+    # Time-based flush for _buffer_incremental_assign_filename's per-user
+    # buffers -- a slow trickle of photos for one user would otherwise sit
+    # buffered (and un-clustered) until the count cap is reached, which may
+    # never happen outside a burst. Stops via the same shutdown_requested
+    # Event; _flush_all_incremental_assign_buffers below catches whatever
+    # this loop's own cadence didn't get to before exit.
+    incremental_assign_flush_thread = threading.Thread(
+        target=_run_incremental_assign_flush_loop, args=(shutdown_requested,),
+        name='ipwork-cluster-batch-flush', daemon=True)
+    incremental_assign_flush_thread.start()
     batch_size = IPWORKER_FACE_RECONCILE_BATCH_SIZE
     # One bounded wave at a time: at most batch_size queue messages held,
     # regardless of inference concurrency. No images/embeddings are prefetched.
@@ -15054,6 +15225,7 @@ def run_ipworker() -> None:
         close_wave_if_drained()
         throughput.log(len(in_flight), force=True, oldest_task_seconds=oldest_task_seconds())
     flush_all_dirty_filename_buffers()      # marks buffered in this process must reach the table before it exits
+    _flush_all_incremental_assign_buffers()  # same reasoning -- a scale-to-zero replica must not strand buffered filenames
     if grace_exhausted:
         os._exit(exit_code)
 

@@ -561,7 +561,7 @@ def test_partial_failed_pass_queues_only_persisted_embeddings(monkeypatch, store
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
     monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'faiss')
     queued = []
-    monkeypatch.setattr(app, '_enqueue_incremental_assign_job', lambda *args: queued.append(args))
+    monkeypatch.setattr(app, '_buffer_incremental_assign_filename', lambda *args: queued.append(args))
     app._queue_people_clustering_after_face_processing('lib-A', 'photo.jpg', {
         'face_status': 'failed', 'faceCount': 1,
         'processing_metadata': json.dumps({'client_face': {'storedFaceIds': stored_ids, 'embeddingsReady': ready}}),

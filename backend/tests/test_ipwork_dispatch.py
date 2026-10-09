@@ -43,13 +43,14 @@ def dispatch_ctx(monkeypatch):
     # Default to "maintenance is due" so existing tests keep exercising the
     # enqueue path; test_maintenance_cooldown_skips_enqueue overrides this.
     monkeypatch.setattr(app, '_clustering_maintenance_due', lambda user_id: True)
-    # Incremental face-to-person assignment is queued for the standalone
-    # clustering worker (see _enqueue_incremental_assign_job), not run
-    # in-process here -- see test_clustering_incremental_assign.py for the
-    # worker-side dispatch of the resulting 'people_incremental_assign' job.
+    # Incremental face-to-person assignment is buffered for a batched flush
+    # to the standalone clustering worker (see _buffer_incremental_assign_filename
+    # / _enqueue_incremental_assign_job), not run in-process here -- see
+    # test_clustering_incremental_assign.py for the worker-side dispatch of
+    # the resulting 'people_incremental_assign' job.
     monkeypatch.setattr(
-        app, '_enqueue_incremental_assign_job',
-        lambda user_id, filename: calls.incremental_assign.append((user_id, filename)) or {'status': 'queued'},
+        app, '_buffer_incremental_assign_filename',
+        lambda user_id, filename: calls.incremental_assign.append((user_id, filename)),
     )
     yield calls
 

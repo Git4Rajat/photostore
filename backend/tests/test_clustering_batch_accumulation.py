@@ -45,6 +45,13 @@ def message(filename, user='u', **kwargs):
         user_id=user, filename=filename, **kwargs)), dequeue_count=1, insertion_time=None)
 
 
+def message_multi(filenames, user='u', **kwargs):
+    # The new producer shape (see _buffer_incremental_assign_filename): one
+    # message, many filenames.
+    return SimpleNamespace(content=json.dumps(dict(type='people_incremental_assign',
+        user_id=user, filenames=list(filenames), **kwargs)), dequeue_count=1, insertion_time=None)
+
+
 class FakeAssigner:
     """Lightweight stand-in for FaissAssigner -- records what batch() was
     called with (user, ids, staged) instead of touching real tables, so
@@ -149,3 +156,45 @@ def test_oversized_user_group_is_chunked_into_multiple_staged_batches(setup):
     assert all(staged for _user, _ids, staged in setup.leases)
     assert sum(sizes) == 300
     assert queue.deleted == messages
+
+
+def test_single_message_with_many_filenames_is_a_singleton_group(setup):
+    # One message carries several filenames (see
+    # _buffer_incremental_assign_filename) but is the only message for this
+    # user in the pool -- still a singleton group of one, dispatched via
+    # assign() once per filename rather than batch().
+    queue = PagedQueue([[message_multi(['a.jpg', 'b.jpg', 'c.jpg'])]])
+    assert app._poll_clustering_queue_batch_once(
+        queue, 'q', 5, batch_size=8, target_size=500, idle_timeout_seconds=0.1, poll_seconds=0.02)
+    assert sorted(setup.assign_calls) == [
+        ('u', 'a.jpg', ['a.jpg']), ('u', 'b.jpg', ['b.jpg']), ('u', 'c.jpg', ['c.jpg']),
+    ]
+
+
+def test_multi_filename_messages_share_one_staged_batch(setup):
+    # Two messages for the same user, each carrying several filenames --
+    # must group into ONE staged batch keyed on the union of every
+    # filename's face ids, not just the first filename per message.
+    pages = [[message_multi(['a.jpg', 'b.jpg'], user='u'), message_multi(['c.jpg'], user='u')]]
+    queue = PagedQueue(pages)
+    assert app._poll_clustering_queue_batch_once(
+        queue, 'q', 5, batch_size=8, target_size=2, idle_timeout_seconds=60, poll_seconds=0.01)
+    assert len(setup.leases) == 1
+    user, ids, staged = setup.leases[0]
+    assert user == 'u'
+    assert sorted(ids) == ['a.jpg', 'b.jpg', 'c.jpg']
+    assert staged is True
+    assert queue.deleted == pages[0]
+
+
+def test_legacy_single_filename_message_still_works_alongside_multi(setup):
+    # Back-compat: an older-deployed ipworker replica mid-rollout may still
+    # send the legacy single 'filename' shape -- must group correctly
+    # alongside the new 'filenames' shape for the same user.
+    pages = [[message('a.jpg', user='u'), message_multi(['b.jpg', 'c.jpg'], user='u')]]
+    queue = PagedQueue(pages)
+    assert app._poll_clustering_queue_batch_once(
+        queue, 'q', 5, batch_size=8, target_size=2, idle_timeout_seconds=60, poll_seconds=0.01)
+    assert len(setup.leases) == 1
+    _user, ids, _staged = setup.leases[0]
+    assert sorted(ids) == ['a.jpg', 'b.jpg', 'c.jpg']
