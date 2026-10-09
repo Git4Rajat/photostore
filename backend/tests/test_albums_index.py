@@ -162,7 +162,7 @@ def test_build_snapshot_includes_share_status_fields(albums_ctx, monkeypatch):
     """AlbumsPage.tsx reads album.isPublic/publicUrl/hasAccessCode directly --
     the index must carry these or the sharing UI regresses to always showing
     'Share' instead of 'Sharing on' for an already-shared album."""
-    monkeypatch.setenv('EXTRAS_PUBLIC_BASE_URL', 'https://extras.example.invalid')
+    monkeypatch.setenv('ARCHIVE_PUBLIC_BASE_URL', 'https://archive.example.invalid')
     albums_table, _, _ = albums_ctx
     _seed_album(
         albums_table, 'lib-A', 'alb-1',
@@ -173,13 +173,13 @@ def test_build_snapshot_includes_share_status_fields(albums_ctx, monkeypatch):
 
     row = snapshot.rows[0]
     assert row['isPublic'] is True
-    assert row['publicUrl'] == 'https://extras.example.invalid/public/album/tok123'
+    assert row['publicUrl'] == 'https://archive.example.invalid/public/album/tok123'
     assert row['hasAccessCode'] is True
     assert row['isExpired'] is False
 
 
 def test_build_snapshot_expired_share_is_not_public(albums_ctx, monkeypatch):
-    monkeypatch.setenv('EXTRAS_PUBLIC_BASE_URL', 'https://extras.example.invalid')
+    monkeypatch.setenv('ARCHIVE_PUBLIC_BASE_URL', 'https://archive.example.invalid')
     albums_table, _, _ = albums_ctx
     _seed_album(
         albums_table, 'lib-A', 'alb-1',

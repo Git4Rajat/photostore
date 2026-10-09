@@ -81,9 +81,9 @@ def test_build_roles_still_build(monkeypatch):
     assert ran == ['lib-2'] and requested == []
 
 
-def test_role_defaults_only_worker_and_ipworker_may_build():
-    for role, expected in (('worker', True), ('ipworker', True), ('backend', False), ('extras', False),
-                           ('admin', False), ('upload', False), ('tools', False)):
+def test_role_defaults_only_cluster_and_vision_may_build():
+    for role, expected in (('cluster', True), ('vision', True), ('core', False), ('archive', False),
+                           ('recovery', False), ('upload', False), ('indexer', False)):
         assert (role in su._INDEX_BUILD_ROLES) is expected, role
 
 
@@ -226,7 +226,7 @@ def test_open_library_db_requests_a_build_only_when_none_exists(monkeypatch):
     import app
     import search_db
     triggered = []
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, **kw: triggered.append(kw.get('reason')))
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid, **kw: triggered.append(kw.get('reason')))
     monkeypatch.setattr(search_db, 'open_database', lambda uid, **kw: None)
 
     monkeypatch.setattr(search_db, 'needs_build', lambda uid: False)        # manifest exists / transient error

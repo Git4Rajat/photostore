@@ -1,3 +1,6 @@
+> **2026-10-09 role rename**: `ipworker`→`vision` (see `deploy/resources.bicep`/
+> `backend/app.py`). This doc still says `ipworker`.
+
 # Bounded ipworker performance metrics
 
 Each replica emits `ipwork throughput metrics=<JSON>` after at least 60 monotonic

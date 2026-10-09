@@ -29,7 +29,7 @@ def test_explore_serves_precomputed_summary_without_loading_lexical(monkeypatch)
 
     monkeypatch.setattr(app, '_explore_places_and_things', _boom)
     triggered = []
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: triggered.append(uid))
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid: triggered.append(uid))
 
     with app.app.test_request_context('/api/explore'):
         response = explore_summary()
@@ -44,7 +44,7 @@ def test_explore_cold_returns_empty_and_nudges_tools(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'load_explore_summary', lambda uid: None)  # never built
     triggered = []
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid: triggered.append(uid))
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid: triggered.append(uid))
 
     with app.app.test_request_context('/api/explore'):
         response = explore_summary()

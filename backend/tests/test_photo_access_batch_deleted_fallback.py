@@ -30,7 +30,7 @@ def _patch_common(monkeypatch, access_index_rows, entities_by_name):
     monkeypatch.setattr(app, 'lookup_access_entries',
                         lambda uid, names: None if table is None else {n: table[n] for n in names if n in table})
     monkeypatch.setattr(app, 'access_index_is_dirty', lambda uid: False)
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *a, **k: None)
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda *a, **k: None)
     monkeypatch.setattr(app, '_get_metadata_entity', lambda uid, name: entities_by_name.get(name))
 
 

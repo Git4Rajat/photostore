@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1.7
-# Dockerfile for ipworker (Azure Container Apps): server-side mirror of the
-# browser's OCR/face/vision/geo pipeline (see backend/ipwork_*.py).
+# Dockerfile for the 'vision' role (Azure Container Apps): server-side mirror
+# of the browser's OCR/face/vision/geo pipeline (see backend/ipwork_*.py).
 #
-# Separate image from backend/worker (which reuse backendImage, differing
+# Separate image from core/cluster (which reuse coreImage, differing
 # only by APP_ROLE) on purpose: this needs torch/open_clip/onnxruntime/
 # opencv/mediapipe/tesseract-ocr -- multiple GB of extra weight that would
-# slow every backend/worker cold start (both scale to zero and back up) if
-# bundled into their shared image. See the ipworker plan for the full
+# slow every core/cluster cold start (both scale to zero and back up) if
+# bundled into their shared image. See the vision plan for the full
 # rationale.
 #
 # Build context is the REPO ROOT, not backend/ -- unlike backend/Dockerfile --
@@ -85,6 +85,6 @@ RUN curl -sL -o /app/models/face_landmarker.task \
     && test -s /app/models/face_landmarker.task
 
 ENV FLASK_APP=app.py
-ENV APP_ROLE=ipworker
+ENV APP_ROLE=vision
 
 CMD ["/app/entrypoint.sh"]

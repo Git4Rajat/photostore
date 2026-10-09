@@ -241,7 +241,7 @@ def test_route_without_database_asks_tools_to_build_and_reports_it(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: None)
     nudged = []
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, **kw: nudged.append(uid))
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid, **kw: nudged.append(uid))
     monkeypatch.setattr(search_db, 'needs_build', lambda uid: True)
     payload = _search('dog')
     assert payload == {'photos': [], 'total': 0, 'searchIndexBuilding': True} and nudged == ['owner']

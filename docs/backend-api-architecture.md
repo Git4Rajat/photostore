@@ -1,5 +1,12 @@
 # Backend API architecture (as of 2026-08-29)
 
+> **2026-10-09 role rename**: the container-app roles described throughout this
+> doc were renamed for clarity: `backend`→`core`, `tools`→`indexer`,
+> `admin`→`recovery`, `extras`→`archive`, `worker`→`cluster`, `ipworker`→`vision`,
+> `frontend`→`web` (`upload` unchanged). The prose and `APP_ROLE=` values below
+> still use the OLD names — translate via this table when cross-referencing
+> against current `deploy/resources.bicep`/`backend/app.py`.
+
 Scope: the synchronous HTTP request path served by the `backend` Container App
 (gunicorn, `APP_ROLE=backend`) — process/thread model, data layer, per-request
 auth cost, caching, and where API latency actually goes today. Everything

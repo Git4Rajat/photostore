@@ -1,20 +1,20 @@
 export interface AppConfig {
     apiBaseUrl?: string;
     uploadBaseUrl?: string;
-    /** Base URL for the dedicated `tools` container app (workbench action
+    /** Base URL for the dedicated `indexer` container app (workbench action
      * history logging, see routes/tools.py) -- falls back to apiBaseUrl when
-     * no separate tools deployment exists for this environment. */
-    toolsApiBaseUrl?: string;
-    /** Base URL for the dedicated `admin` container app (Tools/Workbench
+     * no separate indexer deployment exists for this environment. */
+    indexerApiBaseUrl?: string;
+    /** Base URL for the dedicated `recovery` container app (Tools/Workbench
      * recovery actions, see routes/admin.py) -- falls back to apiBaseUrl when
-     * no separate admin deployment exists for this environment. */
-    adminApiBaseUrl?: string;
-    /** Base URL for the dedicated `extras` container app (people/faces,
+     * no separate recovery deployment exists for this environment. */
+    recoveryApiBaseUrl?: string;
+    /** Base URL for the dedicated `archive` container app (people/faces,
      * library invites/export/clean, and public share-link routes -- see
      * routes/people.py, routes/library.py, routes/public.py) -- falls back
-     * to apiBaseUrl when no separate extras deployment exists for this
+     * to apiBaseUrl when no separate archive deployment exists for this
      * environment. */
-    extrasApiBaseUrl?: string;
+    archiveApiBaseUrl?: string;
     spaBaseUrl?: string;
     azureAdTenantId?: string;
     azureAdClientId?: string;
@@ -26,7 +26,7 @@ export interface AppConfig {
     buildTimestamp?: string;
     /** Deploy-time processing mode: 'browser' (default, today's behavior) runs
      * OCR/face/vision/geo only client-side; 'backend' skips client-side AI
-     * entirely and relies on the ipworker container; 'both' does both and
+     * entirely and relies on the vision container; 'both' does both and
      * whichever result lands first wins (see storage_utils._step_locked_done
      * and the processing-lease claim in app.py). */
     processingMode?: 'browser' | 'backend' | 'both';

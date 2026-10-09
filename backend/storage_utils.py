@@ -256,10 +256,10 @@ _VECTOR_INDEX_CACHE_LOCK = threading.RLock()
 # ~70MB, and nothing ever evicted them -- so a worker building for many libraries
 # (or a replica serving many) only ever grew until the OOM killer. These keep at most
 # INDEX_CACHE_MAX_ENTRIES libraries per kind (oldest evicted). Processes that BUILD
-# indexes but never serve them (worker/ipworker) keep none of the serve-only kinds.
+# indexes but never serve them (cluster/vision) keep none of the serve-only kinds.
 INDEX_CACHE_MAX_ENTRIES = int(os.getenv('INDEX_CACHE_MAX_ENTRIES', '2'))
-_BUILD_ROLE_NAMES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'worker,ipworker').split(',') if r.strip()}
-_IS_BUILD_ROLE = os.getenv('APP_ROLE', 'backend').strip().lower() in _BUILD_ROLE_NAMES
+_BUILD_ROLE_NAMES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'cluster,vision').split(',') if r.strip()}
+_IS_BUILD_ROLE = os.getenv('APP_ROLE', 'core').strip().lower() in _BUILD_ROLE_NAMES
 
 
 class _BoundedCache(dict):
@@ -359,13 +359,13 @@ def _cache_image_name(library_id: str, anonymous_id: str, original_filename: str
 
 # --- Where index builds may run ------------------------------------------------------
 # Index builds scan whole partitions and hold embeddings; one OOM-crash-looped the
-# 1Gi `extras` replica (and would any serving process). Only the build roles
-# (worker, ipworker) may run them. Every other process -- backend, extras, admin,
-# upload, tools -- serves whatever index blob already exists and, when one is
-# missing or stale, ASKS the worker to build it (INDEX_BUILD_REQUEST_HOOK, set by
+# 1Gi `archive` replica (and would any serving process). Only the build roles
+# (cluster, vision) may run them. Every other process -- core, archive, recovery,
+# upload, indexer -- serves whatever index blob already exists and, when one is
+# missing or stale, ASKS the cluster worker to build it (INDEX_BUILD_REQUEST_HOOK, set by
 # app.py to enqueue an index_build job) instead of scanning in-process.
-_INDEX_BUILD_ROLES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'worker,ipworker').split(',') if r.strip()}
-_ROLE_MAY_BUILD_INDEXES = os.getenv('APP_ROLE', 'backend').strip().lower() in _INDEX_BUILD_ROLES
+_INDEX_BUILD_ROLES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'cluster,vision').split(',') if r.strip()}
+_ROLE_MAY_BUILD_INDEXES = os.getenv('APP_ROLE', 'core').strip().lower() in _INDEX_BUILD_ROLES
 INDEX_BUILD_REQUEST_HOOK: Optional[Callable[[str], object]] = None
 
 
@@ -6068,10 +6068,10 @@ def _album_share_fields(row: Dict) -> Dict[str, object]:
     reverse import would be circular. Also deliberately does NOT fall back to
     request.host_url the way _album_entity_to_payload does: this can run on a
     background rebuild thread (see _rebuild_albums_index_in_background) with
-    no active Flask request context at all. EXTRAS_PUBLIC_BASE_URL is read
+    no active Flask request context at all. ARCHIVE_PUBLIC_BASE_URL is read
     directly from the environment (same variable, independently) -- a
     publicUrl is only ever omitted if that's unset in a real deployment,
-    which the live SPA_BASE_URL/EXTRAS_PUBLIC_BASE_URL convention treats as a
+    which the live SPA_BASE_URL/ARCHIVE_PUBLIC_BASE_URL convention treats as a
     misconfiguration anyway, not an expected runtime state.
     """
     is_public = _index_coerce_bool(row.get('isPublic', False))
@@ -6081,7 +6081,7 @@ def _album_share_fields(row: Dict) -> Dict[str, object]:
     is_expired = bool(expires_dt and datetime.now(timezone.utc) > expires_dt)
     public_url = ''
     if is_public and token and not is_expired:
-        base = os.getenv('EXTRAS_PUBLIC_BASE_URL', '').strip()
+        base = os.getenv('ARCHIVE_PUBLIC_BASE_URL', '').strip()
         if base:
             public_url = f"{base.rstrip('/')}/public/album/{token}"
     return {

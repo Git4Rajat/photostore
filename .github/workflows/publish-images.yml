@@ -5,11 +5,11 @@ name: Publish public container images
 # the "Deploy to Azure" button / ARM + Bicep templates pull from, so a deployer
 # never has to build anything themselves.
 #
-# The worker reuses the backend image (it only differs by APP_ROLE=worker),
-# so that's still just photostore-backend. ipworker (server-side OCR/face/
+# The cluster worker reuses the core image (it only differs by APP_ROLE=cluster),
+# so that's still just photostore-backend. The vision role (server-side OCR/face/
 # vision/geo -- see backend/ipwork_*.py) gets its own image,
 # photostore-ipworker, because it needs torch/open_clip/onnxruntime/opencv/
-# mediapipe/tesseract -- multiple GB that would slow every backend/worker
+# mediapipe/tesseract -- multiple GB that would slow every core/cluster
 # cold start if bundled into their shared image instead.
 #
 # ADMIN-ONLY BY DESIGN
@@ -132,6 +132,6 @@ jobs:
           echo "To roll your live deployment onto this exact, pinned image (recommended over :latest — see deploy/resources.bicep param docs):" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "az deployment group create -g <resource-group> -f deploy/resources.bicep \\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  --parameters backendImage=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-backend:${{ steps.ts.outputs.tag }} \\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  --parameters frontendImage=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-frontend:${{ steps.ts.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --parameters coreImage=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-backend:${{ steps.ts.outputs.tag }} \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --parameters webImage=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-frontend:${{ steps.ts.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"

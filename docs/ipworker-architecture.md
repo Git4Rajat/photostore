@@ -1,3 +1,8 @@
+> **2026-10-09 role rename**: `ipworker`→`vision`, `backend`→`core`,
+> `worker`→`cluster`, `tools`→`indexer`, `admin`→`recovery`, `extras`→`archive`,
+> `frontend`→`web` (`upload` unchanged). This doc still uses the OLD names —
+> translate via this table against current `deploy/resources.bicep`/`backend/app.py`.
+
 # Bounded face-index preparation
 
 The ipworker now supports bounded authoritative filename-index reconciliation

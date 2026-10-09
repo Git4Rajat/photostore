@@ -52,7 +52,7 @@ def record_workbench_action():
     # A Workbench/tools run changes tags, faces and metadata: the heavy indexes
     # are rebuilt now (not after plain uploads).
     try:
-        app._trigger_tools_index_rebuild(user_id, reason='workbench-run', scope='light')
+        app._trigger_indexer_rebuild(user_id, reason='workbench-run', scope='light')
     except Exception:
         pass
     return app.jsonify({'success': True, 'actionId': action_id})
@@ -201,11 +201,11 @@ def jsonify_status(ready, indexes, building):
     return app.jsonify({'ready': ready, 'building': bool(building), 'indexes': indexes})
 
 
-# Moved from routes/system.py (APP_ROLE=backend) 2026-10-01: polled
+# Moved from routes/system.py (APP_ROLE=core) 2026-10-01: polled
 # continuously by every session (every ~15-30s, indefinitely) to surface
-# background-job completions. On backend this competed with interactive
+# background-job completions. On core this competed with interactive
 # gallery/photo traffic for the thin GUNICORN_WORKERS=2/THREADS=2 pool --
-# the same scarce resource the 2026-10-01 crash-loop fix was about. tools
+# the same scarce resource the 2026-10-01 crash-loop fix was about. indexer
 # has no interactive request traffic to contend with, so this belongs here.
 @tools_bp.route('/api/jobs/status', methods=['GET'])
 @tools_bp.route('/jobs/status', methods=['GET'])

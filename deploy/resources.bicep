@@ -43,7 +43,7 @@ param adminPassword string
 ])
 param emailDataLocation string = 'Europe'
 
-@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new ipworker container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running ipworker (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and ipworker both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
+@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new vision container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running vision (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and vision both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
 @allowed([
   'browser'
   'backend'
@@ -51,24 +51,24 @@ param emailDataLocation string = 'Europe'
 ])
 param processingMode string = 'browser'
 
-@description('Public backend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
-param backendImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
+@description('Public core API image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
-@description('Public frontend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above.')
-param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
+@description('Public web (frontend) image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as coreImage above.')
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 
-@description('Public ipworker image. Only pulled/deployed when processingMode is "backend" or "both". Separate from backendImage (unlike the clustering `worker` role, which reuses it) because ipworker needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every backend/worker cold start if bundled into their shared image. Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment.')
-param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
+@description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same :latest-vs-pinned-tag guidance as coreImage applies when upgrading an existing deployment.')
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 
-@description('Quota in GiB for the dedicated worker FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
+@description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
 @maxValue(5120)
-param workerFileShareQuotaGiB int = 100
+param clusterFileShareQuotaGiB int = 100
 
-@description('Minimum clustering worker replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
+@description('Minimum clustering replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
 @minValue(0)
 @maxValue(1)
-param workerMinReplicas int = 0
+param clusterMinReplicas int = 0
 
 @description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
 @secure()
@@ -96,18 +96,18 @@ var storageAccountName = take(toLower(replace('${appName}${suffix}', '-', '')), 
 var workerCacheStorageAccountName = 'workercache${uniqueString(resourceGroup().id, appName)}'
 
 var environmentName = '${appName}-env'
-var backendAppName = '${appName}-backend'
-var frontendAppName = '${appName}-frontend'
-var workerAppName = '${appName}-worker'
-var ipworkerAppName = '${appName}-ipworker'
-var toolsAppName = '${appName}-tools'
+var coreAppName = '${appName}-core'
+var webAppName = '${appName}-web'
+var clusterAppName = '${appName}-cluster'
+var visionAppName = '${appName}-vision'
+var indexerAppName = '${appName}-indexer'
 var uploadAppName = '${appName}-upload'
-var adminAppName = '${appName}-admin'
-var extrasAppName = '${appName}-extras'
-// Only deploy ipworker (and grant it storage access) when the deployment
+var recoveryAppName = '${appName}-recovery'
+var archiveAppName = '${appName}-archive'
+// Only deploy vision (and grant it storage access) when the deployment
 // actually needs it -- in 'browser' mode (the default) it would just sit
 // scaled to zero forever, so skip provisioning it at all.
-var deployIpworker = processingMode != 'browser'
+var deployVision = processingMode != 'browser'
 
 // Built-in role definition IDs for storage data-plane access.
 var roleBlobContributor = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
@@ -121,9 +121,9 @@ var storageRoleIds = [
   roleBlobDelegator
 ]
 
-// Frontend URL is predicted from the environment's default domain so the
-// backend can reference it without a circular dependency.
-var frontendUrl = 'https://${frontendAppName}.${managedEnvironment.properties.defaultDomain}'
+// Web URL is predicted from the environment's default domain so the
+// core API can reference it without a circular dependency.
+var webUrl = 'https://${webAppName}.${managedEnvironment.properties.defaultDomain}'
 
 // ---------------------------------------------------------------------------
 // Azure Communication Services — email for password recovery.
@@ -222,7 +222,7 @@ resource workerCheckpointShare 'Microsoft.Storage/storageAccounts/fileServices/s
   name: 'faiss-checkpoints'
   properties: {
     enabledProtocols: 'SMB'
-    shareQuota: workerFileShareQuotaGiB
+    shareQuota: clusterFileShareQuotaGiB
   }
 }
 
@@ -231,11 +231,11 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
   name: 'default'
   properties: {
     // The browser uploads files directly to blob storage via a SAS URL, so the
-    // blob endpoint must allow cross-origin PUT/OPTIONS from the frontend only.
+    // blob endpoint must allow cross-origin PUT/OPTIONS from the web app only.
     cors: {
       corsRules: [
         {
-          allowedOrigins: [ frontendUrl ]
+          allowedOrigins: [ webUrl ]
           allowedMethods: [ 'GET', 'HEAD', 'PUT', 'OPTIONS', 'POST' ]
           allowedHeaders: [ '*' ]
           exposedHeaders: [ '*' ]
@@ -383,8 +383,8 @@ var backendEnv = [
   { name: 'AUTH_MODE', value: 'password' }
   { name: 'OWNER_EMAIL', value: adminEmail }
   { name: 'ACS_SENDER_ADDRESS', value: acsSenderAddress }
-  { name: 'PUBLIC_APP_BASE_URL', value: frontendUrl }
-  { name: 'SPA_BASE_URL', value: frontendUrl }
+  { name: 'PUBLIC_APP_BASE_URL', value: webUrl }
+  { name: 'SPA_BASE_URL', value: webUrl }
   { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
   // BROWSER_ONLY_PROCESSING no longer exists as its own setting -- app.py
   // derives it from PROCESSING_MODE (browser-only iff PROCESSING_MODE ==
@@ -600,8 +600,8 @@ var backendEnv = [
   { name: 'PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', value: '1800' }
 ]
 
-resource backend 'Microsoft.App/containerApps@2024-03-01' = {
-  name: backendAppName
+resource core 'Microsoft.App/containerApps@2024-03-01' = {
+  name: coreAppName
   location: location
   identity: {
     type: 'SystemAssigned'
@@ -626,8 +626,8 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
     template: {
       containers: [
         {
-          name: 'backend'
-          image: backendImage
+          name: 'core'
+          image: coreImage
           volumeMounts: [
             { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
             // Ephemeral (replica-local) disk for the SQLite search database -- SQLite needs a
@@ -706,7 +706,7 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             memory: '1Gi'
           }
           env: concat(backendEnv, [
-            { name: 'APP_ROLE', value: 'backend' }
+            { name: 'APP_ROLE', value: 'core' }
             // Shared Azure Files volume: index blobs are cached here by ETag so a
             // restart/scale-out re-reads from disk instead of re-downloading them.
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
@@ -797,15 +797,15 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
             // still builds the shared publicUrl -- without this, it defaulted
             // to this app's OWN host, which 404s since backend no longer
             // serves that route. See public-album-share-preview memory.
-            { name: 'EXTRAS_PUBLIC_BASE_URL', value: 'https://${extras.properties.configuration.ingress.fqdn}' }
+            { name: 'ARCHIVE_PUBLIC_BASE_URL', value: 'https://${archive.properties.configuration.ingress.fqdn}' }
             // Lets the search-index/sort-index SAS-mint routes fire a
-            // fire-and-forget rebuild on the tools role when they observe a
+            // fire-and-forget rebuild on the indexer role when they observe a
             // dirty manifest -- replacing the in-process background rebuild
             // backend used to run (which loaded the whole index blob into this
             // 1Gi container's memory, the OOM driver fixed 2026-09-30). Backend
             // never builds/loads the blob itself now; it only mints the URL and
-            // nudges tools. See _trigger_tools_index_rebuild in backend/app.py.
-            { name: 'TOOLS_INTERNAL_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
+            // nudges indexer. See _trigger_tools_index_rebuild in backend/app.py.
+            { name: 'INDEXER_INTERNAL_URL', value: 'https://${indexer.properties.configuration.ingress.fqdn}' }
           ])
           // Explicit liveness probe, replacing whatever Container Apps'
           // unconfigured default was (no probes block existed here before --
@@ -900,15 +900,15 @@ resource backend 'Microsoft.App/containerApps@2024-03-01' = {
 // 2026-09-15: first real service split (see backend-cpu-optimization-2026-09
 // memory's coupling map -- tools/workbench action-history logging was the
 // least-entangled route group, touching only its own table, no shared
-// caches). Same image as backend, differing only by APP_ROLE=tools, which
+// caches). Same image as core, differing only by APP_ROLE=indexer, which
 // app.py reads to register just tools_bp instead of the other 9 blueprints
 // (see app.py's blueprint-registration block). Runs the full backendEnv
 // (needs the same storage/session config to boot -- only the route
 // registration differs, not the module's own startup), sized much smaller
 // since this traffic is low-volume, best-effort history logging, not the
 // gallery/upload hot path.
-resource tools 'Microsoft.App/containerApps@2024-03-01' = {
-  name: toolsAppName
+resource indexer 'Microsoft.App/containerApps@2024-03-01' = {
+  name: indexerAppName
   location: location
   identity: {
     type: 'SystemAssigned'
@@ -933,12 +933,12 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
     template: {
       containers: [
         {
-          name: 'tools'
-          image: backendImage
+          name: 'indexer'
+          image: coreImage
           volumeMounts: [
             { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
           ]
-          // 2vCPU/4Gi (was 0.5/1Gi): tools is now the derived-index builder
+          // 2vCPU/4Gi (was 0.5/1Gi): indexer is now the derived-index builder
           // (POST /api/tools/indexes/build). Building the lexical index scans
           // a user's full metadata partition (OCR/tags/faces per row) -- the
           // exact work that OOM-ed the 1Gi backend, so it gets worker-class
@@ -948,7 +948,7 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
             memory: '4Gi'
           }
           env: concat(backendEnv, [
-            { name: 'APP_ROLE', value: 'tools' }
+            { name: 'APP_ROLE', value: 'indexer' }
             // Shared Azure Files volume: index blobs are cached here by ETag so a
             // restart/scale-out re-reads from disk instead of re-downloading them.
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
@@ -996,8 +996,8 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
 // backend-cpu-optimization-2026-09 memory. Isolating this onto its own app
 // also keeps its mutate-everything endpoints off the gallery-facing
 // replica's attack surface.
-resource admin 'Microsoft.App/containerApps@2024-03-01' = {
-  name: adminAppName
+resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
+  name: recoveryAppName
   location: location
   identity: {
     type: 'SystemAssigned'
@@ -1022,14 +1022,14 @@ resource admin 'Microsoft.App/containerApps@2024-03-01' = {
     template: {
       containers: [
         {
-          name: 'admin'
-          image: backendImage
+          name: 'recovery'
+          image: coreImage
           resources: {
             cpu: json('0.5')
             memory: '1Gi'
           }
           env: concat(backendEnv, [
-            { name: 'APP_ROLE', value: 'admin' }
+            { name: 'APP_ROLE', value: 'recovery' }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
@@ -1086,10 +1086,10 @@ resource admin 'Microsoft.App/containerApps@2024-03-01' = {
 // get_person's old path was. Four endpoints with zero callers in the live
 // frontend (list_persons, list_faces, the suggestions pair) were deleted
 // outright rather than carried along, since they were the only genuinely
-// unbounded-by-design reads in this blueprint. 'extras' now carries only
+// unbounded-by-design reads in this blueprint. 'archive' now carries only
 // library/public.
-resource extras 'Microsoft.App/containerApps@2024-03-01' = {
-  name: extrasAppName
+resource archive 'Microsoft.App/containerApps@2024-03-01' = {
+  name: archiveAppName
   location: location
   identity: {
     type: 'SystemAssigned'
@@ -1114,8 +1114,8 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
     template: {
       containers: [
         {
-          name: 'extras'
-          image: backendImage
+          name: 'archive'
+          image: coreImage
           volumeMounts: [
             { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
           ]
@@ -1139,7 +1139,7 @@ resource extras 'Microsoft.App/containerApps@2024-03-01' = {
             memory: '1Gi'
           }
           env: concat(backendEnv, [
-            { name: 'APP_ROLE', value: 'extras' }
+            { name: 'APP_ROLE', value: 'archive' }
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
@@ -1223,7 +1223,7 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'upload'
-          image: backendImage
+          image: coreImage
           resources: {
             cpu: json('0.75')
             memory: '1.5Gi'
@@ -1259,8 +1259,8 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
-resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
-  name: frontendAppName
+resource web 'Microsoft.App/containerApps@2024-03-01' = {
+  name: webAppName
   location: location
   properties: {
     managedEnvironmentId: managedEnvironment.id
@@ -1277,28 +1277,28 @@ resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
     template: {
       containers: [
         {
-          name: 'frontend'
-          image: frontendImage
+          name: 'web'
+          image: webImage
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'
           }
           env: [
-            { name: 'APP_CONFIG_API_BASE_URL', value: 'https://${backend.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_API_BASE_URL', value: 'https://${core.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_UPLOAD_BASE_URL', value: 'https://${upload.properties.configuration.ingress.fqdn}' }
-            { name: 'APP_CONFIG_TOOLS_API_BASE_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
-            { name: 'APP_CONFIG_ADMIN_API_BASE_URL', value: 'https://${admin.properties.configuration.ingress.fqdn}' }
-            { name: 'APP_CONFIG_EXTRAS_API_BASE_URL', value: 'https://${extras.properties.configuration.ingress.fqdn}' }
-            { name: 'APP_CONFIG_SPA_BASE_URL', value: frontendUrl }
+            { name: 'APP_CONFIG_INDEXER_API_BASE_URL', value: 'https://${indexer.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_RECOVERY_API_BASE_URL', value: 'https://${recovery.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_ARCHIVE_API_BASE_URL', value: 'https://${archive.properties.configuration.ingress.fqdn}' }
+            { name: 'APP_CONFIG_SPA_BASE_URL', value: webUrl }
             { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
             // Without this, the frontend's docker-entrypoint.sh defaults
             // processingMode to 'browser' regardless of what this deployment
             // was actually configured with -- caught live: a 'backend'-mode
             // deployment still served env.js with processingMode: "browser",
             // so the browser would have attempted full client-side AI anyway,
-            // defeating the whole point of the mode. deployIpworker/PROCESSING_MODE
-            // (backend container, above) were wired correctly; this was the
-            // missing piece on the frontend side.
+            // defeating the whole point of the mode. deployVision/PROCESSING_MODE
+            // (core container, above) were wired correctly; this was the
+            // missing piece on the web side.
             { name: 'APP_CONFIG_PROCESSING_MODE', value: processingMode }
             { name: 'APP_CONFIG_FACE_API_MODEL_URL', value: '/models/face-api' }
             // Explicit pin, added with the AdaFace swap: docker-entrypoint.sh
@@ -1327,8 +1327,8 @@ resource frontend 'Microsoft.App/containerApps@2024-03-01' = {
 // messages (2025-01-01 API for managed-identity scale rules; the queue itself
 // is created by the backend at startup). An always-on worker polling an almost
 // always-empty queue was the single largest fixed cost in the deployment.
-resource worker 'Microsoft.App/containerApps@2025-01-01' = {
-  name: workerAppName
+resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
+  name: clusterAppName
   location: location
   identity: {
     type: 'SystemAssigned'
@@ -1358,8 +1358,8 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
       terminationGracePeriodSeconds: 600
       containers: [
         {
-          name: 'worker'
-          image: backendImage
+          name: 'cluster'
+          image: coreImage
           // Restore headroom for live FAISS builds and clustering bursts.
           // SQLite and temporary files stay local; SMB holds checkpoints only.
           resources: {
@@ -1371,7 +1371,7 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             { volumeName: 'faiss-checkpoints', mountPath: '/mnt/photostore/faiss-checkpoints' }
           ]
           env: concat(backendEnv, [
-            { name: 'APP_ROLE', value: 'worker' }
+            { name: 'APP_ROLE', value: 'cluster' }
             { name: 'PEOPLE_FAISS_WORK_DIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }
             // Same share the backend/tools mount at /mnt/photostore/shared -- worker builds the
@@ -1445,7 +1445,7 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
         // Live FAISS cannot amortize training if queue lulls destroy its only
         // replica. A replica floor, not merely cooldown, prevents this teardown.
         // It does not prevent deployment/platform/OOM restarts or cache changes.
-        minReplicas: workerMinReplicas
+        minReplicas: clusterMinReplicas
         maxReplicas: 1
         // Relevant only when explicitly opting back into a zero-replica floor.
         cooldownPeriod: 300
@@ -1488,13 +1488,13 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
   ]
 }
 
-// ipworker mirrors the browser's OCR/face/vision/geo pipeline server-side
+// vision mirrors the browser's OCR/face/vision/geo pipeline server-side
 // (see backend/ipwork_*.py) -- only deployed when processingMode says the
-// server should (also) do this work. Modeled directly on `worker` above:
+// server should (also) do this work. Modeled directly on `cluster` above:
 // scales to zero, woken by KEDA when its own queue has messages, its own
-// image (NOT backendImage -- see ipworkerImage's description for why).
-resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker) {
-  name: ipworkerAppName
+// image (NOT coreImage -- see visionImage's description for why).
+resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
+  name: visionAppName
   location: location
   identity: {
     type: 'SystemAssigned'
@@ -1504,8 +1504,8 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
     template: {
       containers: [
         {
-          name: 'ipworker'
-          image: ipworkerImage
+          name: 'vision'
+          image: visionImage
           // Same footprint as worker's 2vCPU/4Gi (see above): a single pass
           // runs YOLO face detection, MediaPipe landmarks, AdaFace embedding,
           // CLIP tagging, and tesseract OCR in sequence for one photo.
@@ -1514,7 +1514,7 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             memory: '4Gi'
           }
           env: concat(backendEnv, [
-            { name: 'APP_ROLE', value: 'ipworker' }
+            { name: 'APP_ROLE', value: 'vision' }
             { name: 'IPWORKER_POLL_SECONDS', value: '2' }
             // How many photos one replica processes concurrently (see
             // IPWORKER_CONCURRENCY in backend/app.py). Was raised live to 3
@@ -1576,13 +1576,13 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
             // a replica only stays up for that rule's 5-minute window, so
             // this only needs to fire once per wake.
             { name: 'IPWORK_SWEEP_INTERVAL_SECONDS', value: '432000' }
-            // Lets the ipworker trigger a derived-index rebuild on the tools
+            // Lets vision trigger a derived-index rebuild on the indexer
             // role (2vCPU/4Gi) when it drains the queue -- and every
             // IPWORKER_INDEX_REBUILD_MILESTONE files on a very large import --
             // via a direct service-to-service POST authenticated with a session
             // token it mints itself (SESSION_SECRET is shared across all
             // roles). See _trigger_tools_index_rebuild in backend/app.py.
-            { name: 'TOOLS_INTERNAL_URL', value: 'https://${tools.properties.configuration.ingress.fqdn}' }
+            { name: 'INDEXER_INTERNAL_URL', value: 'https://${indexer.properties.configuration.ingress.fqdn}' }
           ])
         }
       ]
@@ -1670,53 +1670,53 @@ resource ipworker 'Microsoft.App/containerApps@2025-01-01' = if (deployIpworker)
   }
 }
 
-// Grant the backend and worker managed identities data-plane access to storage.
-resource backendStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+// Grant the core and cluster managed identities data-plane access to storage.
+resource coreStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for roleId in storageRoleIds: {
-    name: guid(storage.id, backend.id, roleId)
+    name: guid(storage.id, core.id, roleId)
     scope: storage
     properties: {
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-      principalId: backend.identity.principalId
+      principalId: core.identity.principalId
       principalType: 'ServicePrincipal'
     }
   }
 ]
 
-resource workerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+resource clusterStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for roleId in storageRoleIds: {
-    name: guid(storage.id, worker.id, roleId)
+    name: guid(storage.id, cluster.id, roleId)
     scope: storage
     properties: {
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-      principalId: worker.identity.principalId
+      principalId: cluster.identity.principalId
       principalType: 'ServicePrincipal'
     }
   }
 ]
 
-resource ipworkerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
-  for roleId in storageRoleIds: if (deployIpworker) {
-    name: guid(storage.id, ipworkerAppName, roleId)
+resource visionStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: if (deployVision) {
+    name: guid(storage.id, visionAppName, roleId)
     scope: storage
     properties: {
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-      // Non-null assertion: this loop shares ipworker's own `deployIpworker`
-      // condition, so ipworker is guaranteed to exist whenever this
+      // Non-null assertion: this loop shares vision's own `deployVision`
+      // condition, so vision is guaranteed to exist whenever this
       // evaluates -- the linter just can't correlate the two `if`s.
-      principalId: ipworker!.identity.principalId
+      principalId: vision!.identity.principalId
       principalType: 'ServicePrincipal'
     }
   }
 ]
 
-resource toolsStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+resource indexerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for roleId in storageRoleIds: {
-    name: guid(storage.id, tools.id, roleId)
+    name: guid(storage.id, indexer.id, roleId)
     scope: storage
     properties: {
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-      principalId: tools.identity.principalId
+      principalId: indexer.identity.principalId
       principalType: 'ServicePrincipal'
     }
   }
@@ -1734,44 +1734,44 @@ resource uploadStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01'
   }
 ]
 
-resource adminStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+resource recoveryStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for roleId in storageRoleIds: {
-    name: guid(storage.id, admin.id, roleId)
+    name: guid(storage.id, recovery.id, roleId)
     scope: storage
     properties: {
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-      principalId: admin.identity.principalId
+      principalId: recovery.identity.principalId
       principalType: 'ServicePrincipal'
     }
   }
 ]
 
-resource extrasStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+resource archiveStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for roleId in storageRoleIds: {
-    name: guid(storage.id, extras.id, roleId)
+    name: guid(storage.id, archive.id, roleId)
     scope: storage
     properties: {
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-      principalId: extras.identity.principalId
+      principalId: archive.identity.principalId
       principalType: 'ServicePrincipal'
     }
   }
 ]
 
 @description('Open this URL in your browser to use Photostore.')
-output appUrl string = frontendUrl
+output appUrl string = webUrl
 
-@description('Backend API URL.')
-output apiUrl string = 'https://${backend.properties.configuration.ingress.fqdn}'
+@description('Core API URL.')
+output apiUrl string = 'https://${core.properties.configuration.ingress.fqdn}'
 
-@description('Tools (workbench action-history) API URL.')
-output toolsUrl string = 'https://${tools.properties.configuration.ingress.fqdn}'
+@description('Indexer (workbench action-history + derived-index builder) API URL.')
+output indexerUrl string = 'https://${indexer.properties.configuration.ingress.fqdn}'
 
 @description('Upload API URL.')
 output uploadUrl string = 'https://${upload.properties.configuration.ingress.fqdn}'
 
-@description('Admin (Tools/Workbench recovery actions) API URL.')
-output adminUrl string = 'https://${admin.properties.configuration.ingress.fqdn}'
+@description('Recovery (Tools/Workbench recovery actions) API URL.')
+output recoveryUrl string = 'https://${recovery.properties.configuration.ingress.fqdn}'
 
-@description('Extras (people/library/public) API URL.')
-output extrasUrl string = 'https://${extras.properties.configuration.ingress.fqdn}'
+@description('Archive (people/library/public) API URL.')
+output archiveUrl string = 'https://${archive.properties.configuration.ingress.fqdn}'

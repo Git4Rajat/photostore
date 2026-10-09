@@ -24,7 +24,7 @@ def explore_summary():
         return error
     summary = app.load_explore_summary(user_id)
     if summary is None:
-        app._trigger_tools_index_rebuild(user_id)
+        app._trigger_indexer_rebuild(user_id)
         return app.jsonify({'places': [], 'things': []})
     return app.jsonify({'places': summary.get('places', []), 'things': summary.get('things', [])})
 

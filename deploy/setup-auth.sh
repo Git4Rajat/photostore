@@ -153,14 +153,14 @@ ok "Signed in — subscription: ${C_BOLD}${SUB_NAME}${C_RESET}, tenant: ${TENANT
 # ---------------------------------------------------------------------------
 step "Locating your Photostore deployment"
 
-FRONTEND_APP="${APP_NAME}-frontend"
-BACKEND_APP="${APP_NAME}-backend"
+WEB_APP="${APP_NAME}-web"
+CORE_APP="${APP_NAME}-core"
 
 if [[ -z "$RESOURCE_GROUP" ]]; then
-  log "Searching for a container app named '${FRONTEND_APP}'…"
-  mapfile -t RGS < <(az containerapp list --query "[?name=='${FRONTEND_APP}'].resourceGroup" -o tsv | sort -u)
+  log "Searching for a container app named '${WEB_APP}'…"
+  mapfile -t RGS < <(az containerapp list --query "[?name=='${WEB_APP}'].resourceGroup" -o tsv | sort -u)
   if (( ${#RGS[@]} == 0 )); then
-    die "No container app named '${FRONTEND_APP}' found in this subscription. Pass --resource-group, or --app-name if you used a different name at deploy time."
+    die "No container app named '${WEB_APP}' found in this subscription. Pass --resource-group, or --app-name if you used a different name at deploy time."
   elif (( ${#RGS[@]} == 1 )); then
     RESOURCE_GROUP="${RGS[0]}"
     ok "Found deployment in resource group: ${C_BOLD}${RESOURCE_GROUP}${C_RESET}"
@@ -175,51 +175,51 @@ if [[ -z "$RESOURCE_GROUP" ]]; then
 fi
 
 # Resolve the public URLs (needed for the SPA redirect URI).
-FRONTEND_FQDN="$(az containerapp show -g "$RESOURCE_GROUP" -n "$FRONTEND_APP" \
+WEB_FQDN="$(az containerapp show -g "$RESOURCE_GROUP" -n "$WEB_APP" \
   --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null || true)"
-BACKEND_FQDN="$(az containerapp show -g "$RESOURCE_GROUP" -n "$BACKEND_APP" \
+CORE_FQDN="$(az containerapp show -g "$RESOURCE_GROUP" -n "$CORE_APP" \
   --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null || true)"
-[[ -n "$FRONTEND_FQDN" ]] || die "Could not find frontend app '${FRONTEND_APP}' in '${RESOURCE_GROUP}'."
-[[ -n "$BACKEND_FQDN"  ]] || die "Could not find backend app '${BACKEND_APP}' in '${RESOURCE_GROUP}'."
+[[ -n "$WEB_FQDN" ]] || die "Could not find frontend app '${WEB_APP}' in '${RESOURCE_GROUP}'."
+[[ -n "$CORE_FQDN"  ]] || die "Could not find backend app '${CORE_APP}' in '${RESOURCE_GROUP}'."
 
-FRONTEND_URL="https://${FRONTEND_FQDN}"
-ok "App URL: ${C_BOLD}${FRONTEND_URL}${C_RESET}"
+WEB_URL="https://${WEB_FQDN}"
+ok "App URL: ${C_BOLD}${WEB_URL}${C_RESET}"
 
 echo
 echo "About to configure Microsoft sign-in for the deployment above:"
 echo "  • create/reuse two app registrations in tenant ${TENANT_ID}"
 echo "  • grant admin consent so the app can sign users in"
-echo "  • turn on required login for '${FRONTEND_APP}' and '${BACKEND_APP}'"
+echo "  • turn on required login for '${WEB_APP}' and '${CORE_APP}'"
 confirm "Proceed?" || die "Cancelled."
 
 # ---------------------------------------------------------------------------
 # Backend API app registration (exposes the API.Writer scope)
 # ---------------------------------------------------------------------------
 step "Backend API app registration"
-BACKEND_DISPLAY="${APP_NAME}-backend-api"
+CORE_DISPLAY="${APP_NAME}-core-api"
 
-BACKEND_APP_ID="$(az ad app list --display-name "$BACKEND_DISPLAY" --query "[0].appId" -o tsv 2>/dev/null || true)"
-if [[ -z "$BACKEND_APP_ID" ]]; then
-  log "Creating '${BACKEND_DISPLAY}'…"
-  BACKEND_APP_ID="$(az ad app create --display-name "$BACKEND_DISPLAY" \
+CORE_APP_ID="$(az ad app list --display-name "$CORE_DISPLAY" --query "[0].appId" -o tsv 2>/dev/null || true)"
+if [[ -z "$CORE_APP_ID" ]]; then
+  log "Creating '${CORE_DISPLAY}'…"
+  CORE_APP_ID="$(az ad app create --display-name "$CORE_DISPLAY" \
     --sign-in-audience AzureADMyOrg --query appId -o tsv)"
-  ok "Created (appId ${BACKEND_APP_ID})"
+  ok "Created (appId ${CORE_APP_ID})"
 else
-  ok "Reusing existing registration (appId ${BACKEND_APP_ID})"
+  ok "Reusing existing registration (appId ${CORE_APP_ID})"
 fi
 
 # Object id is required for Graph PATCH calls.
-BACKEND_OBJ_ID="$(retry 10 3 az ad app show --id "$BACKEND_APP_ID" --query id -o tsv)"
+CORE_OBJ_ID="$(retry 10 3 az ad app show --id "$CORE_APP_ID" --query id -o tsv)"
 
 # Ensure the identifier URI and the API.Writer scope exist (idempotent).
-SCOPE_ID="$(az ad app show --id "$BACKEND_APP_ID" \
+SCOPE_ID="$(az ad app show --id "$CORE_APP_ID" \
   --query "api.oauth2PermissionScopes[?value=='${SCOPE_VALUE}'].id | [0]" -o tsv 2>/dev/null || true)"
 if [[ -z "$SCOPE_ID" ]]; then
   SCOPE_ID="$(new_uuid)"
   log "Exposing API scope '${SCOPE_VALUE}'…"
   BODY="$(cat <<JSON
 {
-  "identifierUris": ["api://${BACKEND_APP_ID}"],
+  "identifierUris": ["api://${CORE_APP_ID}"],
   "api": {
     "oauth2PermissionScopes": [
       {
@@ -237,7 +237,7 @@ if [[ -z "$SCOPE_ID" ]]; then
 }
 JSON
 )"
-  retry 5 3 az rest --method PATCH --url "${GRAPH}/applications/${BACKEND_OBJ_ID}" \
+  retry 5 3 az rest --method PATCH --url "${GRAPH}/applications/${CORE_OBJ_ID}" \
     --headers "Content-Type=application/json" --body "$BODY"
   ok "Scope '${SCOPE_VALUE}' exposed"
 else
@@ -245,9 +245,9 @@ else
 fi
 
 # Service principal for the backend (needed so the grant can reference it).
-if ! az ad sp show --id "$BACKEND_APP_ID" >/dev/null 2>&1; then
+if ! az ad sp show --id "$CORE_APP_ID" >/dev/null 2>&1; then
   log "Creating backend service principal…"
-  retry 5 3 az ad sp create --id "$BACKEND_APP_ID" >/dev/null
+  retry 5 3 az ad sp create --id "$CORE_APP_ID" >/dev/null
 fi
 ok "Backend service principal ready"
 
@@ -255,42 +255,42 @@ ok "Backend service principal ready"
 # Frontend SPA app registration (redirect URI + permission to the backend)
 # ---------------------------------------------------------------------------
 step "Frontend sign-in app registration"
-FRONTEND_DISPLAY="${APP_NAME}-frontend-spa"
+WEB_DISPLAY="${APP_NAME}-web-spa"
 
-FRONTEND_APP_ID="$(az ad app list --display-name "$FRONTEND_DISPLAY" --query "[0].appId" -o tsv 2>/dev/null || true)"
-if [[ -z "$FRONTEND_APP_ID" ]]; then
-  log "Creating '${FRONTEND_DISPLAY}'…"
-  FRONTEND_APP_ID="$(az ad app create --display-name "$FRONTEND_DISPLAY" \
+WEB_APP_ID="$(az ad app list --display-name "$WEB_DISPLAY" --query "[0].appId" -o tsv 2>/dev/null || true)"
+if [[ -z "$WEB_APP_ID" ]]; then
+  log "Creating '${WEB_DISPLAY}'…"
+  WEB_APP_ID="$(az ad app create --display-name "$WEB_DISPLAY" \
     --sign-in-audience AzureADMyOrg --query appId -o tsv)"
-  ok "Created (appId ${FRONTEND_APP_ID})"
+  ok "Created (appId ${WEB_APP_ID})"
 else
-  ok "Reusing existing registration (appId ${FRONTEND_APP_ID})"
+  ok "Reusing existing registration (appId ${WEB_APP_ID})"
 fi
 
-FRONTEND_OBJ_ID="$(retry 10 3 az ad app show --id "$FRONTEND_APP_ID" --query id -o tsv)"
+WEB_OBJ_ID="$(retry 10 3 az ad app show --id "$WEB_APP_ID" --query id -o tsv)"
 
 # Set the SPA redirect URI to this deployment's URL and request the backend scope.
-log "Setting redirect URI to ${FRONTEND_URL} and linking the API permission…"
+log "Setting redirect URI to ${WEB_URL} and linking the API permission…"
 BODY="$(cat <<JSON
 {
-  "spa": { "redirectUris": ["${FRONTEND_URL}"] },
+  "spa": { "redirectUris": ["${WEB_URL}"] },
   "requiredResourceAccess": [
     {
-      "resourceAppId": "${BACKEND_APP_ID}",
+      "resourceAppId": "${CORE_APP_ID}",
       "resourceAccess": [ { "id": "${SCOPE_ID}", "type": "Scope" } ]
     }
   ]
 }
 JSON
 )"
-retry 5 3 az rest --method PATCH --url "${GRAPH}/applications/${FRONTEND_OBJ_ID}" \
+retry 5 3 az rest --method PATCH --url "${GRAPH}/applications/${WEB_OBJ_ID}" \
   --headers "Content-Type=application/json" --body "$BODY"
 ok "Redirect URI and API permission configured"
 
 # Service principal for the frontend.
-if ! az ad sp show --id "$FRONTEND_APP_ID" >/dev/null 2>&1; then
+if ! az ad sp show --id "$WEB_APP_ID" >/dev/null 2>&1; then
   log "Creating frontend service principal…"
-  retry 5 3 az ad sp create --id "$FRONTEND_APP_ID" >/dev/null
+  retry 5 3 az ad sp create --id "$WEB_APP_ID" >/dev/null
 fi
 ok "Frontend service principal ready"
 
@@ -299,11 +299,11 @@ ok "Frontend service principal ready"
 # ---------------------------------------------------------------------------
 step "Granting admin consent"
 log "Consenting the frontend→backend permission for the whole tenant…"
-if retry 8 5 az ad app permission admin-consent --id "$FRONTEND_APP_ID"; then
+if retry 8 5 az ad app permission admin-consent --id "$WEB_APP_ID"; then
   ok "Admin consent granted"
 else
   warn "Automatic admin consent did not complete."
-  warn "Open the Azure portal → Microsoft Entra ID → App registrations → '${FRONTEND_DISPLAY}'"
+  warn "Open the Azure portal → Microsoft Entra ID → App registrations → '${WEB_DISPLAY}'"
   warn "→ API permissions → 'Grant admin consent', then re-run this script."
   die  "Cannot finish without admin consent."
 fi
@@ -312,22 +312,22 @@ fi
 # Point the running app at the new registrations and require login
 # ---------------------------------------------------------------------------
 step "Turning on sign-in for the running app"
-API_SCOPE="${BACKEND_APP_ID}/.default"
+API_SCOPE="${CORE_APP_ID}/.default"
 
-log "Updating backend '${BACKEND_APP}'…"
-az containerapp update -g "$RESOURCE_GROUP" -n "$BACKEND_APP" --set-env-vars \
+log "Updating backend '${CORE_APP}'…"
+az containerapp update -g "$RESOURCE_GROUP" -n "$CORE_APP" --set-env-vars \
   "AUTH_REQUIRED=true" \
   "AUTH_MODE=entra" \
   "AZURE_AD_TENANT_ID=${TENANT_ID}" \
-  "AZURE_AD_CLIENT_ID=${BACKEND_APP_ID}" \
-  "AZURE_AD_API_AUDIENCE=${BACKEND_APP_ID}" >/dev/null
+  "AZURE_AD_CLIENT_ID=${CORE_APP_ID}" \
+  "AZURE_AD_API_AUDIENCE=${CORE_APP_ID}" >/dev/null
 ok "Backend updated"
 
-log "Updating frontend '${FRONTEND_APP}'…"
-az containerapp update -g "$RESOURCE_GROUP" -n "$FRONTEND_APP" --set-env-vars \
+log "Updating frontend '${WEB_APP}'…"
+az containerapp update -g "$RESOURCE_GROUP" -n "$WEB_APP" --set-env-vars \
   "APP_CONFIG_AUTH_MODE=entra" \
   "APP_CONFIG_AZURE_AD_TENANT_ID=${TENANT_ID}" \
-  "APP_CONFIG_AZURE_AD_CLIENT_ID=${FRONTEND_APP_ID}" \
+  "APP_CONFIG_AZURE_AD_CLIENT_ID=${WEB_APP_ID}" \
   "APP_CONFIG_AZURE_AD_API_SCOPE=${API_SCOPE}" >/dev/null
 ok "Frontend updated"
 
@@ -337,13 +337,13 @@ ok "Frontend updated"
 step "${C_GREEN}Sign-in is now enabled 🎉${C_RESET}"
 cat <<EOF
 
-  Open your Photostore:   ${C_BOLD}${FRONTEND_URL}${C_RESET}
+  Open your Photostore:   ${C_BOLD}${WEB_URL}${C_RESET}
 
   You will be asked to sign in with the Microsoft account in tenant
   ${TENANT_ID}. The two app registrations created for you:
 
-    • ${BACKEND_DISPLAY}   (API)      appId ${BACKEND_APP_ID}
-    • ${FRONTEND_DISPLAY}  (sign-in)  appId ${FRONTEND_APP_ID}
+    • ${CORE_DISPLAY}   (API)      appId ${CORE_APP_ID}
+    • ${WEB_DISPLAY}  (sign-in)  appId ${WEB_APP_ID}
 
   It can take a minute for the new revisions to roll out. If the first
   sign-in shows a redirect error, wait ~60s and refresh.

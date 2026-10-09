@@ -1,6 +1,6 @@
-// people_bp moved back to the 'backend' role 2026-10-08 (app.py's
-// APP_ROLE=extras split was undone for people -- see deploy/resources.bicep's
-// 'extras' resource comment) -- plain get/post (API_BASE_URL) now, not
+// people_bp moved back to the 'core' role 2026-10-08 (app.py's
+// APP_ROLE=archive split was undone for people -- see deploy/resources.bicep's
+// 'archive' resource comment) -- plain get/post (API_BASE_URL) now, not
 // getExtras/postExtras.
 import { get, post } from './apiClient';
 

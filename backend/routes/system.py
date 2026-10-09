@@ -52,11 +52,11 @@ def geocode_reverse():
 def performance_throughput():
     return app.jsonify(app._get_throughput_metrics())
 
-# jobs_status moved to routes/tools.py (APP_ROLE=tools) 2026-10-01: polled
+# jobs_status moved to routes/tools.py (APP_ROLE=indexer) 2026-10-01: polled
 # continuously by every session (every ~15-30s, indefinitely), competing with
-# interactive gallery/photo traffic for backend's thin GUNICORN_WORKERS=2/
+# interactive gallery/photo traffic for core's thin GUNICORN_WORKERS=2/
 # THREADS=2 pool -- the same scarce resource the 2026-10-01 crash-loop fix
-# was about. tools has no such contention (no interactive request traffic),
+# was about. indexer has no such contention (no interactive request traffic),
 # so this background polling belongs there instead.
 
 

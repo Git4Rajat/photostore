@@ -571,7 +571,7 @@ def test_real_retry_exhaustion_acks_without_completion_or_milestone(monkeypatch,
     statuses, triggers = [], []
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: statuses.append((a, kw)))
     monkeypatch.setattr(app, '_handle_ipwork_queue_payload', lambda *a: pytest.fail('must not dispatch exhausted job'))
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', triggers.append)
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', triggers.append)
     monkeypatch.setattr(app, 'IPWORKER_INDEX_REBUILD_MILESTONE', 1)
 
     class Queue:

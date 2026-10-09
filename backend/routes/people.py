@@ -122,7 +122,7 @@ def people_page():
             return app.jsonify({'available': True, 'rows': [], 'total': 0, 'offset': 0, 'hasMore': False,
                                 'namedCount': 0, 'unnamedCount': 0, 'libraryTotal': 0})
         try:
-            app._trigger_tools_index_rebuild(user_id, reason='people-index-missing', scope='people')
+            app._trigger_indexer_rebuild(user_id, reason='people-index-missing', scope='people')
         except Exception:
             app.app.logger.warning('Could not request a people index build for %s', user_id, exc_info=True)
         app.app.logger.warning('people_page index-missing for %s (build requested)', user_id)
@@ -652,7 +652,7 @@ def delete_person_cluster(person_id: str):
     # roles cannot rebuild it themselves. Queue the narrow people/albums job
     # now instead of waiting for a later page read to request a full rebuild.
     try:
-        app._trigger_tools_index_rebuild(user_id, reason='person-delete', scope='people')
+        app._trigger_indexer_rebuild(user_id, reason='person-delete', scope='people')
     except Exception:
         app.app.logger.warning('Could not queue People index rebuild after deleting %s', person_id, exc_info=True)
     return app.jsonify({'success': True, 'personId': person_id, **result})
@@ -691,7 +691,7 @@ def delete_person_clusters():
         # One coalesced trigger for the whole request. Large batches must not
         # enqueue one index job per cluster.
         try:
-            app._trigger_tools_index_rebuild(user_id, reason='people-delete', scope='people')
+            app._trigger_indexer_rebuild(user_id, reason='people-delete', scope='people')
         except Exception:
             app.app.logger.warning('Could not queue People index rebuild after batch delete', exc_info=True)
     return app.jsonify({
@@ -723,7 +723,7 @@ def merge_persons(person_id: str):
     except Exception:
         app.app.logger.warning('Could not dirty People index after merge %s', merge_id, exc_info=True)
     try:
-        app._trigger_tools_index_rebuild(user_id, reason='people-merge', scope='people')
+        app._trigger_indexer_rebuild(user_id, reason='people-merge', scope='people')
     except Exception:
         app.app.logger.warning('Could not queue People index rebuild after merge %s', merge_id, exc_info=True)
 
@@ -823,7 +823,7 @@ def merge_persons_batch():
         except Exception:
             app.app.logger.warning('Could not dirty People index after batch merge', exc_info=True)
         try:
-            app._trigger_tools_index_rebuild(user_id, reason='people-merge-batch', scope='people')
+            app._trigger_indexer_rebuild(user_id, reason='people-merge-batch', scope='people')
         except Exception:
             app.app.logger.warning('Could not queue People index rebuild after batch merge', exc_info=True)
 

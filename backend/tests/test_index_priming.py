@@ -500,18 +500,18 @@ def test_ipwork_message_user_id_parses_both_key_spellings():
     assert app._ipwork_message_user_id(_FakeMessage('{}')) == ''
 
 
-def test_trigger_tools_index_rebuild_noop_without_env(monkeypatch):
-    monkeypatch.delenv('TOOLS_INTERNAL_URL', raising=False)
+def test_trigger_indexer_rebuild_noop_without_env(monkeypatch):
+    monkeypatch.delenv('INDEXER_INTERNAL_URL', raising=False)
     started = []
     monkeypatch.setattr(app.threading, 'Thread', lambda *a, **k: started.append((a, k)) or _NoopThread())
 
-    app._trigger_tools_index_rebuild('u1')
+    app._trigger_indexer_rebuild('u1')
 
     assert started == []  # no env -> no thread spawned at all
 
 
-def test_trigger_tools_index_rebuild_posts_with_bearer_token(monkeypatch):
-    monkeypatch.setenv('TOOLS_INTERNAL_URL', 'https://tools.example.invalid')
+def test_trigger_indexer_rebuild_posts_with_bearer_token(monkeypatch):
+    monkeypatch.setenv('INDEXER_INTERNAL_URL', 'https://indexer.example.invalid')
     monkeypatch.setattr(app, '_issue_session_for', lambda uid: f'token-for-{uid}')
 
     captured_fns = []
@@ -528,10 +528,10 @@ def test_trigger_tools_index_rebuild_posts_with_bearer_token(monkeypatch):
     import sys
     monkeypatch.setitem(sys.modules, 'requests', _FakeRequests)
 
-    app._trigger_tools_index_rebuild('u1')
+    app._trigger_indexer_rebuild('u1')
 
     assert len(posts) == 1
-    assert posts[0]['url'] == 'https://tools.example.invalid/api/tools/indexes/build'
+    assert posts[0]['url'] == 'https://indexer.example.invalid/api/tools/indexes/build'
     assert posts[0]['headers']['Authorization'] == 'Bearer token-for-u1'
 
 
@@ -635,13 +635,13 @@ def test_run_index_build_job_marks_failed_and_reraises_for_queue_retry(monkeypat
 
 def test_trigger_prefers_the_queue_over_the_tools_http_path(monkeypatch):
     monkeypatch.setattr(app, 'library_ops_queue_client', _FakeQueue())
-    monkeypatch.setattr(app, '_TOOLS_REBUILD_TRIGGER_LAST', {})
-    monkeypatch.setenv('TOOLS_INTERNAL_URL', 'https://tools.example')
+    monkeypatch.setattr(app, '_INDEXER_REBUILD_TRIGGER_LAST', {})
+    monkeypatch.setenv('INDEXER_INTERNAL_URL', 'https://indexer.example')
     seen = []
     monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': seen.append(uid) or 'queued')
     posted = []
     monkeypatch.setattr('requests.post', lambda *a, **k: posted.append(a))
-    app._trigger_tools_index_rebuild('lib-9')
+    app._trigger_indexer_rebuild('lib-9')
     assert seen == ['lib-9'] and posted == []
 
 

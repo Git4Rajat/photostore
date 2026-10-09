@@ -93,7 +93,7 @@ def test_bulk_delete_route_handles_many_clusters_and_unknown_ids(monkeypatch):
     rebuilds = []
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *args, **kwargs: rebuilds.append((args, kwargs)))
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda *args, **kwargs: rebuilds.append((args, kwargs)))
     with app.app.test_request_context('/api/persons/delete', method='POST', json={'personIds': ['B', 'C', 'B', 'nope']}):
         payload = people.delete_person_clusters().get_json()
     assert sorted(payload['deletedPersonIds'] if 'deletedPersonIds' in payload else payload.get('deleted', [])) == ['B', 'C']
@@ -107,7 +107,7 @@ def test_single_delete_route_triggers_people_index_rebuild(monkeypatch):
     rebuilds = []
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *args, **kwargs: rebuilds.append((args, kwargs)))
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda *args, **kwargs: rebuilds.append((args, kwargs)))
 
     with app.app.test_request_context('/api/persons/B/delete', method='POST'):
         response = people.delete_person_cluster('B')

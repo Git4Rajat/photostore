@@ -39,7 +39,7 @@ param adminPassword string
 ])
 param emailDataLocation string = 'Europe'
 
-@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new ipworker container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running ipworker (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and ipworker both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
+@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new vision container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running vision (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and vision both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
 @allowed([
   'browser'
   'backend'
@@ -47,24 +47,24 @@ param emailDataLocation string = 'Europe'
 ])
 param processingMode string = 'browser'
 
-@description('Public backend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
-param backendImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
+@description('Public core API image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
-@description('Public frontend image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as backendImage above.')
-param frontendImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
+@description('Public web (frontend) image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as coreImage above.')
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 
-@description('Public ipworker image. Only pulled/deployed when processingMode is "backend" or "both". Same :latest-vs-pinned-tag guidance as backendImage applies when upgrading an existing deployment.')
-param ipworkerImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
+@description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Same :latest-vs-pinned-tag guidance as coreImage applies when upgrading an existing deployment.')
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 
-@description('Quota in GiB for the dedicated worker FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
+@description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
 @maxValue(5120)
-param workerFileShareQuotaGiB int = 100
+param clusterFileShareQuotaGiB int = 100
 
-@description('Minimum clustering worker replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
+@description('Minimum clustering replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
 @minValue(0)
 @maxValue(1)
-param workerMinReplicas int = 0
+param clusterMinReplicas int = 0
 
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps console/system logs to. Leave blank (the one-click-deploy default) for no log destination. Required on every redeploy of an EXISTING environment that already has this wired up -- the managedEnvironment resource replaces its properties wholesale, so omitting this on a redeploy silently disconnects logging even if it was set up out-of-band or by a previous deploy.')
 param logAnalyticsWorkspaceName string = ''
@@ -86,11 +86,11 @@ module app 'resources.bicep' = {
     adminPassword: adminPassword
     emailDataLocation: emailDataLocation
     processingMode: processingMode
-    backendImage: backendImage
-    frontendImage: frontendImage
-    ipworkerImage: ipworkerImage
-    workerFileShareQuotaGiB: workerFileShareQuotaGiB
-    workerMinReplicas: workerMinReplicas
+    coreImage: coreImage
+    webImage: webImage
+    visionImage: visionImage
+    clusterFileShareQuotaGiB: clusterFileShareQuotaGiB
+    clusterMinReplicas: clusterMinReplicas
     logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
   }
 }
@@ -98,17 +98,17 @@ module app 'resources.bicep' = {
 @description('URL of the deployed Photostore web app.')
 output appUrl string = app.outputs.appUrl
 
-@description('URL of the backend API.')
+@description('URL of the core API.')
 output apiUrl string = app.outputs.apiUrl
 
-@description('URL of the tools (workbench action-history) API.')
-output toolsUrl string = app.outputs.toolsUrl
+@description('URL of the indexer (workbench action-history + derived-index builder) API.')
+output indexerUrl string = app.outputs.indexerUrl
 
 @description('URL of the upload API.')
 output uploadUrl string = app.outputs.uploadUrl
 
-@description('URL of the admin (Tools/Workbench recovery actions) API.')
-output adminUrl string = app.outputs.adminUrl
+@description('URL of the recovery (Tools/Workbench recovery actions) API.')
+output recoveryUrl string = app.outputs.recoveryUrl
 
-@description('URL of the extras (people/library/public) API.')
-output extrasUrl string = app.outputs.extrasUrl
+@description('URL of the archive (people/library/public) API.')
+output archiveUrl string = app.outputs.archiveUrl

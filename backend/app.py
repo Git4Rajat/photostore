@@ -583,12 +583,12 @@ SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(30 * 24 * 3600)))
 SERVER_SEARCH_ENABLED = os.getenv('SERVER_SEARCH_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 # Base URL of the web app, used to build password-reset links in emails.
 PUBLIC_APP_BASE_URL = os.getenv('PUBLIC_APP_BASE_URL', '').strip() or SPA_BASE_URL
-# Base URL of the 'extras' role (public_bp lives there, not on 'backend' -- see
+# Base URL of the 'archive' role (public_bp lives there, not on 'core' -- see
 # app.py's APP_ROLE registration block), used to build the /public/album/<token>
-# share link returned to the 'backend' role's own album endpoints. Falls back to
+# share link returned to the 'core' role's own album endpoints. Falls back to
 # this process's own host for single-service deployments where APP_ROLE isn't
 # split and public_bp is registered locally.
-EXTRAS_PUBLIC_BASE_URL = os.getenv('EXTRAS_PUBLIC_BASE_URL', '').strip()
+ARCHIVE_PUBLIC_BASE_URL = os.getenv('ARCHIVE_PUBLIC_BASE_URL', '').strip()
 # When false (the default), the unauthenticated `X-User-ID` header is never trusted as
 # an identity. It may only be used as a local development convenience by explicitly
 # opting in AND leaving auth un-enforced. Any enforced deployment ignores it entirely.
@@ -1948,7 +1948,7 @@ def _open_library_db(user_id: str):
         # the manifest must not start a full rebuild (the caller just reports "warming").
         try:
             if search_db.needs_build(user_id):
-                _trigger_tools_index_rebuild(user_id, reason='no-search-db')
+                _trigger_indexer_rebuild(user_id, reason='no-search-db')
         except Exception:
             pass
     return db
@@ -2121,10 +2121,10 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
         # Points at the share page's /public/album/<token> route (not directly
         # at the SPA) so link-preview bots see the album's real name/thumbnail;
         # that page then redirects human visitors into the SPA. That route
-        # lives on the 'extras' role, not this ('backend') role -- see
-        # EXTRAS_PUBLIC_BASE_URL -- so it must not be built from this
+        # lives on the 'archive' role, not this ('core') role -- see
+        # ARCHIVE_PUBLIC_BASE_URL -- so it must not be built from this
         # process's own request.host_url.
-        base = EXTRAS_PUBLIC_BASE_URL or request.host_url.rstrip('/')
+        base = ARCHIVE_PUBLIC_BASE_URL or request.host_url.rstrip('/')
         public_url = f"{base.rstrip('/')}/public/album/{token}"
     deleted_at = str(entity.get('deletedAt') or '')
     payload = {
@@ -12108,7 +12108,7 @@ def _soft_delete_photos_now(
         except Exception:
             pass
         try:
-            _trigger_tools_index_rebuild(user_id, reason='photo-delete', scope='people')
+            _trigger_indexer_rebuild(user_id, reason='photo-delete', scope='people')
         except Exception:
             app.logger.warning('Could not trigger People index rebuild after photo delete for %s', user_id, exc_info=True)
     return {'deleted': deleted, 'errors': errors, 'success': bool(deleted)}
@@ -13532,7 +13532,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         # A clustering run changes people/albums; this (not an upload) is what
         # makes the heavy indexes worth rebuilding.
         try:
-            _trigger_tools_index_rebuild(user_id, reason='clustering-run', scope='people')
+            _trigger_indexer_rebuild(user_id, reason='clustering-run', scope='people')
         except Exception:
             worker_logger.exception('Post-clustering index rebuild trigger failed for %s', user_id)
 
@@ -14825,51 +14825,51 @@ def _ipwork_message_user_id(message) -> str:
     return ''
 
 
-_TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS = float(os.getenv('TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS', '30'))
-_TOOLS_REBUILD_TRIGGER_LAST: Dict[str, float] = {}
-_TOOLS_REBUILD_TRIGGER_LOCK = threading.Lock()
+_INDEXER_REBUILD_TRIGGER_COOLDOWN_SECONDS = float(os.getenv('INDEXER_REBUILD_TRIGGER_COOLDOWN_SECONDS', '30'))
+_INDEXER_REBUILD_TRIGGER_LAST: Dict[str, float] = {}
+_INDEXER_REBUILD_TRIGGER_LOCK = threading.Lock()
 
 
-def _trigger_tools_index_rebuild(user_id: str, reason: str = 'trigger', scope: str = 'full') -> None:
-    """Ask the `tools` role (2vCPU/4Gi) to rebuild this user's derived indexes.
+def _trigger_indexer_rebuild(user_id: str, reason: str = 'trigger', scope: str = 'full') -> None:
+    """Ask the `indexer` role (2vCPU/4Gi) to rebuild this user's derived indexes.
 
     Direct service-to-service HTTP: the caller mints a normal session token for
     the user (SESSION_SECRET is a shared secret across all container-app roles,
-    so tools validates it through its usual _require_user_id) and POSTs the same
+    so indexer validates it through its usual _require_user_id) and POSTs the same
     /api/tools/indexes/build the frontend uses. Fire-and-forget from THIS
-    caller's point of view -- it runs on its own daemon thread so ipworker/
-    backend never block on it -- but the POST itself now blocks until tools
+    caller's point of view -- it runs on its own daemon thread so vision/
+    core never block on it -- but the POST itself now blocks until indexer
     finishes the build (see prime_all_user_indexes_sequentially's wait=True),
     so the timeout here has to cover a full build, not just a request
-    round-trip; tools' own single-flight prime lock + the index_build job row
-    dedupe overlapping triggers. No-op (silent) when TOOLS_INTERNAL_URL is
-    unset, so envs with no tools rebuild wiring are unaffected.
+    round-trip; indexer's own single-flight prime lock + the index_build job row
+    dedupe overlapping triggers. No-op (silent) when INDEXER_INTERNAL_URL is
+    unset, so envs with no indexer rebuild wiring are unaffected.
 
-    Callers: ipworker (queue-drain / every 10k files) and the backend's
+    Callers: vision (queue-drain / every 10k files) and the core API's
     search-index/sort-index SAS-mint routes when they observe a dirty manifest
     (replacing the per-GET background rebuild backend used to run in-process).
     A short per-user cooldown keeps the every-~15s search-index poll from firing
     a trigger on every request while an index sits dirty waiting to rebuild."""
-    tools_url = os.getenv('TOOLS_INTERNAL_URL', '').strip()
+    indexer_url = os.getenv('INDEXER_INTERNAL_URL', '').strip()
     key = str(user_id or '').strip()
-    if not key or (not tools_url and library_ops_queue_client is None):
+    if not key or (not indexer_url and library_ops_queue_client is None):
         return
     now = time.monotonic()
     cooldown_key = f'{key}|{scope}'   # a light trigger must not swallow a people/full one
-    with _TOOLS_REBUILD_TRIGGER_LOCK:
-        last = _TOOLS_REBUILD_TRIGGER_LAST.get(cooldown_key)
-        if last is not None and (now - last) < _TOOLS_REBUILD_TRIGGER_COOLDOWN_SECONDS:
+    with _INDEXER_REBUILD_TRIGGER_LOCK:
+        last = _INDEXER_REBUILD_TRIGGER_LAST.get(cooldown_key)
+        if last is not None and (now - last) < _INDEXER_REBUILD_TRIGGER_COOLDOWN_SECONDS:
             return
-        _TOOLS_REBUILD_TRIGGER_LAST[cooldown_key] = now
+        _INDEXER_REBUILD_TRIGGER_LAST[cooldown_key] = now
     # Preferred: queue the build on the worker (see enqueue_index_build). The
-    # tools HTTP path below is only the fallback when no queue is configured.
+    # indexer HTTP path below is only the fallback when no queue is configured.
     if library_ops_queue_client is not None:
         try:
             if enqueue_index_build(key, reason=reason, scope=scope) != 'unavailable':
                 return
         except Exception:
             worker_logger.exception('Failed to enqueue index build for %s', key)
-    if not tools_url:
+    if not indexer_url:
         return
 
     def _fire() -> None:
@@ -14877,13 +14877,13 @@ def _trigger_tools_index_rebuild(user_id: str, reason: str = 'trigger', scope: s
             import requests
             token = _issue_session_for(key)
             requests.post(
-                f"{tools_url.rstrip('/')}/api/tools/indexes/build",
+                f"{indexer_url.rstrip('/')}/api/tools/indexes/build",
                 json={'scope': scope, 'reason': reason},
                 headers={'Authorization': f'Bearer {token}'},
-                timeout=float(os.getenv('TOOLS_INDEX_REBUILD_TIMEOUT_SECONDS', '600')),
+                timeout=float(os.getenv('INDEXER_INDEX_REBUILD_TIMEOUT_SECONDS', '600')),
             )
         except Exception:
-            worker_logger.exception('Failed to trigger tools index rebuild for %s', key)
+            worker_logger.exception('Failed to trigger indexer index rebuild for %s', key)
 
     threading.Thread(target=_fire, name='index-rebuild-trigger', daemon=True).start()
 
@@ -15207,7 +15207,7 @@ def run_ipworker() -> None:
                     if processed_by_user:
                         for uid, count in list(processed_by_user.items()):
                             if count > 0:
-                                _trigger_tools_index_rebuild(uid, reason="ipworker", scope="light")
+                                _trigger_indexer_rebuild(uid, reason="ipworker", scope="light")
                         processed_by_user.clear()
                     if shutdown_requested.is_set():
                         break
@@ -15278,7 +15278,7 @@ def run_ipworker() -> None:
                         if uid:
                             processed_by_user[uid] = processed_by_user.get(uid, 0) + 1
                             if processed_by_user[uid] >= IPWORKER_INDEX_REBUILD_MILESTONE:
-                                _trigger_tools_index_rebuild(uid, reason="ipworker", scope="light")
+                                _trigger_indexer_rebuild(uid, reason="ipworker", scope="light")
                                 processed_by_user[uid] = 0
                     ack_started = time.monotonic()
                     try:
@@ -15360,38 +15360,38 @@ from routes.suggestions import suggestions_bp
 
 # 2026-09-15: service splits, following the modularity work above. Each
 # split group is registered on its own dedicated container app instead of
-# here, so it can be sized/scaled independently of the core backend's own
+# here, so it can be sized/scaled independently of the core API's own
 # traffic pattern -- see backend-cpu-optimization-2026-09 memory's coupling
-# map for why tools (workbench action-history logging) and upload were the
-# two chosen: tools has zero shared-cache dependency, and upload's few
+# map for why indexer (workbench action-history logging) and upload were the
+# two chosen: indexer has zero shared-cache dependency, and upload's few
 # touches (app._invalidate_metadata_scan_cache) only ever invalidate the
 # calling process's OWN in-memory cache regardless of which role runs it --
 # see _UserScanCache's docstring for why that per-process staleness bound
 # was judged an already-accepted risk, not a new one, before this split.
 # entrypoint.sh needs no change for either: any role other than
-# 'worker'/'ipworker' already falls through to gunicorn, so a dedicated
+# 'cluster'/'vision' already falls through to gunicorn, so a dedicated
 # container just runs this same image with a different APP_ROLE.
-_app_role = os.getenv('APP_ROLE', 'backend').strip().lower() or 'backend'
-if _app_role == 'tools':
+_app_role = os.getenv('APP_ROLE', 'core').strip().lower() or 'core'
+if _app_role == 'indexer':
     app.register_blueprint(tools_bp)
 elif _app_role == 'upload':
     app.register_blueprint(upload_bp)
-elif _app_role == 'admin':
+elif _app_role == 'recovery':
     # Isolated on its own container (2026-09-16, same reasoning as
-    # tools/upload above): admin's own routes now only ever enqueue to the
+    # indexer/upload above): recovery's own routes now only ever enqueue to the
     # clustering worker (see _enqueue_admin_repair_job) rather than running
     # full-account scans inline, so there's no shared-cache coupling
-    # blocking the split -- and unlike tools/upload, isolating admin also
+    # blocking the split -- and unlike indexer/upload, isolating recovery also
     # keeps its mutate-everything endpoints (recluster, dedupe, purge,
     # backfill) off the gallery-facing replica's attack surface even if
     # auth were ever bypassed there.
     app.register_blueprint(admin_bp)
-elif _app_role == 'extras':
-    # 2026-09-17: library/public split off the core 'backend' role so backend
+elif _app_role == 'archive':
+    # 2026-09-17: library/public split off the core role so core
     # itself can shrink to a 0.5vCPU/1Gi tier sized for just the everyday
     # gallery loop. These two carry the heavier secondary features (library
     # export/clean orchestration and public share-link media streaming) that
-    # day-to-day browsing doesn't touch. people_bp moved back to 'backend'
+    # day-to-day browsing doesn't touch. people_bp moved back to 'core'
     # (2026-10-08) once its one request-path full-account scan (get_person's
     # old call into _load_user_face_summary_by_id) was replaced with a
     # bounded fetch scoped to each person's own faceIds (_load_face_rows_by_ids)
@@ -15403,17 +15403,17 @@ elif _app_role == 'extras':
     for _bp in (library_bp, public_bp):
         app.register_blueprint(_bp)
 else:
-    # system_bp stays here rather than moving to 'extras' -- it's negligible
+    # system_bp stays here rather than moving to 'archive' -- it's negligible
     # weight (a handful of point lookups, including /health) and Container
     # Apps' default TCP probe doesn't need it, but losing a friendly
-    # same-origin /health on backend specifically wasn't worth it for zero
+    # same-origin /health on core specifically wasn't worth it for zero
     # real memory/CPU savings. people_bp joined this role 2026-10-08 (see the
-    # 'extras' branch's comment above).
+    # 'archive' branch's comment above).
     for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp):
         app.register_blueprint(_bp)
 
-# Every role answers /health (system_bp only exists on the backend role; upload has its own), so the
-# browser's warm-up probe and any manual check never see a 404 from extras/tools/admin.
+# Every role answers /health (system_bp only exists on the core role; upload has its own), so the
+# browser's warm-up probe and any manual check never see a 404 from archive/indexer/recovery.
 if not any(rule.rule == '/health' for rule in app.url_map.iter_rules()):
     @app.route('/health', methods=['GET'])
     def _role_health():

@@ -18,24 +18,24 @@ const uploadUrl =
     env.VITE_UPLOAD_BASE_URL ||
     env.REACT_APP_UPLOAD_BASE_URL ||
     apiUrl;
-// Falls back to apiUrl when no dedicated tools container app is deployed for
-// this environment -- see routes/tools.py's APP_ROLE=tools split.
-const toolsUrl =
-    runtimeConfig.toolsApiBaseUrl ||
-    env.VITE_TOOLS_API_BASE_URL ||
-    env.REACT_APP_TOOLS_API_BASE_URL ||
+// Falls back to apiUrl when no dedicated indexer container app is deployed for
+// this environment -- see routes/tools.py's APP_ROLE=indexer split.
+const indexerUrl =
+    runtimeConfig.indexerApiBaseUrl ||
+    env.VITE_INDEXER_API_BASE_URL ||
+    env.REACT_APP_INDEXER_API_BASE_URL ||
     apiUrl;
-// Same fallback pattern as toolsUrl -- see routes/admin.py's APP_ROLE=admin split.
-const adminUrl =
-    runtimeConfig.adminApiBaseUrl ||
-    env.VITE_ADMIN_API_BASE_URL ||
-    env.REACT_APP_ADMIN_API_BASE_URL ||
+// Same fallback pattern as indexerUrl -- see routes/admin.py's APP_ROLE=recovery split.
+const recoveryUrl =
+    runtimeConfig.recoveryApiBaseUrl ||
+    env.VITE_RECOVERY_API_BASE_URL ||
+    env.REACT_APP_RECOVERY_API_BASE_URL ||
     apiUrl;
-// Same fallback pattern as toolsUrl -- see routes/people.py|library.py|public.py's APP_ROLE=extras split.
-const extrasUrl =
-    runtimeConfig.extrasApiBaseUrl ||
-    env.VITE_EXTRAS_API_BASE_URL ||
-    env.REACT_APP_EXTRAS_API_BASE_URL ||
+// Same fallback pattern as indexerUrl -- see routes/people.py|library.py|public.py's APP_ROLE=archive split.
+const archiveUrl =
+    runtimeConfig.archiveApiBaseUrl ||
+    env.VITE_ARCHIVE_API_BASE_URL ||
+    env.REACT_APP_ARCHIVE_API_BASE_URL ||
     apiUrl;
 
 if (!apiUrl && import.meta.env.MODE !== 'development') {
@@ -46,23 +46,23 @@ if (!apiUrl && import.meta.env.MODE !== 'development') {
 
 const API_BASE_URL = apiUrl || '';
 const UPLOAD_BASE_URL = uploadUrl || '';
-const TOOLS_BASE_URL = toolsUrl || '';
-const ADMIN_BASE_URL = adminUrl || '';
-const EXTRAS_BASE_URL = extrasUrl || '';
+const INDEXER_BASE_URL = indexerUrl || '';
+const RECOVERY_BASE_URL = recoveryUrl || '';
+const ARCHIVE_BASE_URL = archiveUrl || '';
 
-// Path prefixes exclusively owned by the `extras` container app (library,
-// public share-link routes -- see library.py|public.py's APP_ROLE=extras
+// Path prefixes exclusively owned by the `archive` container app (library,
+// public share-link routes -- see library.py|public.py's APP_ROLE=archive
 // split). resolveApiUrl uses this so callers that already have a raw path
 // (e.g. a public album's thumbnail URL) resolve to the right origin without
 // every call site having to know which service serves which prefix.
 //
 // people/faces ('/api/persons', '/api/faces', '/api/people', '/persons',
 // '/people') moved off this list 2026-10-08 -- routes/people.py's
-// APP_ROLE=extras split was undone (people_bp moved back to 'backend'), so
+// APP_ROLE=archive split was undone (people_bp moved back to 'core'), so
 // those paths now resolve to API_BASE_URL via the plain get/post, not
-// getExtras/postExtras. See faceService.ts, store.tsx, localPeopleIndex.ts,
-// faceMediaCache.ts for the call sites that switched off getExtras/postExtras.
-const EXTRAS_PATH_PREFIXES = ['/api/library', '/public', '/api/public'];
+// getArchive/postArchive. See faceService.ts, store.tsx, localPeopleIndex.ts,
+// faceMediaCache.ts for the call sites that switched off getArchive/postArchive.
+const ARCHIVE_PATH_PREFIXES = ['/api/library', '/public', '/api/public'];
 
 export const resolveApiUrl = (url?: string): string => {
     if (!url) {
@@ -72,7 +72,7 @@ export const resolveApiUrl = (url?: string): string => {
         return url;
     }
     const normalized = url.startsWith('/') ? url : `/${url}`;
-    const base = EXTRAS_PATH_PREFIXES.some((prefix) => normalized.startsWith(prefix)) ? EXTRAS_BASE_URL : API_BASE_URL;
+    const base = ARCHIVE_PATH_PREFIXES.some((prefix) => normalized.startsWith(prefix)) ? ARCHIVE_BASE_URL : API_BASE_URL;
     if (!base) {
         return url;
     }
@@ -81,9 +81,9 @@ export const resolveApiUrl = (url?: string): string => {
 
 const apiClient = createHttpClient(API_BASE_URL);
 const uploadClient = createHttpClient(UPLOAD_BASE_URL);
-const toolsClient = createHttpClient(TOOLS_BASE_URL);
-const adminClient = createHttpClient(ADMIN_BASE_URL);
-const extrasClient = createHttpClient(EXTRAS_BASE_URL);
+const indexerClient = createHttpClient(INDEXER_BASE_URL);
+const recoveryClient = createHttpClient(RECOVERY_BASE_URL);
+const archiveClient = createHttpClient(ARCHIVE_BASE_URL);
 
 // Give the app-wide availability tracker the absolute /health URL so its
 // recovery probes hit the API origin (not the SPA origin) when a base URL is
@@ -94,10 +94,10 @@ configureBackendStatus({ healthUrl: resolveApiUrl('health') });
 const LOCAL_USER_KEY = 'photostore.localUserId';
 
 const setDefaultHeader = (userId: string | null) => {
-    // apiClient/toolsClient/adminClient/extrasClient, matching the existing
-    // (pre-tools-split) behavior of leaving uploadClient out of this -- not
-    // touching that here, unrelated to the tools/admin/extras splits.
-    for (const client of [apiClient, toolsClient, adminClient, extrasClient]) {
+    // apiClient/indexerClient/recoveryClient/archiveClient, matching the existing
+    // (pre-indexer-split) behavior of leaving uploadClient out of this -- not
+    // touching that here, unrelated to the indexer/recovery/archive splits.
+    for (const client of [apiClient, indexerClient, recoveryClient, archiveClient]) {
         const headers = client.defaults.headers as Record<string, string | undefined>;
         if (userId) {
             headers['X-User-ID'] = userId;
@@ -150,9 +150,9 @@ export const post = async <T = any, D = unknown>(url: string, data: D, config?: 
 export const postUpload = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
 export const getUploadJson = async <T = any>(url: string) => requestJson<T>(uploadClient, 'get', url);
 export const postUploadJson = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
-export const getTools = async <T = any>(url: string, config?: Parameters<typeof toolsClient.get>[1]) => requestJson<T>(toolsClient, 'get', url, undefined, config);
-export const postTools = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(toolsClient, 'post', url, data);
-export const getAdmin = async <T = any>(url: string, config?: Parameters<typeof adminClient.get>[1]) => requestJson<T>(adminClient, 'get', url, undefined, config);
-export const postAdmin = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(adminClient, 'post', url, data);
-export const getExtras = async <T = any>(url: string, config?: Parameters<typeof extrasClient.get>[1]) => requestJson<T>(extrasClient, 'get', url, undefined, config);
-export const postExtras = async <T = any, D = unknown>(url: string, data: D, config?: Parameters<typeof extrasClient.post>[2]) => requestJson<T>(extrasClient, 'post', url, data, config);
+export const getTools = async <T = any>(url: string, config?: Parameters<typeof indexerClient.get>[1]) => requestJson<T>(indexerClient, 'get', url, undefined, config);
+export const postTools = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(indexerClient, 'post', url, data);
+export const getAdmin = async <T = any>(url: string, config?: Parameters<typeof recoveryClient.get>[1]) => requestJson<T>(recoveryClient, 'get', url, undefined, config);
+export const postAdmin = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(recoveryClient, 'post', url, data);
+export const getExtras = async <T = any>(url: string, config?: Parameters<typeof archiveClient.get>[1]) => requestJson<T>(archiveClient, 'get', url, undefined, config);
+export const postExtras = async <T = any, D = unknown>(url: string, data: D, config?: Parameters<typeof archiveClient.post>[2]) => requestJson<T>(archiveClient, 'post', url, data, config);

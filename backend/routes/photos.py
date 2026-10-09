@@ -166,14 +166,14 @@ def photo_access_url_batch():
         metadata_map.update(found)
         try:
             if app.access_index_is_dirty(user_id):
-                app._trigger_tools_index_rebuild(user_id, reason='access-dirty', scope='light')  # sort/access only; never this process
+                app._trigger_indexer_rebuild(user_id, reason='access-dirty', scope='light')  # sort/access only; never this process
         except Exception:
             pass
     else:
         # No access index yet: have the worker build it (sort/access only -- not the whole
         # library); this call uses the per-filename fallback below.
         try:
-            app._trigger_tools_index_rebuild(user_id, reason='no-access-index', scope='light')
+            app._trigger_indexer_rebuild(user_id, reason='no-access-index', scope='light')
         except Exception:
             pass
 
@@ -767,7 +767,7 @@ def photos_timeline():
         summary = storage_utils.load_timeline_summary(user_id)
     if summary is None:
         try:
-            app._trigger_tools_index_rebuild(user_id)
+            app._trigger_indexer_rebuild(user_id)
         except Exception:
             pass
         return app.jsonify(app.build_timeline_summary([]))
@@ -904,7 +904,7 @@ def search_photos():
         # No current search database yet (new library / first deploy): have tools
         # build it and tell the client, instead of scanning the library here.
         if search_db.needs_build(user_id):
-            app._trigger_tools_index_rebuild(user_id, reason='no-search-db')
+            app._trigger_indexer_rebuild(user_id, reason='no-search-db')
         return app.jsonify({'photos': [], 'total': 0, 'searchIndexBuilding': True})
 
     pid_to_name, name_to_ids = app._load_people_name_index(user_id)
@@ -1069,7 +1069,7 @@ def photos_sort_index():
     if sort_summary.get('row_count', 0) > SORT_INDEX_CLIENT_MAX_ROWS:
         return app.jsonify({'available': False, 'reason': 'library_too_large', 'rowCount': sort_summary['row_count']})
     if sort_summary.get('dirty'):
-        app._trigger_tools_index_rebuild(user_id, reason='sort-dirty', scope='light')
+        app._trigger_indexer_rebuild(user_id, reason='sort-dirty', scope='light')
     try:
         container_name, blob_name = app.get_sort_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
@@ -1340,7 +1340,7 @@ def restore_trashed_photos():
         except Exception:
             pass
         try:
-            app._trigger_tools_index_rebuild(user_id, reason='photo-restore', scope='people')
+            app._trigger_indexer_rebuild(user_id, reason='photo-restore', scope='people')
         except Exception:
             app.app.logger.warning('Could not trigger People index rebuild after photo restore for %s', user_id, exc_info=True)
 
@@ -1385,7 +1385,7 @@ def restore_all_trashed_photos():
         except Exception:
             pass
         try:
-            app._trigger_tools_index_rebuild(user_id, reason='photo-restore-all', scope='people')
+            app._trigger_indexer_rebuild(user_id, reason='photo-restore-all', scope='people')
         except Exception:
             app.app.logger.warning('Could not trigger People index rebuild after restoring trash for %s', user_id, exc_info=True)
 

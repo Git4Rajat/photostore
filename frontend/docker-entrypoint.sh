@@ -4,15 +4,15 @@ set -eu
 API_BASE_URL="${APP_CONFIG_API_BASE_URL:-}"
 UPLOAD_BASE_URL="${APP_CONFIG_UPLOAD_BASE_URL:-$API_BASE_URL}"
 # Falls back to the main API origin so environments without a dedicated
-# tools container app (not every deploy has one) keep working unchanged --
-# see deploy/resources.bicep's `tools` containerApp resource.
-TOOLS_API_BASE_URL="${APP_CONFIG_TOOLS_API_BASE_URL:-$API_BASE_URL}"
-# Same fallback pattern as TOOLS_API_BASE_URL -- see deploy/resources.bicep's
-# `admin` containerApp resource.
-ADMIN_API_BASE_URL="${APP_CONFIG_ADMIN_API_BASE_URL:-$API_BASE_URL}"
-# Same fallback pattern as TOOLS_API_BASE_URL -- see deploy/resources.bicep's
-# `extras` containerApp resource (people/faces, library, public share links).
-EXTRAS_API_BASE_URL="${APP_CONFIG_EXTRAS_API_BASE_URL:-$API_BASE_URL}"
+# indexer container app (not every deploy has one) keep working unchanged --
+# see deploy/resources.bicep's `indexer` containerApp resource.
+INDEXER_API_BASE_URL="${APP_CONFIG_INDEXER_API_BASE_URL:-$API_BASE_URL}"
+# Same fallback pattern as INDEXER_API_BASE_URL -- see deploy/resources.bicep's
+# `recovery` containerApp resource.
+RECOVERY_API_BASE_URL="${APP_CONFIG_RECOVERY_API_BASE_URL:-$API_BASE_URL}"
+# Same fallback pattern as INDEXER_API_BASE_URL -- see deploy/resources.bicep's
+# `archive` containerApp resource (people/faces, library, public share links).
+ARCHIVE_API_BASE_URL="${APP_CONFIG_ARCHIVE_API_BASE_URL:-$API_BASE_URL}"
 SPA_BASE_URL="${APP_CONFIG_SPA_BASE_URL:-}"
 AZURE_AD_TENANT_ID="${APP_CONFIG_AZURE_AD_TENANT_ID:-}"
 AZURE_AD_CLIENT_ID="${APP_CONFIG_AZURE_AD_CLIENT_ID:-}"
@@ -38,9 +38,9 @@ cat > /usr/share/nginx/html/env.js <<EOF
 window.__APP_CONFIG__ = {
 	  apiBaseUrl: "${API_BASE_URL}",
 	  uploadBaseUrl: "${UPLOAD_BASE_URL}",
-	  toolsApiBaseUrl: "${TOOLS_API_BASE_URL}",
-	  adminApiBaseUrl: "${ADMIN_API_BASE_URL}",
-	  extrasApiBaseUrl: "${EXTRAS_API_BASE_URL}",
+	  indexerApiBaseUrl: "${INDEXER_API_BASE_URL}",
+	  recoveryApiBaseUrl: "${RECOVERY_API_BASE_URL}",
+	  archiveApiBaseUrl: "${ARCHIVE_API_BASE_URL}",
 	  spaBaseUrl: "${SPA_BASE_URL}",
   azureAdTenantId: "${AZURE_AD_TENANT_ID}",
   azureAdClientId: "${AZURE_AD_CLIENT_ID}",
@@ -78,42 +78,42 @@ CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://te
 if [ -n "$API_BASE_URL" ]; then
   CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
 fi
-# TOOLS_API_BASE_URL/UPLOAD_BASE_URL both fall back to API_BASE_URL above
+# INDEXER_API_BASE_URL/UPLOAD_BASE_URL both fall back to API_BASE_URL above
 # when no dedicated container app is deployed for that path, so this is a
 # no-op duplicate origin in that case rather than a second one to add --
 # only append when actually different. UPLOAD_BASE_URL was a real,
-# pre-existing gap here (not just a new one from the tools split): it's been
+# pre-existing gap here (not just a new one from the indexer split): it's been
 # a separately-configurable origin since uploadClient was introduced, just
 # never actually different from API_BASE_URL in any deployment until the
 # upload service split, so this bug was latent rather than never possible.
-if [ -n "$TOOLS_API_BASE_URL" ] && [ "$TOOLS_API_BASE_URL" != "$API_BASE_URL" ]; then
-  CONNECT_SRC="${CONNECT_SRC} ${TOOLS_API_BASE_URL}"
+if [ -n "$INDEXER_API_BASE_URL" ] && [ "$INDEXER_API_BASE_URL" != "$API_BASE_URL" ]; then
+  CONNECT_SRC="${CONNECT_SRC} ${INDEXER_API_BASE_URL}"
 fi
 if [ -n "$UPLOAD_BASE_URL" ] && [ "$UPLOAD_BASE_URL" != "$API_BASE_URL" ]; then
   CONNECT_SRC="${CONNECT_SRC} ${UPLOAD_BASE_URL}"
 fi
-if [ -n "$ADMIN_API_BASE_URL" ] && [ "$ADMIN_API_BASE_URL" != "$API_BASE_URL" ]; then
-  CONNECT_SRC="${CONNECT_SRC} ${ADMIN_API_BASE_URL}"
+if [ -n "$RECOVERY_API_BASE_URL" ] && [ "$RECOVERY_API_BASE_URL" != "$API_BASE_URL" ]; then
+  CONNECT_SRC="${CONNECT_SRC} ${RECOVERY_API_BASE_URL}"
 fi
-if [ -n "$EXTRAS_API_BASE_URL" ] && [ "$EXTRAS_API_BASE_URL" != "$API_BASE_URL" ]; then
-  CONNECT_SRC="${CONNECT_SRC} ${EXTRAS_API_BASE_URL}"
+if [ -n "$ARCHIVE_API_BASE_URL" ] && [ "$ARCHIVE_API_BASE_URL" != "$API_BASE_URL" ]; then
+  CONNECT_SRC="${CONNECT_SRC} ${ARCHIVE_API_BASE_URL}"
 fi
 
 # img-src needs the same backend origins as connect-src: PublicAlbumPage's
 # unauthenticated <img> tags (useProtectedMedia=false, so no fetch+blob
 # indirection) point straight at proxy routes like
-# /public/photos/<token>/preview|thumbnail|image/<filename> on the 'extras'
+# /public/photos/<token>/preview|thumbnail|image/<filename> on the 'archive'
 # role, not just Azure Blob Storage SAS URLs -- confirmed via a live browser
-# console capture showing "img-src" CSP violations on every extras-hosted
+# console capture showing "img-src" CSP violations on every archive-hosted
 # preview once the universal-preview-tier feature made previewUrl point at
-# extras instead of always resolving to a SAS URL. Built the same
+# archive instead of always resolving to a SAS URL. Built the same
 # only-if-different way as CONNECT_SRC above.
 IMG_SRC="'self' data: blob: https://*.blob.core.windows.net"
 if [ -n "$API_BASE_URL" ]; then
   IMG_SRC="${IMG_SRC} ${API_BASE_URL}"
 fi
-if [ -n "$EXTRAS_API_BASE_URL" ] && [ "$EXTRAS_API_BASE_URL" != "$API_BASE_URL" ]; then
-  IMG_SRC="${IMG_SRC} ${EXTRAS_API_BASE_URL}"
+if [ -n "$ARCHIVE_API_BASE_URL" ] && [ "$ARCHIVE_API_BASE_URL" != "$API_BASE_URL" ]; then
+  IMG_SRC="${IMG_SRC} ${ARCHIVE_API_BASE_URL}"
 fi
 
 cat > /etc/nginx/csp.conf <<EOF

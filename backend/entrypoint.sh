@@ -1,15 +1,15 @@
 #!/bin/bash
 set -e
 
-ROLE="${APP_ROLE:-backend}"
+ROLE="${APP_ROLE:-core}"
 
-if [ "${ROLE}" = "worker" ]; then
+if [ "${ROLE}" = "cluster" ]; then
     echo "Starting clustering worker..."
     exec python -u -c "import app; app.run_clustering_worker()"
 fi
 
-if [ "${ROLE}" = "ipworker" ]; then
-    echo "Starting ipworker..."
+if [ "${ROLE}" = "vision" ]; then
+    echo "Starting vision worker..."
     # tesserocr (ipwork_ocr.py) needs TESSDATA_PREFIX explicitly -- unlike
     # the tesseract CLI binary pytesseract used to shell out to, the
     # in-process libtesseract tesserocr links against does not reliably
@@ -25,7 +25,7 @@ if [ "${ROLE}" = "ipworker" ]; then
     exec python -u -c "import app; app.run_ipworker()"
 fi
 
-echo "Starting Flask backend with gunicorn..."
+echo "Starting Flask app with gunicorn..."
 # Use GUNICORN_WORKERS env var if set, otherwise default to 1
 WORKERS="${GUNICORN_WORKERS:-1}"
 # Threaded workers: the app is I/O-bound (table/blob storage round-trips), and a

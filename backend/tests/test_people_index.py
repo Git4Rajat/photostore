@@ -266,7 +266,7 @@ def test_people_page_reads_published_index_from_a_cold_process(people_ctx, monke
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
     monkeypatch.setattr(app, 'person_table_client', persons)
     monkeypatch.setattr(storage_utils, '_rebuild_people_index_in_background', lambda *a: None)
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda *a, **kw: None)
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda *a, **kw: None)
     with app.app.test_request_context('/api/persons/page'):
         payload = people_page().get_json()
     assert payload['available'] is True
@@ -855,7 +855,7 @@ def test_people_page_for_a_library_with_no_people_is_empty_not_preparing_forever
     monkeypatch.setattr(app, 'person_table_client', persons)
     monkeypatch.setattr(app, 'get_user_people_index', lambda uid, **kw: None)
     triggered = []
-    monkeypatch.setattr(app, '_trigger_tools_index_rebuild', lambda uid, reason='', scope='full': triggered.append((reason, scope)))
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid, reason='', scope='full': triggered.append((reason, scope)))
     with app.app.test_request_context('/api/persons/page?offset=0&limit=120'):
         body = people_routes.people_page().get_json()
     assert body['available'] is True and body['rows'] == [] and body['total'] == 0 and not triggered
