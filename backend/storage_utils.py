@@ -4850,7 +4850,7 @@ def get_user_lexical_index(
 # _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
 # tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
 # lexical rebuild -- so this index tracks its own staleness end to end.
-_SORT_INDEX_SCHEMA_VERSION = 'v2'
+_SORT_INDEX_SCHEMA_VERSION = 'v3'
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -5315,7 +5315,12 @@ def refresh_user_sort_index(
 
 def ensure_user_sort_index_current(user_id: str) -> bool:
     """Full-rebuild the sort index if its stored schema predates this deploy
-    (v2 added per-photo thumbnail blob names). True if a rebuild ran."""
+    (v2 added per-photo thumbnail blob names; v3 made that field unconditional
+    -- previously gated on thumbnail_status=='done', so a library whose
+    snapshot was built before this still has `thumb` missing on any row whose
+    thumbnail wasn't done at build time, forcing the client to fall back to
+    /api/photos/access-batch for those rows instead of resolving directly).
+    True if a rebuild ran."""
     key = str(user_id or '').strip()
     manifest = _load_sort_index_manifest(key) if key else {}
     if not manifest.get('sourceVersion') or manifest.get('schemaVersion') == _SORT_INDEX_SCHEMA_VERSION:
