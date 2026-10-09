@@ -5,7 +5,7 @@ import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress, ProtectedFetc
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { resolveMediaAccessUrls } from '../../services/mediaAccessCache';
 import { getCachedSortThumb } from '../../services/localSortIndex';
-import { getCachedMediaToken, imageUrlForBlob, previewUrlForBlob, thumbnailUrlForBlob } from '../../services/mediaToken';
+import { getCachedMediaToken, getMediaToken, imageUrlForBlob, previewUrlForBlob, thumbnailUrlForBlob } from '../../services/mediaToken';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
 import { isRawFilename } from '../../utils/photoDisplay';
 import type { Photo } from './types';
@@ -185,11 +185,33 @@ const fetchFirstAvailableTier = async (
     const fetchOne = (target: string) => (fullRes
         ? fetchProtectedBlobUrlWithProgress(target, { signal, onProgress })
         : fetchProtectedBlobUrl(target));
+
+    // A 401/403 means the token baked into a direct URL was rejected server-
+    // side despite the local cache still thinking it was fresh (clock skew,
+    // or the background auto-refresh -- see mediaToken.ts -- not having run
+    // yet). Force a real refresh and re-resolve the SAME tier once with a
+    // freshly signed URL before giving up; retrying the stale `target`
+    // string itself could never succeed, since its signature doesn't change.
+    const fetchWithAuthRetry = async (kind: 'preview' | 'image' | 'thumbnail', target: string): Promise<string> => {
+        try {
+            return await fetchOne(target);
+        } catch (err) {
+            if (err instanceof ProtectedFetchError && (err.status === 401 || err.status === 403)) {
+                await getMediaToken(true);
+                const refreshed = await accessUrl(kind, filename);
+                if (refreshed && refreshed !== target) {
+                    return fetchOne(refreshed);
+                }
+            }
+            throw err;
+        }
+    };
+
     for (const kind of order) {
         const target = await accessUrl(kind, filename);
         if (!target) continue;
         try {
-            return await fetchOne(target);
+            return await fetchWithAuthRetry(kind, target);
         } catch (err) {
             if (err instanceof ProtectedFetchError && err.status === 404) continue;
             throw err;

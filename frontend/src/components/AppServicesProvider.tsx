@@ -1,5 +1,6 @@
 import { reportIndexBuilding } from '../services/indexBuilding';
 import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
+import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
@@ -930,6 +931,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (!isLikelyAuthenticated()) {
             return;
         }
+        // Independent of index readiness below -- keeps the media token from
+        // ever reaching its short server-side TTL during active use.
+        startMediaTokenAutoRefresh();
         let cancelled = false;
         void (async () => {
             const status = await get<{ ready?: boolean; building?: boolean }>('/api/photos/index-status').catch(() => null);

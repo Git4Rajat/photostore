@@ -651,19 +651,23 @@ def lookup_photo(filename: str):
 @photos_bp.route('/api/photos/media-token', methods=['GET'])
 def photos_media_token():
     """Container-scoped, read-only tokens for every thumbnail, preview, and
-    full-resolution original -- one call per session (plus one more right
-    before expiry), not one per photo/page.
+    full-resolution original -- one call per session (plus periodic silent
+    refreshes while the tab is visible), not one per photo/page.
 
     The browser builds ``{baseUrl}/{blobName}?{sas}`` itself (the physical blob
     name -- anonymousImageId or filename -- is the SAME across all three tiers,
     just a different container/prefix: thumbnail blob as-is, preview under
     ``preview/``, full-res in the separate image-container token below), so
     loading photos involves no backend call and no per-photo signing. Each
-    token is day-aligned and deterministic (same delegation key as the old
-    per-blob SAS URLs), has no list permission -- blobs are only reachable by
-    their unguessable UUID names -- and is cacheable by the client until
-    ``expiresAt``. The browser attempts a blob directly even before its
-    thumbnail/preview is known to exist yet (see _sort_index_row /
+    token is short-lived (MEDIA_TOKEN_SAS_TTL_SECONDS, independent of the
+    shared day-long delegation key still used to sign it -- see
+    _stable_container_read_sas's ttl_seconds) rather than day-aligned: an idle
+    tab's cached token stops working on its own once the backend scales to
+    zero on inactivity, with no server-side revocation needed (which would
+    affect the whole storage account, not just one session). mediaToken.ts
+    refetches well before expiry while the tab is visible, so this is meant to
+    be invisible during actual use. The browser attempts a blob directly even
+    before its thumbnail/preview is known to exist yet (see _sort_index_row /
     _build_photo_summary, which expose the blob name unconditionally rather
     than gating on *_status=='done'); a not-yet-generated blob 404s and the
     client shows a "preparing" placeholder instead of calling back here to
@@ -673,8 +677,9 @@ def photos_media_token():
         return error
     if app.MEDIA_URL_MODE != 'sas' or not app.blob_service_client or not app.account_name:
         return app.jsonify({'available': False})
+    ttl = app.MEDIA_TOKEN_SAS_TTL_SECONDS
     try:
-        base_url, sas, expires_at = app._stable_container_read_sas(app.BLOB_THUMBNAIL_CONTAINER)
+        base_url, sas, expires_at = app._stable_container_read_sas(app.BLOB_THUMBNAIL_CONTAINER, ttl_seconds=ttl)
     except Exception:
         app.app.logger.exception('Failed to mint media token for %s', user_id)
         return app.jsonify({'available': False})
@@ -688,7 +693,7 @@ def photos_media_token():
     # Face crops (the People avatars) live in their own container under a per-user prefix; one more
     # token lets the browser build every avatar URL itself instead of calling /api/faces/crop/<id>.
     try:
-        cover_base, cover_sas, _ = app._stable_container_read_sas(app.BLOB_COVER_CONTAINER)
+        cover_base, cover_sas, _ = app._stable_container_read_sas(app.BLOB_COVER_CONTAINER, ttl_seconds=ttl)
         payload['cover'] = {
             'baseUrl': cover_base,
             'sas': cover_sas,
@@ -702,12 +707,17 @@ def photos_media_token():
     # URL itself too (full-res button, video playback) instead of a per-file
     # /api/photos/access-batch round trip.
     try:
-        image_base, image_sas, _ = app._stable_container_read_sas(app.BLOB_IMAGE_CONTAINER)
+        image_base, image_sas, _ = app._stable_container_read_sas(app.BLOB_IMAGE_CONTAINER, ttl_seconds=ttl)
         payload['image'] = {'baseUrl': image_base, 'sas': image_sas}
     except Exception:
         app.app.logger.warning('Failed to mint image-container token for %s', user_id, exc_info=True)
     response = app.jsonify(payload)
-    response.headers['Cache-Control'] = 'private, max-age=3600'
+    # Must stay well under the SAS's own ttl -- an HTTP-cached response past
+    # that point would hand back an already-expired token without even making
+    # a real request. mediaToken.ts's own freshness check is the real
+    # staleness guard; this just stops a same-second duplicate request from
+    # re-minting (previously 1h, safe when tokens were day-long).
+    response.headers['Cache-Control'] = f'private, max-age={max(0, ttl - 60)}'
     return response
 
 @photos_bp.route('/photos/lookup-batch', methods=['POST'])

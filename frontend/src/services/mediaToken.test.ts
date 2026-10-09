@@ -6,9 +6,12 @@ vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => 'lib-1
 
 import { getCachedMediaToken, getMediaToken, imageUrlForBlob, invalidateMediaToken, previewUrlForBlob, thumbnailUrlForBlob } from './mediaToken';
 
-const future = (hours: number) => new Date(Date.now() + hours * 3600_000).toISOString();
-const tokenResponse = (hours = 30) => ({
-    available: true, baseUrl: 'https://acct.blob.core.windows.net/thumbnails', sas: 'sp=r&sr=c&sig=abc', expiresAt: future(hours), previewPrefix: 'preview/',
+// The server mints short-lived tokens now (MEDIA_TOKEN_SAS_TTL_SECONDS,
+// ~10 minutes) rather than day-long ones -- minutes, not hours, are the
+// realistic unit here.
+const futureMin = (minutes: number) => new Date(Date.now() + minutes * 60_000).toISOString();
+const tokenResponse = (minutes = 9) => ({
+    available: true, baseUrl: 'https://acct.blob.core.windows.net/thumbnails', sas: 'sp=r&sr=c&sig=abc', expiresAt: futureMin(minutes), previewPrefix: 'preview/',
     image: { baseUrl: 'https://acct.blob.core.windows.net/images', sas: 'sp=r&sr=c&sig=def' },
 });
 
@@ -46,11 +49,21 @@ describe('mediaToken', () => {
 
         window.localStorage.clear();
         invalidateMediaToken();
-        getMock.mockResolvedValue(tokenResponse(0.2)); // < 30 min left counts as stale
+        getMock.mockResolvedValue(tokenResponse(1)); // < 2 min left (REFRESH_MARGIN_MS) counts as stale
         await getMediaToken();
         invalidateMediaToken();
         await getMediaToken();
         expect(getMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('forceRefresh bypasses both the in-memory and stored cache even when still fresh', async () => {
+        getMock.mockResolvedValue(tokenResponse());
+        await getMediaToken();
+        expect(getMock).toHaveBeenCalledTimes(1);
+        await getMediaToken(); // still fresh, cached -- no new call
+        expect(getMock).toHaveBeenCalledTimes(1);
+        await getMediaToken(true); // forced -- real request despite looking fresh
+        expect(getMock).toHaveBeenCalledTimes(2);
     });
 
     it('returns null and builds no URLs when the backend has no token (proxy mode)', async () => {
@@ -60,7 +73,7 @@ describe('mediaToken', () => {
     });
 
     it('url-encodes blob names per path segment', () => {
-        const token = { baseUrl: 'https://a/b', sas: 's=1', expiresAt: future(30), previewPrefix: 'preview/' };
+        const token = { baseUrl: 'https://a/b', sas: 's=1', expiresAt: futureMin(9), previewPrefix: 'preview/' };
         expect(thumbnailUrlForBlob('my photo#1.jpg', token)).toBe('https://a/b/my%20photo%231.jpg?s=1');
     });
 });

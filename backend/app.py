@@ -657,6 +657,13 @@ STORAGE_CONNECTION_POOL_MAXSIZE = int(os.getenv('STORAGE_CONNECTION_POOL_MAXSIZE
 # every byte through the backend. 'sas' silently degrades to proxy URLs when
 # minting is impossible (no AAD credential, e.g. Azurite/local dev).
 MEDIA_URL_MODE = os.getenv('MEDIA_URL_MODE', 'sas').strip().lower()
+# Short validity window for the browser's /api/photos/media-token container
+# SAS (thumbnail/preview, cover, and full-res image), independent of the
+# day-long default _stable_container_read_sas otherwise uses -- see that
+# function's ttl_seconds docstring. The browser re-fetches a fresh token
+# periodically while its tab is visible (see mediaToken.ts), so this mainly
+# bounds how long a token an abandoned/backgrounded tab cached keeps working.
+MEDIA_TOKEN_SAS_TTL_SECONDS = int(os.getenv('MEDIA_TOKEN_SAS_TTL_SECONDS', '600'))
 BLOB_VECTOR_INDEX_CONTAINER = os.getenv('BLOB_VECTOR_INDEX_CONTAINER', 'vector-index').strip()
 BLOB_LEXICAL_INDEX_CONTAINER = os.getenv('BLOB_LEXICAL_INDEX_CONTAINER', 'lexical-index').strip()
 # Person-level rep-embedding index for worker's clustering matcher
@@ -10584,7 +10591,7 @@ def _create_stable_read_sas_url(
     return f'{blob_client.url}?{sas}', expires_on.isoformat()
 
 
-def _stable_container_read_sas(container_name: str) -> Tuple[str, str, str]:
+def _stable_container_read_sas(container_name: str, *, ttl_seconds: Optional[int] = None) -> Tuple[str, str, str]:
     """One read-only SAS scoped to the whole container -- day-aligned and
     deterministic like _create_stable_read_sas_url above, but signed ONCE per
     call instead of once per blob. Returns (base_url, sas_query_string,
@@ -10596,10 +10603,28 @@ def _stable_container_read_sas(container_name: str) -> Tuple[str, str, str]:
     costs the same as signing one blob URL -- the saving comes from
     library_export_manifest_page calling it once per page instead of once per
     row, which is what actually matters at up to ~500k files per library.
+
+    ttl_seconds, when given, mints a SAS valid only for that short window from
+    now instead of the day-long default -- still a pure local HMAC against the
+    same cached delegation key (no extra Azure call), just a shorter expiry
+    baked into the signature. Used for the browser's media token (see
+    MEDIA_TOKEN_SAS_TTL_SECONDS) so a token an idle tab cached stops working
+    once the backend naturally scales to zero on inactivity, without needing
+    to revoke anything -- revoking a user-delegation key kills every
+    outstanding SAS for the whole storage account at once, not just one
+    session's. Library export deliberately omits this (its SAS has to outlive
+    a potentially long-running, resumable, many-hundred-thousand-file
+    download), so this is opt-in per caller, not a change to the default.
     """
     if not account_name:
         raise RuntimeError('Storage account name is not configured')
-    key, starts_on, expires_on = _stable_delegation_key()
+    key, key_starts_on, key_expires_on = _stable_delegation_key()
+    if ttl_seconds is not None:
+        now = datetime.now(timezone.utc)
+        starts_on = max(key_starts_on, now - timedelta(minutes=5))  # clock-skew buffer
+        expires_on = min(key_expires_on, now + timedelta(seconds=ttl_seconds))
+    else:
+        starts_on, expires_on = key_starts_on, key_expires_on
     sas = generate_container_sas(
         account_name=account_name,
         container_name=container_name,

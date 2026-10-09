@@ -9,8 +9,16 @@ import { getActiveLibraryFromToken } from './passwordAuthClient';
  * backend call and no per-photo signed URLs. Blob names come from the sort
  * index (`thumb`) or photo summaries (`thumbnailBlob`).
  *
- * Cached in memory and in localStorage until shortly before it expires; the
- * server's tokens are day-aligned, so there are always >=24h of validity left.
+ * Cached in memory and in localStorage until shortly before it expires. The
+ * server's tokens are short-lived (MEDIA_TOKEN_SAS_TTL_SECONDS, currently
+ * 10 minutes) rather than day-aligned -- an idle tab's cached token stops
+ * working on its own once the backend scales to zero on inactivity, with no
+ * server-side revocation needed (which would kill every outstanding token
+ * for the whole account, not just one session). startMediaTokenAutoRefresh
+ * keeps the cache warm with a background refresh every ~9 minutes while the
+ * tab is visible, so this is meant to be invisible during actual use; a
+ * request that still hits a 401/403 (the narrow race right at expiry) should
+ * call getMediaToken(true) to force past the local cache and retry.
  */
 export interface MediaToken {
     baseUrl: string;
@@ -29,7 +37,15 @@ interface MediaTokenResponse extends Partial<MediaToken> {
 
 const STORAGE_KEY = 'photostore-media-token';
 const STORED_VERSION = 3;
-const REFRESH_MARGIN_MS = 30 * 60 * 1000;
+// Must stay under the server's MEDIA_TOKEN_SAS_TTL_SECONDS (10 min default) --
+// a margin longer than the token's own life would make every token look
+// stale immediately. The background auto-refresh below (~9 min cadence) is
+// what actually keeps tokens from reaching this margin during active use;
+// this mainly guards the moment right after a long-idle tab resumes.
+const REFRESH_MARGIN_MS = 2 * 60 * 1000;
+// Comfortably inside the server's 10-minute TTL so a refresh lands well
+// before the 2-minute staleness margin above would otherwise kick in.
+const AUTO_REFRESH_INTERVAL_MS = 9 * 60 * 1000;
 
 let cached: MediaToken | null = null;
 let cachedKey: string | null = null;
@@ -69,16 +85,28 @@ export const getCachedMediaToken = (): MediaToken | null => {
     return cachedKey === key && isFresh(cached) ? cached : null;
 };
 
-export const getMediaToken = async (): Promise<MediaToken | null> => {
+/**
+ * Resolves the current media token, fetching/refreshing if needed.
+ * `forceRefresh` skips the local freshness check (both the in-memory and
+ * localStorage copies) and always re-fetches -- for the narrow case where a
+ * request already got a 401/403 back from storage despite the local cache
+ * thinking the token was still fresh (clock skew, or the server's expiry
+ * enforcement landing slightly ahead of the local margin).
+ */
+export const getMediaToken = async (forceRefresh = false): Promise<MediaToken | null> => {
     const key = tokenKey();
-    const current = getCachedMediaToken();
-    if (current) return current;
+    if (!forceRefresh) {
+        const current = getCachedMediaToken();
+        if (current) return current;
+    }
     if (inFlight && cachedKey === key) return inFlight;
     cachedKey = key;
-    const stored = readStored(key);
-    if (stored) {
-        cached = stored;
-        return stored;
+    if (!forceRefresh) {
+        const stored = readStored(key);
+        if (stored) {
+            cached = stored;
+            return stored;
+        }
     }
     inFlight = perf.span('media_token.fetch', () => get<MediaTokenResponse>('/api/photos/media-token'))
         .then((res) => {
@@ -104,6 +132,30 @@ export const getMediaToken = async (): Promise<MediaToken | null> => {
 export const invalidateMediaToken = (): void => {
     cached = null;
     cachedKey = null;
+};
+
+let autoRefreshStarted = false;
+
+/**
+ * Keeps the cached media token from ever reaching its short server-side TTL
+ * during active use: a background refresh every ~9 minutes while the tab is
+ * visible, plus an immediate refresh the moment a backgrounded tab becomes
+ * visible again (covers a tab that was hidden through an entire refresh
+ * cycle). No-op while hidden -- a tab the user has walked away from makes no
+ * requests at all, which is the point: the token is allowed to actually
+ * expire, not kept alive forever in the background. Idempotent; call once at
+ * app boot (see preloadLocalIndexes).
+ */
+export const startMediaTokenAutoRefresh = (): void => {
+    if (autoRefreshStarted || typeof document === 'undefined') return;
+    autoRefreshStarted = true;
+    const refreshIfVisible = () => {
+        if (document.visibilityState === 'visible') {
+            void getMediaToken();
+        }
+    };
+    setInterval(refreshIfVisible, AUTO_REFRESH_INTERVAL_MS);
+    document.addEventListener('visibilitychange', refreshIfVisible);
 };
 
 const encodeBlobPath = (blob: string): string => blob.split('/').map(encodeURIComponent).join('/');
