@@ -132,7 +132,7 @@ export const ExplorePage: React.FC = () => {
                     cover={(pl) => pl.coverThumbnailUrl}
                     render={(pl, src) => (
                         <button key={pl.id} type="button" className={`pt-shelf-card wide mock-swatch ${pl.swatch}`} onClick={() => navigate('ask', { query: pl.name })}>
-                            {src && <img className="pt-explore-cover" src={src} alt={pl.name} />}
+                            {src && <TileThumbnail key={src} src={src} alt={pl.name} className="pt-explore-cover" />}
                             <span className="pt-shelf-overlay">{pl.name}{pl.count ? ` · ${pl.count}` : ''}</span>
                         </button>
                     )}
@@ -146,7 +146,7 @@ export const ExplorePage: React.FC = () => {
                     cover={(t) => t.coverThumbnailUrl}
                     render={(t, src) => (
                         <button key={t.id} type="button" className={`pt-shelf-card wide mock-swatch ${t.swatch}`} onClick={() => navigate('ask', { query: t.name })}>
-                            {src && <img className="pt-explore-cover" src={src} alt={t.name} />}
+                            {src && <TileThumbnail key={src} src={src} alt={t.name} className="pt-explore-cover" />}
                             <span className="pt-shelf-overlay">{t.name} · {t.count}</span>
                         </button>
                     )}
@@ -160,7 +160,7 @@ export const ExplorePage: React.FC = () => {
                     cover={(a) => a.coverThumbnailUrl}
                     render={(a, src) => (
                         <button key={a.id} type="button" className="pt-shelf-card wide album" onClick={() => navigate('albums', { albumId: a.id })}>
-                            {src && <img className="pt-explore-cover" src={src} alt={a.name} />}
+                            {src && <TileThumbnail key={src} src={src} alt={a.name} className="pt-explore-cover" />}
                             <span className="pt-shelf-overlay">{a.name} · {a.photoCount}</span>
                         </button>
                     )}

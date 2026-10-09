@@ -273,6 +273,24 @@ const PublicAlbumPage: React.FC = () => {
 
     useBackendRecoveryRetry(loadError, () => { void loadPublicAlbum(accessCode); });
 
+    // archive (the container app behind /public/albums) runs minReplicas: 0.
+    // The initial GET above warms it, but a code-protected album then sits on
+    // the access-code screen while the visitor reads/types the code -- long
+    // enough (observed ~90s) for archive to scale back to zero. The
+    // access-code POST then has to cold-start it again, and Container Apps'
+    // own ingress times out and returns a bare 503 (no app headers at all)
+    // before the container finishes booting. Ping /health every 20s -- well
+    // under the observed idle window -- for as long as the code screen is up,
+    // so archive stays warm for the POST.
+    useEffect(() => {
+        if (!codeRequired) {
+            return undefined;
+        }
+        const ping = () => { void get('/health', { signal: AbortSignal.timeout(8000) }).catch(() => undefined); };
+        const timer = window.setInterval(ping, 20000);
+        return () => window.clearInterval(timer);
+    }, [codeRequired]);
+
     // Warms every thumbnail into the browser's HTTP cache as soon as the photo
     // list arrives, instead of waiting for each tile's native loading="lazy"
     // to fire as it scrolls into view. Re-runs only when a fresh photo list
