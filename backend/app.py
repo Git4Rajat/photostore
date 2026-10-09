@@ -3538,7 +3538,60 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
 
 
 IPWORK_CLUSTER_BATCH_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_MAX_FILENAMES', '1500'))
-IPWORK_CLUSTER_BATCH_FLUSH_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_FLUSH_SECONDS', '60'))
+# Pure safety ceiling, not an abandonment timer -- see _is_upload_active's
+# docstring for why the activity check itself can't get stuck and doesn't
+# need this for recovery (e.g. only matters if the activity-table read
+# itself starts failing).
+IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS', '300'))
+# How recent a user's upload activity heartbeat (_mark_upload_activity_heartbeat)
+# must be to count as "still uploading" for _is_upload_active.
+UPLOAD_ACTIVITY_WINDOW_SECONDS = float(os.getenv('UPLOAD_ACTIVITY_WINDOW_SECONDS', '30'))
+# Flush-loop check cadence -- a cheap per-buffered-user table point-read now,
+# not a single queue-depth call, so this can poll much more often than the
+# old fixed-timer design without meaningful extra cost.
+IPWORK_CLUSTER_BATCH_POLL_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_POLL_SECONDS', '15'))
+
+
+def _mark_upload_activity_heartbeat(user_id: str) -> None:
+    """Cheap recency signal for ipworker's cluster-batch flush decision (see
+    _is_upload_active) -- deliberately separate from
+    _mark_fresh_upload_activity's runsSinceUpload reset (that one is
+    finalize-only by design; this one is called from init too, so the
+    signal stays fresh across a single large file's upload window). A plain
+    MERGE-mode upsert only touches this one field, leaving
+    runsSinceUpload/lastStartedAt on the same row untouched."""
+    if metadata_table_client is None:
+        return
+    try:
+        metadata_table_client.upsert_entity(
+            {'PartitionKey': 'clustering_maintenance', 'RowKey': user_id,
+             'lastUploadActivityAt': datetime.now(timezone.utc).isoformat()},
+            mode=UpdateMode.MERGE)
+    except Exception:
+        app.logger.exception('Failed to record upload activity heartbeat for %s', user_id)
+
+
+def _is_upload_active(user_id: str) -> bool:
+    """Whether user_id has touched _mark_upload_activity_heartbeat within
+    UPLOAD_ACTIVITY_WINDOW_SECONDS -- the real signal _flush_stale_incremental_assign_buffers
+    needs ('is more work likely still coming') in place of a fixed timer
+    that can't tell a sustained upload apart from a finished one. Returns
+    False (flush now) on any missing/unparseable/unavailable row -- the
+    only way this can be wrong is flushing a little early, never stuck."""
+    if metadata_table_client is None:
+        return False
+    try:
+        row = metadata_table_client.get_entity('clustering_maintenance', user_id)
+    except Exception:
+        return False
+    raw = row.get('lastUploadActivityAt')
+    if not raw:
+        return False
+    try:
+        last = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - last).total_seconds() <= UPLOAD_ACTIVITY_WINDOW_SECONDS
 
 # Per-user in-memory buffer of filenames awaiting an incremental-assign
 # flush. _queue_people_clustering_after_face_processing runs inside
@@ -3557,6 +3610,7 @@ def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
     in run_ipworker, or on shutdown via _flush_all_incremental_assign_buffers,
     so a slow trickle or a scaling-to-zero replica never strands filenames)."""
     to_flush: Optional[List[str]] = None
+    started_at = None
     with _cluster_batch_lock:
         buffer = _cluster_batch_buffers.setdefault(user_id, [])
         if not buffer:
@@ -3564,28 +3618,44 @@ def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
         buffer.append(filename)
         if len(buffer) >= IPWORK_CLUSTER_BATCH_MAX_FILENAMES:
             to_flush = buffer
+            started_at = _cluster_batch_started_at.get(user_id)
             _cluster_batch_buffers[user_id] = []
             _cluster_batch_started_at.pop(user_id, None)
     if to_flush:
+        age_s = (time.monotonic() - started_at) if started_at is not None else -1
+        worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=count_cap age_s=%.1f',
+                           user_id, len(to_flush), age_s)
         _enqueue_incremental_assign_job(user_id, to_flush)
 
 
 def _flush_stale_incremental_assign_buffers() -> None:
-    """Flush any user's buffer that's been waiting longer than
-    IPWORK_CLUSTER_BATCH_FLUSH_SECONDS, even though it hasn't reached the
-    count cap -- otherwise a slow trickle of photos for one user could sit
-    buffered (and un-clustered) indefinitely."""
+    """Flush any user's buffer whose upload has gone quiet (_is_upload_active
+    is False), or that's been waiting past the hard fallback ceiling
+    regardless of activity -- not a fixed timer. A sustained upload keeps
+    its buffer growing (toward the count cap) for as long as activity stays
+    recent, instead of being cut off every ~60s by a timer that couldn't
+    tell a live upload apart from a finished one."""
     now = time.monotonic()
-    to_flush: List[Tuple[str, List[str]]] = []
+    to_flush: List[Tuple[str, List[str], str, float]] = []
     with _cluster_batch_lock:
-        for user_id, started_at in list(_cluster_batch_started_at.items()):
-            if now - started_at >= IPWORK_CLUSTER_BATCH_FLUSH_SECONDS:
+        candidates = list(_cluster_batch_started_at.items())
+    for user_id, started_at in candidates:
+        age_s = now - started_at
+        hard_fallback = age_s >= IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS
+        if hard_fallback or not _is_upload_active(user_id):
+            with _cluster_batch_lock:
+                # Re-check under the lock -- the buffer may have already
+                # been flushed (count cap) or grown since the snapshot above.
+                if user_id not in _cluster_batch_started_at:
+                    continue
                 buffer = _cluster_batch_buffers.get(user_id)
                 if buffer:
-                    to_flush.append((user_id, buffer))
+                    to_flush.append((user_id, buffer, 'hard_fallback' if hard_fallback else 'inactive', age_s))
                 _cluster_batch_buffers[user_id] = []
                 _cluster_batch_started_at.pop(user_id, None)
-    for user_id, filenames in to_flush:
+    for user_id, filenames, reason, age_s in to_flush:
+        worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=%s age_s=%.1f',
+                           user_id, len(filenames), reason, age_s)
         _enqueue_incremental_assign_job(user_id, filenames)
 
 
@@ -3593,24 +3663,28 @@ def _flush_all_incremental_assign_buffers() -> None:
     """Flush every remaining non-empty buffer regardless of age -- called on
     ipworker shutdown so a scale-to-zero replica never strands filenames
     that were waiting on either the count cap or the time-based flush."""
+    now = time.monotonic()
     with _cluster_batch_lock:
-        pending = [(user_id, filenames) for user_id, filenames in _cluster_batch_buffers.items() if filenames]
+        pending = [(user_id, filenames, now - _cluster_batch_started_at.get(user_id, now))
+                  for user_id, filenames in _cluster_batch_buffers.items() if filenames]
         _cluster_batch_buffers.clear()
         _cluster_batch_started_at.clear()
-    for user_id, filenames in pending:
+    for user_id, filenames, age_s in pending:
+        worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=shutdown age_s=%.1f',
+                           user_id, len(filenames), age_s)
         _enqueue_incremental_assign_job(user_id, filenames)
 
 
 def _run_incremental_assign_flush_loop(shutdown_requested: threading.Event) -> None:
-    """Background daemon loop started once in run_ipworker; polls at
-    roughly a third of the flush interval so the real worst-case wait for a
-    stale buffer never exceeds ~1.33x IPWORK_CLUSTER_BATCH_FLUSH_SECONDS."""
-    interval = max(1.0, IPWORK_CLUSTER_BATCH_FLUSH_SECONDS / 3)
-    while not shutdown_requested.wait(interval):
+    """Background daemon loop started once in run_ipworker; polls every
+    IPWORK_CLUSTER_BATCH_POLL_SECONDS -- cheap now that each check is a
+    per-buffered-user table point-read (_is_upload_active) rather than a
+    fixed timer, so this can run far more often without meaningful cost."""
+    while not shutdown_requested.wait(IPWORK_CLUSTER_BATCH_POLL_SECONDS):
         try:
             _flush_stale_incremental_assign_buffers()
         except Exception:
-            worker_logger.exception('Incremental-assign time-based flush failed')
+            worker_logger.exception('Incremental-assign activity-based flush failed')
 
 
 def _enqueue_propagate_job(user_id: str, person_id: str) -> Dict[str, str]:

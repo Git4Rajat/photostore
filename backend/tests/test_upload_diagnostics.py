@@ -55,6 +55,7 @@ def upload_env(monkeypatch, caplog):
     monkeypatch.setattr(app, 'apply_client_processing_results_for_file', clock.action(19, {}))
     monkeypatch.setattr(app, '_queue_upload_processing', clock.action(23))
     monkeypatch.setattr(app, '_mark_fresh_upload_activity', clock.action(29))
+    monkeypatch.setattr(app, '_mark_upload_activity_heartbeat', clock.action(3))
     monkeypatch.setattr(app, '_queue_people_clustering_after_face_processing', clock.action(31))
     return clock, app.app.test_client()
 
@@ -72,8 +73,8 @@ def test_single_init_has_exact_timings_and_no_secrets(upload_env, caplog):
     assert response.status_code == 200
     assert 'sig=credential' in response.json['blobUrl']  # response untouched
     record, = records(caplog)
-    assert record['phase_ms'] == {'initialization': 5, 'cleanup': 5, 'tracking': 7, 'sas_creation': 24}
-    assert record['total_ms'] == 41
+    assert record['phase_ms'] == {'initialization': 5, 'cleanup': 5, 'tracking': 7, 'sas_creation': 24, 'enqueues': 3}
+    assert record['total_ms'] == 44
     assert record['status'] == 200 and record['outcome'] == 'success'
     assert record['route'] == '/upload/init'
     assert len(record['correlation_id']) == 32
@@ -96,7 +97,19 @@ def test_early_returns_logged_once(upload_env, monkeypatch, caplog, route, failu
     assert response.status_code == status
     record, = records(caplog)
     assert record['status'] == status and record['outcome'] == 'http_error'
-    assert record['total_ms'] == (2 if failure == 'auth' else 5)
+    # init/init-batch now touch the activity heartbeat (enqueues, 3ms) right
+    # after the cleanup-block check, before their own field validation --
+    # so a validation failure on those two routes costs 3ms more than a
+    # cleanup-block failure does. finalize/finalize-batch/client-processing
+    # only touch the heartbeat deep in their success path, never reached by
+    # any of these early-return failures.
+    if failure == 'auth':
+        expected_total = 2
+    elif failure == 'cleanup':
+        expected_total = 5
+    else:
+        expected_total = 8 if route in ('init', 'init-batch') else 5
+    assert record['total_ms'] == expected_total
     assert diagnostics._CURRENT.get() is None
 
 
@@ -108,7 +121,7 @@ def test_caught_sas_503_is_not_success(upload_env, monkeypatch, caplog):
     assert record['outcome'] == 'http_error' and record['status'] == 503
     assert record['phase_errors'] == {'sas_creation': 1}
     assert record['phase_ms']['sas_creation'] == 11
-    assert record['total_ms'] == 28
+    assert record['total_ms'] == 31
     assert 'secret-SAS' not in json.dumps(record)
 
 
@@ -119,8 +132,8 @@ def test_init_batch_aggregates_success_and_failures(upload_env, monkeypatch, cap
     record, = records(caplog)
     assert record['counts'] == {'files': 3, 'succeeded': 2, 'failed': 1}
     assert record['outcome'] == 'partial'
-    assert record['phase_ms'] == {'initialization': 5, 'tracking': 7, 'sas_creation': 48}
-    assert record['total_ms'] == 60
+    assert record['phase_ms'] == {'initialization': 5, 'tracking': 7, 'sas_creation': 48, 'enqueues': 3}
+    assert record['total_ms'] == 63
 
 
 @pytest.mark.parametrize('failure,status,phase', [
@@ -158,8 +171,8 @@ def test_finalize_success_aggregate_stages(upload_env, caplog, batch):
     assert record['phase_ms']['finalize_metadata'] == 11 * multiplier
     assert record['phase_ms']['client_processing'] == 19 * multiplier
     assert record['phase_ms']['metadata_read'] == 34 * multiplier
-    assert record['phase_ms']['enqueues'] == 54 * multiplier + 29
-    assert record['total_ms'] == 5 + (5 + 7 + 11 + 13 + 34 + 19 + 54) * multiplier + 29
+    assert record['phase_ms']['enqueues'] == 54 * multiplier + 29 + 3
+    assert record['total_ms'] == 5 + (5 + 7 + 11 + 13 + 34 + 19 + 54) * multiplier + 29 + 3
     assert record['outcome'] == 'success'
     assert 'private OCR' not in json.dumps(record)
 
@@ -239,8 +252,8 @@ def test_requests_have_distinct_server_ids_and_no_phase_leak(upload_env, caplog)
     assert client.post('/upload/init', json={}).status_code == 400
     first, second = records(caplog)
     assert first['correlation_id'] != second['correlation_id']
-    assert second['phase_ms'] == {'initialization': 5}
-    assert second['total_ms'] == 5 and second['phase_errors'] == {}
+    assert second['phase_ms'] == {'initialization': 5, 'enqueues': 3}
+    assert second['total_ms'] == 8 and second['phase_errors'] == {}
 
 
 @pytest.mark.parametrize('handled', [False, True])

@@ -35,6 +35,10 @@ def init_upload():
     blocked = timed_call('initialization', app._library_cleanup_block_reason, user_id)
     if blocked:
         return app.jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
+    try:
+        timed_call('enqueues', app._mark_upload_activity_heartbeat, user_id)
+    except Exception:
+        app.app.logger.exception('Failed to record upload activity heartbeat for %s', user_id)
     data = timed_call('initialization', app.request.get_json, silent=True) or {}
     upload_count('files', 1)
     filename = app._validate_media_filename(data.get('filename', ''))
@@ -140,6 +144,10 @@ def init_upload_batch():
     blocked = timed_call('initialization', app._library_cleanup_block_reason, user_id)
     if blocked:
         return app.jsonify({'error': blocked, 'code': 'cleanup_in_progress'}), 409
+    try:
+        timed_call('enqueues', app._mark_upload_activity_heartbeat, user_id)
+    except Exception:
+        app.app.logger.exception('Failed to record upload activity heartbeat for %s', user_id)
     data = timed_call('initialization', app.request.get_json, silent=True) or {}
     files = data.get('files')
     upload_count('files', len(files) if isinstance(files, list) else 0)
@@ -349,6 +357,10 @@ def finalize_direct_upload():
     except Exception:
         app.app.logger.exception('Failed to record fresh upload activity for %s', user_id)
     try:
+        timed_call('enqueues', app._mark_upload_activity_heartbeat, user_id)
+    except Exception:
+        app.app.logger.exception('Failed to record upload activity heartbeat for %s', user_id)
+    try:
         timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
     except Exception:
         app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
@@ -408,6 +420,10 @@ def finalize_upload_batch():
         timed_call('enqueues', app._mark_fresh_upload_activity, user_id)
     except Exception:
         app.app.logger.exception('Failed to record fresh upload activity for %s', user_id)
+    try:
+        timed_call('enqueues', app._mark_upload_activity_heartbeat, user_id)
+    except Exception:
+        app.app.logger.exception('Failed to record upload activity heartbeat for %s', user_id)
 
     results = []
     for idx, item in enumerate(files):
