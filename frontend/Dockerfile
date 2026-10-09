@@ -1,5 +1,4 @@
-# syntax=docker/dockerfile:1.7
-FROM node:20-alpine AS build
+FROM mirror.gcr.io/library/node:20-alpine AS build
 
 # Keep CI/ACR logs focused on real build failures.
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
@@ -63,7 +62,7 @@ RUN node -e 'const fs=require("fs"); const ts=new Date().toISOString(); const co
 RUN npm run build
 RUN chmod -R a+rX build/models
 
-FROM nginx:1.27-alpine
+FROM mirror.gcr.io/library/nginx:1.27-alpine
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY security-headers.conf /etc/nginx/security-headers.conf

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Dockerfile for the 'vision' role (Azure Container Apps): server-side mirror
 # of the browser's OCR/face/vision/geo pipeline (see backend/ipwork_*.py).
 #
@@ -13,7 +12,7 @@
 # because this also bundles the frontend's browser-ai model files so ipworker
 # never depends on the frontend container being reachable at runtime:
 #   docker build -f backend/ipworker.Dockerfile .
-FROM python:3.11-slim
+FROM mirror.gcr.io/library/python:3.11-slim
 
 ENV PIP_ROOT_USER_ACTION=ignore \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
