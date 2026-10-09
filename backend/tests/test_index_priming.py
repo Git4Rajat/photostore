@@ -765,6 +765,32 @@ def test_light_job_maintains_sort_access_and_the_search_db_incrementally(monkeyp
     assert primed == [('sort', 'access')] and status[-1] == 'done'
 
 
+def test_no_base_search_db_queues_a_full_rebuild_instead_of_failing_the_light_job(monkeypatch):
+    """no_base ('library has no search database yet') is a documented, expected
+    refresh_user_search_db_incremental outcome -- not an error. The light job
+    must still complete (it handles sort/access regardless), and the missing
+    search db gets queued as a separate full-scope rebuild instead of crash-
+    looping this job on every light pass."""
+    primed, status = _job_env(monkeypatch)
+    triggered = []
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {'status': 'no_base'})
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid, reason='trigger', scope='full': triggered.append((uid, reason, scope)))
+    app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
+    assert primed == [('sort', 'access')] and status[-1] == 'done'
+    assert triggered == [('lib-1', 'search-db-no-base', 'full')]
+
+
+@pytest.mark.parametrize('status', ['unavailable', 'conflict'])
+def test_transient_search_db_statuses_dont_fail_the_light_job(monkeypatch, status):
+    """unavailable (a storage read blip) and conflict (a concurrent rebuild won
+    the race) both self-resolve on the next light pass -- neither is a reason
+    to mark this job failed."""
+    primed, job_status = _job_env(monkeypatch)
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {'status': status})
+    app._run_index_build_job('lib-1', 'index-build-lib-1-light', 'light')
+    assert primed == [('sort', 'access')] and job_status[-1] == 'done'
+
+
 def test_people_job_refreshes_people_and_albums_not_the_whole_library(monkeypatch):
     primed, _ = _job_env(monkeypatch)
     monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {'status': 'noop'})

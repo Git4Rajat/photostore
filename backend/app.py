@@ -10099,6 +10099,22 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
                 raise RuntimeError('search database compaction made no progress')
             compacted = True
             continue
+        if status == 'no_base':
+            # Documented, expected outcome for a library with no search database
+            # yet (new, or a schema upgrade) -- NOT an error. This light-scope
+            # pass only maintains an EXISTING base incrementally; building one
+            # from scratch is the 'full' scope job's chunked, resumable bootstrap
+            # (see _run_index_build_job's else branch). Queue that instead of
+            # raising, so the light job still completes (sort/access, which it
+            # handles regardless) instead of crash-looping on every light pass
+            # until something else happens to trigger a full rebuild.
+            _trigger_indexer_rebuild(user_id, reason='search-db-no-base', scope='full')
+            return outcome
+        if status in ('unavailable', 'conflict'):
+            # Both are expected transients (a storage read blip / a concurrent
+            # rebuild winning a race) that self-resolve on the next light pass --
+            # not a reason to mark this job failed.
+            return outcome
         raise RuntimeError(f'incremental search database refresh returned {status or "an empty status"}')
     raise RuntimeError(
         f'incremental search database refresh did not converge after {INDEX_BUILD_INCREMENTAL_MAX_PASSES} passes')
