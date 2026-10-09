@@ -78,9 +78,15 @@ export const AlbumsPage: React.FC = () => {
     // secret), so remember codes we generate this session to show the owner.
     const [codes, setCodes] = useState<Record<string, string>>({});
 
-    // Fetch the active album's photos whenever the selection changes.
+    // Fetch the active album's photos whenever the selection changes, unless
+    // this album's first page is already cached from a prior visit -- and
+    // queue it behind fetchAlbums rather than firing in parallel with it, so
+    // landing on the tab doesn't pay for two uncoordinated requests every time.
     useEffect(() => {
-        if (album?.id) void openAlbum(album.id);
+        if (!album?.id || albumPhotosById(album.id)) return;
+        const controller = new AbortController();
+        void enqueueBackgroundRequest(async () => { await openAlbum(album.id); }, { signal: controller.signal }).catch(() => {});
+        return () => controller.abort();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [album?.id]);
 
