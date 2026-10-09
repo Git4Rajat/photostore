@@ -1064,6 +1064,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const uploadSessionRef = useRef<PersistedUploadSession | null>(null);
     const discardedUploadSessionIdsRef = useRef<Set<string>>(new Set());
     const isResumingUploadRef = useRef<boolean>(false);
+    const uploadRunGenerationRef = useRef<number>(0);
     const uploadStartInProgressRef = useRef<boolean>(false);
     const uploadSourceFilesRef = useRef<Map<string, File>>(new Map());
     // Mirrors uploadSourceFilesRef but for FileSystemFileHandle-backed
@@ -3015,6 +3016,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
 
         isResumingUploadRef.current = true;
+        const uploadRunGeneration = uploadRunGenerationRef.current + 1;
+        uploadRunGenerationRef.current = uploadRunGeneration;
         // Kick off in parallel with the setup below (notification creation,
         // session persistence, block-size planning) and only await it right
         // before the worker pool starts -- overlaps a network round trip with
@@ -3746,6 +3749,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             await notifyUploadComplete();
         } catch (err) {
+            if (discardedUploadSessionIdsRef.current.has(session.id)) {
+                await clearPersistedSession();
+                setPendingUploadSessionLive(null);
+                setUploadError(null);
+                return;
+            }
             if (uploadStopRequestedRef.current || isUploadStoppedError(err)) {
                 const latest = uploadSessionRef.current || session;
                 await cleanupUnfinishedUploadArtifacts(latest);
@@ -3766,12 +3775,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 return;
             }
             const message = getUploadErrorMessage(err, 'Upload failed unexpectedly.');
-            if (discardedUploadSessionIdsRef.current.has(session.id)) {
-                await clearPersistedSession();
-                setPendingUploadSessionLive(null);
-                setUploadError(null);
-                return;
-            }
             updateNotification(notificationId, {
                 title: 'Upload failed',
                 details: message,
@@ -3785,19 +3788,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             setUploadError(message);
         } finally {
-            setUploading(false);
-            uploadingRef.current = false;
-            setBackgroundUploadTailActive(false);
-            isResumingUploadRef.current = false;
-            uploadSourceFilesRef.current.clear();
-            uploadHandlesRef.current.clear();
-            uploadAbortControllersRef.current.clear();
-            uploadStopRequestedRef.current = false;
-            // Recompute keep-alive state now that the transfer has ended (on
-            // every exit path -- success, stopped, or errored): resumes the
-            // background processing pull, and releases the wake lock if there
-            // is nothing left to protect.
-            void startBrowserProcessing();
+            if (uploadRunGenerationRef.current === uploadRunGeneration) {
+                setUploading(false);
+                uploadingRef.current = false;
+                setBackgroundUploadTailActive(false);
+                isResumingUploadRef.current = false;
+                uploadSourceFilesRef.current.clear();
+                uploadHandlesRef.current.clear();
+                uploadAbortControllersRef.current.clear();
+                uploadStopRequestedRef.current = false;
+                // Recompute keep-alive state now that the transfer has ended (on
+                // every exit path -- success, stopped, or errored): resumes the
+                // background processing pull, and releases the wake lock if there
+                // is nothing left to protect.
+                void startBrowserProcessing();
+            }
         }
     }, [
         addNotification,
@@ -3984,6 +3989,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 discardedUploadSessionIdsRef.current = new Set(Array.from(discardedUploadSessionIdsRef.current).slice(-10));
             }
         }
+        uploadRunGenerationRef.current += 1;
+        isResumingUploadRef.current = false;
+        setBackgroundUploadTailActive(false);
+        setUploading(false);
+        uploadingRef.current = false;
+        uploadStartInProgressRef.current = false;
+        uploadStopRequestedRef.current = false;
+        uploadAbortControllersRef.current.forEach((controller) => controller.abort());
+        uploadAbortControllersRef.current.clear();
         setPendingUploadSessionLive(null);
         uploadSourceFilesRef.current.clear();
         uploadHandlesRef.current.clear();
