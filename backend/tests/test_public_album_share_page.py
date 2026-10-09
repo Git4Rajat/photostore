@@ -174,7 +174,7 @@ def test_public_photo_urls_sets_raw_full_preview_url_only_for_raw_files():
 def test_public_album_route_includes_raw_full_preview_url(monkeypatch):
     entity = _entity(filenames='["IMG_0001.CR3", "IMG_0002.jpg"]')
     monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: entity)
-    monkeypatch.setattr(app, '_get_metadata_entity', lambda owner_id, name: {})
+    monkeypatch.setattr(app, '_get_metadata_entities', lambda owner_id, names: {name: {} for name in names})
     monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: (_ for _ in ()).throw(Exception('no SAS in tests')))
 
     client = app.app.test_client()
@@ -184,6 +184,27 @@ def test_public_album_route_includes_raw_full_preview_url(monkeypatch):
     photos = {p['filename']: p for p in resp.get_json()['photos']}
     assert photos['IMG_0001.CR3']['rawFullPreviewUrl'] == '/public/photos/tok123/raw-full-preview/IMG_0001.CR3'
     assert photos['IMG_0002.jpg']['rawFullPreviewUrl'] == ''
+
+
+def test_public_album_route_pages_large_album_and_batches_metadata(monkeypatch):
+    names = [f'IMG_{i:04d}.jpg' for i in range(300)]
+    entity = _entity(filenames=app.json.dumps(names))
+    seen_batches = []
+    monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: entity)
+    monkeypatch.setattr(app, '_get_metadata_entities', lambda owner_id, batch: seen_batches.append(list(batch)) or {name: {} for name in batch})
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: (_ for _ in ()).throw(Exception('no SAS in tests')))
+
+    client = app.app.test_client()
+    resp = client.get('/public/albums/tok123?offset=120&limit=120')
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload['total'] == 300
+    assert payload['offset'] == 120
+    assert payload['hasMore'] is True
+    assert payload['album']['photoCount'] == 300
+    assert [p['filename'] for p in payload['photos']] == names[120:240]
+    assert seen_batches == [names[120:240]]
 
 
 def test_raw_full_preview_route_returns_native_preview_jpeg(monkeypatch):

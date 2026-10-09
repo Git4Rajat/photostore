@@ -37,6 +37,7 @@ def public_album_share_page(token: str):
 @public_bp.route('/api/public/albums/<token>', methods=['GET'])
 @public_bp.route('/api/public/albums/<token>', methods=['POST'])
 def public_album(token: str):
+    data = app.request.get_json(silent=True) or {} if app.request.method == 'POST' else {}
     entity = app._find_public_album_by_token(token)
     if not entity:
         return app.jsonify({'error': 'Album not found'}), 404
@@ -48,18 +49,26 @@ def public_album(token: str):
     access_code = app._album_access_code(entity)
     provided = ''
     if app.request.method == 'POST':
-        data = app.request.get_json(silent=True) or {}
         provided = (data.get('accessCode') or '').strip()
 
     gate = app._album_access_code_gate(entity, token, provided)
     if gate is not None:
         return gate
 
-    filenames = app._album_filenames(entity)
+    try:
+        raw_offset = data.get('offset') if app.request.method == 'POST' else app.request.args.get('offset', 0)
+        raw_limit = data.get('limit') if app.request.method == 'POST' else app.request.args.get('limit', 120)
+        offset = max(0, int(raw_offset or 0))
+        limit = max(1, min(240, int(raw_limit or 120)))
+    except (TypeError, ValueError):
+        return app.jsonify({'error': 'Invalid paging parameters.'}), 400
+
+    filenames, total = app.album_store.page(entity, offset, limit)
     owner_id = str(entity.get('PartitionKey') or '')
+    metadata_by_name = app._get_metadata_entities(owner_id, filenames) if owner_id and filenames else {}
     photos = []
     for name in filenames:
-        metadata = app._get_metadata_entity(owner_id, name) if owner_id else {}
+        metadata = metadata_by_name.get(name) if owner_id else {}
         if (metadata or {}).get('processing_state') == 'deleted':
             continue
         urls = app._public_photo_urls(token, name, blob_name=app._blob_name_from_metadata(metadata, name))
@@ -76,9 +85,12 @@ def public_album(token: str):
     resp = app.make_response(app.jsonify({
         'album': {
             'name': entity.get('name', ''),
-            'photoCount': len(filenames),
+            'photoCount': total,
         },
         'photos': photos,
+        'total': total,
+        'offset': offset,
+        'hasMore': offset + limit < total,
     }))
     # Issue a signed grant so the browser can subsequently load the (code-protected)
     # media, which are fetched as <img src> and cannot carry the access code themselves.

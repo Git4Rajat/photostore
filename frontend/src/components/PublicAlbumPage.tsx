@@ -86,6 +86,7 @@ const BUFFER_REVEAL_TIMEOUT_MS = 6000;
 // PRELOAD_NEIGHBOR_COUNT there) takes over once the viewer is open.
 const PREVIEW_PREFETCH_COUNT = 20;
 const PREVIEW_PREFETCH_CONCURRENCY = 3;
+const PUBLIC_ALBUM_PAGE_SIZE = 120;
 
 const parsePublicAlbumError = (err: unknown): Record<string, unknown> => {
     // requestJson() always throws a classified ApiError, never the raw axios
@@ -144,6 +145,9 @@ const PublicAlbumPage: React.FC = () => {
     const [accessCode, setAccessCode] = useState<string>('');
     const [album, setAlbum] = useState<PublicAlbum | null>(null);
     const [photos, setPhotos] = useState<PublicPhoto[]>([]);
+    const [offset, setOffset] = useState<number>(0);
+    const [hasMore, setHasMore] = useState<boolean>(false);
+    const [loadingMore, setLoadingMore] = useState<boolean>(false);
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
     const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
     const [selectMode, setSelectMode] = useState<boolean>(false);
@@ -157,6 +161,7 @@ const PublicAlbumPage: React.FC = () => {
     // running percentage (see the meta line below) until it finishes.
     const [bufferReady, setBufferReady] = useState<boolean>(true);
     const [bufferPercent, setBufferPercent] = useState<number>(100);
+    const bufferedPhotoCountRef = useRef<number>(0);
 
     // The grid unmounts entirely while the viewer is open (see the
     // viewerIndex === null gate below), so the page collapses to the
@@ -214,17 +219,24 @@ const PublicAlbumPage: React.FC = () => {
         setViewerIndex(index);
     }, []);
 
-    const loadPublicAlbum = useCallback(async (code: string = '') => {
+    const loadPublicAlbum = useCallback(async (code: string = '', nextOffset = 0, append = false) => {
             if (!token) {
                 setError('Invalid album link.');
                 setLoading(false);
                 return;
             }
-            setLoading(true);
-            setError('');
-            setLoadError(null);
-            setRetryAfterSeconds(null);
+            if (append) {
+                setLoadingMore(true);
+            } else {
+                setLoading(true);
+                setError('');
+                setLoadError(null);
+                setRetryAfterSeconds(null);
+                setOffset(0);
+                setHasMore(false);
+            }
             try {
+                const albumPath = `/public/albums/${encodeURIComponent(token)}?offset=${nextOffset}&limit=${PUBLIC_ALBUM_PAGE_SIZE}`;
                 // withCredentials: this endpoint Set-Cookies a signed "grant" for
                 // code-protected albums so the (cookie-only, cross-origin) preview/
                 // image/thumbnail proxy routes can verify the code was already
@@ -232,9 +244,9 @@ const PublicAlbumPage: React.FC = () => {
                 // credentials on this call the browser never stores that cookie
                 // cross-origin, so every media request 404s and the lightbox
                 // silently falls back to the thumbnail for every photo.
-                const response = code.trim()
-                    ? await post(`/public/albums/${encodeURIComponent(token)}`, { accessCode: code.trim() }, { withCredentials: true })
-                    : await get(`/public/albums/${encodeURIComponent(token)}`, { withCredentials: true });
+                const response = code.trim() && !append
+                    ? await post(albumPath, { accessCode: code.trim(), offset: nextOffset, limit: PUBLIC_ALBUM_PAGE_SIZE }, { withCredentials: true })
+                    : await get(albumPath, { withCredentials: true });
 
                 if (!response || !response.album) {
                     setError('This public album link is invalid or no longer available.');
@@ -242,12 +254,29 @@ const PublicAlbumPage: React.FC = () => {
                     return;
                 }
 
+                const nextPhotos = Array.isArray(response.photos) ? response.photos : [];
                 setAlbum(response.album || null);
-                setPhotos(Array.isArray(response.photos) ? response.photos : []);
-                setSelectedPhotos(new Set());
-                setSelectMode(false);
+                setPhotos((prev) => {
+                    if (!append) {
+                        return nextPhotos;
+                    }
+                    const seen = new Set(prev.map((photo) => photo.filename));
+                    return [...prev, ...nextPhotos.filter((photo: PublicPhoto) => !seen.has(photo.filename))];
+                });
+                const loadedThrough = nextOffset + nextPhotos.length;
+                setOffset(loadedThrough);
+                setHasMore(Boolean(response.hasMore));
+                if (!append) {
+                    setSelectedPhotos(new Set());
+                    setSelectMode(false);
+                    bufferedPhotoCountRef.current = 0;
+                }
                 setCodeRequired(false);
             } catch (err) {
+                if (append) {
+                    notifyApiError(err, { context: 'Unable to load more shared album photos.', retry: () => { void loadPublicAlbum(accessCode, nextOffset, true); } });
+                    return;
+                }
                 setLoadError(classifyApiError(err));
                 const payload = parsePublicAlbumError(err);
                 if (payload.codeRequired === true) {
@@ -267,9 +296,20 @@ const PublicAlbumPage: React.FC = () => {
                     setError(errorMsg);
                 }
             } finally {
-                setLoading(false);
+                if (append) {
+                    setLoadingMore(false);
+                } else {
+                    setLoading(false);
+                }
             }
-    }, [token]);
+    }, [token, accessCode]);
+
+    const loadMorePhotos = useCallback(() => {
+        if (!hasMore || loadingMore || loading) {
+            return;
+        }
+        void loadPublicAlbum(accessCode, offset, true);
+    }, [accessCode, hasMore, loading, loadingMore, loadPublicAlbum, offset]);
 
     useBackendRecoveryRetry(loadError, () => { void loadPublicAlbum(accessCode); });
 
@@ -298,15 +338,22 @@ const PublicAlbumPage: React.FC = () => {
     // unrelated re-renders like selection toggling.
     useEffect(() => {
         if (photos.length === 0) {
+            bufferedPhotoCountRef.current = 0;
             setBufferReady(true);
             setBufferPercent(100);
             return undefined;
         }
+        const shouldGateReveal = bufferedPhotoCountRef.current === 0 || photos.length < bufferedPhotoCountRef.current;
+        bufferedPhotoCountRef.current = photos.length;
         let cancelled = false;
         let settled = 0;
         const total = photos.length;
-        setBufferReady(false);
-        setBufferPercent(0);
+        if (shouldGateReveal) {
+            setBufferReady(false);
+            setBufferPercent(0);
+        } else {
+            setBufferReady(true);
+        }
 
         const resolveThumbSrc = (url?: string): string => {
             if (!url) {
@@ -339,18 +386,20 @@ const PublicAlbumPage: React.FC = () => {
                     return;
                 }
                 settled += 1;
-                setBufferPercent(Math.round((settled / total) * 100));
+                if (shouldGateReveal) {
+                    setBufferPercent(Math.round((settled / total) * 100));
+                }
             }
         };
         const workerCount = Math.min(BUFFER_CONCURRENCY, total);
         void Promise.all(Array.from({ length: workerCount }, runWorker)).then(() => {
-            if (!cancelled) {
+            if (!cancelled && shouldGateReveal) {
                 setBufferReady(true);
             }
         });
 
         const timeoutId = window.setTimeout(() => {
-            if (!cancelled) {
+            if (!cancelled && shouldGateReveal) {
                 setBufferReady(true);
             }
         }, BUFFER_REVEAL_TIMEOUT_MS);
@@ -648,55 +697,69 @@ const PublicAlbumPage: React.FC = () => {
                             )}
 
                             {!loading && !error && bufferReady && photos.length > 0 && viewerIndex === null && (
-                                <div className={`pt-grid pt-public-grid${selectMode ? ' select-mode' : ''}`}>
-                                    {photos.map((photo, index) => {
-                                        const isSelected = selectedPhotos.has(photo.filename);
-                                        const isVideo = isVideoFilename(photo.filename);
-                                        return (
-                                            <div
-                                                key={photo.filename}
-                                                className={`pt-tile${isSelected ? ' selected' : ''}${photo.filename === returnHighlightFilename ? ' tile-return-highlight' : ''}`}
-                                                role="button"
-                                                tabIndex={0}
-                                                data-tile-id={photo.filename}
-                                                title={photo.filename}
-                                                onClick={() => { if (selectMode) { togglePhoto(photo.filename); } else { openViewerAt(index); } }}
-                                                onKeyDown={(e) => {
-                                                    if (e.key === 'Enter' || e.key === ' ') {
-                                                        e.preventDefault();
-                                                        if (selectMode) { togglePhoto(photo.filename); } else { openViewerAt(index); }
-                                                    }
-                                                }}
+                                <div>
+                                    <div className={`pt-grid pt-public-grid${selectMode ? ' select-mode' : ''}`}>
+                                        {photos.map((photo, index) => {
+                                            const isSelected = selectedPhotos.has(photo.filename);
+                                            const isVideo = isVideoFilename(photo.filename);
+                                            return (
+                                                <div
+                                                    key={photo.filename}
+                                                    className={`pt-tile${isSelected ? ' selected' : ''}${photo.filename === returnHighlightFilename ? ' tile-return-highlight' : ''}`}
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    data-tile-id={photo.filename}
+                                                    title={photo.filename}
+                                                    onClick={() => { if (selectMode) { togglePhoto(photo.filename); } else { openViewerAt(index); } }}
+                                                    onKeyDown={(e) => {
+                                                        if (e.key === 'Enter' || e.key === ' ') {
+                                                            e.preventDefault();
+                                                            if (selectMode) { togglePhoto(photo.filename); } else { openViewerAt(index); }
+                                                        }
+                                                    }}
+                                                >
+                                                    <img
+                                                        className="pt-tile-img"
+                                                        src={resolveMediaSrc(photo.thumbnailUrl)}
+                                                        alt={photo.filename}
+                                                        loading="lazy"
+                                                        draggable={false}
+                                                        style={tileRotationStyle(photo)}
+                                                    />
+                                                    {isVideo && (
+                                                        <span className="pt-tile-video" aria-hidden="true">
+                                                            <PlayCircleIcon />
+                                                        </span>
+                                                    )}
+                                                    {selectMode && (
+                                                        <button
+                                                            type="button"
+                                                            className={`pt-tile-check${isSelected ? ' on' : ''}`}
+                                                            aria-label={isSelected ? 'Deselect' : 'Select'}
+                                                            aria-pressed={isSelected}
+                                                            onClick={(e) => { e.stopPropagation(); togglePhoto(photo.filename); }}
+                                                            onTouchStart={(e) => e.stopPropagation()}
+                                                            {...dragSelectHandlers}
+                                                        >
+                                                            <CheckCircleIcon />
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                    {hasMore && (
+                                        <div className="pt-public-state" style={{ minHeight: 'auto', padding: '18px 0 6px' }}>
+                                            <button
+                                                type="button"
+                                                className="btn mock-cta"
+                                                disabled={loadingMore}
+                                                onClick={loadMorePhotos}
                                             >
-                                                <img
-                                                    className="pt-tile-img"
-                                                    src={resolveMediaSrc(photo.thumbnailUrl)}
-                                                    alt={photo.filename}
-                                                    loading="lazy"
-                                                    draggable={false}
-                                                    style={tileRotationStyle(photo)}
-                                                />
-                                                {isVideo && (
-                                                    <span className="pt-tile-video" aria-hidden="true">
-                                                        <PlayCircleIcon />
-                                                    </span>
-                                                )}
-                                                {selectMode && (
-                                                    <button
-                                                        type="button"
-                                                        className={`pt-tile-check${isSelected ? ' on' : ''}`}
-                                                        aria-label={isSelected ? 'Deselect' : 'Select'}
-                                                        aria-pressed={isSelected}
-                                                        onClick={(e) => { e.stopPropagation(); togglePhoto(photo.filename); }}
-                                                        onTouchStart={(e) => e.stopPropagation()}
-                                                        {...dragSelectHandlers}
-                                                    >
-                                                        <CheckCircleIcon />
-                                                    </button>
-                                                )}
-                                            </div>
-                                        );
-                                    })}
+                                                {loadingMore ? 'Loading…' : 'Load more photos'}
+                                            </button>
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
