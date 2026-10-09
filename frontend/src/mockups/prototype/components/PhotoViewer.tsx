@@ -168,6 +168,13 @@ export const PhotoViewer: React.FC = () => {
     }, [showInfo, photo, meta]);
 
     const { url: mainSrc, loading: fullResLoading, progress: fullResProgress, status: mediaStatus } = useMainMedia(photo, fullRes);
+    // Defense in depth: useMainMedia resolves a tier whose fetch succeeds
+    // (200, bytes arrive) but whose content the browser still can't decode
+    // as an image (e.g. a format-detection gap letting raw/undecoded bytes
+    // through) shows up here, not as a network error -- the <img> itself
+    // fires onError. Treated the same as the hook's own 'unavailable'.
+    const [decodeFailed, setDecodeFailed] = useState(false);
+    useEffect(() => { setDecodeFailed(false); }, [mainSrc]);
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
     const photoRef = useRef<HTMLDivElement>(null);
@@ -489,15 +496,16 @@ export const PhotoViewer: React.FC = () => {
                         onMouseLeave={() => { panRef.current = null; }}
                         style={{ cursor: zoomed ? 'grab' : 'default' }}
                     >
-                        {mainSrc ? (
+                        {mainSrc && !decodeFailed ? (
                             <img
                                 className="pt-viewer-img"
                                 src={mainSrc}
                                 alt={photo.filename}
                                 draggable={false}
                                 style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)` }}
+                                onError={() => setDecodeFailed(true)}
                             />
-                        ) : mediaStatus === 'unavailable' ? (
+                        ) : mediaStatus === 'unavailable' || decodeFailed ? (
                             <div className="pt-viewer-unavailable">
                                 <p>Unsupported format — unable to generate a preview.</p>
                                 <button

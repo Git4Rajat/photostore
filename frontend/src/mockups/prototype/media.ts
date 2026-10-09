@@ -244,13 +244,19 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaSt
         setLoading(fullRes);
         const controller = new AbortController();
         // 'image' is a SAS URL to the original blob -- for RAW files
-        // (CR3/NEF/ARW/DNG/...) that's the undecoded raw file itself, which no
-        // browser can render as an <img>. Full-res mode still has to prefer
-        // the (already browser-viewable) preview render for those, or
-        // toggling "FR" just shows a broken image.
-        const order: Array<'preview' | 'image' | 'thumbnail'> = fullRes && !isRawFilename(filename)
-            ? ['image', 'preview', 'thumbnail']
-            : ['preview', 'image', 'thumbnail'];
+        // (CR3/NEF/ARW/DNG/.../SRW) that's the undecoded raw file itself,
+        // which no browser can render as an <img>, REGARDLESS of fullRes: a
+        // fetch of it still succeeds (200, bytes arrive) and createObjectURL
+        // happily wraps raw sensor bytes into a blob: URL, so without this
+        // exclusion a RAW photo whose preview isn't generated yet would
+        // "succeed" into an undecodable blob instead of falling through to
+        // thumbnail or retrying -- confirmed live via a Network-panel trace
+        // (Samsung__NX300__nx300.SRW: blob: URL created, never rendered).
+        const order: Array<'preview' | 'image' | 'thumbnail'> = isRawFilename(filename)
+            ? ['preview', 'thumbnail']
+            : fullRes
+                ? ['image', 'preview', 'thumbnail']
+                : ['preview', 'image', 'thumbnail'];
 
         const attempt = async (retryIndex: number) => {
             try {
