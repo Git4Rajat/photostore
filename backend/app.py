@@ -3538,14 +3538,16 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
 
 
 IPWORK_CLUSTER_BATCH_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_MAX_FILENAMES', '1500'))
-# Pure safety ceiling, not an abandonment timer -- see _is_upload_active's
-# docstring for why the activity check itself can't get stuck and doesn't
-# need this for recovery (e.g. only matters if the activity-table read
-# itself starts failing).
-IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS', '300'))
-# How recent a user's upload activity heartbeat (_mark_upload_activity_heartbeat)
-# must be to count as "still uploading" for _is_upload_active.
-UPLOAD_ACTIVITY_WINDOW_SECONDS = float(os.getenv('UPLOAD_ACTIVITY_WINDOW_SECONDS', '30'))
+# The real trigger: flush once a user's upload has gone quiet for this long
+# (a GAP in incoming filenames) -- NOT "flush after this much total time has
+# passed," which would cut off a still-active upload. See _is_upload_active.
+UPLOAD_ACTIVITY_WINDOW_SECONDS = float(os.getenv('UPLOAD_ACTIVITY_WINDOW_SECONDS', '300'))
+# True last-resort ceiling, not a normal trigger -- only matters if the
+# activity-table read itself starts failing (_is_upload_active fails safe to
+# False on error, so this would rarely even be reached in practice). Set far
+# above UPLOAD_ACTIVITY_WINDOW_SECONDS so it never interrupts a genuinely
+# active, continuously-uploading session.
+IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS', '1800'))
 # Flush-loop check cadence -- a cheap per-buffered-user table point-read now,
 # not a single queue-depth call, so this can poll much more often than the
 # old fixed-timer design without meaningful extra cost.
@@ -14108,11 +14110,21 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
         for key in order:
             indices = groups[key]
             user = key if isinstance(key, str) else None
-            if not user or len(indices) == 1:
+            if not user:
                 for i in indices:
                     _process_clustering_queue_message(take(i), queue_client, queue_name,
                                                       max_retries, deadletter_queue_client)
                 continue
+            # Always route through the batching-capable path, even for a
+            # single message -- it may itself carry hundreds of filenames
+            # (see _buffer_incremental_assign_filename), and the plain
+            # per-message dispatcher processes those serially with one full
+            # lease acquisition per filename instead of one shared lease for
+            # the whole message (confirmed live: a single 570-filename
+            # message took 130s through the old len(indices)==1 shortcut,
+            # vs ~13-30s/message through the staged path). A genuinely
+            # trivial single-filename message still ends up just as fast
+            # here -- one small chunk, one lease, same as before.
             _process_clustering_user_group(user, indices, messages, take, queue_client,
                                            queue_name, max_retries, deadletter_queue_client)
     finally:

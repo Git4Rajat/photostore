@@ -122,9 +122,14 @@ def test_accumulation_stops_at_idle_timeout(setup):
         queue, 'q', 5, batch_size=8, target_size=500, idle_timeout_seconds=0.1, poll_seconds=0.02)
     elapsed = time.monotonic() - started
     assert elapsed < 2
-    # A single message is a group of one -- processed via the regular
-    # per-message path (assign()), not batch().
-    assert setup.assign_calls == [('u', 'a.jpg', ['a.jpg'])]
+    # Even a single message always goes through the batching-capable path
+    # now (not the plain per-message assign() dispatcher) -- a lone message
+    # can itself carry many filenames (see _buffer_incremental_assign_filename),
+    # and routing on message count alone used to skip staging entirely for
+    # exactly that case (confirmed live: a single 570-filename message took
+    # 130s of serial per-filename lease acquisition before this fix).
+    assert setup.leases == [('u', ['a.jpg'], True)]
+    assert setup.assign_calls == []
 
 
 def test_grouping_spans_messages_across_multiple_pages(setup):
@@ -138,9 +143,11 @@ def test_grouping_spans_messages_across_multiple_pages(setup):
         queue, 'q', 5, batch_size=2, target_size=3, idle_timeout_seconds=60, poll_seconds=0.01)
     by_user = {user: ids for user, ids, _staged in setup.leases}
     assert sorted(by_user['u']) == ['a.jpg', 'b.jpg']
-    # 'other' has only one message in the whole accumulated pool -- a
-    # singleton group, so it goes through assign() directly, not batch().
-    assert setup.assign_calls == [('other', 'x.jpg', ['x.jpg'])]
+    # 'other' has only one message in the whole accumulated pool, but still
+    # goes through the same batching-capable path (one-message groups are
+    # no longer special-cased -- see test_accumulation_stops_at_idle_timeout).
+    assert by_user['other'] == ['x.jpg']
+    assert setup.assign_calls == []
 
 
 def test_oversized_user_group_is_chunked_into_multiple_staged_batches(setup):
@@ -158,17 +165,18 @@ def test_oversized_user_group_is_chunked_into_multiple_staged_batches(setup):
     assert queue.deleted == messages
 
 
-def test_single_message_with_many_filenames_is_a_singleton_group(setup):
-    # One message carries several filenames (see
-    # _buffer_incremental_assign_filename) but is the only message for this
-    # user in the pool -- still a singleton group of one, dispatched via
-    # assign() once per filename rather than batch().
+def test_single_fat_message_still_goes_through_the_staged_batch_path(setup):
+    # One message carrying several filenames (see
+    # _buffer_incremental_assign_filename) is still a "group of one message"
+    # but must NOT take the plain per-message assign() shortcut -- that
+    # shortcut used to key off message count, which broke once one message
+    # could carry hundreds of filenames (confirmed live: 130s of serial
+    # per-filename lease acquisition for a single 570-filename message).
     queue = PagedQueue([[message_multi(['a.jpg', 'b.jpg', 'c.jpg'])]])
     assert app._poll_clustering_queue_batch_once(
         queue, 'q', 5, batch_size=8, target_size=500, idle_timeout_seconds=0.1, poll_seconds=0.02)
-    assert sorted(setup.assign_calls) == [
-        ('u', 'a.jpg', ['a.jpg']), ('u', 'b.jpg', ['b.jpg']), ('u', 'c.jpg', ['c.jpg']),
-    ]
+    assert setup.leases == [('u', ['a.jpg', 'b.jpg', 'c.jpg'], True)]
+    assert setup.assign_calls == []
 
 
 def test_multi_filename_messages_share_one_staged_batch(setup):
