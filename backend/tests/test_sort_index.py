@@ -90,7 +90,7 @@ def test_build_snapshot_projects_only_sort_relevant_fields(sort_ctx):
     assert snapshot is not None
     assert len(snapshot.rows) == 1
     row = snapshot.rows[0]
-    assert set(row.keys()) == {'RowKey', 'captureDate', 'rating', 'likes', 'uploadDate'}
+    assert set(row.keys()) == {'RowKey', 'captureDate', 'rating', 'likes', 'uploadDate', 'thumb'}
     assert row['rating'] == 4
     assert row['likes'] == 2
     assert row['uploadDate'] == '2026-01-01T00:00:00+00:00'

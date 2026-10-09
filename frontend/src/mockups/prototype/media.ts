@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { get, post, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
-import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress } from '../../services/imageClient';
+import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress, ProtectedFetchError } from '../../services/imageClient';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { resolveMediaAccessUrls } from '../../services/mediaAccessCache';
 import { getCachedSortThumb } from '../../services/localSortIndex';
-import { getCachedMediaToken, thumbnailUrlForBlob } from '../../services/mediaToken';
+import { getCachedMediaToken, imageUrlForBlob, previewUrlForBlob, thumbnailUrlForBlob } from '../../services/mediaToken';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
 import { isRawFilename } from '../../utils/photoDisplay';
 import type { Photo } from './types';
@@ -95,20 +95,38 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
     return out;
 }
 
-// Mint a scoped access URL for one of the photo's media tiers. Returns '' when
-// that tier isn't available yet (e.g. a preview that hasn't been generated).
+// Direct container-token URL for one of a photo's media tiers (thumbnail/
+// preview/full-res all share the same physical blob name -- just a different
+// container/prefix, see /api/photos/media-token), or '' when the blob name or
+// token isn't known client-side yet.
+const directMediaUrl = (kind: 'preview' | 'image' | 'thumbnail', filename: string): string => {
+    const blob = getCachedSortThumb(filename);
+    const token = getCachedMediaToken();
+    if (!blob || !token) {
+        return '';
+    }
+    if (kind === 'thumbnail') return thumbnailUrlForBlob(blob, token);
+    if (kind === 'preview') return previewUrlForBlob(blob, token);
+    return imageUrlForBlob(blob, token);
+};
+
+// Resolves one of a photo's media tiers to a loadable URL. Prefers the direct
+// container-token URL (zero backend calls, the common case once the sort
+// index/media token are warm -- see directMediaUrl); falls back to the
+// batched/cached access-batch resolvers only when the blob name isn't known
+// client-side yet (a very recently uploaded file whose sort-index row hasn't
+// synced, or proxy mode with no SAS token at all).
 //
-// Routed through the batched, cached resolvers (mediaAccessCache.ts /
-// thumbnailAccessCache.ts) instead of the single-item
-// GET /api/photos/access/<kind>/<filename> route this used to call directly:
-// that route did a guaranteed Table Storage point-read on every single photo
-// view/navigation, never cached, never batched. Even resolving one filename
-// through the batch endpoint is cheaper (it reads the already-warm gallery
-// scan cache instead of a fresh point-read), and a photo re-opened within the
-// session -- or preloaded as a viewer neighbor, see preloadMediaAccessUrls
-// below -- resolves from the in-memory/localStorage cache with no backend
-// call at all.
+// Deliberately doesn't check *_status first: a direct URL for a not-yet-
+// generated blob 404s, and the caller (useMainMedia) treats that as "still
+// generating" and retries with backoff instead of asking this backend whether
+// it's ready first -- that status check used to be the dominant source of
+// /api/photos/access-batch traffic (see the 2026-10-09 HAR investigation).
 const accessUrl = async (kind: 'preview' | 'image' | 'thumbnail', filename: string): Promise<string> => {
+    const direct = directMediaUrl(kind, filename);
+    if (direct) {
+        return direct;
+    }
     const map = kind === 'thumbnail'
         ? await resolveThumbnailAccessUrls([filename])
         : await resolveMediaAccessUrls(kind, [filename]);
@@ -131,6 +149,51 @@ export function preloadMediaAccessUrls(filenames: string[]): void {
     void resolveMediaAccessUrls('preview', targets);
 }
 
+// How long to wait before re-attempting a tier whose blob 404'd (not
+// generated yet), and how many times -- ~1 minute of backoff total before
+// giving up and showing the terminal "unavailable" state. A 404 is the
+// expected, common case for a photo opened moments after upload; genuinely
+// unsupported/corrupt files settle into 'unavailable' once these are
+// exhausted instead of retrying forever.
+const PENDING_RETRY_DELAYS_MS = [4000, 8000, 16000, 32000];
+
+// Tries each media tier's direct/resolved URL in order, falling through to the
+// next tier on a 404 (not generated yet) instead of giving up immediately --
+// e.g. a photo whose preview isn't ready yet but whose thumbnail already is
+// still shows *something*. Returns '' (not an error) when every tier 404'd
+// this round; re-throws any non-404 failure (network/auth/decode error) so
+// the caller can fail fast instead of retrying something that can't succeed.
+const fetchFirstAvailableTier = async (
+    order: Array<'preview' | 'image' | 'thumbnail'>,
+    filename: string,
+    fallbackUrl: string | undefined,
+    fullRes: boolean,
+    signal: AbortSignal,
+    onProgress: (loadedBytes: number, totalBytes: number) => void,
+): Promise<string> => {
+    const fetchOne = (target: string) => (fullRes
+        ? fetchProtectedBlobUrlWithProgress(target, { signal, onProgress })
+        : fetchProtectedBlobUrl(target));
+    for (const kind of order) {
+        const target = await accessUrl(kind, filename);
+        if (!target) continue;
+        try {
+            return await fetchOne(target);
+        } catch (err) {
+            if (err instanceof ProtectedFetchError && err.status === 404) continue;
+            throw err;
+        }
+    }
+    if (fallbackUrl && isHttpUrl(fallbackUrl)) {
+        try {
+            return await fetchOne(fallbackUrl);
+        } catch (err) {
+            if (!(err instanceof ProtectedFetchError && err.status === 404)) throw err;
+        }
+    }
+    return '';
+};
+
 /**
  * Resolves the viewer image for a photo to an object URL, revoking it on
  * change/unmount. In preview mode it prefers the shrunk preview tier and falls
@@ -138,6 +201,13 @@ export function preloadMediaAccessUrls(filenames: string[]): void {
  * preview blob isn't ready yet (HEIC/CR3/video) still show *something* instead
  * of a blank stage. `fullRes` flips the order to fetch the original first — used
  * by the viewer's "Full res" button.
+ *
+ * Every tier is attempted directly (no "is it ready" backend call first --
+ * see accessUrl/directMediaUrl); a blob that 404s because it isn't generated
+ * yet retries with backoff (`status: 'pending'`) instead of giving up, and
+ * settles into a terminal `status: 'unavailable'` once retries are exhausted
+ * or a non-404 error occurs, so the caller can show a graceful message instead
+ * of an endless spinner.
  */
 export interface MainMediaState {
     url: string | undefined;
@@ -145,85 +215,95 @@ export interface MainMediaState {
     loading: boolean;
     /** 0-100 download progress for the in-flight `fullRes` fetch. */
     progress: number;
+    /** 'pending': not generated yet, retrying with backoff. 'unavailable': gave up (terminal). undefined: normal. */
+    status?: 'pending' | 'unavailable';
 }
 
 export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaState {
     const [url, setUrl] = useState<string | undefined>(undefined);
     const [loading, setLoading] = useState(false);
     const [progress, setProgress] = useState(0);
+    const [status, setStatus] = useState<'pending' | 'unavailable' | undefined>(undefined);
     const filename = photo?.filename;
+    const fallbackUrl = photo?.thumbnailUrl;
 
     useEffect(() => {
         if (!filename) {
             setUrl(undefined);
             setLoading(false);
             setProgress(0);
+            setStatus(undefined);
             return;
         }
         let active = true;
         let created: string | undefined;
+        let retryTimer: ReturnType<typeof setTimeout> | undefined;
         setUrl(undefined);
         setProgress(0);
+        setStatus(undefined);
         setLoading(fullRes);
         const controller = new AbortController();
-        void (async () => {
+        // 'image' is a SAS URL to the original blob -- for RAW files
+        // (CR3/NEF/ARW/DNG/...) that's the undecoded raw file itself, which no
+        // browser can render as an <img>. Full-res mode still has to prefer
+        // the (already browser-viewable) preview render for those, or
+        // toggling "FR" just shows a broken image.
+        const order: Array<'preview' | 'image' | 'thumbnail'> = fullRes && !isRawFilename(filename)
+            ? ['image', 'preview', 'thumbnail']
+            : ['preview', 'image', 'thumbnail'];
+
+        const attempt = async (retryIndex: number) => {
             try {
-                // 'image' is a SAS URL to the original blob -- for RAW files
-                // (CR3/NEF/ARW/DNG/...) that's the undecoded raw file itself,
-                // which no browser can render as an <img>. Full-res mode still
-                // has to prefer the (already browser-viewable) preview render
-                // for those, or toggling "FR" just shows a broken image.
-                const order: Array<'preview' | 'image' | 'thumbnail'> = fullRes && !isRawFilename(filename)
-                    ? ['image', 'preview', 'thumbnail']
-                    : ['preview', 'image', 'thumbnail'];
-                let target = '';
-                for (const kind of order) {
-                    target = await accessUrl(kind, filename);
-                    if (target) break;
-                }
-                if (!target && photo?.thumbnailUrl && isHttpUrl(photo.thumbnailUrl)) {
-                    target = photo.thumbnailUrl;
-                }
-                if (!target) {
+                const blobUrl = await fetchFirstAvailableTier(order, filename, fallbackUrl, fullRes, controller.signal, (loadedBytes, totalBytes) => {
+                    if (active) {
+                        setProgress(totalBytes > 0 ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100)) : 0);
+                    }
+                });
+                if (!active) {
+                    if (blobUrl) URL.revokeObjectURL(blobUrl);
                     return;
                 }
-                const blobUrl = fullRes
-                    ? await fetchProtectedBlobUrlWithProgress(target, {
-                          signal: controller.signal,
-                          onProgress: (loadedBytes, totalBytes) => {
-                              if (active) {
-                                  setProgress(totalBytes > 0 ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100)) : 0);
-                              }
-                          },
-                      })
-                    : await fetchProtectedBlobUrl(target);
-                if (!active) {
-                    URL.revokeObjectURL(blobUrl);
+                if (!blobUrl) {
+                    // Every tier 404'd -- nothing generated yet. Retry with backoff
+                    // (loading/FR ring stays on through retries, see below).
+                    if (retryIndex < PENDING_RETRY_DELAYS_MS.length) {
+                        setStatus('pending');
+                        retryTimer = setTimeout(() => { void attempt(retryIndex + 1); }, PENDING_RETRY_DELAYS_MS[retryIndex]);
+                        return;
+                    }
+                    setStatus('unavailable');
+                    setLoading(false);
                     return;
                 }
                 created = blobUrl;
                 setProgress(100);
+                setStatus(undefined);
                 setUrl(blobUrl);
+                setLoading(false);
             } catch {
                 if (active) {
                     setUrl(undefined);
-                }
-            } finally {
-                if (active) {
+                    setStatus('unavailable');
                     setLoading(false);
                 }
             }
-        })();
+        };
+
+        void attempt(0);
+
         return () => {
             active = false;
             controller.abort();
+            if (retryTimer) {
+                clearTimeout(retryTimer);
+            }
             if (created) {
                 URL.revokeObjectURL(created);
             }
         };
     }, [filename, fullRes]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    return { url, loading, progress };
+    return { url, loading, progress, status };
 }
 
 // Shape of GET /api/photos/<filename>/metadata, trimmed to the fields the
@@ -257,26 +337,21 @@ export async function setPhotoRotation(filename: string, rotation: number): Prom
     await post(`/api/photos/${encodeURIComponent(filename)}/rotation`, { rotation: normalized });
 }
 
-// Resolves the best downloadable/shareable URL for a photo: the full-size
-// original if available, then the preview, then a direct thumbnail SAS.
-const resolveDownloadTarget = async (photo: Photo): Promise<string> => {
-    for (const kind of ['image', 'preview'] as const) {
-        const map = await resolveMediaAccessUrls(kind, [photo.filename]);
-        const url = map.get(photo.filename);
-        if (url) {
-            return url;
-        }
-    }
-    return photo.thumbnailUrl && isHttpUrl(photo.thumbnailUrl) ? photo.thumbnailUrl : '';
-};
+// Resolves a photo's best downloadable media (full-size original, else
+// preview, else thumbnail) directly to a fetched object URL -- same 404-
+// tolerant per-tier fallback as the viewer (see fetchFirstAvailableTier), so
+// a photo whose preview isn't generated yet still downloads its thumbnail
+// instead of failing outright.
+const fetchDownloadBlobUrl = (photo: Photo): Promise<string> => (
+    fetchFirstAvailableTier(['image', 'preview', 'thumbnail'], photo.filename, photo.thumbnailUrl, false, new AbortController().signal, () => {})
+);
 
 /** Downloads a photo's file to the user's device. Throws on failure. */
 export async function downloadPhoto(photo: Photo): Promise<void> {
-    const target = await resolveDownloadTarget(photo);
-    if (!target) {
+    const objectUrl = await fetchDownloadBlobUrl(photo);
+    if (!objectUrl) {
         throw new Error('No downloadable media for this photo.');
     }
-    const objectUrl = await fetchProtectedBlobUrl(target);
     try {
         const anchor = document.createElement('a');
         anchor.href = objectUrl;
@@ -292,9 +367,8 @@ export async function downloadPhoto(photo: Photo): Promise<void> {
 }
 
 async function toShareFile(photo: Photo): Promise<File | null> {
-    const target = await resolveDownloadTarget(photo);
-    if (!target) return null;
-    const objectUrl = await fetchProtectedBlobUrl(target);
+    const objectUrl = await fetchDownloadBlobUrl(photo);
+    if (!objectUrl) return null;
     try {
         const blob = await (await fetch(objectUrl)).blob();
         return new File([blob], photo.filename, { type: blob.type || 'application/octet-stream' });

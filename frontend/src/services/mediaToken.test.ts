@@ -4,11 +4,12 @@ const getMock = vi.fn();
 vi.mock('./apiClient', () => ({ get: (...args: unknown[]) => getMock(...args) }));
 vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => 'lib-1' }));
 
-import { getCachedMediaToken, getMediaToken, invalidateMediaToken, previewUrlForBlob, thumbnailUrlForBlob } from './mediaToken';
+import { getCachedMediaToken, getMediaToken, imageUrlForBlob, invalidateMediaToken, previewUrlForBlob, thumbnailUrlForBlob } from './mediaToken';
 
 const future = (hours: number) => new Date(Date.now() + hours * 3600_000).toISOString();
 const tokenResponse = (hours = 30) => ({
     available: true, baseUrl: 'https://acct.blob.core.windows.net/thumbnails', sas: 'sp=r&sr=c&sig=abc', expiresAt: future(hours), previewPrefix: 'preview/',
+    image: { baseUrl: 'https://acct.blob.core.windows.net/images', sas: 'sp=r&sr=c&sig=def' },
 });
 
 describe('mediaToken', () => {
@@ -27,6 +28,7 @@ describe('mediaToken', () => {
         expect(getCachedMediaToken()).toEqual(token);
         expect(thumbnailUrlForBlob('1ed9-uuid')).toBe('https://acct.blob.core.windows.net/thumbnails/1ed9-uuid?sp=r&sr=c&sig=abc');
         expect(previewUrlForBlob('1ed9-uuid')).toBe('https://acct.blob.core.windows.net/thumbnails/preview/1ed9-uuid.jpg?sp=r&sr=c&sig=abc');
+        expect(imageUrlForBlob('1ed9-uuid')).toBe('https://acct.blob.core.windows.net/images/1ed9-uuid?sp=r&sr=c&sig=def');
     });
 
     it('shares one in-flight request between concurrent callers', async () => {

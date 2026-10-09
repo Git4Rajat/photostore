@@ -5035,12 +5035,14 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         'rating': entity.get('rating') or 0,
         'likes': entity.get('likes') or 0,
         'uploadDate': entity.get('uploadDate') or None,
-        # Physical thumbnail blob name, only once the thumbnail exists: lets the
-        # browser build the thumbnail URL itself from the media token with no
-        # backend call (see GET /api/photos/media-token). Absent -> the client
-        # falls back to the URL lookup-batch returns.
-        **({'thumb': str(entity.get('anonymousImageId') or filename)}
-           if str(entity.get('thumbnail_status') or '').strip().lower() == 'done' else {}),
+        # Physical blob name -- lets the browser build thumbnail/preview/full-res
+        # URLs itself from the media token with no backend call (see GET
+        # /api/photos/media-token). Always present (assigned at upload time,
+        # before any processing step runs) rather than gated on
+        # thumbnail_status/preview_status=='done': the client attempts the
+        # blob directly and treats a 404 as "still generating" instead of
+        # asking this index whether it's ready first.
+        'thumb': str(entity.get('anonymousImageId') or filename),
     }
 
 

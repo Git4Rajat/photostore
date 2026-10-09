@@ -84,6 +84,12 @@ const WorkbenchTile: React.FC<{
     onToggleInfo: () => void;
 }> = ({ photo, thumb, selected, onToggleSelect, infoOpen, onToggleInfo }) => {
     const [meta, setMeta] = useState<PhotoMetadata | null | 'loading'>(null);
+    // Thumbnail URLs are attempted directly without the backend confirming the
+    // blob exists first (see usePhotoThumbnails/media.ts), so a just-uploaded
+    // photo's thumbnail can 404 while still generating. Hide on load failure
+    // so the tile's swatch background shows through instead of a broken icon.
+    const [thumbBroken, setThumbBroken] = useState(false);
+    useEffect(() => setThumbBroken(false), [thumb]);
 
     const openInfo = () => {
         onToggleInfo();
@@ -101,7 +107,16 @@ const WorkbenchTile: React.FC<{
             <button type="button" className="wb-tile-info" aria-label="Photo details" onClick={(e) => { e.stopPropagation(); openInfo(); }}>
                 <InformationCircleIcon />
             </button>
-            {thumb && <img className="wb-tile-img" src={thumb} alt={photo.filename} loading="lazy" draggable={false} />}
+            {thumb && !thumbBroken && (
+                <img
+                    className="wb-tile-img"
+                    src={thumb}
+                    alt={photo.filename}
+                    loading="lazy"
+                    draggable={false}
+                    onError={() => setThumbBroken(true)}
+                />
+            )}
             <div className="wb-tile-foot">
                 <span className="wb-tile-name" title={photo.filename}>{photo.filename}</span>
                 <div className="wb-tile-steps" aria-hidden="true">

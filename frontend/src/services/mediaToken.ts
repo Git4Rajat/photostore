@@ -19,6 +19,8 @@ export interface MediaToken {
     previewPrefix: string;
     /** Face-crop container token (People avatars); absent on older tokens or when unavailable. */
     cover?: { baseUrl: string; sas: string; prefix: string };
+    /** Full-resolution original container token (separate container from thumbnail/preview); absent on older tokens or when unavailable. */
+    image?: { baseUrl: string; sas: string };
 }
 
 interface MediaTokenResponse extends Partial<MediaToken> {
@@ -26,7 +28,7 @@ interface MediaTokenResponse extends Partial<MediaToken> {
 }
 
 const STORAGE_KEY = 'photostore-media-token';
-const STORED_VERSION = 2;
+const STORED_VERSION = 3;
 const REFRESH_MARGIN_MS = 30 * 60 * 1000;
 
 let cached: MediaToken | null = null;
@@ -85,7 +87,8 @@ export const getMediaToken = async (): Promise<MediaToken | null> => {
                 return null;
             }
             const token: MediaToken = {
-                baseUrl: res.baseUrl, sas: res.sas, expiresAt: res.expiresAt, previewPrefix: res.previewPrefix || 'preview/', cover: res.cover,
+                baseUrl: res.baseUrl, sas: res.sas, expiresAt: res.expiresAt, previewPrefix: res.previewPrefix || 'preview/',
+                cover: res.cover, image: res.image,
             };
             cached = token;
             writeStored(key, token);
@@ -113,6 +116,11 @@ export const thumbnailUrlForBlob = (blob: string | undefined | null, token: Medi
 /** Direct preview URL (previews live under `preview/` in the same container). */
 export const previewUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => (
     blob && token ? `${token.baseUrl}/${token.previewPrefix}${encodeBlobPath(blob)}.jpg?${token.sas}` : ''
+);
+
+/** Direct full-resolution original URL (separate container token from thumbnail/preview), or '' when unavailable. */
+export const imageUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => (
+    blob && token?.image ? `${token.image.baseUrl}/${encodeBlobPath(blob)}?${token.image.sas}` : ''
 );
 
 const FACE_CROP_PATH = /^\/api\/faces\/crop\/([^/?#]+)$/;

@@ -56,3 +56,28 @@ export const chunk = <T,>(items: T[], size: number): T[][] => {
     for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
     return out;
 };
+
+/**
+ * Runs `fn` over `items` with at most `limit` in flight at once, instead of
+ * `Promise.all(items.map(fn))` firing every item simultaneously.
+ *
+ * MAX_PAGE_SIZE (600) chunked into lookup-batch calls of 100 means a gallery
+ * page on a large/wide screen can produce 6 chunks; a real HAR capture
+ * (forenkladev-web, 2026-10-09) showed all 6 fired in the same millisecond via
+ * Promise.all, each taking 4.6-5.7s under the resulting backend contention
+ * (vs tens of ms for a single request) -- a worker-pool with a small limit
+ * keeps the first (on-screen) chunk starting immediately while bounding how
+ * many concurrent point-read batches the backend sees at once.
+ */
+export const runWithLimit = async <T,>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> => {
+    let index = 0;
+    const workerCount = Math.max(1, Math.min(limit, items.length));
+    const workers = Array.from({ length: workerCount }, async () => {
+        while (index < items.length) {
+            const current = index;
+            index += 1;
+            await fn(items[current]);
+        }
+    });
+    await Promise.all(workers);
+};

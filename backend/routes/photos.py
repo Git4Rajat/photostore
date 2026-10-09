@@ -650,15 +650,24 @@ def lookup_photo(filename: str):
 
 @photos_bp.route('/api/photos/media-token', methods=['GET'])
 def photos_media_token():
-    """ONE container-scoped, read-only token for every thumbnail and preview.
+    """Container-scoped, read-only tokens for every thumbnail, preview, and
+    full-resolution original -- one call per session (plus one more right
+    before expiry), not one per photo/page.
 
-    The browser builds ``{baseUrl}/{blobName}?{sas}`` itself (blob names come from
-    the sort index / photo summaries), so loading a page of thumbnails involves
-    no backend call and no per-photo signing. The token is day-aligned and
-    deterministic (same delegation key as the per-blob SAS URLs), has no list
-    permission -- blobs are only reachable by their unguessable UUID names -- and
-    previews live in the same container under ``preview/``. Cacheable by the
-    client until ``expiresAt``."""
+    The browser builds ``{baseUrl}/{blobName}?{sas}`` itself (the physical blob
+    name -- anonymousImageId or filename -- is the SAME across all three tiers,
+    just a different container/prefix: thumbnail blob as-is, preview under
+    ``preview/``, full-res in the separate image-container token below), so
+    loading photos involves no backend call and no per-photo signing. Each
+    token is day-aligned and deterministic (same delegation key as the old
+    per-blob SAS URLs), has no list permission -- blobs are only reachable by
+    their unguessable UUID names -- and is cacheable by the client until
+    ``expiresAt``. The browser attempts a blob directly even before its
+    thumbnail/preview is known to exist yet (see _sort_index_row /
+    _build_photo_summary, which expose the blob name unconditionally rather
+    than gating on *_status=='done'); a not-yet-generated blob 404s and the
+    client shows a "preparing" placeholder instead of calling back here to
+    ask first."""
     user_id, error = app._require_user_id()
     if error:
         return error
@@ -687,6 +696,16 @@ def photos_media_token():
         }
     except Exception:
         app.app.logger.warning('Failed to mint face-crop token for %s', user_id, exc_info=True)
+    # Full-resolution originals live in their own container (BLOB_IMAGE_CONTAINER,
+    # not BLOB_THUMBNAIL_CONTAINER) under the same physical blob name as the
+    # thumbnail/preview -- one more token lets the browser build the full-res
+    # URL itself too (full-res button, video playback) instead of a per-file
+    # /api/photos/access-batch round trip.
+    try:
+        image_base, image_sas, _ = app._stable_container_read_sas(app.BLOB_IMAGE_CONTAINER)
+        payload['image'] = {'baseUrl': image_base, 'sas': image_sas}
+    except Exception:
+        app.app.logger.warning('Failed to mint image-container token for %s', user_id, exc_info=True)
     response = app.jsonify(payload)
     response.headers['Cache-Control'] = 'private, max-age=3600'
     return response

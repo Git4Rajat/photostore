@@ -5,6 +5,16 @@ import { faceCropUrlForId, faceIdFromCropPath, getMediaToken } from './mediaToke
 
 const DEFAULT_MAX_PROTECTED_IMAGE_REQUESTS = 4;
 
+/** Thrown on a non-OK fetch response; carries the HTTP status so callers can
+ * tell "not generated yet" (404, worth retrying) from a real failure. */
+export class ProtectedFetchError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 export const fetchProtectedBlobUrl = async (path: string): Promise<string> => {
   const url = resolveApiUrl(path);
   const headers: Record<string, string> = {};
@@ -28,7 +38,7 @@ export const fetchProtectedBlobUrl = async (path: string): Promise<string> => {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(body || `Failed to fetch protected image: ${response.status}`);
+    throw new ProtectedFetchError(body || `Failed to fetch protected image: ${response.status}`, response.status);
   }
 
   // Some backend-relative paths (e.g. /api/faces/crop/<faceId>) return a JSON
@@ -83,7 +93,7 @@ export const fetchProtectedBlobUrlWithProgress = async (
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(body || `Failed to fetch protected image: ${response.status}`);
+    throw new ProtectedFetchError(body || `Failed to fetch protected image: ${response.status}`, response.status);
   }
 
   const totalBytes = Number(response.headers.get('Content-Length') || 0);

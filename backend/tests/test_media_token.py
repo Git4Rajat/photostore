@@ -25,6 +25,8 @@ def test_media_token_returns_one_container_scoped_token(monkeypatch):
     cover = body['cover']
     assert cover['baseUrl'].endswith('/' + app.BLOB_COVER_CONTAINER) and 'sr=c' in cover['sas']
     assert cover['prefix'] == app.hashlib.sha256(b'owner').hexdigest()[:16] + '/' and cover['prefix'].endswith('/')
+    image = body['image']
+    assert image['baseUrl'].endswith('/' + app.BLOB_IMAGE_CONTAINER) and 'sr=c' in image['sas']
 
 
 def test_media_token_unavailable_in_proxy_mode(monkeypatch):
@@ -47,13 +49,16 @@ def test_direct_media_summary_has_blob_not_signed_url(monkeypatch):
     assert s['thumbnailBlob'] == 'uuid-1' and s['thumbnailUrl'] == ''
 
 
-def test_direct_media_keeps_proxy_fallback_when_thumbnail_not_ready(monkeypatch):
+def test_direct_media_exposes_blob_even_when_thumbnail_not_ready_yet(monkeypatch):
+    """The blob name is assigned at upload time, before any processing runs --
+    the client attempts it directly and treats a 404 as "still generating"
+    instead of asking this summary whether it's ready first."""
     monkeypatch.setattr(app, 'MEDIA_URL_MODE', 'sas')
     with app.app.test_request_context('/x'):
         app.g.direct_media = True
-        s = app._build_photo_summary('u', 'a.jpg', _meta(thumbnail_status='pending', preview_status='done'),
+        s = app._build_photo_summary('u', 'a.jpg', _meta(thumbnail_status='pending', preview_status='pending'),
                                      include_props=False, head_missing=False)
-    assert 'thumbnailBlob' not in s and s['thumbnailUrl'].endswith('/preview/a.jpg')
+    assert s['thumbnailBlob'] == 'uuid-1' and s['thumbnailUrl'] == ''
 
 
 def test_default_summary_unchanged_without_flag(monkeypatch):
@@ -64,11 +69,14 @@ def test_default_summary_unchanged_without_flag(monkeypatch):
     assert s['thumbnailUrl'] == 'https://signed/uuid-1' and 'thumbnailBlob' not in s
 
 
-def test_sort_row_carries_thumb_only_when_thumbnail_done():
+def test_sort_row_always_carries_thumb_regardless_of_processing_status():
+    """thumb is the physical blob name (anonymousImageId or filename), known from
+    upload time -- present even before thumbnail/preview processing finishes, so
+    the client can attempt the direct URL instead of asking first."""
     done = storage_utils._sort_index_row({'RowKey': 'a.jpg', 'thumbnail_status': 'done', 'anonymousImageId': 'uuid-1'})
     pending = storage_utils._sort_index_row({'RowKey': 'b.jpg', 'thumbnail_status': 'pending', 'anonymousImageId': 'uuid-2'})
     plain = storage_utils._sort_index_row({'RowKey': 'c.jpg', 'thumbnail_status': 'done'})
-    assert done['thumb'] == 'uuid-1' and 'thumb' not in pending and plain['thumb'] == 'c.jpg'
+    assert done['thumb'] == 'uuid-1' and pending['thumb'] == 'uuid-2' and plain['thumb'] == 'c.jpg'
 
 
 def test_ensure_sort_current_rebuilds_old_schema_only(monkeypatch):

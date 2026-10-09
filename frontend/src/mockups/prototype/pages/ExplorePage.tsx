@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { usePhotoThumbnails } from '../media';
+import { TileThumbnail } from '../components/PhotoGrid';
 import { Swatch } from '../components/bits';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
@@ -170,7 +171,9 @@ export const ExplorePage: React.FC = () => {
                 <PlainShelf title="Recently added">
                     {recent.map((p, i) => (
                         <button key={p.id} type="button" className={`pt-shelf-card photo mock-swatch ${p.swatch}`} onClick={() => openViewer(recentIds, i)} aria-label={p.filename}>
-                            {recentThumbs[p.filename] && <img className="pt-explore-cover" src={recentThumbs[p.filename]} alt={p.filename} loading="lazy" />}
+                            {recentThumbs[p.filename] && (
+                                <TileThumbnail key={recentThumbs[p.filename]} src={recentThumbs[p.filename]} alt={p.filename} className="pt-explore-cover" />
+                            )}
                         </button>
                     ))}
                 </PlainShelf>

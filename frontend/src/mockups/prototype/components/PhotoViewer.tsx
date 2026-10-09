@@ -5,6 +5,7 @@ import {
     RotateCw as ArrowUturnRightIcon,
     ChevronLeft as ChevronLeftIcon,
     ChevronRight as ChevronRightIcon,
+    Download as DownloadIcon,
     MoreHorizontal as EllipsisHorizontalIcon,
     ZoomOut as MagnifyingGlassMinusIcon,
     ZoomIn as MagnifyingGlassPlusIcon,
@@ -166,7 +167,7 @@ export const PhotoViewer: React.FC = () => {
         return () => { active = false; };
     }, [showInfo, photo, meta]);
 
-    const { url: mainSrc, loading: fullResLoading, progress: fullResProgress } = useMainMedia(photo, fullRes);
+    const { url: mainSrc, loading: fullResLoading, progress: fullResProgress, status: mediaStatus } = useMainMedia(photo, fullRes);
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
     const photoRef = useRef<HTMLDivElement>(null);
@@ -496,8 +497,22 @@ export const PhotoViewer: React.FC = () => {
                                 draggable={false}
                                 style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)` }}
                             />
+                        ) : mediaStatus === 'unavailable' ? (
+                            <div className="pt-viewer-unavailable">
+                                <p>Unsupported format — unable to generate a preview.</p>
+                                <button
+                                    type="button"
+                                    onClick={() => void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed', undefined, undefined, 'error'))}
+                                >
+                                    <DownloadIcon size={16} aria-hidden="true" />
+                                    Download original
+                                </button>
+                            </div>
                         ) : (
-                            <div className="pt-viewer-loading"><Spinner label="" center={false} /></div>
+                            <div className="pt-viewer-loading">
+                                <Spinner label="" center={false} />
+                                {mediaStatus === 'pending' && <p>Preparing preview…</p>}
+                            </div>
                         )}
                     </div>
                     <button

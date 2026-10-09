@@ -2,6 +2,7 @@ import React, { useEffect } from 'react';
 import { Undo2 as ArrowUturnLeftIcon, Trash2 as TrashIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { usePhotoThumbnails } from '../media';
+import { TileThumbnail } from '../components/PhotoGrid';
 import { confirmDialog } from '../../../components/shared/dialogs';
 
 /** Recently Deleted — restore individually or all, or purge for good. */
@@ -78,7 +79,7 @@ export const TrashPage: React.FC = () => {
                     {trash.map((t) => (
                         <div key={t.photo.id} className={`pt-tile pt-trash-tile mock-swatch ${t.photo.swatch}`}>
                             {thumbs[t.photo.filename] && (
-                                <img className="pt-tile-img" src={thumbs[t.photo.filename]} alt={t.photo.filename} loading="lazy" draggable={false} />
+                                <TileThumbnail key={thumbs[t.photo.filename]} src={thumbs[t.photo.filename]} alt={t.photo.filename} />
                             )}
                             <div className="pt-trash-actions">
                                 <button type="button" title="Restore" aria-label="Restore" onClick={() => restorePhotos([t.photo.id])}><ArrowUturnLeftIcon /></button>

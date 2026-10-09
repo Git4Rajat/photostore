@@ -10,7 +10,7 @@ import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache'
 import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
 import { requestJobPoll } from '../../services/jobNotifications';
 import { publishLibraryChange } from '../../services/libraryChanges';
-import { chunk, measureGridCapacity, pageSizeForCapacity } from '../../services/gridCapacity';
+import { chunk, measureGridCapacity, pageSizeForCapacity, runWithLimit } from '../../services/gridCapacity';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
@@ -38,6 +38,8 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 const PAGE_SIZE = 100; // legacy /photos fallback page size
 // lookup-batch accepts <=200 filenames; enrich in parallel chunks of this size.
 const ENRICH_CHUNK = 100;
+// How many enrichment chunks run concurrently -- see runWithLimit's doc comment.
+const ENRICH_CONCURRENCY = 2;
 
 // The sort/albums/people local indexes all report "unavailable" immediately
 // on a cold account instead of blocking (their backend routes kick a
@@ -667,7 +669,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 // 2) Enrich with full metadata in parallel chunks (first chunk =
                 //    the top of the window, which is what's on screen). directMedia
                 //    skips URL signing; each chunk lands as soon as it returns.
-                await Promise.all(chunk(pageFilenames, ENRICH_CHUNK).map(async (names) => {
+                await runWithLimit(chunk(pageFilenames, ENRICH_CHUNK), ENRICH_CONCURRENCY, async (names) => {
                     // A failed chunk is non-fatal: its tiles are already on screen
                     // from the sort index; they just keep the provisional metadata.
                     const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: true })
@@ -684,7 +686,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     setPhotos((prev) => prev
                         .filter((p) => !nameSet.has(p.id) || enriched.has(p.id))
                         .map((p) => enriched.get(p.id) ?? p));
-                }));
+                });
             } else {
                 // No token (proxy mode): same as before -- wait for lookup-batch.
                 const lookupRes = pageFilenames.length
@@ -837,7 +839,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
             if (token && pageRows.length) {
                 setPhotos(pageRows.map((row) => provisionalPhoto(row, token)));
-                await Promise.all(chunk(pageFilenames, ENRICH_CHUNK).map(async (names) => {
+                await runWithLimit(chunk(pageFilenames, ENRICH_CHUNK), ENRICH_CONCURRENCY, async (names) => {
                     const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: true })
                         .catch(() => null);
                     if (!res) return;
@@ -851,7 +853,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     setPhotos((prev) => prev
                         .filter((p) => !nameSet.has(p.id) || enriched.has(p.id))
                         .map((p) => enriched.get(p.id) ?? p));
-                }));
+                });
             } else {
                 const lookupRes = pageFilenames.length
                     ? await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: pageFilenames })

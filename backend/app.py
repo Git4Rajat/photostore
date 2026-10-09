@@ -2259,12 +2259,18 @@ def _direct_media_requested() -> bool:
 
 
 def _direct_thumbnail_blob(metadata: Dict, filename: str) -> str:
-    """Physical thumbnail blob name when the client can fetch it directly with
-    the container token, else ''. Only the case that would otherwise have been a
-    signed SAS URL qualifies; proxy/preview fallbacks keep their normal URLs."""
+    """Physical blob name the client uses to build thumbnail/preview/full-res
+    URLs directly from its container tokens (see /api/photos/media-token),
+    else '' when direct media wasn't requested at all.
+
+    Deliberately NOT gated on thumbnail_status/preview_status: the physical
+    blob name (anonymousImageId or filename) is assigned at upload time,
+    before any processing step runs, so it's always resolvable. The client
+    attempts the direct blob URL unconditionally and treats a 404 as "still
+    generating" (showing a placeholder) rather than asking this backend
+    whether it's ready first -- that status check was the dominant source of
+    /api/photos/access-batch traffic (see the 2026-10-09 HAR investigation)."""
     if not _direct_media_requested():
-        return ''
-    if _effective_thumbnail_status(metadata or {}) != 'done':
         return ''
     return _blob_name_from_metadata(metadata, filename)
 

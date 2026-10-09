@@ -19,6 +19,28 @@ const tileRotationStyle = (photo: Photo): React.CSSProperties | undefined => {
     return { transform: `rotate(${remaining}deg)` };
 };
 
+// Thumbnail URLs are now attempted directly (see usePhotoThumbnails/media.ts)
+// without the backend confirming the blob exists first, so a just-uploaded
+// photo's thumbnail URL can 404 while it's still generating. Hides itself on
+// load failure so the tile's own swatch background (mock-swatch, see the
+// parent div below) shows through instead of a broken-image icon -- keyed by
+// `src` so a later render with a corrected/ready URL gets a fresh attempt.
+export const TileThumbnail: React.FC<{ src: string; alt: string; style?: React.CSSProperties; className?: string }> = ({ src, alt, style, className }) => {
+    const [broken, setBroken] = React.useState(false);
+    if (broken) return null;
+    return (
+        <img
+            className={className || 'pt-tile-img'}
+            src={src}
+            alt={alt}
+            loading="lazy"
+            draggable={false}
+            style={style}
+            onError={() => setBroken(true)}
+        />
+    );
+};
+
 /**
  * Selection-aware photo grid. Clicking a tile opens the viewer; the corner
  * checkbox toggles selection (which surfaces the command bar). Rating and like
@@ -182,12 +204,10 @@ export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?
                         onTouchEnd={clearLongPress}
                     >
                         {thumbs[photo.filename] && (
-                            <img
-                                className="pt-tile-img"
+                            <TileThumbnail
+                                key={thumbs[photo.filename]}
                                 src={thumbs[photo.filename]}
                                 alt={photo.filename}
-                                loading="lazy"
-                                draggable={false}
                                 style={tileRotationStyle(photo)}
                             />
                         )}
