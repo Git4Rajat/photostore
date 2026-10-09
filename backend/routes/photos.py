@@ -1093,6 +1093,16 @@ def photos_sort_index():
         return app.jsonify({'available': False, 'reason': 'library_too_large', 'rowCount': sort_summary['row_count']})
     if sort_summary.get('dirty'):
         app._trigger_indexer_rebuild(user_id, reason='sort-dirty', scope='light')
+    elif sort_summary.get('schema_version') and sort_summary.get('schema_version') != app.SORT_INDEX_SCHEMA_VERSION:
+        # Schema-only staleness (e.g. a field's gating semantics changed server-side,
+        # no underlying photo data changed) never sets the normal dirty flag, so
+        # without this a library that's gone quiet (no uploads/edits since the
+        # schema changed) would serve its stale snapshot forever -- the light job's
+        # ensure_user_sort_index_current only runs when SOMETHING triggers a light
+        # rebuild in the first place. A missing schema_version (manifest predates
+        # this field entirely) is treated as current, not stale, to avoid pointlessly
+        # rebuilding every pre-existing manifest on this deploy's first read.
+        app._trigger_indexer_rebuild(user_id, reason='schema-upgrade', scope='light')
     try:
         container_name, blob_name = app.get_sort_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)

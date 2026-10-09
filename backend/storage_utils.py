@@ -7198,6 +7198,7 @@ def get_index_manifest_summary(user_id: str, kind: str) -> Optional[Dict[str, ob
         'updated_at': manifest.get('updatedAt') or source_version,
         'dirty': bool(manifest.get('dirty')),
         'row_count': row_count,
+        'schema_version': str(manifest.get('schemaVersion') or ''),
     }
 
 

@@ -466,6 +466,46 @@ def test_photos_sort_index_dirty_manifest_triggers_tools_rebuild(monkeypatch, so
     assert response.get_json()['available'] is True
 
 
+def test_photos_sort_index_stale_schema_triggers_rebuild_even_when_not_dirty(monkeypatch, sort_index_route_ctx):
+    """Schema-only staleness (e.g. a field's gating semantics changed server-
+    side with no underlying photo data change) never sets the normal dirty
+    flag -- a quiet library (no uploads/edits since the schema changed) would
+    otherwise serve its stale snapshot forever, since ensure_user_sort_index_
+    current only runs inside a light job that something else has to trigger
+    first."""
+    monkeypatch.setattr(app, 'get_index_manifest_summary',
+                        lambda uid, kind: {'source_version': 'v5', 'updated_at': 'v5', 'dirty': False, 'schema_version': 'v2'})
+    monkeypatch.setattr(app, 'get_sort_index_blob_location', lambda *a, **k: ('lexical-index', 'abc-sort.json.gz'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: ('https://example.invalid/abc?sas', 'exp'))
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid, **kw: triggered.append((uid, kw.get('reason'))))
+
+    with app.app.test_request_context('/api/photos/sort-index'):
+        response = photos_sort_index()
+
+    assert triggered == [('owner', 'schema-upgrade')]
+    assert response.get_json()['available'] is True
+
+
+def test_photos_sort_index_missing_schema_version_is_not_treated_as_stale(monkeypatch, sort_index_route_ctx):
+    """A manifest written before schema_version existed at all (absent, not a
+    mismatched value) must not trigger a rebuild on every single read -- that
+    would pointlessly rebuild every pre-existing manifest on this field's
+    first deploy instead of only the ones a real schema bump marks stale."""
+    monkeypatch.setattr(app, 'get_index_manifest_summary',
+                        lambda uid, kind: {'source_version': 'v6', 'updated_at': 'v6', 'dirty': False})
+    monkeypatch.setattr(app, 'get_sort_index_blob_location', lambda *a, **k: ('lexical-index', 'abc-sort.json.gz'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda *a, **k: ('https://example.invalid/abc?sas', 'exp'))
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid, **kw: triggered.append(uid))
+
+    with app.app.test_request_context('/api/photos/sort-index'):
+        response = photos_sort_index()
+
+    assert triggered == []
+    assert response.get_json()['available'] is True
+
+
 # --- cold-build is non-blocking + column projection --------------------------
 
 def test_build_snapshot_selects_only_narrow_columns(sort_ctx, monkeypatch):
