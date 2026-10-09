@@ -140,9 +140,20 @@ const accessUrl = async (kind: 'preview' | 'image' | 'thumbnail', filename: stri
  * navigating to them next/prev finds the URL already resolved instead of
  * triggering a fresh backend round trip. Never throws -- resolveMediaAccessUrls
  * already degrades to '' per filename on failure.
+ *
+ * Filenames that already resolve to a direct container-token URL (the common
+ * case once the sort index/media token are warm) are skipped entirely --
+ * there's nothing to "preload" via access-batch for those, since the viewer
+ * will construct the same URL itself on arrival. Without this, every
+ * neighbor-preload call hit access-batch unconditionally regardless of
+ * whether a direct URL was already resolvable, which is what was still
+ * showing up as per-photo access-batch traffic even after useMainMedia
+ * itself was switched to direct-first resolution (confirmed live via a HAR:
+ * 21 calls, all preview-tier, all for formats whose preview isn't generated
+ * yet -- i.e. this path, not useMainMedia's own resolution).
  */
 export function preloadMediaAccessUrls(filenames: string[]): void {
-    const targets = filenames.filter(Boolean);
+    const targets = filenames.filter((f) => Boolean(f) && !directMediaUrl('preview', f));
     if (targets.length === 0) {
         return;
     }
