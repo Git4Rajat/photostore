@@ -31,6 +31,7 @@ import type {
     TrashItem,
     AlbumTrashItem,
 } from './types';
+import { routeToSearch, searchToRoute } from './routeUrl';
 
 // ---- backend <-> prototype photo mapping -------------------------------------
 
@@ -436,7 +437,13 @@ let idSeq = 1000;
 const nextId = () => `x${idSeq++}`;
 
 export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-    const [route, setRoute] = useState<Route>({ page: 'gallery', params: {} });
+    // Seeded from the current URL (not always 'gallery') so a refresh/shared
+    // link restores whatever page the address bar already says -- see
+    // routeUrl.ts and navigate() below, which keeps the two in sync going
+    // forward.
+    const [route, setRoute] = useState<Route>(() => (
+        typeof window === 'undefined' ? { page: 'gallery', params: {} } : searchToRoute(window.location.search)
+    ));
     const [photos, setPhotos] = useState<Photo[]>([]);
     const [photosLoading, setPhotosLoading] = useState<boolean>(true);
     const [hasMorePhotos, setHasMorePhotos] = useState<boolean>(true);
@@ -949,6 +956,27 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setSelectModeState(false);
         setViewer(null);
         window.scrollTo(0, 0);
+        // Pushed (not replaced) so the browser's back button steps through
+        // in-app navigation too, matching the address bar to whatever a
+        // refresh should restore. A no-op push (e.g. re-navigating to the
+        // same album) would otherwise pile up a duplicate history entry.
+        const next = `${window.location.pathname}${routeToSearch({ page, params })}`;
+        if (`${window.location.pathname}${window.location.search}` !== next) {
+            window.history.pushState(null, '', next);
+        }
+    }, []);
+
+    // Back/forward: resync in-memory route state from the URL the browser
+    // just navigated to, instead of only ever moving forward via navigate().
+    useEffect(() => {
+        const onPopState = () => {
+            setRoute(searchToRoute(window.location.search));
+            setSelection([]);
+            setSelectModeState(false);
+            setViewer(null);
+        };
+        window.addEventListener('popstate', onPopState);
+        return () => window.removeEventListener('popstate', onPopState);
     }, []);
 
     const toggleSelect = useCallback((id: string) => {
