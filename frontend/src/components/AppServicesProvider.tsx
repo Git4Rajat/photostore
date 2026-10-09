@@ -1062,6 +1062,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // manual repair) tries the backend preview normally.
     const freshlyUploadedFilenamesRef = useRef<Set<string>>(new Set());
     const uploadSessionRef = useRef<PersistedUploadSession | null>(null);
+    const discardedUploadSessionIdsRef = useRef<Set<string>>(new Set());
     const isResumingUploadRef = useRef<boolean>(false);
     const uploadStartInProgressRef = useRef<boolean>(false);
     const uploadSourceFilesRef = useRef<Map<string, File>>(new Map());
@@ -1147,6 +1148,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
     const queuedUploadBatchesRef = useRef<File[][]>([]);
     const [queuedUploadFileCount, setQueuedUploadFileCount] = useState<number>(0);
+    const [uploadQueueDrainSignal, setUploadQueueDrainSignal] = useState<number>(0);
     const backendKeepaliveTimerRef = useRef<number | null>(null);
     const backendWarmupInFlightRef = useRef<boolean>(false);
     const uploadWarmupInFlightRef = useRef<boolean>(false);
@@ -1711,6 +1713,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, []);
 
     const persistSession = useCallback((session: PersistedUploadSession | null) => {
+        if (session && discardedUploadSessionIdsRef.current.has(session.id)) {
+            return;
+        }
         uploadSessionRef.current = session;
         try {
             if (!session) {
@@ -1727,7 +1732,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const updatePersistedFile = useCallback((fileKey: string, updates: Partial<PersistedUploadFile>) => {
         const current = uploadSessionRef.current;
-        if (!current) {
+        if (!current || discardedUploadSessionIdsRef.current.has(current.id)) {
             return;
         }
         const next: PersistedUploadSession = {
@@ -3685,6 +3690,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // picks up that file's thumbnail instead -- the same fallback path
             // that already handles any client-side thumbnail failure.
 
+            if (discardedUploadSessionIdsRef.current.has(session.id)) {
+                await clearPersistedSession();
+                setPendingUploadSessionLive(null);
+                setUploadError(null);
+                return;
+            }
+
             if (uploadStopRequestedRef.current) {
                 const latest = uploadSessionRef.current || normalized;
                 await cleanupUnfinishedUploadArtifacts(latest);
@@ -3754,12 +3766,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 return;
             }
             const message = getUploadErrorMessage(err, 'Upload failed unexpectedly.');
+            if (discardedUploadSessionIdsRef.current.has(session.id)) {
+                await clearPersistedSession();
+                setPendingUploadSessionLive(null);
+                setUploadError(null);
+                return;
+            }
             updateNotification(notificationId, {
                 title: 'Upload failed',
                 details: message,
             });
             const latest = uploadSessionRef.current;
-            if (latest && latest.files.some((file) => file.status !== 'done')) {
+            if (latest && discardedUploadSessionIdsRef.current.has(latest.id)) {
+                await clearPersistedSession();
+                setPendingUploadSessionLive(null);
+            } else if (latest && latest.files.some((file) => file.status !== 'done')) {
                 setPendingUploadSessionLive(latest);
             }
             setUploadError(message);
@@ -3798,7 +3819,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const attachSelectedFilesToPendingSession = useCallback(async (
         selectedFiles: File[],
     ): Promise<{ matchedCount: number; unmatchedFiles: File[] }> => {
-        const session = pendingUploadSession || loadPersistedSession();
+        const session = pendingUploadSessionRef.current || pendingUploadSession || loadPersistedSession();
         if (!session) {
             return { matchedCount: 0, unmatchedFiles: selectedFiles };
         }
@@ -3902,7 +3923,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [loadPersistedSession, pendingUploadSession, persistSession, setPendingUploadSessionLive, updatePersistedFile]);
 
     const retryPersistedUploadSession = useCallback(async () => {
-        const session = pendingUploadSession || loadPersistedSession();
+        const session = pendingUploadSessionRef.current || pendingUploadSession || loadPersistedSession();
         // isResumingUploadRef, not just `uploading`: runUploadSession now flips
         // `uploading` false as soon as bytes finish transferring, while its own
         // background finalize/retry tail (guarded by isResumingUploadRef) can
@@ -3956,13 +3977,22 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (uploading) {
             return;
         }
-        const session = pendingUploadSession || loadPersistedSession();
+        const session = pendingUploadSessionRef.current || pendingUploadSession || uploadSessionRef.current || loadPersistedSession();
+        if (session) {
+            discardedUploadSessionIdsRef.current.add(session.id);
+            if (discardedUploadSessionIdsRef.current.size > 20) {
+                discardedUploadSessionIdsRef.current = new Set(Array.from(discardedUploadSessionIdsRef.current).slice(-10));
+            }
+        }
+        setPendingUploadSessionLive(null);
+        uploadSourceFilesRef.current.clear();
+        uploadHandlesRef.current.clear();
+        await clearPersistedSession();
         if (session) {
             await cleanupUnfinishedUploadArtifacts(session);
         }
-        await clearPersistedSession();
-        setPendingUploadSessionLive(null);
         setUploadError(null);
+        setUploadQueueDrainSignal((signal) => signal + 1);
         addNotification('Upload discarded', 'Paused upload files were removed.');
     }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, pendingUploadSession, setPendingUploadSessionLive, setUploadError, uploading]);
 
@@ -4419,7 +4449,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // loadPersistedSession() would match that still-active session
             // and misroute a new selection into "attach to paused session"
             // instead of queueing it via startUpload.
-            if (pendingUploadSession || (!uploading && !isResumingUploadRef.current && loadPersistedSession())) {
+            const pausedSession = pendingUploadSessionRef.current
+                || pendingUploadSession
+                || (!uploading && !isResumingUploadRef.current ? loadPersistedSession() : null);
+            if (pausedSession) {
                 void (async () => {
                     try {
                         const { matchedCount, unmatchedFiles } = await attachSelectedFilesToPendingSession(selectedFiles);
@@ -4534,7 +4567,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             setQueuedUploadFileCount((count) => Math.max(0, count - nextBatch.length));
             void startUpload(nextBatch);
         }
-    }, [uploading, pendingUploadSession, backgroundUploadTailActive, startUpload]);
+    }, [uploading, pendingUploadSession, backgroundUploadTailActive, uploadQueueDrainSignal, startUpload]);
 
     useEffect(() => {
         const restored = loadPersistedSession();
