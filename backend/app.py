@@ -8774,6 +8774,9 @@ def _render_public_album_share_page(meta: Dict[str, str], redirect_url: str) -> 
     description = html.escape(meta['description'])
     image = html.escape(meta['image'], quote=True)
     redirect = html.escape(redirect_url, quote=True)
+    redirect_js = json.dumps(redirect_url)
+    spa_base = redirect_url.split('/public/album/', 1)[0].rstrip('/')
+    health_url = json.dumps(f'{spa_base}/health')
     # The branded fallback image is a fixed 1200x630 asset; a real photo
     # thumbnail's rendered size varies with its source aspect ratio (thumbnails
     # are generated bounded within 120x120, not cropped to a fixed box), so we
@@ -8789,7 +8792,6 @@ def _render_public_album_share_page(meta: Dict[str, str], redirect_url: str) -> 
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta http-equiv="refresh" content="0; url={redirect}" />
 <title>{title}</title>
 <meta name="description" content="{description}" />
 <meta property="og:type" content="website" />
@@ -8801,9 +8803,100 @@ def _render_public_album_share_page(meta: Dict[str, str], redirect_url: str) -> 
 <meta name="twitter:title" content="{title}" />
 <meta name="twitter:description" content="{description}" />
 <meta name="twitter:image" content="{image}" />
+<style>
+body {{
+  min-height: 100vh;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  background: #f7f4ef;
+  color: #1a1a1a;
+  font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+main {{
+  width: min(420px, calc(100vw - 48px));
+  text-align: center;
+}}
+.mark {{
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  margin-bottom: 16px;
+}}
+.ring {{
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 3px solid rgba(30, 106, 225, 0.15);
+  border-top-color: #1e6ae1;
+  animation: spin 0.8s linear infinite;
+}}
+h1 {{
+  margin: 0 0 8px;
+  font-size: 22px;
+}}
+p {{
+  margin: 0 0 18px;
+  color: #555;
+}}
+a {{
+  color: #1e6ae1;
+  font-weight: 700;
+}}
+@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+@media (prefers-reduced-motion: reduce) {{ .ring {{ animation-duration: 2.4s; }} }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background: #0c0c0e; color: #f4f4f6; }}
+  p {{ color: #b8b8c2; }}
+  .ring {{ border-color: rgba(77, 162, 255, 0.2); border-top-color: #4da2ff; }}
+}}
+</style>
 </head>
 <body>
-<p>Opening the shared album&hellip; if nothing happens, <a href="{redirect}">tap here</a>.</p>
+<main>
+  <span class="mark" aria-hidden="true">
+    <svg width="52" height="52" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="badge" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b82f6" /><stop offset="1" stop-color="#1450c0" /></linearGradient></defs>
+      <rect width="64" height="64" rx="15" fill="url(#badge)" />
+      <rect x="21" y="15" width="26" height="26" rx="6" fill="#ffffff" opacity="0.32" transform="rotate(9 34 28)" />
+      <rect x="16" y="18" width="32" height="32" rx="6" fill="#ffffff" />
+      <path d="M32 41c-6-4.5-10.5-8-10.5-12 0-2.7 2-4.5 4.3-4.5 2.1 0 4.1 1.3 6.2 3.9 2.1-2.6 4.1-3.9 6.2-3.9 2.3 0 4.3 1.8 4.3 4.5 0 4-4.5 7.5-10.5 12z" fill="#1e6ae1" />
+    </svg>
+    <span class="ring"></span>
+  </span>
+  <h1>Opening shared album</h1>
+  <p id="status">Starting the album viewer...</p>
+  <a href="{redirect}">Open album</a>
+</main>
+<script>
+(function () {{
+  var target = {redirect_js};
+  var health = {health_url};
+  var status = document.getElementById('status');
+  var attempts = 0;
+  function openAlbum() {{
+    window.location.replace(target);
+  }}
+  function retry() {{
+    attempts += 1;
+    if (status && attempts === 2) {{
+      status.textContent = 'Waking the album viewer...';
+    }}
+    fetch(health, {{ cache: 'no-store', mode: 'no-cors' }})
+      .then(openAlbum)
+      .catch(function () {{
+        if (attempts >= 12) {{
+          openAlbum();
+          return;
+        }}
+        window.setTimeout(retry, Math.min(8000, 700 * Math.pow(1.6, attempts)));
+      }});
+  }}
+  retry();
+}}());
+</script>
 </body>
 </html>'''
 

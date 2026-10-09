@@ -5,9 +5,9 @@ iMessage/WhatsApp/Slack, whose link-unfurler bots fetch the URL without
 running JS. The SPA is a static single-page app, so previously every route
 served the same static index.html with fixed "Keepsake" OG tags -- bots never
 saw the actual album name/photo. This page returns real per-album OG tags for
-the bot, then meta-refreshes real browsers into the interactive SPA viewer.
-Access-code-protected albums must stay fully generic here since a bot can
-never supply the code.
+the bot, then gives real browsers a tiny holding page that wakes the SPA before
+navigating there. Access-code-protected albums must stay fully generic here
+since a bot can never supply the code.
 """
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def test_render_omits_dimensions_for_real_photo_thumbnail():
     assert 'og:image:width' not in page
 
 
-def test_share_page_route_returns_html_with_meta_refresh(monkeypatch):
+def test_share_page_route_returns_html_with_warmup_redirect(monkeypatch):
     monkeypatch.setattr(app, 'SPA_BASE_URL', 'https://app.example.com')
     monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: _entity())
 
@@ -109,6 +109,8 @@ def test_share_page_route_returns_html_with_meta_refresh(monkeypatch):
     body = resp.get_data(as_text=True)
     assert 'Beach Trip 2026' in body
     assert 'https://app.example.com/public/album/tok123' in body
+    assert 'http-equiv="refresh"' not in body
+    assert 'https://app.example.com/health' in body
     assert resp.headers['Cache-Control'] == 'no-store'
 
 

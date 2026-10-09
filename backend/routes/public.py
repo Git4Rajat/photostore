@@ -21,8 +21,8 @@ def public_album_share_page(token: str):
     because the SPA is a static single-page app -- every route serves the same
     static index.html with fixed OG tags, so link-preview bots (iMessage,
     WhatsApp, Slack) never see a given album's real name/photo. This page
-    returns real tags for the bot, then meta-refreshes real browsers into the
-    interactive SPA viewer.
+    returns real tags for the bot, then gives real browsers a tiny holding
+    page that wakes the SPA before navigating to the interactive viewer.
     """
     entity = app._find_public_album_by_token(token)
     meta = app._public_album_share_meta(entity, token)
