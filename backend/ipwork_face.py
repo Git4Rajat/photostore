@@ -88,6 +88,14 @@ ARC_FACE_TARGET_EYE_X_RATIO = 0.50
 ARC_FACE_TARGET_EYE_Y_RATIO = 0.38
 ARC_FACE_TARGET_EYE_DISTANCE_RATIO = 0.36
 FIVE_POINT_LANDMARK_PADDING_RATIO = 0.25
+# A detection box clamped hard against the image edge (see
+# _compute_padded_crop_bounds) can leave a near-zero-area crop that is
+# technically non-empty but too thin for FaceMesh to run on. Letting such a
+# crop reach MediaPipe produces native stderr noise (its internal ROI/tensor
+# conversion rejecting the degenerate rectangle) instead of a clean Python
+# reject; this floor turns it into the same 'landmark_detection_failed'
+# quality reject used for a real no-landmark result.
+MIN_LANDMARK_CROP_DIMENSION_PX = 6
 
 # Standard 112x112 ArcFace/InsightFace 5-point reference template
 # (faceAlignment.ts ARC_FACE_5POINT_TEMPLATE). Order: rightEye, leftEye,
@@ -331,6 +339,18 @@ def detect_five_landmarks(image_bgr: np.ndarray, bbox: dict) -> Optional[np.ndar
     if bounds is None:
         return None
     crop_left, crop_top, crop_w, crop_h = bounds
+    if crop_w < MIN_LANDMARK_CROP_DIMENSION_PX or crop_h < MIN_LANDMARK_CROP_DIMENSION_PX:
+        # Forensic-only counter: does NOT feed reasonCounts/qualityRejectedCount
+        # (the caller's generic 'landmark_detection_failed' reject() already
+        # covers this return-None case for those totals) -- this exists purely
+        # to measure, across real traffic, how many landmark failures were this
+        # specific degenerate-crop floor versus MediaPipe genuinely finding no
+        # face, so the floor's effect on the native stderr noise it was added
+        # to avoid (see MIN_LANDMARK_CROP_DIMENSION_PX) is independently visible.
+        diagnostics = _FACE_DIAGNOSTICS.get()
+        if diagnostics is not None:
+            diagnostics['degenerateCropRejectedCount'] = diagnostics.get('degenerateCropRejectedCount', 0) + 1
+        return None
     crop = image_bgr[crop_top:crop_top + crop_h, crop_left:crop_left + crop_w]
     if crop.size == 0:
         return None

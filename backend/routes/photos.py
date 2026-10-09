@@ -714,16 +714,20 @@ def lookup_photos_batch():
         safe_name = app._validate_media_filename(str(raw_name or ''))
         if safe_name:
             safe_names.append(safe_name)
-    # Point reads are independent network round trips -- run them in parallel
-    # (bounded) instead of one after another; executor.map preserves order.
-    with app.perf_instrumentation.span('lookup_batch.metadata_reads', n=len(safe_names)):
-        if len(safe_names) > 1:
-            with ThreadPoolExecutor(max_workers=min(8, len(safe_names))) as executor:
-                entities = list(executor.map(lambda n: app._get_metadata_entity(user_id, n), safe_names))
-        else:
-            entities = [app._get_metadata_entity(user_id, n) for n in safe_names]
+    # _get_metadata_entities batches 15 names per "RowKey eq .. or .." query
+    # (~N/15 round trips) instead of one point read per filename -- same
+    # helper the gallery/trash pages already use for their per-page reads.
+    # expected_batches is logged alongside the span so the storage-call
+    # reduction (N point reads -> ~N/15 queries) is readable directly from
+    # this line instead of requiring a diff against the request's io_top.
+    with app.perf_instrumentation.span(
+        'lookup_batch.metadata_reads', n=len(safe_names),
+        expected_batches=-(-len(safe_names) // 15) if safe_names else 0,
+    ):
+        entities_by_name = app._get_metadata_entities(user_id, safe_names)
     photos = []
-    for safe_name, metadata in zip(safe_names, entities):
+    for safe_name in safe_names:
+        metadata = entities_by_name.get(safe_name)
         if not metadata or metadata.get('processing_state') == 'deleted':
             continue
         photos.append(app._build_photo_summary(user_id, safe_name, metadata, include_props=False, pid_to_name=pid_to_name))
@@ -1405,6 +1409,23 @@ def purge_trashed_photos():
     valid_names, errors = _parse_filenames_request()
     if not valid_names:
         return app.jsonify({'deleted': [], 'errors': errors, 'success': False})
+    if len(valid_names) > app.BULK_MUTATION_MAX_ITEMS:
+        return app.jsonify({
+            'error': f'Too many photos; maximum is {app.BULK_MUTATION_MAX_ITEMS}',
+            'success': False,
+        }), 413
+
+    if len(valid_names) >= app.BULK_MUTATION_ASYNC_THRESHOLD:
+        queued = app._enqueue_photo_hard_delete_job(user_id, valid_names)
+        if queued.get('status') != 'queued':
+            return app.jsonify({'error': 'Could not queue photo purge', **queued, 'success': False}), 503
+        return app.jsonify({
+            **queued,
+            'accepted': len(valid_names),
+            'deleted': [],
+            'errors': errors,
+            'success': True,
+        }), 202
 
     deleted, hard_errors = app._hard_delete_photos_now(user_id, valid_names)
     errors.extend(hard_errors)

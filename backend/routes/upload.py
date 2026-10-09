@@ -537,6 +537,29 @@ def finalize_upload_batch():
         })
 
     upload_results(results)
+    # Evidence for whether finalize-batch's per-file queue sends/job-status
+    # writes are worth batching across files: every finalize already runs
+    # inside perf_instrumentation's per-request storage-call scope (see
+    # install_storage_tracing), so the queue sends and jobs-table writes this
+    # loop triggered are already counted there -- this just surfaces them as
+    # an explicit per-file rate instead of requiring someone to read the raw
+    # io_top breakdown and do the division by hand.
+    try:
+        sc = app.perf_instrumentation.current_scope()
+        if sc is not None and results:
+            queue_sends = sum(int(row[0]) for label, row in sc.ops.items() if label.startswith('queue:'))
+            job_table_writes = sum(
+                int(row[0]) for label, row in sc.ops.items()
+                if label.startswith('table:') and label.split(':', 2)[-1].split('(')[0] == app.JOBS_TABLE
+            )
+            app.perf_instrumentation.log_event(
+                'finalize_batch_fanout', files=len(results),
+                queue_sends=queue_sends, job_table_writes=job_table_writes,
+                queue_sends_per_file=round(queue_sends / len(results), 2),
+                job_rows_per_file=round(job_table_writes / len(results), 2),
+            )
+    except Exception:
+        pass
     return app.jsonify({'results': results})
 
 @upload_bp.route('/upload/client-processing', methods=['POST'])

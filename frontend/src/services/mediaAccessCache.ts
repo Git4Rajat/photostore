@@ -96,6 +96,41 @@ const evictOldest = () => {
     }
 };
 
+// Concurrent callers resolving the same not-yet-cached (kind, filename) --
+// e.g. the viewer's active photo and a neighbor-preload racing each other --
+// share one network request/signed URL instead of each minting their own.
+// Two different SAS signatures for the same blob otherwise show up as a
+// false "blob-multi-url" duplicate-transfer report (see perf.ts). Mirrors
+// thumbnailAccessCache.ts's pending-request map.
+const pending = new Map<string, Promise<string>>();
+
+const fetchBatch = async (kind: MediaAccessKind, filenames: string[]): Promise<Map<string, string>> => {
+    const out = new Map<string, string>();
+    try {
+        const response = await post('/api/photos/access-batch', { kind, filenames });
+        const urls = (response && typeof response.urls === 'object' && response.urls) || {};
+        let gotNewUrl = false;
+        for (const filename of filenames) {
+            const raw = urls[filename];
+            const resolved = isHttpUrl(raw) ? raw : '';
+            if (resolved) {
+                urlCache.set(cacheKey(kind, filename), resolved);
+                evictOldest();
+                gotNewUrl = true;
+            }
+            out.set(filename, resolved);
+        }
+        if (gotNewUrl) {
+            persistToStorage();
+        }
+    } catch {
+        for (const filename of filenames) {
+            out.set(filename, '');
+        }
+    }
+    return out;
+};
+
 /**
  * Resolves preview/image access URLs for a set of filenames, one kind at a
  * time, via a single batched /api/photos/access-batch call for whatever
@@ -118,27 +153,36 @@ export const resolveMediaAccessUrls = async (kind: MediaAccessKind, filenames: s
     if (toFetch.length === 0) {
         return result;
     }
-    try {
-        const response = await post('/api/photos/access-batch', { kind, filenames: toFetch });
-        const urls = (response && typeof response.urls === 'object' && response.urls) || {};
-        let gotNewUrl = false;
-        for (const filename of toFetch) {
-            const raw = urls[filename];
-            const resolved = isHttpUrl(raw) ? raw : '';
-            if (resolved) {
-                urlCache.set(cacheKey(kind, filename), resolved);
-                evictOldest();
-                gotNewUrl = true;
-            }
-            result.set(filename, resolved);
+
+    const alreadyPending = new Map<string, Promise<string>>();
+    const fresh: string[] = [];
+    for (const filename of toFetch) {
+        const existing = pending.get(cacheKey(kind, filename));
+        if (existing) {
+            alreadyPending.set(filename, existing);
+        } else {
+            fresh.push(filename);
         }
-        if (gotNewUrl) {
-            persistToStorage();
-        }
-    } catch {
-        for (const filename of toFetch) {
-            result.set(filename, '');
-        }
+    }
+
+    let freshPromise: Promise<Map<string, string>> | undefined;
+    if (fresh.length > 0) {
+        freshPromise = fetchBatch(kind, fresh);
+        const settled = freshPromise;
+        fresh.forEach((filename) => {
+            pending.set(cacheKey(kind, filename), settled.then((map) => map.get(filename) || ''));
+        });
+        void settled.finally(() => {
+            fresh.forEach((filename) => pending.delete(cacheKey(kind, filename)));
+        });
+    }
+
+    await Promise.all(Array.from(alreadyPending, ([filename, promise]) => promise.then((url) => {
+        result.set(filename, url);
+    })));
+    if (freshPromise) {
+        const freshResult = await freshPromise;
+        freshResult.forEach((url, filename) => result.set(filename, url));
     }
     return result;
 };

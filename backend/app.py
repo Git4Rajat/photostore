@@ -1465,6 +1465,7 @@ def _init_storage_clients():
         queue_service_client_local = QueueServiceClient(
             account_url=f'https://{account_name}.queue.core.windows.net',
             credential=credential,
+            connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
         )
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
@@ -1540,6 +1541,19 @@ def _init_storage_clients():
     clustering_deadletter_queue_client = clustering_deadletter_queue_client_local
     library_ops_deadletter_queue_client = library_ops_deadletter_queue_client_local
     queue_service_client = queue_service_client_local
+
+    # Confirms the deployed pool size and that it now covers queue traffic too
+    # (previously only blob/table clients got connection_pool_maxsize, leaving
+    # the queue client's urllib3 pool capped at the default of 10/host --
+    # plausibly a real contributor to the "Connection pool is full, discarding
+    # connection" warnings seen under concurrent enqueue load). Local/Azurite
+    # (STORAGE_CONNECTION_STRING branch, above) doesn't set this at all, so it
+    # logs the urllib3 default there instead.
+    app.logger.info(
+        'Storage connection pools: maxsize=%s (blob/table/queue) managed_identity=%s',
+        STORAGE_CONNECTION_POOL_MAXSIZE if not STORAGE_CONNECTION_STRING else 'default(10)',
+        bool(not STORAGE_CONNECTION_STRING),
+    )
 
     # Ensure the multi-tenant tables/queues exist. Each create call is an
     # independent, idempotent Azure REST round-trip whose steady-state outcome
@@ -3115,6 +3129,14 @@ def _humanize_job(row: Dict) -> Dict:
             message = f"{_plural(count, 'photo')} moved to Recently Deleted."
         elif status == 'failed':
             title = 'Could not finish deleting photos'
+    elif job_type == 'photo_hard_delete':
+        kind = 'bulk_mutation'
+        count = int(result.get('deleted') or row.get('totalItems') or 0)
+        if status == 'done':
+            title = 'Photos permanently deleted'
+            message = f"{_plural(count, 'photo')} permanently deleted."
+        elif status == 'failed':
+            title = 'Could not finish permanently deleting photos'
     elif job_type == 'clustering':
         recluster_keys = {'peopleAlbums', 'detectedFaces', 'candidateFaces', 'skippedConfirmedFaces', 'assignments'}
         cluster_keys = {'createdPeople', 'clusterCount', 'faceCount'}
@@ -11895,6 +11917,78 @@ def _is_not_found_storage_error(exc: Exception) -> bool:
     )
 
 
+def _batch_delete_blobs(container_name: str, blob_names: List[str]) -> List[str]:
+    """Delete many blobs from one container via the Blob Batch API (up to 256
+    per HTTP request) instead of one request per blob. Returns the subset of
+    blob_names whose delete failed; a not-found blob counts as already gone,
+    not a failure."""
+    if not container_name or blob_service_client is None or not blob_names:
+        return []
+    failed: List[str] = []
+    http_calls = 0
+    container_client = blob_service_client.get_container_client(container_name)
+    for start in range(0, len(blob_names), 256):
+        batch = blob_names[start:start + 256]
+        http_calls += 1
+        try:
+            responses = list(container_client.delete_blobs(*batch, raise_on_any_failure=False))
+        except Exception as exc:
+            app.logger.warning('Batch blob delete failed for container %s: %s', container_name, exc)
+            failed.extend(batch)
+            continue
+        for name, resp in zip(batch, responses):
+            if getattr(resp, 'status_code', None) not in (202, 404):
+                failed.append(name)
+    # Evidence for the "batch delete internals" perf work: this used to be one
+    # delete_blob() HTTP call per blob -- http_calls vs len(blob_names) is the
+    # directly-measured reduction (up to 256x) from switching to Batch API.
+    perf_instrumentation.log_event(
+        'batch_blob_delete', container=container_name, blobs=len(blob_names),
+        http_calls=http_calls, failed=len(failed),
+    )
+    return failed
+
+
+def _batch_delete_table_entities(table_client, partition_key: str, row_keys: List[str]) -> set:
+    """Delete many rows sharing one partition via submit_transaction (up to 100
+    per request) instead of one delete_entity call per row. A transaction is
+    all-or-nothing, so a batch containing an already-gone row falls back to
+    one-by-one deletes for just that batch. Returns the set of row_keys that
+    failed to delete (already-gone rows count as deleted, not a failure)."""
+    if table_client is None or not row_keys:
+        return set()
+    failed: set = set()
+    transactions = 0
+    fallback_batches = 0
+    for start in range(0, len(row_keys), 100):
+        batch = row_keys[start:start + 100]
+        transactions += 1
+        try:
+            table_client.submit_transaction([
+                ('delete', {'PartitionKey': partition_key, 'RowKey': row_key}) for row_key in batch
+            ])
+        except Exception:
+            fallback_batches += 1
+            for row_key in batch:
+                try:
+                    table_client.delete_entity(partition_key=partition_key, row_key=row_key)
+                except ResourceNotFoundError:
+                    pass
+                except Exception as exc:
+                    app.logger.warning('Row delete failed for %s/%s: %s', partition_key, row_key, exc)
+                    failed.add(row_key)
+    # fallback_batches > 0 means a transaction hit an already-gone (or
+    # otherwise conflicting) row and that whole 100-row batch paid the
+    # one-by-one cost instead of one request -- worth watching if it becomes
+    # common, since it erodes the batching win this helper exists for.
+    if row_keys:
+        perf_instrumentation.log_event(
+            'batch_table_delete', table=getattr(table_client, 'table_name', ''), rows=len(row_keys),
+            transactions=transactions, fallback_batches=fallback_batches, failed=len(failed),
+        )
+    return failed
+
+
 def _delete_blob_if_present(container_name: str, blob_name: str) -> Optional[str]:
     if not container_name or blob_service_client is None:
         return None
@@ -11954,13 +12048,10 @@ def _trash_index_add(user_id: str, filename: str, deleted_at: str) -> None:
 
 
 def _trash_index_remove(user_id: str, filenames: List[str]) -> None:
-    if trash_index_table_client is None:
-        return
-    for name in filenames:
-        try:
-            trash_index_table_client.delete_entity(partition_key=user_id, row_key=name)
-        except Exception:
-            pass  # absent (never indexed) or already gone
+    # Absent (never indexed) or already-gone rows are not real failures here,
+    # so the batch helper's "failed" return (real storage errors) is ignored
+    # too -- same tolerant contract the old per-row try/except had.
+    _batch_delete_table_entities(trash_index_table_client, user_id, list(filenames))
 
 
 def _trash_index_entries(user_id: str) -> List[Dict]:
@@ -12178,6 +12269,74 @@ def _run_photo_soft_delete_job(user_id: str, job_id: str, payload_blob_name: str
         raise
 
 
+def _enqueue_photo_hard_delete_job(user_id: str, filenames) -> Dict[str, str]:
+    """Persist a large filename list in Blob Storage and queue only its pointer.
+
+    Mirrors _enqueue_photo_soft_delete_job -- same payload-blob/queue/job-status
+    contract, different job type, used for the irreversible purge path.
+    """
+    job_id = f"photo-purge:{user_id}:{uuid.uuid4().hex}"
+    blob_name = f'bulk-mutations/{user_id}/{job_id}.json'
+    payload = json.dumps({'filenames': list(filenames)}, separators=(',', ':')).encode('utf-8')
+    try:
+        upload_file_to_blob(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name, payload, 'application/json')
+        _upsert_job_status(
+            job_id, user_id, 'photo_hard_delete', 'queued',
+            totalItems=len(filenames), processedItems=0, payloadBlobName=blob_name,
+        )
+        if library_ops_queue_client is None:
+            raise RuntimeError('library operations queue is unavailable')
+        library_ops_queue_client.send_message(json.dumps({
+            'type': 'photo_hard_delete',
+            'userId': user_id,
+            'user_id': user_id,
+            'jobId': job_id,
+            'payloadBlobName': blob_name,
+        }, separators=(',', ':')))
+        return {'status': 'queued', 'jobId': job_id}
+    except Exception:
+        app.logger.exception('Failed to queue bulk photo purge %s', job_id)
+        _upsert_job_status(job_id, user_id, 'photo_hard_delete', 'failed', error='Failed to queue photo purge')
+        _delete_blob_if_present(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
+        return {'status': 'failed', 'jobId': job_id}
+
+
+def _run_photo_hard_delete_job(user_id: str, job_id: str, payload_blob_name: str) -> None:
+    if not payload_blob_name:
+        raise ValueError('bulk photo purge payload is missing')
+    raw = download_file_from_blob(BLOB_MERGE_PAYLOADS_CONTAINER, payload_blob_name)
+    payload = json.loads(raw.decode('utf-8'))
+    filenames = payload.get('filenames') if isinstance(payload, dict) else None
+    if not isinstance(filenames, list) or not filenames:
+        raise ValueError('bulk photo purge payload has no filenames')
+
+    _upsert_job_status(
+        job_id, user_id, 'photo_hard_delete', 'running',
+        totalItems=len(filenames), processedItems=0, payloadBlobName=payload_blob_name,
+    )
+
+    def _progress(processed: int, total: int) -> None:
+        _upsert_job_status(
+            job_id, user_id, 'photo_hard_delete', 'running',
+            totalItems=total, processedItems=processed, payloadBlobName=payload_blob_name,
+        )
+
+    try:
+        deleted, errors = _hard_delete_photos_now(user_id, filenames, progress=_progress)
+        _upsert_job_status(
+            job_id, user_id, 'photo_hard_delete', 'done',
+            totalItems=len(filenames), processedItems=len(filenames),
+            result={'deleted': len(deleted), 'errors': len(errors)},
+        )
+        _delete_blob_if_present(BLOB_MERGE_PAYLOADS_CONTAINER, payload_blob_name)
+    except Exception:
+        _upsert_job_status(
+            job_id, user_id, 'photo_hard_delete', 'failed',
+            totalItems=len(filenames), error='Bulk photo purge failed',
+        )
+        raise
+
+
 def _set_faces_source_deleted_for_filenames(user_id: str, filenames, deleted: bool) -> Dict[str, int]:
     """Hide/show a soft-deleted photo's faces from derived People views without
     destroying the face/person assignment, so restore can make them visible
@@ -12325,114 +12484,47 @@ def _strip_deleted_people_from_photos(user_id: str, person_ids: set, skip_names:
         app.logger.warning('Deleted-people cleanup failed for %s', user_id, exc_info=True)
 
 
-def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[str], List[str]]:
+def _hard_delete_photos_now(
+    user_id: str,
+    filenames: List[str],
+    *,
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[List[str], List[str]]:
     """Permanently remove photos: blob + metadata row + dedup/collision index
     rows and the faces/people, job-row, and album-membership cascades.
-
-    Keep metadata/ownership until the strict face cascade succeeds, so a
-    failed cleanup remains discoverable and retryable instead of reporting
-    deletion success with hidden faces.
 
     This is the real, irreversible delete -- what /photos/delete used to do
     directly for every request. It now only runs for photos that are already
     sitting in trash: the explicit "delete forever" purge endpoint, and the
     retention sweep. ``filenames`` should already be validated/deduped safe
     names (see _validate_media_filename). Returns (deleted, errors).
+
+    Processed in BULK_MUTATION_CHUNK_SIZE chunks (same contract as
+    _soft_delete_photos_now) so a background job can report progress and a
+    huge purge doesn't hold one giant thread-pool batch open at once.
     """
+    valid_names = [str(name or '').strip() for name in filenames if str(name or '').strip()]
     deleted: List[str] = []
     errors: List[str] = []
-    if not filenames:
+    deleted_person_ids: set = set()
+    total = len(valid_names)
+    if not valid_names:
         return deleted, errors
-    names_set = set(filenames)
 
-    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
-        metadata_results = list(executor.map(lambda n: (n, _get_metadata_entity(user_id, n)), filenames))
-    own_rows_by_name = {name: metadata for name, metadata in metadata_results if metadata is not None}
-
-    shared_names = _shared_names_in_batch(names_set, user_id)
-
-    def _hard_delete_one(safe_name: str) -> Tuple[str, str, str]:
-        metadata = own_rows_by_name.get(safe_name)
-        if metadata is None:
-            return safe_name, 'not_found', ''
-        file_errors: List[str] = []
-        anonymous_id = str((metadata or {}).get('anonymousImageId') or '').strip()
-        if safe_name not in shared_names:
-            physical_name = anonymous_id or safe_name
-            extra = [safe_name] if anonymous_id else None
-            file_errors.extend(_delete_photo_blobs_if_present(physical_name, extra))
-            if anonymous_id:
-                try:
-                    delete_image_name_mapping(user_id, anonymous_id)
-                except Exception:
-                    app.logger.debug('Failed to delete image-name mapping for %s', safe_name)
-        # Do not remove the retry anchor or release ownership before the
-        # leased face cascade. Already-removed blobs are idempotent on retry.
-        if file_errors:
-            return safe_name, 'error', '; '.join(file_errors)
-        return safe_name, 'deleted', ''
-
-    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
-        file_results = list(executor.map(_hard_delete_one, filenames))
-
-    for safe_name, outcome, detail in file_results:
-        if outcome == 'deleted':
-            deleted.append(safe_name)
-        elif outcome == 'not_found':
-            errors.append(f'{safe_name}: Not found')
-        else:
-            errors.append(f'{safe_name}: {detail}')
-
-    ready_names_set = set(deleted)
-    deleted = []
-    deleted_person_ids = set()
-    try:
-        deleted_person_ids = _batch_remove_faces_for_filenames(user_id, ready_names_set)
-    except Exception as exc:
-        app.logger.warning('Batch face removal failed for %s: %s', user_id, exc)
-        errors.extend(f'{name}: face cleanup failed' for name in sorted(ready_names_set))
-        ready_names_set = set()
-
-    def _finish_hard_delete(safe_name: str) -> Tuple[str, str]:
-        try:
-            metadata_table_client.delete_entity(partition_key=user_id, row_key=safe_name)
-        except ResourceNotFoundError:
-            pass
-        except Exception as exc:
-            app.logger.warning('Metadata delete failed for %s: %s', safe_name, exc)
-            return safe_name, 'metadata: delete failed'
-        metadata = own_rows_by_name[safe_name]
-        file_hash = str(metadata.get('fileHash') or '')
-        if file_hash:
-            delete_hash_index_entry(user_id, file_hash)
-        delete_embeddings_entry(user_id, safe_name)
-        # A complete-empty generation now exists. Retaining ownership on
-        # cascade/metadata failure helps retry; it is NOT an asset fence
-        # against same-content retries, trash reclaim, or late old results.
-        delete_filename_owner_entry(user_id, safe_name)
-        return safe_name, ''
-
-    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
-        for name, error in executor.map(_finish_hard_delete, sorted(ready_names_set)):
-            if error:
-                errors.append(f'{name}: {error}')
-            else:
-                deleted.append(name)
-    deleted_names_set = set(deleted)
-    try:
-        _batch_remove_job_rows(user_id, deleted_names_set)
-    except Exception as exc:
-        app.logger.warning('Batch job cleanup failed for %s: %s', user_id, exc)
-    try:
-        _batch_remove_filenames_from_albums(user_id, deleted_names_set)
-    except Exception as exc:
-        app.logger.warning('Batch album cleanup failed for %s: %s', user_id, exc)
+    for start in range(0, total, BULK_MUTATION_CHUNK_SIZE):
+        chunk = valid_names[start:start + BULK_MUTATION_CHUNK_SIZE]
+        chunk_deleted, chunk_errors, chunk_person_ids = _hard_delete_photos_chunk(user_id, chunk)
+        deleted.extend(chunk_deleted)
+        errors.extend(chunk_errors)
+        deleted_person_ids.update(chunk_person_ids)
+        if progress is not None:
+            progress(min(start + len(chunk), total), total)
 
     if deleted_person_ids and metadata_table_client is not None:
         # Defensive cleanup of stale peopleIds on surviving photos. It needs a whole-library read,
         # so it runs in the background (streamed, never listed) instead of holding this request.
         threading.Thread(
-            target=_strip_deleted_people_from_photos, args=(user_id, set(deleted_person_ids), set(deleted_names_set)),
+            target=_strip_deleted_people_from_photos, args=(user_id, set(deleted_person_ids), set(deleted)),
             name='strip-deleted-people', daemon=True,
         ).start()
 
@@ -12445,6 +12537,114 @@ def _hard_delete_photos_now(user_id: str, filenames: List[str]) -> Tuple[List[st
             pass
 
     return deleted, errors
+
+
+def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[str], List[str], set]:
+    """One bounded chunk of _hard_delete_photos_now's cascade: blob + metadata
+    row + dedup/collision index rows + faces/people + job-row + album
+    cascades for up to BULK_MUTATION_CHUNK_SIZE filenames.
+
+    Keep metadata/ownership until the strict face cascade succeeds, so a
+    failed cleanup remains discoverable and retryable instead of reporting
+    deletion success with hidden faces. Returns (deleted, errors, deleted_person_ids).
+    """
+    deleted: List[str] = []
+    errors: List[str] = []
+    if not filenames:
+        return deleted, errors, set()
+    names_set = set(filenames)
+
+    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+        metadata_results = list(executor.map(lambda n: (n, _get_metadata_entity(user_id, n)), filenames))
+    own_rows_by_name = {name: metadata for name, metadata in metadata_results if metadata is not None}
+
+    shared_names = _shared_names_in_batch(names_set, user_id)
+
+    # Batch the image+thumbnail blob deletes across the whole chunk (Blob
+    # Batch API, up to 256 blobs/request) instead of one delete_blob() call
+    # per file. A physical blob can be referenced by more than one safe_name
+    # (anonymized photos also clear their original-filename blob).
+    blob_to_names: Dict[str, set] = {}
+    for safe_name, metadata in own_rows_by_name.items():
+        if safe_name in shared_names:
+            continue
+        anonymous_id = str((metadata or {}).get('anonymousImageId') or '').strip()
+        physical_name = anonymous_id or safe_name
+        blob_to_names.setdefault(physical_name, set()).add(safe_name)
+        if anonymous_id:
+            blob_to_names.setdefault(safe_name, set()).add(safe_name)
+    blob_names = list(blob_to_names.keys())
+    blob_errors_by_name: Dict[str, List[str]] = {}
+    for label, container_name in (('blob image', BLOB_IMAGE_CONTAINER), ('blob thumbnail', BLOB_THUMBNAIL_CONTAINER)):
+        for failed_blob in _batch_delete_blobs(container_name, blob_names):
+            for safe_name in blob_to_names.get(failed_blob, ()):
+                blob_errors_by_name.setdefault(safe_name, []).append(f'{label}: delete failed')
+
+    for safe_name, metadata in own_rows_by_name.items():
+        if safe_name in shared_names:
+            continue
+        anonymous_id = str((metadata or {}).get('anonymousImageId') or '').strip()
+        if anonymous_id:
+            try:
+                delete_image_name_mapping(user_id, anonymous_id)
+            except Exception:
+                app.logger.debug('Failed to delete image-name mapping for %s', safe_name)
+
+    # Do not remove the retry anchor or release ownership before the leased
+    # face cascade. Already-removed blobs are idempotent on retry.
+    for safe_name in filenames:
+        if safe_name not in own_rows_by_name:
+            errors.append(f'{safe_name}: Not found')
+            continue
+        file_errors = blob_errors_by_name.get(safe_name)
+        if file_errors:
+            errors.append(f"{safe_name}: {'; '.join(file_errors)}")
+            continue
+        deleted.append(safe_name)
+
+    ready_names_set = set(deleted)
+    deleted = []
+    deleted_person_ids = set()
+    try:
+        deleted_person_ids = _batch_remove_faces_for_filenames(user_id, ready_names_set)
+    except Exception as exc:
+        app.logger.warning('Batch face removal failed for %s: %s', user_id, exc)
+        errors.extend(f'{name}: face cleanup failed' for name in sorted(ready_names_set))
+        ready_names_set = set()
+
+    # Batch the metadata-row deletes via a table transaction (up to 100/request)
+    # instead of one delete_entity() call per file; a failing transaction falls
+    # back to per-row deletes for just that batch (see _batch_delete_table_entities).
+    metadata_delete_failed = _batch_delete_table_entities(metadata_table_client, user_id, sorted(ready_names_set))
+    for name in sorted(metadata_delete_failed):
+        errors.append(f'{name}: metadata: delete failed')
+    metadata_deleted_set = ready_names_set - metadata_delete_failed
+
+    def _finish_hard_delete(safe_name: str) -> None:
+        metadata = own_rows_by_name[safe_name]
+        file_hash = str(metadata.get('fileHash') or '')
+        if file_hash:
+            delete_hash_index_entry(user_id, file_hash)
+        delete_embeddings_entry(user_id, safe_name)
+        # A complete-empty generation now exists. Retaining ownership on
+        # cascade/metadata failure helps retry; it is NOT an asset fence
+        # against same-content retries, trash reclaim, or late old results.
+        delete_filename_owner_entry(user_id, safe_name)
+
+    with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
+        list(executor.map(_finish_hard_delete, sorted(metadata_deleted_set)))
+    deleted = sorted(metadata_deleted_set)
+    deleted_names_set = set(deleted)
+    try:
+        _batch_remove_job_rows(user_id, deleted_names_set)
+    except Exception as exc:
+        app.logger.warning('Batch job cleanup failed for %s: %s', user_id, exc)
+    try:
+        _batch_remove_filenames_from_albums(user_id, deleted_names_set)
+    except Exception as exc:
+        app.logger.warning('Batch album cleanup failed for %s: %s', user_id, exc)
+
+    return deleted, errors, deleted_person_ids
 
 
 def _delete_upload_temp_files_for_filename(filename: str, upload_id: str = '') -> Tuple[List[str], List[str]]:
@@ -12930,7 +13130,7 @@ def _batch_remove_job_rows(user_id: str, names_set: set) -> int:
         rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
     except Exception:
         return 0
-    removed = 0
+    matched_row_keys = []
     for row in rows:
         row_key = str(row.get('RowKey') or '')
         job_id = str(row.get('jobId') or '')
@@ -12944,14 +13144,10 @@ def _batch_remove_job_rows(user_id: str, names_set: set) -> int:
                 for base in (job_id, row_key, correlation_id)
             )
         )
-        if not matches:
-            continue
-        try:
-            jobs_table_client.delete_entity(partition_key=user_id, row_key=row_key)
-            removed += 1
-        except Exception:
-            pass
-    return removed
+        if matches:
+            matched_row_keys.append(row_key)
+    failed = _batch_delete_table_entities(jobs_table_client, user_id, matched_row_keys)
+    return len(matched_row_keys) - len(failed)
 
 
 def _batch_remove_filenames_from_albums(user_id: str, names_set: set) -> None:
@@ -13305,6 +13501,18 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             )
         except Exception:
             worker_logger.exception('Bulk photo delete failed for %s', user_id)
+            raise
+        return
+
+    if job_type == 'photo_hard_delete':
+        try:
+            _run_photo_hard_delete_job(
+                user_id,
+                job_id,
+                str(payload.get('payloadBlobName') or ''),
+            )
+        except Exception:
+            worker_logger.exception('Bulk photo purge failed for %s', user_id)
             raise
         return
 

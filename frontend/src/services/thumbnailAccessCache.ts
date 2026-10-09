@@ -95,6 +95,40 @@ const evictOldest = () => {
     }
 };
 
+// Concurrent callers resolving the same not-yet-cached filename (e.g. several
+// virtualized tiles mounting for the same photo at once, see Gallery
+// windowing) share one network request/signed URL instead of each minting
+// their own -- two different SAS signatures for the same blob otherwise show
+// up as a false "blob-multi-url" duplicate-transfer report (see perf.ts).
+const pending = new Map<string, Promise<string>>();
+
+const fetchBatch = async (filenames: string[]): Promise<Map<string, string>> => {
+    const out = new Map<string, string>();
+    try {
+        const response = await post('/api/photos/access-batch', { kind: 'thumbnail', filenames });
+        const urls = (response && typeof response.urls === 'object' && response.urls) || {};
+        let gotNewUrl = false;
+        for (const filename of filenames) {
+            const raw = urls[filename];
+            const resolved = isHttpUrl(raw) ? raw : '';
+            if (resolved) {
+                urlCache.set(filename, resolved);
+                evictOldest();
+                gotNewUrl = true;
+            }
+            out.set(filename, resolved);
+        }
+        if (gotNewUrl) {
+            persistToStorage();
+        }
+    } catch {
+        for (const filename of filenames) {
+            out.set(filename, '');
+        }
+    }
+    return out;
+};
+
 export const resolveThumbnailAccessUrls = async (filenames: string[]): Promise<Map<string, string>> => {
     hydrateFromStorage();
     const result = new Map<string, string>();
@@ -110,27 +144,36 @@ export const resolveThumbnailAccessUrls = async (filenames: string[]): Promise<M
     if (toFetch.length === 0) {
         return result;
     }
-    try {
-        const response = await post('/api/photos/access-batch', { kind: 'thumbnail', filenames: toFetch });
-        const urls = (response && typeof response.urls === 'object' && response.urls) || {};
-        let gotNewUrl = false;
-        for (const filename of toFetch) {
-            const raw = urls[filename];
-            const resolved = isHttpUrl(raw) ? raw : '';
-            if (resolved) {
-                urlCache.set(filename, resolved);
-                evictOldest();
-                gotNewUrl = true;
-            }
-            result.set(filename, resolved);
+
+    const alreadyPending = new Map<string, Promise<string>>();
+    const fresh: string[] = [];
+    for (const filename of toFetch) {
+        const existing = pending.get(filename);
+        if (existing) {
+            alreadyPending.set(filename, existing);
+        } else {
+            fresh.push(filename);
         }
-        if (gotNewUrl) {
-            persistToStorage();
-        }
-    } catch {
-        for (const filename of toFetch) {
-            result.set(filename, '');
-        }
+    }
+
+    let freshPromise: Promise<Map<string, string>> | undefined;
+    if (fresh.length > 0) {
+        freshPromise = fetchBatch(fresh);
+        const settled = freshPromise;
+        fresh.forEach((filename) => {
+            pending.set(filename, settled.then((map) => map.get(filename) || ''));
+        });
+        void settled.finally(() => {
+            fresh.forEach((filename) => pending.delete(filename));
+        });
+    }
+
+    await Promise.all(Array.from(alreadyPending, ([filename, promise]) => promise.then((url) => {
+        result.set(filename, url);
+    })));
+    if (freshPromise) {
+        const freshResult = await freshPromise;
+        freshResult.forEach((url, filename) => result.set(filename, url));
     }
     return result;
 };
