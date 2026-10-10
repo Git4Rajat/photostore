@@ -460,6 +460,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const photoOffsetRef = useRef(0);
     const photoLoadingRef = useRef(false);
     const photoHasMoreRef = useRef(true);
+    // A reset (filters/range changed) that arrives while a fetch is already
+    // in flight gets dropped by fetchPhotos' busy guard below -- harmless if
+    // the in-flight fetch hasn't read galleryFiltersRef/captureRangeRef yet
+    // (it'll pick up the new values itself), but a second filter change often
+    // lands *after* that read (the enrichment chunk loop that follows it is
+    // the slow part), in which case the dropped reset is never retried and
+    // the grid is stuck showing the superseded filter. Flagging it here means
+    // fetchPhotos' own `finally` fires one more reset once it's free, so the
+    // final fetch always reflects whatever filters/range are current by then.
+    const pendingResetRef = useRef(false);
     const [albums, setAlbums] = useState<Album[]>([]);
     const [albumsLoading, setAlbumsLoading] = useState<boolean>(true);
     // Populated by fetchAlbums's primary (local-index) path -- lets openAlbum
@@ -630,8 +640,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // fetchPhotosViaLegacyEndpoint above on any failure (cold library with no
     // index built yet, network error, anything) so the gallery never breaks.
     const fetchPhotos = useCallback(async (reset: boolean) => {
-        if (photoLoadingRef.current) return;
+        if (photoLoadingRef.current) {
+            if (reset) pendingResetRef.current = true;
+            return;
+        }
         if (!reset && !photoHasMoreRef.current) return;
+        // This fetch is about to read the current filters/range itself, so any
+        // earlier dropped reset request is moot -- clear it to avoid a
+        // redundant extra fetch once this one finishes.
+        if (reset) pendingResetRef.current = false;
         photoLoadingRef.current = true;
         setPhotosLoading(true);
         const offset = reset ? 0 : photoOffsetRef.current;
@@ -716,6 +733,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         } finally {
             photoLoadingRef.current = false;
             setPhotosLoading(false);
+            // A filter/range change that arrived mid-fetch (see the busy guard
+            // above) was dropped rather than applied -- run it now so the grid
+            // ends up reflecting whatever is current, not whatever this fetch
+            // started with.
+            if (pendingResetRef.current) {
+                pendingResetRef.current = false;
+                void fetchPhotos(true);
+            }
         }
     }, [applyServerPhotoTotal, fetchPhotosViaLegacyEndpoint]);
 
