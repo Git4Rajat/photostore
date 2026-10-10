@@ -69,6 +69,58 @@ redelivers, and existing terminal outcomes (including retry exhaustion) are
 deleted on the main thread. Historical `done`-based rebuild logic is retained
 except that exhausted retries no longer inflate it.
 
+## Source volume throughput (MB/hour/replica)
+
+`productive_mb_per_hour` is the primary source-volume throughput rate:
+`window.productive_source_bytes / 1000000 * 3600 / window_seconds`.
+One MB means 1,000,000 bytes, not megabits or MiB. Each sample belongs to one
+replica; its denominator is actual window wall time, including waits and idle
+time. `downloaded_mb_per_hour` uses `window.source_download_bytes` with the same
+formula. Zero-length windows report zero rates. Photo rates remain secondary
+for interpreting per-file overhead and model work.
+
+`source_download_bytes` counts the length of each successful lazy source blob
+download, once per step-runner call. Cache reuse across steps and replacing the
+cache with a smaller preview do not count the source again or change its size.
+Failed downloads have no measured bytes; partial network transfer and internal
+SDK retries are not measured. `productive_source_bytes` credits that source
+size only after the existing productive-completion predicate passes. An apply
+exception, processor error, unknown result or already-processed skip receives
+no productive byte credit. Both counters have window and cumulative totals.
+Per-file step/message logs also include `source_bytes`; completed-message logs
+include `productive=True/False`. No additional storage requests are needed.
+
+These are source-volume proxies, not unique library growth or end-to-end indexed
+bytes. Successful reprocessing can count again; productive credit retains the
+completion limitations above. Downloads and completions can land in different
+windows. File size also does not normalize decoded pixel count, format or model
+cost: later processors commonly consume a shrunk preview. Clustering primarily
+operates on faces/embeddings, so source MB alone is not its service-rate metric.
+
+For a fleet whose replica count changes, divide total productive source MB by
+the **sum of measured replica-hours**, rather than by the final replica count
+or averaging rounded per-sample rates. This LAW query weights actual sample
+durations (including idle samples):
+
+```kusto
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(6h)
+| where ContainerAppName_s == 'forenkladev-vision'
+| parse Log_s with * 'ipwork throughput metrics=' metrics_json
+| extend m = parse_json(metrics_json)
+| where isnotnull(m.window.productive_source_bytes)
+| summarize source_bytes = sum(todouble(m.window.productive_source_bytes)),
+            replica_seconds = sum(todouble(m.window_seconds))
+| extend mb_per_hour_per_replica = iff(replica_seconds > 0,
+    source_bytes / 1000000.0 * 3600.0 / replica_seconds, real(null))
+```
+
+This covers emitted windows, not unobserved replica uptime: cold starts, abrupt
+termination without a final sample and missing logs can leave gaps. Windows are
+selected by emission time and can cross the requested period's boundary. Old
+logs without byte counters cannot establish historical MB throughput from
+photo counts alone.
+
 ## Fixed histograms and latency boundaries
 
 `histograms.window` and `histograms.cumulative` report populated timing names.

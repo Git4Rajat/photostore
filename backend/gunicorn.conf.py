@@ -11,6 +11,26 @@ def post_fork(server, worker):
     maps_utils.prewarm_offline_geocoder()
 
 
+def post_worker_init(worker):
+    if os.environ.get('APP_ROLE', 'core').strip().lower() != 'upload':
+        return
+    try:
+        from upload_diagnostics import start_upload_throughput
+        start_upload_throughput(worker.log, workers_per_replica=worker.cfg.workers)
+    except Exception:
+        worker.log.exception('Upload throughput reporter could not start')
+
+
+def worker_exit(server, worker):
+    if os.environ.get('APP_ROLE', 'core').strip().lower() != 'upload':
+        return
+    try:
+        from upload_diagnostics import stop_upload_throughput
+        stop_upload_throughput()
+    except Exception:
+        worker.log.exception('Upload throughput reporter could not stop')
+
+
 def on_starting(server):
     # Liveness sidecar: a trivial stdlib-only HTTP server on its own port,
     # started once in the gunicorn MASTER process (on_starting runs before

@@ -25,6 +25,7 @@ STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detect
 COUNTERS = ('done', 'noop', 'lease_busy', 'error', 'not_found', 'retry_exhausted',
             'receive', 'receive_failed', 'received', 'ack', 'ack_failed',
             'productive_completed', 'completed_with_step_error', 'completed_result_unknown', 'already_processed',
+            'source_download_bytes', 'productive_source_bytes',
             'eligibility_reprocessing', 'eligibility_unknown',
             'defer_shutdown', 'defer_preparation_failed', 'defer_visibility_budget',
             'watchdog_preparation', 'watchdog_tasks', 'shutdown_grace_exhausted',
