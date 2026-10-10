@@ -3558,21 +3558,44 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
         app.logger.warning('Clustering queue client is unavailable; incremental-assign for %s/%s filenames (user=%s) was not enqueued',
                            len(filenames), filenames[0], user_id)
         return {'status': 'unavailable'}
-    message = {
-        'user_id': user_id,
-        'type': 'people_incremental_assign',
-        'filenames': filenames,
-    }
-    try:
-        clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
-    except Exception:
-        app.logger.exception('Failed to enqueue incremental-assign job for %s filenames (user=%s, first=%s)',
-                             len(filenames), user_id, filenames[0])
-        return {'status': 'failed'}
-    return {'status': 'queued'}
+    # Split a large buffered batch into bounded messages instead of one fat
+    # message. A backfill flush can carry >1000 filenames
+    # (IPWORK_CLUSTER_BATCH_MAX_FILENAMES); as a single message that is one
+    # atomic assignment unit -- it holds the library lease for its whole run,
+    # and ANY one filename's failure re-raises and redelivers the WHOLE thing
+    # (measured live at ~19k table round trips / ~260s for a single ~1,200-
+    # filename message). Bounding it caps per-message lease hold, redelivery
+    # cost and tail latency, and keeps each message within the staged-batch
+    # face cap (see _process_clustering_user_group) so it is eligible for the
+    # grouped-transaction fast path when staged writes are enabled. The drain
+    # still re-groups adjacent small messages up to that cap, so this does not
+    # fragment the work -- it only bounds the blast radius of one message.
+    cap = max(1, INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE)
+    sent = 0
+    for start in range(0, len(filenames), cap):
+        chunk = filenames[start:start + cap]
+        message = {
+            'user_id': user_id,
+            'type': 'people_incremental_assign',
+            'filenames': chunk,
+        }
+        try:
+            clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
+            sent += 1
+        except Exception:
+            app.logger.exception('Failed to enqueue incremental-assign job for %s filenames (user=%s, first=%s)',
+                                 len(chunk), user_id, chunk[0])
+            return {'status': 'failed' if sent == 0 else 'partial', 'messages': sent}
+    return {'status': 'queued', 'messages': sent}
 
 
 IPWORK_CLUSTER_BATCH_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_MAX_FILENAMES', '1500'))
+# Per-queue-message ceiling for incremental-assign: a buffered flush of up to
+# IPWORK_CLUSTER_BATCH_MAX_FILENAMES is split into messages of at most this many
+# filenames so no single message becomes the ~260s / ~19k-round-trip monster
+# measured live. ~128 keeps a typical photo's faces within the staged-batch
+# 256-face cap in _process_clustering_user_group.
+INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE = int(os.getenv('INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE', '128'))
 # The real trigger: flush once a user's upload has gone quiet for this long
 # (a GAP in incoming filenames) -- NOT "flush after this much total time has
 # passed," which would cut off a still-active upload. See _is_upload_active.

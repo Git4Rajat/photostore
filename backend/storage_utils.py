@@ -4248,6 +4248,18 @@ def touch_user_lexical_index_state(user_id: str) -> str:
 # changed photos), so a per-photo dirty row for it was a table write per photo that nothing ever used.
 _SEARCH_INDEX_KINDS = ('lexical', 'sort', 'access')
 
+# Crossover from the incremental merge (one point-read per dirty filename) to a
+# single bulk partition scan. A merge is O(dirty) round trips but a scan is
+# O(library/page_size) *sequential* pages -- so the merge only wins while the
+# dirty set is a small fraction of the library. Past that it's cheaper (and
+# avoids the ~20k-point-read, minutes-long builds measured on large backfills)
+# to re-stream the whole partition once. The absolute floor keeps a handful of
+# edits on a big library on the cheap point-read path; the fraction handles the
+# scaling crossover (a bulk scan of L rows ~ L/1000 page fetches, so it starts
+# beating D parallel point reads around D ~ 10% of L under load).
+_INDEX_MERGE_MAX_DIRTY_ABS = int(os.getenv('INDEX_MERGE_MAX_DIRTY_ABS', '2000'))
+_INDEX_MERGE_MAX_DIRTY_FRACTION = float(os.getenv('INDEX_MERGE_MAX_DIRTY_FRACTION', '0.10'))
+
 
 def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
     # '#' (like '/' and '?') is rejected by Azure Table Storage as a key character: every mark written
@@ -4458,6 +4470,24 @@ def _library_row_count(user_id: str) -> int:
         return 0
 
 
+def _dirty_set_too_large_to_merge(user_id: str, dirty_count: int) -> bool:
+    """True when the incremental merge's per-dirty-row point reads would cost
+    more than just re-streaming the whole partition once, so the rows-index
+    rebuild should take the full-scan branch instead (see
+    _refresh_rows_index_on_disk and _INDEX_MERGE_MAX_DIRTY_*). Cheap: one
+    manifest read for the library size, only reached once the dirty set is
+    already past the absolute floor."""
+    if dirty_count < _INDEX_MERGE_MAX_DIRTY_ABS:
+        return False
+    rows = _library_row_count(user_id)
+    if rows <= 0:
+        # Library size unknown (no search DB yet) but the dirty set is already
+        # past the floor -- a single bulk scan is the safer bet than thousands
+        # of point reads against an unknown-but-clearly-non-trivial partition.
+        return True
+    return dirty_count >= rows * _INDEX_MERGE_MAX_DIRTY_FRACTION
+
+
 def sort_index_skipped(user_id: str) -> bool:
     return SORT_INDEX_MAX_ROWS > 0 and _library_row_count(user_id) > SORT_INDEX_MAX_ROWS
 
@@ -4645,10 +4675,15 @@ def refresh_user_lexical_index(
         existing = _load_lexical_index_blob(key)
         if existing is not None and existing.schema_version == _LEXICAL_INDEX_SCHEMA_VERSION:
             dirty = _get_dirty_search_index_filenames(key, 'lexical')
-            if dirty is not None:
+            if dirty is not None and not _dirty_set_too_large_to_merge(key, len(dirty)):
                 snapshot = _merge_user_lexical_index_snapshot(key, existing, dirty, source_version)
                 if snapshot is not None:
                     dirty_to_clear = dirty
+            elif dirty is not None:
+                # Too many changed rows to point-read one at a time -- fall
+                # through to the full rebuild below (see _dirty_set_too_large_to_merge).
+                perf_instrumentation.log_event('index_merge_crossover', kind='lexical', user=key,
+                                               dirty=len(dirty), rows=_library_row_count(key))
     if snapshot is None:
         snapshot = _build_user_lexical_index_snapshot(key, source_version)
         if snapshot is not None:
@@ -5194,7 +5229,14 @@ def _refresh_rows_index_on_disk(
         header = {'userId': key, 'sourceVersion': source_version, 'schemaVersion': schema_version, 'updatedAt': source_version}
         previous = os.path.join(workdir, f'{kind}-previous.json.gz')
         merge = False
-        if dirty is not None and blob_client is not None and _timed_fetch(kind, blob_client, previous):
+        if dirty is not None and _dirty_set_too_large_to_merge(key, len(dirty)):
+            # More rows changed than it's worth point-reading one at a time:
+            # a single bulk re-scan is cheaper (see _dirty_set_too_large_to_merge).
+            # Skip fetching the previous artifact entirely -- it's only needed
+            # for the merge path -- and fall through to the full-scan branch.
+            perf_instrumentation.log_event('index_merge_crossover', kind=kind, user=key,
+                                           dirty=len(dirty), rows=_library_row_count(key))
+        elif dirty is not None and blob_client is not None and _timed_fetch(kind, blob_client, previous):
             try:
                 merge = index_files.read_header(previous).get('schemaVersion') == schema_version
             except Exception:

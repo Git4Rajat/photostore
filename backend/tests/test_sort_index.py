@@ -360,6 +360,64 @@ def test_refresh_incremental_merge_only_refetches_dirty_filenames(sort_ctx):
     assert by_name['b.jpg']['rating'] == 99
 
 
+# --- crossover: a large dirty set re-scans instead of point-reading ----------
+
+def test_dirty_set_too_large_to_merge_thresholds(monkeypatch):
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_MAX_DIRTY_ABS', 2000)
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_MAX_DIRTY_FRACTION', 0.10)
+    # Below the absolute floor -> always stay on the cheap point-read merge,
+    # no matter how large the library is.
+    monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 1_000_000)
+    assert storage_utils._dirty_set_too_large_to_merge('u', 1999) is False
+    # Past the floor and >= 10% of the library -> a bulk scan is cheaper.
+    monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 10_000)
+    assert storage_utils._dirty_set_too_large_to_merge('u', 2000) is True
+    # Past the floor but a small fraction of a big library -> still merge.
+    monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 1_000_000)
+    assert storage_utils._dirty_set_too_large_to_merge('u', 2000) is False
+    # Library size unknown (no search DB yet) but past the floor -> scan.
+    monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 0)
+    assert storage_utils._dirty_set_too_large_to_merge('u', 5000) is True
+
+
+def test_large_dirty_set_takes_full_scan_not_per_row_point_reads(sort_ctx, monkeypatch):
+    table, _dirty_table, _ = sort_ctx
+    _seed_row(table, 'lib-X', 'a.jpg', rating=1)
+    _seed_row(table, 'lib-X', 'b.jpg', rating=2)
+    _seed_row(table, 'lib-X', 'c.jpg', rating=3)
+    storage_utils.refresh_user_sort_index('lib-X', source_version='v1')
+
+    # Force the crossover with a tiny floor; the fixture has no search DB so
+    # _library_row_count returns 0 -> any dirty set past the floor re-scans.
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_MAX_DIRTY_ABS', 2)
+    _seed_row(table, 'lib-X', 'b.jpg', rating=99)
+    _seed_row(table, 'lib-X', 'c.jpg', rating=98)
+    storage_utils.touch_user_sort_index_dirty('lib-X', ['b.jpg', 'c.jpg'])
+
+    fetched: list = []
+    real_get_entity = table.get_entity
+    def spying_get_entity(partition_key, row_key):
+        fetched.append(row_key)
+        return real_get_entity(partition_key, row_key)
+    table.get_entity = spying_get_entity
+
+    scans: list = []
+    real_query = table.query_entities
+    def counting_query(filter_str, select=None, **kwargs):
+        scans.append(filter_str)
+        return real_query(filter_str, select=select, **kwargs)
+    table.query_entities = counting_query
+
+    storage_utils.refresh_user_sort_index('lib-X', source_version='v2')
+
+    assert fetched == []        # crossover: no per-dirty-file point reads
+    assert len(scans) >= 1      # it took the bulk query_entities branch instead
+    by_name = {row['RowKey']: row for row in storage_utils._load_sort_index_blob('lib-X').rows}
+    assert by_name['a.jpg']['rating'] == 1
+    assert by_name['b.jpg']['rating'] == 99
+    assert by_name['c.jpg']['rating'] == 98
+
+
 # --- cleanup -------------------------------------------------------------
 
 def test_delete_user_sort_index_data_removes_blobs_and_cache(sort_ctx):
