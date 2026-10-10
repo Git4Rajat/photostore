@@ -23,6 +23,15 @@ type ZoomLevel = 'days' | 'months' | 'years';
 // Months too early, so the Gallery gets its own, much smaller floor.
 const GALLERY_TILE_MIN = 24;
 const clampGalleryTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(GALLERY_TILE_MIN, n));
+// Jump-to-date doesn't scroll through a continuous timeline -- it swaps in a
+// fresh page starting at the target date (see jumpToGalleryDate), so there's
+// nothing to actually scroll past. Without this, the swap reads as "did
+// nothing" (new content just appears at the top, no sense of having gone
+// anywhere). This class drives a brief blur/dip on the grid instead -- just
+// enough motion to sell "you went somewhere" before the correct page settles
+// in, without faking a real multi-second scroll through content that was
+// never loaded.
+const DATE_JUMP_ANIM_MS = 420;
 const formatDateJumpLabel = (value: string): string => {
     if (!value) return 'Jump to date';
     const [year, month, day] = value.split('-').map(Number);
@@ -46,6 +55,9 @@ export const GalleryPage: React.FC = () => {
     const [level, setLevel] = useState<ZoomLevel>('days');
     const [focusYear, setFocusYear] = useState<string | null>(null);
     const [dateJump, setDateJump] = useState('');
+    const [jumping, setJumping] = useState(false);
+    const jumpAnimTimerRef = useRef<number | null>(null);
+    useEffect(() => () => { if (jumpAnimTimerRef.current) window.clearTimeout(jumpAnimTimerRef.current); }, []);
 
     const depth = useRef(0);
     const gridRef = useRef<HTMLDivElement>(null);
@@ -141,7 +153,14 @@ export const GalleryPage: React.FC = () => {
         const tile = Array.from(gridRef.current.querySelectorAll<HTMLElement>('[data-tile-id]'))
             .find((el) => el.dataset.tileId === filename);
         if (tile) {
-            tile.scrollIntoView({ block: 'start', behavior: 'smooth' });
+            // 'auto' (instant), not 'smooth' -- a jump swaps in a brand-new page
+            // rather than scrolling through one (see jumpToGalleryDate), so the
+            // target tile is already at/near the top of a short list; a smooth
+            // scroll over that tiny remaining distance reads as "barely moved".
+            // The sense of motion comes from the pt-date-jumping blur instead
+            // (see handleDateJump) -- this just needs to land instantly once
+            // that settles.
+            tile.scrollIntoView({ block: 'start', behavior: 'auto' });
             pendingScrollIdRef.current = null;
         }
     };
@@ -191,6 +210,11 @@ export const GalleryPage: React.FC = () => {
         if (!value) return;
         setLevel('days');
         setFocusYear(null);
+        // Restart the "went somewhere" animation even if a previous jump's
+        // animation is still playing (rapid re-picks in the calendar).
+        if (jumpAnimTimerRef.current) window.clearTimeout(jumpAnimTimerRef.current);
+        setJumping(true);
+        jumpAnimTimerRef.current = window.setTimeout(() => setJumping(false), DATE_JUMP_ANIM_MS);
         void jumpToGalleryDate(value).then((filename) => {
             pendingScrollIdRef.current = filename;
             window.requestAnimationFrame(() => scrollToTile(filename));
@@ -403,7 +427,7 @@ export const GalleryPage: React.FC = () => {
                 </div>
             ) : (
                 <div
-                    className={`pt-drop-surface${dragging ? ' dragging' : ''}`}
+                    className={`pt-drop-surface${dragging ? ' dragging' : ''}${jumping ? ' pt-date-jumping' : ''}`}
                     ref={gridRef}
                     style={{ ['--pt-tile-min' as string]: `${tileMin}px` } as React.CSSProperties}
                     onDragEnter={(e) => { e.preventDefault(); depth.current += 1; setDragging(true); }}

@@ -249,6 +249,11 @@
 /* ---- gallery drop + arrive ---- */
 .pt-drop-surface { position: relative; border-radius: var(--r-md); }
 .pt-drop-surface.dragging .pt-grid { opacity: 0.35; filter: blur(1px); }
+/* Jump-to-date swaps in a whole new page rather than scrolling to it (see
+   GalleryPage's handleDateJump) -- this sells "you went somewhere" with a
+   quick blur/dip instead of an abrupt content swap. */
+@keyframes pt-date-jump-fly { 0%, 100% { opacity: 1; filter: blur(0); } 35% { opacity: 0.35; filter: blur(7px); } }
+.pt-drop-surface.pt-date-jumping .pt-grid { animation: pt-date-jump-fly 420ms ease; }
 .pt-drop-overlay { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border: 2px dashed var(--accent); border-radius: var(--r-md); background: var(--accent-soft); color: var(--accent); font-weight: 650; }
 .pt-drop-surface.dragging .pt-drop-overlay { display: flex; }
 .pt-drop-overlay .drop-icon { width: 46px; height: 46px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #fff; }
