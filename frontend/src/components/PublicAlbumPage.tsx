@@ -577,7 +577,13 @@ const PublicAlbumPage: React.FC = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [token]);
 
-    const countLabel = `${photos.length} photo${photos.length === 1 ? '' : 's'}`;
+    // album.photoCount is the real server-side total (routes/public.py's
+    // album_store.page); photos.length is only how many of that total have
+    // loaded into the client so far (PUBLIC_ALBUM_PAGE_SIZE per page) -- using
+    // it here showed "120 photos" on a much larger album, climbing as the
+    // user scrolled instead of showing the true count up front.
+    const totalPhotoCount = album?.photoCount ?? photos.length;
+    const countLabel = `${totalPhotoCount} photo${totalPhotoCount === 1 ? '' : 's'}`;
     const showToolbar = !loading && !error && bufferReady && photos.length > 0;
 
     return (
