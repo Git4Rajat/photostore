@@ -1,5 +1,6 @@
 """Local-only diagnostics contracts: fake clocks, queues, and sweep phases."""
 from concurrent.futures import Future, ThreadPoolExecutor
+import base64
 import json
 import logging
 from types import SimpleNamespace
@@ -105,6 +106,27 @@ def test_forced_final_window_logs_before_cadence(clock, memory_samples, caplog, 
     assert memory_samples == [1]
     assert window.window == {}
     assert window.cumulative['done'] == 1
+
+
+@pytest.mark.parametrize('elapsed', [0, 30, 120])
+def test_byte_throughput_uses_decimal_mb_and_actual_replica_time(clock, memory_samples, caplog, elapsed):
+    caplog.set_level(logging.INFO, logger=app.worker_logger.name)
+    window = app._IpworkThroughputWindow()
+    window.record('source_download_bytes', count=3000000)
+    window.record('productive_source_bytes', count=2000000)
+    clock.seconds += elapsed
+    window.log(0, force=True)
+    first, = _metrics(caplog)
+    assert first['downloaded_mb_per_hour'] == (round(3 * 3600 / elapsed, 3) if elapsed else 0)
+    assert first['productive_mb_per_hour'] == (round(2 * 3600 / elapsed, 3) if elapsed else 0)
+    assert first['throughput_units'] == 'MB/hour/replica; 1 MB = 1000000 bytes'
+    clock.seconds += 60
+    window.log(0)
+    second = _metrics(caplog)[1]
+    assert second['window']['source_download_bytes'] == second['window']['productive_source_bytes'] == 0
+    assert second['downloaded_mb_per_hour'] == second['productive_mb_per_hour'] == 0
+    assert second['cumulative']['source_download_bytes'] == 3000000
+    assert second['cumulative']['productive_source_bytes'] == 2000000
 
 
 class _ImmediateExecutor:
@@ -513,7 +535,9 @@ def test_step_and_failed_download_timing_without_storage_changes(monkeypatch, cl
     results = app._run_ipwork_steps('u', 'f', ['ocr', 'face'])
     assert results == {'ocr': {'hasData': False}, 'face': {'hasData': False}}
     assert len(downloads) == 1
-    summary = collector.snapshot(1, 1)['histograms']['window']
+    sample = collector.snapshot(1, 1)
+    assert sample['window']['source_download_bytes'] == len(b'photo')
+    summary = sample['histograms']['window']
     assert summary['download']['count'] == 1
     assert summary['download']['sum'] == 20
     assert summary['step_ocr']['sum'] == summary['step_face']['sum'] == 30
@@ -524,9 +548,59 @@ def test_step_and_failed_download_timing_without_storage_changes(monkeypatch, cl
 
     monkeypatch.setattr(app, 'download_media_bytes', failed_download)
     assert app._run_ipwork_steps('u', 'f', ['face'])['face']['error'] == 'download_failed'
-    summary = collector.snapshot(1, 2)['histograms']['window']
+    sample = collector.snapshot(1, 2)
+    assert sample['window']['source_download_bytes'] == 0
+    assert app._ipwork_metrics_context.source_bytes == 0
+    summary = sample['histograms']['window']
     assert summary['download']['sum'] == 40
     assert 'step_face' not in summary
+
+
+@pytest.mark.parametrize('outcome', ['success', 'step_error', 'apply_error', 'already_done'])
+def test_source_bytes_count_original_once_and_only_credit_productive_results(monkeypatch, clock, outcome):
+    collector = metrics_module.Metrics(2, clock=lambda: clock.seconds)
+    monkeypatch.setattr(app._ipwork_metrics_context, 'collector', collector, raising=False)
+    monkeypatch.setattr(app._ipwork_metrics_context, 'source_bytes', 999999, raising=False)
+    monkeypatch.setattr(app, 'claim_processing_lease', lambda *a, **kw: {
+        'statuses': {'ocrStatus': 'done', 'previewStatus': 'done'} if outcome == 'already_done' else {}})
+    monkeypatch.setattr(app, 'release_processing_lease', lambda *a, **kw: None)
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *a: {'anonymousImageId': 'source'})
+    downloads, inputs = [], []
+    original, preview = b'original-photo-bytes', b'small'
+
+    def download(*args):
+        downloads.append(args)
+        return original
+
+    def preview_step(user, filename, image_bytes):
+        inputs.append(image_bytes)
+        return {'hasData': True, 'data': base64.b64encode(preview).decode('ascii')}
+
+    def ocr_step(user, filename, image_bytes):
+        inputs.append(image_bytes)
+        return {'hasData': False, 'error': 'failed'} if outcome == 'step_error' else {'hasData': False}
+
+    def apply_results(*a, **kw):
+        if outcome == 'apply_error':
+            raise OSError('persistence failure')
+        return {'preview_status': 'done', 'ocr_status': 'done'}
+
+    monkeypatch.setattr(app, 'download_media_bytes', download)
+    monkeypatch.setattr(app, 'IPWORK_STEP_PROCESSORS', {'preview': preview_step, 'ocr': ocr_step})
+    monkeypatch.setattr(app, 'apply_client_processing_results_for_file', apply_results)
+    payload = {'filename': 'photo', 'steps': ['preview', 'ocr']}
+    if outcome == 'apply_error':
+        with pytest.raises(OSError):
+            app._handle_ipwork_queue_payload(payload, 'job', 'user')
+    else:
+        assert app._handle_ipwork_queue_payload(payload, 'job', 'user') == (
+            'noop' if outcome == 'already_done' else 'done')
+    sample = collector.snapshot(1, 1)['window']
+    assert sample['source_download_bytes'] == (0 if outcome == 'already_done' else len(original))
+    assert sample['productive_source_bytes'] == (len(original) if outcome == 'success' else 0)
+    assert downloads == ([] if outcome == 'already_done' else [('image', 'source')])
+    assert inputs == ([] if outcome == 'already_done' else [original, preview])
 
 
 @pytest.mark.parametrize('kind, expected', [

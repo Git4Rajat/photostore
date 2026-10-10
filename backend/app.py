@@ -14707,6 +14707,7 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
     client_processing: Dict[str, Dict] = {}
     image_bytes_cache: List[bytes] = []
     download_ms = 0
+    _ipwork_metrics_context.source_bytes = 0
 
     def get_image_bytes() -> bytes:
         nonlocal download_ms
@@ -14716,6 +14717,8 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
                 entity = _get_metadata_entity(user_id, filename) or {}
                 source_blob = str(entity.get('anonymousImageId') or '').strip() or filename
                 image_bytes_cache.append(download_media_bytes('image', source_blob))
+                _ipwork_metrics_context.source_bytes = len(image_bytes_cache[0])
+                _ipwork_metric('source_download_bytes', count=_ipwork_metrics_context.source_bytes)
             finally:
                 elapsed_ms = (time.monotonic() - started) * 1000
                 download_ms = round(elapsed_ms)
@@ -14773,8 +14776,8 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             except Exception:
                 worker_logger.exception('ipworker failed to swap in shrunk preview bytes for %s/%s', user_id, filename)
     worker_logger.info(
-        'ipwork step timings user=%s file=%s download_ms=%s step_ms=%s',
-        user_id, filename, download_ms, step_ms,
+        'ipwork step timings user=%s file=%s download_ms=%s step_ms=%s source_bytes=%s',
+        user_id, filename, download_ms, step_ms, _ipwork_metrics_context.source_bytes,
     )
     return client_processing
 
@@ -14828,6 +14831,7 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     if not filename or not user_id or not steps:
         return 'noop'
     message_started = time.monotonic()
+    _ipwork_metrics_context.source_bytes = 0
     lease_owner = f'ipworker-{job_id}'
     try:
         lease_started = time.monotonic()
@@ -14956,6 +14960,9 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
             for step in runnable_steps)
         _ipwork_metric('productive_completed' if results_ok else
                        'completed_with_step_error' if explicit_error else 'completed_result_unknown')
+        source_bytes = _ipwork_metrics_context.source_bytes
+        if results_ok:
+            _ipwork_metric('productive_source_bytes', count=source_bytes)
         if 'face' in runnable_steps and isinstance(client_processing, dict) and isinstance(client_processing.get('face'), dict):
             face_result = client_processing['face']
             diagnostic = face_result.get('faceDiagnostics')
@@ -14983,11 +14990,12 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
         # per-step split inside _run_ipwork_steps -- lease_claim_ms/apply_ms/
         # cluster_ms cover everything outside that per-step breakdown.
         worker_logger.info(
-            'ipwork message timings user=%s file=%s lease_claim_ms=%s steps_ms=%s apply_ms=%s cluster_ms=%s total_ms=%s requested_steps=%s runnable_steps=%s face_count=%s',
+            'ipwork message timings user=%s file=%s lease_claim_ms=%s steps_ms=%s apply_ms=%s cluster_ms=%s total_ms=%s requested_steps=%s runnable_steps=%s face_count=%s source_bytes=%s productive=%s',
             user_id, filename, lease_claim_ms, steps_ms, apply_ms, cluster_ms,
             round((time.monotonic() - message_started) * 1000),
             ','.join(steps), ','.join(runnable_steps),
             _ipwork_result_face_count(client_processing) if 'face' in runnable_steps else 0,
+            source_bytes, results_ok,
         )
     finally:
         # Only needed when apply_client_processing_results_for_file never
@@ -15161,6 +15169,10 @@ class _IpworkThroughputWindow:
         metrics['loop']['preparation_seconds'] = round(preparation_seconds, 3)
         metrics['done_per_hour'] = round(metrics['window']['done'] * 3600 / elapsed, 3) if elapsed > 0 else 0
         metrics['productive_per_hour'] = round(metrics['window']['productive_completed'] * 3600 / elapsed, 3) if elapsed > 0 else 0
+        metrics['throughput_units'] = 'MB/hour/replica; 1 MB = 1000000 bytes'
+        for rate, counter in (('downloaded_mb_per_hour', 'source_download_bytes'),
+                              ('productive_mb_per_hour', 'productive_source_bytes')):
+            metrics[rate] = round(metrics['window'][counter] * 3600 / (elapsed * 1000000), 3) if elapsed > 0 else 0
         # Keep each console record small; a fully populated pair of histograms
         # can exceed log transport line limits. Main record retains quantiles,
         # counts and sums; full bucket arrays get fixed-label phase records.
