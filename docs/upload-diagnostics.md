@@ -25,6 +25,11 @@ replace the previous success-only batch and client-processing timing messages.
   mismatch can return an HTTP error without throwing a phase exception.
 - `counts`: applicable file, successful/failed batch-entry, and claimed-step
   counts; capped at 1,000,000. Claimed steps are counted, never logged by name.
+- `finalized_bytes` and `finalized_files`: source bytes and files successfully
+  finalized in an accepted response. Bytes come from the existing blob-size
+  verification, are not capped by the file-counter limit, and are zero for
+  init/client-processing calls and HTTP errors. Partial batches credit only
+  their successful entries.
 
 Phase names and counter keys are allowlisted. Batch durations sum across files;
 there is no new per-file timing log. No filename, hash, user ID, credential,
@@ -59,3 +64,66 @@ those boundaries. No upload protocol or performance optimization is introduced.
 Instrumentation is request-local and best-effort: clock/logging failures do not
 change response bodies, statuses, or application exception propagation. A phase
 context records elapsed time even on exceptions and re-raises the original error.
+
+## Upload volume throughput (MB/hour/replica)
+
+The upload role also emits `upload throughput metrics=<JSON>` every 60 seconds
+of monotonic wall time, including idle windows, and a final shorter window on
+graceful Gunicorn worker exit/recycle. A single daemon thread per worker samples
+fixed thread-safe counters; it makes no storage calls and retains no photo,
+user, request or upload IDs. Startup and shutdown use Gunicorn's
+[worker lifecycle hooks](https://gunicorn.org/reference/settings/#post-worker-init).
+
+`window` and `cumulative` include `requests`, `request_errors`, `finalized_files`
+and `finalized_bytes`. Requests cover the instrumented routes above, not health
+probes or every upload API. `finalized_mb_per_hour` is
+`window.finalized_bytes / 1000000 * 3600 / window_seconds`, matching vision's
+decimal MB and wall-time denominator. Zero-length final windows report zero.
+Only accepted finalize responses credit bytes. Hash/size mismatches, missing
+blobs and failed files do not count; successful files in partial batches do.
+Caught enqueue/stamping failures can still produce accepted finalization and
+byte credit; this metric does not imply downstream processing completed.
+
+The current upload deployment uses one Gunicorn process per replica, so this is
+MB/hour/replica. Each sample includes allowlisted replica identity, process ID,
+a fresh process-instance identifier, and actual `workers_per_replica`. With
+multiple processes the replica rate is `null`; `process_mb_per_hour` remains
+available. Combine process volume and replica uptime before reporting a replica
+rate in that configuration. Do not divide bytes by summed concurrent request
+durations or average rounded sample rates.
+
+This measures **source volume finalized by the upload app**. Image transfer
+goes browser-to-Blob and does not pass through this app, so this is not measured
+network bandwidth or upload-session duration. Finalize retries can credit the
+same file again: these are successful finalization attempts, not verified unique
+library growth. No durable deduplication or extra storage I/O is added.
+
+The following LAW query puts upload finalization alongside productive vision
+processing, weighting each pipeline's total bytes by its own recorded
+replica-hours. It supports the current one-process upload configuration:
+
+```kusto
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(6h)
+| where ContainerAppName_s in ('forenkladev-upload', 'forenkladev-vision')
+| where Log_s has 'upload throughput metrics=' or Log_s has 'ipwork throughput metrics='
+| parse Log_s with * 'throughput metrics=' metrics_json
+| extend m = parse_json(metrics_json)
+| extend pipeline = iff(ContainerAppName_s == 'forenkladev-upload', 'uploads', 'vision')
+| where pipeline != 'uploads' or toint(m.workers_per_replica) == 1
+| extend source_bytes = iff(pipeline == 'uploads',
+    todouble(m.window.finalized_bytes), todouble(m.window.productive_source_bytes))
+| where isnotnull(source_bytes)
+| summarize source_bytes = sum(source_bytes),
+    replica_seconds = sum(todouble(m.window_seconds)) by pipeline
+| extend mb_per_hour_per_replica = iff(replica_seconds > 0,
+    source_bytes / 1000000.0 * 3600.0 / replica_seconds, real(null))
+```
+
+Process restarts reset cumulative totals; aggregate `window` counters only.
+Cold initialization before the hook, missing logs and abrupt termination without
+a final sample leave coverage gaps. Logger failure can drop a sample; reporting
+is best-effort and must not block uploads. Windows are selected by log emission
+time and may cross the requested period boundary. Upload and vision are separate
+stages, often handling the same source bytes; their volumes must not be added
+and called distinct uploaded data.

@@ -1,6 +1,9 @@
 """Upload timings observe behavior, including early returns, without payload logs."""
+from concurrent.futures import ThreadPoolExecutor
+import importlib.util
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 from flask import Flask, abort
@@ -35,6 +38,7 @@ def records(caplog):
 def upload_env(monkeypatch, caplog):
     clock = Clock()
     monkeypatch.setattr(diagnostics.time, 'monotonic', clock)
+    monkeypatch.setattr(diagnostics, '_throughput', diagnostics.UploadThroughput(app.app.logger, clock=clock))
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(app, '_require_user_id', clock.action(2, ('library', None)))
     monkeypatch.setattr(app, '_require_library_context', clock.action(2, ('account', 'library', None)))
@@ -97,6 +101,7 @@ def test_early_returns_logged_once(upload_env, monkeypatch, caplog, route, failu
     assert response.status_code == status
     record, = records(caplog)
     assert record['status'] == status and record['outcome'] == 'http_error'
+    assert record['finalized_bytes'] == record['finalized_files'] == 0
     # init/init-batch now touch the activity heartbeat (enqueues, 3ms) right
     # after the cleanup-block check, before their own field validation --
     # so a validation failure on those two routes costs 3ms more than a
@@ -157,6 +162,8 @@ def test_finalize_http_errors(upload_env, monkeypatch, caplog, failure, status, 
     assert record['status'] == status and record['outcome'] == 'http_error'
     assert record['total_ms'] == {'missing': 17, 'size': 17, 'finalize': 28, 'hash': 58}[failure]
     assert record['phase_errors'] == ({phase: 1} if phase else {})
+    assert record['finalized_bytes'] == record['finalized_files'] == 0
+    assert diagnostics._throughput.window['finalized_bytes'] == 0
 
 
 @pytest.mark.parametrize('batch', [False, True])
@@ -174,6 +181,9 @@ def test_finalize_success_aggregate_stages(upload_env, caplog, batch):
     assert record['phase_ms']['enqueues'] == 54 * multiplier + 29 + 3
     assert record['total_ms'] == 5 + (5 + 7 + 11 + 13 + 34 + 19 + 54) * multiplier + 29 + 3
     assert record['outcome'] == 'success'
+    assert record['finalized_bytes'] == 10 * multiplier
+    assert record['finalized_files'] == multiplier
+    assert diagnostics._throughput.window['finalized_bytes'] == 10 * multiplier
     assert 'private OCR' not in json.dumps(record)
 
 
@@ -186,6 +196,46 @@ def test_finalize_batch_caught_failure_is_partial(upload_env, monkeypatch, caplo
     assert record['outcome'] == 'partial' and record['counts']['failed'] == 2
     assert record['phase_errors'] == {'finalize_metadata': 2}
     assert record['phase_ms']['finalize_metadata'] == 22
+    assert record['finalized_bytes'] == record['finalized_files'] == 0
+
+
+def test_partial_finalize_batch_only_counts_successful_verified_bytes(upload_env, monkeypatch, caplog):
+    _, client = upload_env
+
+    def finalize(user_id, filename, *a, **kw):
+        if filename == 'bad.jpg':
+            raise OSError('finalization failed')
+        return [], filename
+
+    monkeypatch.setattr(app, 'finalize_uploaded_file', finalize)
+    response = client.post('/upload/finalize-batch', json={
+        'files': [file_data(filename='good.jpg'), file_data(filename='bad.jpg'), {}]})
+    assert response.status_code == 200
+    record, = records(caplog)
+    assert record['counts'] == {'files': 3, 'succeeded': 1, 'failed': 2}
+    assert record['finalized_bytes'] == 10 and record['finalized_files'] == 1
+    assert diagnostics._throughput.window['finalized_bytes'] == 10
+    assert diagnostics._throughput.window['finalized_files'] == 1
+
+
+def test_byte_totals_are_not_clipped_by_file_counter_cap(upload_env, monkeypatch, caplog):
+    clock, client = upload_env
+    size = 8000000
+    blob = SimpleNamespace(get_blob_properties=clock.action(7, SimpleNamespace(size=size)))
+    monkeypatch.setattr(app, 'blob_service_client', SimpleNamespace(get_blob_client=lambda **kw: blob))
+    assert client.post('/upload/finalize', json=file_data(totalSize=size)).status_code == 200
+    record, = records(caplog)
+    assert record['finalized_bytes'] == diagnostics._throughput.window['finalized_bytes'] == size
+    assert record['finalized_files'] == 1
+
+
+def test_init_and_client_processing_do_not_credit_upload_bytes(upload_env):
+    _, client = upload_env
+    assert client.post('/upload/init', json=file_data()).status_code == 200
+    assert client.post('/upload/init-batch', json={'files': [file_data()]}).status_code == 200
+    assert client.post('/upload/client-processing', json=file_data(clientProcessing={'ocr': {}})).status_code == 200
+    assert diagnostics._throughput.window['requests'] == 3
+    assert diagnostics._throughput.window['finalized_bytes'] == diagnostics._throughput.window['finalized_files'] == 0
 
 
 @pytest.mark.parametrize('deleted,status', [(True, 410), (False, 500)])
@@ -333,3 +383,155 @@ def test_storage_client_processing_persistence_subphases(monkeypatch):
     finally:
         diagnostics._CURRENT.reset(token)
     assert timing.phase_ms == {'metadata_read': pytest.approx(7), 'persistence': pytest.approx(24)}
+
+
+def throughput_records(caplog):
+    prefix = 'upload throughput metrics='
+    return [json.loads(r.getMessage().removeprefix(prefix))
+            for r in caplog.records if r.getMessage().startswith(prefix)]
+
+
+@pytest.mark.parametrize('elapsed', [0, 30, 120])
+def test_upload_rates_use_actual_replica_time_and_reset_idle_windows(caplog, elapsed):
+    caplog.set_level(logging.INFO)
+    clock = Clock()
+    reporter = diagnostics.UploadThroughput(app.app.logger, clock=clock)
+    reporter.record_request(200, finalized_files=2, finalized_bytes=3000000)
+    reporter.record_request(500, finalized_files=9, finalized_bytes=9000000)
+    reporter.log()
+    assert throughput_records(caplog) == []
+    clock.now = elapsed
+    reporter.log(force=True)
+    first, = throughput_records(caplog)
+    assert first['window'] == first['cumulative'] == {
+        'requests': 2, 'request_errors': 1, 'finalized_files': 2, 'finalized_bytes': 3000000}
+    assert first['finalized_mb_per_hour'] == (round(3 * 3600 / elapsed, 3) if elapsed else 0)
+    assert first['process_mb_per_hour'] == first['finalized_mb_per_hour']
+    assert first['workers_per_replica'] == 1
+    assert first['window_seconds'] == first['elapsed_seconds'] == elapsed
+    clock.now += 60
+    reporter.log()
+    second = throughput_records(caplog)[1]
+    assert second['window']['finalized_bytes'] == second['finalized_mb_per_hour'] == 0
+    assert second['cumulative'] == first['cumulative']
+    assert second['process_instance'] == first['process_instance']
+
+
+def test_multiple_processes_do_not_claim_a_replica_rate(caplog):
+    caplog.set_level(logging.INFO)
+    clock = Clock()
+    reporter = diagnostics.UploadThroughput(app.app.logger, clock=clock, workers_per_replica=2)
+    reporter.record_request(200, finalized_files=1, finalized_bytes=1000000)
+    clock.now = 60
+    reporter.log()
+    record, = throughput_records(caplog)
+    assert record['finalized_mb_per_hour'] is None
+    assert record['process_mb_per_hour'] == 60
+    assert record['workers_per_replica'] == 2
+
+
+def test_concurrent_uploads_and_snapshots_do_not_lose_or_duplicate_bytes(caplog):
+    caplog.set_level(logging.INFO)
+    clock = Clock()
+    reporter = diagnostics.UploadThroughput(app.app.logger, clock=clock)
+
+    def upload():
+        for _ in range(500):
+            reporter.record_request(200, finalized_files=1, finalized_bytes=8000000)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(upload) for _ in range(4)]
+        reporter.log(force=True)
+        for future in futures:
+            future.result()
+    clock.now = 60
+    reporter.log(force=True)
+    samples = throughput_records(caplog)
+    assert sum(s['window']['finalized_bytes'] for s in samples) == 2000 * 8000000
+    assert sum(s['window']['finalized_files'] for s in samples) == 2000
+    assert samples[-1]['cumulative']['finalized_bytes'] == 2000 * 8000000
+
+
+@pytest.mark.parametrize('status, exception, expected_bytes', [(200, False, 5000000), (503, False, 0), (200, True, 0)])
+def test_request_emission_credits_bytes_once_only_for_accepted_results(caplog, monkeypatch, status, exception, expected_bytes):
+    caplog.set_level(logging.INFO)
+    clock = Clock()
+    reporter = diagnostics.UploadThroughput(app.app.logger, clock=clock)
+    monkeypatch.setattr(diagnostics, '_throughput', reporter)
+    timing = diagnostics.UploadTiming('/upload/finalize', clock)
+    token = diagnostics._CURRENT.set(timing)
+    try:
+        diagnostics.upload_finalized(5000000)
+    finally:
+        diagnostics._CURRENT.reset(token)
+    timing.emit(app.app.logger, status, exception=exception)
+    timing.emit(app.app.logger, status, exception=exception)
+    assert reporter.window['finalized_bytes'] == expected_bytes
+    assert reporter.window['requests'] == 1
+    assert len(records(caplog)) == 1
+
+
+def test_upload_reporter_start_is_once_and_stop_emits_short_final_window(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    clock = Clock()
+    monkeypatch.setattr(diagnostics.time, 'monotonic', clock)
+    monkeypatch.setattr(diagnostics, '_throughput', None)
+    threads = []
+
+    class Thread:
+        def __init__(self, **kwargs):
+            assert kwargs['daemon'] is True
+            threads.append(self)
+
+        def start(self):
+            pass
+
+        def join(self, *, timeout):
+            assert timeout == 1
+
+    monkeypatch.setattr(diagnostics.threading, 'Thread', Thread)
+    diagnostics.start_upload_throughput(app.app.logger)
+    reporter = diagnostics._throughput
+    diagnostics.start_upload_throughput(app.app.logger)
+    assert len(threads) == 1
+    reporter.record_request(200, finalized_files=1, finalized_bytes=2000000)
+    clock.now = 5
+    diagnostics.stop_upload_throughput()
+    diagnostics.stop_upload_throughput()
+    record, = throughput_records(caplog)
+    assert record['window_seconds'] == 5 and record['finalized_mb_per_hour'] == 1440
+    assert reporter.stopping.is_set()
+    assert diagnostics._throughput is None
+
+
+def test_periodic_reporter_emits_idle_samples_without_requests(caplog):
+    caplog.set_level(logging.INFO)
+    clock = Clock()
+    reporter = diagnostics.UploadThroughput(app.app.logger, clock=clock)
+
+    def wait(seconds):
+        assert seconds == 60
+        clock.now += seconds
+        return clock.now > 120
+
+    reporter.stopping = SimpleNamespace(wait=wait)
+    reporter._run()
+    samples = throughput_records(caplog)
+    assert len(samples) == 2
+    assert all(s['window_seconds'] == 60 and s['finalized_mb_per_hour'] == 0 for s in samples)
+
+
+@pytest.mark.parametrize('role', ['upload', 'core', 'vision'])
+def test_gunicorn_hooks_only_report_for_upload_role(monkeypatch, role):
+    path = Path(__file__).resolve().parents[1] / 'gunicorn.conf.py'
+    spec = importlib.util.spec_from_file_location('upload_gunicorn_config', path)
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+    monkeypatch.setenv('APP_ROLE', role)
+    calls = []
+    monkeypatch.setattr(diagnostics, 'start_upload_throughput', lambda logger, **kw: calls.append(('start', kw)))
+    monkeypatch.setattr(diagnostics, 'stop_upload_throughput', lambda: calls.append(('stop', {})))
+    worker = SimpleNamespace(log=app.app.logger, cfg=SimpleNamespace(workers=1))
+    config.post_worker_init(worker)
+    config.worker_exit(None, worker)
+    assert calls == ([('start', {'workers_per_replica': 1}), ('stop', {})] if role == 'upload' else [])

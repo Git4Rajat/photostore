@@ -7,7 +7,7 @@ the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
 from flask import Blueprint
-from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_results, upload_teardown
+from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_finalized, upload_results, upload_teardown
 
 import app
 
@@ -364,6 +364,7 @@ def finalize_direct_upload():
         timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
     except Exception:
         app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
+    upload_finalized(total_size)
     return app.jsonify({
         'uploadId': data.get('uploadId') or '',
         'filename': final_name,
@@ -535,6 +536,7 @@ def finalize_upload_batch():
             'duplicates': duplicates,
             'clientProcessingLateResultWaitSeconds': 0,
         })
+        upload_finalized(total_size)
 
     upload_results(results)
     # Evidence for whether finalize-batch's per-file queue sends/job-status

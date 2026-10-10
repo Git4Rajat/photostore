@@ -3,11 +3,14 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 import json
+import os
+import threading
 import time
 import uuid
 
 from flask import after_this_request, current_app, g
 from werkzeug.exceptions import HTTPException
+from ipworker_metrics import replica_identity
 
 _CURRENT = ContextVar('upload_diagnostics', default=None)
 # Only code-owned names may enter the record (including nested storage phases).
@@ -17,6 +20,88 @@ _PHASES = frozenset({
     'client_processing', 'enqueues', 'dedup', 'persistence', 'source_read',
 })
 _COUNTERS = frozenset({'files', 'succeeded', 'failed', 'steps'})
+_throughput = None
+
+
+class UploadThroughput:
+    """Fixed, process-local totals shared by upload request threads."""
+    def __init__(self, logger, *, workers_per_replica=1, clock=None):
+        self.logger = logger
+        self.clock = clock or time.monotonic
+        self.started = self.last_logged = self.clock()
+        self.workers_per_replica = max(1, int(workers_per_replica))
+        self.identity = replica_identity()
+        self.process_id = os.getpid()
+        self.process_instance = uuid.uuid4().hex
+        self.lock = threading.Lock()
+        self.window = dict.fromkeys(('requests', 'request_errors', 'finalized_files', 'finalized_bytes'), 0)
+        self.cumulative = self.window.copy()
+        self.stopping = threading.Event()
+        self.thread = None
+
+    def record_request(self, status, *, exception=False, finalized_files=0, finalized_bytes=0):
+        failed = exception or status >= 400
+        with self.lock:
+            for counters in (self.window, self.cumulative):
+                counters['requests'] += 1
+                counters['request_errors'] += int(failed)
+                if not failed:
+                    counters['finalized_files'] += finalized_files
+                    counters['finalized_bytes'] += finalized_bytes
+
+    def log(self, *, force=False):
+        try:
+            with self.lock:
+                now = self.clock()
+                elapsed = max(0, now - self.last_logged)
+                if not force and elapsed < 60:
+                    return
+                rate = round(self.window['finalized_bytes'] * 3600 / (elapsed * 1000000), 3) if elapsed else 0
+                record = {
+                    'identity': self.identity, 'process_id': self.process_id,
+                    'process_instance': self.process_instance,
+                    'workers_per_replica': self.workers_per_replica,
+                    'window_seconds': round(elapsed, 3),
+                    'elapsed_seconds': round(max(0, now - self.started), 3),
+                    'window': self.window.copy(), 'cumulative': self.cumulative.copy(),
+                    'throughput_units': 'MB/hour/replica; 1 MB = 1000000 bytes',
+                    'finalized_mb_per_hour': rate if self.workers_per_replica == 1 else None,
+                    'process_mb_per_hour': rate,
+                }
+                self.window = dict.fromkeys(self.window, 0)
+                self.last_logged = now
+            self.logger.info('upload throughput metrics=%s', json.dumps(record, sort_keys=True, separators=(',', ':')))
+        except Exception:
+            pass
+
+    def _run(self):
+        while not self.stopping.wait(60):
+            self.log()
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name='upload-throughput', daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stopping.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1)
+        self.log(force=True)
+
+
+def start_upload_throughput(logger, *, workers_per_replica=1):
+    global _throughput
+    if _throughput is None:
+        reporter = UploadThroughput(logger, workers_per_replica=workers_per_replica)
+        reporter.start()
+        _throughput = reporter
+
+
+def stop_upload_throughput():
+    global _throughput
+    if _throughput is not None:
+        _throughput.stop()
+        _throughput = None
 
 
 class UploadTiming:
@@ -28,6 +113,7 @@ class UploadTiming:
         self.phase_ms = {}
         self.phase_errors = {}
         self.counters = {}
+        self.finalized_bytes = self.finalized_files = 0
         self.emitted = False
         self.exception = False
 
@@ -69,6 +155,11 @@ class UploadTiming:
             return
         self.emitted = True
         try:
+            finalized_bytes = self.finalized_bytes if status < 400 and not exception else 0
+            finalized_files = self.finalized_files if status < 400 and not exception else 0
+            if _throughput is not None:
+                _throughput.record_request(status, exception=exception,
+                    finalized_bytes=finalized_bytes, finalized_files=finalized_files)
             outcome = ('exception' if exception else 'http_error' if status >= 400
                        else 'partial' if self.counters.get('failed')
                        else 'degraded' if self.phase_errors else 'success')
@@ -78,6 +169,7 @@ class UploadTiming:
                 'total_ms': round(max(0, (self._now() - self.started) * 1000), 3),
                 'phase_ms': {k: round(v, 3) for k, v in self.phase_ms.items()},
                 'phase_errors': self.phase_errors, 'counts': self.counters,
+                'finalized_bytes': finalized_bytes, 'finalized_files': finalized_files,
             }
             logger.info('upload timings %s', json.dumps(record, sort_keys=True))
         except Exception:
@@ -103,6 +195,14 @@ def upload_count(name, value):
     timing = _CURRENT.get()
     if timing is not None:
         timing.count(name, value)
+
+
+def upload_finalized(byte_count):
+    """Credit a successful file using the blob size already verified by the route."""
+    timing = _CURRENT.get()
+    if timing is not None and isinstance(byte_count, int) and not isinstance(byte_count, bool) and byte_count > 0:
+        timing.finalized_bytes += byte_count
+        timing.finalized_files += 1
 
 
 def upload_results(results):
