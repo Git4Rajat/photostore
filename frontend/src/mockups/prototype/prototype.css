@@ -23,6 +23,40 @@
    y:auto is a well-defined pair, so vertical scrolling is unaffected). */
 .pt-body { overflow-x: hidden; }
 
+/* Floating "scroll to top" button (ScrollToTopButton.tsx) -- compensates for
+   .pt-body being the real scroll container instead of the document, which is
+   also why iOS Safari's tap-status-bar gesture can't do this for us. Sits
+   above normal content but below the header (z-index:30) and mobile tabbar
+   (z-index:40, see mockups.css) so it never floats over either. */
+.pt-scroll-top {
+  position: fixed;
+  right: 20px;
+  bottom: calc(20px + env(safe-area-inset-bottom));
+  width: var(--tap-min);
+  height: var(--tap-min);
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--lg-edge);
+  background: var(--lg-surface);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  box-shadow: var(--lg-shadow-resting);
+  color: var(--text);
+  cursor: pointer;
+  z-index: 25;
+  opacity: 0;
+  transform: translateY(8px) scale(0.92);
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.pt-scroll-top.visible { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+.pt-scroll-top:hover { background: var(--lg-surface-strong); }
+@container (max-width: 620px) {
+  /* Clear the fixed mobile tabbar (64px + its own safe-area padding). */
+  .pt-scroll-top { bottom: calc(64px + env(safe-area-inset-bottom) + 16px); }
+}
+
 /* The real .ios-tab is an <a>; we render <button>s, so strip the UA button
    chrome while keeping the underline-on-active treatment. */
 .ios-tabs .ios-tab { appearance: none; -webkit-appearance: none; background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; min-height: var(--tap-min); display: inline-flex; align-items: center; }

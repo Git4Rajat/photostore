@@ -35,6 +35,7 @@ import { Menu } from './components/bits';
 import CommandBar from './components/CommandBar';
 import PhotoViewer from './components/PhotoViewer';
 import Toasts from './components/Toasts';
+import { ScrollToTopButton } from './components/ScrollToTopButton';
 
 const LazyPublicAlbumPage = React.lazy(() => import('../../components/PublicAlbumPage'));
 const LazyAcceptInvitePage = React.lazy(() => import('../../components/AcceptInvitePage'));
@@ -380,6 +381,7 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
                             <Page />
                         </div>
                         <MobileTabbar />
+                        <ScrollToTopButton />
                     </div>
                 </div>
             </div>
