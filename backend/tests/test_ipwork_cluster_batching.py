@@ -40,6 +40,42 @@ def enqueued(monkeypatch):
     return calls
 
 
+class _RecordingQueue:
+    def __init__(self):
+        self.messages = []
+
+    def send_message(self, content, **kwargs):
+        self.messages.append(content)
+
+
+def test_enqueue_splits_large_batch_into_bounded_messages(monkeypatch):
+    import json
+    queue = _RecordingQueue()
+    monkeypatch.setattr(app, 'clustering_queue_client', queue)
+    monkeypatch.setattr(app, 'INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE', 2)
+
+    filenames = [f'{i}.jpg' for i in range(5)]
+    result = app._enqueue_incremental_assign_job('lib-A', filenames)
+
+    assert result == {'status': 'queued', 'messages': 3}  # 2 + 2 + 1
+    sent = [json.loads(m) for m in queue.messages]
+    assert [m['filenames'] for m in sent] == [['0.jpg', '1.jpg'], ['2.jpg', '3.jpg'], ['4.jpg']]
+    # No filename is dropped or duplicated across the split messages.
+    assert sorted(f for m in sent for f in m['filenames']) == sorted(filenames)
+    assert all(m['type'] == 'people_incremental_assign' and m['user_id'] == 'lib-A' for m in sent)
+
+
+def test_enqueue_small_batch_is_a_single_message(monkeypatch):
+    queue = _RecordingQueue()
+    monkeypatch.setattr(app, 'clustering_queue_client', queue)
+    monkeypatch.setattr(app, 'INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE', 128)
+
+    result = app._enqueue_incremental_assign_job('lib-A', ['a.jpg', 'b.jpg'])
+
+    assert result == {'status': 'queued', 'messages': 1}
+    assert len(queue.messages) == 1
+
+
 def test_buffer_does_not_flush_below_count_cap(enqueued, monkeypatch):
     monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_MAX_FILENAMES', 3)
     app._buffer_incremental_assign_filename('lib-A', 'a.jpg')
