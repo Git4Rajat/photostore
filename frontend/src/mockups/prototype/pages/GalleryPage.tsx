@@ -148,6 +148,19 @@ export const GalleryPage: React.FC = () => {
         return () => observer.disconnect();
     }, [hasMorePhotos, loadMorePhotos, photos.length, level]);
 
+    // Zooming out shrinks tile size via a CSS var (not added/removed DOM nodes),
+    // which can pull the sentinel into view purely through reflow with no scroll
+    // event firing. The observer above doesn't reliably catch that case, so
+    // re-check the sentinel's position by hand whenever the zoom level changes.
+    useEffect(() => {
+        if (!hasMorePhotos || photosLoading || level !== 'days') return undefined;
+        const id = requestAnimationFrame(() => {
+            const rect = sentinelRef.current?.getBoundingClientRect();
+            if (rect && rect.top <= window.innerHeight + 600) loadMorePhotos();
+        });
+        return () => cancelAnimationFrame(id);
+    }, [tileMin, level, hasMorePhotos, photosLoading, loadMorePhotos]);
+
     const scrollToTile = (filename: string | null) => {
         if (!filename || !gridRef.current) return;
         const tile = Array.from(gridRef.current.querySelectorAll<HTMLElement>('[data-tile-id]'))
@@ -319,6 +332,28 @@ export const GalleryPage: React.FC = () => {
     }
 
     if (photos.length === 0 && level === 'days' && !captureRange && !uploading) {
+        if (activeFilterCount > 0) {
+            return (
+                <div className="pt-arrive">
+                    <div className="empty-state">
+                        <span className="empty-state-icon"><FilterIcon /></span>
+                        <p className="empty-state-title">No photos match your filters</p>
+                        <p className="empty-state-message">
+                            Try a different rating, like, or media type filter.
+                        </p>
+                        <div className="empty-state-action pt-arrive-actions">
+                            <button
+                                type="button"
+                                className="btn mock-cta"
+                                onClick={() => { setGalleryRating(0); setGalleryLikedOnly(false); setMediaFilter('all'); }}
+                            >
+                                Clear filters
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
         return (
             <div className="pt-arrive">
                 <div className="empty-state">
