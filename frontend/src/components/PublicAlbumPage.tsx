@@ -563,9 +563,19 @@ const PublicAlbumPage: React.FC = () => {
         }
     }, [photos, selectedCount, selectedPhotos, token]);
 
+    // Initial load only -- must NOT depend on loadPublicAlbum itself: that
+    // callback closes over accessCode (see its own deps above), so its
+    // identity changes on every keystroke in the passcode box. Depending on
+    // it here re-ran this effect on every keystroke, each time flipping
+    // `loading` true->false and unmounting/remounting the conditionally-
+    // rendered passcode <input> (`!loading && codeRequired`) -- which closes
+    // the on-screen keyboard on mobile the instant the focused input leaves
+    // the DOM. Keyed on `token` (the actual "new album to load" signal)
+    // instead, so retyping the code no longer re-triggers this at all.
     useEffect(() => {
         void loadPublicAlbum('');
-    }, [loadPublicAlbum]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [token]);
 
     const countLabel = `${photos.length} photo${photos.length === 1 ? '' : 's'}`;
     const showToolbar = !loading && !error && bufferReady && photos.length > 0;
