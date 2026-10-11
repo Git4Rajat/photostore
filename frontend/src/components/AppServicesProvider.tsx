@@ -41,7 +41,7 @@ import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 import { getUnattendedConcurrencyBonus, reportBrowserProcessingOutcome } from '../services/unattendedProcessingScaler';
 import { showToast } from '../services/toast';
 import { publishLibraryChange } from '../services/libraryChanges';
-import { fetchKnownUploadHashes } from '../services/uploadKnownHashes';
+import { fetchKnownUploadHashes, requestUploadHashRefresh, type UploadEndReason } from '../services/uploadKnownHashes';
 import { perf } from '../services/perf';
 import {
     isFileSystemAccessSupported,
@@ -1081,11 +1081,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const uploadHandlesRef = useRef<Map<string, FileSystemFileHandle>>(new Map());
     const uploadStopRequestedRef = useRef<boolean>(false);
     const uploadAbortControllersRef = useRef<Set<AbortController>>(new Set());
-    // Prefetched once per batch (see fetchKnownHashes) so uploadFileInChunks can
-    // skip a known duplicate before spending any transfer bandwidth on it, not
-    // just backend compute. Grown (never cleared) as files finish uploading, so
-    // within-batch duplicates are caught without a second network round trip.
+    // Hashes learned in this tab survive batch boundaries; downloaded library
+    // hashes live separately so each refresh replaces, rather than accumulates, them.
     const knownHashesRef = useRef<Map<string, string>>(new Map());
+    const libraryHashesRef = useRef<Map<string, string>>(new Map());
+    const libraryHashFetchGenerationRef = useRef(0);
+    const libraryHashFetchedAtRef = useRef<number | null>(null);
+    const libraryHashFetchRef = useRef<{ promise: Promise<number>; controller: AbortController } | null>(null);
+    const pickerHashPrefetchRef = useRef<{ startedAt: number; promise: Promise<number> } | null>(null);
+    useEffect(() => () => {
+        libraryHashFetchGenerationRef.current += 1;
+        libraryHashFetchRef.current?.controller.abort();
+    }, []);
     // Coalesces concurrent /upload/init calls (one per upload lane) into
     // /upload/init-batch requests -- see requestBatchedInit below.
     const pendingBatchInitRef = useRef<Array<{
@@ -1761,17 +1768,34 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         sha256ArrayBuffer(await readBlobArrayBuffer(file))
     );
 
-    // Best-effort prefetch of the library's dedup index (see backend
-    // list_known_file_hashes), merged into knownHashesRef so uploadFileInChunks
-    // can skip a known duplicate before staging a single byte. A failed/slow
-    // fetch just means this batch misses the early-skip optimization -- the
+    // Best-effort prefetch of the library's dedup snapshot so uploadFileInChunks
+    // can skip a known duplicate before staging a single byte. Until the
+    // download arrives, files can miss the early-skip optimization -- the
     // backend's own point-lookup at finalize time stays authoritative, so
     // correctness never depends on this succeeding.
-    const fetchKnownHashes = async (): Promise<void> => {
-        const hashes = await fetchKnownUploadHashes();
-        for (const [hash, filename] of Object.entries(hashes)) {
-            knownHashesRef.current.set(hash, filename);
+    const fetchKnownHashes = (force = false): Promise<number> => {
+        if (libraryHashFetchRef.current) return libraryHashFetchRef.current.promise;
+        if (!force && libraryHashFetchedAtRef.current !== null
+            && Date.now() - libraryHashFetchedAtRef.current < 60000) {
+            return Promise.resolve(libraryHashesRef.current.size);
         }
+        const generation = ++libraryHashFetchGenerationRef.current;
+        const controller = new AbortController();
+        libraryHashesRef.current = new Map();
+        libraryHashFetchedAtRef.current = null;
+        const request = {
+            controller,
+            promise: fetchKnownUploadHashes(controller.signal).then((hashes) => {
+                if (generation !== libraryHashFetchGenerationRef.current) return 0;
+                libraryHashesRef.current = new Map(Object.entries(hashes));
+                if (libraryHashesRef.current.size > 0) libraryHashFetchedAtRef.current = Date.now();
+                return libraryHashesRef.current.size;
+            }).finally(() => {
+                if (libraryHashFetchRef.current === request) libraryHashFetchRef.current = null;
+            }),
+        };
+        libraryHashFetchRef.current = request;
+        return request.promise;
     };
 
     // knownHashesRef is grown but never cleared (see its declaration), so a
@@ -1784,11 +1808,20 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (filenames.length === 0) {
             return;
         }
+        // A response sent before this deletion must not reintroduce its hashes.
+        libraryHashFetchGenerationRef.current += 1;
+        libraryHashFetchRef.current?.controller.abort();
+        libraryHashFetchRef.current = null;
+        libraryHashFetchedAtRef.current = null;
+        pickerHashPrefetchRef.current = null;
         const deleted = new Set(filenames);
         knownHashesRef.current.forEach((filename, hash) => {
             if (deleted.has(filename)) {
                 knownHashesRef.current.delete(hash);
             }
+        });
+        libraryHashesRef.current.forEach((filename, hash) => {
+            if (deleted.has(filename)) libraryHashesRef.current.delete(hash);
         });
     }, []);
 
@@ -2748,7 +2781,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
-        if (knownHashesRef.current.has(sha256)) {
+        if (knownHashesRef.current.has(sha256) || libraryHashesRef.current.has(sha256)) {
             // Already have this content under some filename -- skip the network
             // transfer entirely (no /upload/init, no blob staging, no finalize).
             // The backend's own finalize-time check is what actually enforces
@@ -2991,11 +3024,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         isResumingUploadRef.current = true;
         const uploadRunGeneration = uploadRunGenerationRef.current + 1;
         uploadRunGenerationRef.current = uploadRunGeneration;
-        // Kick off in parallel with the setup below (notification creation,
-        // session persistence, block-size planning) and only await it right
-        // before the worker pool starts -- overlaps a network round trip with
-        // work we'd be doing anyway instead of adding it to the critical path.
-        const knownHashesPromise = fetchKnownHashes();
+        // Never wait for library hashes: each file checks the current map just
+        // before transfer, so a background result also benefits this ongoing upload.
+        const pickerPrefetch = pickerHashPrefetchRef.current;
+        pickerHashPrefetchRef.current = null;
+        if (!pickerPrefetch || Date.now() - pickerPrefetch.startedAt >= 60000) {
+            void fetchKnownHashes();
+        }
         setUploading(true);
         uploadingRef.current = true;
         // Hold the wake lock for the whole transfer, not just the post-upload
@@ -3070,9 +3105,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     : { ...file, status: 'pending', error: undefined }
             )),
         };
-        persistSession(normalized);
-
+        const pendingFinalizeTasks = new Set<Promise<void>>();
+        let uploadEndReason: UploadEndReason = 'failed';
         try {
+            persistSession(normalized);
             const pendingFiles = normalized.files.filter((file) => (
                 file.status !== 'done' && (!options.fileKeys || options.fileKeys.has(file.key))
             ));
@@ -3269,7 +3305,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // pendingFinalizeTasks so runUploadSession can wait for all of them
             // to settle before deciding the session is actually complete (a file
             // isn't really done just because its lane moved on).
-            const pendingFinalizeTasks = new Set<Promise<void>>();
             const finalizeUploadedFile = async (
                 file: File,
                 fileMeta: PersistedUploadFile,
@@ -3539,7 +3574,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
             };
 
-            await knownHashesPromise;
             const workerPromises: Promise<void>[] = [];
             const spawnWorkers = (count: number) => {
                 for (let i = 0; i < count; i += 1) {
@@ -3720,6 +3754,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 );
             }
 
+            uploadEndReason = hasPending || totalFailed > 0 ? 'failed' : 'completed';
             await notifyUploadComplete();
         } catch (err) {
             if (discardedUploadSessionIdsRef.current.has(session.id)) {
@@ -3761,6 +3796,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             setUploadError(message);
         } finally {
+            const reason = discardedUploadSessionIdsRef.current.has(session.id) ? 'discarded'
+                : uploadStopRequestedRef.current ? 'stopped' : uploadEndReason;
+            // Include late finalize confirmations even on Stop/error, without
+            // making UI cleanup wait for the snapshot request or build.
+            if (reason !== 'completed' || queuedUploadBatchesRef.current.length === 0) {
+                void Promise.allSettled(Array.from(pendingFinalizeTasks))
+                    .then(() => requestUploadHashRefresh(reason));
+            }
             if (uploadRunGenerationRef.current === uploadRunGeneration) {
                 setUploading(false);
                 uploadingRef.current = false;
@@ -3977,6 +4020,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         await clearPersistedSession();
         if (session) {
             await cleanupUnfinishedUploadArtifacts(session);
+            void requestUploadHashRefresh('discarded');
         }
         setUploadError(null);
         setUploadQueueDrainSignal((signal) => signal + 1);
@@ -4151,6 +4195,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     title: 'Upload warm-up failed',
                     details: message,
                 });
+                void requestUploadHashRefresh('failed');
                 return;
             }
             measuredRttMs = measuringRtt ? lastWarmProbeRef.current?.ms : undefined;
@@ -4215,6 +4260,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             });
         }
 
+        let uploadRunStarted = false;
         try {
             persistSession(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
@@ -4241,6 +4287,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // for this whole (possibly long) session to finish, so requestUpload
             // can let the picker open again to queue files from another folder.
             uploadStartInProgressRef.current = false;
+            uploadRunStarted = true;
             await runUploadSession(session, { notificationId: preparingNotificationId, uploadProfile });
         } catch (err) {
             const message = getUploadErrorMessage(err, 'Upload could not start.');
@@ -4252,6 +4299,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 details: message,
             });
         } finally {
+            if (!uploadRunStarted) {
+                void requestUploadHashRefresh(uploadStopRequestedRef.current ? 'stopped' : 'failed');
+            }
             uploadStartInProgressRef.current = false;
         }
     }, [
@@ -4281,6 +4331,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             armUploadWarmupCeiling();
             void pollUntilWarm(warmUpload, uploadWarmupInFlightRef, uploadWarmupStopRef);
         }
+        // No await: keep the native picker click in the original user gesture.
+        const prefetch = { startedAt: Date.now(), promise: fetchKnownHashes(true) };
+        pickerHashPrefetchRef.current = prefetch;
+        void prefetch.promise.then((count) => {
+            // An unavailable snapshot should get a fresh chance after selection.
+            if (count === 0 && pickerHashPrefetchRef.current === prefetch) {
+                pickerHashPrefetchRef.current = null;
+            }
+        });
         // One-time, pre-picker warning for large libraries on constrained
         // devices. This fires before the native picker opens -- the one
         // moment we're not blind to what's about to happen -- because
@@ -4394,6 +4453,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return;
         }
         if (selectedFiles.length === 0) {
+            pickerHashPrefetchRef.current = null;
+            if (!uploadingRef.current) {
+                libraryHashFetchGenerationRef.current += 1;
+                libraryHashFetchRef.current?.controller.abort();
+                libraryHashFetchRef.current = null;
+                libraryHashFetchedAtRef.current = null;
+            }
             // Indistinguishable from here whether the user cancelled the
             // picker (routine, happens constantly -- must not toast on this)
             // or the native picker itself failed to return any files for a
@@ -4536,6 +4602,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const input = uploadInputRef.current;
         if (!input) return;
         const onCancel = () => {
+            pickerHashPrefetchRef.current = null;
+            if (!uploadingRef.current) {
+                libraryHashFetchGenerationRef.current += 1;
+                libraryHashFetchRef.current?.controller.abort();
+                libraryHashFetchRef.current = null;
+                libraryHashFetchedAtRef.current = null;
+            }
             const openedAt = pickerOpenedAtRef.current;
             pickerOpenedAtRef.current = null;
             stopUploadWarmup();

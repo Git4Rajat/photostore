@@ -7595,7 +7595,7 @@ def detect_duplicates(user_id: str, file_hash: str, perceptual_hash: Optional[st
                     matched_filename = candidate
                 except Exception:
                     try:
-                        hash_index_table_client.delete_entity(partition_key=user_id, row_key=file_hash)
+                        delete_hash_index_entry(user_id, file_hash)
                     except Exception:
                         pass
         else:
@@ -7653,7 +7653,9 @@ def list_known_file_hashes(user_id: str) -> Dict[str, str]:
         return {}
     try:
         rows = hash_index_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
-        return {str(row.get('RowKey') or ''): str(row.get('filename') or '') for row in rows if row.get('RowKey')}
+        from upload_hash_snapshot import CONTROL_ROWS
+        return {str(row.get('RowKey') or ''): str(row.get('filename') or '') for row in rows
+                if row.get('RowKey') and row.get('RowKey') not in CONTROL_ROWS}
     except Exception:
         return {}
 
@@ -10121,6 +10123,9 @@ def _store_hash_index(user_id: str, file_hash: str, filename: str) -> None:
     hash_index_table_client = _CTX.get('hash_index_table_client')
     if hash_index_table_client is None or not file_hash or not filename:
         return
+    from upload_hash_snapshot import CONTROL_ROWS
+    if file_hash in CONTROL_ROWS:
+        return
     try:
         hash_index_table_client.upsert_entity({
             'PartitionKey': user_id,
@@ -10139,7 +10144,8 @@ def delete_hash_index_entry(user_id: str, file_hash: str) -> None:
     if hash_index_table_client is None or not file_hash:
         return
     try:
-        hash_index_table_client.delete_entity(partition_key=user_id, row_key=file_hash)
+        from upload_hash_snapshot import delete_hash
+        delete_hash(hash_index_table_client, user_id, file_hash)
     except Exception:
         pass
 

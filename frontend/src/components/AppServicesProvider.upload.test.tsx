@@ -70,6 +70,8 @@ const initFiles = () => mocks.postUpload.mock.calls
 const finalizedFiles = () => mocks.postUpload.mock.calls
     .filter(([url]) => url === '/upload/finalize-batch')
     .flatMap(([, payload]) => payload.files);
+const refreshRequests = () => mocks.postUpload.mock.calls
+    .filter(([url]) => url === '/upload/known-hashes/refresh');
 
 function memoryStorage(): Storage {
     const items = new Map<string, string>();
@@ -144,6 +146,8 @@ describe('browser upload selection and startup', () => {
         expect(new Set(finalizedFiles().map((file) => file.filename)).size).toBe(count);
         expect(finalizedFiles().every((file) => file.totalSize === 2 && file.contentType === 'image/heic')).toBe(true);
         expect(mocks.staged).toHaveBeenCalledTimes(count);
+        expect(refreshRequests()).toHaveLength(1);
+        expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
         expect(services.pendingUploadSummary).toBeNull();
         expect(services.queuedUploadFileCount).toBe(0);
         expect(mocks.span).toHaveBeenCalledWith('upload.picker.change', expect.any(Number), {
@@ -159,6 +163,109 @@ describe('browser upload selection and startup', () => {
         expect(initFiles()).toHaveLength(3);
         expect(finalizedFiles()).toHaveLength(3);
         expect(mocks.staged).toHaveBeenCalledTimes(3);
+    });
+
+    it('starts immediately and uses a slow hash download to skip remaining files in the same upload', async () => {
+        const files = filesFor(50);
+        let resolveHashes!: (value: unknown) => void;
+        let releaseTransfers!: () => void;
+        mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
+            ? new Promise((resolve) => { resolveHashes = resolve; }) : Promise.resolve({}));
+        const transferGate = new Promise<void>((resolve) => { releaseTransfers = resolve; });
+        mocks.staged.mockImplementation(() => transferGate);
+        const input = select(files);
+        await advance(1000);
+        const transfersStarted = mocks.staged.mock.calls.length;
+        expect(transfersStarted).toBeGreaterThan(0);
+        expect(transfersStarted).toBeLessThan(files.length);
+        await advance(9000);
+        const hashConfig = mocks.getUpload.mock.calls.find(([url]) => url === '/upload/known-hashes')![1];
+        fireEvent(input, new Event('cancel'));
+        expect(hashConfig.signal.aborted).toBe(false);
+        await act(async () => {
+            resolveHashes({ hashes: Object.fromEntries(files.map((file) => [
+                Array.from(new TextEncoder().encode(file.name)).join('-'), `stored-${file.name}`,
+            ])) });
+        });
+        await act(async () => { releaseTransfers(); });
+        await advance(3000);
+        expect(mocks.staged).toHaveBeenCalledTimes(transfersStarted);
+        expect(finalizedFiles()).toHaveLength(transfersStarted);
+        expect(services.pendingUploadSummary).toBeNull();
+        expect(services.notifications.some((notification) =>
+            notification.progress?.skippedDuplicateCount === files.length - transfersStarted)).toBe(true);
+        expect(mocks.getUpload.mock.calls.filter(([url]) => url === '/upload/known-hashes')).toHaveLength(1);
+    });
+
+    it('refreshes after a run ends with failed files', async () => {
+        mocks.staged.mockRejectedValue(new Error('Test transfer failure'));
+        select(filesFor(2));
+        await advance(20000);
+        expect(services.pendingUploadSummary?.fileCount).toBe(2);
+        expect(refreshRequests()).toHaveLength(1);
+        expect(refreshRequests()[0][1]).toEqual({ reason: 'failed' });
+    });
+
+    it('refreshes after stopping an active upload', async () => {
+        mocks.staged.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
+            const abort = () => reject(new Error('upload_stopped_by_user'));
+            if (options.abortSignal.aborted) abort();
+            else options.abortSignal.addEventListener('abort', abort, { once: true });
+        }));
+        select(filesFor(50));
+        await advance(1000);
+        expect(services.uploading).toBe(true);
+        expect(refreshRequests()).toHaveLength(0);
+        act(() => { services.stopActiveUpload(); });
+        await advance(3000);
+        expect(services.uploading).toBe(false);
+        expect(refreshRequests()).toHaveLength(1);
+        expect(refreshRequests()[0][1]).toEqual({ reason: 'stopped' });
+    });
+
+    it('includes late finalization when stopping the remaining transfers', async () => {
+        let releaseFinalize!: () => void;
+        const finalizeGate = new Promise<void>((resolve) => { releaseFinalize = resolve; });
+        const originalPost = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url, payload) => {
+            if (url === '/upload/finalize-batch') await finalizeGate;
+            return originalPost(url, payload);
+        });
+        mocks.staged.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
+            new Promise((_resolve, reject) => {
+                const abort = () => reject(new Error('upload_stopped_by_user'));
+                if (options.abortSignal.aborted) abort();
+                else options.abortSignal.addEventListener('abort', abort, { once: true });
+            }));
+        select(filesFor(50));
+        await advance(1000);
+        expect(finalizedFiles()).toHaveLength(1);
+        act(() => { services.stopActiveUpload(); });
+        await advance(3000);
+        expect(services.uploading).toBe(false);
+        expect(refreshRequests()).toHaveLength(0);
+        await act(async () => { releaseFinalize(); });
+        await advance(1000);
+        expect(refreshRequests()).toHaveLength(1);
+        expect(refreshRequests()[0][1]).toEqual({ reason: 'stopped' });
+    });
+
+    it('does not refresh before pending finalization has finished', async () => {
+        let releaseFinalize!: () => void;
+        const finalizeGate = new Promise<void>((resolve) => { releaseFinalize = resolve; });
+        const originalPost = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url, payload) => {
+            if (url === '/upload/finalize-batch') await finalizeGate;
+            return originalPost(url, payload);
+        });
+        select(filesFor(3));
+        await advance(1000);
+        expect(finalizedFiles()).toHaveLength(3);
+        expect(refreshRequests()).toHaveLength(0);
+        await act(async () => { releaseFinalize(); });
+        await advance(1000);
+        expect(refreshRequests()).toHaveLength(1);
+        expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
     });
 
     it('resumes 100 paused files and also uploads the other 200 from a broader reselection', async () => {
@@ -190,6 +297,112 @@ describe('browser upload selection and startup', () => {
         expect(initFiles()).toHaveLength(0);
         expect(mocks.staged).not.toHaveBeenCalled();
         expect(services.pendingUploadSummary).toBeNull();
+        expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
+    });
+
+    it('loads library hashes while the picker is open without downloading them twice', async () => {
+        const file = filesFor(1)[0];
+        const hash = Array.from(new TextEncoder().encode(file.name)).join('-');
+        mocks.getUpload.mockResolvedValue({ hashes: { [hash]: 'already-stored.heic' } });
+        const view = render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        fireEvent.click(view.getByText('Upload'));
+        await advance(10000);
+        fireEvent.change(view.container.querySelector('input[type="file"]')!, { target: { files: [file] } });
+        await advance(1000);
+        expect(mocks.getUpload.mock.calls.filter(([url]) => url === '/upload/known-hashes')).toHaveLength(1);
+        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
+    });
+
+    it('replaces old downloaded library hashes when a fresh lookup returns no hashes', async () => {
+        const file = filesFor(1)[0];
+        const hash = Array.from(new TextEncoder().encode(file.name)).join('-');
+        mocks.getUpload.mockResolvedValue({ hashes: { [hash]: 'deleted.heic' } });
+        const view = render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        fireEvent.click(view.getByText('Upload'));
+        await advance(1000);
+        const input = view.container.querySelector('input[type="file"]')!;
+        fireEvent(input, new Event('cancel'));
+        mocks.getUpload.mockResolvedValue({ hashes: {} });
+        fireEvent.change(input, { target: { files: [file] } });
+        await advance(1000);
+        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        expect(finalizedFiles()).toHaveLength(1);
+    });
+
+    it('ignores an older picker response arriving after a newer library lookup', async () => {
+        const file = filesFor(1)[0];
+        const hash = Array.from(new TextEncoder().encode(file.name)).join('-');
+        let resolveOld!: (value: unknown) => void;
+        mocks.getUpload.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
+        const view = render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        fireEvent.click(view.getByText('Upload'));
+        await advance(100);
+        const input = view.container.querySelector('input[type="file"]')!;
+        fireEvent(input, new Event('cancel'));
+        mocks.getUpload.mockResolvedValue({ hashes: { unrelated: 'other.heic' } });
+        fireEvent.click(view.getByText('Upload'));
+        await advance(100);
+        await act(async () => { resolveOld({ hashes: { [hash]: 'deleted.heic' } }); });
+        fireEvent.change(input, { target: { files: [file] } });
+        await advance(1000);
+        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        expect(finalizedFiles()).toHaveLength(1);
+    });
+
+    it('does not reintroduce a deleted photo from a delayed library response', async () => {
+        const file = filesFor(1)[0];
+        const hash = Array.from(new TextEncoder().encode(file.name)).join('-');
+        let resolveOld!: (value: unknown) => void;
+        mocks.getUpload.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
+        const view = render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        fireEvent.click(view.getByText('Upload'));
+        await advance(100);
+        act(() => { services.releaseKnownHashesForFilenames(['deleted.heic']); });
+        mocks.getUpload.mockResolvedValue({ hashes: {} });
+        await act(async () => { resolveOld({ hashes: { [hash]: 'deleted.heic' } }); });
+        fireEvent.change(view.container.querySelector('input[type="file"]')!, { target: { files: [file] } });
+        await advance(1000);
+        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        expect(finalizedFiles()).toHaveLength(1);
+    });
+
+    it('skips a file already uploaded in this tab while the shared library lookup is still pending', async () => {
+        mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
+            ? new Promise(() => {}) : Promise.resolve({}));
+        const files = filesFor(1);
+        const input = select(files);
+        await advance(1000);
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(services.pendingUploadSummary).toBeNull();
+
+        fireEvent.change(input, { target: { files } });
+        await advance(1000);
+        expect(initFiles()).toHaveLength(1);
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        expect(mocks.getUpload.mock.calls.filter(([url]) => url === '/upload/known-hashes')).toHaveLength(1);
+        expect(mocks.span.mock.calls.filter(([name]) => name === 'upload.known_hashes.timeout')).toHaveLength(0);
+        expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
+    });
+
+    it('also reports a backend duplicate in the same skipped-duplicate counter after transferring bytes', async () => {
+        mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
+            ? new Promise(() => {}) : Promise.resolve({}));
+        const postUpload = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url, payload) => {
+            if (url === '/upload/finalize-batch') {
+                return { results: payload.files.map((file: { filename: string }) => ({
+                    filename: file.filename, complete: true, duplicates: [{ filename: 'already-stored.heic', type: 'exact' }],
+                })) };
+            }
+            return postUpload(url, payload);
+        });
+        select(filesFor(1));
+        await advance(4000);
+        expect(initFiles()).toHaveLength(1);
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(mocks.staged).toHaveBeenCalledTimes(1);
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
     });
 

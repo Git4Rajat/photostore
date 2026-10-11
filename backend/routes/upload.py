@@ -237,14 +237,47 @@ def init_upload_batch():
 @upload_bp.route('/api/upload/known-hashes', methods=['GET'])
 @upload_bp.route('/api/upload/known-hashes/', methods=['GET'])
 def get_known_upload_hashes():
-    """One bulk fetch for the whole library's dedup index -- meant to be called
-    once per upload batch (see list_known_file_hashes), not per file, so the
-    frontend can skip re-uploading a known duplicate before spending any
-    transfer bandwidth on it."""
+    """Serve a prebuilt compressed snapshot; never scan the library inline."""
     _, user_id, error = app._require_library_context()
     if error:
         return error
-    return app.jsonify({'hashes': app.list_known_file_hashes(user_id)})
+    from upload_hash_snapshot import read_snapshot
+    payload, manifest, refresh = read_snapshot(user_id)
+    if refresh:
+        app.enqueue_index_build(user_id, reason='upload-hash-snapshot', scope='dedup', coalesce=False)
+    if payload is None:
+        response = app.jsonify({'hashes': {}, 'available': False})
+    else:
+        response = app.Response(payload, mimetype='application/json')
+        response.headers['Content-Encoding'] = 'gzip'
+        response.headers['X-Upload-Hash-Count'] = str(manifest['rows'])
+    response.headers['Cache-Control'] = 'private, no-store'
+    return response
+
+
+@upload_bp.route('/upload/known-hashes/refresh', methods=['POST'])
+@upload_bp.route('/api/upload/known-hashes/refresh', methods=['POST'])
+def refresh_known_upload_hashes():
+    """Upload end signals queue dedup only, without waiting for the build."""
+    _, user_id, error = app._require_library_context()
+    if error:
+        return error
+    body = app.request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return app.jsonify({'error': 'Invalid upload end reason'}), 400
+    reason = body.get('reason')
+    if reason not in ('completed', 'stopped', 'failed', 'interrupted', 'discarded'):
+        return app.jsonify({'error': 'Invalid upload end reason'}), 400
+    status = app.enqueue_index_build(user_id, reason=f'upload-{reason}', scope='dedup', coalesce=False)
+    return app.jsonify({'status': status}), 503 if status == 'unavailable' else 202
+
+
+def _queue_idle_hash_refresh(user_id):
+    try:
+        app.enqueue_index_build(user_id, reason='upload-quiet', scope='dedup-idle', coalesce=False)
+    except Exception:
+        app.app.logger.exception('Could not schedule upload hash refresh for %s', user_id)
+
 
 @upload_bp.route('/upload/finalize', methods=['POST'])
 @upload_bp.route('/upload/finalize/', methods=['POST'])
@@ -365,6 +398,7 @@ def finalize_direct_upload():
     except Exception:
         app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
     upload_finalized(total_size)
+    _queue_idle_hash_refresh(user_id)
     return app.jsonify({
         'uploadId': data.get('uploadId') or '',
         'filename': final_name,
@@ -538,6 +572,8 @@ def finalize_upload_batch():
         })
         upload_finalized(total_size)
 
+    if any(result.get('complete') for result in results):
+        _queue_idle_hash_refresh(user_id)
     upload_results(results)
     # Evidence for whether finalize-batch's per-file queue sends/job-status
     # writes are worth batching across files: every finalize already runs

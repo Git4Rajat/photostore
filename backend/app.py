@@ -10140,7 +10140,7 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
     key = str(user_id or '').strip()
     if not key:
         return 'unavailable'
-    scope = scope if scope in ('full', 'light', 'people') else 'full'
+    scope = scope if scope in ('full', 'light', 'people', 'dedup', 'dedup-idle') else 'full'
     light = scope != 'full'
     if not light and _index_build_job_active(key):
         return 'already_active'
@@ -10155,14 +10155,14 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
     # keeps dirtying the indexes must not trigger back-to-back rebuilds: if one
     # finished moments ago, deliver this message after the minimum interval
     # instead (the queued job row dedupes everything that arrives meanwhile).
-    delay = 0
+    delay = max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)) if scope == 'dedup-idle' else 0
     previous = _get_job_row(key, job_id) if jobs_table_client is not None else None
     if coalesce and previous and str(previous.get('status') or '').lower() == 'done':
         updated = _parse_iso_date(str(previous.get('updatedAt') or ''))
         if updated is not None:
             elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
             minimum = INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS if scope == 'people' else INDEX_BUILD_MIN_INTERVAL_SECONDS
-            delay = int(max(0, minimum - elapsed))
+            delay = max(delay, int(max(0, minimum - elapsed)))
     _upsert_job_status(
         job_id, key, INDEX_BUILD_JOB_TYPE, 'queued',
         result={'delayedSeconds': int(delay), 'reason': reason, 'scope': scope} if delay else None,
@@ -10268,6 +10268,32 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     heartbeat.start()
     try:
         with perf_instrumentation.scope(f'index.build.{scope}', user=user_id, job=job_id):
+            import upload_hash_snapshot
+            if scope == 'dedup-idle':
+                if _is_upload_active(user_id):
+                    # Durable delayed check survives browser crashes and worker restarts.
+                    if library_ops_queue_client is None:
+                        raise RuntimeError('upload hash refresh queue is not configured')
+                    library_ops_queue_client.send_message(json.dumps({
+                        'type': 'index_build', 'userId': user_id, 'jobId': job_id,
+                        'scope': scope, 'reason': 'upload-quiet',
+                    }), visibility_timeout=max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)))
+                    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'queued')
+                    return
+                activity = {}
+                if metadata_table_client is not None:
+                    try:
+                        activity = metadata_table_client.get_entity('clustering_maintenance', user_id)
+                    except ResourceNotFoundError:
+                        pass
+                if upload_hash_snapshot.covers_upload_activity(user_id, activity.get('lastUploadActivityAt')):
+                    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+                    return
+            if scope in ('dedup', 'dedup-idle'):
+                if upload_hash_snapshot.rebuild_snapshot(user_id) is None:
+                    raise RuntimeError('upload hash index is not configured')
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+                return
             storage_utils_ensure_sort_current(user_id)  # schema upgrade (full rebuild if stale)
             if scope in ('light', 'people'):
                 # Incremental maintenance: cost follows what changed, not library size.
@@ -10300,6 +10326,12 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     user_id, on_progress=callback, wait=True, kinds=('sort', 'access', 'albums', 'people'))
                 if bad:
                     raise RuntimeError(f'index build produced no {", ".join(bad)} index')
+            if scope != 'people' and storage_utils_module._CTX.get('hash_index_table_client') is not None:
+                # Optional dedup refresh has its own retry lifecycle, not the gallery build's.
+                try:
+                    enqueue_index_build(user_id, reason='index-maintenance', scope='dedup', coalesce=False)
+                except Exception:
+                    worker_logger.warning('Could not queue upload hash snapshot for %s', user_id, exc_info=True)
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')
