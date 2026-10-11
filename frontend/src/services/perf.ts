@@ -118,6 +118,7 @@ class PerfCollector {
     private sender: ((body: unknown) => Promise<unknown>) | null = null;
     private timer: ReturnType<typeof setInterval> | null = null;
     private started = false;
+    private firstGalleryPhotoRecorded = false;
     private resourceAgg = new Map<string, { n: number; cached: number; ms: number; bytes: number }>();
 
     private newView(name: string): ViewStats {
@@ -214,6 +215,12 @@ class PerfCollector {
     /** Manual span for code that already has start/end (e.g. between two awaits). */
     recordSpan(name: string, ms: number, extra: Record<string, string | number | boolean | undefined> = {}): void {
         if (enabled()) this.push({ t: 'span', name, ms: Math.round(ms), view: this.view, ...extra });
+    }
+
+    recordFirstGalleryPhoto(): void {
+        if (!enabled() || this.view !== 'gallery' || this.firstGalleryPhotoRecorded) return;
+        this.firstGalleryPhotoRecorded = true;
+        this.recordSpan('gallery.first_thumbnail', now());
     }
 
     // --- views --------------------------------------------------------------------
@@ -427,6 +434,7 @@ class PerfCollector {
 
     /** Test hook. */
     _reset(): void {
+        this.firstGalleryPhotoRecorded = false;
         this.buffer = [];
         this.requests = [];
         this.recentByKey.clear();

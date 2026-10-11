@@ -2,7 +2,7 @@ import { onIndexReady, reportIndexBuilding } from '../../services/indexBuilding'
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
-import { getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
+import { clearLocalSortIndexRemovals, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
@@ -98,11 +98,9 @@ export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMe
     };
 };
 
-// Backend-free first paint: a Photo built from nothing but a sort-index row and
-// the media token. Metadata the index doesn't carry (people, tags, per-user
-// "liked", processing status, thumbnail rotation) arrives with the background
-// lookup-batch enrichment and replaces this entry by id.
-const provisionalPhoto = (row: SortIndexRow, token: MediaToken | null): Photo => {
+// v4 snapshots carry the complete tile; older snapshots use enrichment only
+// while the indexer upgrades them in the background.
+export const galleryIndexPhoto = (row: SortIndexRow, token: MediaToken | null): Photo => {
     const iso = row.captureDate || row.uploadDate || null;
     const date = iso ? new Date(iso) : null;
     const valid = date && !Number.isNaN(date.getTime()) ? date : null;
@@ -113,12 +111,15 @@ const provisionalPhoto = (row: SortIndexRow, token: MediaToken | null): Photo =>
         dateLabel: valid ? `${MONTHS[valid.getMonth()]} ${valid.getDate()}, ${valid.getFullYear()}` : 'Undated',
         year: valid ? valid.getFullYear() : 0,
         rating: row.rating,
-        liked: false,
+        liked: row.gallery?.liked ?? false,
         likes: row.likes,
         placeId: null,
-        personIds: [],
-        tags: [],
-        thumbnailUrl: thumbnailUrlForBlob(row.thumb, token) || undefined,
+        personIds: row.gallery?.personIds ?? [],
+        tags: row.gallery?.tags ?? [],
+        rotation: row.gallery?.rotation,
+        thumbnailRotation: row.gallery?.thumbnailRotation,
+        processing: row.gallery?.processing,
+        thumbnailUrl: thumbnailUrlForBlob(row.thumb, token) || `/api/photos/thumbnail/${encodeURIComponent(row.filename)}`,
         captureDate: iso,
     };
 };
@@ -631,14 +632,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setPhotos((prev) => (reset ? list : [...prev, ...list]));
     }, [applyServerPhotoTotal]);
 
-    // Server-paged photo fetch. Primary path: download the whole-library
-    // sort-index once per session (see localSortIndex.ts), sort/paginate it
-    // locally, then a single targeted /api/photos/lookup-batch call for just
-    // this page's full photo data -- so a scroll/page-load no longer makes
-    // the backend materialize and sort the entire library per request (see
-    // the sort-index's module comment in storage_utils.py). Falls back to
-    // fetchPhotosViaLegacyEndpoint above on any failure (cold library with no
-    // index built yet, network error, anything) so the gallery never breaks.
+    // v4 gallery pages are entirely index-backed. Older snapshots keep their
+    // enrichment path during migration; unavailable/huge indexes page via the
+    // server so cold libraries and non-token deployments remain usable.
     const fetchPhotos = useCallback(async (reset: boolean) => {
         if (photoLoadingRef.current) {
             if (reset) pendingResetRef.current = true;
@@ -686,9 +682,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             photoHasMoreRef.current = offset + pageFilenames.length < total;
             setHasMorePhotos(photoHasMoreRef.current);
             applyServerPhotoTotal(total);
-            if (token && pageRows.length) {
+            if (pageRows.every((row) => row.gallery)) {
+                const list = pageRows.map((row) => galleryIndexPhoto(row, token));
+                setPhotos((prev) => (reset ? list : [...prev, ...list]));
+            } else if (token && pageRows.length) {
                 // 1) Backend-free paint of the whole window.
-                const provisional = pageRows.map((row) => provisionalPhoto(row, token));
+                const provisional = pageRows.map((row) => galleryIndexPhoto(row, token));
                 setPhotos((prev) => (reset ? provisional : [...prev, ...provisional]));
                 // 2) Enrich with full metadata in parallel chunks (first chunk =
                 //    the top of the window, which is what's on screen). directMedia
@@ -869,8 +868,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setHasMorePhotos(photoHasMoreRef.current);
             applyServerPhotoTotal(sorted.length);
 
-            if (token && pageRows.length) {
-                setPhotos(pageRows.map((row) => provisionalPhoto(row, token)));
+            if (pageRows.every((row) => row.gallery)) {
+                setPhotos(pageRows.map((row) => galleryIndexPhoto(row, token)));
+            } else if (token && pageRows.length) {
+                setPhotos(pageRows.map((row) => galleryIndexPhoto(row, token)));
                 await runWithLimit(chunk(pageFilenames, ENRICH_CHUNK), ENRICH_CONCURRENCY, async (names) => {
                     const res = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames: names, directMedia: true })
                         .catch(() => null);
@@ -1141,14 +1142,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const prevLikes = current?.likes ?? 0;
             const optimisticLikes = Math.max(0, prevLikes + (nextLiked ? 1 : -1));
             setPhotos((prev) => prev.map((p) => (p.id === id ? { ...p, liked: nextLiked, likes: optimisticLikes } : p)));
-            patchLocalSortIndexRow(id, { likes: optimisticLikes });
+            patchLocalSortIndexRow(id, { likes: optimisticLikes, liked: nextLiked });
             void post<{ liked?: boolean; likes?: number }>(`/photos/${encodeURIComponent(id)}/like`, {})
                 .then((res) => {
                     const likes = res.likes ?? optimisticLikes;
                     setPhotos((prev) => prev.map((p) => (p.id === id
                         ? { ...p, liked: res.liked ?? nextLiked, likes }
                         : p)));
-                    patchLocalSortIndexRow(id, { likes });
+                    patchLocalSortIndexRow(id, { likes, liked: res.liked ?? nextLiked });
                     invalidateLocalAlbumsIndex();
                     reloadAlbums();
                 })
@@ -1156,7 +1157,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     setPhotos((prev) => prev.map((p) => (p.id === id
                         ? { ...p, liked: Boolean(current?.liked), likes: prevLikes }
                         : p)));
-                    patchLocalSortIndexRow(id, { likes: prevLikes });
+                    patchLocalSortIndexRow(id, { likes: prevLikes, liked: Boolean(current?.liked) });
                     toast('Couldn’t update like', undefined, undefined, 'error');
                 });
         },
@@ -1170,6 +1171,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // value stored here is what the viewer/grid apply as a CSS transform.
     const applyPhotoRotation = useCallback((filename: string, rotation: number) => {
         const norm = ((rotation % 360) + 360) % 360;
+        patchLocalSortIndexRow(filename, { rotation: norm });
         const patch = (p: Photo): Photo => (p.id === filename && p.rotation !== norm ? { ...p, rotation: norm } : p);
         setPhotos((prev) => prev.map(patch));
         setAlbumPhotos((prev) => {
@@ -1272,6 +1274,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const restorePhotos = useCallback((ids: string[]) => {
         if (!ids.length) return;
+        clearLocalSortIndexRemovals(ids);
         const set = new Set(ids);
         // Optimistically move the photos back from the local trash cache; roll
         // back if the server rejects the restore.
@@ -1285,12 +1288,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         adjustPeopleCountsForPhotos(moved, 1);
         applyPhotoRestoreCount(moved.length);
         void post('/photos/trash/restore', { filenames: ids }).then(() => {
-            publishLibraryChange('photos-restored', ['photos', 'people', 'albums', 'explore', 'trash'], { itemCount: ids.length });
+            publishLibraryChange('photos-restored', ['photos', 'people', 'albums', 'explore', 'trash'], { itemCount: ids.length, entityIds: ids });
         }).catch(() => {
             const movedSet = new Set(moved.map((p) => p.id));
             setPhotos((cur) => cur.filter((p) => !movedSet.has(p.id)));
             adjustPeopleCountsForPhotos(moved, -1);
             applyPhotoDeleteCount(moved.length);
+            removeLocalSortIndexRows(ids);
             setTrash((prev) => [...moved.map((photo) => ({ photo, purgesInDays: 30 })), ...prev]);
             toast('Couldn’t restore photos', undefined, undefined, 'error');
         });
@@ -1319,7 +1323,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                         () => restorePhotos(ids),
                     );
                     publishLibraryChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], {
-                        itemCount: ids.length,
+                        itemCount: ids.length, entityIds: ids,
                     });
                 }
             }).catch(() => {
@@ -1327,6 +1331,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const set = new Set(ids);
                 setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
                 setPhotos((cur) => [...doomed, ...cur]);
+                clearLocalSortIndexRemovals(ids);
                 invalidateLocalSortIndex();
                 adjustPeopleCountsForPhotos(doomed, 1);
                 applyPhotoRestoreCount(ids.length);

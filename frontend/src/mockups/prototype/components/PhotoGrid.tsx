@@ -3,6 +3,7 @@ import { CircleCheck as CheckCircleIcon, Heart as HeartIcon, Star as StarIcon } 
 import { useStore } from '../store';
 import { usePhotoThumbnails } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
+import { perf } from '../../../services/perf';
 import type { Photo } from '../types';
 
 // The served thumbnail bakes in only the client's auto-orientation
@@ -36,6 +37,13 @@ export const TileThumbnail: React.FC<{ src: string; alt: string; style?: React.C
             loading="lazy"
             draggable={false}
             style={style}
+            onLoad={(event) => {
+                const rect = event.currentTarget.getBoundingClientRect();
+                if (document.visibilityState === 'visible' && rect.width > 0 && rect.height > 0
+                    && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth) {
+                    perf.recordFirstGalleryPhoto();
+                }
+            }}
             onError={() => setBroken(true)}
         />
     );

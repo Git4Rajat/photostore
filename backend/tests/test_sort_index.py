@@ -90,7 +90,7 @@ def test_build_snapshot_projects_only_sort_relevant_fields(sort_ctx):
     assert snapshot is not None
     assert len(snapshot.rows) == 1
     row = snapshot.rows[0]
-    assert set(row.keys()) == {'RowKey', 'captureDate', 'rating', 'likes', 'uploadDate', 'thumb'}
+    assert set(row.keys()) == {'RowKey', 'captureDate', 'rating', 'likes', 'uploadDate', 'thumb', 'gallery'}
     assert row['rating'] == 4
     assert row['likes'] == 2
     assert row['uploadDate'] == '2026-01-01T00:00:00+00:00'
@@ -134,6 +134,124 @@ def test_build_snapshot_returns_none_on_query_exception_not_empty_rows(monkeypat
 
 
 # --- serialize / deserialize round trip --------------------------------------
+
+def test_gallery_tile_projection_matches_photo_summary_without_heavy_payloads(sort_ctx):
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-tile', 'a.jpg', likedBy='["lib-tile"]', rotation=-90,
+              tags='["beach", "stockholm"]', locationCity='Stockholm', peopleIds='["person-1"]',
+              processing_metadata=json.dumps({'client_thumbnail': {'rotationDegrees': 450}, 'ocr': {'text': 'x' * 10000}}),
+              thumbnail_status='done', face_status='running', ocrText='x' * 10000,
+              photoEmbedding='[1,2,3]')
+    tile = storage_utils._build_user_sort_index_snapshot('lib-tile', 'v1').rows[0]['gallery']
+    assert tile['liked'] is True
+    assert tile['rotation'] == 270
+    assert tile['thumbnailRotation'] == 90
+    assert tile['tags'] == ['beach']
+    assert tile['personIds'] == ['person-1']
+    assert tile['processing']['thumbnail'] == 'done'
+    assert tile['processing']['face'] == 'running'
+    assert 'ocrText' not in json.dumps(tile)
+    assert 'photoEmbedding' not in json.dumps(tile)
+    assert len(json.dumps(tile)) < 600
+
+
+def test_gallery_tile_projection_tolerates_malformed_optional_metadata():
+    tile = storage_utils._sort_index_row({'RowKey': 'a.jpg', 'rotation': 'bad',
+                                        'likedBy': '{', 'peopleIds': '{', 'processing_metadata': '[]'})['gallery']
+    assert tile['rotation'] == tile['thumbnailRotation'] == 0
+    assert tile['liked'] is False
+    assert tile['personIds'] == []
+
+
+def test_incremental_refresh_updates_gallery_tile_and_removes_deleted_photo(sort_ctx):
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-tile', 'a.jpg', rotation=0, thumbnail_status='pending')
+    _seed_row(table, 'lib-tile', 'b.jpg')
+    storage_utils.refresh_user_sort_index('lib-tile', source_version='v1')
+    _seed_row(table, 'lib-tile', 'a.jpg', rotation=90, thumbnail_status='done', peopleIds='["p1"]')
+    _seed_row(table, 'lib-tile', 'b.jpg', processing_state='deleted')
+    storage_utils.touch_user_sort_index_dirty('lib-tile', ['a.jpg', 'b.jpg'])
+    storage_utils.refresh_user_sort_index('lib-tile', source_version='v2')
+    rows = storage_utils._load_sort_index_blob('lib-tile').rows
+    assert [row['RowKey'] for row in rows] == ['a.jpg']
+    assert rows[0]['gallery']['rotation'] == 90
+    assert rows[0]['gallery']['processing']['thumbnail'] == 'done'
+    assert rows[0]['gallery']['personIds'] == ['p1']
+
+
+def test_incremental_refresh_keeps_previous_snapshot_on_transient_read_failure(sort_ctx, monkeypatch):
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-read-failure', 'a.jpg', rating=1)
+    storage_utils.refresh_user_sort_index('lib-read-failure', source_version='v1')
+    storage_utils.touch_user_sort_index_dirty('lib-read-failure', ['a.jpg'])
+    previous = storage_utils._load_sort_index_manifest('lib-read-failure')
+
+    def fail_read(**kwargs):
+        raise RuntimeError('temporary table failure')
+
+    monkeypatch.setattr(table, 'get_entity', fail_read)
+    assert storage_utils.refresh_user_sort_index('lib-read-failure', source_version='v2') is None
+    assert storage_utils._load_sort_index_manifest('lib-read-failure') == previous
+    assert storage_utils._load_sort_index_blob('lib-read-failure').rows[0]['rating'] == 1
+    assert storage_utils._get_dirty_search_index_filenames('lib-read-failure', 'sort') == {'a.jpg'}
+
+
+def test_incremental_refresh_removes_only_confirmed_missing_rows(sort_ctx, monkeypatch):
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-missing', 'a.jpg')
+    storage_utils.refresh_user_sort_index('lib-missing', source_version='v1')
+    storage_utils.touch_user_sort_index_dirty('lib-missing', ['a.jpg'])
+
+    def missing(**kwargs):
+        raise storage_utils.ResourceNotFoundError('photo deleted')
+
+    monkeypatch.setattr(table, 'get_entity', missing)
+    assert storage_utils.refresh_user_sort_index('lib-missing', source_version='v2') is not None
+    assert storage_utils._load_sort_index_blob('lib-missing').rows == []
+
+
+def test_refresh_keeps_previous_snapshot_and_dirty_marks_on_upload_failure(sort_ctx, monkeypatch):
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-upload-failure', 'a.jpg', rating=1)
+    storage_utils.refresh_user_sort_index('lib-upload-failure', source_version='v1')
+    _seed_row(table, 'lib-upload-failure', 'a.jpg', rating=5)
+    storage_utils.touch_user_sort_index_dirty('lib-upload-failure', ['a.jpg'])
+    previous = storage_utils._load_sort_index_manifest('lib-upload-failure')
+
+    def fail_upload(*args, **kwargs):
+        raise RuntimeError('temporary blob failure')
+
+    monkeypatch.setattr(storage_utils, '_upload_file_to_blob', fail_upload)
+    assert storage_utils.refresh_user_sort_index('lib-upload-failure', source_version='v2') is None
+    assert storage_utils._load_sort_index_manifest('lib-upload-failure') == previous
+    assert storage_utils._load_sort_index_blob('lib-upload-failure').rows[0]['rating'] == 1
+    assert storage_utils._get_dirty_search_index_filenames('lib-upload-failure', 'sort') == {'a.jpg'}
+
+
+def test_sort_tile_updates_coalesce_dirty_marks(sort_ctx, monkeypatch):
+    _, dirty, _ = sort_ctx
+    monkeypatch.setattr(storage_utils, '_schedule_dirty_flush', lambda: None)
+    for _ in range(7):
+        storage_utils.touch_user_sort_index_dirty('lib-coalesce', ['a.jpg', 'b.jpg'])
+    assert dirty.rows == {}
+    assert storage_utils._get_dirty_search_index_filenames('lib-coalesce', 'sort') == {'a.jpg', 'b.jpg'}
+    assert len(dirty.submit_transaction_calls) == 1
+    assert len(dirty.submit_transaction_calls[0]) == 2
+    storage_utils._get_dirty_search_index_filenames('lib-coalesce', 'lexical')
+
+
+@pytest.mark.parametrize('batched', [False, True])
+def test_processing_status_write_dirties_gallery_index(sort_ctx, monkeypatch, batched):
+    table, _, _ = sort_ctx
+    _seed_row(table, 'lib-status', 'a.jpg')
+    calls = []
+    monkeypatch.setattr(storage_utils, 'touch_user_sort_index_dirty', lambda *args: calls.append(args))
+    if batched:
+        storage_utils._flush_processing_status_batch('lib-status', 'a.jpg', [{'step': 'thumbnail', 'status': 'done'}])
+    else:
+        storage_utils.update_processing_status('lib-status', 'a.jpg', 'thumbnail', 'done')
+    assert calls == [('lib-status', ['a.jpg'])]
+
 
 def test_serialize_round_trip_via_gzip_json():
     snapshot = storage_utils.LexicalIndexSnapshot(
@@ -224,7 +342,10 @@ def test_metadata_updates_affect_sort_index_field_set():
     assert storage_utils.metadata_updates_affect_sort_index({'rating': 5}) is True
     assert storage_utils.metadata_updates_affect_sort_index({'likes': 1}) is True
     assert storage_utils.metadata_updates_affect_sort_index({'likedBy': '[]'}) is True
-    assert storage_utils.metadata_updates_affect_sort_index({'tags': '[]'}) is False
+    assert storage_utils.metadata_updates_affect_sort_index({'tags': '[]'}) is True
+    assert storage_utils.metadata_updates_affect_sort_index({'rotation': 90}) is True
+    assert storage_utils.metadata_updates_affect_sort_index({'thumbnail_status': 'done'}) is True
+    assert storage_utils.metadata_updates_affect_sort_index({'ocrText': 'text'}) is False
     assert storage_utils.metadata_updates_affect_sort_index({}) is False
 
 
