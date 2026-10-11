@@ -1,6 +1,7 @@
 import { get } from './apiClient';
 import { perf, perfNow } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
+import type { Photo } from '../types/uiTypes';
 
 /**
  * Client-side counterpart to the backend's sort index (see
@@ -22,6 +23,15 @@ export interface SortIndexRow {
     /** Physical thumbnail blob name once the thumbnail exists; with the media
      * token this yields a direct URL with no backend call. */
     thumb?: string;
+    /** Absent only in snapshots built before the v4 schema migration. */
+    gallery?: {
+        liked: boolean;
+        rotation: number;
+        thumbnailRotation: number;
+        personIds: string[];
+        tags: string[];
+        processing: Photo['processing'];
+    };
 }
 
 /** True once the server said this library is too big for a client-side sort index (it pages instead). */
@@ -41,6 +51,7 @@ interface StoredSortIndex {
     sourceVersion: string;
     updatedAt: string;
     rows: SortIndexRow[];
+    removedRows?: Record<string, string>;
 }
 
 const DB_NAME = 'photostore-sort-index';
@@ -96,6 +107,8 @@ const normalizeRows = (raw: Record<string, unknown>[]): SortIndexRow[] => raw
         likes: Number(row.likes) || 0,
         uploadDate: typeof row.uploadDate === 'string' ? row.uploadDate : null,
         ...(typeof row.thumb === 'string' && row.thumb ? { thumb: row.thumb } : {}),
+        ...(row.gallery && typeof row.gallery === 'object'
+            ? { gallery: row.gallery as SortIndexRow['gallery'] } : {}),
     }))
     .filter((row) => row.filename);
 
@@ -108,19 +121,21 @@ const normalizeRows = (raw: Record<string, unknown>[]): SortIndexRow[] => raw
 // here since the code shape is identical.
 const BLOB_FETCH_TIMEOUT_MS = 120000;
 
-const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => {
+const fetchWithTimeout = async (url: string, timeoutMs: number): Promise<ArrayBuffer> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+    try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error(`Failed to download sort index (${response.status})`);
+        return await response.arrayBuffer();
+    } finally {
+        clearTimeout(timer);
+    }
 };
 
 const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> => {
     const downloadStarted = perfNow();
-    const response = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
-    if (!response.ok) {
-        throw new Error(`Failed to download sort index (${response.status})`);
-    }
-    const buffer = await response.arrayBuffer();
+    const buffer = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     perf.recordSpan('index.sort.blob_download', perfNow() - downloadStarted, { bytes: buffer.byteLength });
     const parseStarted = perfNow();
     // The blob is stored with Content-Encoding: gzip -- most browsers
@@ -151,6 +166,32 @@ const indexKey = (): string => getActiveLibraryFromToken() || '__default__';
 let cachedKey: string | null = null;
 let cachedIndex: SortIndexRow[] | null = null;
 let inFlight: Promise<SortIndexRow[] | null> | null = null;
+// Keep authoritative local deletes hidden while the server snapshot catches up.
+// The blob name identifies a generation, so a re-upload can reuse its filename.
+const removedRows = new Map<string, Map<string, string>>();
+const restoredRows = new Map<string, Set<string>>();
+const removalsFor = (key: string): Map<string, string> => {
+    let removed = removedRows.get(key);
+    if (!removed) { removed = new Map(); removedRows.set(key, removed); }
+    return removed;
+};
+const readStoredRemovals = (key: string, stored: StoredSortIndex | null): void => {
+    const removed = removalsFor(key);
+    for (const [name, blob] of Object.entries(stored?.removedRows ?? {})) {
+        if (!removed.has(name) && !restoredRows.get(key)?.has(name)) removed.set(name, blob);
+    }
+};
+const filterRemovedRows = (key: string, rows: SortIndexRow[], freshDownload = false): SortIndexRow[] => {
+    const removed = removalsFor(key);
+    if (freshDownload && removed.size) {
+        const byName = new Map(rows.map((row) => [row.filename, row]));
+        removed.forEach((blob, name) => {
+            const row = byName.get(name);
+            if (!row || (blob && row.thumb && row.thumb !== blob)) removed.delete(name);
+        });
+    }
+    return removed.size ? rows.filter((row) => !removed.has(row.filename)) : rows;
+};
 
 const fetchLocalSortIndex = async (key: string): Promise<SortIndexRow[] | null> => {
     const totalStarted = perfNow();
@@ -167,22 +208,25 @@ const fetchLocalSortIndex = async (key: string): Promise<SortIndexRow[] | null> 
     const sourceVersion = response.sourceVersion || '';
     const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
+    readStoredRemovals(key, stored);
     perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
     if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
         // Unchanged since the last download for this library -- skip the
         // blob re-fetch entirely, this is the whole point of persisting it.
         perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
-        return stored.rows;
+        return filterRemovedRows(key, stored.rows);
     }
     const rows = await downloadSortIndexBlob(response.indexUrl);
+    filterRemovedRows(key, rows, true);
     const writeStarted = perfNow();
-    await idbPutStored(key, { sourceVersion, updatedAt: response.updatedAt || '', rows }).catch(() => {
+    await idbPutStored(key, { sourceVersion, updatedAt: response.updatedAt || '', rows,
+        removedRows: Object.fromEntries(removalsFor(key)) }).catch(() => {
         // Best-effort persistence -- an in-memory-only session still works,
         // it just re-downloads next reload instead of skipping the fetch.
     });
     perf.recordSpan('index.sort.idb_write', perfNow() - writeStarted, { rows: rows.length });
     perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: false, rows: rows.length });
-    return rows;
+    return filterRemovedRows(key, rows);
 };
 
 export const getLocalSortIndex = async (): Promise<SortIndexRow[] | null> => {
@@ -239,17 +283,27 @@ export const invalidateLocalSortIndex = (): void => {
 // rebuilds its own sort index, but the already-open tab should not keep paging
 // through filenames it just removed.
 export const removeLocalSortIndexRows = (filenames: string[]): void => {
-    if (!cachedIndex || !filenames.length) return;
+    if (!filenames.length) return;
     const doomed = new Set(filenames);
-    const key = cachedKey;
-    cachedIndex = cachedIndex.filter((row) => !doomed.has(row.filename));
+    const key = indexKey();
+    const removed = removalsFor(key);
+    const thumbnails = new Map(cachedKey === key ? cachedIndex?.map((row) => [row.filename, row.thumb ?? '']) : []);
+    filenames.forEach((name) => {
+        restoredRows.get(key)?.delete(name);
+        removed.set(name, thumbnails.get(name) || removed.get(name) || '');
+    });
+    if (cachedKey === key && cachedIndex) cachedIndex = filterRemovedRows(key, cachedIndex);
     thumbMap = null;
     thumbMapSource = null;
     if (key) {
         idbGetStored(key)
             .then((stored) => {
                 if (!stored) return;
-                return idbPutStored(key, { ...stored, rows: stored.rows.filter((row) => !doomed.has(row.filename)) });
+                readStoredRemovals(key, stored);
+                for (const row of stored.rows) {
+                    if (doomed.has(row.filename) && !removed.get(row.filename)) removed.set(row.filename, row.thumb ?? '');
+                }
+                return idbPutStored(key, { ...stored, removedRows: Object.fromEntries(removed) });
             })
             .catch(() => {
                 // Best-effort -- the in-memory removal is what fixes the
@@ -258,25 +312,43 @@ export const removeLocalSortIndexRows = (filenames: string[]): void => {
     }
 };
 
+export const clearLocalSortIndexRemovals = (filenames: string[]): void => {
+    const key = indexKey();
+    const removed = removalsFor(key);
+    const restored = restoredRows.get(key) ?? new Set<string>();
+    restoredRows.set(key, restored);
+    filenames.forEach((name) => { removed.delete(name); restored.add(name); });
+    void idbGetStored(key).then((stored) => {
+        if (!stored) return;
+        const remaining = { ...stored.removedRows };
+        filenames.forEach((name) => delete remaining[name]);
+        return idbPutStored(key, { ...stored, removedRows: remaining });
+    }).catch(() => {});
+};
+
 // Optimistic local patch after a rating/like edit -- store.tsx already
 // patches its own `photos` page-state array immediately on edit; this keeps
 // the whole-library sort-index in step too, so a re-sort/re-scroll within
 // the same session reflects the change without waiting on the backend's
 // independent sort-index manifest to catch up (see touch_user_sort_index_dirty
 // in storage_utils.py, which is near-instant but still a round trip).
-export const patchLocalSortIndexRow = (filename: string, patch: { rating?: number; likes?: number }): void => {
+export const patchLocalSortIndexRow = (filename: string, patch: { rating?: number; likes?: number; liked?: boolean; rotation?: number }): void => {
     if (!cachedIndex) return;
     const key = cachedKey;
-    cachedIndex = cachedIndex.map((row) => (row.filename === filename
-        ? { ...row, rating: patch.rating ?? row.rating, likes: patch.likes ?? row.likes }
-        : row));
+    const patchRow = (row: SortIndexRow): SortIndexRow => row.filename === filename
+        ? {
+            ...row, rating: patch.rating ?? row.rating, likes: patch.likes ?? row.likes,
+            ...(row.gallery ? { gallery: {
+                ...row.gallery, liked: patch.liked ?? row.gallery.liked,
+                rotation: patch.rotation ?? row.gallery.rotation,
+            } } : {}),
+        } : row;
+    cachedIndex = cachedIndex.map(patchRow);
     if (key) {
         idbGetStored(key)
             .then((stored) => {
                 if (!stored) return;
-                const rows = stored.rows.map((row) => (row.filename === filename
-                    ? { ...row, rating: patch.rating ?? row.rating, likes: patch.likes ?? row.likes }
-                    : row));
+                const rows = stored.rows.map(patchRow);
                 return idbPutStored(key, { ...stored, rows });
             })
             .catch(() => {

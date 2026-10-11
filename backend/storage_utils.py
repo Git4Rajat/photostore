@@ -48,7 +48,7 @@ from image_utils import (
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
-from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, is_sensitive_auto_tag_label, normalize_tags
+from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, is_sensitive_auto_tag_label, normalize_tags, visible_tags
 import album_store
 import index_files
 import table_scan
@@ -316,20 +316,16 @@ _VECTOR_INDEX_RELEVANT_FIELDS = {
     'tagMetadata',
     'weakTags',
 }
-# Fields that change a photo's position in the gallery's default sort orders
-# (rating -> likes -> date -> filename, see app.py's
-# _cached_sorted_metadata_list_rows_for_user) without changing anything the
-# lexical/vector/tag-embedding indexes care about. Kept as its own set (not
-# folded into _VECTOR_INDEX_RELEVANT_FIELDS) so a rating tap dirties only the
-# sort index -- see metadata_updates_affect_sort_index and
-# touch_user_sort_index_dirty below -- instead of also triggering those other
-# indexes' full OCR/tag/embedding rebuild for a plain number change. Capture
-# date itself isn't listed here because it's never a directly-written column
-# (see ordering_utils.metadata_capture_datetime) -- it only changes via EXIF
-# extraction/client-processing writeback, which already unconditionally calls
-# touch_user_search_indexes_state (now also touching the sort index, see
-# _SEARCH_INDEX_KINDS below), so no separate trigger is needed for it here.
-_SORT_INDEX_RELEVANT_FIELDS = {'rating', 'likes', 'likedBy'}
+# Gallery ordering and tile fields. Search-relevant writes already dirty sort
+# through touch_user_search_indexes_state; tile-only edits need only this index.
+_SORT_INDEX_RELEVANT_FIELDS = {
+    'rating', 'likes', 'likedBy', 'rotation', 'tags', 'peopleIds',
+    'processing_metadata', 'processing_state', 'anonymousImageId',
+    'preview_status', 'thumbnail_status', 'exif_status', 'ocr_status',
+    'face_status', 'ai_vision_status', 'map_detection_status',
+    'exifData', 'clientLastModified', 'uploadDate', 'tagMetadata',
+    'address', 'locationCity', 'locationCountry', 'locationRegion',
+}
 
 _CTX: Dict[str, object] = {}
 
@@ -4885,26 +4881,21 @@ def get_user_lexical_index(
 # _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
 # tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
 # lexical rebuild -- so this index tracks its own staleness end to end.
-_SORT_INDEX_SCHEMA_VERSION = 'v3'
+_SORT_INDEX_SCHEMA_VERSION = 'v4'  # v4: complete compact gallery tiles, no per-page table enrichment
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
-# The Table columns _build_user_sort_index_snapshot SELECTs -- deliberately
-# narrow (no photoEmbedding/semanticEmbedding/ocrText/tagMetadata/etc.),
-# because the whole point of this index is to relieve the backend-memory
-# pressure a full-column gallery scan causes; pulling the big columns just to
-# emit 5 small fields would reintroduce that spike on every cold build. Covers
-# the deleted-row filter (processing_state), the emitted fields (rating/likes/
-# uploadDate), and every field metadata_capture_datetime reads to derive
-# captureDate (exifData -> clientLastModified -> uploadDate/upload_started_at/
-# last_processing_update). RowKey is listed explicitly so a projecting select
-# still yields it -- real Azure returns PartitionKey/RowKey regardless, but a
-# strict projection (and the test fakes) only return selected columns.
+# Stream only the columns needed for chronology and compact tiles. EXIF and
+# processing JSON are reduced per row, never stored in the browser index.
 _SORT_INDEX_SOURCE_FIELDS = [
     'PartitionKey', 'RowKey', 'processing_state',
     'rating', 'likes', 'uploadDate',
     'exifData', 'clientLastModified', 'upload_started_at', 'last_processing_update',
     'anonymousImageId', 'thumbnail_status',
+    'likedBy', 'rotation', 'tags', 'tagMetadata', 'peopleIds', 'processing_metadata',
+    'preview_status', 'exif_status', 'ocr_status', 'face_status',
+    'ai_vision_status', 'map_detection_status',
+    'latitude', 'longitude', 'address', 'locationCity', 'locationCountry', 'locationRegion',
 ]
 
 
@@ -5005,23 +4996,10 @@ def touch_user_sort_index_dirty(user_id: str, filenames) -> None:
         return
     # The search database stores rating/likes too (filter and gallery order), so the change must
     # reach it as a delta even though no search *text* changed.
-    _mark_search_index_dirty_filenames(key, [str(f) for f in filenames], kinds=('lexical',))
+    _mark_search_index_dirty_filenames(key, [str(f) for f in filenames], kinds=('lexical', 'sort'))
     if sort_index_skipped(key):
         return
     touch_user_sort_index_state(key)
-    table = _CTX.get('search_index_dirty_table_client')
-    if table is None:
-        return
-    now = datetime.now(timezone.utc).isoformat()
-    partition_key = _search_index_dirty_partition_key(key, 'sort')
-    for filename in filenames:
-        filename = str(filename or '').strip()
-        if not filename:
-            continue
-        try:
-            table.upsert_entity({'PartitionKey': partition_key, 'RowKey': filename, 'dirtyAt': now})
-        except Exception:
-            pass
 
 
 def _load_sort_index_manifest(user_id: str) -> Dict[str, str]:
@@ -5064,6 +5042,15 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
     if not filename:
         return None
     capture_dt = metadata_capture_datetime(entity)
+    processing = _safe_json_load(entity.get('processing_metadata'))
+    thumbnail = processing.get('client_thumbnail') if isinstance(processing, dict) else None
+
+    def rotation(value):
+        try:
+            return int(value or 0) % 360
+        except (ValueError, TypeError):
+            return 0
+
     return {
         'RowKey': filename,
         'captureDate': capture_dt.isoformat() if capture_dt else None,
@@ -5078,6 +5065,22 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         # blob directly and treats a 404 as "still generating" instead of
         # asking this index whether it's ready first.
         'thumb': str(entity.get('anonymousImageId') or filename),
+        'gallery': {
+            'liked': str(entity.get('PartitionKey') or '') in _json_list(entity.get('likedBy')),
+            'rotation': rotation(entity.get('rotation')),
+            'thumbnailRotation': rotation(thumbnail.get('rotationDegrees')) if isinstance(thumbnail, dict) else 0,
+            'personIds': _json_list(entity.get('peopleIds')),
+            'tags': visible_tags(entity),
+            'processing': {
+                'preview': entity.get('preview_status'),
+                'thumbnail': entity.get('thumbnail_status'),
+                'exif': entity.get('exif_status'),
+                'ocr': entity.get('ocr_status'),
+                'face': entity.get('face_status'),
+                'aiVision': entity.get('ai_vision_status'),
+                'mapDetection': entity.get('map_detection_status'),
+            },
+        },
     }
 
 
@@ -5250,7 +5253,7 @@ def _refresh_rows_index_on_disk(
                     def _one(filename: str):
                         try:
                             entity = metadata_table_client.get_entity(partition_key=key, row_key=filename)
-                        except Exception:
+                        except ResourceNotFoundError:
                             return filename, None
                         if not keep_entity(entity):
                             return filename, None
@@ -5303,6 +5306,7 @@ def _refresh_rows_index_on_disk(
                     )
             except Exception:
                 _LOGGER.warning('Uploading %s index failed user=%s', kind, key, exc_info=True)
+                return None
     if container_name:
         _clear_manifest_dirty_flag(key, kind)
         manifest = {
@@ -5362,6 +5366,7 @@ def ensure_user_sort_index_current(user_id: str) -> bool:
     snapshot was built before this still has `thumb` missing on any row whose
     thumbnail wasn't done at build time, forcing the client to fall back to
     /api/photos/access-batch for those rows instead of resolving directly).
+    v4 adds the compact tile metadata previously fetched from Table Storage.
     True if a rebuild ran."""
     key = str(user_id or '').strip()
     manifest = _load_sort_index_manifest(key) if key else {}
@@ -7595,7 +7600,7 @@ def detect_duplicates(user_id: str, file_hash: str, perceptual_hash: Optional[st
                     matched_filename = candidate
                 except Exception:
                     try:
-                        hash_index_table_client.delete_entity(partition_key=user_id, row_key=file_hash)
+                        delete_hash_index_entry(user_id, file_hash)
                     except Exception:
                         pass
         else:
@@ -7653,7 +7658,9 @@ def list_known_file_hashes(user_id: str) -> Dict[str, str]:
         return {}
     try:
         rows = hash_index_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'")
-        return {str(row.get('RowKey') or ''): str(row.get('filename') or '') for row in rows if row.get('RowKey')}
+        from upload_hash_snapshot import CONTROL_ROWS
+        return {str(row.get('RowKey') or ''): str(row.get('filename') or '') for row in rows
+                if row.get('RowKey') and row.get('RowKey') not in CONTROL_ROWS}
     except Exception:
         return {}
 
@@ -8392,17 +8399,19 @@ def _bounded_face_diagnostics(value):
     result = {}
     for key in ('anchorCount', 'scorePassedCount', 'validBoxCount', 'invalidBoxCount',
                 'nmsKeptCount', 'nmsRemovedCount', 'failureCount', 'qualityRejectedCount',
-                'landmarkCount', 'alignedCount', 'embeddedCount', 'imageWidth', 'imageHeight', 'detectorInputSize'):
+                'landmarkCount', 'alignedCount', 'embeddedCount', 'imageWidth', 'imageHeight', 'detectorInputSize',
+                'primaryRawFaceCount', 'primaryFilteredFaceCount'):
         if key in value:
             result[key] = _bounded_face_count(value[key])
-    for key in ('detectorMaxScore', 'detectorScoreThreshold'):
+    for key in ('detectorMaxScore', 'detectorScoreThreshold', 'primaryDetectorMaxScore'):
         try:
             score = float(value[key])
             if np.isfinite(score) and 0 <= score <= 1:
                 result[key] = round(score, 6)
         except (KeyError, TypeError, ValueError, OverflowError):
             pass
-    for key in ('detectorModelReady', 'landmarkModelReady', 'embeddingModelReady'):
+    for key in ('detectorModelReady', 'landmarkModelReady', 'embeddingModelReady',
+                'recoveryAttempted', 'recoverySucceeded', 'recoveryDetectorReady'):
         if isinstance(value.get(key), bool):
             result[key] = value[key]
     for key in ('detectorOutputShape', 'embeddingOutputShape'):
@@ -9551,6 +9560,7 @@ def update_processing_status(
             # user edit) between the read and this write loses this attempt
             # and retries against a fresh read instead of clobbering it.
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            touch_user_sort_index_dirty(user_id, [filename])
             return
         except ResourceModifiedError:
             import time
@@ -9596,6 +9606,7 @@ def _flush_processing_status_batch(user_id: str, filename: str, updates: List[Di
         entity['processing_complete'] = _photo_processing_complete(entity)
         try:
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            touch_user_sort_index_dirty(user_id, [filename])
             return
         except ResourceModifiedError:
             import time
@@ -10119,6 +10130,9 @@ def _store_hash_index(user_id: str, file_hash: str, filename: str) -> None:
     hash_index_table_client = _CTX.get('hash_index_table_client')
     if hash_index_table_client is None or not file_hash or not filename:
         return
+    from upload_hash_snapshot import CONTROL_ROWS
+    if file_hash in CONTROL_ROWS:
+        return
     try:
         hash_index_table_client.upsert_entity({
             'PartitionKey': user_id,
@@ -10137,7 +10151,8 @@ def delete_hash_index_entry(user_id: str, file_hash: str) -> None:
     if hash_index_table_client is None or not file_hash:
         return
     try:
-        hash_index_table_client.delete_entity(partition_key=user_id, row_key=file_hash)
+        from upload_hash_snapshot import delete_hash
+        delete_hash(hash_index_table_client, user_id, file_hash)
     except Exception:
         pass
 

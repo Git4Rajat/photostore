@@ -1,5 +1,5 @@
 import IndexBuildBar from './components/IndexBuildBar';
-import { invalidateLocalSortIndex } from '../../services/localSortIndex';
+import { clearLocalSortIndexRemovals, invalidateLocalSortIndex, removeLocalSortIndexRows } from '../../services/localSortIndex';
 import { invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { subscribeLibraryChanges } from '../../services/libraryChanges';
@@ -341,6 +341,10 @@ const DataRefreshBridge: React.FC = () => {
     useEffect(() => subscribeLibraryChanges((change) => {
         const domains = new Set(change.domains);
         if (domains.has('photos')) {
+            if (change.entityIds?.length) {
+                if (change.operation === 'photos-deleted') removeLocalSortIndexRows(change.entityIds);
+                if (change.operation === 'photos-restored') clearLocalSortIndexRemovals(change.entityIds);
+            }
             if (change.operation === 'photos-deleted' && change.itemCount) {
                 applyExternalPhotoDeleteCount(change.itemCount);
             }

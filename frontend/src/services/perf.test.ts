@@ -75,4 +75,17 @@ describe('perf collector', () => {
         perf.recordRequest(rec({ ms: 5000 }), 'k');
         expect(perf._events()).toHaveLength(0);
     });
+
+    it('records navigation-to-first-gallery-thumbnail only once and only in gallery', () => {
+        perf.setView('albums');
+        perf.recordFirstGalleryPhoto();
+        expect(perf._events().filter((e) => e.name === 'gallery.first_thumbnail')).toHaveLength(0);
+        perf.setView('gallery');
+        perf.recordFirstGalleryPhoto();
+        perf.recordFirstGalleryPhoto();
+        const spans = perf._events().filter((e) => e.name === 'gallery.first_thumbnail');
+        expect(spans).toHaveLength(1);
+        expect(spans[0]).toMatchObject({ t: 'span', view: 'gallery' });
+        expect(spans[0].ms).toBeGreaterThanOrEqual(0);
+    });
 });
