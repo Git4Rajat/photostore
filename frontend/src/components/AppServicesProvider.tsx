@@ -41,6 +41,8 @@ import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 import { getUnattendedConcurrencyBonus, reportBrowserProcessingOutcome } from '../services/unattendedProcessingScaler';
 import { showToast } from '../services/toast';
 import { publishLibraryChange } from '../services/libraryChanges';
+import { fetchKnownUploadHashes } from '../services/uploadKnownHashes';
+import { perf } from '../services/perf';
 import {
     isFileSystemAccessSupported,
     isFileSystemFileHandle,
@@ -1759,32 +1761,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         sha256ArrayBuffer(await readBlobArrayBuffer(file))
     );
 
-    // GET analogue of postUploadWithRetry below: /upload/known-hashes can hit
-    // the same cold-start 502/503 as init/finalize (the backend scales to
-    // zero), and without a retry here that would silently disable client-side
-    // dedup for the WHOLE batch instead of just costing one extra round trip.
-    const getUploadWithRetry = async <T = any>(url: string): Promise<T> => {
-        let lastError: unknown = null;
-        for (let attempt = 0; attempt < MAX_FINALIZE_RETRIES; attempt += 1) {
-            if (uploadStopRequestedRef.current) {
-                throw new Error(UPLOAD_STOPPED_ERROR);
-            }
-            try {
-                return await getUpload<T>(url);
-            } catch (err) {
-                lastError = err;
-                if (!isRetriableUploadError(err)) {
-                    break;
-                }
-                if (!navigator.onLine) {
-                    await waitForOnline();
-                }
-                await sleep(Math.min(1000 * Math.pow(2, attempt), 15000));
-            }
-        }
-        throw lastError || new Error(`Request to ${url} failed.`);
-    };
-
     // Best-effort prefetch of the library's dedup index (see backend
     // list_known_file_hashes), merged into knownHashesRef so uploadFileInChunks
     // can skip a known duplicate before staging a single byte. A failed/slow
@@ -1792,16 +1768,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // backend's own point-lookup at finalize time stays authoritative, so
     // correctness never depends on this succeeding.
     const fetchKnownHashes = async (): Promise<void> => {
-        try {
-            const response = await getUploadWithRetry<{ hashes?: Record<string, string> }>('/upload/known-hashes');
-            const hashes = response?.hashes;
-            if (hashes && typeof hashes === 'object') {
-                for (const [hash, filename] of Object.entries(hashes)) {
-                    knownHashesRef.current.set(hash, filename);
-                }
-            }
-        } catch {
-            // Ignore -- see comment above.
+        const hashes = await fetchKnownUploadHashes();
+        for (const [hash, filename] of Object.entries(hashes)) {
+            knownHashesRef.current.set(hash, filename);
         }
     };
 
@@ -4408,6 +4377,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         pickerOpenedAtRef.current = null;
         const pickerOpenDurationMs = pickerOpenedAt !== null ? Date.now() - pickerOpenedAt : null;
         const selectedFiles = event.target.files ? Array.from(event.target.files) : [];
+        perf.recordSpan('upload.picker.change', pickerOpenDurationMs ?? 0, {
+            rows: selectedFiles.length,
+            bytes: selectedFiles.reduce((sum, file) => sum + file.size, 0),
+        });
         if (selectedFiles.length > MAX_MOBILE_SELECTION_SIZE && isConstrainedUploadDevice()) {
             console.warn('Rejected oversized mobile upload selection.', {
                 count: selectedFiles.length,
@@ -4558,6 +4531,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         stopUploadWarmup,
         uploading,
     ]);
+
+    useEffect(() => {
+        const input = uploadInputRef.current;
+        if (!input) return;
+        const onCancel = () => {
+            const openedAt = pickerOpenedAtRef.current;
+            pickerOpenedAtRef.current = null;
+            stopUploadWarmup();
+            perf.recordSpan('upload.picker.cancel', openedAt === null ? 0 : Date.now() - openedAt, { rows: 0 });
+            // A cancel can also mean native acquisition failed; do not label it as an upload error.
+            if (openedAt !== null && Date.now() - openedAt > PICKER_LIKELY_FAILED_THRESHOLD_MS) {
+                showToast('No files were received from the picker. If you selected files, try selecting them again.', { timeout: 8000 });
+            }
+        };
+        input.addEventListener('cancel', onCancel);
+        return () => input.removeEventListener('cancel', onCancel);
+    }, [stopUploadWarmup]);
 
     // Drain queued folder/batch selections (queuedUploadBatchesRef) once the
     // active session is fully clear -- i.e. it finished cleanly and isn't
