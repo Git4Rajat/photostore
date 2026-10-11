@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import io
 import os
+import copy
 import threading
 import time
+import zipfile
 from contextvars import ContextVar
 from typing import Dict, List, Optional, Tuple
 
@@ -54,7 +56,7 @@ ort = try_import('onnxruntime')
 try:
     import mediapipe as mp
     from mediapipe.tasks.python import BaseOptions
-    from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions
+    from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, FaceDetector, FaceDetectorOptions
 except Exception:  # pragma: no cover - only absent outside the ipworker image
     mp = None
 
@@ -117,6 +119,12 @@ FACE_EMBEDDING_RUNTIME = 'onnxruntime+mediapipe'
 _yolo_session: Optional[ort.InferenceSession] = None
 _adaface_session: Optional[ort.InferenceSession] = None
 _face_mesh = None
+_recovery_detector = None
+_FACE_RECOVERY_LOCK = threading.RLock()
+# Expanded negative testing found animal heads that pass both detectors and
+# landmark verification. Keep the recall experiment opt-in until an independent
+# human-face check has been validated; ordinary deployments retain the baseline.
+FACE_RECOVERY_ENABLED = os.getenv('IPWORKER_FACE_RECOVERY_ENABLED', '0').strip().lower() in ('1', 'true', 'yes')
 # MediaPipe's Tasks API is not documented thread-safe for concurrent
 # .detect() calls on one shared FaceLandmarker instance -- unlike ONNX
 # Runtime's Run(), this is a real correctness risk (crossed-up/corrupted
@@ -203,6 +211,53 @@ def _get_face_landmarker() -> 'FaceLandmarker':
     if diagnostics is not None:
         diagnostics['landmarkModelReady'] = True
     return _face_mesh
+
+
+def detect_recovery_faces(image_bgr: np.ndarray) -> List[dict]:
+    """Use the independent detector already in the FaceLandmarker task asset.
+
+    Only the empty/unusable-result path calls this. Scores are this detector's
+    actual scores, not inflated YOLO scores; normal storage quality gates still
+    apply. Serialize initialization and inference on the shared native instance.
+    """
+    global _recovery_detector
+    if mp is None or cv2 is None:
+        raise RuntimeError('mediapipe_or_opencv_unavailable')
+    with _FACE_RECOVERY_LOCK:
+        if _recovery_detector is None:
+            with zipfile.ZipFile(FACE_LANDMARKER_MODEL_PATH) as bundle:
+                model = bundle.read('face_detector.tflite')
+            _recovery_detector = FaceDetector.create_from_options(FaceDetectorOptions(
+                base_options=BaseOptions(model_asset_buffer=model),
+                min_detection_confidence=0.5, min_suppression_threshold=YOLO_IOU_THRESHOLD,
+            ))
+        rgb = np.ascontiguousarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+        result = _recovery_detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    height, width = image_bgr.shape[:2]
+    candidates = []
+    for detection in result.detections:
+        box = detection.bounding_box
+        score = float(detection.categories[0].score)
+        values = (box.origin_x, box.origin_y, box.width, box.height, score)
+        if not all(np.isfinite(value) for value in values) or not 0 <= score <= 1 or box.width <= 0 or box.height <= 0:
+            raise ValueError('recovery_detector_output_invalid')
+        left, top = max(0., float(box.origin_x)), max(0., float(box.origin_y))
+        right = min(float(width), float(box.origin_x + box.width))
+        bottom = min(float(height), float(box.origin_y + box.height))
+        if right <= left or bottom <= top:
+            raise ValueError('recovery_detector_box_outside_image')
+        if score >= 0.5:
+            candidates.append({'left': left, 'top': top, 'width': right-left,
+                               'height': bottom-top, 'score': score})
+    kept = _nms(candidates, YOLO_IOU_THRESHOLD)
+    diagnostics = _FACE_DIAGNOSTICS.get()
+    if diagnostics is not None:
+        diagnostics.update(detectorModelReady=True, scorePassedCount=len(candidates),
+                           validBoxCount=len(candidates), invalidBoxCount=0,
+                           nmsKeptCount=len(kept), nmsRemovedCount=len(candidates)-len(kept),
+                           detectorScoreThreshold=0.5,
+                           detectorMaxScore=max((c['score'] for c in candidates), default=0.))
+    return kept
 
 
 def _letterbox(image_bgr: np.ndarray, size: int) -> Tuple[np.ndarray, float, int, int]:
@@ -521,13 +576,17 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
     return image_bytes
 
 
-def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
-    diagnostics = {
+def _new_face_diagnostics():
+    return {
         'stageTimingsMs': dict.fromkeys(('decode', 'detect', 'landmarkWait', 'landmark', 'align', 'embed', 'total'), 0),
         'reasonCounts': {}, 'failureCount': 0, 'qualityRejectedCount': 0,
         'landmarkCount': 0, 'alignedCount': 0, 'embeddedCount': 0,
         'detectorModelReady': False, 'landmarkModelReady': False, 'embeddingModelReady': False,
     }
+
+
+def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
+    diagnostics = _new_face_diagnostics()
     token = _FACE_DIAGNOSTICS.set(diagnostics)
     started = time.perf_counter()
     try:
@@ -544,7 +603,7 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
         _FACE_DIAGNOSTICS.reset(token)
 
 
-def _process_face(user_id: str, filename: str, image_bytes: bytes) -> Dict:
+def _process_face(user_id: str, filename: str, image_bytes: bytes, *, recovery=False) -> Dict:
     diagnostics = _FACE_DIAGNOSTICS.get()
     decode_started = time.perf_counter()
     try:
@@ -583,7 +642,7 @@ def _process_face(user_id: str, filename: str, image_bytes: bytes) -> Dict:
     diagnostics.update(imageWidth=image_width, imageHeight=image_height)
 
     try:
-        detections = _timed('detect', detect_faces, image_bgr)
+        detections = _timed('detect', detect_recovery_faces if recovery else detect_faces, image_bgr)
         diagnostics['detectorModelReady'] = True
     except Exception as exc:
         return {
@@ -658,6 +717,7 @@ def _process_face(user_id: str, filename: str, image_bytes: bytes) -> Dict:
             'modelTaxonomyVersion': FACE_EMBEDDING_MODEL_TAXONOMY_VERSION,
             'runtime': FACE_EMBEDDING_RUNTIME,
             'modelAvailability': 'available',
+            **({'detectorSource': 'mediapipe-face-detector'} if recovery else {}),
         })
 
     # Top-level model/version fields (not just per-face) are required so
@@ -686,4 +746,41 @@ def _process_face(user_id: str, filename: str, image_bytes: bytes) -> Dict:
         result['faceFailureDetail'] = 'ipworker_candidates_not_fully_embedded'
     elif not detections:
         result['noDetectionReason'] = 'below_score_threshold'
+
+    if recovery or not FACE_RECOVERY_ENABLED:
+        return result
+
+    # Use the write path's actual quality gate, including deployment-specific
+    # settings, so a low-score large box doesn't suppress a useful retry. This
+    # does not bypass that gate or change the successful primary pipeline.
+    from storage_utils import _client_face_passes_quality_gate
+    has_usable_faces = any(_client_face_passes_quality_gate(face) for face in faces)
+    eligible = not detections or bool(faces) or 'landmark_detection_failed' in diagnostics['reasonCounts']
+    if not recovery and not has_usable_faces and eligible:
+        primary = copy.deepcopy(diagnostics)
+        diagnostics.clear()
+        diagnostics.update(_new_face_diagnostics())
+        recovered = _process_face(user_id, filename, image_bytes, recovery=True)
+        retry = copy.deepcopy(diagnostics)
+        usable = any(_client_face_passes_quality_gate(face) for face in recovered.get('faces', []))
+        if usable:
+            result = recovered
+        else:
+            diagnostics.clear()
+            diagnostics.update(primary)
+            if recovered.get('faceFailureStage') and not result.get('faceFailureStage'):
+                # An unavailable/broken fallback is not a verified empty pass.
+                result['faceFailureStage'] = recovered['faceFailureStage']
+                result['faceFailureDetail'] = 'ipworker_recovery_failed'
+                if recovered.get('error'):
+                    result['error'] = recovered['error']
+                result.pop('noDetectionReason', None)
+        for stage in diagnostics['stageTimingsMs']:
+            diagnostics['stageTimingsMs'][stage] = round(
+                primary['stageTimingsMs'].get(stage, 0) + retry['stageTimingsMs'].get(stage, 0), 3)
+        diagnostics.update(recoveryAttempted=True, recoverySucceeded=usable,
+                           recoveryDetectorReady=retry.get('detectorModelReady', False),
+                           primaryRawFaceCount=len(detections) + invalid_boxes,
+                           primaryFilteredFaceCount=filtered_count,
+                           primaryDetectorMaxScore=primary.get('detectorMaxScore', 0.))
     return result

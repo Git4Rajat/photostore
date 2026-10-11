@@ -20,6 +20,15 @@ cv2 = pytest.importorskip('cv2')
 pytest.importorskip('onnxruntime')
 
 import ipwork_face as face_mod  # noqa: E402
+_REAL_RECOVERY_DETECTOR = face_mod.detect_recovery_faces
+
+
+@pytest.fixture(autouse=True)
+def _no_native_recovery_model(monkeypatch):
+    # Most tests exercise primary failure shapes without installed task assets.
+    # Recovery-specific tests override this with independent detector outputs.
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: [])
+    monkeypatch.setattr(face_mod, 'FACE_RECOVERY_ENABLED', True)
 
 
 def test_solve_similarity_transform_recovers_known_scale_rotation_translation():
@@ -378,3 +387,139 @@ def test_mixed_invalid_box_and_valid_embedding_still_incomplete(monkeypatch, ima
     assert result['filteredFaceCount'] == 1
     assert result['faceFailureStage'] == 'quality_filter_rejected'
     assert result['faceDiagnostics']['reasonCounts'] == {'invalid_detection_boxes': 1}
+
+
+def test_detector_zero_recovers_verified_face(monkeypatch, candidate_pipeline, image_bytes):
+    monkeypatch.setattr(face_mod, 'detect_faces', lambda image: [])
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: [dict(candidate_pipeline)])
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['hasData'] is True
+    assert result['rawFaceCount'] == 1
+    assert result['filteredFaceCount'] == 0
+    assert 'faceFailureStage' not in result
+    assert 'noDetectionReason' not in result
+    assert result['faces'][0]['detectorSource'] == 'mediapipe-face-detector'
+    diagnostic = result['faceDiagnostics']
+    assert diagnostic['primaryRawFaceCount'] == 0
+    assert diagnostic['recoveryAttempted'] is diagnostic['recoverySucceeded'] is True
+    assert diagnostic['embeddedCount'] == 1
+
+
+def test_primary_success_never_invokes_recovery(monkeypatch, candidate_pipeline, image_bytes):
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: pytest.fail('normal face must not be changed'))
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['faces'][0]['bbox'] == {k: candidate_pipeline[k] for k in ('left', 'top', 'width', 'height')}
+    assert 'detectorSource' not in result['faces'][0]
+    assert 'recoveryAttempted' not in result['faceDiagnostics']
+
+
+def test_disabled_recovery_retains_original_empty_result(monkeypatch, image_bytes):
+    monkeypatch.setattr(face_mod, 'FACE_RECOVERY_ENABLED', False)
+    monkeypatch.setattr(face_mod, 'detect_faces', lambda image: [])
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: pytest.fail('experimental recovery must stay disabled'))
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['faces'] == []
+    assert result['noDetectionReason'] == 'below_score_threshold'
+    assert 'faceFailureStage' not in result
+    assert 'recoveryAttempted' not in result['faceDiagnostics']
+
+
+def test_partial_primary_faces_are_preserved_without_recovery(monkeypatch, candidate_pipeline, image_bytes):
+    monkeypatch.setattr(face_mod, 'detect_faces', lambda image: [dict(candidate_pipeline), dict(candidate_pipeline, left=40.)])
+    monkeypatch.setattr(face_mod, 'detect_five_landmarks', lambda image, box: np.ones((5, 2)) if box['left'] == 5 else None)
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: pytest.fail('must preserve usable primary embeddings'))
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert len(result['faces']) == 1
+    assert result['faceFailureStage'] == 'postprocessing_failed'
+
+
+def test_landmark_zero_can_recover_with_independent_box(monkeypatch, candidate_pipeline, image_bytes):
+    monkeypatch.setattr(face_mod, 'detect_five_landmarks', lambda image, box: None if box['left'] == 5 else np.ones((5, 2)))
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: [dict(candidate_pipeline, left=10.)])
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['faces'][0]['bbox']['left'] == 10
+    assert 'faceFailureStage' not in result
+    assert result['faceDiagnostics']['primaryFilteredFaceCount'] == 1
+    assert result['faceDiagnostics']['failureCount'] == 0
+
+
+def test_quality_rejected_primary_does_not_block_recovery(monkeypatch, candidate_pipeline, image_bytes):
+    import storage_utils
+    monkeypatch.setattr(storage_utils, 'FACE_LOW_CONFIDENCE_REJECT_BELOW', .36)
+    monkeypatch.setattr(face_mod, 'detect_faces', lambda image: [dict(candidate_pipeline, score=.354)])
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: [dict(candidate_pipeline, score=.8)])
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['faces'][0]['confidence'] == .8
+    assert result['faceDiagnostics']['recoverySucceeded'] is True
+    assert storage_utils._client_face_passes_quality_gate(result['faces'][0])
+
+
+def test_both_detectors_zero_remains_a_verified_empty_result(monkeypatch, image_bytes):
+    monkeypatch.setattr(face_mod, 'detect_faces', lambda image: [])
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['rawFaceCount'] == 0
+    assert 'faceFailureStage' not in result
+    assert result['faceDiagnostics']['recoveryAttempted'] is True
+    assert result['faceDiagnostics']['recoverySucceeded'] is False
+
+
+def test_unavailable_recovery_cannot_publish_a_false_empty(monkeypatch, image_bytes):
+    monkeypatch.setattr(face_mod, 'detect_faces', lambda image: [])
+    def unavailable(image):
+        raise RuntimeError('task asset unavailable')
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', unavailable)
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['faces'] == []
+    assert result['faceFailureStage'] == 'unsupported_runtime'
+    assert result['faceFailureDetail'] == 'ipworker_recovery_failed'
+    assert 'task asset unavailable' in result['error']
+    assert 'noDetectionReason' not in result
+
+
+def test_recovery_landmark_failure_cannot_be_accepted(monkeypatch, image_bytes):
+    monkeypatch.setattr(face_mod, 'detect_faces', lambda image: [])
+    monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: [{'left': 10., 'top': 10., 'width': 20., 'height': 20., 'score': .8}])
+    monkeypatch.setattr(face_mod, 'detect_five_landmarks', lambda *args: None)
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['faces'] == []
+    assert result['faceFailureStage'] == 'postprocessing_failed'
+    assert result['faceDiagnostics']['recoverySucceeded'] is False
+
+
+def _recovery_result(monkeypatch, boxes):
+    detections = [SimpleNamespace(
+        bounding_box=SimpleNamespace(origin_x=x, origin_y=y, width=w, height=h),
+        categories=[SimpleNamespace(score=score)]) for x, y, w, h, score in boxes]
+    monkeypatch.setattr(face_mod, '_recovery_detector', SimpleNamespace(
+        detect=lambda image: SimpleNamespace(detections=detections)))
+    monkeypatch.setattr(face_mod, 'mp', SimpleNamespace(
+        Image=lambda **kwargs: kwargs, ImageFormat=SimpleNamespace(SRGB='rgb')))
+
+
+def test_recovery_detector_clips_boxes_and_suppresses_duplicates(monkeypatch):
+    _recovery_result(monkeypatch, [(-5, -5, 30, 30, .8), (0, 0, 25, 25, .7), (40, 40, 10, 10, .49)])
+    diagnostics = face_mod._new_face_diagnostics()
+    token = face_mod._FACE_DIAGNOSTICS.set(diagnostics)
+    try:
+        boxes = _REAL_RECOVERY_DETECTOR(np.zeros((64, 64, 3), dtype=np.uint8))
+    finally:
+        face_mod._FACE_DIAGNOSTICS.reset(token)
+    assert boxes == [{'left': 0., 'top': 0., 'width': 25., 'height': 25., 'score': .8}]
+    assert diagnostics['nmsKeptCount'] == diagnostics['nmsRemovedCount'] == 1
+    assert diagnostics['detectorMaxScore'] == .8
+
+
+@pytest.mark.parametrize('box', [(0, 0, 20, 20, float('nan')), (0, 0, 20, 20, 1.1),
+                                 (0, 0, 0, 20, .8), (100, 100, 20, 20, .8)])
+def test_recovery_detector_rejects_invalid_native_outputs(monkeypatch, box):
+    _recovery_result(monkeypatch, [box])
+    with pytest.raises(ValueError, match='recovery_detector_'):
+        _REAL_RECOVERY_DETECTOR(np.zeros((64, 64, 3), dtype=np.uint8))
+
+
+def test_recovery_diagnostics_survive_storage_bounds():
+    from storage_utils import _bounded_face_diagnostics
+    fields = {'recoveryAttempted': True, 'recoverySucceeded': True,
+              'recoveryDetectorReady': True, 'primaryRawFaceCount': 0,
+              'primaryFilteredFaceCount': 0, 'primaryDetectorMaxScore': .31}
+    assert _bounded_face_diagnostics(fields) == fields

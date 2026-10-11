@@ -8392,17 +8392,19 @@ def _bounded_face_diagnostics(value):
     result = {}
     for key in ('anchorCount', 'scorePassedCount', 'validBoxCount', 'invalidBoxCount',
                 'nmsKeptCount', 'nmsRemovedCount', 'failureCount', 'qualityRejectedCount',
-                'landmarkCount', 'alignedCount', 'embeddedCount', 'imageWidth', 'imageHeight', 'detectorInputSize'):
+                'landmarkCount', 'alignedCount', 'embeddedCount', 'imageWidth', 'imageHeight', 'detectorInputSize',
+                'primaryRawFaceCount', 'primaryFilteredFaceCount'):
         if key in value:
             result[key] = _bounded_face_count(value[key])
-    for key in ('detectorMaxScore', 'detectorScoreThreshold'):
+    for key in ('detectorMaxScore', 'detectorScoreThreshold', 'primaryDetectorMaxScore'):
         try:
             score = float(value[key])
             if np.isfinite(score) and 0 <= score <= 1:
                 result[key] = round(score, 6)
         except (KeyError, TypeError, ValueError, OverflowError):
             pass
-    for key in ('detectorModelReady', 'landmarkModelReady', 'embeddingModelReady'):
+    for key in ('detectorModelReady', 'landmarkModelReady', 'embeddingModelReady',
+                'recoveryAttempted', 'recoverySucceeded', 'recoveryDetectorReady'):
         if isinstance(value.get(key), bool):
             result[key] = value[key]
     for key in ('detectorOutputShape', 'embeddingOutputShape'):
