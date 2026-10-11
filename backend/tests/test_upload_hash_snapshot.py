@@ -2,18 +2,23 @@
 import copy
 import gzip
 import hashlib
+import io
 import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import requests
 from azure.core.exceptions import ResourceNotFoundError
+from azure.core.pipeline.transport import RequestsTransport
 from azure.data.tables import TableTransactionError
+from azure.storage.blob import BlobClient
+from urllib3.response import HTTPResponse
 
 import app
 import index_files
 import storage_utils as su
 import upload_hash_snapshot as snapshots
-from tests.test_search_db_delta import _Svc
+from tests.test_search_db_delta import _Blob, _Svc
 from tests.test_upload_diagnostics import upload_env, file_data
 
 
@@ -63,9 +68,19 @@ class HashTable:
             raise
 
 
+class SnapshotBlob(_Blob):
+    def download_blob(self, **kwargs):
+        return super().download_blob()
+
+
+class SnapshotBlobs(_Svc):
+    def get_blob_client(self, container, blob):
+        return SnapshotBlob(self, f'{container}/{blob}')
+
+
 @pytest.fixture
 def world(monkeypatch, tmp_path):
-    table, blobs = HashTable(), _Svc()
+    table, blobs = HashTable(), SnapshotBlobs()
     monkeypatch.setitem(su._CTX, 'hash_index_table_client', table)
     monkeypatch.setitem(su._CTX, 'metadata_table_client', object())
     monkeypatch.setitem(su._CTX, 'blob_service_client', blobs)
@@ -155,8 +170,8 @@ def test_deletion_during_download_is_not_served(world, monkeypatch):
         blob = original(container, name)
         download = blob.download_blob
 
-        def interrupted():
-            result = download()
+        def interrupted(**kwargs):
+            result = download(**kwargs)
             snapshots.delete_hash(table, 'lib', 'a' * 64)
             return result
         blob.download_blob = interrupted
@@ -209,6 +224,46 @@ def test_ready_route_serves_gzip_without_query_or_build(world, monkeypatch):
     assert response.status_code == 200 and response.headers['Content-Encoding'] == 'gzip'
     assert json.loads(gzip.decompress(response.data)) == {'hashes': {'a' * 64: 'original.heic'}}
     assert table.scans == 1
+
+
+@pytest.mark.parametrize('cached_share', [False, True])
+def test_ready_route_preserves_gzip_through_real_blob_sdk(world, monkeypatch, cached_share):
+    _, blobs = world
+    manifest = snapshots.rebuild_snapshot('lib')
+    compressed = blobs.store['lexical-index/' + manifest['blobName']]
+    headers = {
+        'Content-Type': 'application/json', 'Content-Encoding': 'gzip',
+        'Content-Length': str(len(compressed)),
+        'Content-Range': f'bytes 0-{len(compressed) - 1}/{len(compressed)}',
+        'ETag': '"snapshot"', 'x-ms-blob-type': 'BlockBlob',
+    }
+    session = requests.Session()
+
+    def request(*args, **kwargs):
+        response = requests.Response()
+        response.status_code = 206
+        response.headers.update(headers)
+        response.raw = HTTPResponse(body=io.BytesIO(compressed), headers=headers,
+                                    status=206, preload_content=False)
+        return response
+
+    monkeypatch.setattr(session, 'request', request)
+    with BlobClient('https://storage.example', 'lexical-index', manifest['blobName'],
+                    transport=RequestsTransport(session=session)) as blob:
+        # Unlike the in-memory blob fake, the real SDK decodes gzip by default.
+        assert blob.download_blob().readall() == gzip.decompress(compressed)
+        reader = blob
+        if cached_share:
+            reader = su._ShareBackedBlob(blob, 'lexical-index', manifest['blobName'])
+            # A previous default download could also cache the decoded JSON.
+            monkeypatch.setattr(reader, '_cached_bytes', lambda: gzip.decompress(compressed))
+        monkeypatch.setattr(su, '_get_blob_client', lambda *args: reader)
+        monkeypatch.setattr(app, '_require_library_context', lambda: ('account', 'lib', None))
+        response = app.app.test_client().get('/upload/known-hashes')
+    assert response.status_code == 200
+    assert response.headers['Content-Encoding'] == 'gzip'
+    assert response.data == compressed
+    assert json.loads(gzip.decompress(response.data)) == {'hashes': {'a' * 64: 'original.heic'}}
 
 
 def test_old_snapshot_is_served_while_additions_refresh_in_background(world, monkeypatch):

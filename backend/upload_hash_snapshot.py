@@ -93,7 +93,8 @@ def read_snapshot(user_id):
         blob = su._get_blob_client(su._lexical_index_container_name(), blob_name)
         if blob is None:
             return None, {}, True
-        payload = blob.download_blob().readall()
+        # Preserve stored gzip bytes for HTTP Content-Encoding; the SDK otherwise decodes them.
+        payload = blob.download_blob(decompress=False).readall()
         # A deletion during the download must not turn into a known stale skip.
         if str(manifest.get('deleteEpoch') or '') != _epoch(table, user_id):
             return None, {}, True
