@@ -8452,6 +8452,12 @@ def _apply_client_processing_results(
     metadata_table_client = _CTX['metadata_table_client']
     payload = client_processing if isinstance(client_processing, dict) else {}
     report = _normalize_client_report(client_asset_id, client_processing_report)
+    if metadata.get('processingIsolated') is True:
+        import sys
+        from benchmark_upload import apply_isolated_derivatives
+        apply_isolated_derivatives(sys.modules[__name__], metadata, payload, report)
+        _update_metadata_fields(user_id, filename, {key: metadata[key] for key in ['preview_status', 'thumbnail_status', 'processing_metadata'] if key in metadata})
+        return
     status_updates: Dict[str, object] = {}
     # Captured before _apply_client_report_statuses below can overwrite
     # thumbnail_status from this call's report, so the fallback trigger further
@@ -8584,12 +8590,17 @@ def _apply_client_processing_results(
     preview_blob_name = f'preview/{thumbnail_blob_name}.jpg'
     preview_payload = payload.get('preview')
     preview_already_uploaded = False
+    if isinstance(preview_payload, dict) and preview_payload.get('alreadyUploaded') is True:
+        from benchmark_upload import verify_jpeg
+        import sys
+        verify_jpeg(sys.modules[__name__], preview_blob_name, byte_cap=1_500_000, edge_cap=2048)
+        preview_already_uploaded = True
     if preview_payload is not None and had_preview_before:
         pass
     elif preview_payload is not None:
         preview_provenance = _client_source_provenance(preview_payload)
         preview_data = str(preview_payload.get('data') or '').strip()
-        if preview_data:
+        if preview_data and not preview_already_uploaded:
             try:
                 preview_bytes = base64.b64decode(preview_data)
                 if preview_bytes:
@@ -9328,6 +9339,8 @@ def finalize_uploaded_file(
             pass
 
     metadata = timed_call('metadata_read', get_or_create_metadata, user_id, final_filename)
+    from benchmark_upload import isolated
+    benchmark_isolated = isolated(metadata)
     # The metadata row is usually pre-created at /upload/init (which records
     # upload_started_at but no uploadDate), so get_or_create_metadata returns it
     # without an uploadDate. Persist one here so the gallery has a stable
@@ -9368,13 +9381,16 @@ def finalize_uploaded_file(
     video_status_overrides = {'preview': 'skipped', 'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
     status_overrides = video_status_overrides if file_is_video else {}
     for step in PROCESSING_STEPS:
-        metadata[f'{step}_status'] = status_overrides.get(step, 'pending')
+        metadata[f'{step}_status'] = 'skipped' if benchmark_isolated else status_overrides.get(step, 'pending')
     metadata['processing_metadata'] = json.dumps({})
     metadata['processing_state'] = 'active'
     metadata['processing_lease'] = ''
     metadata['processing_lease_expires_at'] = ''
     metadata['processing_lease_owner'] = ''
     metadata['retry_count'] = 0
+    if benchmark_isolated:
+        metadata['processing_complete'] = True
+        metadata['processing_metadata'] = json.dumps({'isolation': {'reason': 'upload_only_benchmark', 'runId': metadata.get('benchmarkRunId')}})
     metadata['last_processing_update'] = datetime.now(timezone.utc).isoformat()
 
     with upload_phase('persistence'):
@@ -9393,7 +9409,8 @@ def finalize_uploaded_file(
     timed_call('persistence', touch_user_search_indexes_state, user_id, filenames=final_filename)
     # Keep the O(1) dedup/collision indexes current for the next upload -- see
     # detect_duplicates() and _resolve_filename_for_upload().
-    timed_call('persistence', _store_hash_index, user_id, file_hash, final_filename)
+    if not benchmark_isolated:
+        timed_call('persistence', _store_hash_index, user_id, file_hash, final_filename)
     timed_call('persistence', _store_filename_owner, user_id, final_filename, file_hash)
 
     # Server-side thumbnail / metadata extraction, eagerly, here -- video only.
@@ -9668,6 +9685,8 @@ def claim_processing_lease(
             raise PhotoNotFoundError('Photo not found.')
         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
             raise PhotoNotFoundError('Photo has been deleted.')
+        if entity.get('processingIsolated') is True:
+            raise PhotoNotFoundError('Photo is isolated for an upload-only benchmark.')
 
         lease_expired = _processing_is_expired(entity)
         current_owner = str(entity.get('processing_lease_owner') or '').strip()

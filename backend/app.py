@@ -3843,6 +3843,9 @@ def _enqueue_processing_steps(
             results[step] = {'status': 'error', 'reason': 'not found'}
         return results
 
+    if entity.get('processingIsolated') is True:
+        return {step: {'status': 'skipped', 'reason': 'upload_only_benchmark'} for step in steps}
+
     visibility_timeout = max(0, min(int(visibility_timeout or 0), 7 * 24 * 60 * 60))
     for step in steps:
         status_field = f'{step}_status'
@@ -10391,6 +10394,10 @@ def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
 
 
 def _enqueue_preview_generation_job(user_id: str, filename: str) -> Dict[str, str]:
+    if filename.startswith('rawbench-'):
+        entity = _get_metadata_entity(user_id, filename)
+        if not entity or entity.get('processingIsolated') is True:
+            return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
     existing_job_id = _active_preview_job_for_file(user_id, filename)
     if existing_job_id:
         return {'status': 'already_queued', 'jobId': existing_job_id}
@@ -11307,6 +11314,10 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
     to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
     silently redo more than was asked.
     """
+    if filename.startswith('rawbench-'):
+        entity = _get_metadata_entity(user_id, filename)
+        if not entity or entity.get('processingIsolated') is True:
+            return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
     if PROCESSING_MODE == 'browser':
         return {'status': 'skipped', 'reason': 'browser_only_processing'}
     requested_steps = [s for s in (steps if steps is not None else IPWORK_STEPS) if s in IPWORK_STEPS]
@@ -11451,6 +11462,8 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
     """
     if not _people_features_available() or not isinstance(metadata, dict):
         return None
+    if metadata.get('processingIsolated') is True:
+        return None
     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
         return None
     if str(metadata.get('face_status') or '').strip().lower() != 'done':
@@ -11536,6 +11549,7 @@ BROWSER_PROCESSING_STATUS_FIELDS = (
 BROWSER_PROCESSING_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout'}
 BROWSER_PROCESSING_PENDING_SELECT = [
     'RowKey',
+    'processingIsolated',
     'rotation',
     'processing_state',
     'processing_lease_owner',
@@ -11666,6 +11680,8 @@ def _browser_processing_face_version_stale(entity: Dict) -> bool:
 
 def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
     filename = str(entity.get('RowKey') or '').strip()
+    if entity.get('processingIsolated') is True:
+        return None
     if not filename:
         return None
     if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
@@ -11786,7 +11802,7 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
     -- otherwise every sweep interval would pile a fresh duplicate message
     onto a perfectly healthy backlog.
     """
-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+    if entity.get('processingIsolated') is True or str(entity.get('processing_state') or '').strip().lower() == 'deleted':
         return []
     lease_expired = _browser_processing_lease_expired(entity)
     face_version_stale = _browser_processing_face_version_stale(entity)
@@ -13983,6 +13999,7 @@ def _prepare_incremental_assignment(payload, user_id) -> List[Tuple[str, List[st
             continue
         metadata = _get_metadata_entity(user_id, filename)
         if (not isinstance(metadata, dict)
+                or metadata.get('processingIsolated') is True
                 or str(metadata.get('processing_state') or '').strip().lower() == 'deleted'
                 or str(metadata.get('face_status') or '').strip().lower() != 'done'):
             continue

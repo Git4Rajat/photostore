@@ -1,0 +1,5 @@
+@colorhythm/libraw-wasm 1.1.1 (MIT bindings; LibRaw dual LGPL/CDDL)
+Package source revision: 9b0f59a5e0f6d3d12a8f6fa594015ef4f30a6e95
+https://github.com/colorhythm/libraw-wasm/tree/9b0f59a5e0f6d3d12a8f6fa594015ef4f30a6e95
+Corresponding LibRaw source and build scripts are in that source tree.
+Package integrity: sha512-OxqXLhDurX/sM4KL/rR71zjuH0VHBUWCOJ71tLiIxy3ATbIS2KM/8RixT0Gc3RygcsS1T8SXnzdipPqWYSjt9A==

@@ -1,0 +1,14 @@
+FROM mirror.gcr.io/library/node:22-alpine AS build
+WORKDIR /src
+COPY frontend/package*.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+COPY frontend/benchmark.html frontend/vite.benchmark.config.mjs ./
+COPY frontend/src/benchmark ./src/benchmark
+COPY frontend/src/config/appConfig.ts ./src/config/appConfig.ts
+COPY frontend/src/services/passwordAuthClient.ts ./src/services/passwordAuthClient.ts
+RUN npx vite build --config vite.benchmark.config.mjs
+RUN mkdir -p benchmark-build/benchmark-licenses && cp node_modules/@colorhythm/libraw-wasm/LibRaw/* benchmark-build/benchmark-licenses/
+COPY deploy/benchmark/decoder-source.txt ./benchmark-build/benchmark-licenses/decoder-source.txt
+
+FROM ghcr.io/git4rajat/photostore-frontend@sha256:d2b16c9753c7cc46d6ba7fc8175e5de07a4f4f082f8bdee7a4eed2dca9b4e4d4
+COPY --from=build /src/benchmark-build /usr/share/nginx/html

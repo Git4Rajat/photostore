@@ -10,9 +10,65 @@ from flask import Blueprint
 from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_finalized, upload_results, upload_teardown
 
 import app
+from benchmark_upload import authorize_entry, validate_finalization, isolated
 
 upload_bp = Blueprint('upload', __name__)
 upload_bp.teardown_request(upload_teardown)
+
+
+@upload_bp.route('/upload/benchmark/config', methods=['GET'])
+def benchmark_config():
+    import os
+    account_id, library_id, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    payload, error = app._resolve_session_payload(True)
+    allowed = os.getenv('BENCHMARK_UPLOAD_EMAIL', '').strip().lower()
+    if error or not allowed or str((payload or {}).get('email') or '').lower() != allowed:
+        return app.jsonify({'error': 'Benchmark is disabled for this account'}), 403
+    return app.jsonify({'enabled': True, 'processingIsolation': 'persistent', 'directPreview': True,
+                        'accountId': account_id, 'libraryId': library_id, 'storageAccount': app.account_name})
+
+
+@upload_bp.route('/upload/benchmark/verify', methods=['POST'])
+def benchmark_verify():
+    import storage_utils
+    from benchmark_upload import verify_jpeg
+    _, user_id, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    files = (app.request.get_json(silent=True) or {}).get('files')
+    if not isinstance(files, list) or not 0 < len(files) <= app.MAX_INIT_BATCH_FILES:
+        return app.jsonify({'error': 'Expected 1-20 benchmark files'}), 400
+    results = []
+    for index, entry in enumerate(files):
+        try:
+            filename = app._validate_media_filename(entry.get('filename', ''))
+            if not filename or not authorize_entry(app, entry, filename):
+                raise ValueError('Expected benchmark filename')
+            validate_finalization(app, user_id, entry, filename)
+            row = app.metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+            physical = row['anonymousImageId']
+            props = storage_utils.get_media_properties('image', physical)
+            if int(props['size']) != int(entry['totalSize']):
+                raise ValueError('Original byte size does not match')
+            expected = entry.get('expectedDerivatives') or {}
+            assets = {'originalBytes': int(props['size'])}
+            for kind, name, edge, cap in [('preview', f'preview/{physical}.jpg', 2048, 1_500_000),
+                                         ('thumbnail', physical, 120, 512_000)]:
+                if expected.get(kind):
+                    size = verify_jpeg(storage_utils, name, byte_cap=cap, edge_cap=edge)
+                    if size != int(expected[kind]) or row.get(f'{kind}_status') != 'done':
+                        raise ValueError(f'{kind} finalization did not match the uploaded JPEG')
+                    assets[f'{kind}Bytes'] = size
+            excluded = all(row.get(f'{step}_status') == 'skipped' for step in ['exif', 'ocr', 'face', 'ai_vision', 'map_detection', 'verify'])
+            if not isolated(row) or not excluded or app._ipwork_sweep_eligible_steps(row):
+                raise ValueError('Processing isolation verification failed')
+            results.append({'index': index, 'filename': filename, 'verified': True, 'processingIsolated': True, **assets})
+        except Exception as exc:
+            app.app.logger.warning('Benchmark verification failed for item %s: %s', index, type(exc).__name__)
+            results.append({'index': index, 'verified': False, 'error': 'Asset or isolation verification failed'})
+    return app.jsonify({'results': results})
 
 @upload_bp.route('/health', methods=['GET'])
 def health_check():
@@ -51,6 +107,11 @@ def init_upload():
         return app.jsonify({'error': 'Invalid totalSize'}), 400
     if total_size > app.MAX_UPLOAD_FILE_BYTES:
         return app.jsonify({'error': 'File exceeds upload limit'}), 413
+
+    try:
+        benchmark_fields = authorize_entry(app, data, filename)
+    except (ValueError, PermissionError) as exc:
+        return app.jsonify({'error': str(exc)}), 403
 
     upload_id = app.secure_filename(str(data.get('uploadId') or '')) or str(app.uuid.uuid4())
     direct = bool(data.get('directToBlob'))
@@ -91,6 +152,8 @@ def init_upload():
 
     blob_url = None
     expires_at = None
+    if benchmark_fields:
+        app._update_metadata_entity_fields(user_id, filename, benchmark_fields)
     if direct:
         try:
             # Use anonymous_blob_name for the SAS URL if available
@@ -106,11 +169,16 @@ def init_upload():
         thumbnail_blob_url, thumbnail_sas_expires_at = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, anonymous_blob_name or filename)
     except Exception:
         pass
+    preview_blob_url = None
+    if data.get('includePreview') and direct:
+        preview_blob_url, _ = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, f'preview/{anonymous_blob_name or filename}.jpg')
     return app.jsonify({
         'uploadId': upload_id,
         'uploadUrl': f'/upload/{upload_id}?filename={filename}',
         'blobUrl': blob_url,
         'thumbnailBlobUrl': thumbnail_blob_url,
+        'previewBlobUrl': preview_blob_url,
+        'processingIsolated': bool(benchmark_fields),
         'blobName': anonymous_blob_name or filename,
         'originalFilename': filename,
         'sasExpiresAt': expires_at,
@@ -170,12 +238,19 @@ def init_upload_batch():
         if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
             parsed.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
             continue
+        try:
+            benchmark_fields = authorize_entry(app, item, filename)
+        except (ValueError, PermissionError) as exc:
+            parsed.append({'index': idx, 'filename': filename, 'error': str(exc)})
+            continue
         parsed.append({
             'index': idx,
             'filename': filename,
             'total_size': total_size,
             'expected_hash': expected_hash,
             'upload_id': str(app.uuid.uuid4()),
+            'benchmark_fields': benchmark_fields,
+            'include_preview': bool(item.get('includePreview')),
         })
 
     valid = [p for p in parsed if 'error' not in p]
@@ -204,6 +279,8 @@ def init_upload_batch():
             continue
         filename = p['filename']
         anonymous_blob_name = anonymous_blob_names.get(filename)
+        if p['benchmark_fields']:
+            app._update_metadata_entity_fields(user_id, filename, p['benchmark_fields'])
         try:
             blob_url, expires_at = timed_call('sas_creation', app._create_direct_upload_blob_url, anonymous_blob_name or filename)
         except Exception as exc:
@@ -216,6 +293,9 @@ def init_upload_batch():
             thumbnail_blob_url, thumbnail_sas_expires_at = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, anonymous_blob_name or filename)
         except Exception:
             pass
+        preview_blob_url = None
+        if p['include_preview']:
+            preview_blob_url, _ = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, f'preview/{anonymous_blob_name or filename}.jpg')
         results.append({
             'index': p['index'],
             'filename': filename,
@@ -223,6 +303,8 @@ def init_upload_batch():
             'uploadUrl': f"/upload/{p['upload_id']}?filename={filename}",
             'blobUrl': blob_url,
             'thumbnailBlobUrl': thumbnail_blob_url,
+            'previewBlobUrl': preview_blob_url,
+            'processingIsolated': bool(p['benchmark_fields']),
             'blobName': anonymous_blob_name or filename,
             'originalFilename': filename,
             'sasExpiresAt': expires_at,
@@ -300,6 +382,11 @@ def finalize_direct_upload():
         return app.jsonify({'error': 'Invalid filename'}), 400
     if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
         return app.jsonify({'error': 'Invalid totalSize'}), 400
+
+    try:
+        validate_finalization(app, user_id, data, filename)
+    except (ValueError, PermissionError) as exc:
+        return app.jsonify({'error': str(exc)}), 403
 
     # Prefer the blob name the browser itself got back from /upload/init and
     # actually staged its blocks against, over re-deriving it from the shared
@@ -407,6 +494,7 @@ def finalize_direct_upload():
         'complete': True,
         'duplicates': duplicates,
         'clientProcessingLateResultWaitSeconds': 0,
+        'processingIsolated': isolated(metadata),
     })
 
 @upload_bp.route('/upload/finalize-batch', methods=['POST'])
@@ -473,6 +561,12 @@ def finalize_upload_batch():
             continue
         if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
             results.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
+            continue
+
+        try:
+            validate_finalization(app, user_id, item, filename)
+        except (ValueError, PermissionError) as exc:
+            results.append({'index': idx, 'filename': filename, 'error': str(exc)})
             continue
 
         # See the matching comment in finalize_direct_upload above -- same
@@ -569,6 +663,7 @@ def finalize_upload_batch():
             'complete': True,
             'duplicates': duplicates,
             'clientProcessingLateResultWaitSeconds': 0,
+            'processingIsolated': isolated(metadata),
         })
         upload_finalized(total_size)
 
