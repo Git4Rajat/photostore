@@ -1,0 +1,412 @@
+--- a/app.py
++++ b/app.py
+@@ -3843,6 +3843,9 @@
+             results[step] = {'status': 'error', 'reason': 'not found'}
+         return results
+ 
++    if entity.get('processingIsolated') is True:
++        return {step: {'status': 'skipped', 'reason': 'upload_only_benchmark'} for step in steps}
++
+     visibility_timeout = max(0, min(int(visibility_timeout or 0), 7 * 24 * 60 * 60))
+     for step in steps:
+         status_field = f'{step}_status'
+@@ -10391,6 +10394,10 @@
+ 
+ 
+ def _enqueue_preview_generation_job(user_id: str, filename: str) -> Dict[str, str]:
++    if filename.startswith('rawbench-'):
++        entity = _get_metadata_entity(user_id, filename)
++        if not entity or entity.get('processingIsolated') is True:
++            return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
+     existing_job_id = _active_preview_job_for_file(user_id, filename)
+     if existing_job_id:
+         return {'status': 'already_queued', 'jobId': existing_job_id}
+@@ -11307,6 +11314,10 @@
+     to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
+     silently redo more than was asked.
+     """
++    if filename.startswith('rawbench-'):
++        entity = _get_metadata_entity(user_id, filename)
++        if not entity or entity.get('processingIsolated') is True:
++            return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
+     if PROCESSING_MODE == 'browser':
+         return {'status': 'skipped', 'reason': 'browser_only_processing'}
+     requested_steps = [s for s in (steps if steps is not None else IPWORK_STEPS) if s in IPWORK_STEPS]
+@@ -11451,6 +11462,8 @@
+     """
+     if not _people_features_available() or not isinstance(metadata, dict):
+         return None
++    if metadata.get('processingIsolated') is True:
++        return None
+     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
+         return None
+     if str(metadata.get('face_status') or '').strip().lower() != 'done':
+@@ -11536,6 +11549,7 @@
+ BROWSER_PROCESSING_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout'}
+ BROWSER_PROCESSING_PENDING_SELECT = [
+     'RowKey',
++    'processingIsolated',
+     'rotation',
+     'processing_state',
+     'processing_lease_owner',
+@@ -11666,6 +11680,8 @@
+ 
+ def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
+     filename = str(entity.get('RowKey') or '').strip()
++    if entity.get('processingIsolated') is True:
++        return None
+     if not filename:
+         return None
+     if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+@@ -11786,7 +11802,7 @@
+     -- otherwise every sweep interval would pile a fresh duplicate message
+     onto a perfectly healthy backlog.
+     """
+-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
++    if entity.get('processingIsolated') is True or str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+         return []
+     lease_expired = _browser_processing_lease_expired(entity)
+     face_version_stale = _browser_processing_face_version_stale(entity)
+@@ -13983,6 +13999,7 @@
+             continue
+         metadata = _get_metadata_entity(user_id, filename)
+         if (not isinstance(metadata, dict)
++                or metadata.get('processingIsolated') is True
+                 or str(metadata.get('processing_state') or '').strip().lower() == 'deleted'
+                 or str(metadata.get('face_status') or '').strip().lower() != 'done'):
+             continue
+--- a/storage_utils.py
++++ b/storage_utils.py
+@@ -8452,6 +8452,12 @@
+     metadata_table_client = _CTX['metadata_table_client']
+     payload = client_processing if isinstance(client_processing, dict) else {}
+     report = _normalize_client_report(client_asset_id, client_processing_report)
++    if metadata.get('processingIsolated') is True:
++        import sys
++        from benchmark_upload import apply_isolated_derivatives
++        apply_isolated_derivatives(sys.modules[__name__], metadata, payload, report)
++        _update_metadata_fields(user_id, filename, {key: metadata[key] for key in ['preview_status', 'thumbnail_status', 'processing_metadata'] if key in metadata})
++        return
+     status_updates: Dict[str, object] = {}
+     # Captured before _apply_client_report_statuses below can overwrite
+     # thumbnail_status from this call's report, so the fallback trigger further
+@@ -8584,12 +8590,17 @@
+     preview_blob_name = f'preview/{thumbnail_blob_name}.jpg'
+     preview_payload = payload.get('preview')
+     preview_already_uploaded = False
++    if isinstance(preview_payload, dict) and preview_payload.get('alreadyUploaded') is True:
++        from benchmark_upload import verify_jpeg
++        import sys
++        verify_jpeg(sys.modules[__name__], preview_blob_name, byte_cap=1_500_000, edge_cap=2048)
++        preview_already_uploaded = True
+     if preview_payload is not None and had_preview_before:
+         pass
+     elif preview_payload is not None:
+         preview_provenance = _client_source_provenance(preview_payload)
+         preview_data = str(preview_payload.get('data') or '').strip()
+-        if preview_data:
++        if preview_data and not preview_already_uploaded:
+             try:
+                 preview_bytes = base64.b64decode(preview_data)
+                 if preview_bytes:
+@@ -9328,6 +9339,8 @@
+             pass
+ 
+     metadata = timed_call('metadata_read', get_or_create_metadata, user_id, final_filename)
++    from benchmark_upload import isolated
++    benchmark_isolated = isolated(metadata)
+     # The metadata row is usually pre-created at /upload/init (which records
+     # upload_started_at but no uploadDate), so get_or_create_metadata returns it
+     # without an uploadDate. Persist one here so the gallery has a stable
+@@ -9368,13 +9381,16 @@
+     video_status_overrides = {'preview': 'skipped', 'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
+     status_overrides = video_status_overrides if file_is_video else {}
+     for step in PROCESSING_STEPS:
+-        metadata[f'{step}_status'] = status_overrides.get(step, 'pending')
++        metadata[f'{step}_status'] = 'skipped' if benchmark_isolated else status_overrides.get(step, 'pending')
+     metadata['processing_metadata'] = json.dumps({})
+     metadata['processing_state'] = 'active'
+     metadata['processing_lease'] = ''
+     metadata['processing_lease_expires_at'] = ''
+     metadata['processing_lease_owner'] = ''
+     metadata['retry_count'] = 0
++    if benchmark_isolated:
++        metadata['processing_complete'] = True
++        metadata['processing_metadata'] = json.dumps({'isolation': {'reason': 'upload_only_benchmark', 'runId': metadata.get('benchmarkRunId')}})
+     metadata['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+ 
+     with upload_phase('persistence'):
+@@ -9393,7 +9409,8 @@
+     timed_call('persistence', touch_user_search_indexes_state, user_id, filenames=final_filename)
+     # Keep the O(1) dedup/collision indexes current for the next upload -- see
+     # detect_duplicates() and _resolve_filename_for_upload().
+-    timed_call('persistence', _store_hash_index, user_id, file_hash, final_filename)
++    if not benchmark_isolated:
++        timed_call('persistence', _store_hash_index, user_id, file_hash, final_filename)
+     timed_call('persistence', _store_filename_owner, user_id, final_filename, file_hash)
+ 
+     # Server-side thumbnail / metadata extraction, eagerly, here -- video only.
+@@ -9668,6 +9685,8 @@
+             raise PhotoNotFoundError('Photo not found.')
+         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+             raise PhotoNotFoundError('Photo has been deleted.')
++        if entity.get('processingIsolated') is True:
++            raise PhotoNotFoundError('Photo is isolated for an upload-only benchmark.')
+ 
+         lease_expired = _processing_is_expired(entity)
+         current_owner = str(entity.get('processing_lease_owner') or '').strip()
+@@ -10205,6 +10224,7 @@
+     filename: str,
+     total_size: int,
+     expected_hash: Optional[str] = None,
++    initial_metadata: Optional[Dict] = None,
+ ) -> Optional[str]:
+     """Fresh-upload version of /upload/init's per-file bookkeeping: does the
+     combined work of reset_received_ranges() + reserve_pending_anonymous_blob()
+@@ -10241,10 +10261,13 @@
+ 
+     anonymous_blob_name = existing if reuse else _generate_anonymous_id()
+     entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
++    entity.update(initial_metadata or {})
+ 
+     try:
+         metadata_table_client.upsert_entity(entity)
+     except Exception:
++        if initial_metadata:
++            raise
+         return anonymous_blob_name
+     return anonymous_blob_name
+ 
+@@ -10308,6 +10331,7 @@
+ 
+         anonymous_blob_name = existing_blob if reuse else _generate_anonymous_id()
+         entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
++        entity.update(f.get('initial_metadata') or {})
+         anonymous_blob_names[filename] = anonymous_blob_name
+         operations.append(('upsert', entity))
+ 
+@@ -10322,5 +10346,7 @@
+             try:
+                 metadata_table_client.upsert_entity(entity)
+             except Exception:
++                if entity.get('processingIsolated') is True:
++                    raise
+                 pass
+     return anonymous_blob_names
+--- a/routes/upload.py
++++ b/routes/upload.py
+@@ -10,9 +10,65 @@
+ from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_finalized, upload_results, upload_teardown
+ 
+ import app
++from benchmark_upload import authorize_entry, validate_finalization, isolated
+ 
+ upload_bp = Blueprint('upload', __name__)
+ upload_bp.teardown_request(upload_teardown)
++
++
++@upload_bp.route('/upload/benchmark/config', methods=['GET'])
++def benchmark_config():
++    import os
++    account_id, library_id, error = app._require_library_context(require_auth=True)
++    if error:
++        return error
++    payload, error = app._resolve_session_payload(True)
++    allowed = os.getenv('BENCHMARK_UPLOAD_EMAIL', '').strip().lower()
++    if error or not allowed or str((payload or {}).get('email') or '').lower() != allowed:
++        return app.jsonify({'error': 'Benchmark is disabled for this account'}), 403
++    return app.jsonify({'enabled': True, 'processingIsolation': 'persistent', 'directPreview': True,
++                        'accountId': account_id, 'libraryId': library_id, 'storageAccount': app.account_name})
++
++
++@upload_bp.route('/upload/benchmark/verify', methods=['POST'])
++def benchmark_verify():
++    import storage_utils
++    from benchmark_upload import verify_jpeg
++    _, user_id, error = app._require_library_context(require_auth=True)
++    if error:
++        return error
++    files = (app.request.get_json(silent=True) or {}).get('files')
++    if not isinstance(files, list) or not 0 < len(files) <= app.MAX_INIT_BATCH_FILES:
++        return app.jsonify({'error': 'Expected 1-20 benchmark files'}), 400
++    results = []
++    for index, entry in enumerate(files):
++        try:
++            filename = app._validate_media_filename(entry.get('filename', ''))
++            if not filename or not authorize_entry(app, entry, filename):
++                raise ValueError('Expected benchmark filename')
++            validate_finalization(app, user_id, entry, filename)
++            row = app.metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
++            physical = row['anonymousImageId']
++            props = storage_utils.get_media_properties('image', physical)
++            if int(props['size']) != int(entry['totalSize']):
++                raise ValueError('Original byte size does not match')
++            expected = entry.get('expectedDerivatives') or {}
++            assets = {'originalBytes': int(props['size'])}
++            for kind, name, edge, cap in [('preview', f'preview/{physical}.jpg', 2048, 1_500_000),
++                                         ('thumbnail', physical, 120, 512_000)]:
++                if expected.get(kind):
++                    size = verify_jpeg(storage_utils, name, byte_cap=cap, edge_cap=edge)
++                    if size != int(expected[kind]) or row.get(f'{kind}_status') != 'done':
++                        raise ValueError(f'{kind} finalization did not match the uploaded JPEG')
++                    assets[f'{kind}Bytes'] = size
++            excluded = all(row.get(f'{step}_status') == 'skipped' for step in ['exif', 'ocr', 'face', 'ai_vision', 'map_detection', 'verify'])
++            if not isolated(row) or not excluded or app._ipwork_sweep_eligible_steps(row):
++                raise ValueError('Processing isolation verification failed')
++            results.append({'index': index, 'filename': filename, 'verified': True, 'processingIsolated': True, **assets})
++        except Exception as exc:
++            app.app.logger.warning('Benchmark verification failed for item %s: %s', index, type(exc).__name__)
++            results.append({'index': index, 'verified': False, 'error': 'Asset or isolation verification failed'})
++    return app.jsonify({'results': results})
+ 
+ @upload_bp.route('/health', methods=['GET'])
+ def health_check():
+@@ -52,9 +108,16 @@
+     if total_size > app.MAX_UPLOAD_FILE_BYTES:
+         return app.jsonify({'error': 'File exceeds upload limit'}), 413
+ 
++    try:
++        benchmark_fields = authorize_entry(app, data, filename)
++    except (ValueError, PermissionError) as exc:
++        return app.jsonify({'error': str(exc)}), 403
++
+     upload_id = app.secure_filename(str(data.get('uploadId') or '')) or str(app.uuid.uuid4())
+     direct = bool(data.get('directToBlob'))
+     is_fresh_upload = not data.get('uploadId')
++    if benchmark_fields and (not direct or not is_fresh_upload):
++        return app.jsonify({'error': 'Benchmark requires a fresh direct upload'}), 400
+     if is_fresh_upload:
+         try:
+             timed_call('cleanup', app._cleanup_failed_upload, user_id, filename)
+@@ -74,6 +137,7 @@
+         try:
+             anonymous_blob_name = timed_call('tracking', app.reset_upload_tracking_and_reserve_blob,
+                 user_id, filename, total_size, expected_hash or None,
++                initial_metadata=benchmark_fields or None,
+             )
+         except Exception:
+             app.app.logger.debug('Failed to reset tracking / reserve anonymous blob name for %s', filename)
+@@ -91,6 +155,8 @@
+ 
+     blob_url = None
+     expires_at = None
++    if benchmark_fields and not anonymous_blob_name:
++        return app.jsonify({'error': 'Isolated upload reservation failed'}), 503
+     if direct:
+         try:
+             # Use anonymous_blob_name for the SAS URL if available
+@@ -106,11 +172,16 @@
+         thumbnail_blob_url, thumbnail_sas_expires_at = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, anonymous_blob_name or filename)
+     except Exception:
+         pass
++    preview_blob_url = None
++    if data.get('includePreview') and direct:
++        preview_blob_url, _ = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, f'preview/{anonymous_blob_name or filename}.jpg')
+     return app.jsonify({
+         'uploadId': upload_id,
+         'uploadUrl': f'/upload/{upload_id}?filename={filename}',
+         'blobUrl': blob_url,
+         'thumbnailBlobUrl': thumbnail_blob_url,
++        'previewBlobUrl': preview_blob_url,
++        'processingIsolated': bool(benchmark_fields),
+         'blobName': anonymous_blob_name or filename,
+         'originalFilename': filename,
+         'sasExpiresAt': expires_at,
+@@ -170,12 +241,19 @@
+         if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
+             parsed.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
+             continue
++        try:
++            benchmark_fields = authorize_entry(app, item, filename)
++        except (ValueError, PermissionError) as exc:
++            parsed.append({'index': idx, 'filename': filename, 'error': str(exc)})
++            continue
+         parsed.append({
+             'index': idx,
+             'filename': filename,
+             'total_size': total_size,
+             'expected_hash': expected_hash,
+             'upload_id': str(app.uuid.uuid4()),
++            'benchmark_fields': benchmark_fields,
++            'include_preview': bool(item.get('includePreview')),
+         })
+ 
+     valid = [p for p in parsed if 'error' not in p]
+@@ -190,6 +268,7 @@
+                         'total_size': p['total_size'],
+                         'expected_hash': p['expected_hash'] or None,
+                         'is_fresh': True,
++                        'initial_metadata': p['benchmark_fields'],
+                     }
+                     for p in valid
+                 ],
+@@ -204,6 +283,9 @@
+             continue
+         filename = p['filename']
+         anonymous_blob_name = anonymous_blob_names.get(filename)
++        if p['benchmark_fields'] and not anonymous_blob_name:
++            results.append({'index': p['index'], 'filename': filename, 'error': 'Isolated upload reservation failed'})
++            continue
+         try:
+             blob_url, expires_at = timed_call('sas_creation', app._create_direct_upload_blob_url, anonymous_blob_name or filename)
+         except Exception as exc:
+@@ -216,6 +298,9 @@
+             thumbnail_blob_url, thumbnail_sas_expires_at = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, anonymous_blob_name or filename)
+         except Exception:
+             pass
++        preview_blob_url = None
++        if p['include_preview']:
++            preview_blob_url, _ = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, f'preview/{anonymous_blob_name or filename}.jpg')
+         results.append({
+             'index': p['index'],
+             'filename': filename,
+@@ -223,6 +308,8 @@
+             'uploadUrl': f"/upload/{p['upload_id']}?filename={filename}",
+             'blobUrl': blob_url,
+             'thumbnailBlobUrl': thumbnail_blob_url,
++            'previewBlobUrl': preview_blob_url,
++            'processingIsolated': bool(p['benchmark_fields']),
+             'blobName': anonymous_blob_name or filename,
+             'originalFilename': filename,
+             'sasExpiresAt': expires_at,
+@@ -300,6 +387,11 @@
+         return app.jsonify({'error': 'Invalid filename'}), 400
+     if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
+         return app.jsonify({'error': 'Invalid totalSize'}), 400
++
++    try:
++        validate_finalization(app, user_id, data, filename)
++    except (ValueError, PermissionError) as exc:
++        return app.jsonify({'error': str(exc)}), 403
+ 
+     # Prefer the blob name the browser itself got back from /upload/init and
+     # actually staged its blocks against, over re-deriving it from the shared
+@@ -407,6 +499,7 @@
+         'complete': True,
+         'duplicates': duplicates,
+         'clientProcessingLateResultWaitSeconds': 0,
++        'processingIsolated': isolated(metadata),
+     })
+ 
+ @upload_bp.route('/upload/finalize-batch', methods=['POST'])
+@@ -475,6 +568,12 @@
+             results.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
+             continue
+ 
++        try:
++            validate_finalization(app, user_id, item, filename)
++        except (ValueError, PermissionError) as exc:
++            results.append({'index': idx, 'filename': filename, 'error': str(exc)})
++            continue
++
+         # See the matching comment in finalize_direct_upload above -- same
+         # same-filename-collision race, same fix.
+         anonymous_blob_name = app._validate_client_blob_name(item.get('blobName')) or timed_call('name_resolution', app.read_pending_anonymous_blob, user_id, filename)
+@@ -569,6 +668,7 @@
+             'complete': True,
+             'duplicates': duplicates,
+             'clientProcessingLateResultWaitSeconds': 0,
++            'processingIsolated': isolated(metadata),
+         })
+         upload_finalized(total_size)
+ 

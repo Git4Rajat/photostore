@@ -9,6 +9,7 @@
 # Frontend build output
 frontend/build/
 frontend/.vite/
+frontend/benchmark-build/
 
 # Local secrets
 **/.env

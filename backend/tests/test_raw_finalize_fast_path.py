@@ -93,3 +93,16 @@ def test_video_finalize_still_uses_eager_path(finalize_ctx, monkeypatch):
         storage_utils.finalize_uploaded_file(
             'lib-A', 'clip.mp4', 'video/mp4', client_sha256='b' * 64,
         )
+
+
+def test_benchmark_finalize_retains_isolation_without_overwriting_dedup(finalize_ctx, monkeypatch):
+    name = 'rawbench-run-12345678-originals-00000.cr3'
+    finalize_ctx.upsert_entity({'PartitionKey': 'lib-A', 'RowKey': name,
+                               'processingIsolated': True, 'benchmarkRunId': 'run-12345678'})
+    monkeypatch.setattr(storage_utils, '_store_hash_index', lambda *args: pytest.fail('Benchmark replaced dedup index'))
+    storage_utils.finalize_uploaded_file('lib-A', name, 'image/x-canon-cr3', client_sha256='a' * 64,
+                                        anonymous_blob_name='blob-1')
+    row = finalize_ctx.get_entity('lib-A', name)
+    assert row['processingIsolated'] is True
+    assert row['processing_complete'] is True
+    assert all(row[f'{step}_status'] == 'skipped' for step in storage_utils.PROCESSING_STEPS)
