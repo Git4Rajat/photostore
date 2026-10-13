@@ -23,6 +23,9 @@
 @maxLength(17)
 param appName string = 'photostore'
 
+@description('Communication Services resource name. Override if the default name is already globally reserved.')
+param communicationServiceName string = '${appName}-comm'
+
 @description('Azure region for all resources. Defaults to the resource group location.')
 param location string = resourceGroup().location
 
@@ -162,7 +165,7 @@ resource emailSenderUsername 'Microsoft.Communication/emailServices/domains/send
 }
 
 resource communicationService 'Microsoft.Communication/communicationServices@2023-04-01' = {
-  name: '${appName}-comm'
+  name: communicationServiceName
   location: 'global'
   properties: {
     dataLocation: emailDataLocation

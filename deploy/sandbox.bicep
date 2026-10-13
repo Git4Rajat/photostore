@@ -37,6 +37,7 @@ module app 'resources.bicep' = {
   scope: rg
   params: {
     appName: appName
+    communicationServiceName: '${appName}-comm-${uniqueString(rg.id)}'
     location: location
     adminEmail: adminEmail
     adminPassword: adminPassword
