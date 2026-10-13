@@ -35,15 +35,14 @@ down the whole ipworker replica's process, not just this one OCR call.
 from __future__ import annotations
 
 import glob
-import io
 import os
 import threading
 from typing import Dict, Optional
 
-from PIL import Image, ImageOps
 
 from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
 from optional_deps import try_import
+from ipwork_image import rgb_image
 
 tesserocr = try_import('tesserocr')
 
@@ -102,6 +101,11 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
     resulting UnidentifiedImageError was being swallowed into the same
     terminal 'no_data' status as a genuine empty-OCR result (see
     storage_utils.py's ocr_result handling), permanently hiding real text."""
+    # The preview-first runner retains the RAW filename while passing JPEG
+    # bytes. Extracting a RAW preview again wastes subprocess I/O and can
+    # select an embedded JPEG thumbnail instead of these actual pixels.
+    if image_bytes.startswith(b'\xff\xd8'):
+        return image_bytes
     ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
     if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
         preview = extract_raw_preview_bytes(image_bytes, filename)
@@ -114,15 +118,14 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
     if tesserocr is None:
         return {'hasData': False, 'error': 'tesserocr_unavailable'}
     try:
-        with Image.open(io.BytesIO(_decodable_image_bytes(image_bytes, filename))) as image:
+        with rgb_image(image_bytes, filename, _decodable_image_bytes) as image:
             # Phone photos are commonly stored with an EXIF orientation tag
             # rather than physically rotated pixels (confirmed against real
             # photos during face-pipeline validation -- see ipwork_face.py);
             # without correcting for it, OCR would read sideways/upside-down
             # text on any photo with a non-default orientation.
-            image = ImageOps.exif_transpose(image)
             api = _get_api()
-            api.SetImage(image.convert('RGB'))
+            api.SetImage(image)
             # MapWordConfidences() reads back the last Recognize() pass rather
             # than running one itself (unlike GetUTF8Text(), which recognizes
             # on demand) -- without this explicit call it silently returns an

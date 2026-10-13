@@ -113,11 +113,14 @@ def test_byte_throughput_uses_decimal_mb_and_actual_replica_time(clock, memory_s
     caplog.set_level(logging.INFO, logger=app.worker_logger.name)
     window = app._IpworkThroughputWindow()
     window.record('source_download_bytes', count=3000000)
+    window.record('preview_download_bytes', count=500000)
     window.record('productive_source_bytes', count=2000000)
     clock.seconds += elapsed
     window.log(0, force=True)
     first, = _metrics(caplog)
     assert first['downloaded_mb_per_hour'] == (round(3 * 3600 / elapsed, 3) if elapsed else 0)
+    assert first['preview_downloaded_mb_per_hour'] == (round(.5 * 3600 / elapsed, 3) if elapsed else 0)
+    assert first['total_downloaded_mb_per_hour'] == (round(3.5 * 3600 / elapsed, 3) if elapsed else 0)
     assert first['productive_mb_per_hour'] == (round(2 * 3600 / elapsed, 3) if elapsed else 0)
     assert first['throughput_units'] == 'MB/hour/replica; 1 MB = 1000000 bytes'
     clock.seconds += 60
@@ -125,6 +128,7 @@ def test_byte_throughput_uses_decimal_mb_and_actual_replica_time(clock, memory_s
     second = _metrics(caplog)[1]
     assert second['window']['source_download_bytes'] == second['window']['productive_source_bytes'] == 0
     assert second['downloaded_mb_per_hour'] == second['productive_mb_per_hour'] == 0
+    assert second['preview_downloaded_mb_per_hour'] == second['total_downloaded_mb_per_hour'] == 0
     assert second['cumulative']['source_download_bytes'] == 3000000
     assert second['cumulative']['productive_source_bytes'] == 2000000
 

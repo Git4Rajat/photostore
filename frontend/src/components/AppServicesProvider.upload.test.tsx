@@ -7,11 +7,19 @@ const mocks = vi.hoisted(() => ({
     postUpload: vi.fn(),
     staged: vi.fn(),
     committed: vi.fn(),
+    idbDelete: vi.fn(),
+    idbGet: vi.fn(),
     toast: vi.fn(),
     span: vi.fn(),
+    preparationEnabled: false,
+    prepared: vi.fn(),
 }));
 
-vi.mock('../config/appConfig', () => ({ getRuntimeConfig: () => ({ processingMode: 'backend' }) }));
+vi.mock('../config/appConfig', () => ({ getRuntimeConfig: () => ({ processingMode: 'backend', browserUploadPreparation: mocks.preparationEnabled }) }));
+vi.mock('../services/uploadPreparationPipeline', () => ({UploadPreparationPipeline: class {
+    start = mocks.prepared;
+    dispose() {}
+}}));
 vi.mock('../services/apiClient', () => ({
     get: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
@@ -37,8 +45,8 @@ vi.mock('../services/toast', () => ({ showToast: mocks.toast }));
 vi.mock('../services/perf', () => ({ perf: { recordSpan: mocks.span } }));
 vi.mock('./PhotoGallery', () => ({
     idbPut: vi.fn().mockResolvedValue(undefined),
-    idbGet: vi.fn().mockResolvedValue(null),
-    idbDelete: vi.fn().mockResolvedValue(undefined),
+    idbGet: mocks.idbGet,
+    idbDelete: mocks.idbDelete,
     readBlobArrayBuffer: async (file: File) => new TextEncoder().encode(file.name).buffer,
     sha256ArrayBuffer: async (buffer: ArrayBuffer) => Array.from(new Uint8Array(buffer)).join('-'),
     createBrowserThumbnail: vi.fn().mockResolvedValue(null),
@@ -51,6 +59,7 @@ vi.mock('@azure/storage-blob', () => ({
 }));
 
 import { AppServicesProvider, useAppServices } from './AppServicesProvider';
+import { UPLOAD_SESSION_STORAGE_KEY } from './browserAiShared';
 
 let services: ReturnType<typeof useAppServices>;
 function Probe() {
@@ -92,6 +101,8 @@ async function advance(ms: number) {
 beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    mocks.preparationEnabled = false;
+    mocks.prepared.mockResolvedValue({});
     vi.stubGlobal('localStorage', memoryStorage());
     vi.stubGlobal('sessionStorage', memoryStorage());
     localStorage.clear();
@@ -99,6 +110,8 @@ beforeEach(() => {
     mocks.getUpload.mockImplementation(async () => ({ hashes: {} }));
     mocks.staged.mockResolvedValue(undefined);
     mocks.committed.mockResolvedValue(undefined);
+    mocks.idbDelete.mockResolvedValue(undefined);
+    mocks.idbGet.mockResolvedValue(null);
     mocks.postUpload.mockImplementation(async (url: string, payload: { filename: string; files: Array<{ filename: string }> }) => {
         if (url === '/upload/init') {
             return { uploadId: payload.filename, blobName: `blob-${payload.filename}`,
@@ -109,6 +122,9 @@ beforeEach(() => {
                 uploadId: file.filename,
                 blobName: `blob-${file.filename}`,
                 blobUrl: `https://test.blob.core.windows.net/images/${file.filename}`,
+                uploadPreparationEnabled: true,
+                previewBlobUrl: 'https://test.blob.core.windows.net/thumbnails/preview.jpg',
+                metadataBlobUrl: 'https://test.blob.core.windows.net/thumbnails/metadata.bin',
             })) };
         }
         if (url === '/upload/finalize-batch') {
@@ -134,8 +150,35 @@ function select(files: File[]) {
 }
 
 describe('browser upload selection and startup', () => {
+    it('starts original transfers without waiting for preparation, then finalizes its assets in backend mode', async () => {
+        mocks.preparationEnabled = true;
+        let resolvePreparation!: (value: unknown) => void;
+        mocks.prepared.mockImplementation(() => new Promise(resolve => { resolvePreparation = resolve; }));
+        select(filesFor(1));
+        await advance(1000);
+        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        expect(mocks.committed).toHaveBeenCalledTimes(1);
+        expect(finalizedFiles()).toHaveLength(0);
+        expect(initFiles()[0]).toMatchObject({includePreview: true, includeMetadata: true});
+        const prepared = {clientProcessing: {preview: {alreadyUploaded: true}},
+            clientMetadata: {version: 1, bytes: 400, sha256: 'b'.repeat(64), sourceSha256: 'a'.repeat(64)}};
+        await act(async () => { resolvePreparation(prepared); });
+        await advance(4000);
+        expect(finalizedFiles()[0]).toMatchObject({...prepared, blobName: 'blob-original-0.heic'});
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('does not request or run preparation when the feature is off', async () => {
+        select(filesFor(1));
+        await advance(4000);
+        expect(initFiles()[0].includePreview).toBeUndefined();
+        expect(mocks.prepared).not.toHaveBeenCalled();
+        expect(finalizedFiles()).toHaveLength(1);
+    });
+
     it.each([300, 3000])('initializes and finalizes all %i selected originals', async (count) => {
         const files = filesFor(count);
+        const writes = vi.spyOn(localStorage, 'setItem');
         select(files);
         for (let tick = 0; tick < 150 && finalizedFiles().length < count; tick += 1) {
             await advance(1000);
@@ -150,6 +193,7 @@ describe('browser upload selection and startup', () => {
         expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
         expect(services.pendingUploadSummary).toBeNull();
         expect(services.queuedUploadFileCount).toBe(0);
+        expect(writes.mock.calls.filter(([key]) => key === UPLOAD_SESSION_STORAGE_KEY).length).toBeLessThan(count / 10);
         expect(mocks.span).toHaveBeenCalledWith('upload.picker.change', expect.any(Number), {
             rows: count, bytes: count * 2,
         });
@@ -263,9 +307,101 @@ describe('browser upload selection and startup', () => {
         expect(finalizedFiles()).toHaveLength(3);
         expect(refreshRequests()).toHaveLength(0);
         await act(async () => { releaseFinalize(); });
-        await advance(1000);
+        await advance(3000);
         expect(refreshRequests()).toHaveLength(1);
         expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
+    });
+
+    it('saves finalized recovery state before deleting cached source bytes', async () => {
+        let releaseFinalize!: () => void;
+        const gate = new Promise<void>((resolve) => { releaseFinalize = resolve; });
+        const originalPost = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url, payload) => {
+            if (url === '/upload/finalize-batch') await gate;
+            return originalPost(url, payload);
+        });
+        const deletedStates: string[] = [];
+        mocks.idbDelete.mockImplementation(async (key) => {
+            const saved = JSON.parse(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)!);
+            deletedStates.push(saved.files.find((file: { key: string }) => file.key === key).status);
+        });
+        select(filesFor(3));
+        await advance(1000);
+        expect(mocks.idbDelete).not.toHaveBeenCalled();
+        await act(async () => { releaseFinalize(); });
+        await advance(1000);
+        expect(mocks.idbDelete).not.toHaveBeenCalled();
+        await advance(2000);
+        expect(deletedStates.length).toBeGreaterThanOrEqual(3);
+        expect(deletedStates.every((status) => status === 'done')).toBe(true);
+        expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
+    });
+
+    it('flushes active upload progress when the page is hidden or unloaded', async () => {
+        mocks.staged.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
+            const abort = () => reject(new Error('upload_stopped_by_user'));
+            if (options.abortSignal.aborted) abort();
+            else options.abortSignal.addEventListener('abort', abort, { once: true });
+        }));
+        select(filesFor(3));
+        await advance(1000);
+        const before = JSON.parse(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)!);
+        expect(before.files.every((file: { uploadId?: string }) => !file.uploadId)).toBe(true);
+        vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+        fireEvent(document, new Event('visibilitychange'));
+        const hidden = JSON.parse(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)!);
+        expect(hidden.files.every((file: { uploadId?: string }) => !!file.uploadId)).toBe(true);
+        fireEvent(window, new Event('pagehide'));
+        fireEvent(window, new Event('beforeunload'));
+        expect(services.uploading).toBe(true);
+        act(() => { services.stopActiveUpload(); });
+        await advance(20000);
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+        await advance(3000);
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+    });
+
+    it('does not slow duplicate-only selections by waiting for a checkpoint in each lane', async () => {
+        const files = filesFor(3000);
+        const skippedKeys = new Set<string>();
+        mocks.idbDelete.mockImplementation(async (key) => {
+            const saved = JSON.parse(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)!);
+            const file = saved.files.find((item: { key: string }) => item.key === key);
+            expect(file).toMatchObject({ status: 'done', skippedDuplicate: true });
+            skippedKeys.add(key);
+        });
+        mocks.getUpload.mockResolvedValue({ hashes: Object.fromEntries(files.map((file) => [
+            Array.from(new TextEncoder().encode(file.name)).join('-'), `stored-${file.name}`,
+        ])) });
+        select(files);
+        await advance(1000);
+        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
+        expect(skippedKeys.size).toBe(3000);
+        expect(services.queuedUploadFileCount).toBe(0);
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+    });
+
+    it('restores the existing checkpoint format and reuses already staged blocks after reload', async () => {
+        const file = filesFor(1)[0];
+        mocks.idbGet.mockResolvedValue(file);
+        const blockId = btoa('block-00000000');
+        localStorage.setItem(UPLOAD_SESSION_STORAGE_KEY, JSON.stringify({
+            id: 'legacy', createdAt: Date.now(), files: [{
+                key: 'legacy:0', name: file.name, size: file.size, type: file.type,
+                lastModified: file.lastModified, uploadedBytes: file.size, skippedDuplicate: false,
+                status: 'finalizing', uploadId: file.name, blobName: `blob-${file.name}`,
+                blockIds: [blockId], chunkSizeBytes: file.size,
+            }],
+        }));
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(4000);
+        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.committed).toHaveBeenCalledWith([blockId], expect.anything());
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(mocks.postUpload.mock.calls.find(([url]) => url === '/upload/init')![1]).toMatchObject({ uploadId: file.name });
+        expect(services.pendingUploadSummary).toBeNull();
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
     });
 
     it('resumes 100 paused files and also uploads the other 200 from a broader reselection', async () => {
@@ -372,7 +508,7 @@ describe('browser upload selection and startup', () => {
             ? new Promise(() => {}) : Promise.resolve({}));
         const files = filesFor(1);
         const input = select(files);
-        await advance(1000);
+        await advance(3000);
         expect(finalizedFiles()).toHaveLength(1);
         expect(services.pendingUploadSummary).toBeNull();
 

@@ -1,0 +1,18 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS base
+
+FROM mirror.gcr.io/library/alpine:3.21 AS patched
+RUN apk add --no-cache git
+COPY --from=base /app/app.py /app/app.py
+COPY --from=base /app/storage_utils.py /app/storage_utils.py
+COPY --from=base /app/routes/upload.py /app/routes/upload.py
+COPY deploy/benchmark/overlay.patch /tmp/overlay.patch
+WORKDIR /app
+RUN git apply --check /tmp/overlay.patch && git apply /tmp/overlay.patch
+
+FROM base
+COPY --from=patched /app/app.py /app/app.py
+COPY --from=patched /app/storage_utils.py /app/storage_utils.py
+COPY --from=patched /app/routes/upload.py /app/routes/upload.py
+COPY backend/benchmark_upload.py /app/benchmark_upload.py
+RUN python -m py_compile /app/app.py /app/storage_utils.py /app/routes/upload.py /app/benchmark_upload.py

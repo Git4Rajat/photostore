@@ -60,6 +60,10 @@ RUN onnx=public/models/browser-ai/models/adaface/model.onnx; \
 # silently kept loading the old ArcFace model despite the code/version bump).
 RUN node -e 'const fs=require("fs"); const ts=new Date().toISOString(); const content = `window.__APP_CONFIG__ = { apiBaseUrl: "", uploadBaseUrl: "", spaBaseUrl: "", azureAdTenantId: "", azureAdClientId: "", azureAdApiScope: "", authMode: "entra", blazeFaceModelUrl: "/models/browser-ai/models/blazeface/model.json", arcFaceModelUrl: "/models/browser-ai/models/adaface/model.onnx", arcFaceWasmPath: "/models/browser-ai/runtime/", buildTimestamp: "${ts}" };`; try{fs.writeFileSync("public/env.js", content)}catch(e){console.error("failed to write public/env.js",e); process.exit(1);} '
 RUN npm run build
+RUN mkdir -p build/decoder-licenses && \
+    cp node_modules/@colorhythm/libraw-wasm/LibRaw/* build/decoder-licenses/ && \
+    cp node_modules/@colorhythm/libraw-wasm/LICENSE build/decoder-licenses/JS-LICENSE && \
+    cp decoder-source.txt build/decoder-licenses/
 RUN chmod -R a+rX build/models
 
 FROM mirror.gcr.io/library/nginx:1.27-alpine

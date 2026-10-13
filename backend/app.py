@@ -3843,6 +3843,9 @@ def _enqueue_processing_steps(
             results[step] = {'status': 'error', 'reason': 'not found'}
         return results
 
+    if entity.get('processingIsolated') is True:
+        return {step: {'status': 'skipped', 'reason': 'upload_only_benchmark'} for step in steps}
+
     visibility_timeout = max(0, min(int(visibility_timeout or 0), 7 * 24 * 60 * 60))
     for step in steps:
         status_field = f'{step}_status'
@@ -10391,6 +10394,10 @@ def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
 
 
 def _enqueue_preview_generation_job(user_id: str, filename: str) -> Dict[str, str]:
+    if filename.startswith('rawbench-'):
+        entity = _get_metadata_entity(user_id, filename)
+        if not entity or entity.get('processingIsolated') is True:
+            return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
     existing_job_id = _active_preview_job_for_file(user_id, filename)
     if existing_job_id:
         return {'status': 'already_queued', 'jobId': existing_job_id}
@@ -11294,7 +11301,7 @@ def _create_scoped_blob_url(container_name: str, filename: str, *, minutes: int 
     )
 
 
-def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None) -> Dict[str, str]:
+def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None, *, use_original: bool = False) -> Dict[str, str]:
     """Send a real queue message so ipworker (also) processes this upload.
 
     No-op in 'browser' mode (the default) -- ipworker never needs to be
@@ -11307,6 +11314,10 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
     to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
     silently redo more than was asked.
     """
+    if filename.startswith('rawbench-'):
+        entity = _get_metadata_entity(user_id, filename)
+        if not entity or entity.get('processingIsolated') is True:
+            return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
     if PROCESSING_MODE == 'browser':
         return {'status': 'skipped', 'reason': 'browser_only_processing'}
     requested_steps = [s for s in (steps if steps is not None else IPWORK_STEPS) if s in IPWORK_STEPS]
@@ -11323,6 +11334,8 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
         'filename': filename,
         'steps': requested_steps,
     }
+    if use_original:
+        message['imageSource'] = 'original'
     try:
         ipwork_queue_client.send_message(json.dumps(message, separators=(',', ':')))
     except Exception:
@@ -11451,6 +11464,8 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
     """
     if not _people_features_available() or not isinstance(metadata, dict):
         return None
+    if metadata.get('processingIsolated') is True:
+        return None
     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
         return None
     if str(metadata.get('face_status') or '').strip().lower() != 'done':
@@ -11536,6 +11551,7 @@ BROWSER_PROCESSING_STATUS_FIELDS = (
 BROWSER_PROCESSING_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout'}
 BROWSER_PROCESSING_PENDING_SELECT = [
     'RowKey',
+    'processingIsolated',
     'rotation',
     'processing_state',
     'processing_lease_owner',
@@ -11666,6 +11682,8 @@ def _browser_processing_face_version_stale(entity: Dict) -> bool:
 
 def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
     filename = str(entity.get('RowKey') or '').strip()
+    if entity.get('processingIsolated') is True:
+        return None
     if not filename:
         return None
     if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
@@ -11786,7 +11804,7 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
     -- otherwise every sweep interval would pile a fresh duplicate message
     onto a perfectly healthy backlog.
     """
-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+    if entity.get('processingIsolated') is True or str(entity.get('processing_state') or '').strip().lower() == 'deleted':
         return []
     lease_expired = _browser_processing_lease_expired(entity)
     face_version_stale = _browser_processing_face_version_stale(entity)
@@ -12212,6 +12230,10 @@ def _delete_photo_blobs_if_present(blob_name: str, extra_blob_names: Optional[Li
             error = _delete_blob_if_present(container_name, name)
             if error:
                 errors.append(f'{label}: {error}')
+    for name in names:
+        error = _delete_blob_if_present(BLOB_THUMBNAIL_CONTAINER, f'metadata/{name}.bin')
+        if error:
+            errors.append(f'blob metadata: {error}')
     return errors
 
 
@@ -12769,11 +12791,15 @@ def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[
         if anonymous_id:
             blob_to_names.setdefault(safe_name, set()).add(safe_name)
     blob_names = list(blob_to_names.keys())
+    metadata_blob_to_names = {f'metadata/{name}.bin': owners for name, owners in blob_to_names.items()}
     blob_errors_by_name: Dict[str, List[str]] = {}
     for label, container_name in (('blob image', BLOB_IMAGE_CONTAINER), ('blob thumbnail', BLOB_THUMBNAIL_CONTAINER)):
         for failed_blob in _batch_delete_blobs(container_name, blob_names):
             for safe_name in blob_to_names.get(failed_blob, ()):
                 blob_errors_by_name.setdefault(safe_name, []).append(f'{label}: delete failed')
+    for failed_blob in _batch_delete_blobs(BLOB_THUMBNAIL_CONTAINER, list(metadata_blob_to_names)):
+        for safe_name in metadata_blob_to_names.get(failed_blob, ()):
+            blob_errors_by_name.setdefault(safe_name, []).append('blob metadata: delete failed')
 
     for safe_name, metadata in own_rows_by_name.items():
         if safe_name in shared_names:
@@ -13983,6 +14009,7 @@ def _prepare_incremental_assignment(payload, user_id) -> List[Tuple[str, List[st
             continue
         metadata = _get_metadata_entity(user_id, filename)
         if (not isinstance(metadata, dict)
+                or metadata.get('processingIsolated') is True
                 or str(metadata.get('processing_state') or '').strip().lower() == 'deleted'
                 or str(metadata.get('face_status') or '').strip().lower() != 'done'):
             continue
@@ -14662,6 +14689,12 @@ def run_clustering_worker() -> None:
 # ipworker's model coverage ships incrementally rather than all at once.
 IPWORK_STEP_PROCESSORS: Dict[str, Callable[[str, str, bytes], Optional[Dict]]] = {}
 
+# Experimental until representative replay establishes quality and latency.
+IPWORK_SHARED_DECODE = os.getenv('IPWORK_SHARED_DECODE', 'false').lower() == 'true'
+IPWORK_REUSE_PREVIEW = os.getenv('IPWORK_REUSE_PREVIEW', 'false').lower() == 'true'
+IPWORK_REUSE_EXIF = os.getenv('IPWORK_REUSE_EXIF', 'false').lower() == 'true'
+IPWORK_REUSE_METADATA_PACKET = os.getenv('IPWORK_REUSE_METADATA_PACKET', 'false').lower() == 'true'
+
 # Scoped to the task's thread: browser/API calls do not enter worker metrics.
 _ipwork_metrics_context = threading.local()
 
@@ -14730,32 +14763,74 @@ def _register_ipwork_processors() -> None:
         worker_logger.exception('ipwork_vision unavailable; ai_vision step will report not_implemented')
 
 
-def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str, Dict]:
+def _run_ipwork_steps(user_id: str, filename: str, steps: List[str], *, use_original: bool = False) -> Dict[str, Dict]:
+    from ipwork_image import image_job
+    with image_job(IPWORK_SHARED_DECODE):
+        return _run_ipwork_steps_with_images(user_id, filename, steps, use_original=use_original)
+
+
+def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str], *, use_original: bool = False) -> Dict[str, Dict]:
     """Run each requested step's registered processor for one photo.
 
     Returns a dict shaped like the browser's `clientProcessing` payload so it
     can be handed straight to apply_client_processing_results_for_file.
     """
     client_processing: Dict[str, Dict] = {}
-    image_bytes_cache: List[bytes] = []
+    original_bytes_cache: List[bytes] = []
+    visual_bytes_cache: List[bytes] = []
+    source_metadata: List[Dict] = []
+    preview_attempted = False
     download_ms = 0
     _ipwork_metrics_context.source_bytes = 0
 
-    def get_image_bytes() -> bytes:
-        nonlocal download_ms
-        if not image_bytes_cache:
+    def get_source_metadata() -> Dict:
+        if not source_metadata:
+            source_metadata.append(_get_metadata_entity(user_id, filename) or {})
+        return source_metadata[0]
+
+    def get_image_bytes(step: str) -> bytes:
+        nonlocal download_ms, preview_attempted
+        visual = step in {'thumbnail', 'ocr', 'face', 'ai_vision'}
+        if visual and visual_bytes_cache:
+            return visual_bytes_cache[0]
+        if not original_bytes_cache or (visual and IPWORK_REUSE_PREVIEW and not use_original and not preview_attempted):
             started = time.monotonic()
             try:
-                entity = _get_metadata_entity(user_id, filename) or {}
+                entity = get_source_metadata()
                 source_blob = str(entity.get('anonymousImageId') or '').strip() or filename
-                image_bytes_cache.append(download_media_bytes('image', source_blob))
-                _ipwork_metrics_context.source_bytes = len(image_bytes_cache[0])
-                _ipwork_metric('source_download_bytes', count=_ipwork_metrics_context.source_bytes)
+                if (visual and IPWORK_REUSE_PREVIEW and not use_original and not preview_attempted and 'preview' not in steps
+                        and str(entity.get('preview_status') or '').lower() == 'done'
+                        and not is_video_file(filename)):
+                    preview_attempted = True
+                    try:
+                        # HEAD the original for source-volume accounting, without
+                        # crediting preview bytes as original bytes downloaded.
+                        source_size = int(get_media_properties('image', source_blob)['size'])
+                        if source_size <= 0:
+                            raise ValueError('Invalid source size')
+                        preview = download_media_bytes('thumbnail', _preview_cache_blob_name(source_blob))
+                        _ipwork_metric('preview_download_bytes', count=len(preview))
+                        if not _looks_like_jpeg(preview):
+                            raise ValueError('Invalid cached preview')
+                        from ipwork_image import rgb_image
+                        with rgb_image(preview, filename) as pixels:
+                            pixels.load()  # fully validate; seed the shared decode when enabled
+                        visual_bytes_cache.append(preview)
+                        _ipwork_metrics_context.source_bytes = source_size
+                        _ipwork_metric('preview_reused')
+                        return preview
+                    except Exception:
+                        _ipwork_metric('preview_reuse_failed')
+                        worker_logger.info('ipworker cached preview unavailable; falling back to original')
+                if not original_bytes_cache:
+                    original_bytes_cache.append(download_media_bytes('image', source_blob))
+                    _ipwork_metrics_context.source_bytes = len(original_bytes_cache[0])
+                    _ipwork_metric('source_download_bytes', count=_ipwork_metrics_context.source_bytes)
             finally:
                 elapsed_ms = (time.monotonic() - started) * 1000
-                download_ms = round(elapsed_ms)
+                download_ms += round(elapsed_ms)
                 _ipwork_metric('download', duration_ms=elapsed_ms, observation=True)
-        return image_bytes_cache[0]
+        return original_bytes_cache[0]
 
     def _failure_shape(step: str, error: str) -> Dict:
         # storage_utils's face block only resolves face_status to a terminal
@@ -14780,15 +14855,43 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
         if processor is None:
             client_processing[step] = _failure_shape(step, 'not_implemented')
             continue
+        geo_exif = None
+        packet_exif = None
         try:
-            image_bytes = get_image_bytes()
+            if step == 'exif' and IPWORK_REUSE_METADATA_PACKET and not use_original:
+                import ipwork_geo
+                if processor is ipwork_geo.process_exif and get_source_metadata().get('uploadMetadataPacket'):
+                    import storage_utils
+                    from upload_metadata import extract_candidate
+                    packet_started = time.monotonic()
+                    packet_exif = extract_candidate(storage_utils, filename, get_source_metadata(),
+                        on_download=lambda size: _ipwork_metric('metadata_packet_download_bytes', count=size))
+                    if packet_exif is not None:
+                        _ipwork_metrics_context.source_bytes = int(get_source_metadata().get('size') or 0)
+                    _ipwork_metric('metadata_packet', duration_ms=(time.monotonic() - packet_started) * 1000, observation=True)
+                    _ipwork_metric('metadata_packet_reused' if packet_exif is not None else 'metadata_packet_fallback')
+            if step == 'map_detection' and IPWORK_REUSE_EXIF and not use_original:
+                import ipwork_geo
+                if processor is ipwork_geo.process_geo:
+                    exif_result = client_processing.get('exif')
+                    if (isinstance(exif_result, dict) and exif_result.get('hasData') is True
+                            and not exif_result.get('error') and isinstance(exif_result.get('data'), dict)):
+                        geo_exif = exif_result['data']
+                    else:
+                        geo_exif = ipwork_geo.geo_exif_from_metadata(get_source_metadata())
+                    if geo_exif is not None:
+                        _ipwork_metric('geo_metadata_reused')
+            image_bytes = get_image_bytes(step) if geo_exif is None and packet_exif is None else None
         except Exception as exc:
             worker_logger.exception('ipworker image download failed for %s/%s', user_id, filename)
             client_processing[step] = _failure_shape(step, 'download_failed')
             continue
         step_started = time.monotonic()
         try:
-            result = processor(user_id, filename, image_bytes)
+            if packet_exif is not None:
+                result = {'hasData': True, 'data': packet_exif, 'source': 'browser_metadata_packet'}
+            else:
+                result = ipwork_geo.process_geo_from_exif(geo_exif) if geo_exif is not None else processor(user_id, filename, image_bytes)
             client_processing[step] = result if isinstance(result, dict) else _failure_shape(step, 'invalid_result_shape')
         except Exception as exc:
             worker_logger.exception('ipworker step %r failed for %s/%s', step, user_id, filename)
@@ -14798,13 +14901,13 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             step_ms[step] = round(elapsed_ms)
             _ipwork_metric('step_' + step, duration_ms=elapsed_ms, observation=True)
         # 'preview' is meant to run first (see IPWORK_STEPS/callers): once it
-        # succeeds, swap the ~2048px shrunk bytes into the shared cache so
-        # every later step this call (thumbnail/face/ocr/ai_vision) decodes
+        # succeeds, put the ~2048px shrunk bytes into the visual cache so
+        # every later visual step (thumbnail/face/ocr/ai_vision) decodes
         # that instead of re-downloading/re-decoding the full original --
-        # this is the whole point of ordering it first (see ipwork_preview.py).
-        if step == 'preview' and client_processing[step].get('hasData'):
+        # Metadata steps still receive the original with its EXIF/GPS intact.
+        if step == 'preview' and client_processing[step].get('hasData') and not use_original:
             try:
-                image_bytes_cache[0] = base64.b64decode(str(client_processing[step].get('data') or ''))
+                visual_bytes_cache[:] = [base64.b64decode(str(client_processing[step].get('data') or ''))]
             except Exception:
                 worker_logger.exception('ipworker failed to swap in shrunk preview bytes for %s/%s', user_id, filename)
     worker_logger.info(
@@ -14935,7 +15038,10 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     lease_cleared_by_apply = False
     try:
         steps_started = time.monotonic()
-        client_processing = _ipwork_timed_call('steps', _run_ipwork_steps, user_id, filename, runnable_steps)
+        if payload.get('imageSource') == 'original':
+            client_processing = _ipwork_timed_call('steps', _run_ipwork_steps, user_id, filename, runnable_steps, use_original=True)
+        else:
+            client_processing = _ipwork_timed_call('steps', _run_ipwork_steps, user_id, filename, runnable_steps)
         steps_ms = round((time.monotonic() - steps_started) * 1000)
         apply_started = time.monotonic()
         metadata = _ipwork_timed_call('apply', apply_client_processing_results_for_file,
@@ -15174,6 +15280,10 @@ class _IpworkThroughputWindow:
         self.window = self.collector.window
         self.identity = replica_identity()
         self.config = {'concurrency': IPWORKER_CONCURRENCY,
+                       'shared_decode': IPWORK_SHARED_DECODE,
+                       'reuse_preview': IPWORK_REUSE_PREVIEW,
+                       'reuse_exif': IPWORK_REUSE_EXIF,
+                       'reuse_metadata_packet': IPWORK_REUSE_METADATA_PACKET,
                        'face_reconcile_batch_size': IPWORKER_FACE_RECONCILE_BATCH_SIZE,
                        'visibility_timeout_seconds': IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
                        'task_timeout_seconds': IPWORKER_TASK_TIMEOUT_SECONDS,
@@ -15203,8 +15313,13 @@ class _IpworkThroughputWindow:
         metrics['productive_per_hour'] = round(metrics['window']['productive_completed'] * 3600 / elapsed, 3) if elapsed > 0 else 0
         metrics['throughput_units'] = 'MB/hour/replica; 1 MB = 1000000 bytes'
         for rate, counter in (('downloaded_mb_per_hour', 'source_download_bytes'),
+                              ('preview_downloaded_mb_per_hour', 'preview_download_bytes'),
+                              ('metadata_downloaded_mb_per_hour', 'metadata_packet_download_bytes'),
                               ('productive_mb_per_hour', 'productive_source_bytes')):
             metrics[rate] = round(metrics['window'][counter] * 3600 / (elapsed * 1000000), 3) if elapsed > 0 else 0
+        transferred = (metrics['window']['source_download_bytes'] + metrics['window']['preview_download_bytes']
+                       + metrics['window']['metadata_packet_download_bytes'])
+        metrics['total_downloaded_mb_per_hour'] = round(transferred * 3600 / (elapsed * 1000000), 3) if elapsed > 0 else 0
         # Keep each console record small; a fully populated pair of histograms
         # can exceed log transport line limits. Main record retains quantiles,
         # counts and sums; full bucket arrays get fixed-label phase records.

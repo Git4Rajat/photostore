@@ -3,6 +3,13 @@
 > `frontend`→`web` (`upload` unchanged). This doc still uses the OLD names —
 > translate via this table against current `deploy/resources.bicep`/`backend/app.py`.
 
+> **2026-10-11 image reuse experiments**: preview-first processing already
+> reuses JPEG bytes. Task-scoped RGB reuse and downloading a completed stored
+> preview now have separate, default-off flags. See
+> [the benchmark and adoption limits](vision-image-reuse-benchmark-20261011.md).
+> Results remain batched until processing finishes; early photo visibility is
+> outside the accepted scope.
+
 # Bounded face-index preparation
 
 The ipworker now supports bounded authoritative filename-index reconciliation

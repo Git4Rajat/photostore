@@ -26,13 +26,16 @@ COUNTERS = ('done', 'noop', 'lease_busy', 'error', 'not_found', 'retry_exhausted
             'receive', 'receive_failed', 'received', 'ack', 'ack_failed',
             'productive_completed', 'completed_with_step_error', 'completed_result_unknown', 'already_processed',
             'source_download_bytes', 'productive_source_bytes',
+            'preview_download_bytes', 'preview_reused', 'preview_reuse_failed',
+            'geo_metadata_reused',
+            'metadata_packet_reused', 'metadata_packet_fallback', 'metadata_packet_download_bytes',
             'eligibility_reprocessing', 'eligibility_unknown',
             'defer_shutdown', 'defer_preparation_failed', 'defer_visibility_budget',
             'watchdog_preparation', 'watchdog_tasks', 'shutdown_grace_exhausted',
             'face_no_detection', 'face_postprocessing_failed', 'face_quality_rejected', 'face_embedded')
 TIMINGS = ('receive', 'receive_failed', 'ack', 'ack_failed', 'download', 'lease',
            'steps', 'apply', 'cluster', 'task', 'receipt_to_start', 'receipt_to_ack',
-           'preparation', 'wave') + tuple('step_' + step for step in STEPS) + tuple(
+           'preparation', 'wave', 'metadata_packet') + tuple('step_' + step for step in STEPS) + tuple(
                'face_' + phase for phase in ('decode', 'detect', 'landmarkWait', 'landmark', 'align', 'embed'))
 
 

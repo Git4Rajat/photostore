@@ -30,7 +30,6 @@ app.run_ipworker(), never from the plain backend/worker roles.
 """
 from __future__ import annotations
 
-import io
 import os
 import copy
 import threading
@@ -40,10 +39,10 @@ from contextvars import ContextVar
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageOps
 
 from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
 from optional_deps import try_import
+from ipwork_image import rgb_image
 
 # cv2/onnxruntime/mediapipe are ipworker-only deps (requirements-ipworker.txt),
 # not in backend/requirements.txt -- guarded the same way ipwork_ocr.py guards
@@ -568,6 +567,8 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
     raw bytes raises 'cannot identify image file'. Extract the same embedded/
     rawpy preview ipwork_thumbnail.py already uses so RAW photos decode here
     too, instead of every RAW upload silently failing face + ai_vision."""
+    if image_bytes.startswith(b'\xff\xd8'):
+        return image_bytes  # already a JPEG preview, even under a RAW filename
     ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
     if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
         preview = extract_raw_preview_bytes(image_bytes, filename)
@@ -607,7 +608,7 @@ def _process_face(user_id: str, filename: str, image_bytes: bytes, *, recovery=F
     diagnostics = _FACE_DIAGNOSTICS.get()
     decode_started = time.perf_counter()
     try:
-        with Image.open(io.BytesIO(_decodable_image_bytes(image_bytes, filename))) as pil_image:
+        with rgb_image(image_bytes, filename, _decodable_image_bytes) as rgb_image_pixels:
             # Most phone photos are stored with an EXIF orientation tag rather
             # than physically rotated pixels. Confirmed against a real sideways
             # photo (orientation=6) during validation: without this, detection
@@ -617,10 +618,8 @@ def _process_face(user_id: str, filename: str, image_bytes: bytes, *, recovery=F
             # corrupting the alignment crop fed to AdaFace. The browser's own
             # canvas-based pipeline never hits this because canvas drawImage
             # already auto-orients.
-            pil_image = ImageOps.exif_transpose(pil_image)
-            rgb_image = pil_image.convert('RGB')
-            image_width, image_height = rgb_image.size
-            image_bgr = cv2.cvtColor(np.array(rgb_image), cv2.COLOR_RGB2BGR)
+            image_width, image_height = rgb_image_pixels.size
+            image_bgr = cv2.cvtColor(np.array(rgb_image_pixels), cv2.COLOR_RGB2BGR)
     except Exception as exc:
         # 'faces' must be present (even empty) and faceFailureStage must be a
         # non-transient value -- storage_utils._apply_client_processing_results'
