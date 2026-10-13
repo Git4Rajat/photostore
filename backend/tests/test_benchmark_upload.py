@@ -187,12 +187,71 @@ def test_packet_exif_keeps_more_than_200_tags_and_late_gps(monkeypatch):
 
 
 def test_normal_direct_thumbnail_rejects_oversize_pixels(monkeypatch):
-    monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', object())
+    monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', SimpleNamespace(upsert_entity=lambda row: None))
     storage, _, _ = jpeg_storage(121, 80)
     monkeypatch.setattr(storage_utils, '_get_blob_client', storage._get_blob_client)
     monkeypatch.setitem(storage_utils._CTX, 'blob_thumbnail_container', 'thumbs')
     row = {'anonymousImageId': 'blob-1', 'processing_metadata': '{}', 'thumbnail_status': 'pending'}
-    with pytest.raises(ValueError):
-        storage_utils._apply_client_processing_results('lib', 'photo.cr3', row,
-            lambda: pytest.fail('Original was downloaded'), {'thumbnail': {'alreadyUploaded': True}}, [], 'asset')
+    monkeypatch.setattr(storage_utils, '_extract_and_store_embeddings', lambda *_: None)
+    monkeypatch.setattr(storage_utils, 'touch_user_search_indexes_state', lambda *args, **kwargs: None)
+    storage_utils._apply_client_processing_results('lib', 'photo.cr3', row,
+        lambda: pytest.fail('Original was downloaded'), {'thumbnail': {'alreadyUploaded': True}}, [], 'asset')
     assert row['thumbnail_status'] == 'pending'
+    import json
+    assert json.loads(row['processing_metadata'])['client_thumbnail_rejected']['reason'] == 'derivative_format_or_dimensions'
+
+
+@pytest.mark.parametrize('failed_kind', ['preview', 'thumbnail'])
+@pytest.mark.parametrize('failure,expected', [
+    ('byte_limit', 'derivative_byte_limit'), ('content_type', 'derivative_content_type'),
+    ('dimensions', 'derivative_format_or_dimensions'), ('storage', 'processing_exception'),
+])
+def test_direct_derivative_rejection_is_independent_without_original_fallback(monkeypatch, failed_kind, failure, expected):
+    import json
+    writes = []
+    monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', SimpleNamespace(upsert_entity=lambda row: writes.append(dict(row))))
+    monkeypatch.setitem(storage_utils._CTX, 'blob_thumbnail_container', 'thumbs')
+    healthy, _, _ = jpeg_storage(120, 80)
+    edge = 2048 if failed_kind == 'preview' else 120
+    cap = 1_500_000 if failed_kind == 'preview' else 512_000
+    bad, _, _ = jpeg_storage(edge + 1 if failure == 'dimensions' else 120, 80,
+        size_override=cap + 1 if failure == 'byte_limit' else None,
+        content_type='application/octet-stream' if failure == 'content_type' else 'image/jpeg')
+    def get_blob(container, name):
+        kind = 'preview' if name.startswith('preview/') else 'thumbnail'
+        if kind == failed_kind and failure == 'storage':
+            raise RuntimeError('Transient storage failure')
+        return (bad if kind == failed_kind else healthy)._get_blob_client(container, name)
+    monkeypatch.setattr(storage_utils, '_get_blob_client', get_blob)
+    monkeypatch.setattr(storage_utils, 'mark_step_done', lambda *args, **kwargs: None)
+    monkeypatch.setattr(storage_utils, '_extract_and_store_embeddings', lambda *_: None)
+    monkeypatch.setattr(storage_utils, 'touch_user_search_indexes_state', lambda *args, **kwargs: None)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *_: pytest.fail('Finalize ran semantic processing'))
+    row = {'anonymousImageId': 'physical', 'processing_metadata': '{}', 'thumbnail_status': 'pending', 'preview_status': 'pending'}
+    storage_utils._apply_client_processing_results('lib', 'photo.cr3', row,
+        lambda: pytest.fail('Original was downloaded'),
+        {'thumbnail': {'alreadyUploaded': True}, 'preview': {'alreadyUploaded': True}}, [], 'asset')
+    healthy_kind = 'thumbnail' if failed_kind == 'preview' else 'preview'
+    assert writes[-1][healthy_kind + '_status'] == 'done'
+    assert writes[-1][failed_kind + '_status'] == 'pending'
+    processing = json.loads(writes[-1]['processing_metadata'])
+    assert processing['client_' + failed_kind + '_rejected']['reason'] == expected
+    assert processing['client_' + failed_kind + '_rejected']['clientAssetId'] == 'asset'
+    assert processing['client_' + healthy_kind]['source'] == 'browser'
+
+
+def test_valid_derivative_clears_prior_rejection_on_retry(monkeypatch):
+    import json
+    monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', SimpleNamespace(upsert_entity=lambda row: None))
+    monkeypatch.setitem(storage_utils._CTX, 'blob_thumbnail_container', 'thumbs')
+    good, _, _ = jpeg_storage(120, 80)
+    monkeypatch.setattr(storage_utils, '_get_blob_client', good._get_blob_client)
+    monkeypatch.setattr(storage_utils, 'mark_step_done', lambda *args, **kwargs: None)
+    monkeypatch.setattr(storage_utils, '_extract_and_store_embeddings', lambda *_: None)
+    monkeypatch.setattr(storage_utils, 'touch_user_search_indexes_state', lambda *args, **kwargs: None)
+    row = {'anonymousImageId': 'physical', 'preview_status': 'pending', 'processing_metadata': json.dumps({
+        'client_preview_rejected': {'clientAssetId': 'asset', 'reason': 'storage_http_503'}})}
+    storage_utils._apply_client_processing_results('lib', 'photo.cr3', row,
+        lambda: pytest.fail('Original was downloaded'), {'preview': {'alreadyUploaded': True}}, [], 'asset')
+    assert row['preview_status'] == 'done'
+    assert json.loads(row['processing_metadata'])['client_preview_rejected'] is None

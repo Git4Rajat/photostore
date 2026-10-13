@@ -45,14 +45,15 @@ test('returns busy fallback instead of growing an unbounded queue', async () => 
     expect(await queued).toEqual({status: 'fallback', reason: 'disposed'});
 });
 
-test('timeout includes queue waiting and terminates active work', async () => {
+test('each decoder gets its own timeout after queue admission', async () => {
     const service = new UploadAssetPreparer(factory, 4, 100);
     const active = service.prepare(new File(['raw'], 'a.CR3'));
     const queued = service.prepare(new File(['raw'], 'b.CR3'));
     await vi.advanceTimersByTimeAsync(100);
     expect(await active).toEqual({status: 'fallback', reason: 'timeout', failureReason: 'generation_timeout'});
-    expect(await queued).toEqual({status: 'fallback', reason: 'timeout', failureReason: 'generation_queue_timeout'});
-    expect(factory).toHaveBeenCalledTimes(1);
+    expect(factory).toHaveBeenCalledTimes(2);
+    complete(1);
+    expect((await queued).status).toBe('generated');
     expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
     service.dispose();
 });

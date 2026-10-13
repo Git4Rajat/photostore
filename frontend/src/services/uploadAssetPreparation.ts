@@ -14,7 +14,7 @@ type WorkerFactory = (raw: boolean) => PreparationWorker;
 interface PreparationOptions {signal?: AbortSignal; preserveEligibleJpeg?: boolean;}
 interface Job {
     file: File; options: PreparationOptions; resolve: (result: UploadPreparationResult) => void;
-    timer: ReturnType<typeof setTimeout>; abort: () => void; worker?: PreparationWorker; settled: boolean; deadline: number;
+    timer?: ReturnType<typeof setTimeout>; abort: () => void; worker?: PreparationWorker; settled: boolean;
 }
 const createPreparationWorker: WorkerFactory = raw => raw
     ? new Worker(new URL('../workers/rawUploadAssets.worker.js', import.meta.url), {type: 'module'})
@@ -32,10 +32,8 @@ export class UploadAssetPreparer {
             return Promise.resolve({status: 'fallback', reason: this.disposed ? 'disposed' : options.signal?.aborted ? 'aborted' : isVideoFilename(file.name) ? 'unsupported' : 'busy'});
         }
         return new Promise(resolve => {
-            const job = {file, options, resolve, settled: false, deadline: Date.now() + this.timeoutMs} as Job;
+            const job = {file, options, resolve, settled: false} as Job;
             job.abort = () => this.finish(job, {status: 'fallback', reason: 'aborted'});
-            job.timer = setTimeout(() => this.finish(job, {status: 'fallback', reason: 'timeout',
-                failureReason: job.worker ? 'generation_timeout' : 'generation_queue_timeout'}), this.timeoutMs);
             options.signal?.addEventListener('abort', job.abort, {once: true});
             this.queue.push(job);
             this.pump();
@@ -63,10 +61,8 @@ export class UploadAssetPreparer {
         if (this.disposed || this.active || !this.queue.length) return;
         const job = this.queue.shift()!;
         this.active = job;
-        if (Date.now() >= job.deadline) {
-            this.finish(job, {status: 'fallback', reason: 'timeout', failureReason: 'generation_queue_timeout'});
-            return;
-        }
+        job.timer = setTimeout(() => this.finish(job, {status: 'fallback', reason: 'timeout',
+            failureReason: 'generation_timeout'}), this.timeoutMs);
         try {
             const worker = this.workerFactory(isRawFilename(job.file.name));
             job.worker = worker;

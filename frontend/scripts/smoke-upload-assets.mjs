@@ -176,6 +176,34 @@ try {
             assert.equal(pipeline.prepared.preparationReport.assets[kind].httpStatus, 201);
         }
         console.log(JSON.stringify({pipeline: 'passed', ...pipeline}));
+        const queued = await page.evaluate(async () => {
+            const file = document.querySelector('#source').files[0];
+            const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+            const sha = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+            const originalFetch = window.fetch;
+            let active = 0, maximum = 0, calls = 0;
+            window.fetch = async (url, options) => {
+                if (!String(url).startsWith('https://mock-storage.invalid/')) return originalFetch(url, options);
+                active++; calls++; maximum = Math.max(maximum, active);
+                try { await new Promise(resolve => setTimeout(resolve, 20)); return new Response('', {status: 201}); }
+                finally { active--; }
+            };
+            const service = new window.Pipeline();
+            try {
+                const results = await Promise.all(Array.from({length: 10}, (_, index) => service.start(
+                    new File([file], `queued-${index}.dng`), sha,
+                    {previewBlobUrl: `https://mock-storage.invalid/preview-${index}`,
+                        thumbnailBlobUrl: `https://mock-storage.invalid/thumb-${index}`,
+                        metadataBlobUrl: `https://mock-storage.invalid/metadata-${index}`}, new AbortController().signal)));
+                return {maximum, calls, completed: results.filter(r => r.clientProcessing?.preview && r.clientProcessing?.thumbnail && r.clientMetadata).length,
+                    queued: results.filter(r => r.preparationReport.admissionMs > 10).length};
+            } finally { service.dispose(); window.fetch = originalFetch; }
+        });
+        assert.equal(queued.completed, 10);
+        assert.equal(queued.calls, 30);
+        assert.ok(queued.maximum <= 2);
+        assert.ok(queued.queued >= 5);
+        console.log(JSON.stringify({queuedPipeline: 'passed', ...queued}));
     }
     await page.evaluate(() => window.preparer.dispose());
     await fs.writeFile(path.join(output, 'results.json'), JSON.stringify({browser: await browser.version(), rotation, rows}, null, 2));

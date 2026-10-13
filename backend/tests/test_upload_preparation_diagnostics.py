@@ -38,6 +38,21 @@ def test_unhashable_enum_inputs_are_ignored():
         'preview': {'bytes': 10 ** 1000}}}) == {'version': 1, 'assets': {'preview': {}}}
 
 
+def test_queue_latency_and_retry_attempts_are_bounded():
+    raw = report()
+    raw['admissionMs'] = 6000
+    raw['assets']['preview'].update(attempts=3, uploadReason='upload_timeout')
+    clean = bounded_report(raw)
+    assert clean['admissionMs'] == 6000
+    assert clean['assets']['preview']['attempts'] == 3
+    assert clean['assets']['preview']['uploadReason'] == 'upload_timeout'
+    raw['assets']['preview']['attempts'] = 4
+    raw['admissionMs'] = 10 ** 1000
+    clean = bounded_report(raw)
+    assert 'attempts' not in clean['assets']['preview']
+    assert 'admissionMs' not in clean
+
+
 def test_receipt_uses_backend_state_not_browser_success_claim():
     row = {'preview_status': 'done', 'thumbnail_status': 'pending',
            'processing_metadata': json.dumps({'client_preview': {'source': 'browser'}})}
@@ -65,6 +80,21 @@ def test_receipt_failure_does_not_reject_original():
     record_receipt(app, 'library', 'photo.cr3', {'preparationReport': report()})
     app._update_metadata_entity_fields.assert_not_called()
     app.app.logger.info.assert_called_once()
+
+
+def test_receipt_preserves_independent_derivative_rejection_reason():
+    row = {'preview_status': 'done', 'thumbnail_status': 'pending', 'processing_metadata': json.dumps({
+        'client_preview': {'source': 'browser'},
+        'client_thumbnail_rejected': {'clientAssetId': 'upload-id', 'reason': 'derivative_byte_limit'}})}
+    app = SimpleNamespace(metadata_table_client=SimpleNamespace(get_entity=lambda **_: row),
+                          _update_metadata_entity_fields=Mock(), app=SimpleNamespace(logger=Mock()))
+    payload = {'uploadId': 'upload-id', 'preparationReport': report(), 'clientProcessing': {
+        'preview': {'alreadyUploaded': True}, 'thumbnail': {'alreadyUploaded': True}}}
+    record_receipt(app, 'library', 'photo.cr3', payload)
+    receipt = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])['backendReceipt']
+    assert receipt['preview'] == 'accepted'
+    assert receipt['thumbnail'] == 'rejected'
+    assert receipt['thumbnailReason'] == 'derivative_byte_limit'
 
 
 def test_offer_reports_gates_without_expanding_formats(monkeypatch):

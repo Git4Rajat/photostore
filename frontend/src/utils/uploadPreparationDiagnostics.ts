@@ -11,10 +11,12 @@ export interface AssetPreparationDiagnostic {
     uploadMs?: number;
     queueMs?: number;
     httpStatus?: number;
+    attempts?: number;
 }
 export interface UploadPreparationReport {
     version: 1;
     elapsedMs: number;
+    admissionMs?: number;
     reason?: string;
     assets: Record<PreparationAsset, AssetPreparationDiagnostic>;
 }

@@ -8489,11 +8489,23 @@ def _apply_client_processing_results(
     # the image; fall back to the original filename for pre-anonymization photos.
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
     thumbnail_payload = payload.get('thumbnail')
+    thumbnail_verification_failed = False
     if isinstance(thumbnail_payload, dict) and thumbnail_payload.get('alreadyUploaded') and not had_thumbnail_before:
         import sys
         from benchmark_upload import verify_jpeg
-        verify_jpeg(sys.modules[__name__], thumbnail_blob_name, byte_cap=512_000, edge_cap=120)
-        thumbnail_already_uploaded = True
+        try:
+            verify_jpeg(sys.modules[__name__], thumbnail_blob_name, byte_cap=512_000, edge_cap=120)
+            thumbnail_already_uploaded = True
+        except Exception as exc:
+            from upload_preparation_diagnostics import rejection_reason
+            _merge_processing_metadata(metadata, 'client_thumbnail_rejected', {
+                'source': origin, 'clientAssetId': client_asset_id, 'rejectedAt': _utc_now(),
+                'reason': rejection_reason(exc, domain='processing'),
+            })
+            # Reject only this claim; keep finalization free of original reads.
+            thumbnail_payload = {}
+            thumbnail_verification_failed = True
+            status_updates['thumbnail_status'] = 'pending'
     if (
         not thumbnail_already_uploaded
         and thumbnail_payload is None
@@ -8549,6 +8561,7 @@ def _apply_client_processing_results(
             except Exception:
                 pass
         if thumbnail_already_uploaded:
+            _merge_processing_metadata(metadata, 'client_thumbnail_rejected', None)
             mark_step_done(user_id, filename, 'thumbnail', result={
                 'source': origin,
                 'clientAssetId': client_asset_id,
@@ -8565,6 +8578,7 @@ def _apply_client_processing_results(
     if (
         not thumbnail_already_uploaded
         and not had_thumbnail_before
+        and not thumbnail_verification_failed
         and (
             _client_report_needs_server_thumbnail_fallback(report)
             # ipworker reports failure inline via clientProcessing.thumbnail's
@@ -8595,11 +8609,23 @@ def _apply_client_processing_results(
     preview_blob_name = f'preview/{thumbnail_blob_name}.jpg'
     preview_payload = payload.get('preview')
     preview_already_uploaded = False
+    preview_verification_failed = False
     if isinstance(preview_payload, dict) and preview_payload.get('alreadyUploaded') is True:
         from benchmark_upload import verify_jpeg
         import sys
-        verify_jpeg(sys.modules[__name__], preview_blob_name, byte_cap=1_500_000, edge_cap=2048)
-        preview_already_uploaded = True
+        try:
+            verify_jpeg(sys.modules[__name__], preview_blob_name, byte_cap=1_500_000, edge_cap=2048)
+            preview_already_uploaded = True
+        except Exception as exc:
+            from upload_preparation_diagnostics import rejection_reason
+            _merge_processing_metadata(metadata, 'client_preview_rejected', {
+                'source': origin, 'clientAssetId': client_asset_id, 'rejectedAt': _utc_now(),
+                'reason': rejection_reason(exc, domain='processing'),
+            })
+            preview_payload = {}
+            preview_verification_failed = True
+            if not had_preview_before:
+                status_updates['preview_status'] = 'pending'
     if preview_payload is not None and had_preview_before:
         pass
     elif preview_payload is not None:
@@ -8614,6 +8640,7 @@ def _apply_client_processing_results(
             except Exception:
                 pass
         if preview_already_uploaded:
+            _merge_processing_metadata(metadata, 'client_preview_rejected', None)
             mark_step_done(user_id, filename, 'preview', result={
                 'source': origin,
                 'clientAssetId': client_asset_id,
@@ -8629,6 +8656,7 @@ def _apply_client_processing_results(
     if (
         not preview_already_uploaded
         and not had_preview_before
+        and not preview_verification_failed
         and not is_video_file(filename)
         and (
             _client_report_needs_server_preview_fallback(report)
