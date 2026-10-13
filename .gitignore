@@ -20,6 +20,7 @@ frontend/benchmark-build/
 **/.DS_Store
 **/.claude
 codex-memory/
+.azure/
 
 # Backfill scripts
 backend/scripts/backfill_face_by_filename_table.py
