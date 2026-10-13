@@ -68,15 +68,25 @@ def test_sparse_reconstruction_and_etag_binding(monkeypatch):
         return {'Make': 'Test', 'GPS.LatitudeDecimal': '0', 'GPS.LongitudeDecimal': '0'}
     monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', extract)
     sizes = []
-    assert transport.extract_candidate(storage, 'photo.dng', row, sizes.append)['Make'] == 'Test'
+    outcomes = []
+    assert transport.extract_candidate(storage, 'photo.dng', row, sizes.append, outcomes.append)['Make'] == 'Test'
+    assert outcomes == ['reused']
     assert sizes == [len(packet)]
     assert calls[0]['etag'] == 'etag-1' and calls[0]['length'] == len(packet)
-    for result in [{}, {'FileType': 'DNG'}, {'Make': 'Test', 'Warning': 'Partial'}, {'Make': 'Test', 'EXIF.Truncated': 'true'}]:
+    for result, reason in [({}, 'no_exif'), ({'FileType': 'DNG'}, 'unqualified_exif'),
+                           ({'Make': 'Test', 'Warning': 'Partial'}, 'exiftool_warning'),
+                           ({'Make': 'Test', 'EXIF.Truncated': 'true'}, 'exiftool_warning')]:
         monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: result)
-        assert transport.extract_candidate(storage, 'photo.dng', row) is None
+        assert transport.extract_candidate(storage, 'photo.dng', row, on_outcome=outcomes.append) is None
+        assert outcomes[-1] == reason
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', extract)
+    assert transport.extract_candidate(storage, 'photo.dng', row,
+        on_outcome=lambda _: (_ for _ in ()).throw(RuntimeError('diagnostics failed')))['Make'] == 'Test'
     row['anonymousImageId'] = 'replacement'
-    assert transport.extract_candidate(storage, 'photo.dng', row) is None
-    assert transport.extract_candidate(storage, 'photo.iiq', row) is None
+    assert transport.extract_candidate(storage, 'photo.dng', row, on_outcome=outcomes.append) is None
+    assert outcomes[-1] == 'binding_validation_failed'
+    assert transport.extract_candidate(storage, 'photo.iiq', row, on_outcome=outcomes.append) is None
+    assert outcomes[-1] == 'unqualified_family'
 
 
 def test_candidate_is_durable_without_marking_exif_done(monkeypatch):

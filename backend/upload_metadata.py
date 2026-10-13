@@ -96,24 +96,35 @@ def decode_packet(packet, descriptor, source_size):
     return decoded
 
 
-def extract_candidate(storage, filename, row, on_download=None):
+def extract_candidate(storage, filename, row, on_download=None, on_outcome=None):
     """Return EXIF or None for original fallback. Never trust packet-only no_data."""
     from azure.core import MatchConditions
     from exif_utils import _extract_exiftool_from_path
+    def outcome(reason):
+        if on_outcome:
+            try:
+                on_outcome(reason)
+            except Exception:
+                pass
     if not qualified_family(filename):
+        outcome('unqualified_family')
         return None
+    phase = 'binding_validation'
     try:
         candidate = json.loads(row.get('uploadMetadataPacket') or '{}')
         descriptor = validate_descriptor(candidate, row.get('fileHash'))
         source_size = _integer(candidate.get('sourceSize'), 1, MAX_SOURCE_BYTES)
         if candidate.get('physical') != row.get('anonymousImageId') or source_size != int(row.get('size') or 0) or not candidate.get('etag'):
             raise ValueError('Stale metadata binding')
+        phase = 'packet_download'
         blob = storage._get_blob_client(storage._CTX['blob_thumbnail_container'], packet_blob_name(candidate['physical']))
         packet = blob.download_blob(offset=0, length=descriptor['bytes'], etag=candidate['etag'],
                                     match_condition=MatchConditions.IfNotModified).readall()
         if on_download:
             on_download(len(packet))
+        phase = 'packet_validation'
         ranges = decode_packet(packet, descriptor, source_size)
+        phase = 'exiftool_extraction'
         with tempfile.TemporaryDirectory(prefix='photostore-metadata-') as directory:
             path = os.path.join(directory, 'source' + Path(filename).suffix.lower())
             # Sparse holes preserve the original offsets without copying sensor pixels.
@@ -124,12 +135,16 @@ def extract_candidate(storage, filename, row, on_download=None):
                     handle.write(data)
             exif = _extract_exiftool_from_path(path)
         if not exif or any(key in exif for key in ('Warning', 'Error', 'EXIF.Truncated')):
+            outcome('exiftool_warning' if exif else 'no_exif')
             return None
         # File/system tags alone do not establish complete or absent EXIF.
         if not any(key in exif for key in ('Make', 'Model', 'DateTimeOriginal', 'GPS.LatitudeDecimal', 'Orientation')):
+            outcome('unqualified_exif')
             return None
         for key in ('FileModifyDate', 'FileAccessDate', 'FileInodeChangeDate', 'FilePermissions'):
             exif.pop(key, None)
+        outcome('reused')
         return exif
     except Exception:
+        outcome(phase + '_failed')
         return None

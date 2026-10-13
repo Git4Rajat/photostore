@@ -49,6 +49,22 @@ def test_bad_packet_does_not_fail_original_finalization(context, monkeypatch, ba
     assert 'queue' in context
 
 
+@pytest.mark.parametrize('batch', [False, True])
+def test_receipt_reaches_both_finalize_routes_before_enqueue(context, monkeypatch, batch):
+    from unittest.mock import Mock
+    receipt = Mock(side_effect=lambda *args, **kwargs: context.append('receipt'))
+    monkeypatch.setattr(upload, 'record_receipt', receipt)
+    item = {'filename': 'photo.cr3', 'blobName': 'physical', 'totalSize': 100,
+            'preparationReport': {'version': 1, 'assets': {}}}
+    with app.app.test_request_context('/upload/finalize-batch' if batch else '/upload/finalize', method='POST',
+                                     json={'files': [item]} if batch else item):
+        response = upload.finalize_upload_batch() if batch else upload.finalize_direct_upload()
+    assert response.status_code == 200
+    assert receipt.call_args.args[2] == 'renamed.cr3'
+    assert receipt.call_args.args[3]['preparationReport'] == item['preparationReport']
+    assert context.index('receipt') < context.index('queue')
+
+
 @pytest.mark.parametrize('enabled', [False, True])
 @pytest.mark.parametrize('batch', [False, True])
 def test_metadata_sas_is_capability_gated(context, monkeypatch, enabled, batch):

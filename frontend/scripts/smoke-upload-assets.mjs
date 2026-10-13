@@ -169,6 +169,12 @@ try {
         assert.equal(pipeline.prepared.clientProcessing.preview.alreadyUploaded, true);
         assert.equal(pipeline.prepared.clientProcessing.thumbnail.alreadyUploaded, true);
         assert.equal(pipeline.prepared.clientMetadata.version, 1);
+        assert.equal(pipeline.prepared.preparationReport.version, 1);
+        for (const kind of ['preview', 'thumbnail', 'metadata']) {
+            assert.equal(pipeline.prepared.preparationReport.assets[kind].generation, 'generated');
+            assert.equal(pipeline.prepared.preparationReport.assets[kind].upload, 'uploaded');
+            assert.equal(pipeline.prepared.preparationReport.assets[kind].httpStatus, 201);
+        }
         console.log(JSON.stringify({pipeline: 'passed', ...pipeline}));
     }
     await page.evaluate(() => window.preparer.dispose());

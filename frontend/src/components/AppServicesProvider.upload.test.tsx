@@ -161,7 +161,8 @@ describe('browser upload selection and startup', () => {
         expect(finalizedFiles()).toHaveLength(0);
         expect(initFiles()[0]).toMatchObject({includePreview: true, includeMetadata: true});
         const prepared = {clientProcessing: {preview: {alreadyUploaded: true}},
-            clientMetadata: {version: 1, bytes: 400, sha256: 'b'.repeat(64), sourceSha256: 'a'.repeat(64)}};
+            clientMetadata: {version: 1, bytes: 400, sha256: 'b'.repeat(64), sourceSha256: 'a'.repeat(64)},
+            preparationReport: {version: 1, elapsedMs: 200, assets: {preview: {target: true, generation: 'generated', upload: 'uploaded'}}}};
         await act(async () => { resolvePreparation(prepared); });
         await advance(4000);
         expect(finalizedFiles()[0]).toMatchObject({...prepared, blobName: 'blob-original-0.heic'});

@@ -14865,11 +14865,14 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                     from upload_metadata import extract_candidate
                     packet_started = time.monotonic()
                     packet_exif = extract_candidate(storage_utils, filename, get_source_metadata(),
-                        on_download=lambda size: _ipwork_metric('metadata_packet_download_bytes', count=size))
+                        on_download=lambda size: _ipwork_metric('metadata_packet_download_bytes', count=size),
+                        on_outcome=lambda reason: worker_logger.info('ipwork metadata outcome user=%s file=%s reason=%s', user_id, filename, reason))
                     if packet_exif is not None:
                         _ipwork_metrics_context.source_bytes = int(get_source_metadata().get('size') or 0)
                     _ipwork_metric('metadata_packet', duration_ms=(time.monotonic() - packet_started) * 1000, observation=True)
                     _ipwork_metric('metadata_packet_reused' if packet_exif is not None else 'metadata_packet_fallback')
+                elif processor is ipwork_geo.process_exif:
+                    worker_logger.info('ipwork metadata outcome user=%s file=%s reason=not_submitted', user_id, filename)
             if step == 'map_detection' and IPWORK_REUSE_EXIF and not use_original:
                 import ipwork_geo
                 if processor is ipwork_geo.process_geo:
@@ -14882,6 +14885,10 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                     if geo_exif is not None:
                         _ipwork_metric('geo_metadata_reused')
             image_bytes = get_image_bytes(step) if geo_exif is None and packet_exif is None else None
+            input_kind = ('metadata_packet' if packet_exif is not None else 'stored_exif' if geo_exif is not None
+                          else 'preview' if visual_bytes_cache and image_bytes is visual_bytes_cache[0] else 'original')
+            worker_logger.info('ipwork input user=%s file=%s step=%s source=%s bytes=%d',
+                               user_id, filename, step, input_kind, len(image_bytes) if image_bytes is not None else 0)
         except Exception as exc:
             worker_logger.exception('ipworker image download failed for %s/%s', user_id, filename)
             client_processing[step] = _failure_shape(step, 'download_failed')

@@ -50,8 +50,8 @@ test('timeout includes queue waiting and terminates active work', async () => {
     const active = service.prepare(new File(['raw'], 'a.CR3'));
     const queued = service.prepare(new File(['raw'], 'b.CR3'));
     await vi.advanceTimersByTimeAsync(100);
-    expect(await active).toEqual({status: 'fallback', reason: 'timeout'});
-    expect(await queued).toEqual({status: 'fallback', reason: 'timeout'});
+    expect(await active).toEqual({status: 'fallback', reason: 'timeout', failureReason: 'generation_timeout'});
+    expect(await queued).toEqual({status: 'fallback', reason: 'timeout', failureReason: 'generation_queue_timeout'});
     expect(factory).toHaveBeenCalledTimes(1);
     expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
     service.dispose();
@@ -72,11 +72,11 @@ test('abort cancels active work and frees the next job', async () => {
 
 test('handles worker startup and generation failures without throwing into upload lanes', async () => {
     const unsupported = new UploadAssetPreparer(() => { throw new Error('Worker unavailable'); });
-    expect(await unsupported.prepare(new File(['raw'], 'a.CR3'))).toEqual({status: 'fallback', reason: 'unsupported'});
+    expect(await unsupported.prepare(new File(['raw'], 'a.CR3'))).toEqual({status: 'fallback', reason: 'unsupported', failureReason: 'worker_start_failed'});
     const service = new UploadAssetPreparer(factory);
     const pending = service.prepare(new File(['raw'], 'a.CR3'));
     complete(0, {status: 'failed', error: 'Decoder unsupported'});
-    expect(await pending).toEqual({status: 'fallback', reason: 'generation_failed'});
+    expect(await pending).toMatchObject({status: 'fallback', reason: 'generation_failed', failureReason: 'generation_failed'});
     service.dispose();
 });
 
@@ -84,7 +84,7 @@ test('rejects oversized or invalid worker outputs', async () => {
     const service = new UploadAssetPreparer(factory);
     const pending = service.prepare(new File(['raw'], 'a.CR3'));
     complete(0, {status: 'generated', preview: {...jpeg(), width: 4096}, thumbnail: jpeg()});
-    expect(await pending).toEqual({status: 'fallback', reason: 'generation_failed'});
+    expect(await pending).toMatchObject({status: 'fallback', reason: 'generation_failed', failureReason: 'invalid_derivative'});
     service.dispose();
 });
 

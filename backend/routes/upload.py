@@ -12,6 +12,7 @@ from upload_diagnostics import instrument_upload, timed_call, upload_count, uplo
 import app
 from benchmark_upload import authorize_entry, validate_finalization, isolated
 from upload_metadata import uploads_enabled, qualified_family, packet_blob_name, stamp_candidate
+from upload_preparation_diagnostics import record_receipt, rejection_reason, metadata_offer_reason
 
 upload_bp = Blueprint('upload', __name__)
 upload_bp.teardown_request(upload_teardown)
@@ -189,6 +190,7 @@ def init_upload():
         'thumbnailBlobUrl': thumbnail_blob_url,
         'previewBlobUrl': preview_blob_url,
         'metadataBlobUrl': metadata_blob_url,
+        'metadataPreparationReason': metadata_offer_reason(data.get('includeMetadata') and direct, anonymous_blob_name, filename, metadata_blob_url),
         'uploadPreparationEnabled': bool(anonymous_blob_name and uploads_enabled()),
         'processingIsolated': bool(benchmark_fields),
         'blobName': anonymous_blob_name or filename,
@@ -326,6 +328,7 @@ def init_upload_batch():
             'thumbnailBlobUrl': thumbnail_blob_url,
             'previewBlobUrl': preview_blob_url,
             'metadataBlobUrl': metadata_blob_url,
+            'metadataPreparationReason': metadata_offer_reason(p['include_metadata'], anonymous_blob_name, filename, metadata_blob_url),
             'uploadPreparationEnabled': bool(anonymous_blob_name and uploads_enabled()),
             'processingIsolated': bool(p['benchmark_fields']),
             'blobName': anonymous_blob_name or filename,
@@ -476,6 +479,7 @@ def finalize_direct_upload():
             }), 422
     except Exception:
         pass
+    processing_rejection = None
     if data.get('clientProcessing') or data.get('clientProcessingReport'):
         try:
             metadata = timed_call('client_processing', app.apply_client_processing_results_for_file,
@@ -485,18 +489,25 @@ def finalize_direct_upload():
                 client_processing_report=data.get('clientProcessingReport'),
                 client_asset_id=str(data.get('clientAssetId') or data.get('uploadId') or ''),
             )
-        except Exception:
+        except Exception as exc:
+            processing_rejection = rejection_reason(exc, domain='processing')
             app.app.logger.exception('Inline client processing update failed for %s', final_name)
     try:
         metadata = metadata or timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
     except Exception:
         pass
+    packet_accepted = False
+    packet_rejection = 'backend_disabled' if not uploads_enabled() else 'processing_isolated' if isolated(metadata) else None
     if not duplicates and not isolated(metadata) and data.get('clientMetadata'):
         try:
             timed_call('metadata_packet', stamp_candidate, app, user_id, final_name, data['clientMetadata'],
                        anonymous_blob_name, total_size, str(data.get('sha256') or ''))
-        except Exception:
+            packet_accepted = uploads_enabled()
+        except Exception as exc:
+            packet_rejection = rejection_reason(exc)
             app.app.logger.info('Metadata sidecar rejected; original fallback retained for %s', final_name)
+    record_receipt(app, user_id, final_name, data, packet_accepted=packet_accepted,
+                   packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
     try:
         timed_call('enqueues', app._queue_upload_processing, user_id, final_name)
     except Exception:
@@ -659,6 +670,7 @@ def finalize_upload_batch():
             })
             continue
 
+        processing_rejection = None
         if item.get('clientProcessing') or item.get('clientProcessingReport'):
             try:
                 metadata = timed_call('client_processing', app.apply_client_processing_results_for_file,
@@ -668,18 +680,25 @@ def finalize_upload_batch():
                     client_processing_report=item.get('clientProcessingReport'),
                     client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
                 )
-            except Exception:
+            except Exception as exc:
+                processing_rejection = rejection_reason(exc, domain='processing')
                 app.app.logger.exception('Inline client processing update failed for %s', final_name)
         try:
             metadata = metadata or timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
         except Exception:
             pass
+        packet_accepted = False
+        packet_rejection = 'backend_disabled' if not uploads_enabled() else 'processing_isolated' if isolated(metadata) else None
         if not duplicates and not isolated(metadata) and item.get('clientMetadata'):
             try:
                 timed_call('metadata_packet', stamp_candidate, app, user_id, final_name, item['clientMetadata'],
                            anonymous_blob_name, total_size, str(item.get('sha256') or ''))
-            except Exception:
+                packet_accepted = uploads_enabled()
+            except Exception as exc:
+                packet_rejection = rejection_reason(exc)
                 app.app.logger.info('Metadata sidecar rejected; original fallback retained for %s', final_name)
+        record_receipt(app, user_id, final_name, item, packet_accepted=packet_accepted,
+                       packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
         try:
             timed_call('enqueues', app._queue_upload_processing, user_id, final_name)
         except Exception:

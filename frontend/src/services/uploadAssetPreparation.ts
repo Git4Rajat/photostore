@@ -1,4 +1,5 @@
 import {isRawFilename, isVideoFilename} from '../utils/photoDisplay';
+import {preparationFailureReason} from '../utils/uploadPreparationDiagnostics';
 import {
     UPLOAD_PREVIEW_MAX_EDGE, UPLOAD_PREVIEW_MAX_BYTES, UPLOAD_THUMBNAIL_MAX_EDGE, UPLOAD_THUMBNAIL_MAX_BYTES,
     validUploadDerivative, type UploadDerivative,
@@ -6,7 +7,7 @@ import {
 
 export type UploadPreparationResult = {
     status: 'generated'; preview: UploadDerivative; thumbnail: UploadDerivative;
-} | {status: 'fallback'; reason: string};
+} | {status: 'fallback'; reason: string; failureReason?: string};
 
 type PreparationWorker = Pick<Worker, 'postMessage' | 'terminate' | 'onmessage' | 'onerror'>;
 type WorkerFactory = (raw: boolean) => PreparationWorker;
@@ -33,7 +34,8 @@ export class UploadAssetPreparer {
         return new Promise(resolve => {
             const job = {file, options, resolve, settled: false, deadline: Date.now() + this.timeoutMs} as Job;
             job.abort = () => this.finish(job, {status: 'fallback', reason: 'aborted'});
-            job.timer = setTimeout(() => this.finish(job, {status: 'fallback', reason: 'timeout'}), this.timeoutMs);
+            job.timer = setTimeout(() => this.finish(job, {status: 'fallback', reason: 'timeout',
+                failureReason: job.worker ? 'generation_timeout' : 'generation_queue_timeout'}), this.timeoutMs);
             options.signal?.addEventListener('abort', job.abort, {once: true});
             this.queue.push(job);
             this.pump();
@@ -62,7 +64,7 @@ export class UploadAssetPreparer {
         const job = this.queue.shift()!;
         this.active = job;
         if (Date.now() >= job.deadline) {
-            this.finish(job, {status: 'fallback', reason: 'timeout'});
+            this.finish(job, {status: 'fallback', reason: 'timeout', failureReason: 'generation_queue_timeout'});
             return;
         }
         try {
@@ -77,12 +79,13 @@ export class UploadAssetPreparer {
                     && validUploadDerivative(preview, UPLOAD_PREVIEW_MAX_EDGE, UPLOAD_PREVIEW_MAX_BYTES)
                     && validUploadDerivative(thumbnail, UPLOAD_THUMBNAIL_MAX_EDGE, UPLOAD_THUMBNAIL_MAX_BYTES)) {
                     this.finish(job, {status: 'generated', preview, thumbnail});
-                } else this.finish(job, {status: 'fallback', reason: 'generation_failed'});
+                } else this.finish(job, {status: 'fallback', reason: 'generation_failed',
+                    failureReason: result?.status === 'generated' ? 'invalid_derivative' : result?.failureReason || preparationFailureReason(result?.error)});
             };
-            worker.onerror = () => this.finish(job, {status: 'fallback', reason: 'generation_failed'});
+            worker.onerror = () => this.finish(job, {status: 'fallback', reason: 'generation_failed', failureReason: 'worker_error'});
             worker.postMessage({file: job.file, preserveEligibleJpeg: !!job.options.preserveEligibleJpeg, maxMegapixels: 120, maxBytes: 256 * 1024 * 1024});
         } catch {
-            this.finish(job, {status: 'fallback', reason: 'unsupported'});
+            this.finish(job, {status: 'fallback', reason: 'unsupported', failureReason: 'worker_start_failed'});
         }
     }
 }

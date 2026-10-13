@@ -1127,6 +1127,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         blobName?: string;
         clientLastModified?: number;
         clientMetadata?: UploadMetadataDescriptor;
+        preparationReport?: PreparedUpload['preparationReport'];
         resolve: (value: any) => void;
         reject: (err: unknown) => void;
     }>>([]);
@@ -2100,8 +2101,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchFinalizeRef.current;
         pendingBatchFinalizeRef.current = [];
         runGatedRequestWithRetry(gate, '/upload/finalize-batch', {
-            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata }) => ({
-                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata,
+            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport }) => ({
+                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport,
             })),
         })
             .then((response) => {
@@ -2132,6 +2133,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         blobName?: string;
         clientLastModified?: number;
         clientMetadata?: UploadMetadataDescriptor;
+        preparationReport?: PreparedUpload['preparationReport'];
     }): Promise<any> => (
         new Promise((resolve, reject) => {
             // Same same-filename guard as requestBatchedInit -- two entries
@@ -3502,9 +3504,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 onUploadInitialized: (uploadId, blobName, sha256, targets) => {
                                     resolvedBlobName = blobName;
                                     updatePersistedFile(fileMeta.key, { uploadId, blobName });
-                                    preparation = targets.uploadPreparationEnabled
-                                        ? uploadPreparation?.start(resolvedFile, sha256, targets, controller.signal) || Promise.resolve({})
-                                        : Promise.resolve({});
+                                    preparation = uploadPreparation?.start(resolvedFile, sha256,
+                                        {...targets, uploadPreparationEnabled: !!targets.uploadPreparationEnabled}, controller.signal) || Promise.resolve({});
                                 },
                                 onChunkCommitted: (bytesReceived) => {
                                     const previousBytes = lastCommittedBytesByFile.get(fileMeta.key) || 0;

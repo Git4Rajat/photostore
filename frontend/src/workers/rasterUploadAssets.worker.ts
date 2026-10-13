@@ -1,4 +1,5 @@
 import {eligibleUploadJpeg, generateUploadPreview, generateUploadThumbnail} from '../utils/uploadDerivatives';
+import {preparationFailureReason} from '../utils/uploadPreparationDiagnostics';
 
 self.onmessage = async ({data: {file, preserveEligibleJpeg = false, maxMegapixels = 120}}: MessageEvent) => {
     let bitmap: ImageBitmap | undefined;
@@ -11,8 +12,8 @@ self.onmessage = async ({data: {file, preserveEligibleJpeg = false, maxMegapixel
             : await generateUploadPreview(bitmap);
         const thumbnail = await generateUploadThumbnail(bitmap);
         self.postMessage({status: 'generated', preview, thumbnail, source: 'browser_raster'});
-    } catch {
-        self.postMessage({status: 'fallback', reason: 'generation_failed'});
+    } catch (error) {
+        self.postMessage({status: 'fallback', reason: 'generation_failed', failureReason: preparationFailureReason(error)});
     } finally {
         bitmap?.close();
     }
