@@ -158,7 +158,7 @@ def _photo_processing_complete(entity: Dict) -> bool:
         if status not in _PROCESSING_STEP_TERMINAL_STATUSES:
             return False
     return True
-HEIF_EXTENSIONS = {'heic', 'heif'}
+HEIF_EXTENSIONS = {'heic', 'heif', 'hif'}
 CLIENT_PROCESSING_ALLOWED_REASONS = {
     'done',
     'offline',

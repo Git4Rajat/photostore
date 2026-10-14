@@ -1,6 +1,6 @@
 import {extractRanges} from './metadataRanges';
 
-export const METADATA_PACKET_MAX_BYTES = 4 * 1024 * 1024;
+export const METADATA_PACKET_MAX_BYTES = 8 * 1024 * 1024;
 export interface UploadMetadataDescriptor {version: 1; bytes: number; sha256: string; sourceSha256: string;}
 export interface UploadMetadataPacket {blob: Blob; descriptor: UploadMetadataDescriptor;}
 

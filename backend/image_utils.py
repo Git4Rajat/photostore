@@ -38,7 +38,7 @@ RAW_EXTENSIONS_CINEMA = {
 
 PILLOW_NATIVE = {
     'tif', 'tiff', 'jpg', 'jpeg', 'png',
-    'webp', 'heic', 'heif', 'bmp', 'gif', 'jxl',
+    'webp', 'heic', 'heif', 'hif', 'bmp', 'gif', 'jxl',
 }
 
 # .tif/.tiff is PILLOW_NATIVE for upload validation/browser-display purposes
@@ -69,7 +69,7 @@ ALLOWED_EXTENSIONS = PILLOW_NATIVE | RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEM
 # <img src>, so the frontend must fetch a backend-converted JPEG preview instead of
 # trying to display the original bytes (mirrors frontend/src/utils/photoDisplay.ts's
 # requiresBackendPreview).
-BROWSER_UNVIEWABLE_EXTENSIONS = RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | {'heic', 'heif', 'jxl'}
+BROWSER_UNVIEWABLE_EXTENSIONS = RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | {'heic', 'heif', 'hif', 'jxl'}
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:

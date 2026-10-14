@@ -1,6 +1,6 @@
 import {Blob as NodeBlob} from 'node:buffer';
 import {webcrypto} from 'node:crypto';
-import {createUploadMetadata} from './uploadMetadata';
+import {createUploadMetadata, METADATA_PACKET_MAX_BYTES} from './uploadMetadata';
 
 beforeEach(() => { vi.stubGlobal('Blob', NodeBlob); vi.stubGlobal('crypto', webcrypto); });
 afterEach(() => vi.unstubAllGlobals());
@@ -57,4 +57,21 @@ test('JPEG header transport stops before sensor/scan bytes', async () => {
     expect(manifest.kind).toBe('jpeg-header-ranges');
     expect(manifest.ranges).toEqual([{offset: 0, length: 256}]);
     expect(packet.length - 4 - length).toBe(256);
+});
+
+test('approved 8 MiB metadata cap transports a CAMF block larger than 4 MiB', async () => {
+    expect(METADATA_PACKET_MAX_BYTES).toBe(8 * 1024 * 1024);
+    const length = 4 * 1024 * 1024 + 4096;
+    const bytes = new Uint8Array(length + 4096), view = new DataView(bytes.buffer);
+    bytes.set(new TextEncoder().encode('FOVb'));
+    const directory = bytes.length - 32;
+    view.setUint32(bytes.length - 4, directory, true);
+    bytes.set(new TextEncoder().encode('SECd'), directory);
+    view.setUint32(directory + 8, 1, true);
+    view.setUint32(directory + 12, 256, true);
+    view.setUint32(directory + 16, length, true);
+    bytes.set(new TextEncoder().encode('CAMF'), directory + 20);
+    const result = await createUploadMetadata(file(bytes), 'a'.repeat(64));
+    expect(result.blob.size).toBeGreaterThan(4 * 1024 * 1024);
+    expect(result.blob.size).toBeLessThan(METADATA_PACKET_MAX_BYTES);
 });

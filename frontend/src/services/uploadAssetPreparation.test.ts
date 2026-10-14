@@ -35,6 +35,16 @@ test('serializes decoding and starts the next file after completion', async () =
     service.dispose();
 });
 
+test.each(['heic', 'heif', 'hif', 'HIF'])('routes %s to the bounded HEIF worker', async extension => {
+    const service = new UploadAssetPreparer(factory);
+    const pending = service.prepare(new File(['heif'], 'photo.' + extension));
+    expect(factory).toHaveBeenCalledWith(false, true);
+    expect(workers[0].postMessage).toHaveBeenCalledWith(expect.objectContaining({maxMegapixels: 120, maxBytes: 256 * 1024 * 1024}));
+    complete(0);
+    expect((await pending).status).toBe('generated');
+    service.dispose();
+});
+
 test('returns busy fallback instead of growing an unbounded queue', async () => {
     const service = new UploadAssetPreparer(factory, 1);
     const active = service.prepare(new File(['raw'], 'a.CR3'));

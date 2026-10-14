@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { shouldSkipConvertedRawPreview } from './photoDisplay';
+import { FILE_ACCEPT_FILTER, isHeicFilename, requiresBackendPreview, shouldSkipConvertedRawPreview } from './photoDisplay';
+
+it.each(['heic', 'heif', 'hif', 'HIF'])('recognizes %s as HEIF with a backend preview fallback', extension => {
+    expect(isHeicFilename(`image.${extension}`)).toBe(true);
+    expect(requiresBackendPreview(`image.${extension}`)).toBe(true);
+    expect(FILE_ACCEPT_FILTER).toContain('.' + extension.toLowerCase());
+});
 
 describe('shouldSkipConvertedRawPreview', () => {
     it('does not skip on a normal (non-forced) pass', () => {

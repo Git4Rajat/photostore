@@ -1,9 +1,10 @@
 import {eligibleUploadJpeg, generateUploadPreview, generateUploadThumbnail} from '../utils/uploadDerivatives';
 import {preparationFailureReason} from '../utils/uploadPreparationDiagnostics';
 
-self.onmessage = async ({data: {file, preserveEligibleJpeg = false, maxMegapixels = 120}}: MessageEvent) => {
+self.onmessage = async ({data: {file, preserveEligibleJpeg = false, maxMegapixels = 120, maxBytes = 256 * 1024 * 1024}}: MessageEvent) => {
     let bitmap: ImageBitmap | undefined;
     try {
+        if (file.size > maxBytes) throw new Error('Resource guard: raster byte limit');
         // Native decoding applies EXIF orientation; the canvas bakes it once.
         bitmap = await createImageBitmap(file);
         if (bitmap.width * bitmap.height > maxMegapixels * 1_000_000) throw new Error('Resource guard: raster pixel limit');

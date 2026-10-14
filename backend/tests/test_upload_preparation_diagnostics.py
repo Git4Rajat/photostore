@@ -97,15 +97,28 @@ def test_receipt_preserves_independent_derivative_rejection_reason():
     assert receipt['thumbnailReason'] == 'derivative_byte_limit'
 
 
-def test_offer_reports_gates_without_expanding_formats(monkeypatch):
+def test_offer_reports_runtime_and_qualification_gates(monkeypatch):
     monkeypatch.setenv('BROWSER_UPLOAD_PREPARATION', 'false')
     assert metadata_offer_reason(True, 'id', 'photo.cr3', None) == 'backend_disabled'
     monkeypatch.setenv('BROWSER_UPLOAD_PREPARATION', 'true')
     assert metadata_offer_reason(False, 'id', 'photo.cr3', None) == 'not_requested'
     assert metadata_offer_reason(True, None, 'photo.cr3', None) == 'missing_binding'
-    assert metadata_offer_reason(True, 'id', 'photo.orf', None) == 'unqualified_family'
+    assert metadata_offer_reason(True, 'id', 'photo.ari', None) == 'unqualified_family'
+    assert metadata_offer_reason(True, 'id', 'photo.orf', 'url') is None
     assert metadata_offer_reason(True, 'id', 'photo.cr3', None) == 'target_unavailable'
     assert metadata_offer_reason(True, 'id', 'photo.cr3', 'url') is None
+
+
+def test_metadata_report_cap_matches_transport_without_widening_derivative_cap():
+    from upload_metadata import MAX_PACKET_BYTES
+    value = report()
+    value['assets']['metadata']['bytes'] = 4_800_000
+    value['assets']['preview']['bytes'] = 4_800_000
+    clean = bounded_report(value)
+    assert clean['assets']['metadata']['bytes'] == 4_800_000
+    assert 'bytes' not in clean['assets']['preview']
+    value['assets']['metadata']['bytes'] = MAX_PACKET_BYTES + 1
+    assert 'bytes' not in bounded_report(value)['assets']['metadata']
 
 
 @pytest.mark.parametrize('message,reason', [

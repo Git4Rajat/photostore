@@ -27,7 +27,7 @@ from image_utils import (
     is_video_file,
 )
 
-HEIF_EXTENSIONS = {'heic', 'heif'}
+HEIF_EXTENSIONS = {'heic', 'heif', 'hif'}
 
 
 def _filename_extension(filename: str) -> str:

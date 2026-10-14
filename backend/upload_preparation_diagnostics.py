@@ -26,6 +26,7 @@ def metadata_offer_reason(requested, physical, filename, url):
 
 
 def bounded_report(value):
+    from upload_metadata import MAX_PACKET_BYTES
     if not isinstance(value, dict) or type(value.get('version')) is not int or value['version'] != 1:
         return None
     result = {'version': 1, 'assets': {}}
@@ -50,7 +51,8 @@ def bounded_report(value):
             if type(raw.get(field)) is str and raw[field] in REASONS:
                 clean[field] = raw[field]
         for field, cap in [('generationMs', 3_600_000), ('uploadMs', 3_600_000),
-                           ('queueMs', 3_600_000), ('bytes', 4_194_304), ('httpStatus', 599), ('attempts', 3)]:
+                           ('queueMs', 3_600_000), ('bytes', MAX_PACKET_BYTES if asset == 'metadata' else 4_194_304),
+                           ('httpStatus', 599), ('attempts', 3)]:
             number = raw.get(field)
             if type(number) in (int, float) and 0 <= number <= cap and math.isfinite(number):
                 clean[field] = round(number)

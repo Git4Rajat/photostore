@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import tempfile
 
-MAX_PACKET_BYTES = 4 * 1024 * 1024
+MAX_PACKET_BYTES = 8 * 1024 * 1024
 MAX_SOURCE_BYTES = 256 * 1024 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 HASH = re.compile(r'^[a-f0-9]{64}$')
@@ -14,7 +14,9 @@ KINDS = {'tiff-ifd-ranges', 'ciff-directory-ranges', 'raf-header-jpeg-metadata-d
          'mrw-pre-sensor-header', 'x3f-directory-nonimage-sections', 'bmff-non-mdat-boxes', 'jpeg-header-ranges'}
 # Corpus-qualified families only. This is experimental, not universal camera coverage.
 QUALIFIED_EXTENSIONS = {'.arw', '.cr2', '.cr3', '.dng', '.erf', '.gpr', '.mos', '.mrw',
-                        '.nef', '.pef', '.raf', '.rw2', '.rwl', '.3fr', '.jpg', '.jpeg'}
+                        '.nef', '.pef', '.raf', '.rw2', '.rwl', '.3fr', '.jpg', '.jpeg',
+                        '.crw', '.fff', '.iiq', '.nrw', '.orf', '.ori', '.raw', '.srw',
+                        '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif'}
 
 
 def uploads_enabled():
@@ -96,7 +98,35 @@ def decode_packet(packet, descriptor, source_size):
     return decoded
 
 
-def extract_candidate(storage, filename, row, on_download=None, on_outcome=None):
+def _extraction_diagnostic(exif):
+    version = str(exif.get('ExifToolVersion') or '')
+    if not re.fullmatch(r'\d{1,3}\.\d{1,3}', version):
+        version = 'unknown'
+    warning = str(exif.get('Warning') or '')
+    category = 'none'
+    if 'Error' in exif:
+        category = 'parser_error'
+    elif 'EXIF.Truncated' in exif:
+        category = 'storage_limit'
+    elif 'Warning' in exif:
+        category = 'unclassified_warning'
+        for text, name in (
+            ('original decision data', 'canon_decision_data'),
+            ('VignettingCorr', 'canon_vignetting'),
+            ('Not decoding some large array', 'large_array_limit'),
+            ('Overlapping MakerNotes', 'overlapping_maker_notes'),
+            ('IPTC', 'iptc'),
+            ('PrintIM', 'print_im'),
+            ('UserComment', 'user_comment_encoding'),
+            ('SensorCalibration', 'sensor_calibration'),
+        ):
+            if text in warning:
+                category = name
+                break
+    return {'version': version, 'category': category}
+
+
+def extract_candidate(storage, filename, row, on_download=None, on_outcome=None, on_diagnostic=None):
     """Return EXIF or None for original fallback. Never trust packet-only no_data."""
     from azure.core import MatchConditions
     from exif_utils import _extract_exiftool_from_path
@@ -134,6 +164,11 @@ def extract_candidate(storage, filename, row, on_download=None, on_outcome=None)
                     handle.seek(offset)
                     handle.write(data)
             exif = _extract_exiftool_from_path(path)
+        if on_diagnostic:
+            try:
+                on_diagnostic(_extraction_diagnostic(exif or {}))
+            except Exception:
+                pass
         if not exif or any(key in exif for key in ('Warning', 'Error', 'EXIF.Truncated')):
             outcome('exiftool_warning' if exif else 'no_exif')
             return None

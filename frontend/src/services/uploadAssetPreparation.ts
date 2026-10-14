@@ -1,4 +1,4 @@
-import {isRawFilename, isVideoFilename} from '../utils/photoDisplay';
+import {isHeicFilename, isRawFilename, isVideoFilename} from '../utils/photoDisplay';
 import {preparationFailureReason} from '../utils/uploadPreparationDiagnostics';
 import {
     UPLOAD_PREVIEW_MAX_EDGE, UPLOAD_PREVIEW_MAX_BYTES, UPLOAD_THUMBNAIL_MAX_EDGE, UPLOAD_THUMBNAIL_MAX_BYTES,
@@ -10,14 +10,15 @@ export type UploadPreparationResult = {
 } | {status: 'fallback'; reason: string; failureReason?: string};
 
 type PreparationWorker = Pick<Worker, 'postMessage' | 'terminate' | 'onmessage' | 'onerror'>;
-type WorkerFactory = (raw: boolean) => PreparationWorker;
+type WorkerFactory = (raw: boolean, heif?: boolean) => PreparationWorker;
 interface PreparationOptions {signal?: AbortSignal; preserveEligibleJpeg?: boolean;}
 interface Job {
     file: File; options: PreparationOptions; resolve: (result: UploadPreparationResult) => void;
     timer?: ReturnType<typeof setTimeout>; abort: () => void; worker?: PreparationWorker; settled: boolean;
 }
-const createPreparationWorker: WorkerFactory = raw => raw
+const createPreparationWorker: WorkerFactory = (raw, heif = false) => raw
     ? new Worker(new URL('../workers/rawUploadAssets.worker.js', import.meta.url), {type: 'module'})
+    : heif ? new Worker(new URL('../workers/heifUploadAssets.worker.ts', import.meta.url), {type: 'module'})
     : new Worker(new URL('../workers/rasterUploadAssets.worker.ts', import.meta.url), {type: 'module'});
 
 // The caller starts this only after dedup/init, without awaiting it in a transfer lane.
@@ -64,7 +65,7 @@ export class UploadAssetPreparer {
         job.timer = setTimeout(() => this.finish(job, {status: 'fallback', reason: 'timeout',
             failureReason: 'generation_timeout'}), this.timeoutMs);
         try {
-            const worker = this.workerFactory(isRawFilename(job.file.name));
+            const worker = isHeicFilename(job.file.name) ? this.workerFactory(false, true) : this.workerFactory(isRawFilename(job.file.name));
             job.worker = worker;
             worker.onmessage = event => {
                 const result = event.data;

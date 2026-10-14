@@ -11,12 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     ffmpeg \
     libffi-dev \
-    libimage-exiftool-perl \
+    perl \
     libraw-bin \
     libssl-dev \
     libgomp1 \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/install_exiftool.py /tmp/install_exiftool.py
+RUN python /tmp/install_exiftool.py && rm /tmp/install_exiftool.py
 
 # Set workdir
 WORKDIR /app

@@ -10,7 +10,7 @@ const SUPPORTED_VIDEO_EXTENSIONS = [
     'mpeg', 'mpg', 'mts', 'webm', 'wmv',
 ] as const;
 
-const SUPPORTED_HEIC_EXTENSIONS = ['heic', 'heif'] as const;
+const SUPPORTED_HEIC_EXTENSIONS = ['heic', 'heif', 'hif'] as const;
 
 // JPEG XL: Pillow decodes it server-side (backend/image_utils.py), but no
 // mainstream browser renders it natively via <img src>, so like HEIC/RAW it
@@ -33,6 +33,7 @@ export const FILE_ACCEPT_FILTER = [
     'video/*',
     '.heic',
     '.heif',
+    '.hif',
     ...SUPPORTED_RAW_EXTENSIONS.map((ext) => `.${ext}`),
     ...SUPPORTED_VIDEO_EXTENSIONS.map((ext) => `.${ext}`),
     ...SUPPORTED_JXL_EXTENSIONS.map((ext) => `.${ext}`),

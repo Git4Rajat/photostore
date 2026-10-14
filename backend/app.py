@@ -10424,7 +10424,7 @@ def _enqueue_preview_generation_job(user_id: str, filename: str) -> Dict[str, st
 def _preview_failure_payload(filename: str) -> dict:
     """Build a structured, user-facing explanation for why a preview could not be made."""
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    if ext in {'heic', 'heif'}:
+    if ext in {'heic', 'heif', 'hif'}:
         reason = 'heic_decode_failed'
         detail = ('This HEIC/HEIF image could not be converted into a viewable preview. '
                   'It may be damaged or use an unsupported variant.')
@@ -14866,7 +14866,9 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                     packet_started = time.monotonic()
                     packet_exif = extract_candidate(storage_utils, filename, get_source_metadata(),
                         on_download=lambda size: _ipwork_metric('metadata_packet_download_bytes', count=size),
-                        on_outcome=lambda reason: worker_logger.info('ipwork metadata outcome user=%s file=%s reason=%s', user_id, filename, reason))
+                        on_outcome=lambda reason: worker_logger.info('ipwork metadata outcome user=%s file=%s reason=%s', user_id, filename, reason),
+                        on_diagnostic=lambda info: worker_logger.info('ipwork metadata diagnostic user=%s file=%s version=%s category=%s',
+                            user_id, filename, info['version'], info['category']))
                     if packet_exif is not None:
                         _ipwork_metrics_context.source_bytes = int(get_source_metadata().get('size') or 0)
                     _ipwork_metric('metadata_packet', duration_ms=(time.monotonic() - packet_started) * 1000, observation=True)
