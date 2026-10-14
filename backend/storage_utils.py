@@ -7886,7 +7886,7 @@ def _looks_like_jpeg_bytes(data: bytes) -> bool:
 
 def _create_server_thumbnail_for_upload(image_bytes: bytes, filename: str) -> Optional[bytes]:
     if is_video_file(filename):
-        return create_video_thumbnail_data(image_bytes, filename)
+        return None
     ext = _filename_extension(filename)
     if ext in HEIF_EXTENSIONS:
         preview_bytes = convert_image_to_jpeg(image_bytes, filename)
@@ -8070,6 +8070,8 @@ def _apply_exif_metadata(metadata: Dict, exif_data: Dict[str, str]) -> Tuple[str
 
 
 def _extract_server_exif_for_processing(image_bytes: bytes, filename: str) -> Dict[str, str]:
+    if is_video_file(filename):
+        return {}
     try:
         return extract_exif_from_bytes(image_bytes, filename)
     except Exception:
@@ -8451,6 +8453,9 @@ def _apply_client_processing_results(
 ) -> None:
     metadata_table_client = _CTX['metadata_table_client']
     payload = client_processing if isinstance(client_processing, dict) else {}
+    if is_video_file(filename):
+        def get_image_bytes():
+            raise ValueError('Video processing is browser-only')
     report = _normalize_client_report(client_asset_id, client_processing_report)
     if metadata.get('processingIsolated') is True:
         import sys
@@ -8505,7 +8510,7 @@ def _apply_client_processing_results(
             # Reject only this claim; keep finalization free of original reads.
             thumbnail_payload = {}
             thumbnail_verification_failed = True
-            status_updates['thumbnail_status'] = 'pending'
+            status_updates['thumbnail_status'] = 'failed' if is_video_file(filename) else 'pending'
     if (
         not thumbnail_already_uploaded
         and thumbnail_payload is None
@@ -8701,7 +8706,8 @@ def _apply_client_processing_results(
             else:
                 status_updates['exif_status'] = 'failed'
         elif exif_result.get('hasData') is True:
-            if origin == 'ipworker' and exif_result.get('source') == 'browser_metadata_packet':
+            if ((origin == 'ipworker' and exif_result.get('source') == 'browser_metadata_packet')
+                    or (origin == 'browser_video_metadata' and exif_result.get('source') == 'browser_video_metadata')):
                 from exif_utils import _trim_exif_for_storage, _stringify_exif_value
                 exif_data = _trim_exif_for_storage({str(key): _stringify_exif_value(value)
                     for key, value in (exif_result.get('data') or {}).items()})
@@ -9274,6 +9280,8 @@ def apply_client_processing_results_for_file(
     image_bytes_cache: List[bytes] = []
 
     def get_image_bytes() -> bytes:
+        if is_video_file(filename):
+            raise ValueError('Video processing is browser-only')
         if not image_bytes_cache:
             image_bytes_cache.append(download_media_bytes('image', source_blob))
         return image_bytes_cache[0]
@@ -9328,8 +9336,8 @@ def finalize_uploaded_file(
         thumbnail attempt fails, the backend steps in reactively later, once
         the client's processing report actually says so (see
         _client_report_needs_server_thumbnail_fallback), not here;
-      * only video/RAW are downloaded eagerly, because they need a server-side
-        thumbnail or metadata the browser can't reliably produce on its own;
+      * videos require browser thumbnails/metadata and a client SHA-256;
+        their originals are never downloaded for preparation fallback;
       * the blob is only (re)written under a new name in the rare event a
         cross-tenant filename clash forces a rename.
       * anonymized images use the anonymous_blob_name instead of filename for storage.
@@ -9337,14 +9345,7 @@ def finalize_uploaded_file(
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
 
-    # Only video still needs eager bytes here (for the metadata extraction
-    # below). RAW used to be lumped in with video via _upload_needs_server_bytes
-    # -- forcing a blob re-download + synchronous decode inside this HTTP
-    # request even when the browser already sent a trustworthy hash -- but
-    # RAW's thumbnail/EXIF work is redundant with what ipworker's queued
-    # 'thumbnail'/'exif' steps already do for every upload (see
-    # _queue_upload_processing below), so there's no reason to also do it here,
-    # synchronously, on one of the backend's few gunicorn threads.
+    # Video preparation belongs to the browser even when generation fails.
     is_video = is_video_file(filename)
     blob_to_read = anonymous_blob_name or filename
 
@@ -9353,7 +9354,9 @@ def finalize_uploaded_file(
     # Fall back to reading the blob when there is no client hash to trust.
     image_bytes: Optional[bytes] = None
     client_hash = str(client_sha256 or '')
-    if is_video or not client_hash:
+    if is_video and not re.fullmatch(r'[a-f0-9]{64}', client_hash):
+        raise ValueError('Video uploads require a client SHA-256')
+    if not client_hash:
         image_bytes = timed_call('source_read', download_media_bytes, 'image', blob_to_read)
         file_hash = hashlib.sha256(image_bytes).hexdigest()
     else:
@@ -9363,6 +9366,8 @@ def finalize_uploaded_file(
     final_filename = timed_call('name_resolution', _resolve_filename_for_upload, user_id, filename, file_hash)
 
     if final_filename != filename and not anonymous_blob_name:
+        if is_video:
+            raise ValueError('Video filename collisions require anonymous storage')
         # Rare: a cross-tenant filename clash forced a unique name, so place the
         # bytes under it. (Non-renamed uploads are already stored in place, so the
         # common path moves no image data at all.)
@@ -9419,7 +9424,8 @@ def finalize_uploaded_file(
     # just written two lines earlier, purely to set these fields and write it
     # right back. Same final state, one fewer read + write per file.
     file_is_video = is_video_file(final_filename)
-    video_status_overrides = {'preview': 'skipped', 'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
+    video_status_overrides = {'preview': 'skipped', 'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped',
+                              'thumbnail': 'failed', 'exif': 'failed', 'map_detection': 'skipped'}
     status_overrides = video_status_overrides if file_is_video else {}
     for step in PROCESSING_STEPS:
         metadata[f'{step}_status'] = 'skipped' if benchmark_isolated else status_overrides.get(step, 'pending')
@@ -9434,6 +9440,12 @@ def finalize_uploaded_file(
         metadata['processing_complete'] = True
         metadata['processing_metadata'] = json.dumps({'isolation': {'reason': 'upload_only_benchmark', 'runId': metadata.get('benchmarkRunId')}})
     metadata['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+    if file_is_video:
+        metadata['videoBrowserOnly'] = True
+        metadata['processing_complete'] = _photo_processing_complete(metadata)
+        if not benchmark_isolated:
+            metadata['processing_metadata'] = json.dumps({'video_preparation': {'source': 'browser',
+                'reason': 'browser_assets_required', 'backendFallback': False}})
 
     with upload_phase('persistence'):
         metadata_table_client.upsert_entity(metadata)
@@ -9455,38 +9467,6 @@ def finalize_uploaded_file(
         timed_call('persistence', _store_hash_index, user_id, file_hash, final_filename)
     timed_call('persistence', _store_filename_owner, user_id, final_filename, file_hash)
 
-    # Server-side thumbnail / metadata extraction, eagerly, here -- video only.
-    # RAW used to get this treatment too, but it's redundant: ipworker's queued
-    # 'thumbnail'/'exif' steps (_queue_upload_processing, below) call the exact
-    # same helpers for every uploaded photo, including RAW, so doing it again
-    # here just duplicated the work while holding a gunicorn thread for as long
-    # as the RAW decode took (measured multi-second to ~60s on real CR3 files).
-    # RAW capture dates and thumbnails now show up whenever ipworker gets to
-    # them instead of instantly -- an intentional trade (see the "own highway"
-    # discussion): correctness-only background work no longer blocks the
-    # upload-critical path.
-    if file_is_video and image_bytes is not None:
-        try:
-            thumbnail_bytes = _create_server_thumbnail_for_upload(image_bytes, final_filename)
-            if thumbnail_bytes:
-                # Use anonymous ID for thumbnail if image was anonymized
-                thumbnail_blob_name = metadata.get('anonymousImageId') or final_filename
-                upload_media_file('thumbnail', thumbnail_blob_name, thumbnail_bytes, 'image/jpeg')
-                mark_step_done(user_id, final_filename, 'thumbnail', result={
-                    'source': 'server',
-                    'reason': 'video_browser_unsupported',
-                })
-        except Exception:
-            pass
-        try:
-            _finalize_server_side_exif(
-                user_id,
-                final_filename,
-                image_bytes,
-                fallback_for='video_upload',
-            )
-        except Exception:
-            pass
     return duplicates, final_filename
 
 
@@ -9494,6 +9474,8 @@ def _finalize_server_side_exif(user_id: str, filename: str, image_bytes: bytes, 
     """Extract EXIF (exiftool) server-side so capture-date sort/search works
     immediately for formats the browser can't reliably self-report (video,
     RAW), instead of waiting on client-side processing."""
+    if is_video_file(filename):
+        return
     metadata_table_client = _CTX['metadata_table_client']
     try:
         entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)

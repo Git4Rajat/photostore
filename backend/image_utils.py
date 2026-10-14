@@ -61,6 +61,7 @@ RAW_EXTENSIONS_TIFF_CONTAINER = {'tif', 'tiff'}
 VIDEO_EXTENSIONS = {
     'mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv',
     '3gp', '3g2', 'mts', 'm2ts', 'mpg', 'mpeg', 'wmv',
+    'asf', 'flv', 'm2v', 'mxf', 'ogv', 'ts', 'vob', 'braw', 'r3d', 'crm', 'nev',
 }
 
 ALLOWED_EXTENSIONS = PILLOW_NATIVE | RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | VIDEO_EXTENSIONS
@@ -69,7 +70,7 @@ ALLOWED_EXTENSIONS = PILLOW_NATIVE | RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEM
 # <img src>, so the frontend must fetch a backend-converted JPEG preview instead of
 # trying to display the original bytes (mirrors frontend/src/utils/photoDisplay.ts's
 # requiresBackendPreview).
-BROWSER_UNVIEWABLE_EXTENSIONS = RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | {'heic', 'heif', 'hif', 'jxl'}
+BROWSER_UNVIEWABLE_EXTENSIONS = (RAW_EXTENSIONS_RAWPY | RAW_EXTENSIONS_CINEMA | {'heic', 'heif', 'hif', 'jxl'}) - VIDEO_EXTENSIONS
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:

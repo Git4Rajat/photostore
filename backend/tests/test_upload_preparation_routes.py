@@ -83,3 +83,27 @@ def test_metadata_sas_is_capability_gated(context, monkeypatch, enabled, batch):
     assert value['uploadPreparationEnabled'] is enabled
     assert value['metadataBlobUrl'] == ('url-metadata/physical.bin' if enabled else None)
     assert ('metadata/physical.bin' in urls) is enabled
+
+
+@pytest.mark.parametrize('batch', [False, True])
+@pytest.mark.parametrize('valid', [False, True])
+def test_video_metadata_is_applied_inline_and_bad_packet_does_not_reject_original(context, monkeypatch, batch, valid):
+    import video_metadata
+    monkeypatch.setenv('BROWSER_UPLOAD_PREPARATION', 'false')
+    monkeypatch.setattr(app, 'finalize_uploaded_file', lambda *_, **__: (context.append('original') or [], 'clip.mp4'))
+    def apply(*_):
+        context.append('video_metadata')
+        if not valid:
+            raise ValueError('Invalid video metadata candidate')
+        return {'exif_status': 'done'}
+    monkeypatch.setattr(video_metadata, 'apply_browser_video_metadata', apply)
+    receipts = []
+    monkeypatch.setattr(upload, 'record_receipt', lambda *args, **kwargs: receipts.append(kwargs))
+    item = {'filename': 'clip.mp4', 'blobName': 'physical', 'totalSize': 100, 'sha256': 'a' * 64, 'clientMetadata': {'version': 1}}
+    with app.app.test_request_context('/upload/finalize-batch' if batch else '/upload/finalize', method='POST',
+                                     json={'files': [item]} if batch else item):
+        response = upload.finalize_upload_batch() if batch else upload.finalize_direct_upload()
+    value = response.get_json()['results'][0] if batch else response.get_json()
+    assert value['complete'] is True
+    assert receipts[0]['packet_accepted'] is valid
+    assert context.index('original') < context.index('video_metadata') < context.index('queue')

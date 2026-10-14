@@ -18,14 +18,18 @@ EXPECTED = '[Minor] Not decoding some large array(s). Ignore minor errors to dec
     ([{'Warning': EXPECTED}, {'Warning': EXPECTED}], False),
     ({'Warning': EXPECTED}, False),
 ])
-def test_all_diagnostics_must_be_the_exact_allowed_warning(monkeypatch, output, allowed):
+@pytest.mark.parametrize('suffix', ['', ' [x2]', ' [x3]'])
+def test_all_diagnostics_must_be_the_exact_allowed_warning(monkeypatch, output, allowed, suffix):
+    expected = EXPECTED + suffix
+    if isinstance(output, list):
+        output = [{key: expected if value == EXPECTED else value for key, value in row.items()} for row in output]
     monkeypatch.setattr(exif_utils.shutil, 'which', lambda _: '/usr/bin/exiftool')
     calls = []
     def run(args, **kwargs):
         calls.append((args, kwargs))
         return SimpleNamespace(returncode=0, stdout=json.dumps(output).encode(), stderr=b'')
     monkeypatch.setattr(exif_utils.subprocess, 'run', run)
-    assert exif_utils._exiftool_has_only_warning('photo.dng', EXPECTED) is allowed
+    assert exif_utils._exiftool_has_only_warning('photo.dng', expected) is allowed
     assert calls[0][0] == ['/usr/bin/exiftool', '-j', '-G4', '-Warning', '-Error', 'photo.dng']
     assert calls[0][1]['timeout'] == exif_utils.EXIFTOOL_TIMEOUT_SECONDS
 

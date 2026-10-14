@@ -3836,6 +3836,8 @@ def _enqueue_processing_steps(
     force: bool = False,
     visibility_timeout: int = 0,
 ) -> Dict[str, Dict[str, str]]:
+    if is_video_file(filename):
+        return {step: {'status': 'skipped', 'reason': 'video_browser_only'} for step in steps}
     results: Dict[str, Dict[str, str]] = {}
     entity = _get_metadata_entity(user_id, filename)
     if entity is None:
@@ -10394,6 +10396,8 @@ def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
 
 
 def _enqueue_preview_generation_job(user_id: str, filename: str) -> Dict[str, str]:
+    if is_video_file(filename):
+        return {'status': 'skipped', 'reason': 'video_browser_only'}
     if filename.startswith('rawbench-'):
         entity = _get_metadata_entity(user_id, filename)
         if not entity or entity.get('processingIsolated') is True:
@@ -11314,6 +11318,8 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
     to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
     silently redo more than was asked.
     """
+    if is_video_file(filename):
+        return {'status': 'skipped', 'reason': 'video_browser_only'}
     if filename.startswith('rawbench-'):
         entity = _get_metadata_entity(user_id, filename)
         if not entity or entity.get('processingIsolated') is True:
@@ -11682,6 +11688,8 @@ def _browser_processing_face_version_stale(entity: Dict) -> bool:
 
 def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
     filename = str(entity.get('RowKey') or '').strip()
+    if is_video_file(filename):
+        return None
     if entity.get('processingIsolated') is True:
         return None
     if not filename:
@@ -11804,7 +11812,8 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
     -- otherwise every sweep interval would pile a fresh duplicate message
     onto a perfectly healthy backlog.
     """
-    if entity.get('processingIsolated') is True or str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+    if (is_video_file(str(entity.get('RowKey') or '')) or entity.get('processingIsolated') is True
+            or str(entity.get('processing_state') or '').strip().lower() == 'deleted'):
         return []
     lease_expired = _browser_processing_lease_expired(entity)
     face_version_stale = _browser_processing_face_version_stale(entity)
@@ -13565,6 +13574,10 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         return
     if job_type == PREVIEW_JOB_TYPE:
         filename = _validate_media_filename(str(payload.get('filename') or ''))
+        if filename and is_video_file(filename):
+            if job_id:
+                _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'done', filename=filename)
+            return
         if not filename:
             if job_id:
                 _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'failed', error='invalid filename')
@@ -14775,6 +14788,8 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
     Returns a dict shaped like the browser's `clientProcessing` payload so it
     can be handed straight to apply_client_processing_results_for_file.
     """
+    if is_video_file(filename):
+        return {step: {'hasData': False, 'error': 'video_browser_only'} for step in steps}
     client_processing: Dict[str, Dict] = {}
     original_bytes_cache: List[bytes] = []
     visual_bytes_cache: List[bytes] = []
@@ -14973,6 +14988,10 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     filename = str(payload.get('filename') or '').strip()
     steps = [str(s).strip() for s in (payload.get('steps') or []) if str(s).strip() in IPWORK_STEPS]
     if not filename or not user_id or not steps:
+        return 'noop'
+    if is_video_file(filename):
+        if job_id:
+            _upsert_job_status(job_id, user_id, 'ipwork', 'done')
         return 'noop'
     message_started = time.monotonic()
     _ipwork_metrics_context.source_bytes = 0

@@ -7,6 +7,7 @@ the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
 from flask import Blueprint
+import re
 from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_finalized, upload_results, upload_teardown
 
 import app
@@ -178,7 +179,7 @@ def init_upload():
     if data.get('includePreview') and direct:
         preview_blob_url, _ = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, f'preview/{anonymous_blob_name or filename}.jpg')
     metadata_blob_url = None
-    if data.get('includeMetadata') and direct and anonymous_blob_name and uploads_enabled() and qualified_family(filename):
+    if data.get('includeMetadata') and direct and anonymous_blob_name and uploads_enabled(filename) and qualified_family(filename):
         try:
             metadata_blob_url, _ = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, packet_blob_name(anonymous_blob_name))
         except Exception:
@@ -191,7 +192,7 @@ def init_upload():
         'previewBlobUrl': preview_blob_url,
         'metadataBlobUrl': metadata_blob_url,
         'metadataPreparationReason': metadata_offer_reason(data.get('includeMetadata') and direct, anonymous_blob_name, filename, metadata_blob_url),
-        'uploadPreparationEnabled': bool(anonymous_blob_name and uploads_enabled()),
+        'uploadPreparationEnabled': bool(anonymous_blob_name and uploads_enabled(filename)),
         'processingIsolated': bool(benchmark_fields),
         'blobName': anonymous_blob_name or filename,
         'originalFilename': filename,
@@ -314,7 +315,7 @@ def init_upload_batch():
         if p['include_preview']:
             preview_blob_url, _ = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, f'preview/{anonymous_blob_name or filename}.jpg')
         metadata_blob_url = None
-        if p['include_metadata'] and anonymous_blob_name and uploads_enabled() and qualified_family(filename):
+        if p['include_metadata'] and anonymous_blob_name and uploads_enabled(filename) and qualified_family(filename):
             try:
                 metadata_blob_url, _ = timed_call('sas_creation', app._create_direct_thumbnail_upload_blob_url, packet_blob_name(anonymous_blob_name))
             except Exception:
@@ -329,7 +330,7 @@ def init_upload_batch():
             'previewBlobUrl': preview_blob_url,
             'metadataBlobUrl': metadata_blob_url,
             'metadataPreparationReason': metadata_offer_reason(p['include_metadata'], anonymous_blob_name, filename, metadata_blob_url),
-            'uploadPreparationEnabled': bool(anonymous_blob_name and uploads_enabled()),
+            'uploadPreparationEnabled': bool(anonymous_blob_name and uploads_enabled(filename)),
             'processingIsolated': bool(p['benchmark_fields']),
             'blobName': anonymous_blob_name or filename,
             'originalFilename': filename,
@@ -408,6 +409,8 @@ def finalize_direct_upload():
         return app.jsonify({'error': 'Invalid filename'}), 400
     if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
         return app.jsonify({'error': 'Invalid totalSize'}), 400
+    if app.is_video_file(filename) and not re.fullmatch(r'[a-f0-9]{64}', str(data.get('sha256') or '')):
+        return app.jsonify({'error': 'Video uploads require a client SHA-256'}), 400
 
     try:
         validate_finalization(app, user_id, data, filename)
@@ -497,15 +500,19 @@ def finalize_direct_upload():
     except Exception:
         pass
     packet_accepted = False
-    packet_rejection = 'backend_disabled' if not uploads_enabled() else 'processing_isolated' if isolated(metadata) else None
+    packet_rejection = 'backend_disabled' if not uploads_enabled(final_name) else 'processing_isolated' if isolated(metadata) else None
     if not duplicates and not isolated(metadata) and data.get('clientMetadata'):
         try:
             timed_call('metadata_packet', stamp_candidate, app, user_id, final_name, data['clientMetadata'],
                        anonymous_blob_name, total_size, str(data.get('sha256') or ''))
-            packet_accepted = uploads_enabled()
+            if app.is_video_file(final_name):
+                from video_metadata import apply_browser_video_metadata
+                metadata = timed_call('metadata_packet', apply_browser_video_metadata, app, user_id, final_name,
+                                      str(data.get('clientAssetId') or data.get('uploadId') or ''))
+            packet_accepted = uploads_enabled(final_name)
         except Exception as exc:
             packet_rejection = rejection_reason(exc)
-            app.app.logger.info('Metadata sidecar rejected; original fallback retained for %s', final_name)
+            app.app.logger.info('Metadata sidecar rejected for %s; original fallback=%s', final_name, not app.is_video_file(final_name))
     record_receipt(app, user_id, final_name, data, packet_accepted=packet_accepted,
                    packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
     try:
@@ -602,6 +609,9 @@ def finalize_upload_batch():
         if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
             results.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
             continue
+        if app.is_video_file(filename) and not re.fullmatch(r'[a-f0-9]{64}', str(item.get('sha256') or '')):
+            results.append({'index': idx, 'filename': filename, 'error': 'Video uploads require a client SHA-256'})
+            continue
 
         try:
             validate_finalization(app, user_id, item, filename)
@@ -688,15 +698,19 @@ def finalize_upload_batch():
         except Exception:
             pass
         packet_accepted = False
-        packet_rejection = 'backend_disabled' if not uploads_enabled() else 'processing_isolated' if isolated(metadata) else None
+        packet_rejection = 'backend_disabled' if not uploads_enabled(final_name) else 'processing_isolated' if isolated(metadata) else None
         if not duplicates and not isolated(metadata) and item.get('clientMetadata'):
             try:
                 timed_call('metadata_packet', stamp_candidate, app, user_id, final_name, item['clientMetadata'],
                            anonymous_blob_name, total_size, str(item.get('sha256') or ''))
-                packet_accepted = uploads_enabled()
+                if app.is_video_file(final_name):
+                    from video_metadata import apply_browser_video_metadata
+                    metadata = timed_call('metadata_packet', apply_browser_video_metadata, app, user_id, final_name,
+                                          str(item.get('clientAssetId') or item.get('uploadId') or ''))
+                packet_accepted = uploads_enabled(final_name)
             except Exception as exc:
                 packet_rejection = rejection_reason(exc)
-                app.app.logger.info('Metadata sidecar rejected; original fallback retained for %s', final_name)
+                app.app.logger.info('Metadata sidecar rejected for %s; original fallback=%s', final_name, not app.is_video_file(final_name))
         record_receipt(app, user_id, final_name, item, packet_accepted=packet_accepted,
                        packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
         try:

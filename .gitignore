@@ -10,6 +10,7 @@
 frontend/build/
 frontend/.vite/
 frontend/benchmark-build/
+frontend/public/video-runtime/
 
 # Local secrets
 **/.env

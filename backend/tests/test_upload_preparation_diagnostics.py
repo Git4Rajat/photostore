@@ -24,6 +24,14 @@ def test_report_drops_untrusted_strings_and_unbounded_values():
     assert 'secret' not in json.dumps(clean)
 
 
+def test_report_preserves_embedded_video_runtime_and_bounded_reads():
+    raw = report()
+    raw['assets']['thumbnail'].update(runtime='embedded_video_jpeg', readBytes=12000, readCalls=14)
+    clean = bounded_report(raw)['assets']['thumbnail']
+    assert clean['runtime'] == 'embedded_video_jpeg'
+    assert clean['readBytes'] == 12000 and clean['readCalls'] == 14
+
+
 @pytest.mark.parametrize('value', [None, [], {'version': True}, {'version': 2}, 'secret'])
 def test_invalid_report_has_no_storage_side_effects(value):
     app = Mock()

@@ -76,7 +76,7 @@ def test_generated_preview_keeps_original_for_metadata(monkeypatch, preview_ctx)
 
 
 @pytest.mark.parametrize('filename,status,enabled', [
-    ('video.mp4', 'done', True), ('a.CR3', 'running', True), ('a.CR3', 'done', False)])
+    ('a.CR3', 'running', True), ('a.CR3', 'done', False)])
 def test_preview_requires_enabled_ready_photo(monkeypatch, preview_ctx, filename, status, enabled):
     _, calls, _ = preview_ctx
     monkeypatch.setattr(app, 'IPWORK_REUSE_PREVIEW', enabled)

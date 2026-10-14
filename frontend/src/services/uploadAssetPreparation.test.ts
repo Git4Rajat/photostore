@@ -1,5 +1,7 @@
 import {Blob as NodeBlob} from 'node:buffer';
 import {UploadAssetPreparer} from './uploadAssetPreparation';
+const video = vi.hoisted(() => ({prepare: vi.fn()}));
+vi.mock('./videoThumbnailPreparation', () => ({prepareVideoThumbnail: video.prepare}));
 
 const workers: Worker[] = [];
 const factory = vi.fn(() => {
@@ -17,6 +19,7 @@ beforeEach(() => {
     vi.stubGlobal('Blob', NodeBlob);
     workers.length = 0;
     factory.mockClear();
+    video.prepare.mockReset().mockResolvedValue({thumbnail: jpeg(), runtime: 'native_video'});
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
@@ -108,9 +111,16 @@ test('accepts the existing RAW worker blob/dimension message shape', async () =>
     service.dispose();
 });
 
-test('skips video and already-aborted work', async () => {
+test('prepares video thumbnail without creating an image decoder worker', async () => {
     const service = new UploadAssetPreparer(factory);
-    expect(await service.prepare(new File(['video'], 'a.mp4'))).toEqual({status: 'fallback', reason: 'unsupported'});
+    expect(await service.prepare(new File(['video'], 'a.mp4'))).toEqual({status: 'generated', thumbnail: jpeg(), runtime: 'native_video'});
+    expect(factory).not.toHaveBeenCalled();
+    expect(video.prepare).toHaveBeenCalledOnce();
+    service.dispose();
+});
+
+test('skips already-aborted work', async () => {
+    const service = new UploadAssetPreparer(factory);
     const controller = new AbortController();
     controller.abort();
     expect(await service.prepare(new File(['raw'], 'a.CR3'), {signal: controller.signal})).toEqual({status: 'fallback', reason: 'aborted'});

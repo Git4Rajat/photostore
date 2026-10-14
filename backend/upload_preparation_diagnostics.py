@@ -9,14 +9,15 @@ REASONS = frozenset({'disposed', 'caller_aborted', 'unsupported_type', 'busy', '
                     'metadata_unsupported', 'metadata_reference', 'metadata_structure',
                     'invalid_derivative', 'worker_error', 'worker_start_failed', 'http_error', 'network_error',
                     'packet_invalid', 'backend_disabled', 'unqualified_family', 'not_requested', 'missing_binding', 'target_unavailable',
-                    'generation_timeout', 'generation_queue_timeout', 'upload_timeout'})
+                    'generation_timeout', 'generation_queue_timeout', 'upload_timeout',
+                    'video_decode_unsupported', 'video_metadata_unsupported', 'metadata_read_budget'})
 
 
 def metadata_offer_reason(requested, physical, filename, url):
     from upload_metadata import uploads_enabled, qualified_family
     if not requested:
         return 'not_requested'
-    if not uploads_enabled():
+    if not uploads_enabled(filename):
         return 'backend_disabled'
     if not physical:
         return 'missing_binding'
@@ -47,12 +48,14 @@ def bounded_report(value):
                 clean[field] = raw[field]
         if type(raw.get('target')) is bool:
             clean['target'] = raw['target']
+        if type(raw.get('runtime')) is str and raw['runtime'] in {'embedded_video_jpeg', 'native_video', 'ffmpeg_wasm', 'mediainfo_wasm'}:
+            clean['runtime'] = raw['runtime']
         for field in ('generationReason', 'uploadReason'):
             if type(raw.get(field)) is str and raw[field] in REASONS:
                 clean[field] = raw[field]
         for field, cap in [('generationMs', 3_600_000), ('uploadMs', 3_600_000),
                            ('queueMs', 3_600_000), ('bytes', MAX_PACKET_BYTES if asset == 'metadata' else 4_194_304),
-                           ('httpStatus', 599), ('attempts', 3)]:
+                           ('httpStatus', 599), ('attempts', 3), ('readBytes', 32 * 1024 * 1024), ('readCalls', 2048)]:
             number = raw.get(field)
             if type(number) in (int, float) and 0 <= number <= cap and math.isfinite(number):
                 clean[field] = round(number)

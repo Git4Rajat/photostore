@@ -19,17 +19,31 @@ QUALIFIED_EXTENSIONS = {'.arw', '.cr2', '.cr3', '.dng', '.erf', '.gpr', '.mos', 
                         '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif', '.png'}
 
 
-def _verified_proraw_array_warning(filename, exif):
+def _verified_dng_array_warning(filename, exif):
     # Default ExifTool intentionally summarizes these arrays; do not enable -m
-    # or suppress corruption warnings. Both verified originals have exact parity.
-    return (Path(filename).suffix.lower() == '.dng'
-            and not any(key in exif for key in ('Error', 'EXIF.Truncated'))
-            and exif.get('Warning') == '[Minor] Not decoding some large array(s). Ignore minor errors to decode'
-            and exif.get('ExifToolVersion') == '13.55'
-            and exif.get('FileType') == 'DNG'
-            and exif.get('Make') == 'Apple'
-            and (exif.get('Model'), exif.get('DNGVersion')) in {
-                ('iPhone 12 Pro', '1 4 0 0'), ('iPhone 12 Pro Max', '1 6 0 0')})
+    # or suppress corruption warnings. Only corpus-verified profiles qualify.
+    if (Path(filename).suffix.lower() != '.dng'
+            or any(key in exif for key in ('Error', 'EXIF.Truncated'))
+            or exif.get('ExifToolVersion') != '13.55' or exif.get('FileType') != 'DNG'):
+        return False
+    warning = '[Minor] Not decoding some large array(s). Ignore minor errors to decode'
+    profiles = {
+        ('Apple', 'iPhone 12 Pro', '1 4 0 0'): {'Warning': warning},
+        ('Apple', 'iPhone 12 Pro Max', '1 6 0 0'): {'Warning': warning},
+        ('Canon', 'Canon EOS 5D Mark III', '1 4 0 0'): {
+            'Warning': warning + ' [x3]',
+            'ProfileHueSatMapData1': '(large array of 8100 float values)',
+            'ProfileHueSatMapData2': '(large array of 8100 float values)',
+            'ProfileLookTableData': '(large array of 13824 float values)',
+        },
+        ('Autel Robotics', 'XB015', '1 4 0 0'): {
+            'Warning': warning + ' [x2]',
+            'ProfileHueSatMapData1': '(large array of 2250 float values)',
+            'ProfileHueSatMapData2': '(large array of 2250 float values)',
+        },
+    }
+    expected = profiles.get((exif.get('Make'), exif.get('Model'), exif.get('DNGVersion')))
+    return bool(expected) and all(exif.get(key) == value for key, value in expected.items())
 
 
 def _qualified_png_metadata(filename, exif):
@@ -45,12 +59,14 @@ def _qualified_png_metadata(filename, exif):
             and exif.get('Interlace') in {'0', '1'})
 
 
-def uploads_enabled():
-    return os.getenv('BROWSER_UPLOAD_PREPARATION', 'false').lower() == 'true'
+def uploads_enabled(filename=''):
+    from image_utils import is_video_file
+    return is_video_file(filename) or os.getenv('BROWSER_UPLOAD_PREPARATION', 'false').lower() == 'true'
 
 
 def qualified_family(filename):
-    return Path(filename).suffix.lower() in QUALIFIED_EXTENSIONS
+    from image_utils import is_video_file
+    return is_video_file(filename) or Path(filename).suffix.lower() in QUALIFIED_EXTENSIONS
 
 
 def packet_blob_name(physical):
@@ -77,7 +93,7 @@ def validate_descriptor(descriptor, source_hash):
 
 def stamp_candidate(app, user_id, filename, descriptor, physical, total_size, source_hash):
     """Persist HEAD-bound candidate before queueing; parse only in the worker."""
-    if not uploads_enabled() or not descriptor:
+    if not uploads_enabled(filename) or not descriptor:
         return
     import storage_utils
     clean = validate_descriptor(descriptor, source_hash)
@@ -190,7 +206,7 @@ def extract_candidate(storage, filename, row, on_download=None, on_outcome=None,
                     handle.seek(offset)
                     handle.write(data)
             exif = _extract_exiftool_from_path(path)
-            verified_warning = (bool(exif) and _verified_proraw_array_warning(filename, exif)
+            verified_warning = (bool(exif) and _verified_dng_array_warning(filename, exif)
                                 and _exiftool_has_only_warning(path, exif['Warning']))
         if on_diagnostic:
             try:

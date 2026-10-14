@@ -34,7 +34,7 @@ import {
     isConstrainedUploadDevice,
     isUploadStoppedError,
 } from './browserAiShared';
-import { FILE_ACCEPT_FILTER, requiresBackendPreview, shouldSkipConvertedRawPreview } from '../utils/photoDisplay';
+import { FILE_ACCEPT_FILTER, isVideoFilename, requiresBackendPreview, shouldSkipConvertedRawPreview } from '../utils/photoDisplay';
 import { plural } from '../utils/format';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
@@ -2010,7 +2010,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         pendingBatchInitRef.current = [];
         runGatedRequestWithRetry(gate, '/upload/init-batch', {
             files: batch.map(({ filename, totalSize, sha256 }) => ({ filename, totalSize, sha256,
-                ...(getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
+                ...(isVideoFilename(filename) ? {includeMetadata: true} : getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
             })),
         })
             .then((response) => {
@@ -2833,7 +2833,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     sha256,
                     directToBlob: true,
                     uploadId: options.existingUploadId,
-                    ...(getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
+                    ...(isVideoFilename(file.name) ? {includeMetadata: true} : getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
                 }, options?.signal)
                 : await requestBatchedInit(file.name, file.size, sha256);
             options?.onInitLatencyMs?.(performance.now() - initStartedAt);
@@ -3132,7 +3132,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             )),
         };
         const pendingFinalizeTasks = new Set<Promise<void>>();
-        const uploadPreparation = getRuntimeConfig().browserUploadPreparation ? new UploadPreparationPipeline() : null;
+        const uploadPreparation = new UploadPreparationPipeline();
         let uploadEndReason: UploadEndReason = 'failed';
         try {
             persistSession(normalized);
@@ -3159,6 +3159,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const parallelThumbnailTasks = new Set<Promise<void>>();
 
             const kickOffThumbnailForFile = (file: File, filename: string, blobName?: string) => {
+                if (isVideoFilename(filename)) return;
                 if (getRuntimeConfig().processingMode === 'backend') {
                     // ipworker owns thumbnails entirely in this mode (queued
                     // automatically by the upload finalize call, same as its
@@ -3504,8 +3505,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 onUploadInitialized: (uploadId, blobName, sha256, targets) => {
                                     resolvedBlobName = blobName;
                                     updatePersistedFile(fileMeta.key, { uploadId, blobName });
-                                    preparation = uploadPreparation?.start(resolvedFile, sha256,
-                                        {...targets, uploadPreparationEnabled: !!targets.uploadPreparationEnabled}, controller.signal) || Promise.resolve({});
+                                    preparation = getRuntimeConfig().browserUploadPreparation || isVideoFilename(resolvedFile.name)
+                                        ? uploadPreparation.start(resolvedFile, sha256,
+                                            {...targets, uploadPreparationEnabled: !!targets.uploadPreparationEnabled}, controller.signal) : Promise.resolve({});
                                 },
                                 onChunkCommitted: (bytesReceived) => {
                                     const previousBytes = lastCommittedBytesByFile.get(fileMeta.key) || 0;

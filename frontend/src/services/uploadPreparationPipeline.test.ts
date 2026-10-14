@@ -35,6 +35,23 @@ test('only successful uploads are attached to finalization', async () => {
     pipeline.dispose();
 });
 
+test.each(['ffmpeg_wasm', 'embedded_video_jpeg'])('video prepares %s thumbnail and metadata without uploading an image preview', async runtime => {
+    metadataWorker();
+    mocks.prepare.mockResolvedValue({status: 'generated', thumbnail: assets().thumbnail, runtime, readBytes: 12000, readCalls: 14});
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(new File(['video'], 'clip.mkv'), 'a'.repeat(64), {
+        thumbnailBlobUrl: 'https://storage/thumb', metadataBlobUrl: 'https://storage/metadata', uploadPreparationEnabled: true,
+    }, new AbortController().signal);
+    expect(result.clientProcessing?.thumbnail.alreadyUploaded).toBe(true);
+    expect(result.clientProcessing?.preview).toBeUndefined();
+    expect(result.clientMetadata).toBeDefined();
+    expect(result.preparationReport?.assets.thumbnail.runtime).toBe(runtime);
+    if (runtime === 'embedded_video_jpeg') expect(result.preparationReport?.assets.thumbnail).toMatchObject({readBytes: 12000, readCalls: 14});
+    expect(result.preparationReport?.assets.preview.generation).toBe('skipped');
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    pipeline.dispose();
+});
+
 test('bounded admission queues excess files until uploads release a job slot', async () => {
     mocks.fetch.mockImplementation(() => new Promise(resolve => setTimeout(() => resolve({ok: true, status: 201}), 1000)));
     const pipeline = new UploadPreparationPipeline();

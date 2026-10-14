@@ -4,8 +4,7 @@ That eager work (_upload_needs_server_bytes' old codepath) was redundant with
 ipworker's queued 'thumbnail'/'exif' steps (see _queue_upload_processing),
 which call the exact same helpers asynchronously -- and it held a gunicorn
 thread for as long as the RAW decode took (measured multi-second to ~60s on
-real CR3 files in production). Video keeps its eager path since it wasn't
-part of that finding and has its own metadata-extraction need.
+real CR3 files in production). Video preparation is now browser-only too.
 """
 from __future__ import annotations
 
@@ -85,14 +84,14 @@ def test_raw_finalize_skips_eager_download_and_thumbnail(finalize_ctx):
     assert stored.get('thumbnail_status') == 'pending'
 
 
-def test_video_finalize_still_uses_eager_path(finalize_ctx, monkeypatch):
-    # Video is intentionally untouched by this change -- it should still hit
-    # the eager download+thumbnail path (raising via the monkeypatches),
-    # proving the RAW-only carve-out didn't accidentally widen to video too.
-    with pytest.raises(AssertionError, match='download_media_bytes should not be called'):
-        storage_utils.finalize_uploaded_file(
-            'lib-A', 'clip.mp4', 'video/mp4', client_sha256='b' * 64,
-        )
+def test_video_finalize_has_no_eager_path_even_without_browser_assets(finalize_ctx):
+    assert storage_utils.finalize_uploaded_file(
+        'lib-A', 'clip.mp4', 'video/mp4', client_sha256='b' * 64,
+    ) == ([], 'clip.mp4')
+    stored = finalize_ctx.get_entity('lib-A', 'clip.mp4')
+    assert stored['fileHash'] == 'b' * 64
+    assert stored['thumbnail_status'] == 'failed' and stored['exif_status'] == 'failed'
+    assert stored['processing_complete'] is True
 
 
 def test_benchmark_finalize_retains_isolation_without_overwriting_dedup(finalize_ctx, monkeypatch):
@@ -105,4 +104,16 @@ def test_benchmark_finalize_retains_isolation_without_overwriting_dedup(finalize
     row = finalize_ctx.get_entity('lib-A', name)
     assert row['processingIsolated'] is True
     assert row['processing_complete'] is True
+    assert all(row[f'{step}_status'] == 'skipped' for step in storage_utils.PROCESSING_STEPS)
+
+
+def test_video_benchmark_retains_isolation_provenance(finalize_ctx):
+    import json
+    name = 'rawbench-run-12345678-originals-00000.mp4'
+    finalize_ctx.upsert_entity({'PartitionKey': 'lib-A', 'RowKey': name,
+                               'processingIsolated': True, 'benchmarkRunId': 'run-12345678'})
+    storage_utils.finalize_uploaded_file('lib-A', name, 'video/mp4', client_sha256='a' * 64,
+                                        anonymous_blob_name='blob-1')
+    row = finalize_ctx.get_entity('lib-A', name)
+    assert json.loads(row['processing_metadata'])['isolation']['reason'] == 'upload_only_benchmark'
     assert all(row[f'{step}_status'] == 'skipped' for step in storage_utils.PROCESSING_STEPS)

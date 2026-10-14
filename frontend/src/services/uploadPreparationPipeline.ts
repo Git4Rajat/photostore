@@ -65,11 +65,10 @@ export class UploadPreparationPipeline {
             thumbnail: {target: !!targets.thumbnailBlobUrl, generation: 'not_attempted', upload: 'not_attempted'},
             metadata: {target: !!targets.metadataBlobUrl, generation: 'not_attempted', upload: 'not_attempted'},
         }};
-        if (this.disposed || signal.aborted || targets.uploadPreparationEnabled === false || isVideoFilename(file.name)
-            || (!targets.previewBlobUrl && !targets.metadataBlobUrl)) {
+        if (this.disposed || signal.aborted || targets.uploadPreparationEnabled === false
+            || (!targets.previewBlobUrl && !targets.metadataBlobUrl && !targets.thumbnailBlobUrl)) {
             const reason = this.disposed ? 'disposed' : signal.aborted ? 'caller_aborted' : targets.uploadPreparationEnabled === false
-                ? 'backend_disabled' : isVideoFilename(file.name)
-                ? 'unsupported_type' : 'missing_target';
+                ? 'backend_disabled' : 'missing_target';
             report.reason = reason;
             for (const asset of PREPARATION_ASSETS) Object.assign(report.assets[asset], {generation: 'skipped', generationReason: reason});
             return Promise.resolve({preparationReport: report});
@@ -132,12 +131,18 @@ export class UploadPreparationPipeline {
             const abort = () => { diagnostic.generationReason = 'aborted'; finish(null); };
             if (signal.aborted) { abort(); return; }
             try {
-                worker = new Worker(new URL('../workers/uploadMetadata.worker.ts', import.meta.url), {type: 'module'});
+                worker = isVideoFilename(file.name)
+                    ? new Worker(new URL('../workers/videoMetadata.worker.ts', import.meta.url), {type: 'module'})
+                    : new Worker(new URL('../workers/uploadMetadata.worker.ts', import.meta.url), {type: 'module'});
                 signal.addEventListener('abort', abort, {once: true});
                 worker.onmessage = ({data}) => {
                     if (settled) return;
                     const packet = data?.packet;
                     if (data?.status === 'generated' && packet?.blob instanceof Blob && packet?.descriptor?.version === 1) {
+                        if (isVideoFilename(file.name)) Object.assign(diagnostic, {
+                            runtime: 'mediainfo_wasm', readBytes: packet.readBytes, readCalls: packet.readCalls,
+                        });
+                        if (packet.readBudgetReached) diagnostic.generationReason = 'metadata_read_budget';
                         finish(packet);
                     } else {
                         diagnostic.generationReason = data?.status === 'generated' ? 'packet_invalid' : data?.reason || 'generation_failed';
@@ -199,19 +204,29 @@ export class UploadPreparationPipeline {
     private async run(file: File, sha256: string, targets: UploadAssetTargets, signal: AbortSignal, report: UploadPreparationReport): Promise<PreparedUpload> {
         const assetsStarted = performance.now();
         const result: PreparedUpload = {preparationReport: report};
-        const assetsPromise = targets.previewBlobUrl
+        const assetsPromise = targets.previewBlobUrl || (isVideoFilename(file.name) && targets.thumbnailBlobUrl)
             ? this.preparer.prepare(file, {signal}).then(async assets => {
                 for (const kind of ['preview', 'thumbnail'] as const) {
                     const diagnostic = report.assets[kind];
+                    if (isVideoFilename(file.name) && kind === 'preview') {
+                        Object.assign(diagnostic, {generation: 'skipped', generationReason: 'not_requested'});
+                        continue;
+                    }
                     diagnostic.generationMs = Math.round(performance.now() - assetsStarted);
                     diagnostic.generation = assets.status === 'generated' ? 'generated' : assets.reason === 'busy' ? 'skipped' : 'failed';
-                    if (assets.status === 'generated') diagnostic.bytes = assets[kind].blob.size;
+                    if (assets.status === 'generated') {
+                        diagnostic.bytes = assets[kind]?.blob.size; diagnostic.runtime = assets.runtime;
+                        if (kind === 'thumbnail' && assets.runtime === 'embedded_video_jpeg') {
+                            diagnostic.readBytes = assets.readBytes; diagnostic.readCalls = assets.readCalls;
+                        }
+                    }
                     else diagnostic.generationReason = assets.failureReason || assets.reason || 'generation_failed';
                 }
                 if (assets.status === 'generated') {
                     await Promise.all((['preview', 'thumbnail'] as const).map(async kind => {
                         const url = targets[kind === 'preview' ? 'previewBlobUrl' : 'thumbnailBlobUrl'];
-                        if (url && await this.put(url, assets[kind].blob, signal, report.assets[kind], kind)) {
+                        const derivative = assets[kind];
+                        if (url && derivative && await this.put(url, derivative.blob, signal, report.assets[kind], kind)) {
                             result.clientProcessing ??= {};
                             result.clientProcessing[kind] = {alreadyUploaded: true, source: 'browser_upload'};
                         }

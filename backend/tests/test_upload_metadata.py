@@ -190,7 +190,93 @@ def test_proraw_exception_never_accepts_other_warnings_profiles_or_truncation(mo
     outcomes = []
     assert transport.extract_candidate(storage, 'photo.dng', row, on_outcome=outcomes.append) is None
     assert outcomes == ['exiftool_warning']
-    assert not transport._verified_proraw_array_warning('photo.jpg', _proraw())
+    assert not transport._verified_dng_array_warning('photo.jpg', _proraw())
+
+
+def _profile_dng(camera):
+    warning = '[Minor] Not decoding some large array(s). Ignore minor errors to decode'
+    if camera == 'canon':
+        return {'Make': 'Canon', 'Model': 'Canon EOS 5D Mark III', 'FileType': 'DNG',
+                'DNGVersion': '1 4 0 0', 'ExifToolVersion': '13.55', 'Warning': warning + ' [x3]',
+                'ProfileHueSatMapData1': '(large array of 8100 float values)',
+                'ProfileHueSatMapData2': '(large array of 8100 float values)',
+                'ProfileLookTableData': '(large array of 13824 float values)'}
+    return {'Make': 'Autel Robotics', 'Model': 'XB015', 'FileType': 'DNG',
+            'DNGVersion': '1 4 0 0', 'ExifToolVersion': '13.55', 'Warning': warning + ' [x2]',
+            'ProfileHueSatMapData1': '(large array of 2250 float values)',
+            'ProfileHueSatMapData2': '(large array of 2250 float values)'}
+
+
+@pytest.mark.parametrize('camera', ['canon', 'autel'])
+def test_verified_profile_arrays_reuse_packet_without_expanding_or_dropping_warning(monkeypatch, camera):
+    import exif_utils
+    storage, row = _candidate_fixture()
+    exif = {**_profile_dng(camera), 'DateTimeOriginal': '2020:01:02 03:04:05',
+            'GPS.LatitudeDecimal': '12.34', 'GPS.LongitudeDecimal': '56.78'}
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: exif.copy())
+    checks = []
+    def check(path, warning):
+        checks.append((path, warning))
+        return warning == exif['Warning']
+    monkeypatch.setattr(exif_utils, '_exiftool_has_only_warning', check)
+    outcomes, diagnostics, sizes = [], [], []
+    assert transport.extract_candidate(storage, 'photo.DNG', row, sizes.append,
+        outcomes.append, diagnostics.append) == exif
+    assert len(checks) == 1 and checks[0][1] == exif['Warning']
+    assert sizes == [len(envelope()[0])]
+    assert outcomes == ['reused']
+    assert diagnostics == [{'version': '13.55', 'category': 'large_array_limit'}]
+
+
+@pytest.mark.parametrize('camera', ['canon', 'autel'])
+@pytest.mark.parametrize('changes', [
+    {'Warning': 'Invalid EXIF text encoding for UserComment'},
+    {'Warning': '[Minor] Not decoding some large array(s). Ignore minor errors to decode'},
+    {'Warning': '[Minor] Not decoding some large array(s). Ignore minor errors to decode [x4]'},
+    {'ExifToolVersion': '13.56'}, {'ExifToolVersion': 'unknown'},
+    {'Make': 'Unknown'}, {'Model': 'Unknown'}, {'DNGVersion': '1 6 0 0'}, {'FileType': 'TIFF'},
+    {'Error': 'Bad offset'}, {'EXIF.Truncated': 'true'},
+    {'ProfileHueSatMapData1': '(large array of 99999 float values)'},
+    {'ProfileHueSatMapData2': '(large array of 2250 double values)'},
+    {'ProfileHueSatMapData1': None}, {'ProfileHueSatMapData2': None},
+])
+def test_profile_array_exception_rejects_unverified_data(monkeypatch, camera, changes):
+    import exif_utils
+    storage, row = _candidate_fixture()
+    exif = {**_profile_dng(camera), **changes}
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: exif.copy())
+    monkeypatch.setattr(exif_utils, '_exiftool_has_only_warning', lambda *_: pytest.fail('Unqualified profile must not be exempted'))
+    outcomes = []
+    assert transport.extract_candidate(storage, 'photo.dng', row, on_outcome=outcomes.append) is None
+    assert outcomes == ['exiftool_warning']
+
+
+@pytest.mark.parametrize('value', [None, '(large array of 13824 double values)', '(large array of 13825 float values)'])
+def test_canon_profile_requires_verified_look_table(monkeypatch, value):
+    import exif_utils
+    storage, row = _candidate_fixture()
+    exif = {**_profile_dng('canon'), 'ProfileLookTableData': value}
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: exif.copy())
+    assert transport.extract_candidate(storage, 'photo.dng', row) is None
+
+
+@pytest.mark.parametrize('camera', ['canon', 'autel'])
+@pytest.mark.parametrize('failure', ['additional_warning', 'check_exception'])
+def test_profile_arrays_still_require_independent_diagnostic_check(monkeypatch, camera, failure):
+    import exif_utils
+    storage, row = _candidate_fixture()
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: _profile_dng(camera))
+    def check(*_):
+        if failure == 'check_exception':
+            raise RuntimeError('Diagnostic check failed')
+        return False
+    monkeypatch.setattr(exif_utils, '_exiftool_has_only_warning', check)
+    assert transport.extract_candidate(storage, 'photo.dng', row) is None
+
+
+@pytest.mark.parametrize('camera', ['canon', 'autel'])
+def test_profile_array_exception_is_dng_only(camera):
+    assert not transport._verified_dng_array_warning('photo.tif', _profile_dng(camera))
 
 
 def _png_exif():

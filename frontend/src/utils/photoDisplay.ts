@@ -1,13 +1,13 @@
 export const SUPPORTED_RAW_EXTENSIONS = [
-    '3fr', 'ari', 'arw', 'bay', 'braw', 'cap', 'cr2', 'cr3', 'crw', 'dcr',
+    '3fr', 'ari', 'arw', 'bay', 'cap', 'cr2', 'cr3', 'crw', 'dcr',
     'dcs', 'dng', 'drf', 'eip', 'erf', 'fff', 'gpr', 'iiq', 'k25', 'kdc',
     'mdc', 'mef', 'mos', 'mrw', 'nef', 'nrw', 'orf', 'pef', 'ptx', 'pxn',
-    'r3d', 'raf', 'raw', 'rw2', 'rwl', 'rwz', 'sr2', 'srf', 'srw', 'x3f',
+    'raf', 'raw', 'rw2', 'rwl', 'rwz', 'sr2', 'srf', 'srw', 'x3f',
 ] as const;
 
-const SUPPORTED_VIDEO_EXTENSIONS = [
+export const SUPPORTED_VIDEO_EXTENSIONS = [
     '3g2', '3gp', 'avi', 'm2ts', 'm4v', 'mkv', 'mov', 'mp4',
-    'mpeg', 'mpg', 'mts', 'webm', 'wmv',
+    'mpeg', 'mpg', 'mts', 'webm', 'wmv', 'asf', 'flv', 'm2v', 'mxf', 'ogv', 'ts', 'vob', 'braw', 'r3d', 'crm', 'nev',
 ] as const;
 
 const SUPPORTED_HEIC_EXTENSIONS = ['heic', 'heif', 'hif'] as const;
