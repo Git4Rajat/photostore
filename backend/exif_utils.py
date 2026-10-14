@@ -194,6 +194,38 @@ def _extract_exiftool_from_path(path: str) -> Dict[str, str]:
     return _trim_exif_for_storage(exif)
 
 
+def _exiftool_has_only_warning(path: str, expected: str) -> bool:
+    """Check every diagnostic before exempting a known, benign warning.
+
+    Ordinary JSON output hides duplicate Warning tags. Family 4 makes them
+    unique without changing the existing metadata extraction/normalization.
+    """
+    exiftool = shutil.which('exiftool')
+    if not exiftool:
+        return False
+    try:
+        result = subprocess.run(
+            [exiftool, '-j', '-G4', '-Warning', '-Error', path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=EXIFTOOL_TIMEOUT_SECONDS, check=False,
+        )
+        if result.returncode != 0 or result.stderr:
+            return False
+        parsed = json.loads(result.stdout.decode('utf-8'))
+        if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+            return False
+        warnings = []
+        for key, value in parsed[0].items():
+            if key == 'SourceFile':
+                continue
+            if key.rsplit(':', 1)[-1] != 'Warning':
+                return False
+            warnings.append(value)
+        return bool(warnings) and all(value == expected for value in warnings)
+    except Exception:
+        return False
+
+
 def _valid_decimal_from_exiftool(value, ref: str, minimum: float, maximum: float) -> str:
     try:
         parsed = float(value)

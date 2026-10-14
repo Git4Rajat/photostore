@@ -30,6 +30,6 @@ export function preparationFailureReason(error: unknown): string {
     if (message.includes('unsupported container') || message.includes('unsupported tiff')) return 'metadata_unsupported';
     if (message.includes('out-of-bounds') || message.includes('short read')) return 'metadata_reference';
     if (message.includes('traversal') || message.includes('ifd') || message.includes('ciff') || message.includes('jpeg')
-        || message.includes('bmff') || message.includes('ctmd') || message.includes('x3f')) return 'metadata_structure';
+        || message.includes('bmff') || message.includes('ctmd') || message.includes('x3f') || message.includes('png')) return 'metadata_structure';
     return 'generation_failed';
 }

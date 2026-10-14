@@ -415,6 +415,41 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         }
         throw new Error('Incomplete JPEG header');
     }
+    async function png() {
+        await read(0, 8);
+        let pos = 8, sawHeader = false, sawData = false, endedData = false;
+        for (let i = 0; i < 4096 && pos + 12 <= source.size; i++) {
+            const header = await read(pos, 8);
+            const length = new DataView(header.buffer).getUint32(0), type = ascii(header, 4, 4);
+            if (!/^[A-Za-z]{2}[A-Z][A-Za-z]$/.test(type) || length > 0x7fffffff || pos + length + 12 > source.size) {
+                throw new Error('Invalid PNG chunk');
+            }
+            if (!sawHeader && (type !== 'IHDR' || length !== 13)) throw new Error('Invalid PNG header');
+            if (sawHeader && type === 'IHDR') throw new Error('Duplicate PNG header');
+            if (/^[A-Z]/.test(type) && !['IHDR', 'PLTE', 'IDAT', 'IEND'].includes(type)) throw new Error('Unsupported PNG critical chunk');
+            if (type === 'fdAT') throw new Error('Unsupported PNG animation data');
+            if (type === 'IDAT') {
+                if (endedData) throw new Error('Nonconsecutive PNG image data');
+                sawData = true;
+                // Keep structure and CRC at original offsets, not compressed pixels.
+                await read(pos + 8 + length, 4);
+            } else {
+                if (sawData) endedData = true;
+                await read(pos + 8, length + 4);
+            }
+            sawHeader = true;
+            pos += length + 12;
+            if (type === 'IEND') {
+                if (length || !sawData) throw new Error('Invalid PNG end');
+                if (pos < source.size) {
+                    const footer = await read(source.size - 8, 8, false);
+                    if (ascii(footer, 4, 4) !== 'SEFT') throw new Error('Unsupported PNG trailer');
+                }
+                return;
+            }
+        }
+        throw new Error('Incomplete PNG chunks');
+    }
     async function samsungTrailer() {
         if (source.size < 8) return;
         const footer = await read(source.size - 8, 8, false);
@@ -428,18 +463,33 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         if (ascii(directory, 0, 4) !== 'SEFH') throw new Error('Invalid Samsung trailer header');
         const count = view.getUint32(8, true);
         if (count > 4096 || 12 + count * 12 > length) throw new Error('Invalid Samsung trailer count');
+        let firstBlock = start, hasMotionPhoto = false;
         for (let i = 0; i < count; i++) {
             const entry = 12 + i * 12;
             const backwards = view.getUint32(entry + 4, true), size = view.getUint32(entry + 8, true);
+            if (view.getUint16(entry + 2, true) === 0x0a30) hasMotionPhoto = true;
             if (backwards > start || size > backwards || size < 8) throw new Error('Invalid Samsung trailer reference');
+            firstBlock = Math.min(firstBlock, start - backwards);
             const block = await read(start - backwards, size);
             if (new DataView(block.buffer).getUint32(4, true) + 8 > size) throw new Error('Invalid Samsung trailer item');
         }
+        if (kind === 'jpeg-header-ranges' && hasMotionPhoto) {
+            // ExifTool scans to EOI before interpreting motion-photo trailers.
+            // Never invent a terminator or scan/copy the entire JPEG pixel stream.
+            if (!count || firstBlock < 2) throw new Error('Invalid Samsung JPEG trailer boundary');
+            const eoi = await read(firstBlock - 2, 2);
+            if (eoi[0] !== 255 || eoi[1] !== 217) throw new Error('Unsupported Samsung JPEG trailer boundary');
+        }
     }
-    const head = await read(0, Math.min(source.size, 256));
+    const head = await read(0, Math.min(source.size, 256), false);
     const view = new DataView(head.buffer);
     let kind;
-    if (head[0] === 255 && head[1] === 216) {
+    const isPng = ascii(head, 0, 8) === '\x89PNG\r\n\x1a\n';
+    if (!isPng && head.length) ranges.push({offset: 0, bytes: head});
+    if (isPng) {
+        kind = 'png-chunk-ranges';
+        await png();
+    } else if (head[0] === 255 && head[1] === 216) {
         kind = 'jpeg-header-ranges';
         await jpeg(0, source.size);
     } else if (ascii(head, 6, 8) === 'HEAPCCDR') {

@@ -19,6 +19,61 @@ const rebuild = async (bytes: Uint8Array, maxBytes?: number) => {
     return {copy, result};
 };
 
+function png() {
+    const bytes = new Uint8Array(1024), view = new DataView(bytes.buffer);
+    bytes.set([137, 80, 78, 71, 13, 10, 26, 10]);
+    const offsets: Record<string, number> = {};
+    let pos = 8;
+    const chunk = (type: string, payload: Uint8Array) => {
+        offsets[type] = pos;
+        view.setUint32(pos, payload.length);
+        bytes.set(new TextEncoder().encode(type), pos + 4);
+        bytes.set(payload, pos + 8);
+        bytes.fill(17, pos + 8 + payload.length, pos + 12 + payload.length);
+        pos += payload.length + 12;
+    };
+    const header = new Uint8Array(13), hv = new DataView(header.buffer);
+    hv.setUint32(0, 900); hv.setUint32(4, 705); header[8] = 8; header[9] = 2;
+    chunk('IHDR', header);
+    chunk('iCCP', new Uint8Array(20).fill(77));
+    chunk('IDAT', new Uint8Array(512).fill(99));
+    chunk('eXIf', new Uint8Array(24).fill(66));
+    chunk('iTXt', new TextEncoder().encode('Comment\0text'));
+    chunk('IEND', new Uint8Array());
+    return {bytes: bytes.slice(0, pos), offsets};
+}
+
+test('PNG retains metadata before and after IDAT, structural headers and CRCs, but no pixels', async () => {
+    const {bytes, offsets} = png();
+    const {copy, result} = await rebuild(bytes);
+    expect(result.kind).toBe('png-chunk-ranges');
+    expect(copy.slice(0, offsets.IDAT + 8)).toEqual(bytes.slice(0, offsets.IDAT + 8));
+    expect(copy.slice(offsets.IDAT + 8, offsets.IDAT + 8 + 512)).toEqual(new Uint8Array(512));
+    expect(copy.slice(offsets.IDAT + 8 + 512)).toEqual(bytes.slice(offsets.IDAT + 8 + 512));
+    expect(result.payloadBytes).toBe(bytes.length - 512);
+});
+
+test.each(['header', 'duplicate', 'critical', 'reserved', 'length', 'end', 'missing-data', 'trailer', 'animation'])('PNG rejects malformed/unsupported %s', async fault => {
+    const {bytes, offsets} = png(), view = new DataView(bytes.buffer);
+    if (fault === 'header') view.setUint32(8, 12);
+    if (fault === 'duplicate') bytes.set(new TextEncoder().encode('IHDR'), offsets.iCCP + 4);
+    if (fault === 'critical') bytes.set(new TextEncoder().encode('ABCD'), offsets.iCCP + 4);
+    if (fault === 'reserved') bytes.set(new TextEncoder().encode('iCcP'), offsets.iCCP + 4);
+    if (fault === 'length') view.setUint32(offsets.IDAT, 0xffffffff);
+    if (fault === 'end') bytes.set(new TextEncoder().encode('iTXt'), offsets.IEND + 4);
+    if (fault === 'missing-data') bytes.set(new TextEncoder().encode('tEXt'), offsets.IDAT + 4);
+    if (fault === 'animation') bytes.set(new TextEncoder().encode('fdAT'), offsets.IDAT + 4);
+    const input = fault === 'trailer' ? new Uint8Array([...Array.from(bytes), 0]) : bytes;
+    await expect(rebuild(input)).rejects.toThrow('PNG');
+});
+
+test('PNG respects metadata budgets without charging compressed image payload', async () => {
+    const {bytes} = png();
+    await expect(rebuild(bytes, 256)).resolves.toBeDefined();
+    await expect(rebuild(bytes, 100)).rejects.toThrow('budget');
+    await expect(rebuild(bytes.slice(0, -1))).rejects.toThrow('PNG');
+});
+
 function heic(locationVersion = 1, method = 0, type = 'Exif', entryVersion = 2) {
     const encoder = new TextEncoder();
     const box = (type: string, payload: Uint8Array) => {
@@ -167,6 +222,24 @@ test('Samsung SEFT trailer metadata survives without retaining sensor data', asy
     expect(copy.slice(3900, 3920)).toEqual(bytes.slice(3900, 3920));
     expect(copy.slice(4064)).toEqual(bytes.slice(4064));
     expect(copy.slice(512, 3000)).toEqual(new Uint8Array(2488));
+});
+
+test('Samsung motion JPEG preserves the original end marker before its trailer', async () => {
+    const {bytes, view} = samsungTrailer();
+    view.setUint16(4078, 0x0a30, true);
+    bytes.set([255, 216, 255, 225, 0, 4, 69, 88, 255, 218, 0, 2]);
+    bytes.set([255, 217], 3898);
+    const {copy} = await rebuild(bytes);
+    expect(copy.slice(3898)).toEqual(bytes.slice(3898));
+    expect(copy.slice(512, 3000)).toEqual(new Uint8Array(2488));
+    bytes[3899] = 0;
+    await expect(rebuild(bytes)).rejects.toThrow('Samsung JPEG trailer boundary');
+});
+
+test('Samsung JPEG metadata-only trailers do not require a motion-photo end boundary', async () => {
+    const {bytes} = samsungTrailer();
+    bytes.set([255, 216, 255, 225, 0, 4, 69, 88, 255, 218, 0, 2]);
+    expect((await rebuild(bytes)).copy.slice(3900)).toEqual(bytes.slice(3900));
 });
 
 test.each(['length', 'header', 'count', 'offset', 'size', 'name'])('invalid Samsung trailer %s rejects packets', async fault => {

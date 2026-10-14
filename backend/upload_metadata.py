@@ -11,12 +11,38 @@ MAX_SOURCE_BYTES = 256 * 1024 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 HASH = re.compile(r'^[a-f0-9]{64}$')
 KINDS = {'tiff-ifd-ranges', 'ciff-directory-ranges', 'raf-header-jpeg-metadata-directories',
-         'mrw-pre-sensor-header', 'x3f-directory-nonimage-sections', 'bmff-non-mdat-boxes', 'jpeg-header-ranges'}
+         'mrw-pre-sensor-header', 'x3f-directory-nonimage-sections', 'bmff-non-mdat-boxes', 'jpeg-header-ranges', 'png-chunk-ranges'}
 # Corpus-qualified families only. This is experimental, not universal camera coverage.
 QUALIFIED_EXTENSIONS = {'.arw', '.cr2', '.cr3', '.dng', '.erf', '.gpr', '.mos', '.mrw',
                         '.nef', '.pef', '.raf', '.rw2', '.rwl', '.3fr', '.jpg', '.jpeg',
                         '.crw', '.fff', '.iiq', '.nrw', '.orf', '.ori', '.raw', '.srw',
-                        '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif'}
+                        '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif', '.png'}
+
+
+def _verified_proraw_array_warning(filename, exif):
+    # Default ExifTool intentionally summarizes these arrays; do not enable -m
+    # or suppress corruption warnings. Both verified originals have exact parity.
+    return (Path(filename).suffix.lower() == '.dng'
+            and not any(key in exif for key in ('Error', 'EXIF.Truncated'))
+            and exif.get('Warning') == '[Minor] Not decoding some large array(s). Ignore minor errors to decode'
+            and exif.get('ExifToolVersion') == '13.55'
+            and exif.get('FileType') == 'DNG'
+            and exif.get('Make') == 'Apple'
+            and (exif.get('Model'), exif.get('DNGVersion')) in {
+                ('iPhone 12 Pro', '1 4 0 0'), ('iPhone 12 Pro Max', '1 6 0 0')})
+
+
+def _qualified_png_metadata(filename, exif):
+    # PNG screenshots often have ICC/text metadata but no camera identity tags.
+    # Require parsed PNG header fields, never accept file/system tags alone.
+    return (Path(filename).suffix.lower() == '.png' and exif.get('FileType') == 'PNG'
+            and all(re.fullmatch(r'[1-9]\d{0,9}', str(exif.get(key) or ''))
+                    and int(exif[key]) <= 0x7fffffff
+                    for key in ('ImageWidth', 'ImageHeight'))
+            and exif.get('BitDepth') in {'1', '2', '4', '8', '16'}
+            and exif.get('ColorType') in {'0', '2', '3', '4', '6'}
+            and exif.get('Compression') == '0' and exif.get('Filter') == '0'
+            and exif.get('Interlace') in {'0', '1'})
 
 
 def uploads_enabled():
@@ -129,7 +155,7 @@ def _extraction_diagnostic(exif):
 def extract_candidate(storage, filename, row, on_download=None, on_outcome=None, on_diagnostic=None):
     """Return EXIF or None for original fallback. Never trust packet-only no_data."""
     from azure.core import MatchConditions
-    from exif_utils import _extract_exiftool_from_path
+    from exif_utils import _extract_exiftool_from_path, _exiftool_has_only_warning
     def outcome(reason):
         if on_outcome:
             try:
@@ -164,16 +190,20 @@ def extract_candidate(storage, filename, row, on_download=None, on_outcome=None,
                     handle.seek(offset)
                     handle.write(data)
             exif = _extract_exiftool_from_path(path)
+            verified_warning = (bool(exif) and _verified_proraw_array_warning(filename, exif)
+                                and _exiftool_has_only_warning(path, exif['Warning']))
         if on_diagnostic:
             try:
                 on_diagnostic(_extraction_diagnostic(exif or {}))
             except Exception:
                 pass
-        if not exif or any(key in exif for key in ('Warning', 'Error', 'EXIF.Truncated')):
+        if (not exif or any(key in exif for key in ('Error', 'EXIF.Truncated'))
+                or ('Warning' in exif and not verified_warning)):
             outcome('exiftool_warning' if exif else 'no_exif')
             return None
         # File/system tags alone do not establish complete or absent EXIF.
-        if not any(key in exif for key in ('Make', 'Model', 'DateTimeOriginal', 'GPS.LatitudeDecimal', 'Orientation')):
+        if (not any(key in exif for key in ('Make', 'Model', 'DateTimeOriginal', 'GPS.LatitudeDecimal', 'Orientation'))
+                and not _qualified_png_metadata(filename, exif)):
             outcome('unqualified_exif')
             return None
         for key in ('FileModifyDate', 'FileAccessDate', 'FileInodeChangeDate', 'FilePermissions'):
