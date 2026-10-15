@@ -35,6 +35,17 @@ test('only successful uploads are attached to finalization', async () => {
     pipeline.dispose();
 });
 
+test('reports preview byte reuse without changing finalization trust or upload handling', async () => {
+    const prepared = assets();
+    mocks.prepare.mockResolvedValue({...prepared, preview: {...prepared.preview, passthrough: true}});
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(source(), 'a'.repeat(64), targets, new AbortController().signal);
+    expect(result.preparationReport?.assets.preview.passthrough).toBe(true);
+    expect(result.preparationReport?.assets.thumbnail.passthrough).toBeUndefined();
+    expect(result.clientProcessing?.preview).toEqual({alreadyUploaded: true, source: 'browser_upload'});
+    pipeline.dispose();
+});
+
 test.each(['ffmpeg_wasm', 'embedded_video_jpeg'])('video prepares %s thumbnail and metadata without uploading an image preview', async runtime => {
     metadataWorker();
     mocks.prepare.mockResolvedValue({status: 'generated', thumbnail: assets().thumbnail, runtime, readBytes: 12000, readCalls: 14});

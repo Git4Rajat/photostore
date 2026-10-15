@@ -6,6 +6,29 @@ The normal uploader is integrated behind default-off frontend and backend contro
 
 - `frontend/src/services/uploadAssetPreparation.ts`: one active worker, at most four queued files, a 30-second active decoding deadline excluding queue wait, abort/disposal handling and explicit fallback results. Invoke only after original dedup/init, without awaiting preparation in an original-transfer lane.
 - `frontend/src/utils/uploadDerivatives.ts`: JPEG previews at most 2048 px on the longest edge and 1,500,000 bytes, thumbnails at most 120 px and 512,000 bytes, no upscaling, bounded encoding retries and dimension/byte validation.
+- Normal raster preparation picks an already-compliant original JPEG over the
+  generated preview only when the original is smaller, and only after
+  native decoding and a complete bounded marker walk qualify it as an 8-bit
+  grayscale/three-component JFIF JPEG with matching decoded dimensions, no
+  EXIF/XMP/ICC/Adobe/comment/unknown markers, and no trailer. This avoids preview
+  byte growth and additional JPEG loss for these files without copying private
+  camera metadata into previews. Rotated/profile-bearing/uncertain JPEGs and
+  non-JPEG inputs keep canvas conversion; that conversion can still be larger
+  than a highly compressed source. Thumbnail generation remains unchanged.
+  `preserveEligibleJpeg:false` is an explicit local-comparison opt-out, not the
+  ordinary upload default. Preview diagnostics carry a boolean `passthrough`
+  browser claim; backend byte/pixel/content verification is still authoritative.
+
+Local replay of the exact 2,220 originals from the October15,2026 study,using
+Chrome155: old previews125,002,168 bytes versus107,723,809 bytes after smaller-safe-
+JPEG selection (13.8% less).2,180 previews were byte-identical originals with
+identical decoded pixels;no per-file preview grew relative to the old path.
+Seventeen browser fixtures cover all eight EXIF orientations,metadata before/
+after scans,profile/comment rejection,trailers,dimension/byte caps and retaining
+an encoded JPEG when it is smaller. This is local preview-payload evidence,
+not a deployed upload-speed or Azure-invoice comparison. Run
+`frontend/scripts/preview-passthrough-smoke.mjs` against a loopback Vite server;
+`PREVIEW_SMOKE_MANIFEST` can supply the exact local source manifest.
 - Raster generation uses native orientation-aware decoding. Byte-identical JPEG pass-through is opt-in, gated by actual JPEG signature and size/dimensions; metadata/privacy policy must decide whether to enable it.
 - RAW generation uses the existing LibRaw WASM sensor-decoding policy, never embedded-preview extraction. Normal preparation passes a 256 MiB source guard and a 120 MP sensor guard. Fresh workers are terminated after every result to release their WASM memory.
 - The benchmark imports the same RAW worker and encoder, preventing algorithm drift. Its original sensor settings and default limits are unchanged.

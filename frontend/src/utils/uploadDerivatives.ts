@@ -1,3 +1,5 @@
+import {extractRanges} from './metadataRanges';
+
 export const UPLOAD_PREVIEW_MAX_EDGE = 2048;
 export const UPLOAD_PREVIEW_MAX_BYTES = 1_500_000;
 export const UPLOAD_THUMBNAIL_MAX_EDGE = 120;
@@ -53,11 +55,19 @@ export async function generateUploadThumbnail(source: Source): Promise<UploadDer
     return result;
 }
 
+// Call only after native decoding; dimensions must match that decoded image.
 export async function eligibleUploadJpeg(source: Blob, width: number, height: number): Promise<boolean> {
     if (![width, height].every(value => Number.isInteger(value) && value > 0)
         || source.size === 0 || source.size > UPLOAD_PREVIEW_MAX_BYTES || Math.max(width, height) > UPLOAD_PREVIEW_MAX_EDGE) return false;
-    const signature = new Uint8Array(await source.slice(0, 2).arrayBuffer());
-    return signature[0] === 255 && signature[1] === 216;
+    try {
+        const signature = new Uint8Array(await source.slice(0, 2).arrayBuffer());
+        if (signature[0] !== 255 || signature[1] !== 216) return false;
+        const {jpegPassthrough} = await extractRanges(source);
+        return !!jpegPassthrough && jpegPassthrough.width === width && jpegPassthrough.height === height;
+    } catch {
+        // An optimization must not turn metadata uncertainty into upload failure.
+        return false;
+    }
 }
 
 export function validUploadDerivative(value: unknown, edge: number, bytes: number): value is UploadDerivative {

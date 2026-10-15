@@ -32,6 +32,20 @@ def test_report_preserves_embedded_video_runtime_and_bounded_reads():
     assert clean['readBytes'] == 12000 and clean['readCalls'] == 14
 
 
+@pytest.mark.parametrize('value', [True, False, 'true', 1, {}, None])
+def test_passthrough_is_a_preview_only_boolean_claim(value):
+    raw = report()
+    for asset in raw['assets'].values():
+        asset['passthrough'] = value
+    clean = bounded_report(raw)['assets']
+    if type(value) is bool:
+        assert clean['preview']['passthrough'] is value
+    else:
+        assert 'passthrough' not in clean['preview']
+    assert 'passthrough' not in clean['thumbnail']
+    assert 'passthrough' not in clean['metadata']
+
+
 @pytest.mark.parametrize('value', [None, [], {'version': True}, {'version': 2}, 'secret'])
 def test_invalid_report_has_no_storage_side_effects(value):
     app = Mock()

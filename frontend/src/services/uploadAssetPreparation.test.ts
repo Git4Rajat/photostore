@@ -29,12 +29,22 @@ test('serializes decoding and starts the next file after completion', async () =
     const second = service.prepare(new File(['jpeg'], 'b.jpg'));
     expect(factory).toHaveBeenCalledTimes(1);
     expect(factory).toHaveBeenNthCalledWith(1, true);
+    expect(workers[0].postMessage).toHaveBeenCalledWith(expect.objectContaining({preserveEligibleJpeg: true}));
     complete(0);
     expect(factory).toHaveBeenNthCalledWith(2, false);
     complete(1);
     expect((await first).status).toBe('generated');
     expect((await second).status).toBe('generated');
     expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
+    service.dispose();
+});
+
+test('retains explicit JPEG re-encode opt-out for local comparisons', async () => {
+    const service = new UploadAssetPreparer(factory);
+    const pending = service.prepare(new File(['jpeg'], 'photo.jpg'), {preserveEligibleJpeg: false});
+    expect(workers[0].postMessage).toHaveBeenCalledWith(expect.objectContaining({preserveEligibleJpeg: false}));
+    complete(0);
+    expect((await pending).status).toBe('generated');
     service.dispose();
 });
 

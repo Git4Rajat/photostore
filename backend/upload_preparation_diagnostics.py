@@ -48,6 +48,8 @@ def bounded_report(value):
                 clean[field] = raw[field]
         if type(raw.get('target')) is bool:
             clean['target'] = raw['target']
+        if asset == 'preview' and type(raw.get('passthrough')) is bool:
+            clean['passthrough'] = raw['passthrough']
         if type(raw.get('runtime')) is str and raw['runtime'] in {'embedded_video_jpeg', 'native_video', 'ffmpeg_wasm', 'mediainfo_wasm'}:
             clean['runtime'] = raw['runtime']
         for field in ('generationReason', 'uploadReason'):
@@ -120,7 +122,8 @@ def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, pa
                        asset=asset, generation=claim.get('generation'), upload=claim.get('upload'),
                        receipt=receipts.get(asset), generation_ms=claim.get('generationMs'),
                        upload_ms=claim.get('uploadMs'), queue_ms=claim.get('queueMs'),
-                       bytes=claim.get('bytes'), reason=claim.get('generationReason') or receipts.get(asset + 'Reason'))
+                       bytes=claim.get('bytes'), passthrough=claim.get('passthrough'),
+                       reason=claim.get('generationReason') or receipts.get(asset + 'Reason'))
         app._update_metadata_entity_fields(user_id, filename, {'uploadPreparationReport': json.dumps(record, separators=(',', ':'))})
         app.app.logger.info('upload preparation receipt %s', json.dumps({
             'user': user_id, 'file': filename, 'uploadId': str(payload.get('uploadId') or '')[:100], **record}, separators=(',', ':')))

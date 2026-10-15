@@ -90,7 +90,7 @@ export class UploadAssetPreparer {
                     failureReason: result?.status === 'generated' ? 'invalid_derivative' : result?.failureReason || preparationFailureReason(result?.error)});
             };
             worker.onerror = () => this.finish(job, {status: 'fallback', reason: 'generation_failed', failureReason: 'worker_error'});
-            worker.postMessage({file: job.file, preserveEligibleJpeg: !!job.options.preserveEligibleJpeg, maxMegapixels: 120, maxBytes: 256 * 1024 * 1024});
+            worker.postMessage({file: job.file, preserveEligibleJpeg: job.options.preserveEligibleJpeg !== false, maxMegapixels: 120, maxBytes: 256 * 1024 * 1024});
         } catch {
             this.finish(job, {status: 'fallback', reason: 'unsupported', failureReason: 'worker_start_failed'});
         }

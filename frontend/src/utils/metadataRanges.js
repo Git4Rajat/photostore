@@ -10,6 +10,7 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
     const notices = [];
     let readBytes = 0;
     let readCalls = 0;
+    let jpegPassthrough = null;
     async function read(offset, length, retain = true) {
         if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 || offset + length > source.size) {
             const error = new Error('Out-of-bounds metadata reference');
@@ -427,6 +428,7 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         ranges.length = 0;
         await read(0, 2);
         let pos = 2, scanBytes = new Uint8Array(), scanOffset = 0;
+        let safe = true, jfif = false, frame = null, scanned = false;
         async function nextMarker(start) {
             let cursor = start;
             while (cursor + 1 < source.size) {
@@ -450,12 +452,31 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
             if (marker[0] !== 255) throw new Error('Invalid JPEG marker');
             if (marker[1] === 0xd9) {
                 if (pos + 2 !== source.size) throw new Error('Unsupported JPEG trailer');
-                return;
+                return safe && jfif && frame && scanned ? {width: frame.width, height: frame.height} : null;
             }
             const word = await read(pos + 2, 2);
             const size = new DataView(word.buffer).getUint16(0);
             if (size < 2 || pos + size + 2 > source.size) throw new Error('Invalid JPEG segment');
-            await read(pos + 4, size - 2);
+            const body = await read(pos + 4, size - 2);
+            // This classification never changes packet ranges. It only allows
+            // byte reuse where canvas rotation/profile conversion is unnecessary.
+            if (![0xc0, 0xc2, 0xc4, 0xdb, 0xdd, 0xda, 0xe0].includes(marker[1])) safe = false;
+            if (marker[1] === 0xe0) {
+                if (body.length !== 14 || ascii(body, 0, 5) !== 'JFIF\0'
+                    || body[12] !== 0 || body[13] !== 0) safe = false;
+                else jfif = true;
+            }
+            if (marker[1] === 0xc0 || marker[1] === 0xc2) {
+                const components = body[5];
+                if (frame || body.length !== 6 + 3 * components || body[0] !== 8 || ![1, 3].includes(components)) safe = false;
+                const width = (body[3] << 8) | body[4], height = (body[1] << 8) | body[2];
+                if (!width || !height) safe = false;
+                frame = {width, height};
+            }
+            if (marker[1] === 0xda) {
+                if (!frame || !body[0] || body[0] > 3 || body.length !== 4 + 2 * body[0]) safe = false;
+                scanned = true;
+            }
             pos += size + 2;
             if (marker[1] === 0xda) pos = await nextMarker(pos);
         }
@@ -537,7 +558,7 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         await png();
     } else if (head[0] === 255 && head[1] === 216) {
         kind = 'jpeg-header-ranges';
-        if (await jpeg(0, source.size)) await jpegWithoutExif();
+        if (await jpeg(0, source.size)) jpegPassthrough = await jpegWithoutExif();
     } else if (ascii(head, 6, 8) === 'HEAPCCDR') {
         kind = 'ciff-directory-ranges';
         const little = ascii(head, 0, 2) === 'II';
@@ -630,5 +651,5 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
     if (payloadBytes > maxBytes) throw new Error('Metadata payload budget exceeded');
     const chunks = [];
     for (const r of merged) chunks.push({offset: r.offset, bytes: await read(r.offset, r.length, false)});
-    return {kind, notices, chunks, payloadBytes, readBytes, readCalls};
+    return {kind, notices, chunks, payloadBytes, readBytes, readCalls, jpegPassthrough};
 }

@@ -56,11 +56,44 @@ test('generates a bounded thumbnail', async () => {
     expect([result.width, result.height, result.quality]).toEqual([120, 80, .65]);
 });
 
-test('JPEG pass-through uses bytes, not filename or content type', async () => {
-    expect(await eligibleUploadJpeg(new Blob([new Uint8Array([255, 216, 1])], {type: 'image/png'}), 200, 100)).toBe(true);
+const jpegFixture = (options: {after?: number[]; before?: number[]; progressive?: boolean; components?: number; thumbnail?: boolean} = {}) => {
+    const bytes = [255, 216];
+    const segment = (marker: number, body: number[]) => bytes.push(255, marker, (body.length + 2) >> 8, (body.length + 2) & 255, ...body);
+    segment(0xe0, [74,70,73,70,0,1,1,0,0,1,0,1,...(options.thumbnail ? [1,1,255,0,0] : [0,0])]);
+    bytes.push(...(options.before || []));
+    const components = options.components || 3;
+    segment(options.progressive ? 0xc2 : 0xc0, [8,0,100,0,200,components,
+        ...Array.from({length: components}, (_, i) => [i+1,17,0]).flat()]);
+    segment(0xda, [1,1,0,0,63,0]);
+    bytes.push(33,255,0,33,255,208,33,...(options.after || []),255,217);
+    return new Blob([new Uint8Array(bytes)], {type: 'image/png'});
+};
+
+test('JPEG pass-through requires complete metadata-free structure, not filename or MIME', async () => {
+    expect(await eligibleUploadJpeg(jpegFixture(), 200, 100)).toBe(true);
+    expect(await eligibleUploadJpeg(jpegFixture({progressive: true}), 200, 100)).toBe(true);
+    expect(await eligibleUploadJpeg(jpegFixture({components: 1}), 200, 100)).toBe(true);
+    expect(await eligibleUploadJpeg(jpegFixture({components: 4}), 200, 100)).toBe(false);
+    expect(await eligibleUploadJpeg(jpegFixture({thumbnail: true}), 200, 100)).toBe(false);
+    expect(await eligibleUploadJpeg(new Blob([new Uint8Array([255, 216, 1])]), 200, 100)).toBe(false);
     expect(await eligibleUploadJpeg(new Blob(['png'], {type: 'image/jpeg'}), 200, 100)).toBe(false);
+    expect(await eligibleUploadJpeg(jpegFixture(), 100, 200)).toBe(false);
     expect(await eligibleUploadJpeg(new Blob([new Uint8Array([255, 216])]), 2049, 100)).toBe(false);
     expect(await eligibleUploadJpeg(new Blob([new Uint8Array(1_500_001)]), 200, 100)).toBe(false);
+});
+
+test.each([0xe1, 0xe2, 0xee, 0xfe])('metadata marker %s before or after scans disables pass-through', async marker => {
+    const segment = [255,marker,0,4,1,1];
+    expect(await eligibleUploadJpeg(jpegFixture({before: segment}), 200, 100)).toBe(false);
+    expect(await eligibleUploadJpeg(jpegFixture({after: segment}), 200, 100)).toBe(false);
+});
+
+test('malformed trailers and read failures fall back to canvas generation', async () => {
+    const source = jpegFixture();
+    expect(await eligibleUploadJpeg(new Blob([source, 'trailer']), 200, 100)).toBe(false);
+    expect(await eligibleUploadJpeg(source.slice(0, -2), 200, 100)).toBe(false);
+    const unreadable = {size: 40, slice: () => { throw new Error('read failed'); }} as unknown as Blob;
+    expect(await eligibleUploadJpeg(unreadable, 200, 100)).toBe(false);
 });
 
 test('validates worker results before accepting a derivative', () => {

@@ -6,6 +6,7 @@ export interface AssetPreparationDiagnostic {
     generationReason?: string;
     generationMs?: number;
     bytes?: number;
+    passthrough?: boolean;
     upload: 'not_attempted' | 'uploaded' | 'failed' | 'aborted';
     uploadReason?: string;
     uploadMs?: number;

@@ -39,6 +39,7 @@ test('EXIF-free JPEG retains complete marker structure and EOI, not scan pixels'
     const {bytes, scanStart} = plainJpeg();
     const {copy, result} = await rebuild(bytes);
     expect(result.kind).toBe('jpeg-header-ranges');
+    expect(result.jpegPassthrough).toEqual({width: 40, height: 20});
     expect(result.chunks.map(chunk => ({offset: chunk.offset, length: chunk.bytes.length}))).toEqual([
         {offset: 0, length: scanStart}, {offset: bytes.length - 2, length: 2},
     ]);
@@ -50,8 +51,9 @@ test('EXIF-free JPEG retains complete marker structure and EOI, not scan pixels'
 test('JPEG retains metadata after scans instead of claiming absence from its first header', async () => {
     const afterScan = [255, 225, 0, 8, 69, 120, 105, 102, 0, 0, 255, 218, 0, 8, 1, 1, 0, 0, 63, 0, 45, 45];
     const {bytes, scanStart} = plainJpeg(100, afterScan);
-    const {copy} = await rebuild(bytes);
+    const {copy, result} = await rebuild(bytes);
     expect(copy.slice(scanStart + 100, scanStart + 100 + 20)).toEqual(bytes.slice(scanStart + 100, scanStart + 100 + 20));
+    expect(result.jpegPassthrough).toBeNull();
 });
 
 test('progressive JPEG preserves every scan header and inter-scan tables', async () => {
