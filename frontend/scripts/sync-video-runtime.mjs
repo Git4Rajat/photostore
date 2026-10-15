@@ -1,4 +1,5 @@
-import {copyFileSync, mkdirSync, readdirSync, rmSync} from 'node:fs';
+import {copyFileSync, mkdirSync, readdirSync, rmSync, readFileSync, chmodSync} from 'node:fs';
+import {createHash} from 'node:crypto';
 import path from 'node:path';
 import {createRequire} from 'node:module';
 
@@ -24,3 +25,16 @@ mkdirSync(licenses, {recursive: true});
 copyFileSync(path.join(path.dirname(require.resolve('mediainfo.js/package.json')), 'LICENSE.txt'), path.join(licenses, 'MediaInfo-BSD-2-Clause.txt'));
 copyFileSync(path.join(root, 'video-decoder-source.txt'), path.join(licenses, 'video-decoder-source.txt'));
 copyFileSync(path.join(root, 'licenses', 'GPL-2.0.txt'), path.join(licenses, 'FFmpeg-core-GPL-2.0.txt'));
+const rawSource = path.join(root, 'vendor', 'prores-raw');
+const rawDestination = path.join(destination, 'prores-raw-9.0-r1');
+const integrity = JSON.parse(readFileSync(path.join(rawSource, 'integrity.json'), 'utf8'));
+mkdirSync(rawDestination, {recursive: true});
+for (const [name, digest] of Object.entries(integrity)) {
+    if (createHash('sha256').update(readFileSync(path.join(rawSource, name))).digest('hex') !== digest) {
+        throw new Error('ProRes RAW runtime integrity mismatch: ' + name);
+    }
+}
+for (const name of readdirSync(rawSource)) {
+    copyFileSync(path.join(rawSource, name), path.join(rawDestination, name));
+    chmodSync(path.join(rawDestination, name), 0o644);
+}

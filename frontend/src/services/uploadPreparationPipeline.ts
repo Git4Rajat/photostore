@@ -216,7 +216,7 @@ export class UploadPreparationPipeline {
                     diagnostic.generation = assets.status === 'generated' ? 'generated' : assets.reason === 'busy' ? 'skipped' : 'failed';
                     if (assets.status === 'generated') {
                         diagnostic.bytes = assets[kind]?.blob.size; diagnostic.runtime = assets.runtime;
-                        if (kind === 'thumbnail' && assets.runtime === 'embedded_video_jpeg') {
+                        if (kind === 'thumbnail' && assets.readBytes !== undefined) {
                             diagnostic.readBytes = assets.readBytes; diagnostic.readCalls = assets.readCalls;
                         }
                     }

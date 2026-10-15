@@ -1,5 +1,6 @@
 const mocks = vi.hoisted(() => ({load: vi.fn(), probe: vi.fn(), read: vi.fn(), exec: vi.fn(), mount: vi.fn(),
-    terminate: vi.fn(), bitmap: vi.fn(), encode: vi.fn(), createDir: vi.fn(), embedded: vi.fn()}));
+    terminate: vi.fn(), bitmap: vi.fn(), encode: vi.fn(), createDir: vi.fn(), embedded: vi.fn(), raw: vi.fn()}));
+vi.mock('./proresRawThumbnail', () => ({proresRawThumbnail: mocks.raw}));
 vi.mock('../utils/videoEmbeddedThumbnail', () => ({embeddedVideoJpegs: mocks.embedded}));
 vi.mock('@ffmpeg/ffmpeg', () => ({FFmpeg: class {
     load = mocks.load; ffprobe = mocks.probe; readFile = mocks.read; exec = mocks.exec;
@@ -73,6 +74,30 @@ test('pre-aborted work never starts the WASM runtime', async () => {
     await expect(wasmVideoThumbnail(new File(['video'], 'clip.mov'), controller.signal)).rejects.toThrow('aborted');
     expect(mocks.load).not.toHaveBeenCalled();
 });
+
+test.each(['aprn', 'aprh'])('routes only RAW sample entry %s to the dedicated decoder', async codec => {
+    mocks.read.mockResolvedValue(JSON.stringify({streams: [{codec_tag_string: codec}]}));
+    const expected = {blob: new Blob(['jpeg']), width: 120, height: 63, quality: .65, readBytes: 6000000, readCalls: 5};
+    mocks.raw.mockResolvedValue(expected);
+    const file = new File(['video'], 'raw.mov'), signal = new AbortController().signal;
+    expect(await wasmVideoThumbnail(file, signal)).toBe(expected);
+    expect(mocks.raw).toHaveBeenCalledWith(file, signal);
+    expect(mocks.exec).not.toHaveBeenCalled();
+});
+
+test('ordinary ProRes does not load the RAW decoder', async () => {
+    mocks.read.mockImplementation(path => path.endsWith('.json')
+        ? JSON.stringify({streams: [{width: 1920, height: 1080, codec_tag_string: 'apch'}]}) : new Uint8Array([255, 216, 255]));
+    await wasmVideoThumbnail(new File(['video'], 'prores.mov'), new AbortController().signal);
+    expect(mocks.raw).not.toHaveBeenCalled(); expect(mocks.exec).toHaveBeenCalledOnce();
+});
+
+test.each([{sample_aspect_ratio: '2:1'}, {tags: {rotate: '90'}}, {side_data_list: [{rotation: -90}]}])(
+    'rejects unqualified RAW display geometry', async geometry => {
+        mocks.read.mockResolvedValue(JSON.stringify({streams: [{codec_tag_string: 'aprh', ...geometry}]}));
+        await expect(wasmVideoThumbnail(new File(['video'], 'raw.mov'), new AbortController().signal)).rejects.toThrow('geometry unsupported');
+        expect(mocks.raw).not.toHaveBeenCalled(); expect(mocks.exec).not.toHaveBeenCalled();
+    });
 
 test('uses embedded JPEG before loading either video decoder and preserves read counters', async () => {
     mocks.embedded.mockImplementation(async function* () {

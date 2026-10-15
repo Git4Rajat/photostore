@@ -46,7 +46,7 @@ test.each(['ffmpeg_wasm', 'embedded_video_jpeg'])('video prepares %s thumbnail a
     expect(result.clientProcessing?.preview).toBeUndefined();
     expect(result.clientMetadata).toBeDefined();
     expect(result.preparationReport?.assets.thumbnail.runtime).toBe(runtime);
-    if (runtime === 'embedded_video_jpeg') expect(result.preparationReport?.assets.thumbnail).toMatchObject({readBytes: 12000, readCalls: 14});
+    expect(result.preparationReport?.assets.thumbnail).toMatchObject({readBytes: 12000, readCalls: 14});
     expect(result.preparationReport?.assets.preview.generation).toBe('skipped');
     expect(mocks.fetch).toHaveBeenCalledTimes(2);
     pipeline.dispose();

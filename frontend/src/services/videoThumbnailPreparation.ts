@@ -48,7 +48,7 @@ export async function nativeVideoThumbnail(file: File, signal: AbortSignal): Pro
     }
 }
 
-export async function wasmVideoThumbnail(file: File, signal: AbortSignal): Promise<UploadDerivative> {
+export async function wasmVideoThumbnail(file: File, signal: AbortSignal): Promise<UploadDerivative & {readBytes?: number; readCalls?: number}> {
     if (signal.aborted) throw aborted();
     const {FFmpeg} = await import('@ffmpeg/ffmpeg');
     const ffmpeg = new FFmpeg();
@@ -63,12 +63,26 @@ export async function wasmVideoThumbnail(file: File, signal: AbortSignal): Promi
         // WORKERFS reads the File on demand; never copy a multi-GB video into MEMFS.
         const source = new File([file], 'source.' + getFileExtension(file.name), {type: file.type});
         if (!await ffmpeg.mount('WORKERFS' as import('@ffmpeg/ffmpeg').FFFSType, {files: [source]}, '/input')) throw new Error('Video mount unsupported');
-        const probeCode = await ffmpeg.ffprobe(['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
+        const probeCode = await ffmpeg.ffprobe(['-v', 'error', '-select_streams', 'v:0', '-show_entries',
+            'stream=width,height,codec_tag_string,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation',
             '-of', 'json', '/input/' + source.name, '-o', '/dimensions.json'], 8000);
         // Pinned core 0.12.10 returns -1 for successful ffprobe (upstream #817).
         // Require fresh, valid bounded dimensions; timeout/error codes still fail.
         if (probeCode !== 0 && probeCode !== -1) throw new Error('Video decode unsupported');
         const probe = JSON.parse(String(await ffmpeg.readFile('/dimensions.json', 'utf8')));
+        // The general FFmpeg 5 core recognizes these MOV sample entries but cannot decode RAW.
+        if (['aprn', 'aprh'].includes(probe.streams?.[0]?.codec_tag_string)) {
+            const stream = probe.streams[0];
+            // Do not silently publish a stretched or incorrectly oriented RAW thumbnail.
+            if ((stream.sample_aspect_ratio && !['1:1', '0:1', 'N/A'].includes(stream.sample_aspect_ratio))
+                || (stream.tags?.rotate && Number(stream.tags.rotate) % 360 !== 0)
+                || stream.side_data_list?.some((side: {rotation?: number}) => side.rotation !== undefined && side.rotation % 360 !== 0)) {
+                throw new Error('ProRes RAW display geometry unsupported');
+            }
+            ffmpeg.terminate();
+            const {proresRawThumbnail} = await import('./proresRawThumbnail');
+            return await proresRawThumbnail(file, signal);
+        }
         const {width, height} = probe.streams?.[0] || {};
         if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
             throw new Error('Video decode unsupported');
@@ -114,6 +128,7 @@ export async function prepareVideoThumbnail(file: File, signal: AbortSignal): Pr
     catch (error) {
         if (signal.aborted) throw aborted();
         if (error instanceof Error && error.message.includes('resource guard')) throw error;
-        return {thumbnail: await wasmVideoThumbnail(file, signal), runtime: 'ffmpeg_wasm'};
+        const thumbnail = await wasmVideoThumbnail(file, signal);
+        return {thumbnail, runtime: 'ffmpeg_wasm', readBytes: thumbnail.readBytes, readCalls: thumbnail.readCalls};
     }
 }
