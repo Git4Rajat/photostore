@@ -8782,7 +8782,16 @@ def _apply_client_processing_results(
         pass
     elif isinstance(ocr_result, dict):
         ocr_text = _sanitize_client_text(ocr_result.get('text'), 2048)
-        if ocr_text:
+        if ocr_result.get('error') or ocr_result.get('errorCode'):
+            status_updates['ocr_status'] = 'failed'
+            code = ocr_result.get('errorCode')
+            if not isinstance(code, str) or code not in {'tesserocr_unavailable', 'ocr_decode_failed', 'ocr_engine_failed'}:
+                code = 'ocr_processing_failed'
+            _merge_processing_metadata(metadata, 'client_ocr', {
+                'source': origin, 'acceptedAt': _utc_now(),
+                'clientAssetId': client_asset_id, 'errorCode': code,
+            })
+        elif ocr_text:
             metadata['ocrText'] = ocr_text
             metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
             metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
@@ -8792,9 +8801,16 @@ def _apply_client_processing_results(
                 'acceptedAt': _utc_now(),
                 'clientAssetId': client_asset_id,
                 'textLength': len(ocr_text),
+                'errorCode': '',
             })
         elif ocr_result.get('hasData') is False:
-            metadata['ocr_status'] = 'no_data'
+            status_updates['ocr_status'] = 'no_data'
+            _merge_processing_metadata(metadata, 'client_ocr', {
+                'source': origin, 'acceptedAt': _utc_now(),
+                'clientAssetId': client_asset_id, 'textLength': 0, 'errorCode': '',
+            })
+        else:
+            status_updates['ocr_status'] = 'failed'
     elif ocr_result is not None:
         metadata['ocr_status'] = 'failed'
 

@@ -567,6 +567,30 @@ def test_partial_failed_pass_queues_only_persisted_embeddings(monkeypatch, store
         'processing_metadata': json.dumps({'client_face': {'storedFaceIds': stored_ids, 'embeddingsReady': ready}}),
     })
     assert len(queued) == expected
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *args: {
+        'face_status': 'failed', 'faceCount': 1,
+        'processing_metadata': json.dumps({'client_face': {'storedFaceIds': stored_ids, 'embeddingsReady': ready}}),
+    })
+    monkeypatch.setattr(app, '_face_ids_awaiting_person_assignment', lambda *args: ['accepted-face'])
+    prepared = app._prepare_incremental_assignment({'filename': 'photo.jpg'}, 'lib-A')
+    assert prepared == ([('photo.jpg', ['accepted-face'])] if expected else [])
+
+
+@pytest.mark.parametrize('metadata,reason', [
+    (None, 'metadata_missing'),
+    ({'face_status': 'done', 'processingIsolated': True}, 'processing_isolated'),
+    ({'face_status': 'done', 'processing_state': 'deleted'}, 'deleted'),
+    ({'face_status': 'pending'}, 'face_not_ready'),
+    ({'face_status': 'failed', 'processing_metadata': '{'}, 'failed_without_persisted_embeddings'),
+])
+def test_assignment_skip_reasons_are_explicit(monkeypatch, metadata, reason):
+    events = []
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *args: metadata)
+    monkeypatch.setattr(app.processing_diagnostics, 'file_event', lambda *args, **kw: events.append((args, kw)))
+    monkeypatch.setattr(app, '_face_ids_awaiting_person_assignment', lambda *args: pytest.fail('must not read faces'))
+    assert app._prepare_incremental_assignment({'filename': 'photo.jpg'}, 'lib-A') == []
+    assert events == [(('cluster_skipped', 'lib-A', 'photo.jpg'), {'role': 'cluster', 'reason': reason})]
 
 
 def test_incremental_assign_job_matches_awaiting_face_to_existing_person(clustering_tables, monkeypatch):

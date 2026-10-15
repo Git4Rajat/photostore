@@ -23,6 +23,7 @@ import unicodedata
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
@@ -3617,9 +3618,8 @@ IPWORK_CLUSTER_BATCH_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_MAX_FIL
 # measured live. ~128 keeps a typical photo's faces within the staged-batch
 # 256-face cap in _process_clustering_user_group.
 INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE = int(os.getenv('INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE', '128'))
-# The real trigger: flush once a user's upload has gone quiet for this long
-# (a GAP in incoming filenames) -- NOT "flush after this much total time has
-# passed," which would cut off a still-active upload. See _is_upload_active.
+# Upload quietness is an early flush signal; the separate maximum wait
+# below prevents active photo/video uploads from indefinitely delaying faces.
 UPLOAD_ACTIVITY_WINDOW_SECONDS = float(os.getenv('UPLOAD_ACTIVITY_WINDOW_SECONDS', '300'))
 # True last-resort ceiling, not a normal trigger -- only matters if the
 # activity-table read itself starts failing (_is_upload_active fails safe to
@@ -3631,6 +3631,9 @@ IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS = float(os.getenv('IPWORK_CLUSTER_BAT
 # not a single queue-depth call, so this can poll much more often than the
 # old fixed-timer design without meaningful extra cost.
 IPWORK_CLUSTER_BATCH_POLL_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_POLL_SECONDS', '15'))
+# Bound face-result latency even while unrelated uploads/videos keep the
+# library heartbeat active. The poll cadence adds at most one extra tick.
+IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS', '60'))
 
 
 def _mark_upload_activity_heartbeat(user_id: str) -> None:
@@ -3717,12 +3720,7 @@ def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
 
 
 def _flush_stale_incremental_assign_buffers() -> None:
-    """Flush any user's buffer whose upload has gone quiet (_is_upload_active
-    is False), or that's been waiting past the hard fallback ceiling
-    regardless of activity -- not a fixed timer. A sustained upload keeps
-    its buffer growing (toward the count cap) for as long as activity stays
-    recent, instead of being cut off every ~60s by a timer that couldn't
-    tell a live upload apart from a finished one."""
+    """Flush on inactivity, count cap, or bounded age even during active uploads."""
     now = time.monotonic()
     to_flush: List[Tuple[str, List[str], str, float]] = []
     with _cluster_batch_lock:
@@ -3730,15 +3728,17 @@ def _flush_stale_incremental_assign_buffers() -> None:
     for user_id, started_at in candidates:
         age_s = now - started_at
         hard_fallback = age_s >= IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS
-        if hard_fallback or not _is_upload_active(user_id):
+        max_wait = age_s >= IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS
+        if hard_fallback or max_wait or not _is_upload_active(user_id):
             with _cluster_batch_lock:
                 # Re-check under the lock -- the buffer may have already
                 # been flushed (count cap) or grown since the snapshot above.
-                if user_id not in _cluster_batch_started_at:
+                if _cluster_batch_started_at.get(user_id) != started_at:
                     continue
                 buffer = _cluster_batch_buffers.get(user_id)
                 if buffer:
-                    to_flush.append((user_id, buffer, 'hard_fallback' if hard_fallback else 'inactive', age_s))
+                    reason = 'hard_fallback' if hard_fallback else 'max_wait' if max_wait else 'inactive'
+                    to_flush.append((user_id, buffer, reason, age_s))
                 _cluster_batch_buffers[user_id] = []
                 _cluster_batch_started_at.pop(user_id, None)
     for user_id, filenames, reason, age_s in to_flush:
@@ -11488,6 +11488,30 @@ def _face_ids_awaiting_person_assignment(user_id: str, filename: str) -> List[st
     ]
 
 
+def _incremental_assignment_skip_reason(metadata) -> Optional[str]:
+    """Shared producer/consumer eligibility; only persisted partial results qualify."""
+    if not isinstance(metadata, dict):
+        return 'metadata_missing'
+    if metadata.get('processingIsolated') is True:
+        return 'processing_isolated'
+    if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
+        return 'deleted'
+    status = str(metadata.get('face_status') or '').strip().lower()
+    if status == 'done':
+        return None
+    if status == 'failed':
+        try:
+            processing = json.loads(metadata.get('processing_metadata') or '{}')
+            accepted = processing.get('client_face') or {}
+            ids = accepted.get('storedFaceIds')
+            if isinstance(ids, list) and ids and accepted.get('embeddingsReady'):
+                return None
+        except (ValueError, TypeError, AttributeError):
+            pass
+        return 'failed_without_persisted_embeddings'
+    return 'face_not_ready'
+
+
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
     """Queue face-to-person assignment for newly-detected faces, then queue a
     maintenance recluster if one's due.
@@ -11506,26 +11530,8 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
     _enqueue_incremental_assign_job) -- the maintenance-cooldown gate below,
     which is what actually fixed the runaway-loop bug, is untouched.
     """
-    if not _people_features_available() or not isinstance(metadata, dict):
+    if not _people_features_available() or _incremental_assignment_skip_reason(metadata):
         return None
-    if metadata.get('processingIsolated') is True:
-        return None
-    if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
-        return None
-    if str(metadata.get('face_status') or '').strip().lower() != 'done':
-        # A partial pass is failed (not a verified complete set), but its
-        # validated/persisted embeddings can still take the normal assignment
-        # path. The worker reads canonical faces, never failed candidates.
-        try:
-            processing = json.loads(metadata.get('processing_metadata') or '{}')
-            accepted = processing.get('client_face') or {}
-            ids = accepted.get('storedFaceIds')
-            if (str(metadata.get('face_status') or '').lower() != 'failed'
-                    or not isinstance(ids, list) or not ids
-                    or not accepted.get('embeddingsReady')):
-                return None
-        except (ValueError, TypeError, AttributeError):
-            return None
 
     try:
         face_count = int(metadata.get('faceCount') or 0)
@@ -14048,21 +14054,24 @@ def _incremental_assign_message_filenames(payload) -> List[str]:
 def _prepare_incremental_assignment(payload, user_id) -> List[Tuple[str, List[str]]]:
     """Fresh per-photo preparation for every filename this message carries
     (one, or many -- see _incremental_assign_message_filenames); independent
-    reads may overlap in a batch. Filenames that fail validation or aren't
-    in a clusterable state are silently omitted from the result, matching
-    this function's previous single-filename behavior."""
+    reads may overlap in a batch. Non-clusterable files report bounded skip
+    reasons; preparation exceptions still propagate for queue retry."""
     if not _people_features_available():
+        for name in _incremental_assign_message_filenames(payload):
+            processing_diagnostics.file_event('cluster_skipped', user_id, name,
+                role='cluster', reason='features_disabled')
         return []
     prepared: List[Tuple[str, List[str]]] = []
     for raw_filename in _incremental_assign_message_filenames(payload):
         filename = _validate_media_filename(raw_filename)
         if not filename:
+            processing_diagnostics.file_event('cluster_skipped', user_id, raw_filename,
+                role='cluster', reason='invalid_filename')
             continue
         metadata = _get_metadata_entity(user_id, filename)
-        if (not isinstance(metadata, dict)
-                or metadata.get('processingIsolated') is True
-                or str(metadata.get('processing_state') or '').strip().lower() == 'deleted'
-                or str(metadata.get('face_status') or '').strip().lower() != 'done'):
+        reason = _incremental_assignment_skip_reason(metadata)
+        if reason:
+            processing_diagnostics.file_event('cluster_skipped', user_id, filename, role='cluster', reason=reason)
             continue
         prepared.append((filename, _face_ids_awaiting_person_assignment(user_id, filename)))
     return prepared
@@ -14331,10 +14340,9 @@ def _clustering_message_work_units(message) -> int:
     return max(1, len(_incremental_assign_message_filenames(payload)))
 
 
-@processing_diagnostics.measured('cluster', 'queue_accumulation', state='accumulating')
 def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_size,
                                   idle_timeout_seconds, visibility_timeout, poll_seconds,
-                                  shutdown_requested=None):
+                                  shutdown_requested=None, max_wait_seconds=5.0):
     """Pool messages across possibly many receive_messages calls (Azure Queue
     Storage caps a single call at 32 -- page_size stays within that), so a
     caller can accumulate far more than one page before grouping/processing.
@@ -14344,7 +14352,9 @@ def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_
     carry many filenames (see _buffer_incremental_assign_filename); every
     other job type counts as one unit, same as a raw message count would
     give -- or once idle_timeout_seconds have passed since the last message
-    arrived. idle_timeout_seconds<=0
+    arrived. A separate max_wait_seconds bounds total held-work latency;
+    an empty initial poll returns immediately so priority work can be polled
+    again. idle_timeout_seconds<=0
     disables waiting entirely: exactly one receive_messages call is made and
     whatever it returns (including nothing) is the result -- this matches
     the previous single-page poll's behavior.
@@ -14391,46 +14401,74 @@ def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_
     thread.start()
 
     started = time.monotonic()
-    if idle_timeout_seconds <= 0:
-        page = list(queue_client.receive_messages(
-            messages_per_page=page_size, max_messages=page_size,
-            visibility_timeout=visibility_timeout))
-        received(page)
-        with lock:
-            for message in page:
-                holders.append([message, True])
-        receive_ms = int((time.monotonic() - started) * 1000)
-        return page, holders, lock, stop, thread, 'single_page', receive_ms
-
+    first_received = None
+    accumulation = ExitStack()
     messages: List = []
     last_received = started
-    stopped_reason = 'idle_timeout'
+    stopped_reason = 'empty'
     work_units = 0
-    while True:
-        if shutdown_requested is not None and shutdown_requested.is_set():
-            stopped_reason = 'shutdown'
-            break
-        page = list(queue_client.receive_messages(
-            messages_per_page=page_size, max_messages=page_size,
-            visibility_timeout=visibility_timeout))
-        received(page)
-        now = time.monotonic()
-        if page:
-            with lock:
-                for message in page:
-                    messages.append(message)
-                    holders.append([message, True])
-            last_received = now
-            work_units += sum(_clustering_message_work_units(m) for m in page)
+    try:
+        while True:
+            if shutdown_requested is not None and shutdown_requested.is_set():
+                stopped_reason = 'shutdown'
+                break
+            if messages:
+                now = time.monotonic()
+                if now - first_received >= max_wait_seconds:
+                    stopped_reason = 'max_wait'
+                    break
+                if now - last_received >= idle_timeout_seconds:
+                    stopped_reason = 'idle_timeout'
+                    break
+            page = list(queue_client.receive_messages(
+                messages_per_page=page_size, max_messages=page_size,
+                visibility_timeout=visibility_timeout))
+            received(page)
+            now = time.monotonic()
+            if page:
+                with lock:
+                    for message in page:
+                        messages.append(message)
+                        holders.append([message, True])
+                if first_received is None:
+                    first_received = now
+                    accumulation.enter_context(processing_diagnostics.phase(
+                        'cluster', 'queue_accumulation', state='accumulating'))
+                last_received = now
+                work_units += sum(_clustering_message_work_units(m) for m in page)
+            if idle_timeout_seconds <= 0:
+                stopped_reason = 'single_page'
+                break
+            if not messages:
+                stopped_reason = 'empty'
+                break
             if work_units >= target_size:
                 stopped_reason = 'target_reached'
                 break
-        if now - last_received > idle_timeout_seconds:
-            stopped_reason = 'idle_timeout'
-            break
-        if not page:
-            time.sleep(poll_seconds)
+            remaining = min(idle_timeout_seconds - (now - last_received),
+                            max_wait_seconds - (now - first_received))
+            if remaining <= 0:
+                stopped_reason = 'max_wait' if now - first_received >= max_wait_seconds else 'idle_timeout'
+                break
+            if not page:
+                delay = min(poll_seconds, remaining)
+                if shutdown_requested is not None:
+                    shutdown_requested.wait(delay)
+                else:
+                    time.sleep(delay)
+    except BaseException:
+        # No caller receives holders on a failed receive. Stop its renewer
+        # so any already-held messages become visible for retry normally.
+        stop.set()
+        thread.join(timeout=5)
+        raise
+    finally:
+        accumulation.close()
     receive_ms = int((time.monotonic() - started) * 1000)
+    if messages:
+        processing_diagnostics.emit('cluster_accumulation', role='cluster', reason=stopped_reason,
+            initial_receive_ms=int((first_received - started) * 1000),
+            held_work_ms=int((time.monotonic() - first_received) * 1000))
     return messages, holders, lock, stop, thread, stopped_reason, receive_ms
 
 
@@ -14564,7 +14602,7 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
 def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
                                       deadletter_queue_client=None, *, batch_size=8,
                                       target_size=None, idle_timeout_seconds=0.0,
-                                      poll_seconds=2.0, shutdown_requested=None):
+                                      poll_seconds=2.0, shutdown_requested=None, max_wait_seconds=5.0):
     """Accumulate messages (possibly across many receive_messages calls --
     see _accumulate_clustering_batch) then group by user ACROSS THE WHOLE
     accumulated pool, not just adjacent positions, so same-user jobs
@@ -14581,7 +14619,8 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
         queue_client, queue_name, page_size=batch_size, target_size=target_size,
         idle_timeout_seconds=idle_timeout_seconds,
         visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
-        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested)
+        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
+        max_wait_seconds=max_wait_seconds)
     if not messages:
         stop.set()
         thread.join(timeout=5)
@@ -14672,6 +14711,9 @@ def run_clustering_worker() -> None:
     idle_timeout_seconds = float(os.getenv('CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS', '300'))
     if not 0 <= idle_timeout_seconds <= 3600:
         raise ValueError('CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS must be between 0 and 3600')
+    max_accumulation_seconds = float(os.getenv('CLUSTERING_WORKER_MAX_ACCUMULATION_SECONDS', '5'))
+    if not 0 <= max_accumulation_seconds <= 60:
+        raise ValueError('CLUSTERING_WORKER_MAX_ACCUMULATION_SECONDS must be between 0 and 60')
     queue_service_client_local = queue_service_client
     if queue_service_client_local is None:
         _init_storage_clients()
@@ -14700,6 +14742,7 @@ def run_clustering_worker() -> None:
     )
     processing_diagnostics.ready('cluster', page_size=batch_size, target_size=target_batch_size,
         accumulation_idle_seconds=idle_timeout_seconds, poll_seconds=poll_seconds,
+        accumulation_max_seconds=max_accumulation_seconds,
         coalesced_writes=os.getenv('PEOPLE_FAISS_COALESCE_WRITES', 'false').lower() in ('true', '1', 'yes'),
         assignment_engine=PEOPLE_ASSIGNMENT_ENGINE)
 
@@ -14751,7 +14794,8 @@ def run_clustering_worker() -> None:
                         queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
                         clustering_deadletter_client, batch_size=batch_size,
                         target_size=target_batch_size, idle_timeout_seconds=idle_timeout_seconds,
-                        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested)
+                        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
+                        max_wait_seconds=max_accumulation_seconds)
             if not processed_any and not shutdown_requested.is_set():
                 time.sleep(poll_seconds)
         except Exception:

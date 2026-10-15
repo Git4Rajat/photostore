@@ -164,3 +164,35 @@ def test_verified_absence_lock_requires_backend_provenance_and_allows_forced_rep
     row = {'exif_status': status, 'processing_metadata': json.dumps({'client_exif': {
         'source': source, 'verifiedNoExif': verified}})}
     assert storage_utils._step_locked_done(row, 'exif') is locked
+
+
+@pytest.mark.parametrize('result,status,code', [
+    ({'hasData': False}, 'no_data', ''),
+    ({'hasData': True, 'text': 'hello'}, 'done', ''),
+    ({'hasData': False, 'error': 'engine error'}, 'failed', 'ocr_processing_failed'),
+    ({'hasData': False, 'errorCode': 'ocr_decode_failed'}, 'failed', 'ocr_decode_failed'),
+    ({'hasData': True, 'text': 'partial', 'error': 'engine error', 'errorCode': 'ocr_engine_failed'}, 'failed', 'ocr_engine_failed'),
+    ({'hasData': False, 'errorCode': 'private filename or secret'}, 'failed', 'ocr_processing_failed'),
+    ({'hasData': False, 'errorCode': {'untrusted': 'object'}}, 'failed', 'ocr_processing_failed'),
+    ({'hasData': True}, 'failed', None),
+])
+def test_ocr_errors_are_not_verified_empty_results(metadata, monkeypatch, result, status, code):
+    _seed_row(metadata, 'owner', 'photo.jpg', ocr_status='running')
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    storage_utils.apply_client_processing_results_for_file(
+        'owner', 'photo.jpg', client_processing={'ocr': result}, origin='ipworker',
+        client_asset_id='test', claimed_steps=['ocr'])
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['ocr_status'] == status
+    if code is not None:
+        assert json.loads(stored['processing_metadata'])['client_ocr']['errorCode'] == code
+
+
+def test_late_ocr_error_cannot_overwrite_completed_text(metadata):
+    _seed_row(metadata, 'owner', 'photo.jpg', ocr_status='done', ocrText='verified text')
+    storage_utils.apply_client_processing_results_for_file(
+        'owner', 'photo.jpg', client_processing={'ocr': {'hasData': False, 'error': 'late failure'}},
+        origin='ipworker')
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['ocr_status'] == 'done'
+    assert stored['ocrText'] == 'verified text'

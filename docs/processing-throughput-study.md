@@ -1,7 +1,37 @@
 # Processing Throughput Study
 
-This instrumentation observes the existing pipeline. It does not tune scaling,
-batching, timers, concurrency, retries, deduplication or video fallback behavior.
+The initial instrumentation observed the existing pipeline without tuning it.
+The post-baseline correctness and scheduling changes are recorded below so
+future comparisons can distinguish application changes from scaler experiments.
+
+## Post-Baseline Fixes
+
+- Producer and consumer share the same partial-face eligibility check. Failed
+  passes qualify only with nonempty stored face IDs and ready embeddings;
+  assignment still reads canonical persisted faces. Deleted/isolated/unready
+  files emit `cluster_skipped` with a bounded reason instead of disappearing
+  silently. Preparation/storage failures still follow queue retry semantics.
+- OCR errors persist as `failed`, with a bounded `client_ocr.errorCode`, not
+  verified `no_data`. Successfully empty OCR remains `no_data`. Existing
+  terminal successful results retain their first-result-wins protection.
+- `IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS` defaults to 60, checked on the existing
+  15-second flush tick. Photo clustering no longer waits for a five-minute
+  upload quiet window when photos or videos keep the library active. Count-cap,
+  inactive-upload and shutdown flushes remain available.
+- Empty cluster polls return immediately, revisiting the priority queue on the
+  normal poll cadence. `CLUSTERING_WORKER_MAX_ACCUMULATION_SECONDS` defaults to
+  5 (0 disables waiting, maximum 60), bounding held-work coalescing even under
+  continuous arrivals. This caps the existing idle timeout rather than changing
+  the configured target size or Azure receive-page limit. In-flight processing
+  itself is not preempted; its leases and success-only ACKs remain unchanged.
+- `cluster_accumulation` separates `initial_receive_ms` from `held_work_ms`.
+  Accumulating resident-state time now starts only after a message arrives;
+  empty queue polling counts as idle. The aggregate `cluster_batch.accumulation_ms`
+  remains receive-plus-coalescing wall time for compatibility.
+
+Replica counts, scaler targets, concurrency, preview/metadata caps, EXIF packet
+qualification and video browser-only behavior are unchanged by these fixes.
+The next measured run should precede any separate queue-target experiment.
 
 ## Evidence
 
@@ -26,7 +56,7 @@ bounded upload run using the file ID. No per-library diagnostic cache is retaine
 | cluster_buffered / cluster_enqueued / cluster_received / cluster_started | In-memory buffer wait, queue wait and accumulation/preparation wait. |
 | upload_activity / upload_heartbeat / cluster_upload_gate / cluster_buffer_flush | Media mix at init/finalize, persisted shared activity heartbeat and gate decisions/flush reasons. Mixed video activity can prolong the photo-clustering gate. |
 | cluster_batch / cluster_prepare / cluster_assignment / cluster_storage | Effective work units, accumulation cutoff, metadata preparation, lease/prefetch time, transactions and persistence overhead. |
-| cluster_applied / cluster_acknowledged / cluster_retry | Assignment attempt, ACK and redelivery evidence. Applied counts are attempts, not distinct successful photos. Faces are pending unique input IDs per photo on that attempt, not a claim about unique people or all historical faces. |
+| cluster_applied / cluster_acknowledged / cluster_retry / cluster_skipped | Assignment attempt, ACK, redelivery and explicit non-clusterable-file reasons. Applied counts are attempts, not distinct successful photos. Faces are pending unique input IDs per photo on that attempt, not a claim about unique people or all historical faces. |
 
 Existing `ipwork throughput metrics=` supplies per-replica slot occupancy,
 preparation-only/ready/idle seconds, productive/error counts, payload bytes and
@@ -37,8 +67,8 @@ Existing FAISS logs distinguish checkpoint restore from cold rebuild.
 `worker_first_work` means the first dispatched task, possibly a no-op; use the
 first productive result plus ACK for time-to-first-success. Worker processing
 state includes storage waits, not just CPU inference. Compare CPU and PERF spans
-to distinguish compute from I/O. Cluster accumulation includes empty polling;
-received/batch events distinguish waiting for the first message from holding work.
+to distinguish compute from I/O. Historical accumulation included empty polling;
+new `cluster_accumulation` records separate the initial receive from holding work.
 
 ## Study Protocol
 

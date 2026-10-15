@@ -165,3 +165,28 @@ def test_shutdown_checkpoint_error_does_not_break_exit(monkeypatch, caplog):
     monkeypatch.setattr(app, '_live_faiss_assigner', SimpleNamespace(final_checkpoint=fail))
     app.run_clustering_worker()
     assert 'Final clustering checkpoint failed' in caplog.text
+
+
+def test_empty_general_queue_does_not_delay_next_priority_poll(monkeypatch):
+    monkeypatch.setenv('CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS', '300')
+    monkeypatch.setenv('CLUSTERING_WORKER_POLL_SECONDS', '0.01')
+    monkeypatch.setattr(app, '_live_faiss_assigner', None)
+    general = _FakeQueueClient()
+    priority = _FakeQueueClient()
+    class Service:
+        def get_queue_client(self, name):
+            return priority if name == app.LIBRARY_OPS_QUEUE_NAME else general
+    monkeypatch.setattr(app, 'queue_service_client', Service())
+    handlers, calls = {}, []
+    monkeypatch.setattr(app.signal, 'signal', lambda sig, handler: handlers.update({sig: handler}))
+    def poll(*args):
+        calls.append('priority')
+        if len(calls) == 2:
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+        return False
+    monkeypatch.setattr(app, '_poll_clustering_queue_once', poll)
+    started = time.monotonic()
+    app.run_clustering_worker()
+    assert time.monotonic() - started < 2
+    assert len(calls) == 2
+    assert len(general.receive_calls) == 1

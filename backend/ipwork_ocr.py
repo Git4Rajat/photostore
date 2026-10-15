@@ -116,9 +116,11 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
 
 def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
     if tesserocr is None:
-        return {'hasData': False, 'error': 'tesserocr_unavailable'}
+        return {'hasData': False, 'error': 'tesserocr_unavailable', 'errorCode': 'tesserocr_unavailable'}
+    error_code = 'ocr_decode_failed'
     try:
         with rgb_image(image_bytes, filename, _decodable_image_bytes) as image:
+            error_code = 'ocr_engine_failed'
             # Phone photos are commonly stored with an EXIF orientation tag
             # rather than physically rotated pixels (confirmed against real
             # photos during face-pipeline validation -- see ipwork_face.py);
@@ -133,7 +135,7 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
             api.Recognize()
             word_confidences = api.MapWordConfidences()
     except Exception as exc:
-        return {'hasData': False, 'error': str(exc)}
+        return {'hasData': False, 'error': str(exc), 'errorCode': error_code}
     # MapWordConfidences() (not GetUTF8Text()) so individually low-confidence
     # words -- texture/grain tesseract hallucinated as "text", the dominant
     # false-positive mode documented in docs/ipworker-architecture.md's PSM

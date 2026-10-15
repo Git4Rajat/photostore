@@ -214,3 +214,23 @@ def test_process_ocr_on_raw_bytes_without_fallback_would_fail():
             assert False, 'expected PIL to fail on non-image bytes'
         except Exception:
             pass
+
+
+def test_unavailable_engine_reports_bounded_category(monkeypatch):
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', None)
+    result = ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())
+    assert result['hasData'] is False
+    assert result['errorCode'] == 'tesserocr_unavailable'
+
+
+def test_decode_failure_is_distinct_from_engine_failure(monkeypatch):
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', object())
+    result = ipwork_ocr.process_ocr('owner', 'photo.jpg', b'not an image')
+    assert result['hasData'] is False
+    assert result['errorCode'] == 'ocr_decode_failed'
+    def fail():
+        raise RuntimeError('engine initialization failed')
+    monkeypatch.setattr(ipwork_ocr, '_get_api', fail)
+    result = ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())
+    assert result['hasData'] is False
+    assert result['errorCode'] == 'ocr_engine_failed'
