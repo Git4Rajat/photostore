@@ -113,6 +113,14 @@ def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, pa
         if processing_rejection and any(receipts[asset] == 'rejected' for asset in ('preview', 'thumbnail')):
             receipts['processingReason'] = processing_rejection
         record = {'browserClaim': report, 'backendReceipt': receipts}
+        from processing_diagnostics import file_event, batch_id
+        for asset in ('preview', 'thumbnail', 'metadata'):
+            claim = report.get('assets', {}).get(asset, {})
+            file_event('upload_asset', user_id, filename, batch_id=batch_id(payload.get('uploadBatchId')),
+                       asset=asset, generation=claim.get('generation'), upload=claim.get('upload'),
+                       receipt=receipts.get(asset), generation_ms=claim.get('generationMs'),
+                       upload_ms=claim.get('uploadMs'), queue_ms=claim.get('queueMs'),
+                       bytes=claim.get('bytes'), reason=claim.get('generationReason') or receipts.get(asset + 'Reason'))
         app._update_metadata_entity_fields(user_id, filename, {'uploadPreparationReport': json.dumps(record, separators=(',', ':'))})
         app.app.logger.info('upload preparation receipt %s', json.dumps({
             'user': user_id, 'file': filename, 'uploadId': str(payload.get('uploadId') or '')[:100], **record}, separators=(',', ':')))

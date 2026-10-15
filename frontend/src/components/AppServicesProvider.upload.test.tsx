@@ -249,6 +249,13 @@ describe('browser upload selection and startup', () => {
         await act(async () => { resolvePreparation(prepared); });
         await advance(4000);
         expect(finalizedFiles()[0]).toMatchObject({...prepared, blobName: 'blob-original-0.heic'});
+        const batchId = finalizedFiles()[0].uploadBatchId;
+        expect(batchId).toMatch(/^[0-9a-f-]{36}$/);
+        const summaries = mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/telemetry');
+        expect(summaries.map(([, payload]) => payload)).toEqual(expect.arrayContaining([
+            expect.objectContaining({batchId, phase: 'start', selected: 1, photos: 1, videos: 0}),
+            expect.objectContaining({batchId, phase: 'end', uploaded: 1, failed: 0, duplicates: 0}),
+        ]));
         expect(services.pendingUploadSummary).toBeNull();
     });
 

@@ -7,6 +7,7 @@ the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
 from flask import Blueprint
+import processing_diagnostics
 import re
 from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_finalized, upload_results, upload_teardown
 
@@ -17,6 +18,20 @@ from upload_preparation_diagnostics import record_receipt, rejection_reason, met
 
 upload_bp = Blueprint('upload', __name__)
 upload_bp.teardown_request(upload_teardown)
+
+
+@upload_bp.route('/api/upload/telemetry', methods=['POST'])
+@upload_bp.route('/upload/telemetry', methods=['POST'])
+def upload_telemetry():
+    user_id, error = app._require_user_id(require_auth=True)
+    if error:
+        return error
+    if app.request.content_length is not None and app.request.content_length > 4096:
+        return app.jsonify({'error': 'Telemetry too large'}), 413
+    data = app.request.get_json(silent=True)
+    if not isinstance(data, dict) or not processing_diagnostics.browser_batch(user_id, data):
+        return app.jsonify({'error': 'Invalid telemetry'}), 400
+    return app.jsonify({'recorded': True})
 
 
 @upload_bp.route('/upload/benchmark/config', methods=['GET'])
@@ -110,6 +125,8 @@ def init_upload():
         return app.jsonify({'error': 'Invalid totalSize'}), 400
     if total_size > app.MAX_UPLOAD_FILE_BYTES:
         return app.jsonify({'error': 'File exceeds upload limit'}), 413
+
+    processing_diagnostics.activity(user_id, [data], app.is_video_file, phase='init')
 
     try:
         benchmark_fields = authorize_entry(app, data, filename)
@@ -238,6 +255,8 @@ def init_upload_batch():
         return app.jsonify({'error': 'files must be a non-empty list'}), 400
     if len(files) > app.MAX_INIT_BATCH_FILES:
         return app.jsonify({'error': f'Batch too large (max {app.MAX_INIT_BATCH_FILES} files)'}), 400
+
+    processing_diagnostics.activity(user_id, files, app.is_video_file, phase='init')
 
     parsed = []
     for idx, item in enumerate(files):
@@ -463,6 +482,7 @@ def finalize_direct_upload():
     # attributes the photo to the library member who added it.
     try:
         finalize_updates: app.Dict[str, object] = {'size': total_size}
+        finalize_updates.update(processing_diagnostics.upload_fields(data))
         if account_id:
             finalize_updates['uploadedBy'] = account_id
         client_last_modified_iso = app.epoch_millis_to_iso(data.get('clientLastModified'))
@@ -516,7 +536,7 @@ def finalize_direct_upload():
     record_receipt(app, user_id, final_name, data, packet_accepted=packet_accepted,
                    packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
     try:
-        timed_call('enqueues', app._queue_upload_processing, user_id, final_name)
+        timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, data)
     except Exception:
         app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
     try:
@@ -532,6 +552,8 @@ def finalize_direct_upload():
     except Exception:
         app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
     upload_finalized(total_size)
+    processing_diagnostics.upload_event(user_id, final_name, data, size=total_size,
+                                       duplicate=bool(duplicates), video=app.is_video_file(final_name))
     _queue_idle_hash_refresh(user_id)
     return app.jsonify({
         'uploadId': data.get('uploadId') or '',
@@ -585,6 +607,8 @@ def finalize_upload_batch():
         return app.jsonify({'error': 'files must be a non-empty list'}), 400
     if len(files) > app.MAX_INIT_BATCH_FILES:
         return app.jsonify({'error': f'Batch too large (max {app.MAX_INIT_BATCH_FILES} files)'}), 400
+
+    processing_diagnostics.activity(user_id, files, app.is_video_file, phase='finalize')
 
     try:
         timed_call('enqueues', app._mark_fresh_upload_activity, user_id)
@@ -654,6 +678,7 @@ def finalize_upload_batch():
         app._invalidate_metadata_scan_cache(user_id)
         try:
             finalize_updates: app.Dict[str, object] = {'size': total_size}
+            finalize_updates.update(processing_diagnostics.upload_fields(item))
             if account_id:
                 finalize_updates['uploadedBy'] = account_id
             client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
@@ -714,7 +739,7 @@ def finalize_upload_batch():
         record_receipt(app, user_id, final_name, item, packet_accepted=packet_accepted,
                        packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
         try:
-            timed_call('enqueues', app._queue_upload_processing, user_id, final_name)
+            timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, item)
         except Exception:
             app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
         try:
@@ -734,6 +759,8 @@ def finalize_upload_batch():
             'processingIsolated': isolated(metadata),
         })
         upload_finalized(total_size)
+        processing_diagnostics.upload_event(user_id, final_name, item, size=total_size,
+                                           duplicate=bool(duplicates), video=app.is_video_file(final_name))
 
     if any(result.get('complete') for result in results):
         _queue_idle_hash_refresh(user_id)

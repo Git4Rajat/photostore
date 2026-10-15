@@ -1130,6 +1130,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clientLastModified?: number;
         clientMetadata?: UploadMetadataDescriptor;
         preparationReport?: PreparedUpload['preparationReport'];
+        uploadBatchId?: string;
         resolve: (value: any) => void;
         reject: (err: unknown) => void;
     }>>([]);
@@ -2113,8 +2114,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchFinalizeRef.current;
         pendingBatchFinalizeRef.current = [];
         runGatedRequestWithRetry(gate, '/upload/finalize-batch', {
-            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport }) => ({
-                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport,
+            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport, uploadBatchId }) => ({
+                filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport, uploadBatchId,
             })),
         })
             .then((response) => {
@@ -2146,6 +2147,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clientLastModified?: number;
         clientMetadata?: UploadMetadataDescriptor;
         preparationReport?: PreparedUpload['preparationReport'];
+        uploadBatchId?: string;
     }): Promise<any> => (
         new Promise((resolve, reject) => {
             // Same same-filename guard as requestBatchedInit -- two entries
@@ -3061,6 +3063,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
         isResumingUploadRef.current = true;
         const uploadRunGeneration = uploadRunGenerationRef.current + 1;
+        const uploadBatchId = crypto.randomUUID();
+        const telemetryStartedAt = performance.now();
+        const selectedVideos = filesToProcess.filter(file => isVideoFilename(file.name)).length;
+        const batchTelemetry = (phase: 'start' | 'end', counts = {}) => {
+            void postUpload('/upload/telemetry', {batchId: uploadBatchId, phase,
+                selected: filesToProcess.length, photos: filesToProcess.length - selectedVideos,
+                videos: selectedVideos, elapsedMs: Math.round(performance.now() - telemetryStartedAt), ...counts}).catch(() => {});
+        };
+        batchTelemetry('start');
         uploadRunGenerationRef.current = uploadRunGeneration;
         // Never wait for library hashes: each file checks the current map just
         // before transfer, so a background result also benefits this ongoing upload.
@@ -3080,6 +3091,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let totalUploaded = session.files.filter((file) => file.status === 'done').length;
         let totalFailed = 0;
         let totalSkippedDuplicates = session.files.filter((file) => file.skippedDuplicate).length;
+        const previouslyUploaded = totalUploaded;
+        const previouslySkipped = totalSkippedDuplicates;
         const uploadProfile = options.uploadProfile || getAdaptiveUploadProfile(session.files);
         const uploadStartedAt = Date.now();
         let transferredBytesThisRun = 0;
@@ -3361,6 +3374,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     // in flight runs to completion rather than being torn down
                     // mid-request on Stop).
                     const completeResponse = await requestBatchedFinalize({
+                        uploadBatchId,
                         filename: file.name,
                         uploadId: staged.uploadId,
                         totalSize: file.size,
@@ -3848,6 +3862,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             setUploadError(message);
         } finally {
             uploadPreparation?.dispose();
+            void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => batchTelemetry('end', {
+                uploaded: totalUploaded - previouslyUploaded - (totalSkippedDuplicates - previouslySkipped),
+                failed: totalFailed, duplicates: totalSkippedDuplicates - previouslySkipped,
+            }));
             uploadSessionStoreRef.current!.flush();
             const reason = discardedUploadSessionIdsRef.current.has(session.id) ? 'discarded'
                 : uploadStopRequestedRef.current ? 'stopped' : uploadEndReason;
