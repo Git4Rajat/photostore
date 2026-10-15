@@ -8,6 +8,7 @@ the caller's error path, only clears lease ownership, not step statuses).
 from __future__ import annotations
 
 import pytest
+import json
 
 import storage_utils
 
@@ -116,3 +117,50 @@ def test_exception_with_no_running_steps_does_not_touch_the_row(metadata, monkey
     stored = metadata.get_entity(user_id, filename)
     assert stored['exif_status'] == 'done'
     assert stored['ocr_status'] == 'no_data'
+
+
+@pytest.mark.parametrize('origin,source,verified,status', [
+    ('ipworker', 'browser_metadata_packet', True, 'no_data'),
+    ('browser', 'browser_metadata_packet', True, 'done'),
+    ('ipworker', 'other', True, 'done'),
+    ('ipworker', 'browser_metadata_packet', False, 'done'),
+])
+def test_verified_absence_persists_dimensions_without_original_fallback(metadata, monkeypatch, origin, source, verified, status):
+    user_id, filename = 'owner', 'plain.jpg'
+    _seed_row(metadata, user_id, filename, exif_status='running')
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    monkeypatch.setattr(storage_utils.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Unexpected geocoding'))
+    result = storage_utils.apply_client_processing_results_for_file(
+        user_id, filename, client_processing={'exif': {
+            'hasData': True, 'source': source, 'verifiedNoExif': verified,
+            'data': {'FileType': 'JPEG', 'ImageWidth': '40', 'ImageHeight': '20'},
+        }}, origin=origin, client_asset_id='test',
+    )
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['exif_status'] == status
+    assert stored['map_detection_status'] == 'no_data'
+    assert json.loads(stored['exifData'])['ImageWidth'] == '40'
+    assert result is not None
+
+
+def test_late_browser_no_data_cannot_redownload_verified_exif_absence(metadata, monkeypatch):
+    user_id, filename = 'owner', 'plain.jpg'
+    _seed_row(metadata, user_id, filename, exif_status='no_data', exifData='{"ImageWidth":"40"}',
+        processing_metadata=json.dumps({'client_exif': {'source': 'ipworker', 'verifiedNoExif': True}}))
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Late browser result fetched original'))
+    storage_utils.apply_client_processing_results_for_file(
+        user_id, filename, client_processing={'exif': {'hasData': False}}, origin='browser',
+    )
+    stored = metadata.get_entity(user_id, filename)
+    assert stored['exif_status'] == 'no_data'
+    assert json.loads(stored['exifData'])['ImageWidth'] == '40'
+
+
+@pytest.mark.parametrize('status,source,verified,locked', [
+    ('no_data', 'ipworker', True, True), ('pending', 'ipworker', True, False),
+    ('no_data', 'browser', True, False), ('no_data', 'ipworker', False, False),
+])
+def test_verified_absence_lock_requires_backend_provenance_and_allows_forced_repair(status, source, verified, locked):
+    row = {'exif_status': status, 'processing_metadata': json.dumps({'client_exif': {
+        'source': source, 'verifiedNoExif': verified}})}
+    assert storage_utils._step_locked_done(row, 'exif') is locked

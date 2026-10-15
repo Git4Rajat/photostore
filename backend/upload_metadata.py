@@ -1,4 +1,4 @@
-"""Bounded browser metadata transport. Candidates never imply confirmed absence."""
+"""Bounded metadata transport with format-validated JPEG absence qualification."""
 import hashlib
 import json
 import os
@@ -57,6 +57,68 @@ def _qualified_png_metadata(filename, exif):
             and exif.get('ColorType') in {'0', '2', '3', '4', '6'}
             and exif.get('Compression') == '0' and exif.get('Filter') == '0'
             and exif.get('Interlace') in {'0', '1'})
+
+
+def _verified_jpeg_no_exif(filename, ranges, source_size, exif):
+    """Qualify a complete, JFIF-only JPEG marker walk, not a client no-data flag."""
+    if Path(filename).suffix.lower() not in {'.jpg', '.jpeg'} or exif.get('FileType') != 'JPEG':
+        return False
+    # Unknown application segments/comments may carry metadata ExifTool did not
+    # recognize. Keep original fallback for those, trailers, and header-only packets.
+    index = 0
+    def read(offset, length):
+        nonlocal index
+        while index < len(ranges) and offset >= ranges[index][0] + len(ranges[index][1]):
+            index += 1
+        if index >= len(ranges):
+            raise ValueError('Incomplete JPEG structure')
+        start, data = ranges[index]
+        relative = offset - start
+        if relative < 0 or relative + length > len(data):
+            raise ValueError('Missing JPEG marker bytes')
+        return data[relative:relative + length]
+    try:
+        if read(0, 2) != b'\xff\xd8':
+            return False
+        pos, frame, scans = 2, None, 0
+        for _ in range(1024):
+            marker = read(pos, 2)
+            if marker == b'\xff\xd9':
+                return bool(frame and scans and pos + 2 == source_size
+                            and index == len(ranges) - 1
+                            and ranges[index][0] + len(ranges[index][1]) == source_size)
+            if marker[0] != 255 or marker[1] not in {0xc0, 0xc2, 0xc4, 0xdb, 0xdd, 0xda, 0xe0}:
+                return False
+            size = int.from_bytes(read(pos + 2, 2), 'big')
+            if size < 2:
+                return False
+            data = read(pos + 4, size - 2)
+            if marker[1] == 0xe0:
+                if len(data) < 14 or not data.startswith(b'JFIF\0') or len(data) != 14 + 3 * data[12] * data[13]:
+                    return False
+            if marker[1] in {0xc0, 0xc2}:
+                if frame or len(data) < 6 or data[0] != 8 or data[5] not in {1, 3} or len(data) != 6 + 3 * data[5]:
+                    return False
+                height, width = int.from_bytes(data[1:3], 'big'), int.from_bytes(data[3:5], 'big')
+                if not width or not height or str(width) != exif.get('ImageWidth') or str(height) != exif.get('ImageHeight'):
+                    return False
+                frame = data[5]
+            if marker[1] == 0xdd and len(data) != 2:
+                return False
+            pos += size + 2
+            if marker[1] == 0xda:
+                if not frame or not data or not 1 <= data[0] <= frame or len(data) != 4 + 2 * data[0]:
+                    return False
+                scans += 1
+                # A complete packet ends each SOS range exactly at the entropy
+                # boundary and retains the next marker at its original offset.
+                if pos != ranges[index][0] + len(ranges[index][1]) or index + 1 >= len(ranges):
+                    return False
+                index += 1
+                pos = ranges[index][0]
+        return False
+    except (ValueError, IndexError, TypeError):
+        return False
 
 
 def uploads_enabled(filename=''):
@@ -169,7 +231,7 @@ def _extraction_diagnostic(exif):
 
 
 def extract_candidate(storage, filename, row, on_download=None, on_outcome=None, on_diagnostic=None):
-    """Return EXIF or None for original fallback. Never trust packet-only no_data."""
+    """Return validated metadata or None for fallback; qualify absence structurally."""
     from azure.core import MatchConditions
     from exif_utils import _extract_exiftool_from_path, _exiftool_has_only_warning
     def outcome(reason):
@@ -218,13 +280,15 @@ def extract_candidate(storage, filename, row, on_download=None, on_outcome=None,
             outcome('exiftool_warning' if exif else 'no_exif')
             return None
         # File/system tags alone do not establish complete or absent EXIF.
-        if (not any(key in exif for key in ('Make', 'Model', 'DateTimeOriginal', 'GPS.LatitudeDecimal', 'Orientation'))
-                and not _qualified_png_metadata(filename, exif)):
+        has_identity = any(key in exif for key in ('Make', 'Model', 'DateTimeOriginal', 'GPS.LatitudeDecimal', 'Orientation'))
+        no_exif = not has_identity and _verified_jpeg_no_exif(filename, ranges, source_size, exif)
+        if (not has_identity
+                and not _qualified_png_metadata(filename, exif) and not no_exif):
             outcome('unqualified_exif')
             return None
         for key in ('FileModifyDate', 'FileAccessDate', 'FileInodeChangeDate', 'FilePermissions'):
             exif.pop(key, None)
-        outcome('reused')
+        outcome('reused_no_exif' if no_exif else 'reused')
         return exif
     except Exception:
         outcome(phase + '_failed')

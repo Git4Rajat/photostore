@@ -19,6 +19,69 @@ const rebuild = async (bytes: Uint8Array, maxBytes?: number) => {
     return {copy, result};
 };
 
+function plainJpeg(scanSize = 64, afterScan: number[] = []) {
+    const bytes = [255, 216];
+    const segment = (marker: number, data: number[]) => bytes.push(255, marker, (data.length + 2) >> 8, (data.length + 2) & 255, ...data);
+    segment(0xe0, [...Array.from(new TextEncoder().encode('JFIF\0')), 1, 1, 0, 0, 1, 0, 1, 0, 0]);
+    segment(0xc0, [8, 0, 20, 0, 40, 1, 1, 17, 0]);
+    segment(0xda, [1, 1, 0, 0, 63, 0]);
+    const scanStart = bytes.length;
+    const header = Uint8Array.from(bytes);
+    const result = new Uint8Array(header.length + scanSize + afterScan.length + 2);
+    result.set(header);
+    result.fill(33, scanStart, scanStart + scanSize);
+    result.set(afterScan, scanStart + scanSize);
+    result.set([255, 217], result.length - 2);
+    return {bytes: result, scanStart};
+}
+
+test('EXIF-free JPEG retains complete marker structure and EOI, not scan pixels', async () => {
+    const {bytes, scanStart} = plainJpeg();
+    const {copy, result} = await rebuild(bytes);
+    expect(result.kind).toBe('jpeg-header-ranges');
+    expect(result.chunks.map(chunk => ({offset: chunk.offset, length: chunk.bytes.length}))).toEqual([
+        {offset: 0, length: scanStart}, {offset: bytes.length - 2, length: 2},
+    ]);
+    expect(copy.slice(0, scanStart)).toEqual(bytes.slice(0, scanStart));
+    expect(copy.slice(scanStart, -2)).toEqual(new Uint8Array(bytes.length - scanStart - 2));
+    expect(Array.from(copy.slice(-2))).toEqual([255, 217]);
+});
+
+test('JPEG retains metadata after scans instead of claiming absence from its first header', async () => {
+    const afterScan = [255, 225, 0, 8, 69, 120, 105, 102, 0, 0, 255, 218, 0, 8, 1, 1, 0, 0, 63, 0, 45, 45];
+    const {bytes, scanStart} = plainJpeg(100, afterScan);
+    const {copy} = await rebuild(bytes);
+    expect(copy.slice(scanStart + 100, scanStart + 100 + 20)).toEqual(bytes.slice(scanStart + 100, scanStart + 100 + 20));
+});
+
+test('progressive JPEG preserves every scan header and inter-scan tables', async () => {
+    const afterScan = [255, 196, 0, 4, 0, 0, 255, 218, 0, 8, 1, 1, 0, 1, 63, 0, 45, 45];
+    const {bytes, scanStart} = plainJpeg(100, afterScan);
+    bytes[21] = 0xc2;
+    const {copy, result} = await rebuild(bytes);
+    expect(copy.slice(scanStart + 100, scanStart + 116)).toEqual(bytes.slice(scanStart + 100, scanStart + 116));
+    expect(result.chunks).toHaveLength(3);
+});
+
+test.each([65535, 65536, 65537])('JPEG entropy marker handling crosses chunk boundary %i', async scanSize => {
+    const {bytes, scanStart} = plainJpeg(scanSize);
+    bytes.set([255, 0, 255, 208, 255, 255, 0], scanStart + 10);
+    const {result} = await rebuild(bytes);
+    expect(result.chunks.at(-1)?.offset).toBe(bytes.length - 2);
+});
+
+test.each(['missing-eoi', 'trailer', 'segment-length'])('JPEG absence walk rejects %s', async fault => {
+    const {bytes} = plainJpeg();
+    if (fault === 'missing-eoi') bytes.fill(44, bytes.length - 2);
+    const input = fault === 'trailer' ? new Uint8Array([...Array.from(bytes), 0])
+        : fault === 'segment-length' ? new Uint8Array([...Array.from(bytes.slice(0, -2)), 255, 254, 0, 1, 255, 217]) : bytes;
+    await expect(rebuild(input)).rejects.toThrow('JPEG');
+});
+
+test('JPEG complete scan remains bounded by the metadata read budget', async () => {
+    await expect(rebuild(plainJpeg(10000).bytes, 512)).rejects.toThrow('budget');
+});
+
 function png() {
     const bytes = new Uint8Array(1024), view = new DataView(bytes.buffer);
     bytes.set([137, 80, 78, 71, 13, 10, 26, 10]);

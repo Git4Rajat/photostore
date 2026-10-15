@@ -8356,7 +8356,7 @@ def _apply_server_preview_fallback(
 
 
 def _step_locked_done(metadata: Dict, step: str) -> bool:
-    """True if `step` is already 'done' on this photo.
+    """True for a completed step, including backend-verified EXIF absence.
 
     Guards against two writers racing on the same photo (browser + a
     server-side ipworker both processing the same upload in "both" mode) --
@@ -8366,7 +8366,16 @@ def _step_locked_done(metadata: Dict, step: str) -> bool:
     _enqueue_processing_steps *before* the new result is submitted, so a
     forced resubmission never actually observes 'done' here.
     """
-    return str(metadata.get(f'{step}_status') or '').strip().lower() == 'done'
+    status = str(metadata.get(f'{step}_status') or '').strip().lower()
+    if status == 'done':
+        return True
+    if step == 'exif' and status == 'no_data':
+        try:
+            provenance = json.loads(metadata.get('processing_metadata') or '{}').get('client_exif') or {}
+            return provenance.get('source') == 'ipworker' and provenance.get('verifiedNoExif') is True
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return False
 
 
 def _try_get_image_bytes(get_image_bytes: Callable[[], bytes]) -> Optional[bytes]:
@@ -8721,11 +8730,14 @@ def _apply_client_processing_results(
                 metadata['latitude'] = lat
                 metadata['longitude'] = lon
             _apply_exif_metadata(metadata, exif_data)
+            verified_absent = (origin == 'ipworker' and exif_result.get('source') == 'browser_metadata_packet'
+                               and exif_result.get('verifiedNoExif') is True and not lat and not lon)
             _merge_processing_metadata(metadata, 'client_exif', {
                 'source': origin,
                 'acceptedAt': _utc_now(),
                 'hasGps': bool(lat and lon),
                 'clientAssetId': client_asset_id,
+                'verifiedNoExif': verified_absent,
                 **exif_provenance,
             })
             if lat and lon and not _CTX.get('queue_map_on_upload'):
@@ -8749,7 +8761,7 @@ def _apply_client_processing_results(
             elif not lat or not lon:
                 mark_step_no_data(user_id, filename, 'map_detection')
                 status_updates['map_detection_status'] = 'no_data'
-            status_updates['exif_status'] = 'done'
+            status_updates['exif_status'] = 'no_data' if verified_absent else 'done'
     elif exif_result is not None:
         status_updates['exif_status'] = 'failed'
     elif _client_report_needs_server_exif_fallback(report):

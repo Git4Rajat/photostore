@@ -403,6 +403,7 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         const signature = await read(offset, 2);
         if (signature[0] !== 255 || signature[1] !== 216) throw new Error('Not JPEG');
         let pos = offset + 2;
+        let absenceCandidate = true;
         for (let i = 0; i < 1024 && pos + 4 <= end; i++) {
             const head = await read(pos, 4);
             if (head[0] !== 255) throw new Error('Invalid JPEG marker');
@@ -410,10 +411,55 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
             const size = new DataView(head.buffer).getUint16(2);
             if (size < 2 || pos + size + 2 > end) throw new Error('Invalid JPEG segment');
             await read(pos + 4, size - 2);
-            if (head[1] === 0xda) return;
+            if (![0xc0, 0xc2, 0xc4, 0xdb, 0xdd, 0xda, 0xe0].includes(head[1])) absenceCandidate = false;
+            if (head[1] === 0xe0) {
+                const identifier = await read(pos + 4, Math.min(size - 2, 5), false);
+                if (ascii(identifier, 0, 5) !== 'JFIF\0') absenceCandidate = false;
+            }
+            if (head[1] === 0xda) return absenceCandidate;
             pos += size + 2;
         }
         throw new Error('Incomplete JPEG header');
+    }
+    async function jpegWithoutExif() {
+        // Retain every marker, including between progressive scans, but not
+        // entropy-coded pixels. Legacy header-only packets cannot prove absence.
+        ranges.length = 0;
+        await read(0, 2);
+        let pos = 2, scanBytes = new Uint8Array(), scanOffset = 0;
+        async function nextMarker(start) {
+            let cursor = start;
+            while (cursor + 1 < source.size) {
+                if (cursor < scanOffset || cursor + 1 >= scanOffset + scanBytes.length) {
+                    scanOffset = cursor;
+                    scanBytes = await read(cursor, Math.min(65536, source.size - cursor), false);
+                }
+                const index = scanBytes.indexOf(255, cursor - scanOffset);
+                if (index < 0) { cursor = scanOffset + scanBytes.length; continue; }
+                cursor = scanOffset + index;
+                if (index + 1 >= scanBytes.length) continue;
+                const marker = scanBytes[index + 1];
+                if (marker === 255) cursor++;
+                else if (marker === 0 || (marker >= 0xd0 && marker <= 0xd7)) cursor += 2;
+                else return cursor;
+            }
+            throw new Error('Incomplete JPEG scan');
+        }
+        for (let i = 0; i < 1024 && pos + 2 <= source.size; i++) {
+            const marker = await read(pos, 2);
+            if (marker[0] !== 255) throw new Error('Invalid JPEG marker');
+            if (marker[1] === 0xd9) {
+                if (pos + 2 !== source.size) throw new Error('Unsupported JPEG trailer');
+                return;
+            }
+            const word = await read(pos + 2, 2);
+            const size = new DataView(word.buffer).getUint16(0);
+            if (size < 2 || pos + size + 2 > source.size) throw new Error('Invalid JPEG segment');
+            await read(pos + 4, size - 2);
+            pos += size + 2;
+            if (marker[1] === 0xda) pos = await nextMarker(pos);
+        }
+        throw new Error('Incomplete JPEG structure');
     }
     async function png() {
         await read(0, 8);
@@ -491,7 +537,7 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         await png();
     } else if (head[0] === 255 && head[1] === 216) {
         kind = 'jpeg-header-ranges';
-        await jpeg(0, source.size);
+        if (await jpeg(0, source.size)) await jpegWithoutExif();
     } else if (ascii(head, 6, 8) === 'HEAPCCDR') {
         kind = 'ciff-directory-ranges';
         const little = ascii(head, 0, 2) === 'II';

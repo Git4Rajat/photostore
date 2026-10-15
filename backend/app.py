@@ -14958,16 +14958,21 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
             continue
         geo_exif = None
         packet_exif = None
+        packet_outcome = None
         try:
             if step == 'exif' and IPWORK_REUSE_METADATA_PACKET and not use_original:
                 import ipwork_geo
                 if processor is ipwork_geo.process_exif and get_source_metadata().get('uploadMetadataPacket'):
                     import storage_utils
                     from upload_metadata import extract_candidate
+                    def packet_finished(reason):
+                        nonlocal packet_outcome
+                        packet_outcome = reason
+                        worker_logger.info('ipwork metadata outcome user=%s file=%s reason=%s', user_id, filename, reason)
                     packet_started = time.monotonic()
                     packet_exif = extract_candidate(storage_utils, filename, get_source_metadata(),
                         on_download=packet_downloaded,
-                        on_outcome=lambda reason: worker_logger.info('ipwork metadata outcome user=%s file=%s reason=%s', user_id, filename, reason),
+                        on_outcome=packet_finished,
                         on_diagnostic=lambda info: worker_logger.info('ipwork metadata diagnostic user=%s file=%s version=%s category=%s',
                             user_id, filename, info['version'], info['category']))
                     if packet_exif is not None:
@@ -15004,6 +15009,8 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
         try:
             if packet_exif is not None:
                 result = {'hasData': True, 'data': packet_exif, 'source': 'browser_metadata_packet'}
+                if packet_outcome == 'reused_no_exif':
+                    result['verifiedNoExif'] = True
             else:
                 result = ipwork_geo.process_geo_from_exif(geo_exif) if geo_exif is not None else processor(user_id, filename, image_bytes)
             client_processing[step] = result if isinstance(result, dict) else _failure_shape(step, 'invalid_result_shape')

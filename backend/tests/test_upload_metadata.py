@@ -309,3 +309,116 @@ def test_png_file_tags_alone_never_establish_exif_absence(monkeypatch):
     storage, row = _candidate_fixture()
     monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: {'FileType': 'PNG', 'FileSize': '100'})
     assert transport.extract_candidate(storage, 'screen.png', row) is None
+
+
+def _jpeg_candidate(ranges=None, progressive=False):
+    import io
+    from PIL import Image
+    stream = io.BytesIO()
+    Image.new('RGB', (40, 20), 'red').save(stream, format='JPEG', progressive=progressive)
+    source = stream.getvalue()
+    if ranges is None:
+        ranges = []
+        pos, start = 2, 0
+        while source[pos:pos + 2] != b'\xff\xd9':
+            marker = source[pos + 1]
+            pos += 2 + int.from_bytes(source[pos + 2:pos + 4], 'big')
+            if marker == 0xda:
+                ranges.append((start, source[start:pos]))
+                while True:
+                    pos = source.index(b'\xff', pos)
+                    following = source[pos + 1]
+                    if following == 0 or 0xd0 <= following <= 0xd7:
+                        pos += 2
+                    elif following == 255:
+                        pos += 1
+                    else:
+                        break
+                start = pos
+        ranges.append((start, source[start:]))
+    header = json.dumps({'version': 1, 'kind': 'jpeg-header-ranges', 'sourceSha256': 'a' * 64,
+        'sourceSize': len(source), 'ranges': [{'offset': offset, 'length': len(data)} for offset, data in ranges]}).encode()
+    packet = len(header).to_bytes(4, 'big') + header + b''.join(data for _, data in ranges)
+    descriptor = {'version': 1, 'bytes': len(packet), 'sha256': hashlib.sha256(packet).hexdigest(), 'sourceSha256': 'a' * 64}
+    row = {'uploadMetadataPacket': json.dumps({**descriptor, 'physical': 'physical', 'sourceSize': len(source), 'etag': 'etag-1'}),
+        'fileHash': 'a' * 64, 'anonymousImageId': 'physical', 'size': len(source)}
+    storage = SimpleNamespace(_CTX={'blob_thumbnail_container': 'thumbnails'},
+        _get_blob_client=lambda *_: SimpleNamespace(download_blob=lambda **_: SimpleNamespace(readall=lambda: packet)))
+    return storage, row, ranges, source
+
+
+def _jpeg_exif():
+    return {'FileType': 'JPEG', 'ImageWidth': '40', 'ImageHeight': '20', 'JFIFVersion': '1 1'}
+
+
+def test_complete_jpeg_without_exif_reuses_structural_metadata(monkeypatch):
+    import exif_utils
+    storage, row, _, _ = _jpeg_candidate()
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: _jpeg_exif())
+    outcomes = []
+    assert transport.extract_candidate(storage, 'plain.JPEG', row, on_outcome=outcomes.append) == _jpeg_exif()
+    assert outcomes == ['reused_no_exif']
+
+
+@pytest.mark.parametrize('fault', ['header-only', 'hole', 'wrong-end', 'application', 'frame', 'scan', 'jfif', 'trailer'])
+def test_jpeg_absence_requires_complete_qualified_structure(monkeypatch, fault):
+    import exif_utils
+    _, _, ranges, source = _jpeg_candidate()
+    header = bytearray(ranges[0][1])
+    if fault == 'header-only':
+        ranges = ranges[:1]
+    elif fault == 'hole':
+        ranges = [(0, bytes(header[:20])), (21, bytes(header[21:])), ranges[-1]]
+    elif fault == 'wrong-end':
+        ranges[-1] = (len(source) - 3, b'\xff\xd9')
+    elif fault == 'application':
+        header[3] = 0xe1
+        ranges[0] = (0, bytes(header))
+    elif fault == 'frame':
+        index = header.index(b'\xff\xc0')
+        header[index + 8] = 39
+        ranges[0] = (0, bytes(header))
+    elif fault == 'scan':
+        index = header.index(b'\xff\xda')
+        header[index + 4] = 4
+        ranges[0] = (0, bytes(header))
+    elif fault == 'jfif':
+        header[6:11] = b'JFXX\0'
+        ranges[0] = (0, bytes(header))
+    else:
+        ranges[-1] = (len(source) - 2, b'xx')
+    storage, row, _, _ = _jpeg_candidate(ranges)
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: _jpeg_exif())
+    assert transport.extract_candidate(storage, 'plain.jpg', row) is None
+
+
+@pytest.mark.parametrize('changes', [
+    {'ImageWidth': '0'}, {'ImageHeight': '21'}, {'FileType': 'TIFF'},
+    {'Warning': 'Partial'}, {'Error': 'Bad JPEG'}, {'EXIF.Truncated': 'true'},
+])
+def test_jpeg_no_exif_still_rejects_parser_errors_and_mismatched_dimensions(monkeypatch, changes):
+    import exif_utils
+    storage, row, _, _ = _jpeg_candidate()
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: {**_jpeg_exif(), **changes})
+    assert transport.extract_candidate(storage, 'plain.jpg', row) is None
+
+
+def test_jpeg_no_exif_is_not_inferred_for_other_formats():
+    _, _, ranges, source = _jpeg_candidate()
+    assert not transport._verified_jpeg_no_exif('photo.dng', ranges, len(source), _jpeg_exif())
+
+
+@pytest.mark.parametrize('progressive', [False, True])
+def test_complete_jpeg_packet_with_real_exiftool(tmp_path, progressive):
+    import shutil
+    import exif_utils
+    if not shutil.which('exiftool'):
+        pytest.skip('Real ExifTool not installed')
+    storage, row, _, source = _jpeg_candidate(progressive=progressive)
+    original_path = tmp_path / 'plain.jpg'
+    original_path.write_bytes(source)
+    excluded = {'FileModifyDate', 'FileAccessDate', 'FileInodeChangeDate', 'FilePermissions'}
+    expected = {key: value for key, value in exif_utils._extract_exiftool_from_path(str(original_path)).items() if key not in excluded}
+    outcomes = []
+    assert transport.extract_candidate(storage, 'plain.jpg', row, on_outcome=outcomes.append) == expected
+    assert outcomes == ['reused_no_exif']
