@@ -3124,16 +3124,32 @@ def _humanize_job(row: Dict) -> Dict:
         elif status == 'failed':
             title = 'Preview generation failed'
     elif job_type == INDEX_BUILD_JOB_TYPE:
-        # The library-index build the tools role runs on a cold account (or an
-        # ipworker-triggered rebuild). The frontend's own "Building your
-        # library index" gate is the primary UX for this -- the bell entry is
-        # just a secondary record, so keep it quiet and non-toasting.
         kind = 'index_build'
+        scope = str(row.get('indexScope') or result.get('scope') or '')
+        if scope not in {'full', 'light', 'people', 'dedup', 'dedup-idle'}:
+            # Older workers did not retain scope in result. Match the complete
+            # deterministic ID, not a suffix that could be part of a user ID.
+            base = _index_build_job_id(str(row.get('userId') or row.get('PartitionKey') or ''))
+            scope = next((name for name in ('light', 'people', 'dedup', 'dedup-idle')
+                          if row.get('jobId') == f'{base}-{name}'), 'full')
+        label, description = {
+            'full': ('Full library indexes', 'Photo browsing, search, albums and people indexes finished updating. '
+                     'Duplicate-check updates are reported separately.'),
+            'light': ('Photo browsing index', 'Photo ordering and library access refreshed. '
+                      'Search, people and album updates can finish separately.'),
+            'people': ('People and albums indexes', 'People and album listings refreshed. '
+                       'Photo analysis and face grouping can still be running.'),
+            'dedup': ('Duplicate-check index', 'Saved file hashes for checking future uploads for duplicates refreshed. '
+                      'This is separate from photo processing and search.'),
+            'dedup-idle': ('Duplicate-check index', 'The duplicate-check snapshot is current for the last observed uploads. '
+                           'This is separate from photo processing and search.'),
+        }[scope]
+        title = f'{label} updating'
         if status == 'done':
-            title = 'Library index ready'
-            message = 'Your library index finished building.'
+            title = f'{label} updated'
+            message = description
         elif status == 'failed':
-            title = 'Library index build failed'
+            title = f'{label} update failed'
     elif job_type == 'photo_soft_delete':
         kind = 'bulk_mutation'
         count = int(result.get('deleted') or row.get('totalItems') or 0)
@@ -3215,6 +3231,7 @@ def _humanize_job(row: Dict) -> Dict:
         'updatedAt': str(row.get('updatedAt') or ''),
         'suppressNotification': suppress_notification,
         'snapshotId': str(result.get('snapshotId') or ''),
+        **({'indexScope': scope} if job_type == INDEX_BUILD_JOB_TYPE else {}),
     }
 
 
@@ -10170,6 +10187,7 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
             delay = max(delay, int(max(0, minimum - elapsed)))
     _upsert_job_status(
         job_id, key, INDEX_BUILD_JOB_TYPE, 'queued',
+        indexScope=scope,
         result={'delayedSeconds': int(delay), 'reason': reason, 'scope': scope} if delay else None,
     )
     try:
@@ -10268,7 +10286,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             except Exception:
                 worker_logger.exception('Index build heartbeat failed for %s', user_id)
 
-    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running')
+    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running', indexScope=scope)
     heartbeat = threading.Thread(target=_heartbeat, name='index-build-heartbeat', daemon=True)
     heartbeat.start()
     try:

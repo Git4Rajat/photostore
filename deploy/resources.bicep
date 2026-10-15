@@ -54,6 +54,9 @@ param emailDataLocation string = 'Europe'
 ])
 param processingMode string = 'browser'
 
+@description('Prepare thumbnails, previews and metadata in the browser, and reuse accepted assets for backend processing.')
+param browserUploadPreparation bool = false
+
 @description('Public core API image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
 param coreImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
@@ -394,6 +397,10 @@ var backendEnv = [
   // 'browser') so the two can't drift out of sync the way a second
   // hand-edited literal here eventually would.
   { name: 'PROCESSING_MODE', value: processingMode }
+  { name: 'BROWSER_UPLOAD_PREPARATION', value: string(browserUploadPreparation) }
+  { name: 'IPWORK_REUSE_PREVIEW', value: string(browserUploadPreparation) }
+  { name: 'IPWORK_REUSE_EXIF', value: string(browserUploadPreparation) }
+  { name: 'IPWORK_REUSE_METADATA_PACKET', value: string(browserUploadPreparation) }
   // v3 drops the 128-d face-api descriptor concatenated onto ArcFace's 512-d
   // output (it diluted ArcFace's signal) and 5-point-landmark-aligns the crop
   // fed to ArcFace instead of using a plain padded box. v2 stays in the
@@ -1303,6 +1310,7 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
             // (core container, above) were wired correctly; this was the
             // missing piece on the web side.
             { name: 'APP_CONFIG_PROCESSING_MODE', value: processingMode }
+            { name: 'APP_CONFIG_BROWSER_UPLOAD_PREPARATION', value: string(browserUploadPreparation) }
             { name: 'APP_CONFIG_FACE_API_MODEL_URL', value: '/models/face-api' }
             // Explicit pin, added with the AdaFace swap: docker-entrypoint.sh
             // generates window.__APP_CONFIG__.arcFaceModelUrl at container start

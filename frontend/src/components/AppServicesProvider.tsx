@@ -55,6 +55,8 @@ import {
 } from '../services/fileSystemAccess';
 import {
     fetchJobStatuses,
+    jobNotificationKey,
+    indexNotificationGroup,
     isLikelyAuthenticated,
     loadSeenJobIds,
     persistSeenJobIds,
@@ -1208,8 +1210,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // minimized tab.
     const [browserProcessingActive, setBrowserProcessingActive] = useState<boolean>(false);
 
-    const addNotification = useCallback((title: string, details: string, progress?: UploadProgress) => {
-        const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const addNotification = useCallback((title: string, details: string, progress?: UploadProgress, group?: string) => {
+        const id = group ? `group:${group}` : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const created: AppNotification = {
             id,
             title,
@@ -1218,7 +1220,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             unread: true,
             progress,
         };
-        setNotifications((prev) => [created, ...prev].slice(0, 40));
+        setNotifications((prev) => [created, ...prev.filter(notification => notification.id !== id)].slice(0, 40));
         return id;
     }, []);
 
@@ -1241,6 +1243,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // first has finished setting up jobPollTimerRef — see startJobPolling below.
     const jobPollStartingRef = useRef<boolean>(false);
     const notifiedJobIdsRef = useRef<Set<string>>(loadSeenJobIds());
+    const indexNotificationTimesRef = useRef<Map<string, number>>(new Map());
     // In-flight jobs from the latest poll, surfaced to the UI for live progress.
     const [activeJobs, setActiveJobs] = useState<JobStatusRecord[]>([]);
     // Buffered clustering-kind completions awaiting a coalesced bell + toast,
@@ -1363,12 +1366,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     inFlight.push(job);
                     continue;
                 }
-                if (!job.jobId || seen.has(job.jobId)) {
+                const notificationKey = jobNotificationKey(job);
+                if (!job.jobId || seen.has(notificationKey)) {
                     continue;
                 }
                 // Mark seen first so an unannounced-but-stale finish (below) is
                 // never re-evaluated, and a completion is only ever shown once.
-                seen.add(job.jobId);
+                seen.add(notificationKey);
                 changed = true;
                 const finishedAt = job.updatedAt ? Date.parse(job.updatedAt) : NaN;
                 const isRecent = !Number.isFinite(finishedAt)
@@ -1403,7 +1407,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     // ipwork (backend/both processing mode) runs one job per photo --
                     // same "frequent, low-signal" shape as preview, and the gallery
                     // tile's own processing badge already covers per-photo feedback.
-                    addNotification(job.title, detail);
+                    const group = indexNotificationGroup(job);
+                    // Jobs arrive newest first. An older dedup/idle pass must
+                    // not replace the newer completion for the same index.
+                    if (group) {
+                        const timestamp = Number.isFinite(finishedAt) ? finishedAt : Date.now();
+                        if (timestamp <= (indexNotificationTimesRef.current.get(group) ?? -Infinity)) continue;
+                        indexNotificationTimesRef.current.set(group, timestamp);
+                    }
+                    addNotification(job.title, detail, undefined, group);
                     if (TOASTABLE_JOB_KINDS.has(job.kind)) {
                         showToast(detail ? `${job.title} — ${detail}` : job.title, {
                             variant: job.status === 'failed' ? 'error' : 'default',
@@ -1441,8 +1453,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 ipworkProcessingFinalizeTimerRef.current = window.setTimeout(() => {
                     ipworkProcessingFinalizeTimerRef.current = null;
                     updateNotification(notificationId, {
-                        title: 'Server processing finished',
-                        details: 'Server-side photo processing finished.',
+                        title: 'Server photo processing finished',
+                        details: 'Photo-processing activity has gone idle. Index updates and people grouping are reported separately.',
                     });
                     // The library indexes are rebuilt right after processing: refresh now, and once more
                     // shortly after (the index-build job may finish after this poller has gone idle).

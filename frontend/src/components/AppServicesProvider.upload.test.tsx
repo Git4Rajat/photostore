@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
     span: vi.fn(),
     preparationEnabled: false,
     prepared: vi.fn(),
+    pollAuthenticated: false,
+    jobs: vi.fn(),
 }));
 
 vi.mock('../config/appConfig', () => ({ getRuntimeConfig: () => ({ processingMode: 'backend', browserUploadPreparation: mocks.preparationEnabled }) }));
@@ -31,7 +33,8 @@ vi.mock('../services/apiClient', () => ({
 vi.mock('../services/authClient', () => ({ isAuthEnabled: () => false, getAccessToken: async () => null }));
 vi.mock('../services/jobNotifications', async (importOriginal) => ({
     ...await importOriginal<typeof import('../services/jobNotifications')>(),
-    isLikelyAuthenticated: () => false,
+    isLikelyAuthenticated: () => mocks.pollAuthenticated,
+    fetchJobStatuses: mocks.jobs,
     requestJobPoll: vi.fn(),
 }));
 vi.mock('../services/backgroundKeepAlive', () => ({
@@ -102,6 +105,8 @@ beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
     mocks.preparationEnabled = false;
+    mocks.pollAuthenticated = false;
+    mocks.jobs.mockResolvedValue([]);
     mocks.prepared.mockResolvedValue({});
     vi.stubGlobal('localStorage', memoryStorage());
     vi.stubGlobal('sessionStorage', memoryStorage());
@@ -148,6 +153,84 @@ function select(files: File[]) {
     fireEvent.change(input, { target: { files } });
     return input;
 }
+
+describe('index completion notifications', () => {
+    const indexJob = (scope: string, message: string, millisecondsAgo = 0) => ({
+        jobId: `index-build-owner-${scope}`, kind: 'index_build', status: 'done', indexScope: scope,
+        title: scope.startsWith('dedup') ? 'Duplicate-check index updated' : `${scope} index updated`,
+        message, updatedAt: new Date(Date.now() - millisecondsAgo).toISOString(),
+    });
+    const focus = async () => {
+        await act(async () => { window.dispatchEvent(new Event('focus')); });
+        await advance(0);
+    };
+
+    it('distinguishes index categories and keeps only the newest successful duplicate-check pass', async () => {
+        mocks.pollAuthenticated = true;
+        mocks.jobs.mockResolvedValue([
+            indexJob('dedup-idle', 'Newest duplicate-check snapshot'),
+            indexJob('dedup', 'Older duplicate-check snapshot', 1000),
+            indexJob('light', 'Photo ordering and access'),
+            indexJob('people', 'People and album listings'),
+            indexJob('full', 'Full library indexes'),
+        ]);
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(0);
+        expect(services.notifications).toHaveLength(4);
+        expect(services.notifications.find(n => n.title === 'Duplicate-check index updated')?.details).toBe('Newest duplicate-check snapshot');
+        expect(new Set(services.notifications.map(n => n.title)).size).toBe(4);
+        expect(mocks.toast).not.toHaveBeenCalled();
+    });
+
+    it('updates one entry for later batches with the same job ID without repeating the same completion', async () => {
+        mocks.pollAuthenticated = true;
+        const first = indexJob('light', 'First batch');
+        mocks.jobs.mockResolvedValue([first]);
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(0);
+        const id = services.notifications[0].id;
+        await advance(2000);
+        mocks.jobs.mockResolvedValue([{...first, message: 'Second batch', updatedAt: new Date().toISOString()}]);
+        await focus();
+        expect(services.notifications).toHaveLength(1);
+        expect(services.notifications[0]).toMatchObject({id, details: 'Second batch'});
+        act(() => services.markAllNotificationsRead());
+        await focus();
+        expect(services.notifications[0].unread).toBe(false);
+        act(() => services.clearNotifications());
+        await advance(2000);
+        mocks.jobs.mockResolvedValue([{...first, message: 'Third batch', updatedAt: new Date().toISOString()}]);
+        await focus();
+        expect(services.notifications).toHaveLength(1);
+        expect(services.notifications[0].details).toBe('Third batch');
+    });
+
+    it('does not hide a failed maintenance pass behind another successful update', async () => {
+        mocks.pollAuthenticated = true;
+        mocks.jobs.mockResolvedValue([
+            indexJob('dedup-idle', 'Snapshot refreshed'),
+            {...indexJob('dedup', 'Storage unavailable', 1000), status: 'failed', title: 'Duplicate-check index update failed'},
+        ]);
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(0);
+        expect(services.notifications).toHaveLength(2);
+        expect(services.notifications.some(n => n.details === 'Storage unavailable')).toBe(true);
+    });
+
+    it('separates server photo processing completion from indexing and people grouping', async () => {
+        mocks.pollAuthenticated = true;
+        const running = {jobId: 'photo-job', kind: 'ipwork', status: 'running', title: '', message: ''};
+        mocks.jobs.mockResolvedValue([running]);
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(0);
+        expect(services.notifications.some(n => n.title === 'Server processing started')).toBe(true);
+        mocks.jobs.mockResolvedValue([{...running, status: 'done'}]);
+        await advance(6000);
+        await advance(40000);
+        expect(services.notifications.find(n => n.title === 'Server photo processing finished')?.details)
+            .toContain('Index updates and people grouping are reported separately');
+    });
+});
 
 describe('browser upload selection and startup', () => {
     it('starts original transfers without waiting for preparation, then finalizes its assets in backend mode', async () => {

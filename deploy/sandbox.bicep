@@ -9,6 +9,9 @@ param resourceGroupName string = '${appName}-rg'
 param location string = deployment().location
 param adminEmail string
 
+param emailDataLocation string = 'Europe'
+param browserUploadPreparation bool = true
+
 @minLength(8)
 @secure()
 param adminPassword string
@@ -40,6 +43,8 @@ module app 'resources.bicep' = {
     communicationServiceName: '${appName}-comm-${uniqueString(rg.id)}'
     location: location
     adminEmail: adminEmail
+    emailDataLocation: emailDataLocation
+    browserUploadPreparation: browserUploadPreparation
     adminPassword: adminPassword
     processingMode: 'backend'
     coreImage: coreImage
