@@ -397,10 +397,10 @@ var backendEnv = [
   // 'browser') so the two can't drift out of sync the way a second
   // hand-edited literal here eventually would.
   { name: 'PROCESSING_MODE', value: processingMode }
-  { name: 'BROWSER_UPLOAD_PREPARATION', value: string(browserUploadPreparation) }
-  { name: 'IPWORK_REUSE_PREVIEW', value: string(browserUploadPreparation) }
-  { name: 'IPWORK_REUSE_EXIF', value: string(browserUploadPreparation) }
-  { name: 'IPWORK_REUSE_METADATA_PACKET', value: string(browserUploadPreparation) }
+  { name: 'BROWSER_UPLOAD_PREPARATION', value: browserUploadPreparation ? 'true' : 'false' }
+  { name: 'IPWORK_REUSE_PREVIEW', value: browserUploadPreparation ? 'true' : 'false' }
+  { name: 'IPWORK_REUSE_EXIF', value: browserUploadPreparation ? 'true' : 'false' }
+  { name: 'IPWORK_REUSE_METADATA_PACKET', value: browserUploadPreparation ? 'true' : 'false' }
   // v3 drops the 128-d face-api descriptor concatenated onto ArcFace's 512-d
   // output (it diluted ArcFace's signal) and 5-point-landmark-aligns the crop
   // fed to ArcFace instead of using a plain padded box. v2 stays in the
@@ -1310,7 +1310,7 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
             // (core container, above) were wired correctly; this was the
             // missing piece on the web side.
             { name: 'APP_CONFIG_PROCESSING_MODE', value: processingMode }
-            { name: 'APP_CONFIG_BROWSER_UPLOAD_PREPARATION', value: string(browserUploadPreparation) }
+            { name: 'APP_CONFIG_BROWSER_UPLOAD_PREPARATION', value: browserUploadPreparation ? 'true' : 'false' }
             { name: 'APP_CONFIG_FACE_API_MODEL_URL', value: '/models/face-api' }
             // Explicit pin, added with the AdaFace swap: docker-entrypoint.sh
             // generates window.__APP_CONFIG__.arcFaceModelUrl at container start
