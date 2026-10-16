@@ -94,6 +94,38 @@ def file_event(event, user, filename, **fields):
         pass
 
 
+@contextmanager
+def apply_phase(user, filename, phase):
+    """Attribute apply work without retaining metadata or changing worker state."""
+    def io_snapshot():
+        try:
+            from perf_instrumentation import current_scope
+            scope = current_scope()
+            if scope is not None:
+                with scope.lock:
+                    return scope, scope.io_count, scope.io_ms
+        except Exception:
+            pass
+        return None
+
+    started, cpu_started = time.monotonic(), time.thread_time()
+    before = io_snapshot()
+    outcome = 'success'
+    try:
+        yield
+    except BaseException:
+        outcome = 'error'
+        raise
+    finally:
+        after = io_snapshot()
+        same_scope = before is not None and after is not None and before[0] is after[0]
+        file_event('processing_apply_phase', user, filename, phase=phase, outcome=outcome,
+            milliseconds=max(0, time.monotonic() - started) * 1000,
+            thread_cpu_ms=max(0, time.thread_time() - cpu_started) * 1000,
+            sdk_calls=after[1] - before[1] if same_scope else None,
+            sdk_send_ms=after[2] - before[2] if same_scope else None)
+
+
 def payload(message):
     try:
         result = json.loads(message.content or '{}')

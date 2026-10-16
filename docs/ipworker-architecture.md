@@ -116,6 +116,35 @@ checks and whether they extended the lease. Both use opaque file/delivery
 identity, not photo contents. Allocations, concurrency and scaling are unchanged;
 actual deployed throughput and Azure cost savings have not been measured.
 
+## Remaining Apply Work (Local Only, 2026-10-16)
+
+The historical 28.69% apply share is not pure persistence: it includes the
+semantic text encoder in `_refresh_semantic_fields`, face reconciliation and
+embedding-table writes. It predates the local metadata/lease reductions above.
+OCR, EXIF-derived location, explicit geo and AI result branches no longer build
+intermediate semantic text/layers that the final refresh immediately replaces.
+A mixed OCR/geo/AI result now builds each once instead of four times; the final
+text, layers and embedding inputs remain identical. This is a local work-count
+reduction, not evidence of a particular wall-clock improvement.
+
+`processing_apply_phase` reports `face_persistence`, `semantic_refresh`,
+`embedding_write`, each attempted `metadata_cas`, and `index_dirty`. Events carry
+opaque file/library/delivery identity, success/error, wall milliseconds, current
+thread CPU milliseconds, and (when a PERF scope exists) SDK call-count/send-time
+deltas. They add no storage reads or worker-state transitions. No metadata,
+OCR text, embeddings, filenames or error strings are emitted.
+
+`semantic_refresh` includes text/layer construction, text-model inference and
+serialization. Current-thread CPU is not whole-process/native-pool CPU; SDK
+send latency is not complete body-transfer time or billing. A successful phase
+means its helper returned, not that every internally best-effort operation was
+confirmed. Phase timings are subsets of outer apply/commit timings; do not sum
+both. Claim/read time, conflict backoff/read time and other validation remain
+in the outer timing's residual. Background cover warming is measured separately.
+Use a retained matched upload to establish the new apply share before choosing
+cross-photo write batching or semantic-model batching; do not weaken generation
+fences or acknowledge unconfirmed writes to make apply appear faster.
+
 # ipworker background-processing architecture (as of 2026-08-28)
 
 Scope: how server-side AI processing of uploaded photos actually works today —

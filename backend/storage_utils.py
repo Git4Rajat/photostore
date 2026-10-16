@@ -8792,8 +8792,6 @@ def _apply_client_processing_results(
                         metadata['address'] = place['address']
                     metadata['locationCity'] = place.get('city', '')
                     metadata['locationCountry'] = place.get('country', '')
-                    metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
-                    metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
                 mark_step_done(user_id, filename, 'map_detection', result={
                     'source': origin,
                     'latitude': lat,
@@ -8838,8 +8836,6 @@ def _apply_client_processing_results(
             })
         elif ocr_text:
             metadata['ocrText'] = ocr_text
-            metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
-            metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             status_updates['ocr_status'] = 'done'
             _merge_processing_metadata(metadata, 'client_ocr', {
                 'source': origin,
@@ -8891,8 +8887,6 @@ def _apply_client_processing_results(
                     metadata['locationCity'] = place.get('city', '')
                     metadata['locationRegion'] = place.get('region', '')
                     metadata['locationCountry'] = place.get('country', '')
-            metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
-            metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             status_updates['map_detection_status'] = 'done'
         elif (map_result.get('hasData') is False
                 and all(map_result.get(key) is None or map_result.get(key) == '' for key in ('latitude', 'longitude'))):
@@ -9048,10 +9042,11 @@ def _apply_client_processing_results(
             )
             # Empty failures have nothing to publish and must not acquire a
             # filename-write lease or enumerate old rows just to preserve them.
-            stored_face_ids = _store_client_face_entities(
-                user_id, filename, faces_with_embeddings,
-                force_reconcile=face_was_forced and detection_genuinely_ran,
-            ) if faces_with_embeddings or detection_genuinely_ran else []
+            with processing_diagnostics.apply_phase(user_id, filename, 'face_persistence'):
+                stored_face_ids = _store_client_face_entities(
+                    user_id, filename, faces_with_embeddings,
+                    force_reconcile=face_was_forced and detection_genuinely_ran,
+                ) if faces_with_embeddings or detection_genuinely_ran else []
             if stored_face_ids:
                 rotation = int(metadata.get('rotation', 0) or 0) % 360
                 from ipwork_image import crop_preview
@@ -9202,8 +9197,6 @@ def _apply_client_processing_results(
                 metadata['photoEmbedding'] = _json_compact(image_embedding)
                 metadata['photoEmbeddingVersion'] = PHOTO_EMBEDDING_MODEL_VERSION
                 metadata['photoEmbeddingDimension'] = len(image_embedding)
-            metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
-            metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             mark_step_done(user_id, filename, 'ai_vision', result={
                 'source': origin,
                 'tags': tags,
@@ -9258,12 +9251,14 @@ def _apply_client_processing_results(
     derivatives_only = bool(payload) and not report and set(payload) <= {'preview', 'thumbnail'} and all(
         isinstance(value, dict) and value.get('alreadyUploaded') is True for value in payload.values())
     if not derivatives_only:
-        _refresh_semantic_fields(filename, metadata)
+        with processing_diagnostics.apply_phase(user_id, filename, 'semantic_refresh'):
+            _refresh_semantic_fields(filename, metadata)
 
     if status_updates:
         metadata.update(status_updates)
     metadata['processing_complete'] = _photo_processing_complete(metadata)
-    _extract_and_store_embeddings(user_id, filename, metadata)
+    with processing_diagnostics.apply_phase(user_id, filename, 'embedding_write'):
+        _extract_and_store_embeddings(user_id, filename, metadata)
     # The worker commits this aggregate together with collected step statuses
     # and lease release. Legacy/direct callers retain their existing upsert:
     # immediate mark_step_* calls may already have invalidated their ETag.
@@ -9485,7 +9480,8 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
             entity['processing_complete'] = _photo_processing_complete(entity)
             try:
                 writes += 1
-                table.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+                with processing_diagnostics.apply_phase(user_id, filename, 'metadata_cas'):
+                    table.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             except ResourceModifiedError:
                 conflicts += 1
                 if attempt + 1 == _METADATA_UPDATE_MAX_RETRIES:
@@ -9495,7 +9491,8 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
                 current = table.get_entity(partition_key=user_id, row_key=filename)
                 continue
             outcome = 'partial' if error is not None else 'success'
-            touch_user_search_indexes_state(user_id, filenames=filename)
+            with processing_diagnostics.apply_phase(user_id, filename, 'index_dirty'):
+                touch_user_search_indexes_state(user_id, filenames=filename)
             return entity
     finally:
         processing_diagnostics.file_event('vision_metadata_commit', user_id, filename,
