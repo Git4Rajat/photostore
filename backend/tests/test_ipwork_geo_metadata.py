@@ -136,6 +136,24 @@ def test_verified_exif_absence_packet_skips_original_and_geocoding(monkeypatch, 
     assert geo_ctx == []
 
 
+@pytest.mark.parametrize('filename,filetype', [('profile.jpg', 'JPEG'), ('profile.webp', 'Extended WEBP')])
+def test_non_camera_packet_metadata_skips_original_and_geocoding_without_claiming_exif_absence(monkeypatch, geo_ctx, filename, filetype):
+    import upload_metadata
+    monkeypatch.setattr(app, 'IPWORK_REUSE_METADATA_PACKET', True)
+    monkeypatch.setitem(app.IPWORK_STEP_PROCESSORS, 'exif', ipwork_geo.process_exif)
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *_: {'uploadMetadataPacket': 'candidate'})
+    def extract(*_, **kwargs):
+        kwargs['on_outcome']('reused')
+        return {'FileType': filetype, 'ImageWidth': '40', 'ImageHeight': '20', 'Software': 'Editor'}
+    monkeypatch.setattr(upload_metadata, 'extract_candidate', extract)
+    monkeypatch.setattr(ipwork_geo.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Absent GPS was geocoded'))
+    result = app._run_ipwork_steps('library', filename, ['exif', 'map_detection'])
+    assert result['exif']['data']['Software'] == 'Editor'
+    assert 'verifiedNoExif' not in result['exif']
+    assert result['map_detection'] == {'hasData': False}
+    assert geo_ctx == []
+
+
 def test_packet_fallback_does_not_make_visual_processors_use_original(monkeypatch, geo_ctx):
     import upload_metadata
     monkeypatch.setattr(app, 'IPWORK_REUSE_METADATA_PACKET', True)

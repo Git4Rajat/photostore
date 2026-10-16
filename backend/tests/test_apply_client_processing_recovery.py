@@ -196,3 +196,153 @@ def test_late_ocr_error_cannot_overwrite_completed_text(metadata):
     stored = metadata.get_entity('owner', 'photo.jpg')
     assert stored['ocr_status'] == 'done'
     assert stored['ocrText'] == 'verified text'
+
+
+@pytest.mark.parametrize('result,status,code', [
+    ({'hasData': False}, 'no_data', ''),
+    ({'hasData': False, 'latitude': None, 'longitude': ''}, 'no_data', ''),
+    ({'hasData': False, 'error': 'geocoder failed'}, 'failed', 'geo_processing_failed'),
+    ({'hasData': False, 'errorCode': 'secret or URL'}, 'failed', 'geo_processing_failed'),
+    ({'hasData': False, 'errorCode': {'untrusted': True}}, 'failed', 'geo_processing_failed'),
+    ({'hasData': True, 'latitude': 10, 'longitude': 20, 'error': 'partial'}, 'failed', 'geo_processing_failed'),
+    ({'hasData': True}, 'failed', 'geo_invalid_result'),
+    ({}, 'failed', 'geo_invalid_result'),
+    ({'hasData': False, 'latitude': 10}, 'failed', 'geo_invalid_result'),
+    ({'hasData': True, 'latitude': 'NaN', 'longitude': 20}, 'failed', 'geo_invalid_result'),
+    ({'hasData': True, 'latitude': 91, 'longitude': 20}, 'failed', 'geo_invalid_result'),
+    ({'hasData': True, 'latitude': True, 'longitude': 20}, 'failed', 'geo_invalid_result'),
+    ('malformed result', 'failed', 'geo_invalid_result'),
+])
+def test_geo_failures_are_not_no_gps_results(metadata, monkeypatch, result, status, code):
+    _seed_row(metadata, 'owner', 'photo.jpg', map_detection_status='running')
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    monkeypatch.setattr(storage_utils.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Unexpected geocoding'))
+    storage_utils.apply_client_processing_results_for_file(
+        'owner', 'photo.jpg', client_processing={'map_detection': result}, origin='ipworker',
+        client_asset_id='test', claimed_steps=['map_detection'])
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['map_detection_status'] == status
+    assert json.loads(stored['processing_metadata'])['client_map_detection']['errorCode'] == code
+    assert 'secret or URL' not in stored['processing_metadata']
+    assert 'latitude' not in stored and 'longitude' not in stored
+    lease = storage_utils.claim_processing_lease('owner', 'photo.jpg', 'retry', steps=['map_detection'])
+    assert lease['statuses']['map_detectionStatus'] == ('running' if status == 'failed' else 'no_data')
+
+
+def test_geo_error_overrides_same_payload_exif_no_gps_status(metadata, monkeypatch):
+    _seed_row(metadata, 'owner', 'photo.jpg', exif_status='running', map_detection_status='running')
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    storage_utils.apply_client_processing_results_for_file('owner', 'photo.jpg', origin='ipworker', client_processing={
+        'exif': {'hasData': True, 'source': 'browser_metadata_packet', 'data': {'FileType': 'JPEG'}},
+        'map_detection': {'hasData': False, 'error': 'processing_failed'},
+    })
+    assert metadata.get_entity('owner', 'photo.jpg')['map_detection_status'] == 'failed'
+
+
+@pytest.mark.parametrize('fallback', ['no_data', 'unsupported'])
+@pytest.mark.parametrize('exif_data', [{}, {'Make': 'Test'}, {
+    'GPS.LatitudeDecimal': '10', 'GPS.LongitudeDecimal': '20',
+}])
+def test_geo_error_survives_server_exif_fallback(metadata, monkeypatch, fallback, exif_data):
+    _seed_row(metadata, 'owner', 'photo.jpg', exif_status='running', map_detection_status='running')
+    monkeypatch.setitem(storage_utils._CTX, 'queue_map_on_upload', False)
+    monkeypatch.setattr(storage_utils.vision_utils, 'encode_text_embedding', lambda *_: [])
+    downloads = []
+    def download(*_):
+        downloads.append(True)
+        return b'original'
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', download)
+    monkeypatch.setattr(storage_utils, '_extract_server_exif_for_processing', lambda *_: exif_data)
+    monkeypatch.setattr(storage_utils.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Duplicate geocoding'))
+    payload = {'map_detection': {'hasData': False, 'error': 'processing_failed'}}
+    if fallback == 'no_data':
+        payload['exif'] = {'hasData': False}
+    storage_utils.apply_client_processing_results_for_file(
+        'owner', 'photo.jpg', origin='ipworker', client_processing=payload,
+        client_processing_report=[{'step': 'exif', 'status': 'unsupported'}] if fallback == 'unsupported' else None,
+    )
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['exif_status'] == ('done' if exif_data else 'no_data')
+    assert stored['map_detection_status'] == 'failed'
+    assert json.loads(stored['processing_metadata'])['client_map_detection']['errorCode'] == 'geo_processing_failed'
+    assert len(downloads) == 1  # Only the existing EXIF fallback reads the original.
+
+
+def test_explicit_geo_success_does_not_trigger_duplicate_exif_geocoding(metadata, monkeypatch):
+    _seed_row(metadata, 'owner', 'photo.jpg', exif_status='running', map_detection_status='running')
+    monkeypatch.setitem(storage_utils._CTX, 'queue_map_on_upload', False)
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    monkeypatch.setattr(storage_utils.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Duplicate geocoding'))
+    storage_utils.apply_client_processing_results_for_file('owner', 'photo.jpg', origin='ipworker', client_processing={
+        'exif': {'hasData': True, 'source': 'browser_metadata_packet',
+                 'data': {'GPS.LatitudeDecimal': '10', 'GPS.LongitudeDecimal': '20'}},
+        'map_detection': {'hasData': True, 'latitude': 10, 'longitude': 20, 'city': 'Ready', 'country': 'Test'},
+    })
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['map_detection_status'] == 'done'
+    assert stored['locationCity'] == 'Ready'
+
+
+@pytest.mark.parametrize('result', [{'hasData': False, 'error': 'late failure'}, {}, 'bad'])
+def test_late_geo_failure_cannot_replace_completed_location(metadata, monkeypatch, result):
+    _seed_row(metadata, 'owner', 'photo.jpg', map_detection_status='done', latitude='10.0', longitude='20.0',
+              locationCity='Verified City', locationCountry='Verified Country')
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    monkeypatch.setattr(storage_utils.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Unexpected geocoding'))
+    storage_utils.apply_client_processing_results_for_file('owner', 'photo.jpg', origin='ipworker',
+        client_processing={'map_detection': result})
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['map_detection_status'] == 'done'
+    assert stored['locationCity'] == 'Verified City'
+    assert stored['latitude'] == '10.0' and stored['longitude'] == '20.0'
+
+
+def test_geo_successful_retry_clears_failure_diagnostic(metadata, monkeypatch):
+    _seed_row(metadata, 'owner', 'photo.jpg', map_detection_status='running')
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    for result in [{'hasData': False, 'error': 'processing_failed'},
+                   {'hasData': True, 'latitude': 0, 'longitude': 0, 'city': 'Recovered', 'country': 'Test'}]:
+        storage_utils.apply_client_processing_results_for_file('owner', 'photo.jpg', origin='ipworker',
+            client_processing={'map_detection': result})
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['map_detection_status'] == 'done'
+    assert stored['latitude'] == '0.0' and stored['longitude'] == '0.0'
+    assert stored['locationCity'] == 'Recovered'
+    assert json.loads(stored['processing_metadata'])['client_map_detection']['errorCode'] == ''
+
+
+def test_geo_processor_exception_persists_failed_and_retries_from_stored_exif(metadata, monkeypatch):
+    import app
+    import ipwork_geo
+    _seed_row(metadata, 'owner', 'photo.jpg', exif_status='done', map_detection_status='running',
+              exifData=json.dumps({'GPS.LatitudeDecimal': '10', 'GPS.LongitudeDecimal': '20'}))
+    monkeypatch.setattr(app, 'IPWORK_REUSE_EXIF', True)
+    monkeypatch.setitem(app.IPWORK_STEP_PROCESSORS, 'map_detection', ipwork_geo.process_geo)
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda user, name: metadata.get_entity(user, name))
+    monkeypatch.setattr(app, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original download'))
+    calls = []
+    def geocode(*_):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError('Geocoder unavailable')
+        return {'city': 'Recovered', 'country': 'Test'}
+    monkeypatch.setattr(ipwork_geo.maps_utils, 'reverse_geocode', geocode)
+    result = app._run_ipwork_steps('owner', 'photo.jpg', ['map_detection'])
+    assert result['map_detection']['error'] == 'processing_failed'
+    storage_utils.apply_client_processing_results_for_file('owner', 'photo.jpg', origin='ipworker',
+        client_processing=result, claimed_steps=['map_detection'])
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['map_detection_status'] == 'failed'
+    assert json.loads(stored['processing_metadata'])['client_map_detection']['errorCode'] == 'geo_processing_failed'
+    lease = storage_utils.claim_processing_lease('owner', 'photo.jpg', 'retry', steps=['map_detection'])
+    assert lease['statuses']['map_detectionStatus'] == 'running'
+    result = app._run_ipwork_steps('owner', 'photo.jpg', ['map_detection'])
+    storage_utils.apply_client_processing_results_for_file('owner', 'photo.jpg', origin='ipworker',
+        client_processing=result, claimed_steps=['map_detection'])
+    stored = metadata.get_entity('owner', 'photo.jpg')
+    assert stored['map_detection_status'] == 'done'
+    assert stored['locationCity'] == 'Recovered'
+    assert 'map_detection' not in app._ipwork_sweep_eligible_steps(stored)
+    assert json.loads(stored['processing_metadata'])['client_map_detection']['errorCode'] == ''
+    assert len(calls) == 2

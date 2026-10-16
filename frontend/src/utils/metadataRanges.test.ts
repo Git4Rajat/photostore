@@ -84,6 +84,85 @@ test('JPEG complete scan remains bounded by the metadata read budget', async () 
     await expect(rebuild(plainJpeg(10000).bytes, 512)).rejects.toThrow('budget');
 });
 
+test.each([0xe1, 0xe2, 0xec, 0xed, 0xee, 0xfe])('metadata JPEG marker %i retains the full walk without enabling preview passthrough', async marker => {
+    const {bytes, scanStart} = plainJpeg(800);
+    const segment = new Uint8Array([255, marker, 0, 6, 1, 2, 3, 4]);
+    const source = new Uint8Array([...Array.from(bytes.slice(0, 2)), ...Array.from(segment), ...Array.from(bytes.slice(2))]);
+    const {copy, result} = await rebuild(source);
+    expect(copy.slice(2, 10)).toEqual(segment);
+    expect(result.chunks.at(-1)?.offset).toBe(source.length - 2);
+    expect(copy.slice(scanStart + segment.length, -2)).toEqual(new Uint8Array(800));
+    expect(result.jpegPassthrough).toBeNull();
+});
+
+test('large metadata-bearing JPEG keeps bounded legacy header transport instead of an extra complete scan', async () => {
+    const {bytes} = plainJpeg(10000);
+    const segment = [255, 225, 0, 8, 69, 120, 105, 102, 0, 0];
+    const source = new Uint8Array([...Array.from(bytes.slice(0, 2)), ...segment, ...Array.from(bytes.slice(2))]);
+    const {result} = await rebuild(source, 512);
+    expect(result.chunks).toHaveLength(1);
+    expect(result.chunks[0].offset).toBe(0);
+    expect(result.readBytes).toBeLessThan(1024);
+    expect(result.jpegPassthrough).toBeNull();
+});
+
+function webp(imageSize = 600, lossless = false) {
+    const parts: Uint8Array[] = [], offsets: Record<string, number> = {};
+    let pos = 12;
+    const chunk = (type: string, data: Uint8Array) => {
+        offsets[type] = pos;
+        const bytes = new Uint8Array(8 + data.length + (data.length & 1));
+        bytes.set(new TextEncoder().encode(type));
+        new DataView(bytes.buffer).setUint32(4, data.length, true);
+        bytes.set(data, 8); parts.push(bytes); pos += bytes.length;
+    };
+    const extended = new Uint8Array(10); extended[0] = 8; extended[4] = 39; extended[7] = 19;
+    chunk('VP8X', extended);
+    const image = new Uint8Array(imageSize).fill(77);
+    if (lossless) {
+        image[0] = 0x2f;
+        new DataView(image.buffer).setUint32(1, 39 | (19 << 14), true);
+    } else image.set([0, 0, 0, 0x9d, 1, 0x2a, 40, 0, 20, 0]);
+    chunk(lossless ? 'VP8L' : 'VP8 ', image);
+    chunk('EXIF', new TextEncoder().encode('Exif\0\0preserved-metadata'));
+    const bytes = new Uint8Array(pos);
+    bytes.set(new TextEncoder().encode('RIFF')); bytes.set(new TextEncoder().encode('WEBP'), 8);
+    new DataView(bytes.buffer).setUint32(4, pos - 8, true);
+    let cursor = 12;
+    for (const part of parts) {bytes.set(part, cursor); cursor += part.length;}
+    return {bytes, offsets};
+}
+
+test.each([false, true])('WebP retains metadata after image data and image prefixes, not pixels (lossless=%s)', async lossless => {
+    const {bytes, offsets} = webp(601, lossless);
+    const {copy, result} = await rebuild(bytes);
+    const start = offsets[lossless ? 'VP8L' : 'VP8 '] + 8 + (lossless ? 5 : 10);
+    expect(result.kind).toBe('webp-chunk-ranges');
+    expect(copy.slice(0, start)).toEqual(bytes.slice(0, start));
+    expect(copy.slice(start, offsets.EXIF - 1)).toEqual(new Uint8Array(offsets.EXIF - 1 - start));
+    expect(copy.slice(offsets.EXIF)).toEqual(bytes.slice(offsets.EXIF));
+    expect(result.jpegPassthrough).toBeNull();
+});
+
+test.each(['size', 'trailer', 'animation', 'reserved', 'duplicate', 'length', 'missing-image', 'unknown'])('WebP rejects %s', async fault => {
+    const {bytes, offsets} = webp(), view = new DataView(bytes.buffer);
+    if (fault === 'size') view.setUint32(4, bytes.length, true);
+    if (fault === 'animation') bytes[offsets.VP8X + 8] |= 2;
+    if (fault === 'reserved') bytes[offsets.VP8X + 9] = 1;
+    if (fault === 'duplicate') bytes.set(new TextEncoder().encode('VP8X'), offsets.EXIF);
+    if (fault === 'length') view.setUint32(offsets['VP8 '] + 4, 0xffffffff, true);
+    if (fault === 'missing-image') bytes.set(new TextEncoder().encode('XMP '), offsets['VP8 ']);
+    if (fault === 'unknown') bytes.set(new TextEncoder().encode('ANMF'), offsets['VP8 ']);
+    await expect(rebuild(fault === 'trailer' ? new Uint8Array([...Array.from(bytes), 0]) : bytes)).rejects.toThrow('WebP');
+});
+
+test('WebP skips large image payloads within the metadata read budget', async () => {
+    const {bytes} = webp(1024 * 1024);
+    const {result} = await rebuild(bytes, 512);
+    expect(result.payloadBytes).toBeLessThan(512);
+    expect(result.readBytes).toBeLessThan(1024);
+});
+
 function png() {
     const bytes = new Uint8Array(1024), view = new DataView(bytes.buffer);
     bytes.set([137, 80, 78, 71, 13, 10, 26, 10]);

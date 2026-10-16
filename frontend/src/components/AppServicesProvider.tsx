@@ -1691,21 +1691,25 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
     }, []);
 
-    const notifyUploadComplete = useCallback(async () => {
+    const notifyUploadComplete = useCallback(() => {
         invalidatePhotoCache();
-        await postTools('/api/tools/indexes/build', {
+        // Index readiness is separate from upload finalization. Let the server
+        // coalesce builds, and nudge polling again once a slow enqueue returns.
+        void postTools('/api/tools/indexes/build', {
             scope: 'light',
             reason: 'upload-complete',
-            force: true,
-            wait: true,
-            waitSeconds: 90,
+            wait: false,
+        }).then(() => {
+            requestJobPoll();
         }).catch(() => null);
         // Finalizing a photo with faces enqueues a clustering job server-side;
         // wake the job poller so the "Grouping people…" indicator can appear.
         requestJobPoll();
         publishLibraryChange('upload-complete', ['photos', 'albums', 'people', 'explore']);
         const handlers = Array.from(uploadCompletionHandlersRef.current);
-        await Promise.all(handlers.map((handler) => Promise.resolve(handler()).catch(() => undefined)));
+        handlers.forEach((handler) => {
+            void Promise.resolve().then(handler).catch(() => undefined);
+        });
     }, [invalidatePhotoCache]);
 
     const registerUploadCompletionHandler = useCallback((handler: () => void | Promise<void>) => {
@@ -3820,7 +3824,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
 
             uploadEndReason = hasPending || totalFailed > 0 ? 'failed' : 'completed';
-            await notifyUploadComplete();
+            notifyUploadComplete();
         } catch (err) {
             if (discardedUploadSessionIdsRef.current.has(session.id)) {
                 await clearPersistedSession();

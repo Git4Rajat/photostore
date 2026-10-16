@@ -14896,13 +14896,16 @@ def _register_ipwork_processors() -> None:
         worker_logger.exception('ipwork_vision unavailable; ai_vision step will report not_implemented')
 
 
-def _run_ipwork_steps(user_id: str, filename: str, steps: List[str], *, use_original: bool = False) -> Dict[str, Dict]:
+def _run_ipwork_steps(user_id: str, filename: str, steps: List[str], *, use_original: bool = False,
+                     metadata_snapshot: Optional[Dict] = None) -> Dict[str, Dict]:
     from ipwork_image import image_job
     with image_job(IPWORK_SHARED_DECODE):
-        return _run_ipwork_steps_with_images(user_id, filename, steps, use_original=use_original)
+        return _run_ipwork_steps_with_images(user_id, filename, steps, use_original=use_original,
+                                             metadata_snapshot=metadata_snapshot)
 
 
-def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str], *, use_original: bool = False) -> Dict[str, Dict]:
+def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str], *, use_original: bool = False,
+                                 metadata_snapshot: Optional[Dict] = None) -> Dict[str, Dict]:
     """Run each requested step's registered processor for one photo.
 
     Returns a dict shaped like the browser's `clientProcessing` payload so it
@@ -14914,13 +14917,23 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
     original_bytes_cache: List[bytes] = []
     visual_bytes_cache: List[bytes] = []
     source_metadata: List[Dict] = []
+    snapshot_matches = (isinstance(metadata_snapshot, dict)
+        and metadata_snapshot.get('PartitionKey') == user_id
+        and metadata_snapshot.get('RowKey') == filename
+        and str(metadata_snapshot.get('processing_state') or '').strip().lower() != 'deleted'
+        and metadata_snapshot.get('processingIsolated') is not True)
     preview_attempted = False
     download_ms = 0
     _ipwork_metrics_context.source_bytes = 0
 
     def get_source_metadata() -> Dict:
         if not source_metadata:
-            source_metadata.append(_get_metadata_entity(user_id, filename) or {})
+            # Read-only input decisions can reuse the successful lease claim.
+            # Persistence still fetches current rows and keeps its ETag guards.
+            source_metadata.append(dict(metadata_snapshot) if snapshot_matches else
+                                   _get_metadata_entity(user_id, filename) or {})
+            processing_diagnostics.file_event('vision_metadata_read', user_id, filename, role='vision',
+                source='lease_snapshot' if snapshot_matches else 'table', reads=0 if snapshot_matches else 1)
         return source_metadata[0]
 
     def get_image_bytes(step: str) -> bytes:
@@ -14952,6 +14965,8 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                         from ipwork_image import rgb_image
                         with rgb_image(preview, filename) as pixels:
                             pixels.load()  # fully validate; seed the shared decode when enabled
+                            from ipwork_image import remember_crop_preview
+                            remember_crop_preview(user_id, filename, entity, preview, pixels.width, pixels.height)
                         visual_bytes_cache.append(preview)
                         _ipwork_metrics_context.source_bytes = source_size
                         _ipwork_metric('preview_reused')
@@ -14960,7 +14975,9 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                         _ipwork_metric('preview_reuse_failed')
                         worker_logger.info('ipworker cached preview unavailable; falling back to original')
                 if not original_bytes_cache:
-                    original_bytes_cache.append(download_media_bytes('image', source_blob))
+                    purpose = 'exif_fallback' if step in {'exif', 'map_detection'} else 'inference'
+                    with processing_diagnostics.media_download_scope(purpose):
+                        original_bytes_cache.append(download_media_bytes('image', source_blob))
                     processing_diagnostics.file_event('vision_download', user_id, filename, role='vision',
                         source='original', bytes=len(original_bytes_cache[0]))
                     _ipwork_metrics_context.source_bytes = len(original_bytes_cache[0])
@@ -15075,6 +15092,9 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
         if step == 'preview' and client_processing[step].get('hasData') and not use_original:
             try:
                 visual_bytes_cache[:] = [base64.b64decode(str(client_processing[step].get('data') or ''))]
+                from ipwork_image import rgb_image, remember_crop_preview
+                with rgb_image(visual_bytes_cache[0], 'preview.jpg') as pixels:
+                    remember_crop_preview(user_id, filename, get_source_metadata(), visual_bytes_cache[0], pixels.width, pixels.height)
             except Exception:
                 worker_logger.exception('ipworker failed to swap in shrunk preview bytes for %s/%s', user_id, filename)
     worker_logger.info(
@@ -15096,6 +15116,14 @@ def _ipwork_result_face_count(client_processing) -> int:
 
 
 def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> str:
+    from ipwork_image import crop_input_job
+    filename = str(payload.get('filename') or '').strip()
+    with crop_input_job(user_id, filename), processing_diagnostics.media_download_scope(
+            'inference', user=user_id, filename=filename):
+        return _handle_ipwork_queue_payload_impl(payload, job_id, user_id)
+
+
+def _handle_ipwork_queue_payload_impl(payload: Dict, job_id: str, user_id: str) -> str:
     """Process one ipwork queue message. Returns 'done', 'noop', 'lease_busy',
     or 'not_found'.
 
@@ -15209,10 +15237,13 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     lease_cleared_by_apply = False
     try:
         steps_started = time.monotonic()
+        step_options = {}
+        if isinstance(lease.get('entity'), dict):
+            step_options['metadata_snapshot'] = dict(lease['entity'])
         if payload.get('imageSource') == 'original':
-            client_processing = _ipwork_timed_call('steps', _run_ipwork_steps, user_id, filename, runnable_steps, use_original=True)
-        else:
-            client_processing = _ipwork_timed_call('steps', _run_ipwork_steps, user_id, filename, runnable_steps)
+            step_options['use_original'] = True
+        client_processing = _ipwork_timed_call('steps', _run_ipwork_steps,
+            user_id, filename, runnable_steps, **step_options)
         steps_ms = round((time.monotonic() - steps_started) * 1000)
         apply_started = time.monotonic()
         metadata = _ipwork_timed_call('apply', apply_client_processing_results_for_file,
@@ -15223,10 +15254,11 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
             client_asset_id=f'ipworker:{job_id}',
             origin='ipworker',
             claimed_steps=runnable_steps,
+            lease_owner=lease_owner,
         )
         apply_ms = round((time.monotonic() - apply_started) * 1000)
         # apply_client_processing_results_for_file already clears the lease
-        # fields unconditionally once it returns -- mark that here so the
+        # fields in the fenced result commit once it returns -- mark that here so the
         # finally block below doesn't pay a redundant read+write re-releasing
         # a lease that's already cleared (same waste class just fixed on the
         # browser side, see browser AI heartbeat/release redundancy).

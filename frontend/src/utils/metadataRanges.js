@@ -422,7 +422,7 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         }
         throw new Error('Incomplete JPEG header');
     }
-    async function jpegWithoutExif() {
+    async function jpegStructure() {
         // Retain every marker, including between progressive scans, but not
         // entropy-coded pixels. Legacy header-only packets cannot prove absence.
         ranges.length = 0;
@@ -481,6 +481,41 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
             if (marker[1] === 0xda) pos = await nextMarker(pos);
         }
         throw new Error('Incomplete JPEG structure');
+    }
+    async function webp() {
+        ranges.length = 0;
+        const header = await read(0, 12);
+        if (new DataView(header.buffer).getUint32(4, true) + 8 !== source.size) throw new Error('Invalid WebP RIFF size');
+        let pos = 12, image = false, extended = false;
+        const seen = new Set();
+        for (let i = 0; i < 4096 && pos + 8 <= source.size; i++) {
+            const chunk = await read(pos, 8), type = ascii(chunk, 0, 4);
+            const length = new DataView(chunk.buffer).getUint32(4, true);
+            const end = pos + 8 + length;
+            if (end + (length & 1) > source.size || seen.has(type)) throw new Error('Invalid WebP chunk');
+            seen.add(type);
+            if (type === 'VP8X') {
+                if (pos !== 12 || length !== 10) throw new Error('Invalid WebP extended header');
+                const bytes = await read(pos + 8, length);
+                if ((bytes[0] & 0xc3) || bytes[1] || bytes[2] || bytes[3]) throw new Error('Unsupported WebP flags');
+                extended = true;
+            } else if (type === 'VP8 ' || type === 'VP8L') {
+                const prefix = type === 'VP8 ' ? 10 : 5;
+                if (image || length < prefix) throw new Error('Invalid WebP image');
+                await read(pos + 8, prefix);
+                image = true;
+            } else if (['ICCP', 'EXIF', 'XMP '].includes(type)) {
+                if (!extended || !length) throw new Error('Invalid WebP metadata');
+                await read(pos + 8, length);
+            } else if (type === 'ALPH') {
+                if (!extended || image || !length) throw new Error('Invalid WebP alpha');
+                await read(pos + 8, 1);
+            } else throw new Error('Unsupported WebP chunk');
+            if (length & 1) await read(end, 1);
+            pos = end + (length & 1);
+            if (pos === source.size && image) return;
+        }
+        throw new Error('Incomplete WebP structure');
     }
     async function png() {
         await read(0, 8);
@@ -552,13 +587,27 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
     const view = new DataView(head.buffer);
     let kind;
     const isPng = ascii(head, 0, 8) === '\x89PNG\r\n\x1a\n';
-    if (!isPng && head.length) ranges.push({offset: 0, bytes: head});
+    const isWebp = ascii(head, 0, 4) === 'RIFF' && ascii(head, 8, 4) === 'WEBP';
+    if (!isPng && !isWebp && head.length) ranges.push({offset: 0, bytes: head});
     if (isPng) {
         kind = 'png-chunk-ranges';
         await png();
     } else if (head[0] === 255 && head[1] === 216) {
         kind = 'jpeg-header-ranges';
-        if (await jpeg(0, source.size)) jpegPassthrough = await jpegWithoutExif();
+        const absenceCandidate = await jpeg(0, source.size);
+        if (absenceCandidate) jpegPassthrough = await jpegStructure();
+        else if (source.size <= maxBytes) {
+            const headers = ranges.slice();
+            try { jpegPassthrough = await jpegStructure(); }
+            catch {
+                // Preserve legacy camera/trailer transport when a complete
+                // bounded scan cannot qualify the broader metadata-only path.
+                ranges.splice(0, ranges.length, ...headers);
+            }
+        }
+    } else if (isWebp) {
+        kind = 'webp-chunk-ranges';
+        await webp();
     } else if (ascii(head, 6, 8) === 'HEAPCCDR') {
         kind = 'ciff-directory-ranges';
         const little = ascii(head, 0, 2) === 'II';

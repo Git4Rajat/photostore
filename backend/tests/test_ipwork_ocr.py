@@ -18,10 +18,34 @@ directly reproduced UnidentifiedImageError on their raw bytes.
 from __future__ import annotations
 
 import io
+from pathlib import Path
+import threading
+from types import SimpleNamespace
 
+import pytest
 from PIL import Image
 
 import ipwork_ocr
+
+
+class _WordIterator:
+    def __init__(self, entries):
+        self.entries = entries
+        self.index = 0
+
+    def Empty(self, level):
+        return not self.entries or self.entries[self.index] is None
+
+    def GetUTF8Text(self, level):
+        assert not self.Empty(level), 'Empty layout entry read as a word'
+        return self.entries[self.index][0]
+
+    def Confidence(self, level):
+        return self.entries[self.index][1]
+
+    def Next(self, level):
+        self.index += 1
+        return self.index < len(self.entries)
 
 
 def _make_jpeg_bytes() -> bytes:
@@ -70,12 +94,14 @@ def test_process_ocr_passes_decoded_bytes_to_tesseract(monkeypatch):
 
         def Recognize(self):
             received['recognized'] = True
+            return True
 
-        def MapWordConfidences(self):
-            assert received.get('recognized'), 'MapWordConfidences called before Recognize()'
-            return [('TPLINE', 92.0)]
+        def GetIterator(self):
+            assert received.get('recognized'), 'Iterator read before Recognize()'
+            return _WordIterator([('TPLINE', 92.0)])
 
     class FakeTesserocr:
+        RIL = SimpleNamespace(WORD=3)
         @staticmethod
         def PyTessBaseAPI(path=None):
             return FakeApi()
@@ -98,12 +124,13 @@ def test_process_ocr_drops_low_confidence_words(monkeypatch):
             pass
 
         def Recognize(self):
-            pass
+            return True
 
-        def MapWordConfidences(self):
-            return [('REAL', 95.0), ('noise', 12.0), ('WORD', 41.0), ('junk', -1.0)]
+        def GetIterator(self):
+            return _WordIterator([('REAL', 95.0), ('noise', 12.0), ('WORD', 41.0), ('junk', -1.0)])
 
     class FakeTesserocr:
+        RIL = SimpleNamespace(WORD=3)
         @staticmethod
         def PyTessBaseAPI(path=None):
             return FakeApi()
@@ -125,12 +152,13 @@ def test_process_ocr_reports_no_data_when_all_words_low_confidence(monkeypatch):
             pass
 
         def Recognize(self):
-            pass
+            return True
 
-        def MapWordConfidences(self):
-            return [('noise', 10.0), ('junk', -1.0)]
+        def GetIterator(self):
+            return _WordIterator([('noise', 10.0), ('junk', -1.0)])
 
     class FakeTesserocr:
+        RIL = SimpleNamespace(WORD=3)
         @staticmethod
         def PyTessBaseAPI(path=None):
             return FakeApi()
@@ -162,12 +190,14 @@ def test_process_ocr_calls_recognize_before_reading_confidences(monkeypatch):
 
         def Recognize(self):
             calls.append('Recognize')
+            return True
 
-        def MapWordConfidences(self):
-            calls.append('MapWordConfidences')
-            return [('REAL', 95.0)]
+        def GetIterator(self):
+            calls.append('GetIterator')
+            return _WordIterator([('REAL', 95.0)])
 
     class FakeTesserocr:
+        RIL = SimpleNamespace(WORD=3)
         @staticmethod
         def PyTessBaseAPI(path=None):
             return FakeApi()
@@ -177,7 +207,7 @@ def test_process_ocr_calls_recognize_before_reading_confidences(monkeypatch):
 
     ipwork_ocr.process_ocr('owner', 'photo.jpg', jpeg_bytes)
 
-    assert calls == ['SetImage', 'Recognize', 'MapWordConfidences']
+    assert calls == ['SetImage', 'Recognize', 'GetIterator']
 
 
 def test_resolve_tessdata_path_prefers_env_override(monkeypatch):
@@ -234,3 +264,63 @@ def test_decode_failure_is_distinct_from_engine_failure(monkeypatch):
     result = ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())
     assert result['hasData'] is False
     assert result['errorCode'] == 'ocr_engine_failed'
+
+
+@pytest.mark.parametrize('entries,expected', [([], None), ([None, None], None),
+    ([None, ('REAL', 95), None, ('WORD', 90), None], 'REAL WORD')])
+def test_empty_layout_entries_are_skipped_without_reading_text(monkeypatch, entries, expected):
+    api = SimpleNamespace(SetImage=lambda _: None, Recognize=lambda: True,
+                          GetIterator=lambda: _WordIterator(entries))
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(RIL=SimpleNamespace(WORD=3)))
+    monkeypatch.setattr(ipwork_ocr, '_get_api', lambda: api)
+    result = ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())
+    assert result == ({'hasData': True, 'text': expected} if expected else {'hasData': False})
+
+
+@pytest.mark.parametrize('fault', ['recognition', 'iterator', 'text', 'text-empty-message', 'confidence', 'next'])
+def test_real_engine_and_iterator_failures_are_not_collapsed_into_no_data(monkeypatch, fault):
+    iterator = _WordIterator([('REAL', 95)])
+    def fail(*_):
+        raise RuntimeError('Engine failure')
+    if fault == 'text-empty-message':
+        def fail_text(*_):
+            raise RuntimeError('No text returned')
+        monkeypatch.setattr(iterator, 'GetUTF8Text', fail_text)
+    for name, kind in [('GetUTF8Text', 'text'), ('Confidence', 'confidence'), ('Next', 'next')]:
+        if fault == kind:
+            monkeypatch.setattr(iterator, name, fail)
+    api = SimpleNamespace(SetImage=lambda _: None, Recognize=lambda: fault != 'recognition',
+                          GetIterator=lambda: None if fault == 'iterator' else iterator)
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(RIL=SimpleNamespace(WORD=3)))
+    monkeypatch.setattr(ipwork_ocr, '_get_api', lambda: api)
+    result = ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())
+    assert result['hasData'] is False
+    assert result['errorCode'] == 'ocr_engine_failed'
+    assert result['error']
+
+
+def test_real_engine_handles_text_free_images_and_reuse_without_losing_text(monkeypatch):
+    from PIL import ImageDraw, ImageFont
+    if ipwork_ocr.tesserocr is None:
+        pytest.skip('tesserocr not installed')
+    candidates = [ipwork_ocr._TESSDATA_PATH, '/opt/homebrew/share/tessdata']
+    tessdata = next((p for p in candidates if p and (Path(p) / 'eng.traineddata').is_file()), None)
+    if not tessdata:
+        pytest.skip('English Tesseract data not installed')
+    monkeypatch.setattr(ipwork_ocr, '_TESSDATA_PATH', tessdata)
+    local = threading.local()
+    monkeypatch.setattr(ipwork_ocr, '_thread_local', local)
+    small = Image.new('RGB', (200, 50), 'white')
+    ImageDraw.Draw(small).text((5, 15), 'PHOTO STORE 2026', fill='black', font=ImageFont.load_default())
+    text = small.resize((800, 200))
+    outputs = []
+    try:
+        for image in [Image.new('RGB', (800, 200), 'white'), text, Image.new('RGB', (800, 200), 'white'), text]:
+            stream = io.BytesIO(); image.save(stream, 'JPEG')
+            outputs.append(ipwork_ocr.process_ocr('owner', 'photo.jpg', stream.getvalue()))
+        assert outputs[0] == outputs[2] == {'hasData': False}
+        assert outputs[1]['hasData'] is True and 'PHOTO' in outputs[1]['text']
+        assert outputs[1] == outputs[3]
+    finally:
+        if getattr(local, 'api', None) is not None:
+            local.api.End()

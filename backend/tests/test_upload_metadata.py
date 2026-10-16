@@ -311,12 +311,13 @@ def test_png_file_tags_alone_never_establish_exif_absence(monkeypatch):
     assert transport.extract_candidate(storage, 'screen.png', row) is None
 
 
-def _jpeg_candidate(ranges=None, progressive=False):
+def _jpeg_candidate(ranges=None, progressive=False, source=None):
     import io
     from PIL import Image
-    stream = io.BytesIO()
-    Image.new('RGB', (40, 20), 'red').save(stream, format='JPEG', progressive=progressive)
-    source = stream.getvalue()
+    if source is None:
+        stream = io.BytesIO()
+        Image.new('RGB', (40, 20), 'red').save(stream, format='JPEG', progressive=progressive)
+        source = stream.getvalue()
     if ranges is None:
         ranges = []
         pos, start = 2, 0
@@ -422,3 +423,111 @@ def test_complete_jpeg_packet_with_real_exiftool(tmp_path, progressive):
     outcomes = []
     assert transport.extract_candidate(storage, 'plain.jpg', row, on_outcome=outcomes.append) == expected
     assert outcomes == ['reused_no_exif']
+
+
+@pytest.mark.parametrize('marker,data', [
+    (0xe1, b'http://ns.adobe.com/xap/1.0/\x00metadata'), (0xe2, b'ICC_PROFILE\x00\x01\x01profile'),
+    (0xec, b'Ducky\x00metadata'), (0xed, b'Photoshop 3.0\x00metadata'),
+    (0xee, b'Adobe' + bytes(7)), (0xee, b'Adobe' + bytes(31)), (0xfe, b'Comment'),
+])
+def test_complete_metadata_jpeg_is_reused_but_not_reported_as_no_exif(monkeypatch, marker, data):
+    import exif_utils
+    _, _, _, source = _jpeg_candidate()
+    segment = bytes([255, marker]) + (len(data) + 2).to_bytes(2, 'big') + data
+    storage, row, ranges, source = _jpeg_candidate(source=source[:2] + segment + source[2:])
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: _jpeg_exif())
+    outcomes = []
+    assert transport.extract_candidate(storage, 'photo.jpg', row, on_outcome=outcomes.append) == _jpeg_exif()
+    assert outcomes == ['reused']
+    assert not transport._verified_jpeg_no_exif('photo.jpg', ranges, len(source), _jpeg_exif())
+    assert not transport._verified_jpeg_structure('photo.jpg', ranges[:1], len(source), _jpeg_exif(), metadata=True)
+
+
+@pytest.mark.parametrize('mode,progressive', [('RGB', False), ('RGB', True), ('CMYK', False)])
+def test_metadata_jpeg_exact_parity_with_real_exiftool(tmp_path, mode, progressive):
+    import io
+    import shutil
+    from PIL import Image, ImageCms
+    import exif_utils
+    if not shutil.which('exiftool'):
+        pytest.skip('Real ExifTool not installed')
+    exif = Image.Exif(); exif[305] = 'Local parity fixture'
+    output = io.BytesIO()
+    Image.new(mode, (40, 20)).save(output, 'JPEG', exif=exif, progressive=progressive,
+        icc_profile=ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes(), comment=b'Preserved comment')
+    source = output.getvalue()
+    storage, row, _, _ = _jpeg_candidate(source=source)
+    path = tmp_path / 'metadata.jpg'; path.write_bytes(source)
+    excluded = {'FileModifyDate', 'FileAccessDate', 'FileInodeChangeDate', 'FilePermissions'}
+    expected = {k: v for k, v in exif_utils._extract_exiftool_from_path(str(path)).items() if k not in excluded}
+    outcomes = []
+    assert transport.extract_candidate(storage, 'metadata.jpg', row, on_outcome=outcomes.append) == expected
+    assert outcomes == ['reused']
+
+
+def _webp_candidate(source=None, ranges=None, lossless=False, alpha=False):
+    import io
+    from PIL import Image, ImageCms
+    if source is None:
+        output = io.BytesIO()
+        exif = Image.Exif(); exif[305] = 'Local parity fixture'
+        Image.new('RGBA' if alpha else 'RGB', (40, 20), (10, 20, 30, 128) if alpha else (10, 20, 30)).save(
+            output, 'WEBP', lossless=lossless, exif=exif,
+            icc_profile=ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes(),
+            xmp=b'<x:xmpmeta xmlns:x="adobe:ns:meta/"/>')
+        source = output.getvalue()
+    if ranges is None:
+        ranges, pos = [(0, source[:12])], 12
+        while pos < len(source):
+            kind = source[pos:pos + 4]
+            length = int.from_bytes(source[pos + 4:pos + 8], 'little')
+            prefix = min(length, {b'VP8 ': 10, b'VP8L': 5, b'ALPH': 1}.get(kind, length))
+            ranges.append((pos, source[pos:pos + 8 + prefix]))
+            if length & 1:
+                ranges.append((pos + 8 + length, source[pos + 8 + length:pos + 9 + length]))
+            pos += 8 + length + (length & 1)
+    header = json.dumps({'version': 1, 'kind': 'webp-chunk-ranges', 'sourceSha256': 'a' * 64,
+        'sourceSize': len(source), 'ranges': [{'offset': pos, 'length': len(data)} for pos, data in ranges]}).encode()
+    packet = len(header).to_bytes(4, 'big') + header + b''.join(data for _, data in ranges)
+    descriptor = {'version': 1, 'bytes': len(packet), 'sha256': hashlib.sha256(packet).hexdigest(), 'sourceSha256': 'a' * 64}
+    row = {'uploadMetadataPacket': json.dumps({**descriptor, 'physical': 'local', 'sourceSize': len(source), 'etag': 'local'}),
+           'fileHash': 'a' * 64, 'anonymousImageId': 'local', 'size': len(source)}
+    storage = SimpleNamespace(_CTX={'blob_thumbnail_container': 'local'}, _get_blob_client=lambda *_:
+        SimpleNamespace(download_blob=lambda **_: SimpleNamespace(readall=lambda: packet)))
+    return storage, row, ranges, source
+
+
+@pytest.mark.parametrize('lossless', [False, True])
+@pytest.mark.parametrize('alpha', [False, True])
+def test_webp_exact_parity_with_real_exiftool(tmp_path, lossless, alpha):
+    import shutil
+    import exif_utils
+    if not shutil.which('exiftool'):
+        pytest.skip('Real ExifTool not installed')
+    storage, row, _, source = _webp_candidate(lossless=lossless, alpha=alpha)
+    path = tmp_path / 'photo.webp'; path.write_bytes(source)
+    excluded = {'FileModifyDate', 'FileAccessDate', 'FileInodeChangeDate', 'FilePermissions'}
+    expected = {k: v for k, v in exif_utils._extract_exiftool_from_path(str(path)).items() if k not in excluded}
+    outcomes = []
+    assert transport.extract_candidate(storage, 'photo.webp', row, on_outcome=outcomes.append) == expected
+    assert outcomes == ['reused']
+
+
+@pytest.mark.parametrize('fault', ['size', 'flags', 'prefix', 'metadata-hole', 'dimensions', 'trailer', 'warning', 'unknown'])
+def test_webp_requires_complete_structure_even_with_camera_identity(monkeypatch, fault):
+    import exif_utils
+    _, _, ranges, source = _webp_candidate()
+    ranges = [(pos, bytearray(data)) for pos, data in ranges]
+    exif = {'FileType': 'WEBP', 'ImageWidth': '40', 'ImageHeight': '20', 'Make': 'Test'}
+    if fault == 'size': ranges[0][1][4] ^= 1
+    if fault == 'flags': ranges[1][1][8] |= 2
+    if fault == 'prefix': next(data for _, data in ranges if data[:4] == b'VP8 ')[11] = 0
+    if fault == 'metadata-hole':
+        ranges = [(pos, data[:9] if data[:4] == b'EXIF' else data) for pos, data in ranges]
+    if fault == 'dimensions': exif['ImageHeight'] = '21'
+    if fault == 'trailer': ranges[-1] = (ranges[-1][0], ranges[-1][1][:-1])
+    if fault == 'warning': exif['Warning'] = 'Partial metadata'
+    if fault == 'unknown': next(data for _, data in ranges if data[:4] == b'EXIF')[:4] = b'JUNK'
+    storage, row, _, _ = _webp_candidate(source=source, ranges=ranges)
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: exif.copy())
+    assert transport.extract_candidate(storage, 'photo.webp', row) is None

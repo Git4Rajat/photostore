@@ -5,18 +5,21 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
+
+import processing_diagnostics
 
 MAX_PACKET_BYTES = 8 * 1024 * 1024
 MAX_SOURCE_BYTES = 256 * 1024 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 HASH = re.compile(r'^[a-f0-9]{64}$')
 KINDS = {'tiff-ifd-ranges', 'ciff-directory-ranges', 'raf-header-jpeg-metadata-directories',
-         'mrw-pre-sensor-header', 'x3f-directory-nonimage-sections', 'bmff-non-mdat-boxes', 'jpeg-header-ranges', 'png-chunk-ranges'}
+         'mrw-pre-sensor-header', 'x3f-directory-nonimage-sections', 'bmff-non-mdat-boxes', 'jpeg-header-ranges', 'png-chunk-ranges', 'webp-chunk-ranges'}
 # Corpus-qualified families only. This is experimental, not universal camera coverage.
 QUALIFIED_EXTENSIONS = {'.arw', '.cr2', '.cr3', '.dng', '.erf', '.gpr', '.mos', '.mrw',
                         '.nef', '.pef', '.raf', '.rw2', '.rwl', '.3fr', '.jpg', '.jpeg',
                         '.crw', '.fff', '.iiq', '.nrw', '.orf', '.ori', '.raw', '.srw',
-                        '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif', '.png'}
+                        '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif', '.png', '.webp'}
 
 
 def _verified_dng_array_warning(filename, exif):
@@ -59,12 +62,10 @@ def _qualified_png_metadata(filename, exif):
             and exif.get('Interlace') in {'0', '1'})
 
 
-def _verified_jpeg_no_exif(filename, ranges, source_size, exif):
-    """Qualify a complete, JFIF-only JPEG marker walk, not a client no-data flag."""
+def _verified_jpeg_structure(filename, ranges, source_size, exif, *, metadata=False):
+    """Validate every marker through EOI; metadata segments must be retained."""
     if Path(filename).suffix.lower() not in {'.jpg', '.jpeg'} or exif.get('FileType') != 'JPEG':
         return False
-    # Unknown application segments/comments may carry metadata ExifTool did not
-    # recognize. Keep original fallback for those, trailers, and header-only packets.
     index = 0
     def read(offset, length):
         nonlocal index
@@ -87,7 +88,8 @@ def _verified_jpeg_no_exif(filename, ranges, source_size, exif):
                 return bool(frame and scans and pos + 2 == source_size
                             and index == len(ranges) - 1
                             and ranges[index][0] + len(ranges[index][1]) == source_size)
-            if marker[0] != 255 or marker[1] not in {0xc0, 0xc2, 0xc4, 0xdb, 0xdd, 0xda, 0xe0}:
+            application = metadata and (0xe0 <= marker[1] <= 0xef or marker[1] == 0xfe)
+            if marker[0] != 255 or (not application and marker[1] not in {0xc0, 0xc2, 0xc4, 0xdb, 0xdd, 0xda, 0xe0}):
                 return False
             size = int.from_bytes(read(pos + 2, 2), 'big')
             if size < 2:
@@ -96,8 +98,18 @@ def _verified_jpeg_no_exif(filename, ranges, source_size, exif):
             if marker[1] == 0xe0:
                 if len(data) < 14 or not data.startswith(b'JFIF\0') or len(data) != 14 + 3 * data[12] * data[13]:
                     return False
+            if application and marker[1] != 0xe0:
+                signatures = {
+                    0xe1: (b'Exif\x00\x00', b'http://ns.adobe.com/xap/1.0/\x00', b'http://ns.adobe.com/xmp/extension/\x00'),
+                    0xe2: (b'ICC_PROFILE\x00',), 0xec: (b'Ducky',),
+                    0xed: (b'Photoshop 3.0\x00',), 0xee: (b'Adobe',),
+                }
+                if marker[1] != 0xfe and not any(data.startswith(prefix) for prefix in signatures.get(marker[1], ())):
+                    return False
+                if marker[1] == 0xee and len(data) < 12:
+                    return False
             if marker[1] in {0xc0, 0xc2}:
-                if frame or len(data) < 6 or data[0] != 8 or data[5] not in {1, 3} or len(data) != 6 + 3 * data[5]:
+                if frame or len(data) < 6 or data[0] != 8 or data[5] not in ({1, 3, 4} if metadata else {1, 3}) or len(data) != 6 + 3 * data[5]:
                     return False
                 height, width = int.from_bytes(data[1:3], 'big'), int.from_bytes(data[3:5], 'big')
                 if not width or not height or str(width) != exif.get('ImageWidth') or str(height) != exif.get('ImageHeight'):
@@ -116,6 +128,84 @@ def _verified_jpeg_no_exif(filename, ranges, source_size, exif):
                     return False
                 index += 1
                 pos = ranges[index][0]
+        return False
+    except (ValueError, IndexError, TypeError):
+        return False
+
+
+def _verified_jpeg_no_exif(filename, ranges, source_size, exif):
+    return _verified_jpeg_structure(filename, ranges, source_size, exif)
+
+
+def _qualified_webp_metadata(filename, ranges, source_size, exif):
+    if (Path(filename).suffix.lower() != '.webp'
+            or exif.get('FileType') not in {'WEBP', 'WEBP (lossless)', 'Extended WEBP', 'Extended WEBP (lossless)'}):
+        return False
+    index = 0
+    def read(offset, length):
+        nonlocal index
+        while index < len(ranges) and offset >= ranges[index][0] + len(ranges[index][1]):
+            index += 1
+        if index >= len(ranges):
+            raise ValueError('Incomplete WebP packet')
+        start, data = ranges[index]
+        relative = offset - start
+        if relative < 0 or relative + length > len(data):
+            raise ValueError('Missing WebP bytes')
+        return data[relative:relative + length]
+    try:
+        header = read(0, 12)
+        if header[:4] != b'RIFF' or header[8:] != b'WEBP' or int.from_bytes(header[4:8], 'little') + 8 != source_size:
+            return False
+        pos, dimensions, extended, flags, seen = 12, None, None, 0, set()
+        for _ in range(4096):
+            header = read(pos, 8)
+            kind, length = header[:4], int.from_bytes(header[4:], 'little')
+            end = pos + 8 + length
+            if end + (length & 1) > source_size or kind in seen:
+                return False
+            seen.add(kind)
+            if kind == b'VP8X':
+                if pos != 12 or length != 10:
+                    return False
+                data = read(pos + 8, 10)
+                flags = data[0]
+                if flags & 0xc3 or any(data[1:4]):
+                    return False
+                extended = (1 + int.from_bytes(data[4:7], 'little'), 1 + int.from_bytes(data[7:10], 'little'))
+            elif kind in {b'VP8 ', b'VP8L'}:
+                prefix = 10 if kind == b'VP8 ' else 5
+                if dimensions or length < prefix:
+                    return False
+                data = read(pos + 8, prefix)
+                if kind == b'VP8 ':
+                    if data[0] & 1 or data[3:6] != b'\x9d\x01\x2a':
+                        return False
+                    dimensions = (int.from_bytes(data[6:8], 'little') & 0x3fff, int.from_bytes(data[8:10], 'little') & 0x3fff)
+                else:
+                    bits = int.from_bytes(data[1:], 'little')
+                    if data[0] != 0x2f or bits >> 29:
+                        return False
+                    dimensions = (1 + (bits & 0x3fff), 1 + ((bits >> 14) & 0x3fff))
+            elif kind in {b'ICCP', b'EXIF', b'XMP '}:
+                if extended is None or not length:
+                    return False
+                read(pos + 8, length)
+            elif kind == b'ALPH':
+                if extended is None or dimensions or not length:
+                    return False
+                if read(pos + 8, 1)[0] & 0xc0:
+                    return False
+            else:
+                return False
+            if length & 1 and read(end, 1) != b'\x00':
+                return False
+            pos = end + (length & 1)
+            if pos == source_size:
+                return bool(dimensions and all(dimensions) and (extended is None or extended == dimensions)
+                    and tuple(map(str, dimensions)) == (exif.get('ImageWidth'), exif.get('ImageHeight'))
+                    and all(bool(flags & flag) == (kind in seen) for flag, kind in ((0x20, b'ICCP'), (0x08, b'EXIF'), (0x04, b'XMP ')))
+                    and index == len(ranges) - 1)
         return False
     except (ValueError, IndexError, TypeError):
         return False
@@ -252,8 +342,15 @@ def extract_candidate(storage, filename, row, on_download=None, on_outcome=None,
             raise ValueError('Stale metadata binding')
         phase = 'packet_download'
         blob = storage._get_blob_client(storage._CTX['blob_thumbnail_container'], packet_blob_name(candidate['physical']))
-        packet = blob.download_blob(offset=0, length=descriptor['bytes'], etag=candidate['etag'],
-                                    match_condition=MatchConditions.IfNotModified).readall()
+        started, downloaded, download_outcome = time.monotonic(), 0, 'error'
+        try:
+            packet = blob.download_blob(offset=0, length=descriptor['bytes'], etag=candidate['etag'],
+                                        match_condition=MatchConditions.IfNotModified).readall()
+            downloaded, download_outcome = len(packet), 'success'
+        finally:
+            with processing_diagnostics.media_download_scope('metadata_packet'):
+                processing_diagnostics.media_download('metadata_packet', downloaded,
+                    (time.monotonic() - started) * 1000, download_outcome)
         if on_download:
             on_download(len(packet))
         phase = 'packet_validation'
@@ -279,11 +376,17 @@ def extract_candidate(storage, filename, row, on_download=None, on_outcome=None,
                 or ('Warning' in exif and not verified_warning)):
             outcome('exiftool_warning' if exif else 'no_exif')
             return None
+        webp_metadata = _qualified_webp_metadata(filename, ranges, source_size, exif)
+        if Path(filename).suffix.lower() == '.webp' and not webp_metadata:
+            outcome('unqualified_exif')
+            return None
         # File/system tags alone do not establish complete or absent EXIF.
         has_identity = any(key in exif for key in ('Make', 'Model', 'DateTimeOriginal', 'GPS.LatitudeDecimal', 'Orientation'))
         no_exif = not has_identity and _verified_jpeg_no_exif(filename, ranges, source_size, exif)
         if (not has_identity
-                and not _qualified_png_metadata(filename, exif) and not no_exif):
+                and not _qualified_png_metadata(filename, exif) and not no_exif
+                and not _verified_jpeg_structure(filename, ranges, source_size, exif, metadata=True)
+                and not webp_metadata):
             outcome('unqualified_exif')
             return None
         for key in ('FileModifyDate', 'FileAccessDate', 'FileInodeChangeDate', 'FilePermissions'):

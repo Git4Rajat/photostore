@@ -128,15 +128,23 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
             # text on any photo with a non-default orientation.
             api = _get_api()
             api.SetImage(image)
-            # MapWordConfidences() reads back the last Recognize() pass rather
-            # than running one itself (unlike GetUTF8Text(), which recognizes
-            # on demand) -- without this explicit call it silently returns an
-            # empty list on every image, indistinguishable from "no text found".
-            api.Recognize()
-            word_confidences = api.MapWordConfidences()
+            if not api.Recognize():
+                raise RuntimeError('OCR recognition failed')
+            iterator = api.GetIterator()
+            if iterator is None:
+                raise RuntimeError('OCR result iterator unavailable')
+            word_confidences = []
+            level = tesserocr.RIL.WORD
+            while True:
+                # MapWordConfidences reads empty layout entries as words and
+                # raises "No text returned" on valid text-free images.
+                if not iterator.Empty(level):
+                    word_confidences.append((iterator.GetUTF8Text(level), iterator.Confidence(level)))
+                if not iterator.Next(level):
+                    break
     except Exception as exc:
         return {'hasData': False, 'error': str(exc), 'errorCode': error_code}
-    # MapWordConfidences() (not GetUTF8Text()) so individually low-confidence
+    # Word-level confidences (not full-page GetUTF8Text()) so low-confidence
     # words -- texture/grain tesseract hallucinated as "text", the dominant
     # false-positive mode documented in docs/ipworker-architecture.md's PSM
     # sweep -- can be dropped before they ever reach ocrText/search, without

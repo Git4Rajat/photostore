@@ -67,15 +67,16 @@ def test_receipt_reaches_both_finalize_routes_before_enqueue(context, monkeypatc
 
 @pytest.mark.parametrize('enabled', [False, True])
 @pytest.mark.parametrize('batch', [False, True])
-def test_metadata_sas_is_capability_gated(context, monkeypatch, enabled, batch):
+@pytest.mark.parametrize('filename', ['photo.cr3', 'photo.webp'])
+def test_metadata_sas_is_capability_gated(context, monkeypatch, enabled, batch, filename):
     monkeypatch.setenv('BROWSER_UPLOAD_PREPARATION', str(enabled).lower())
     monkeypatch.setattr(app, '_cleanup_failed_upload', lambda *_: None)
     monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blob', lambda *args, **kwargs: 'physical')
-    monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blobs_batch', lambda *args: {'photo.cr3': 'physical'})
+    monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blobs_batch', lambda *args: {filename: 'physical'})
     monkeypatch.setattr(app, '_create_direct_upload_blob_url', lambda name: ('original-url', 'expiry'))
     urls = []
     monkeypatch.setattr(app, '_create_direct_thumbnail_upload_blob_url', lambda name: (urls.append(name) or 'url-' + name, 'expiry'))
-    item = {'filename': 'photo.cr3', 'totalSize': 100, 'sha256': 'a' * 64, 'directToBlob': True, 'includePreview': True, 'includeMetadata': True}
+    item = {'filename': filename, 'totalSize': 100, 'sha256': 'a' * 64, 'directToBlob': True, 'includePreview': True, 'includeMetadata': True}
     with app.app.test_request_context('/upload/init-batch' if batch else '/upload/init', method='POST',
                                      json={'files': [item]} if batch else item):
         response = upload.init_upload_batch() if batch else upload.init_upload()

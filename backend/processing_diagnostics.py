@@ -23,6 +23,38 @@ _LABEL = re.compile(r'^[a-zA-Z0-9_.:-]{1,80}$')
 _STATES = ('startup', 'idle', 'accumulating', 'processing', 'checkpoint')
 _BATCH = ContextVar('processing_upload_batch', default=None)
 _TRACE = ContextVar('processing_message', default=None)
+_MEDIA = ContextVar('processing_media_download', default=None)
+
+
+def media_download_context():
+    return dict(_MEDIA.get() or {})
+
+
+@contextmanager
+def media_download_scope(purpose, *, user=None, filename=None, context=None):
+    fields = dict(context if context is not None else _MEDIA.get() or {})
+    if user is not None and filename is not None:
+        fields.update(_TRACE.get() or {})
+        fields.update(file_id=file_id(user, filename), library_id=file_id(user, ''))
+    fields['purpose'] = purpose if purpose in {
+        'inference', 'exif_fallback', 'face_cover', 'result_fallback', 'metadata_packet',
+    } else 'unattributed'
+    token = _MEDIA.set(fields)
+    try:
+        yield
+    finally:
+        _MEDIA.reset(token)
+
+
+def media_download(kind, size, milliseconds, outcome='success'):
+    try:
+        fields = media_download_context()
+        fields.setdefault('purpose', 'unattributed')
+        emit('media_download', **fields, role=os.getenv('APP_ROLE', 'unknown'),
+             source=kind if kind in {'image', 'thumbnail', 'cover', 'metadata_packet'} else 'other',
+             bytes=size, milliseconds=milliseconds, outcome=outcome)
+    except Exception:
+        pass
 
 
 def batch_id(value):

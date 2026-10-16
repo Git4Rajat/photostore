@@ -15,6 +15,7 @@ of just not crashing.
 from __future__ import annotations
 
 import threading
+import json
 
 import pytest
 from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
@@ -288,3 +289,208 @@ def test_batched_processing_status_updates_flushes_partial_batch_on_exception(ra
 
     final = table.get_entity('u1', 'a.jpg')
     assert final['ocr_status'] == 'done'
+
+
+@pytest.fixture
+def worker_commit_ctx(racy_ctx, monkeypatch):
+    table = racy_ctx
+    _seed(table, 'u1', 'a.jpg', ocr_status='running', map_detection_status='running',
+          processing_lease_owner='worker-A', processing_lease='worker-A',
+          processing_lease_expires_at='2099-01-01T00:00:00+00:00', rating=1)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a: None)
+    monkeypatch.setattr(storage_utils, 'touch_user_search_indexes_state', lambda *a, **k: None)
+    monkeypatch.setattr(storage_utils, 'touch_user_sort_index_dirty', lambda *a, **k: None)
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *a: pytest.fail('Unexpected download'))
+    table.get_calls = table.update_calls = 0
+    return table
+
+
+def _apply_worker(**kwargs):
+    kwargs.setdefault('client_processing', {'ocr': {'hasData': True, 'text': 'hello'},
+                                           'map_detection': {'hasData': False}})
+    return storage_utils.apply_client_processing_results_for_file(
+        'u1', 'a.jpg', origin='ipworker', lease_owner='worker-A',
+        **kwargs)
+
+
+def test_worker_results_statuses_and_release_use_one_read_one_conditional_write(worker_commit_ctx, caplog):
+    table = worker_commit_ctx
+    with caplog.at_level('INFO', logger='processing_diagnostics'):
+        result = _apply_worker(client_processing={
+            'ocr': {'hasData': True, 'text': 'hello'},
+            'exif': {'hasData': True, 'data': {'Make': 'Test'}},
+        })
+    assert table.get_calls == table.update_calls == 1
+    stored = table.rows[('u1', 'a.jpg')]
+    assert stored['ocrText'] == 'hello'
+    assert stored['ocr_status'] == 'done'
+    assert stored['map_detection_status'] == 'no_data'
+    assert json.loads(stored['processing_metadata'])['client_ocr']['source'] == 'ipworker'
+    assert all(stored[key] == '' for key in (
+        'processing_lease_owner', 'processing_lease', 'processing_lease_expires_at'))
+    assert dict(result) == stored
+    assert table.etags[('u1', 'a.jpg')] == 2  # seed + one commit, no blind aggregate upsert
+    event = next(json.loads(record.getMessage().removeprefix('processing telemetry '))
+                 for record in caplog.records if 'vision_metadata_commit' in record.getMessage())
+    assert event['write_attempts'] == 1 and event['retry_reads'] == 0
+    assert event['status_updates'] == 1 and event['outcome'] == 'success'
+    assert 'a.jpg' not in json.dumps(event) and 'hello' not in json.dumps(event)
+
+
+def test_worker_commit_retries_only_merge_preserving_concurrent_edits(worker_commit_ctx, monkeypatch):
+    table = worker_commit_ctx
+    work_calls = []
+    def concurrent_edit(*_):
+        work_calls.append(True)
+        current = dict(table.rows[('u1', 'a.jpg')])
+        current.update(rating=5, face_status='done', processing_metadata='{"other":{"kept":true}}')
+        table.upsert_entity(current)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', concurrent_edit)
+    result = _apply_worker()
+    assert work_calls == [True]
+    assert table.get_calls == table.update_calls == 2
+    assert result['rating'] == 5 and result['face_status'] == 'done'
+    processing = json.loads(result['processing_metadata'])
+    assert processing['other'] == {'kept': True}
+    assert processing['client_ocr']['source'] == 'ipworker'
+
+
+@pytest.mark.parametrize('change,expected', [
+    ({'processing_state': 'deleted'}, 'deleted'),
+    ({'processingIsolated': True}, 'isolated'),
+    ({'processing_lease_owner': 'worker-B'}, 'owner changed'),
+    (None, 'not found'),
+])
+def test_worker_commit_does_not_resurrect_or_release_a_successor(worker_commit_ctx, monkeypatch, change, expected):
+    table = worker_commit_ctx
+    def concurrent_edit(*_):
+        if change is None:
+            del table.rows[('u1', 'a.jpg')]
+        else:
+            current = dict(table.rows[('u1', 'a.jpg')])
+            current.update(change)
+            table.upsert_entity(current)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', concurrent_edit)
+    error_type = ResourceNotFoundError if change is None else RuntimeError
+    with pytest.raises(error_type):
+        _apply_worker()
+    if change is None:
+        assert ('u1', 'a.jpg') not in table.rows
+    else:
+        stored = table.rows[('u1', 'a.jpg')]
+        assert all(stored[key] == value for key, value in change.items())
+        assert 'ocrText' not in stored
+        assert stored['processing_lease_owner'] == change.get('processing_lease_owner', 'worker-A')
+
+
+def test_worker_rejects_stale_owner_before_external_mutations(worker_commit_ctx, monkeypatch):
+    table = worker_commit_ctx
+    table.rows[('u1', 'a.jpg')]['processing_lease_owner'] = 'worker-B'
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', lambda *a, **k: pytest.fail('Stale apply'))
+    with pytest.raises(RuntimeError, match='owner changed'):
+        _apply_worker()
+    assert table.update_calls == 0
+
+
+def test_worker_rejects_isolation_before_external_mutations(worker_commit_ctx, monkeypatch):
+    table = worker_commit_ctx
+    table.rows[('u1', 'a.jpg')]['processingIsolated'] = True
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', lambda *a, **k: pytest.fail('Isolated apply'))
+    with pytest.raises(RuntimeError, match='isolated'):
+        _apply_worker()
+    assert table.update_calls == 0
+
+
+@pytest.mark.parametrize('change,expected', [
+    ({'ocr_status': 'done', 'ocrText': 'first result'}, 'step completed'),
+    ({'anonymousImageId': 'replacement'}, 'source changed'),
+    ({'fileHash': 'replacement'}, 'source changed'),
+])
+def test_worker_conflict_preserves_completed_step_and_source_replacement(worker_commit_ctx, monkeypatch, change, expected):
+    table = worker_commit_ctx
+    def concurrent_edit(*_):
+        current = dict(table.rows[('u1', 'a.jpg')])
+        current.update(change)
+        table.upsert_entity(current)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', concurrent_edit)
+    with pytest.raises(RuntimeError, match=expected):
+        _apply_worker()
+    stored = table.rows[('u1', 'a.jpg')]
+    assert all(stored[key] == value for key, value in change.items())
+    assert stored['processing_lease_owner'] == 'worker-A'
+
+
+@pytest.mark.parametrize('lost_response', [False, True])
+def test_worker_commit_transport_failure_never_reports_success(worker_commit_ctx, monkeypatch, lost_response):
+    table = worker_commit_ctx
+    original = table.update_entity
+    def outage(*a, **k):
+        if lost_response:
+            original(*a, **k)
+        raise OSError('commit response unavailable')
+    monkeypatch.setattr(table, 'update_entity', outage)
+    with pytest.raises(OSError, match='response unavailable'):
+        _apply_worker()
+    stored = table.rows[('u1', 'a.jpg')]
+    assert stored['processing_lease_owner'] == ('' if lost_response else 'worker-A')
+    assert stored.get('ocr_status') == ('done' if lost_response else 'running')
+
+
+def test_worker_partial_failure_atomically_flushes_completed_steps_and_unsticks_others(worker_commit_ctx, monkeypatch):
+    table = worker_commit_ctx
+    def fail_apply(*a, **k):
+        storage_utils.mark_step_done('u1', 'a.jpg', 'ocr', {'text': 'partial'})
+        raise RuntimeError('later operation failed')
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', fail_apply)
+    with pytest.raises(RuntimeError, match='later operation failed'):
+        _apply_worker(claimed_steps=['ocr', 'map_detection'])
+    assert table.get_calls == table.update_calls == 1
+    stored = table.rows[('u1', 'a.jpg')]
+    assert stored['ocr_status'] == 'done'
+    assert json.loads(stored['processing_metadata'])['ocr'] == {'text': 'partial'}
+    assert stored['map_detection_status'] == 'failed'
+    assert stored['processing_lease_owner'] == ''
+
+
+def test_worker_partial_failure_cannot_flush_into_successor_lease(worker_commit_ctx, monkeypatch):
+    table = worker_commit_ctx
+    def fail_apply(*a, **k):
+        storage_utils.mark_step_done('u1', 'a.jpg', 'ocr')
+        current = dict(table.rows[('u1', 'a.jpg')])
+        current['processing_lease_owner'] = 'worker-B'
+        table.upsert_entity(current)
+        raise RuntimeError('original apply failure')
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', fail_apply)
+    with pytest.raises(RuntimeError, match='original apply failure'):
+        _apply_worker()
+    stored = table.rows[('u1', 'a.jpg')]
+    assert stored['ocr_status'] == 'running' and stored['processing_lease_owner'] == 'worker-B'
+
+
+def test_worker_commit_exhausted_conflicts_raise_without_replaying_work(worker_commit_ctx, monkeypatch):
+    table = worker_commit_ctx
+    calls = []
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a: calls.append(True))
+    attempts = []
+    def conflict(*a, **k):
+        attempts.append(True)
+        raise ResourceModifiedError('persistent conflict')
+    monkeypatch.setattr(table, 'update_entity', conflict)
+    monkeypatch.setattr(storage_utils, '_METADATA_UPDATE_RETRY_BASE_SECONDS', 0)
+    with pytest.raises(ResourceModifiedError):
+        _apply_worker()
+    assert len(attempts) == storage_utils._METADATA_UPDATE_MAX_RETRIES
+    assert calls == [True]
+    assert table.rows[('u1', 'a.jpg')]['processing_lease_owner'] == 'worker-A'
+
+
+def test_worker_retry_count_is_applied_once_after_cas_conflict(worker_commit_ctx, monkeypatch):
+    table = worker_commit_ctx
+    def work(*a, **k):
+        storage_utils.update_processing_status('u1', 'a.jpg', 'ocr', 'failed', error='test', increment_retry=True)
+        current = dict(table.rows[('u1', 'a.jpg')])
+        current['rating'] = 5
+        table.upsert_entity(current)
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', work)
+    result = _apply_worker()
+    assert result['retry_count'] == 1 and result['rating'] == 5

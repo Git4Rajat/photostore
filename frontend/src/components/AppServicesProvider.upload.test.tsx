@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     getUpload: vi.fn(),
     postUpload: vi.fn(),
+    postTools: vi.fn(),
+    requestJobPoll: vi.fn(),
     staged: vi.fn(),
     committed: vi.fn(),
     idbDelete: vi.fn(),
@@ -25,7 +27,7 @@ vi.mock('../services/uploadPreparationPipeline', () => ({UploadPreparationPipeli
 vi.mock('../services/apiClient', () => ({
     get: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
-    postTools: vi.fn().mockResolvedValue({}),
+    postTools: mocks.postTools,
     getUpload: mocks.getUpload,
     postUpload: mocks.postUpload,
     resolveApiUrl: (url: string) => url,
@@ -35,7 +37,7 @@ vi.mock('../services/jobNotifications', async (importOriginal) => ({
     ...await importOriginal<typeof import('../services/jobNotifications')>(),
     isLikelyAuthenticated: () => mocks.pollAuthenticated,
     fetchJobStatuses: mocks.jobs,
-    requestJobPoll: vi.fn(),
+    requestJobPoll: mocks.requestJobPoll,
 }));
 vi.mock('../services/backgroundKeepAlive', () => ({
     BackgroundKeepAlive: class {
@@ -107,6 +109,7 @@ beforeEach(() => {
     mocks.preparationEnabled = false;
     mocks.pollAuthenticated = false;
     mocks.jobs.mockResolvedValue([]);
+    mocks.postTools.mockResolvedValue({});
     mocks.prepared.mockResolvedValue({});
     vi.stubGlobal('localStorage', memoryStorage());
     vi.stubGlobal('sessionStorage', memoryStorage());
@@ -233,6 +236,98 @@ describe('index completion notifications', () => {
 });
 
 describe('browser upload selection and startup', () => {
+    const endSummaries = () => mocks.postUpload.mock.calls
+        .filter(([url, payload]) => url === '/upload/telemetry' && payload.phase === 'end');
+
+    it('finishes upload bookkeeping while the index enqueue and view refresh remain pending', async () => {
+        mocks.postTools.mockImplementation(() => new Promise(() => {}));
+        const input = select(filesFor(1));
+        const refresh = vi.fn(() => new Promise<void>(() => {}));
+        act(() => { services.registerUploadCompletionHandler(refresh); });
+        await advance(4000);
+        expect(mocks.postTools).toHaveBeenCalledWith('/api/tools/indexes/build', {
+            scope: 'light', reason: 'upload-complete', wait: false,
+        });
+        expect(refresh).toHaveBeenCalledTimes(1);
+        expect(services.uploading).toBe(false);
+        expect(services.pendingUploadSummary).toBeNull();
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+        expect(endSummaries()).toHaveLength(1);
+        expect(refreshRequests()).toHaveLength(1);
+        expect(mocks.requestJobPoll).toHaveBeenCalled();
+        fireEvent.change(input, {target: {files: [filesFor(2)[1]]}});
+        await advance(4000);
+        expect(finalizedFiles()).toHaveLength(2);
+        expect(endSummaries()).toHaveLength(2);
+    });
+
+    it('starts the next queued upload without waiting for an index response', async () => {
+        mocks.postTools.mockImplementation(() => new Promise(() => {}));
+        let releaseTransfer!: () => void;
+        mocks.staged.mockImplementationOnce(() => new Promise<void>(resolve => { releaseTransfer = resolve; }));
+        const files = filesFor(2);
+        const input = select([files[0]]);
+        await advance(1000);
+        fireEvent.change(input, {target: {files: [files[1]]}});
+        await advance(1000);
+        expect(services.queuedUploadFileCount).toBe(1);
+        await act(async () => { releaseTransfer(); });
+        for (let tick = 0; tick < 6; tick += 1) await advance(1000);
+        expect(finalizedFiles()).toHaveLength(2);
+        expect(endSummaries()).toHaveLength(2);
+        expect(services.queuedUploadFileCount).toBe(0);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('wakes job polling again after a delayed enqueue response', async () => {
+        let resolveIndex!: (value: unknown) => void;
+        mocks.postTools.mockImplementation(() => new Promise(resolve => { resolveIndex = resolve; }));
+        select(filesFor(1));
+        await advance(4000);
+        expect(endSummaries()).toHaveLength(1);
+        const nudges = mocks.requestJobPoll.mock.calls.length;
+        await act(async () => { resolveIndex({queued: 'already_active', building: true}); });
+        expect(mocks.requestJobPoll).toHaveBeenCalledTimes(nudges + 1);
+    });
+
+    it('refreshes views and reports index readiness after upload has already finished', async () => {
+        mocks.pollAuthenticated = true;
+        select(filesFor(1));
+        const refresh = vi.fn();
+        act(() => { services.registerDataRefreshHandler(refresh); });
+        await advance(4000);
+        expect(endSummaries()).toHaveLength(1);
+        expect(refresh).not.toHaveBeenCalled();
+        mocks.jobs.mockResolvedValue([{
+            jobId: 'index-build-owner-light', kind: 'index_build', status: 'done', indexScope: 'light',
+            title: 'Photo index updated', message: 'Photo ordering and access are ready.',
+            updatedAt: new Date().toISOString(),
+        }]);
+        await act(async () => { window.dispatchEvent(new Event('focus')); });
+        await advance(4000);
+        expect(refresh).toHaveBeenCalledTimes(1);
+        expect(services.notifications.some(n => n.title === 'Photo index updated')).toBe(true);
+        expect(endSummaries()).toHaveLength(1);
+    });
+
+    it('keeps successful uploads successful when indexing or refresh handlers fail', async () => {
+        mocks.postTools.mockRejectedValue(new Error('Indexer unavailable'));
+        select(filesFor(1));
+        const healthy = vi.fn();
+        act(() => {
+            services.registerUploadCompletionHandler(() => { throw new Error('Refresh failed'); });
+            services.registerUploadCompletionHandler(() => Promise.reject(new Error('Async refresh failed')));
+            services.registerUploadCompletionHandler(healthy);
+        });
+        await advance(4000);
+        expect(healthy).toHaveBeenCalledTimes(1);
+        expect(endSummaries()).toHaveLength(1);
+        expect(endSummaries()[0][1]).toMatchObject({uploaded: 1, failed: 0});
+        expect(services.notifications.some(n => n.title === 'Upload failed')).toBe(false);
+        expect(services.pendingUploadSummary).toBeNull();
+        expect(services.uploading).toBe(false);
+    });
+
     it('starts original transfers without waiting for preparation, then finalizes its assets in backend mode', async () => {
         mocks.preparationEnabled = true;
         let resolvePreparation!: (value: unknown) => void;
