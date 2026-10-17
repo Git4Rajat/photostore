@@ -25,12 +25,20 @@ export interface BrowserExifResult {
   exifToolJson: Record<string, unknown>;
 }
 
-type Pending = (value: BrowserExifResult | null) => void;
+export type BrowserExifOutcome =
+  | { ok: true; result: BrowserExifResult }
+  | { ok: false; reason: string; ms: number };
+
+type Pending = (value: BrowserExifOutcome) => void;
 
 let worker: Worker | null = null;
 let unavailable = false;
 let seq = 0;
-const pending = new Map<number, { resolve: Pending; timer: ReturnType<typeof setTimeout> }>();
+const pending = new Map<number, { resolve: Pending; timer: ReturnType<typeof setTimeout>; started: number }>();
+
+function failed(reason: string, started: number): BrowserExifOutcome {
+  return { ok: false, reason, ms: Math.round(performance.now() - started) };
+}
 
 function capable(): boolean {
   return typeof Worker !== 'undefined' && typeof WebAssembly !== 'undefined';
@@ -43,17 +51,23 @@ function getWorker(): Worker | null {
     // Classic worker (served from public/) — it importScripts the Emscripten glue.
     const w = new Worker(WORKER_URL);
     w.onmessage = (event: MessageEvent) => {
-      const data = (event.data || {}) as { id?: number; ok?: boolean; json?: Record<string, unknown> };
+      const data = (event.data || {}) as {
+        id?: number; ok?: boolean; json?: Record<string, unknown>; outcome?: string;
+      };
       if (typeof data.id !== 'number') return;
       const entry = pending.get(data.id);
       if (!entry) return;
       pending.delete(data.id);
       clearTimeout(entry.timer);
-      entry.resolve(
-        data.ok && data.json
-          ? { source: 'browser_exiftool', verifiedComplete: true, exifToolJson: data.json }
-          : null,
-      );
+      if (data.ok && data.json) {
+        entry.resolve({
+          ok: true,
+          result: { source: 'browser_exiftool', verifiedComplete: true, exifToolJson: data.json },
+        });
+      } else {
+        entry.resolve(failed(data.outcome || 'parse_error', entry.started));
+        recycleWorker();
+      }
     };
     w.onerror = () => { markUnavailable(); };
     worker = w;
@@ -66,9 +80,15 @@ function getWorker(): Worker | null {
 
 function markUnavailable(): void {
   unavailable = true;
+  recycleWorker('tool_unavailable');
+}
+
+// A failed parse leaves the WASM heap wedged ("Out of memory!" on every later
+// parse in the same worker), so the next parse always boots a fresh worker.
+function recycleWorker(reason = 'worker_recycled'): void {
   try { worker?.terminate(); } catch { /* ignore */ }
   worker = null;
-  pending.forEach(({ resolve, timer }) => { clearTimeout(timer); resolve(null); });
+  pending.forEach(({ resolve, timer, started }) => { clearTimeout(timer); resolve(failed(reason, started)); });
   pending.clear();
 }
 
@@ -84,28 +104,32 @@ export function browserExifToolAvailable(): boolean {
 }
 
 /**
- * Extract EXIF in-browser. Resolves to the authoritative result, or `null` if the
- * tool is unavailable/failed (→ caller falls back to the server EXIF path).
+ * Extract EXIF in-browser. Never throws: a failed run reports its reason so the
+ * caller can record it and fall back to the server EXIF path.
  */
 export async function extractBrowserExif(
   bytes: Uint8Array,
   timeoutMs = 20000,
-): Promise<BrowserExifResult | null> {
+): Promise<BrowserExifOutcome> {
+  const started = performance.now();
   const w = getWorker();
-  if (!w) return null;
+  if (!w) return failed(unavailable ? 'tool_unavailable' : 'unsupported_runtime', started);
   const id = ++seq;
-  return new Promise<BrowserExifResult | null>((resolve) => {
+  return new Promise<BrowserExifOutcome>((resolve) => {
     const timer = setTimeout(() => {
-      if (pending.delete(id)) resolve(null); // tool too slow → let the server handle it
+      if (!pending.has(id)) return;
+      pending.delete(id);
+      resolve(failed('timeout', started));
+      recycleWorker();
     }, timeoutMs);
-    pending.set(id, { resolve, timer });
+    pending.set(id, { resolve, timer, started });
     try {
       // Transfer the buffer to avoid a copy; caller must not reuse `bytes` after.
       w.postMessage({ id, type: 'parse', bytes }, [bytes.buffer]);
     } catch {
       pending.delete(id);
       clearTimeout(timer);
-      resolve(null);
+      resolve(failed('post_failed', started));
     }
   });
 }

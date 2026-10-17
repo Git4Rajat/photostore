@@ -145,6 +145,8 @@ export interface ClientProcessingReportItem {
     modelVersion?: string;
     modelTaxonomyVersion?: string;
     runtime?: string;
+    browserExifReason?: string;
+    browserExifMs?: number;
     sourceKind?: ClientProcessingSourceKind;
     sourceFormat?: string;
     rawParserVersion?: string;

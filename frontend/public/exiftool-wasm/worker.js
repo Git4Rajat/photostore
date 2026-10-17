@@ -58,7 +58,7 @@ self.onmessage = async function (ev) {
   OUT = []; ERR = [];
   try {
     FS.writeFile('/in', msg.bytes);
-    try { callMain(['/exiftool', '-j', '-G1', '-n', '/in']); }
+    try { Module.callMain(['/exiftool', '-j', '-G1', '-n', '/in']); }
     catch (e) { if (!/exit/i.test(String(e))) ERR.push(String(e)); }
     try { FS.unlink('/in'); } catch (e) {}
     var txt = OUT.join('\n'), json = null;

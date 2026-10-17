@@ -3413,9 +3413,13 @@ export const runBrowserProcessing = async (
         // WASM tool was unavailable/failed/too-slow -> fall through to the legacy
         // DataView parser (which leaves the server EXIF fallback in charge).
         // Geo for the authoritative path is derived server-side from this EXIF.
-        const browserExif = visionSource.imageSource
-            ? await extractBrowserExif(new Uint8Array(await file.arrayBuffer())).catch(() => null)
+        const browserAttempt = visionSource.imageSource
+            ? await extractBrowserExif(new Uint8Array(await file.arrayBuffer()))
             : null;
+        const browserExif = browserAttempt?.ok ? browserAttempt.result : null;
+        const browserFallback = browserAttempt && !browserAttempt.ok
+            ? { browserExifReason: browserAttempt.reason, browserExifMs: browserAttempt.ms }
+            : {};
         if (browserExif) {
             clientProcessing.exif = {
                 ...browserExif,
@@ -3443,6 +3447,7 @@ export const runBrowserProcessing = async (
             };
             clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'done', 'done', startedAt, {
                 runtime: 'browser-dataview',
+                ...browserFallback,
                 ...(visionSource.isRaw ? { ...sourceFields, sourceKind: 'raw_exif_only' as const } : sourceFields),
             }));
         } else if (exif) {
@@ -3454,11 +3459,13 @@ export const runBrowserProcessing = async (
             };
             clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'done', 'done', startedAt, {
                 runtime: 'browser-dataview',
+                ...browserFallback,
                 ...(visionSource.isRaw ? { ...sourceFields, sourceKind: 'raw_exif_only' as const } : sourceFields),
             }));
         } else {
             clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'unsupported', visionSource.isRaw ? 'raw_container_unsupported' : 'unsupported_runtime', startedAt, {
                 runtime: 'browser-dataview',
+                ...browserFallback,
                 ...(visionSource.isRaw ? { ...sourceFields, sourceKind: 'unsupported' as const } : sourceFields),
             }));
         }

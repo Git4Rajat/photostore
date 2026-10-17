@@ -46,6 +46,7 @@ import { perf } from '../services/perf';
 import { UploadSessionStore } from '../services/uploadSessionStore';
 import { UploadPreparationPipeline, type PreparedUpload, type UploadAssetTargets } from '../services/uploadPreparationPipeline';
 import type { UploadMetadataDescriptor } from '../utils/uploadMetadata';
+import { prewarmBrowserExifTool } from '../utils/browserExifTool';
 import {
     isFileSystemAccessSupported,
     isFileSystemFileHandle,
@@ -4192,6 +4193,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (filesToUpload.length === 0) {
             return;
         }
+        prewarmBrowserExifTool();
         if (uploadStartInProgressRef.current || pendingUploadSessionRef.current) {
             const message = pendingUploadSessionRef.current
                 ? 'A paused upload is waiting -- use Retry or Discard on the banner before starting a new one.'

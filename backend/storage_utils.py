@@ -7772,6 +7772,11 @@ def _normalize_client_report(client_asset_id: str, report_value) -> List[Dict]:
         detail = str(item.get('detail') or '').strip()
         if detail:
             normalized_item['detail'] = detail[:500]
+        browser_exif_reason = str(item.get('browserExifReason') or '').strip()
+        if browser_exif_reason:
+            normalized_item['browserExifReason'] = browser_exif_reason[:64]
+        if isinstance(item.get('browserExifMs'), (int, float)):
+            normalized_item['browserExifMs'] = max(0, min(int(item['browserExifMs']), 10 * 60 * 1000))
         model_availability = str(item.get('modelAvailability') or '').strip()
         if model_availability in CLIENT_PROCESSING_ALLOWED_MODEL_AVAILABILITY:
             normalized_item['modelAvailability'] = model_availability
@@ -8880,6 +8885,15 @@ def _apply_client_processing_results(
 
     map_result = payload.get('map_detection')
     exif_result = payload.get('exif')
+    browser_exif_item = next((item for item in report if item.get('step') == 'exif'), {})
+    _LOGGER.info(
+        'exif gate user=%s file=%s origin=%s authoritative=%s browser_status=%s browser_reason=%s browser_ms=%s server_fallback=%s',
+        user_id, filename, origin,
+        isinstance(exif_result, dict) and exif_result.get('source') == 'browser_exiftool'
+        and exif_result.get('verifiedComplete') is True,
+        browser_exif_item.get('status'), browser_exif_item.get('browserExifReason'),
+        browser_exif_item.get('browserExifMs'), _client_report_needs_server_exif_fallback(report),
+    )
     if isinstance(exif_result, dict) and _step_locked_done(metadata, 'exif'):
         # Race guard, same as ocr/map_detection/face/ai_vision/thumbnail: the
         # browser's hand-rolled EXIF parser and the server's exiftool-based one
