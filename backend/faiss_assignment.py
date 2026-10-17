@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import uuid
+import processing_diagnostics
 
 from azure.core.exceptions import ResourceNotFoundError
 from azure.core import MatchConditions
@@ -354,6 +355,10 @@ class FaissAssigner:
                                                 user_id, filename, type(error).__name__)
                     guard.check()
                     failed = bool(assign.metadata_errors)
+                    processing_diagnostics.emit('cluster_storage', role='cluster', transactions=transactions,
+                        faces=len(stage['faces']), persons=len(stage['persons']), persistence_ms=persistence_ms,
+                        metadata_ms=int((time.monotonic() - projection_started) * 1000),
+                        metadata_failures=len(assign.metadata_errors))
                     _LOGGER.info('faiss batch flush user=%s persons=%d members=%d faces=%d '
                                  'transactions=%d persistence_ms=%d metadata_ms=%d metadata_failures=%d',
                                  user_id, len(stage['persons']), len(stage['members']), len(stage['faces']),
@@ -374,6 +379,8 @@ class FaissAssigner:
             _LOGGER.info('faiss batch user=%s prefetched_faces=%d failed=%s lease_ms=%d '
                          'prefetch_ms=%d elapsed_ms=%d', user_id, len(ids), failed,
                          lease_ms, prefetch_ms, int((time.monotonic() - started) * 1000))
+            processing_diagnostics.emit('cluster_assignment', role='cluster', faces=len(ids), failed=failed,
+                lease_ms=lease_ms, prefetch_ms=prefetch_ms, elapsed_ms=int((time.monotonic() - started) * 1000))
 
     def _allowed(self, face):
         return not _rejected(face) and self.clusterable(face) and self.eligible(face)
@@ -438,6 +445,7 @@ class FaissAssigner:
                        'embedding': vector, 'tier': self.tier(face),
                        'embeddingVersion': self.version(face)}
 
+    @processing_diagnostics.measured('cluster', 'index_acquire')
     def _runtime(self, user_id, guard):
         global _ACTIVE, _COLD_BUILD_ATTEMPTS
         generation = getattr(guard, 'cache_generation', None)
@@ -527,6 +535,7 @@ class FaissAssigner:
                                 active.user_id, exc_info=True)
                 return False
 
+    @processing_diagnostics.measured('cluster', 'checkpoint', state='checkpoint')
     def _checkpoint(self, user_id, guard, *, force=False):
         checkpoint = self._checkpoint_path(user_id, guard)
         active = _ACTIVE

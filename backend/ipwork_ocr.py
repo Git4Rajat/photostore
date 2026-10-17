@@ -35,15 +35,14 @@ down the whole ipworker replica's process, not just this one OCR call.
 from __future__ import annotations
 
 import glob
-import io
 import os
 import threading
 from typing import Dict, Optional
 
-from PIL import Image, ImageOps
 
 from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
 from optional_deps import try_import
+from ipwork_image import rgb_image
 
 tesserocr = try_import('tesserocr')
 
@@ -102,6 +101,11 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
     resulting UnidentifiedImageError was being swallowed into the same
     terminal 'no_data' status as a genuine empty-OCR result (see
     storage_utils.py's ocr_result handling), permanently hiding real text."""
+    # The preview-first runner retains the RAW filename while passing JPEG
+    # bytes. Extracting a RAW preview again wastes subprocess I/O and can
+    # select an embedded JPEG thumbnail instead of these actual pixels.
+    if image_bytes.startswith(b'\xff\xd8'):
+        return image_bytes
     ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
     if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
         preview = extract_raw_preview_bytes(image_bytes, filename)
@@ -112,26 +116,35 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
 
 def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
     if tesserocr is None:
-        return {'hasData': False, 'error': 'tesserocr_unavailable'}
+        return {'hasData': False, 'error': 'tesserocr_unavailable', 'errorCode': 'tesserocr_unavailable'}
+    error_code = 'ocr_decode_failed'
     try:
-        with Image.open(io.BytesIO(_decodable_image_bytes(image_bytes, filename))) as image:
+        with rgb_image(image_bytes, filename, _decodable_image_bytes) as image:
+            error_code = 'ocr_engine_failed'
             # Phone photos are commonly stored with an EXIF orientation tag
             # rather than physically rotated pixels (confirmed against real
             # photos during face-pipeline validation -- see ipwork_face.py);
             # without correcting for it, OCR would read sideways/upside-down
             # text on any photo with a non-default orientation.
-            image = ImageOps.exif_transpose(image)
             api = _get_api()
-            api.SetImage(image.convert('RGB'))
-            # MapWordConfidences() reads back the last Recognize() pass rather
-            # than running one itself (unlike GetUTF8Text(), which recognizes
-            # on demand) -- without this explicit call it silently returns an
-            # empty list on every image, indistinguishable from "no text found".
-            api.Recognize()
-            word_confidences = api.MapWordConfidences()
+            api.SetImage(image)
+            if not api.Recognize():
+                raise RuntimeError('OCR recognition failed')
+            iterator = api.GetIterator()
+            if iterator is None:
+                raise RuntimeError('OCR result iterator unavailable')
+            word_confidences = []
+            level = tesserocr.RIL.WORD
+            while True:
+                # MapWordConfidences reads empty layout entries as words and
+                # raises "No text returned" on valid text-free images.
+                if not iterator.Empty(level):
+                    word_confidences.append((iterator.GetUTF8Text(level), iterator.Confidence(level)))
+                if not iterator.Next(level):
+                    break
     except Exception as exc:
-        return {'hasData': False, 'error': str(exc)}
-    # MapWordConfidences() (not GetUTF8Text()) so individually low-confidence
+        return {'hasData': False, 'error': str(exc), 'errorCode': error_code}
+    # Word-level confidences (not full-page GetUTF8Text()) so low-confidence
     # words -- texture/grain tesseract hallucinated as "text", the dominant
     # false-positive mode documented in docs/ipworker-architecture.md's PSM
     # sweep -- can be dropped before they ever reach ocrText/search, without

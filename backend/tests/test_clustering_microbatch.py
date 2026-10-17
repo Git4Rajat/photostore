@@ -65,6 +65,21 @@ def test_same_library_batch_shares_lease_and_acks_each_success(setup):
     assert queue.received[0]['max_messages'] == 8
 
 
+def test_partial_failed_face_pass_is_assigned_before_ack(setup, monkeypatch):
+    calls, _ = setup
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *args: {
+        'face_status': 'failed',
+        'processing_metadata': json.dumps({'client_face': {
+            'storedFaceIds': ['persisted-face'], 'embeddingsReady': True}}),
+    })
+    monkeypatch.setattr(app, '_face_ids_awaiting_person_assignment', lambda *args: ['persisted-face'])
+    queued = message('partial.jpg')
+    queue = Queue([queued])
+    assert app._poll_clustering_queue_batch_once(queue, 'q', 5)
+    assert calls == [('partial.jpg', ['persisted-face'])]
+    assert queue.deleted == [queued]
+
+
 def test_failed_filename_does_not_ack_or_drop_other_messages(setup):
     messages = [message('a.jpg'), message('fail.jpg'), message('c.jpg')]
     queue = Queue(messages)

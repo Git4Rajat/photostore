@@ -1,0 +1,4 @@
+@colorhythm/libraw-wasm 1.1.1: MIT JavaScript bindings; LibRaw dual LGPL/CDDL.
+Package copyright and license files are published alongside this notice.
+Corresponding decoder source and build scripts:
+https://github.com/colorhythm/libraw-wasm/tree/9b0f59a5e0f6d3d12a8f6fa594015ef4f30a6e95

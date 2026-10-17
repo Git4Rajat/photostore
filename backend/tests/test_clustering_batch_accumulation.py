@@ -12,6 +12,7 @@ adjacent positions), chunking any single user's group back down to the
 from contextlib import contextmanager
 import json
 import time
+import threading
 from types import SimpleNamespace
 
 import app
@@ -130,6 +131,66 @@ def test_accumulation_stops_at_idle_timeout(setup):
     # 130s of serial per-filename lease acquisition before this fix).
     assert setup.leases == [('u', ['a.jpg'], True)]
     assert setup.assign_calls == []
+
+
+def test_empty_queue_returns_without_accumulation_or_sleep(monkeypatch):
+    queue = PagedQueue([])
+    monkeypatch.setattr(app.time, 'sleep', lambda *_: pytest.fail('empty queue must not wait'))
+    assert not app._poll_clustering_queue_batch_once(
+        queue, 'q', 5, target_size=500, idle_timeout_seconds=300)
+    assert len(queue.received) == 1
+
+
+def test_continuous_arrivals_cannot_extend_total_hold(setup, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(app.time, 'monotonic', lambda: now[0])
+    class Stream(PagedQueue):
+        def receive_messages(self, **kwargs):
+            now[0] += 1
+            return super().receive_messages(**kwargs)
+    queue = Stream([[message(f'{i}.jpg')] for i in range(20)])
+    assert app._poll_clustering_queue_batch_once(
+        queue, 'q', 5, target_size=500, idle_timeout_seconds=300, max_wait_seconds=3)
+    assert len(queue.received) == 4
+    assert len(queue.deleted) == 4
+
+
+def test_shutdown_interrupts_accumulation_and_drains_held_work(setup):
+    shutdown = threading.Event()
+    class ShutdownQueue(PagedQueue):
+        def receive_messages(self, **kwargs):
+            page = super().receive_messages(**kwargs)
+            if not page:
+                shutdown.set()
+            return page
+    held = message('a.jpg')
+    queue = ShutdownQueue([[held]])
+    started = time.monotonic()
+    assert app._poll_clustering_queue_batch_once(
+        queue, 'q', 5, target_size=500, idle_timeout_seconds=300,
+        poll_seconds=60, shutdown_requested=shutdown)
+    assert time.monotonic() - started < 2
+    assert queue.deleted == [held]
+
+
+def test_receive_error_stops_pending_lease_renewer(monkeypatch):
+    threads = []
+    original = app.threading.Thread
+    def thread(*args, **kwargs):
+        result = original(*args, **kwargs)
+        threads.append(result)
+        return result
+    monkeypatch.setattr(app.threading, 'Thread', thread)
+    class Broken(PagedQueue):
+        def receive_messages(self, **kwargs):
+            if self.received:
+                raise OSError('queue disconnected')
+            return super().receive_messages(**kwargs)
+    queue = Broken([[message('a.jpg')]])
+    with pytest.raises(OSError):
+        app._poll_clustering_queue_batch_once(queue, 'q', 5, target_size=500, idle_timeout_seconds=300)
+    assert threads and not any(t.is_alive() for t in threads)
+    assert not queue.deleted
 
 
 def test_grouping_spans_messages_across_multiple_pages(setup):

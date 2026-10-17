@@ -17,7 +17,7 @@ _CURRENT = ContextVar('upload_diagnostics', default=None)
 _PHASES = frozenset({
     'initialization', 'cleanup', 'tracking', 'sas_creation', 'name_resolution',
     'blob_check', 'finalize_metadata', 'metadata_stamp', 'metadata_read',
-    'client_processing', 'enqueues', 'dedup', 'persistence', 'source_read',
+    'client_processing', 'enqueues', 'dedup', 'persistence', 'source_read', 'metadata_packet',
 })
 _COUNTERS = frozenset({'files', 'succeeded', 'failed', 'steps'})
 _throughput = None

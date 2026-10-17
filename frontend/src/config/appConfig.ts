@@ -30,6 +30,8 @@ export interface AppConfig {
      * whichever result lands first wins (see storage_utils._step_locked_done
      * and the processing-lease claim in app.py). */
     processingMode?: 'browser' | 'backend' | 'both';
+    /** Default-off upload preparation, independent of browser AI processing. */
+    browserUploadPreparation?: boolean;
 }
 
 declare global {

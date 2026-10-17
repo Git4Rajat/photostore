@@ -69,6 +69,37 @@ def file_data(**extra):
             'directToBlob': True, **extra}
 
 
+@pytest.mark.parametrize('route', ['finalize', 'finalize-batch'])
+def test_processing_batch_id_is_stamped_and_passed_to_queue_without_extra_reads(upload_env, monkeypatch, route):
+    import processing_diagnostics as processing
+    _, client = upload_env
+    identifier = '01234567-89ab-4def-8123-456789abcdef'
+    stamped, queued = [], []
+    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda u, f, fields: stamped.append(fields))
+    monkeypatch.setattr(app, '_queue_upload_processing', lambda u, f: queued.append(processing.current_batch()))
+    data = file_data(uploadBatchId=identifier)
+    response = client.post('/upload/' + route, json={'files': [data]} if route.endswith('batch') else data)
+    assert response.status_code == 200
+    assert any(row.get('processingBatchId') == identifier.replace('-', '') for row in stamped)
+    assert queued == [identifier.replace('-', '')]
+    assert processing.current_batch() is None
+
+
+def test_browser_summary_requires_auth_and_logs_only_allowlisted_fields(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger='processing_diagnostics')
+    called = []
+    monkeypatch.setattr(app, '_require_user_id', lambda **kwargs: (called.append(kwargs) or ('u', None)))
+    data = {'batchId': '01234567-89ab-4def-8123-456789abcdef', 'phase': 'start', 'selected': 2,
+            'photos': 1, 'videos': 1, 'filename': 'secret.mov', 'Authorization': 'secret-token'}
+    response = app.app.test_client().post('/upload/telemetry', json=data)
+    assert response.status_code == 200 and called == [{'require_auth': True}]
+    row = next(r.getMessage() for r in caplog.records if 'processing telemetry ' in r.getMessage())
+    assert 'secret.mov' not in row and 'secret-token' not in row
+    assert app.app.test_client().post('/upload/telemetry', json={'phase': 'start'}).status_code == 400
+    monkeypatch.setattr(app, '_require_user_id', lambda **kwargs: (None, (app.jsonify({'error': 'auth'}), 401)))
+    assert app.app.test_client().post('/upload/telemetry', json=data).status_code == 401
+
+
 def test_single_init_has_exact_timings_and_no_secrets(upload_env, caplog):
     _, client = upload_env
     response = client.post('/api/upload/init/', json=file_data(), headers={

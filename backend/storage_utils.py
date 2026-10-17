@@ -1,9 +1,11 @@
 import contextlib
+import copy
 import contextvars
 import gzip
 import io
 import hashlib
 import json
+import math
 import logging
 import os
 import re
@@ -54,6 +56,7 @@ import index_files
 import table_scan
 import maps_utils
 import perf_instrumentation
+import processing_diagnostics
 import vision_utils
 
 CLIENT_PROCESSING_SCHEMA_VERSION = 2
@@ -158,7 +161,7 @@ def _photo_processing_complete(entity: Dict) -> bool:
         if status not in _PROCESSING_STEP_TERMINAL_STATUSES:
             return False
     return True
-HEIF_EXTENSIONS = {'heic', 'heif'}
+HEIF_EXTENSIONS = {'heic', 'heif', 'hif'}
 CLIENT_PROCESSING_ALLOWED_REASONS = {
     'done',
     'offline',
@@ -1116,7 +1119,7 @@ def _finish_face_filename_write(user_id: str, filename: str, generation: str,
 
 
 def _renew_face_filename_write(user_id: str, filename: str, generation: str) -> None:
-    """Fence/renew before each mutation, including embedding/member writes."""
+    """Fence every mutation; extend only when less than 90 seconds remain."""
     if generation is None:
         return
     table = _CTX['face_by_filename_table_client']
@@ -1125,12 +1128,19 @@ def _renew_face_filename_write(user_id: str, filename: str, generation: str) -> 
             or current.get('state') != 'writing'
             or not _face_filename_lease_active(current)):
         raise FaceFilenameLookupRetryableError('Filename face writer lost its lease')
-    entity = dict(current)
-    entity['leaseExpiresAt'] = (datetime.now(timezone.utc) + timedelta(
-        seconds=_FACE_FILENAME_LEASE_SECONDS)).isoformat()
-    table.update_entity(entity, mode=UpdateMode.REPLACE,
-                        etag=_face_filename_etag(current),
-                        match_condition=MatchConditions.IfNotModified)
+    etag = _face_filename_etag(current)
+    now = datetime.now(timezone.utc)
+    try:
+        remaining = (datetime.fromisoformat(current['leaseExpiresAt']) - now).total_seconds()
+    except (TypeError, ValueError):
+        remaining = 0  # Cannot prove headroom: retain the conditional renewal.
+    renewed = remaining <= _FACE_FILENAME_LEASE_SECONDS * .75
+    if renewed:
+        entity = dict(current)
+        entity['leaseExpiresAt'] = (now + timedelta(seconds=_FACE_FILENAME_LEASE_SECONDS)).isoformat()
+        table.update_entity(entity, mode=UpdateMode.REPLACE, etag=etag,
+                            match_condition=MatchConditions.IfNotModified)
+    processing_diagnostics.file_event('face_index_lease_check', user_id, filename, renewed=renewed)
 
 
 def _set_face_ids_for_filename(user_id: str, filename: str, face_ids: List[str],
@@ -1661,11 +1671,17 @@ def _start_face_crop_warming(user_id, filename, face_ids, get_image_bytes, rotat
     """Optional work: no waiting queue and no retained closures when saturated."""
     slots = _FACE_CROP_WARM_SLOTS
     if not slots.acquire(blocking=False):
+        processing_diagnostics.file_event('face_cover_admission', user_id, filename,
+            role=os.getenv('APP_ROLE', 'unknown'), outcome='busy')
         return False
+
+    download_context = processing_diagnostics.media_download_context()
 
     def warm():
         try:
-            _warm_face_crops_for_photo(user_id, filename, face_ids, get_image_bytes, rotation)
+            with processing_diagnostics.media_download_scope(
+                    'face_cover', user=user_id, filename=filename, context=download_context):
+                _warm_face_crops_for_photo(user_id, filename, face_ids, get_image_bytes, rotation)
         finally:
             slots.release()
 
@@ -1689,10 +1705,10 @@ def _warm_face_crops_for_photo(
     re-encode, upload -- synchronously in that request; fine for one face,
     but a library with thousands of faces nobody has ever viewed turns
     opening People into a multi-minute wait (see the 2026-09-29 forenkla-qa
-    HAR investigation). get_image_bytes is the SAME memoized closure
-    _apply_client_processing_results already threads through for its own
-    fallback paths, so a multi-face photo downloads the original at most
-    once here, not once per face. Never raises and never blocks the caller
+    HAR investigation). get_image_bytes supplies immutable worker-preview
+    bytes when available, otherwise the existing memoized original getter.
+    Multiple faces share one source read, not one download per face.
+    Never raises and never blocks the caller
     (run via threading.Thread) -- any face this misses just falls back to
     face_crop()'s on-demand path exactly as if this had never run.
     """
@@ -1700,10 +1716,14 @@ def _warm_face_crops_for_photo(
     if not face_ids or face_table_client is None:
         return
     image_bytes: Optional[bytes] = None
+    from ipwork_image import CropPreview
+    source = 'preview' if isinstance(get_image_bytes, CropPreview) else 'original'
+    generated, cached, failed = 0, 0, 0
     for face_id in face_ids:
         cover_blob = _face_cover_blob_name(user_id, face_id)
         try:
             if get_media_properties('cover', cover_blob):
+                cached += 1
                 continue  # already generated -- e.g. a re-detection of an existing face
         except Exception:
             pass
@@ -1713,14 +1733,25 @@ def _warm_face_crops_for_photo(
             img_w = int(entity.get('imageWidth', 0) or 0)
             img_h = int(entity.get('imageHeight', 0) or 0)
             if img_w <= 0 or img_h <= 0:
+                failed += 1
                 continue
             if image_bytes is None:
                 image_bytes = get_image_bytes()
-            cover_bytes = crop_face_thumbnail(image_bytes, filename, bbox, img_w, img_h, rotation)
+            # Reused previews contain oriented JPEG pixels, even under RAW names.
+            crop_filename = 'preview.jpg' if isinstance(get_image_bytes, CropPreview) else filename
+            cover_bytes = crop_face_thumbnail(image_bytes, crop_filename, bbox, img_w, img_h, rotation)
             if cover_bytes:
                 upload_media_file('cover', cover_blob, cover_bytes, 'image/jpeg')
+                generated += 1
+            else:
+                failed += 1
         except Exception:
+            failed += 1
             continue
+    processing_diagnostics.emit('face_cover_result', **processing_diagnostics.media_download_context(),
+        role=os.getenv('APP_ROLE', 'unknown'), source=source if image_bytes is not None else 'unused',
+        generated=generated, cached=cached, failed=failed,
+        input_bytes=len(image_bytes) if image_bytes is not None else 0)
 
 
 # --- Index files on the shared Azure Files volume -----------------------------
@@ -2019,7 +2050,14 @@ def download_media_bytes(kind: str, filename: str) -> bytes:
         container_name = _CTX.get('blob_image_container')
     if not container_name:
         raise ResourceNotFoundError(f'{kind} storage is not configured')
-    return download_file_from_blob(str(container_name), filename)
+    started = time.monotonic()
+    size, outcome = 0, 'error'
+    try:
+        data = download_file_from_blob(str(container_name), filename)
+        size, outcome = len(data), 'success'
+        return data
+    finally:
+        processing_diagnostics.media_download(kind, size, (time.monotonic() - started) * 1000, outcome)
 
 
 def get_media_properties(kind: str, filename: str):
@@ -7690,7 +7728,7 @@ def _valid_decimal(value, minimum: float, maximum: float) -> str:
         parsed = float(value)
     except Exception:
         return ''
-    if parsed < minimum or parsed > maximum:
+    if not math.isfinite(parsed) or isinstance(value, bool) or parsed < minimum or parsed > maximum:
         return ''
     return str(round(parsed, 7))
 
@@ -7734,6 +7772,11 @@ def _normalize_client_report(client_asset_id: str, report_value) -> List[Dict]:
         detail = str(item.get('detail') or '').strip()
         if detail:
             normalized_item['detail'] = detail[:500]
+        browser_exif_reason = str(item.get('browserExifReason') or '').strip()
+        if browser_exif_reason:
+            normalized_item['browserExifReason'] = browser_exif_reason[:64]
+        if isinstance(item.get('browserExifMs'), (int, float)):
+            normalized_item['browserExifMs'] = max(0, min(int(item['browserExifMs']), 10 * 60 * 1000))
         model_availability = str(item.get('modelAvailability') or '').strip()
         if model_availability in CLIENT_PROCESSING_ALLOWED_MODEL_AVAILABILITY:
             normalized_item['modelAvailability'] = model_availability
@@ -7886,7 +7929,7 @@ def _looks_like_jpeg_bytes(data: bytes) -> bool:
 
 def _create_server_thumbnail_for_upload(image_bytes: bytes, filename: str) -> Optional[bytes]:
     if is_video_file(filename):
-        return create_video_thumbnail_data(image_bytes, filename)
+        return None
     ext = _filename_extension(filename)
     if ext in HEIF_EXTENSIONS:
         preview_bytes = convert_image_to_jpeg(image_bytes, filename)
@@ -8059,6 +8102,8 @@ def _build_curated_ai_tag_payload(
 
 def _apply_exif_metadata(metadata: Dict, exif_data: Dict[str, str]) -> Tuple[str, str]:
     lat, lon = extract_gps_decimal_from_exif(exif_data)
+    if not _valid_decimal(lat, -90, 90) or not _valid_decimal(lon, -180, 180):
+        lat, lon = '', ''
     if lat and lon:
         exif_data['GPS.LatitudeDecimal'] = lat
         exif_data['GPS.LongitudeDecimal'] = lon
@@ -8070,10 +8115,15 @@ def _apply_exif_metadata(metadata: Dict, exif_data: Dict[str, str]) -> Tuple[str
 
 
 def _extract_server_exif_for_processing(image_bytes: bytes, filename: str) -> Dict[str, str]:
-    try:
-        return extract_exif_from_bytes(image_bytes, filename)
-    except Exception:
+    if is_video_file(filename):
         return {}
+    return extract_exif_from_bytes(image_bytes, filename)
+
+
+def _exif_error_code(value) -> str:
+    allowed = {'exif_unavailable', 'exif_unsupported', 'exif_timeout', 'exif_parser_error', 'exif_invalid_output', 'exif_storage_limit',
+               'exif_execution_failed', 'exif_read_failed'}
+    return value if isinstance(value, str) and value in allowed else 'exif_processing_failed'
 
 
 def _client_model_provenance(value) -> Dict:
@@ -8231,11 +8281,41 @@ def _apply_server_exif_fallback(
     image_bytes: bytes,
     *,
     fallback_for: str,
+    apply_geo: bool = True,
 ) -> Dict[str, object]:
     status_updates: Dict[str, object] = {}
-    server_exif = _extract_server_exif_for_processing(image_bytes, filename)
+    apply_geo = apply_geo and not _step_locked_done(metadata, 'map_detection')
+    try:
+        server_exif = _extract_server_exif_for_processing(image_bytes, filename)
+        from exif_utils import ExifExtractionError, _exif_failure_category
+        failure = _exif_failure_category(server_exif)
+        if failure:
+            raise ExifExtractionError(failure)
+        if 'EXIF.Truncated' in server_exif:
+            raise ExifExtractionError('storage_limit')
+    except Exception as error:
+        code = _exif_error_code('exif_' + str(getattr(error, 'category', 'processing_failed')))
+        _merge_processing_metadata(metadata, 'server_exif', {
+            'source': 'server', 'acceptedAt': _utc_now(), 'fallbackFor': fallback_for,
+            'errorCode': code,
+        })
+        status_updates['exif_status'] = 'failed'
+        if apply_geo and not _step_locked_done(metadata, 'map_detection'):
+            status_updates['map_detection_status'] = 'failed'
+        return status_updates
     if server_exif:
-        lat, lon = _apply_exif_metadata(metadata, server_exif)
+        invalid_gps = False
+        try:
+            from ipwork_geo import geo_coordinates_from_exif
+            geo_coordinates_from_exif(server_exif)
+        except (ValueError, TypeError, OverflowError):
+            invalid_gps = True
+        if invalid_gps:
+            lat, lon = '', ''
+            metadata['exifData'] = json.dumps(server_exif, ensure_ascii=False, separators=(',', ':'))
+            metadata['exifCount'] = len(server_exif)
+        else:
+            lat, lon = _apply_exif_metadata(metadata, server_exif)
         _merge_processing_metadata(metadata, 'server_exif', {
             'source': 'server',
             'acceptedAt': _utc_now(),
@@ -8243,7 +8323,12 @@ def _apply_server_exif_fallback(
             'hasGps': bool(lat and lon),
         })
         status_updates['exif_status'] = 'done'
-        if lat and lon and not _CTX.get('queue_map_on_upload'):
+        if apply_geo and invalid_gps and not _step_locked_done(metadata, 'map_detection'):
+            status_updates['map_detection_status'] = 'failed'
+            _merge_processing_metadata(metadata, 'server_geo', {
+                'source': 'server', 'acceptedAt': _utc_now(), 'errorCode': 'geo_invalid_result',
+            })
+        elif apply_geo and not invalid_gps and lat and lon and not _CTX.get('queue_map_on_upload'):
             place = _reverse_geocode_fallback(lat, lon)
             if place:
                 if place.get('address'):
@@ -8259,7 +8344,7 @@ def _apply_server_exif_fallback(
                 'longitude': lon,
             })
             status_updates['map_detection_status'] = 'done'
-        elif not lat or not lon:
+        elif apply_geo and not invalid_gps and (not lat or not lon):
             mark_step_no_data(user_id, filename, 'map_detection')
             status_updates['map_detection_status'] = 'no_data'
     else:
@@ -8273,6 +8358,114 @@ def _apply_server_exif_fallback(
         # to a terminal status. Pre-existing gap, not specific to ipworker
         # (the browser's own fallback-trigger path hits the same code).
         status_updates['exif_status'] = 'no_data'
+        if apply_geo:
+            mark_step_no_data(user_id, filename, 'map_detection')
+            status_updates['map_detection_status'] = 'no_data'
+    return status_updates
+
+
+def _apply_browser_exiftool_result(
+    user_id: str,
+    filename: str,
+    metadata: Dict,
+    exif_result: Dict,
+    client_asset_id: str,
+    *,
+    apply_geo: bool = True,
+) -> Dict[str, object]:
+    """Apply an authoritative in-browser ExifTool verdict without ever fetching
+    the original.
+
+    The browser ran the SAME ExifTool (same pinned version) on the full file, so
+    re-running server-side would yield identical results -- there is nothing to
+    gain from downloading the original. Normalization, GPS and reverse-geocoding
+    reuse the server's own paths, so stored fields match a native server
+    extraction byte-for-byte. Outcomes:
+      - unsupported format   -> exif_status 'unsupported' (shown in Additional Info)
+      - genuine parser error -> 'failed' (terminal; no re-fetch, same tool/result)
+      - no EXIF present       -> 'no_data' (verified absence)
+      - EXIF present          -> 'done' (+ reverse-geocode, as the server fallback does)
+    """
+    from exif_utils import classify_browser_exiftool, browser_exiftool_fields
+    status_updates: Dict[str, object] = {}
+    apply_geo = apply_geo and not _step_locked_done(metadata, 'map_detection')
+    provenance = _client_source_provenance(exif_result)
+    raw = exif_result.get('exifToolJson')
+    category = classify_browser_exiftool(raw)
+
+    if category == 'unsupported':
+        _merge_processing_metadata(metadata, 'client_exif', {
+            'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
+            'clientAssetId': client_asset_id, 'errorCode': 'exif_unsupported_format',
+            'unsupportedFormat': True, **provenance,
+        })
+        status_updates['exif_status'] = 'unsupported'
+        if apply_geo:
+            mark_step_no_data(user_id, filename, 'map_detection')
+            status_updates['map_detection_status'] = 'no_data'
+        return status_updates
+    if category:
+        _merge_processing_metadata(metadata, 'client_exif', {
+            'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
+            'clientAssetId': client_asset_id, 'errorCode': _exif_error_code('exif_' + category),
+            **provenance,
+        })
+        status_updates['exif_status'] = 'failed'
+        if apply_geo:
+            status_updates['map_detection_status'] = 'failed'
+        return status_updates
+
+    exif_data = browser_exiftool_fields(raw)
+    if not exif_data:
+        _apply_exif_metadata(metadata, {})
+        _merge_processing_metadata(metadata, 'client_exif', {
+            'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
+            'clientAssetId': client_asset_id, 'verifiedNoExif': True, 'hasGps': False,
+            **provenance,
+        })
+        status_updates['exif_status'] = 'no_data'
+        if apply_geo:
+            mark_step_no_data(user_id, filename, 'map_detection')
+            status_updates['map_detection_status'] = 'no_data'
+        return status_updates
+
+    invalid_gps = False
+    try:
+        from ipwork_geo import geo_coordinates_from_exif
+        geo_coordinates_from_exif(exif_data)
+    except (ValueError, TypeError, OverflowError):
+        invalid_gps = True
+    if invalid_gps:
+        lat, lon = '', ''
+        metadata['exifData'] = json.dumps(exif_data, ensure_ascii=False, separators=(',', ':'))
+        metadata['exifCount'] = len(exif_data)
+    else:
+        lat, lon = _apply_exif_metadata(metadata, exif_data)
+    _merge_processing_metadata(metadata, 'client_exif', {
+        'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
+        'clientAssetId': client_asset_id, 'hasGps': bool(lat and lon), **provenance,
+    })
+    status_updates['exif_status'] = 'done'
+    if apply_geo and invalid_gps:
+        status_updates['map_detection_status'] = 'failed'
+        _merge_processing_metadata(metadata, 'server_geo', {
+            'source': 'browser_exiftool', 'acceptedAt': _utc_now(), 'errorCode': 'geo_invalid_result',
+        })
+    elif apply_geo and lat and lon and not _CTX.get('queue_map_on_upload'):
+        place = _reverse_geocode_fallback(lat, lon)
+        if place:
+            if place.get('address'):
+                metadata['address'] = place['address']
+            metadata['locationCity'] = place.get('city', '')
+            metadata['locationRegion'] = place.get('region', '')
+            metadata['locationCountry'] = place.get('country', '')
+            metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
+            metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
+        mark_step_done(user_id, filename, 'map_detection', result={
+            'source': 'browser_exiftool', 'latitude': lat, 'longitude': lon,
+        })
+        status_updates['map_detection_status'] = 'done'
+    elif apply_geo and (not lat or not lon):
         mark_step_no_data(user_id, filename, 'map_detection')
         status_updates['map_detection_status'] = 'no_data'
     return status_updates
@@ -8354,7 +8547,7 @@ def _apply_server_preview_fallback(
 
 
 def _step_locked_done(metadata: Dict, step: str) -> bool:
-    """True if `step` is already 'done' on this photo.
+    """True for a completed step, including backend-verified EXIF absence.
 
     Guards against two writers racing on the same photo (browser + a
     server-side ipworker both processing the same upload in "both" mode) --
@@ -8364,7 +8557,16 @@ def _step_locked_done(metadata: Dict, step: str) -> bool:
     _enqueue_processing_steps *before* the new result is submitted, so a
     forced resubmission never actually observes 'done' here.
     """
-    return str(metadata.get(f'{step}_status') or '').strip().lower() == 'done'
+    status = str(metadata.get(f'{step}_status') or '').strip().lower()
+    if status == 'done':
+        return True
+    if step == 'exif' and status == 'no_data':
+        try:
+            provenance = json.loads(metadata.get('processing_metadata') or '{}').get('client_exif') or {}
+            return provenance.get('source') == 'ipworker' and provenance.get('verifiedNoExif') is True
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return False
 
 
 def _try_get_image_bytes(get_image_bytes: Callable[[], bytes]) -> Optional[bytes]:
@@ -8448,10 +8650,20 @@ def _apply_client_processing_results(
     thumbnail_already_uploaded: bool = False,
     origin: str = 'browser',
     claimed_steps: Optional[List[str]] = None,
+    persist_result: bool = True,
 ) -> None:
     metadata_table_client = _CTX['metadata_table_client']
     payload = client_processing if isinstance(client_processing, dict) else {}
+    if is_video_file(filename):
+        def get_image_bytes():
+            raise ValueError('Video processing is browser-only')
     report = _normalize_client_report(client_asset_id, client_processing_report)
+    if metadata.get('processingIsolated') is True:
+        import sys
+        from benchmark_upload import apply_isolated_derivatives
+        apply_isolated_derivatives(sys.modules[__name__], metadata, payload, report)
+        _update_metadata_fields(user_id, filename, {key: metadata[key] for key in ['preview_status', 'thumbnail_status', 'processing_metadata'] if key in metadata})
+        return
     status_updates: Dict[str, object] = {}
     # Captured before _apply_client_report_statuses below can overwrite
     # thumbnail_status from this call's report, so the fallback trigger further
@@ -8483,6 +8695,23 @@ def _apply_client_processing_results(
     # the image; fall back to the original filename for pre-anonymization photos.
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
     thumbnail_payload = payload.get('thumbnail')
+    thumbnail_verification_failed = False
+    if isinstance(thumbnail_payload, dict) and thumbnail_payload.get('alreadyUploaded') and not had_thumbnail_before:
+        import sys
+        from benchmark_upload import verify_jpeg
+        try:
+            verify_jpeg(sys.modules[__name__], thumbnail_blob_name, byte_cap=512_000, edge_cap=120)
+            thumbnail_already_uploaded = True
+        except Exception as exc:
+            from upload_preparation_diagnostics import rejection_reason
+            _merge_processing_metadata(metadata, 'client_thumbnail_rejected', {
+                'source': origin, 'clientAssetId': client_asset_id, 'rejectedAt': _utc_now(),
+                'reason': rejection_reason(exc, domain='processing'),
+            })
+            # Reject only this claim; keep finalization free of original reads.
+            thumbnail_payload = {}
+            thumbnail_verification_failed = True
+            status_updates['thumbnail_status'] = 'failed' if is_video_file(filename) else 'pending'
     if (
         not thumbnail_already_uploaded
         and thumbnail_payload is None
@@ -8538,6 +8767,7 @@ def _apply_client_processing_results(
             except Exception:
                 pass
         if thumbnail_already_uploaded:
+            _merge_processing_metadata(metadata, 'client_thumbnail_rejected', None)
             mark_step_done(user_id, filename, 'thumbnail', result={
                 'source': origin,
                 'clientAssetId': client_asset_id,
@@ -8554,6 +8784,7 @@ def _apply_client_processing_results(
     if (
         not thumbnail_already_uploaded
         and not had_thumbnail_before
+        and not thumbnail_verification_failed
         and (
             _client_report_needs_server_thumbnail_fallback(report)
             # ipworker reports failure inline via clientProcessing.thumbnail's
@@ -8584,12 +8815,29 @@ def _apply_client_processing_results(
     preview_blob_name = f'preview/{thumbnail_blob_name}.jpg'
     preview_payload = payload.get('preview')
     preview_already_uploaded = False
+    preview_verification_failed = False
+    if isinstance(preview_payload, dict) and preview_payload.get('alreadyUploaded') is True:
+        from benchmark_upload import verify_jpeg
+        import sys
+        try:
+            verify_jpeg(sys.modules[__name__], preview_blob_name, byte_cap=1_500_000, edge_cap=2048)
+            preview_already_uploaded = True
+        except Exception as exc:
+            from upload_preparation_diagnostics import rejection_reason
+            _merge_processing_metadata(metadata, 'client_preview_rejected', {
+                'source': origin, 'clientAssetId': client_asset_id, 'rejectedAt': _utc_now(),
+                'reason': rejection_reason(exc, domain='processing'),
+            })
+            preview_payload = {}
+            preview_verification_failed = True
+            if not had_preview_before:
+                status_updates['preview_status'] = 'pending'
     if preview_payload is not None and had_preview_before:
         pass
     elif preview_payload is not None:
         preview_provenance = _client_source_provenance(preview_payload)
         preview_data = str(preview_payload.get('data') or '').strip()
-        if preview_data:
+        if preview_data and not preview_already_uploaded:
             try:
                 preview_bytes = base64.b64decode(preview_data)
                 if preview_bytes:
@@ -8598,6 +8846,7 @@ def _apply_client_processing_results(
             except Exception:
                 pass
         if preview_already_uploaded:
+            _merge_processing_metadata(metadata, 'client_preview_rejected', None)
             mark_step_done(user_id, filename, 'preview', result={
                 'source': origin,
                 'clientAssetId': client_asset_id,
@@ -8613,6 +8862,7 @@ def _apply_client_processing_results(
     if (
         not preview_already_uploaded
         and not had_preview_before
+        and not preview_verification_failed
         and not is_video_file(filename)
         and (
             _client_report_needs_server_preview_fallback(report)
@@ -8633,7 +8883,17 @@ def _apply_client_processing_results(
         else:
             status_updates['preview_status'] = 'failed'
 
+    map_result = payload.get('map_detection')
     exif_result = payload.get('exif')
+    browser_exif_item = next((item for item in report if item.get('step') == 'exif'), {})
+    _LOGGER.info(
+        'exif gate user=%s file=%s origin=%s authoritative=%s browser_status=%s browser_reason=%s browser_ms=%s server_fallback=%s',
+        user_id, filename, origin,
+        isinstance(exif_result, dict) and exif_result.get('source') == 'browser_exiftool'
+        and exif_result.get('verifiedComplete') is True,
+        browser_exif_item.get('status'), browser_exif_item.get('browserExifReason'),
+        browser_exif_item.get('browserExifMs'), _client_report_needs_server_exif_fallback(report),
+    )
     if isinstance(exif_result, dict) and _step_locked_done(metadata, 'exif'):
         # Race guard, same as ocr/map_detection/face/ai_vision/thumbnail: the
         # browser's hand-rolled EXIF parser and the server's exiftool-based one
@@ -8644,7 +8904,35 @@ def _apply_client_processing_results(
         pass
     elif isinstance(exif_result, dict):
         exif_provenance = _client_source_provenance(exif_result)
-        if exif_result.get('hasData') is False:
+        if exif_result.get('source') == 'browser_exiftool' and exif_result.get('verifiedComplete') is True:
+            # Authoritative in-browser ExifTool verdict: trust it and never fetch
+            # the original (re-running the same ExifTool server-side is identical).
+            # Covers data / verified-no-EXIF / unsupported-format / parser-error,
+            # all terminal without a download. The server fallback below still runs
+            # for clients that could NOT run the browser tool (no such result here).
+            status_updates.update(_apply_browser_exiftool_result(
+                user_id, filename, metadata, exif_result, client_asset_id,
+                apply_geo=map_result is None))
+        elif ((origin == 'ipworker' or exif_result.get('hasData') is True)
+                and (exif_result.get('error') or exif_result.get('errorCode'))):
+            status_updates['exif_status'] = 'failed'
+            _merge_processing_metadata(metadata, 'client_exif', {
+                'source': origin, 'acceptedAt': _utc_now(), 'clientAssetId': client_asset_id,
+                'errorCode': _exif_error_code(exif_result.get('errorCode')),
+            })
+            if map_result is None and not _step_locked_done(metadata, 'map_detection'):
+                status_updates['map_detection_status'] = 'failed'
+        elif (origin == 'ipworker' and exif_result.get('hasData') is False
+              and exif_result.get('verifiedNoExif') is True and exif_result.get('source') == 'server_metadata'):
+            _apply_exif_metadata(metadata, {})
+            _merge_processing_metadata(metadata, 'client_exif', {
+                'source': origin, 'acceptedAt': _utc_now(), 'clientAssetId': client_asset_id,
+                'verifiedNoExif': True, 'hasGps': False,
+            })
+            status_updates['exif_status'] = 'no_data'
+            if map_result is None and not _step_locked_done(metadata, 'map_detection'):
+                status_updates['map_detection_status'] = 'no_data'
+        elif exif_result.get('hasData') is False:
             source_bytes = _try_get_image_bytes(get_image_bytes)
             if source_bytes is not None:
                 status_updates.update(_apply_server_exif_fallback(
@@ -8653,11 +8941,24 @@ def _apply_client_processing_results(
                     metadata,
                     source_bytes,
                     fallback_for='browser_no_data',
+                    apply_geo=map_result is None,
                 ))
             else:
                 status_updates['exif_status'] = 'failed'
         elif exif_result.get('hasData') is True:
-            exif_data = _sanitize_client_exif(exif_result.get('data') or {})
+            if (origin == 'ipworker'
+                    or (origin == 'browser_video_metadata' and exif_result.get('source') == 'browser_video_metadata')):
+                from exif_utils import _trim_exif_for_storage, _stringify_exif_value
+                exif_data = _trim_exif_for_storage({str(key): _stringify_exif_value(value)
+                    for key, value in (exif_result.get('data') or {}).items()})
+            else:
+                exif_data = _sanitize_client_exif(exif_result.get('data') or {})
+            invalid_exif_gps = False
+            try:
+                from ipwork_geo import geo_coordinates_from_exif
+                geo_coordinates_from_exif(exif_data)
+            except (ValueError, TypeError, OverflowError):
+                invalid_exif_gps = True
             lat = _valid_decimal(exif_result.get('latitude') or exif_data.get('GPS.LatitudeDecimal'), -90.0, 90.0)
             lon = _valid_decimal(exif_result.get('longitude') or exif_data.get('GPS.LongitudeDecimal'), -180.0, 180.0)
             if lat and lon:
@@ -8666,14 +8967,22 @@ def _apply_client_processing_results(
                 metadata['latitude'] = lat
                 metadata['longitude'] = lon
             _apply_exif_metadata(metadata, exif_data)
+            verified_absent = (origin == 'ipworker' and exif_result.get('source') == 'browser_metadata_packet'
+                               and exif_result.get('verifiedNoExif') is True and not lat and not lon)
             _merge_processing_metadata(metadata, 'client_exif', {
                 'source': origin,
                 'acceptedAt': _utc_now(),
                 'hasGps': bool(lat and lon),
                 'clientAssetId': client_asset_id,
+                'verifiedNoExif': verified_absent,
                 **exif_provenance,
             })
-            if lat and lon and not _CTX.get('queue_map_on_upload'):
+            # An explicit geo result is applied below. Do not geocode twice or
+            # queue an EXIF-derived status that would overwrite it on batch flush.
+            if map_result is None and invalid_exif_gps:
+                if not _step_locked_done(metadata, 'map_detection'):
+                    status_updates['map_detection_status'] = 'failed'
+            elif map_result is None and lat and lon and not _CTX.get('queue_map_on_upload'):
                 # Reverse geocode the EXIF GPS coordinates to populate location names
                 place = _reverse_geocode_fallback(lat, lon)
                 if place:
@@ -8681,8 +8990,6 @@ def _apply_client_processing_results(
                         metadata['address'] = place['address']
                     metadata['locationCity'] = place.get('city', '')
                     metadata['locationCountry'] = place.get('country', '')
-                    metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
-                    metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
                 mark_step_done(user_id, filename, 'map_detection', result={
                     'source': origin,
                     'latitude': lat,
@@ -8691,10 +8998,10 @@ def _apply_client_processing_results(
                     **exif_provenance,
                 })
                 status_updates['map_detection_status'] = 'done'
-            elif not lat or not lon:
+            elif map_result is None and (not lat or not lon):
                 mark_step_no_data(user_id, filename, 'map_detection')
                 status_updates['map_detection_status'] = 'no_data'
-            status_updates['exif_status'] = 'done'
+            status_updates['exif_status'] = 'no_data' if verified_absent else 'done'
     elif exif_result is not None:
         status_updates['exif_status'] = 'failed'
     elif _client_report_needs_server_exif_fallback(report):
@@ -8706,6 +9013,7 @@ def _apply_client_processing_results(
                 metadata,
                 source_bytes,
                 fallback_for='browser_unsupported',
+                apply_geo=map_result is None,
             ))
         else:
             status_updates['exif_status'] = 'failed'
@@ -8715,29 +9023,49 @@ def _apply_client_processing_results(
         pass
     elif isinstance(ocr_result, dict):
         ocr_text = _sanitize_client_text(ocr_result.get('text'), 2048)
-        if ocr_text:
+        if ocr_result.get('error') or ocr_result.get('errorCode'):
+            status_updates['ocr_status'] = 'failed'
+            code = ocr_result.get('errorCode')
+            if not isinstance(code, str) or code not in {'tesserocr_unavailable', 'ocr_decode_failed', 'ocr_engine_failed'}:
+                code = 'ocr_processing_failed'
+            _merge_processing_metadata(metadata, 'client_ocr', {
+                'source': origin, 'acceptedAt': _utc_now(),
+                'clientAssetId': client_asset_id, 'errorCode': code,
+            })
+        elif ocr_text:
             metadata['ocrText'] = ocr_text
-            metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
-            metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             status_updates['ocr_status'] = 'done'
             _merge_processing_metadata(metadata, 'client_ocr', {
                 'source': origin,
                 'acceptedAt': _utc_now(),
                 'clientAssetId': client_asset_id,
                 'textLength': len(ocr_text),
+                'errorCode': '',
             })
         elif ocr_result.get('hasData') is False:
-            metadata['ocr_status'] = 'no_data'
+            status_updates['ocr_status'] = 'no_data'
+            _merge_processing_metadata(metadata, 'client_ocr', {
+                'source': origin, 'acceptedAt': _utc_now(),
+                'clientAssetId': client_asset_id, 'textLength': 0, 'errorCode': '',
+            })
+        else:
+            status_updates['ocr_status'] = 'failed'
     elif ocr_result is not None:
         metadata['ocr_status'] = 'failed'
 
-    map_result = payload.get('map_detection')
-    if isinstance(map_result, dict) and _step_locked_done(metadata, 'map_detection'):
+    if map_result is not None and _step_locked_done(metadata, 'map_detection'):
         pass
     elif isinstance(map_result, dict):
         lat = _valid_decimal(map_result.get('latitude'), -90.0, 90.0)
         lon = _valid_decimal(map_result.get('longitude'), -180.0, 180.0)
-        if lat and lon:
+        geo_error_code = ''
+        if map_result.get('error') or map_result.get('errorCode'):
+            # An explicit failure is not evidence of absent GPS, even when a
+            # partial result also supplies coordinates. Never persist raw errors.
+            status_updates['map_detection_status'] = 'failed'
+            geo_error_code = 'geo_processing_failed'
+        elif (lat and lon and np.isfinite(float(lat)) and np.isfinite(float(lon))
+                and not any(isinstance(map_result.get(key), bool) for key in ('latitude', 'longitude'))):
             metadata['latitude'] = lat
             metadata['longitude'] = lon
             metadata['address'] = _sanitize_client_text(map_result.get('address'), 512)
@@ -8757,19 +9085,26 @@ def _apply_client_processing_results(
                     metadata['locationCity'] = place.get('city', '')
                     metadata['locationRegion'] = place.get('region', '')
                     metadata['locationCountry'] = place.get('country', '')
-            metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
-            metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             status_updates['map_detection_status'] = 'done'
-            _merge_processing_metadata(metadata, 'client_map_detection', {
-                'source': origin,
-                'acceptedAt': _utc_now(),
-                'clientAssetId': client_asset_id,
-                **_client_source_provenance(map_result),
-            })
-        elif map_result.get('hasData') is False:
-            metadata['map_detection_status'] = 'no_data'
+        elif (map_result.get('hasData') is False
+                and all(map_result.get(key) is None or map_result.get(key) == '' for key in ('latitude', 'longitude'))):
+            status_updates['map_detection_status'] = 'no_data'
+        else:
+            status_updates['map_detection_status'] = 'failed'
+            geo_error_code = 'geo_invalid_result'
+        _merge_processing_metadata(metadata, 'client_map_detection', {
+            'source': origin,
+            'acceptedAt': _utc_now(),
+            'clientAssetId': client_asset_id,
+            'errorCode': geo_error_code,
+            **_client_source_provenance(map_result),
+        })
     elif map_result is not None:
-        metadata['map_detection_status'] = 'failed'
+        status_updates['map_detection_status'] = 'failed'
+        _merge_processing_metadata(metadata, 'client_map_detection', {
+            'source': origin, 'acceptedAt': _utc_now(),
+            'clientAssetId': client_asset_id, 'errorCode': 'geo_invalid_result',
+        })
 
     face_result = payload.get('face')
     face_result_version = str(face_result.get('modelTaxonomyVersion') or '').strip() if isinstance(face_result, dict) else ''
@@ -8883,6 +9218,11 @@ def _apply_client_processing_results(
                 quality_only = not backend_invalid and not face_diagnostics.get('failureCount', 0) and (
                     str(face_result.get('filteredReason') or '') in {
                         'quality_filter_rejected', 'alignment_transform_rejected', 'invalid_detection_boxes',
+                        # A candidate MediaPipe found no face mesh in is a
+                        # non-face/quality rejection, not a processing error --
+                        # mirrors ipwork_face.py's quality-class reject() for
+                        # the same reason so browser reports agree with ipworker.
+                        'landmark_detection_failed',
                     } or (backend_quality_rejected > 0 and reported_raw_face_count <= face_count
                           and not _bounded_face_count(face_result.get('filteredFaceCount'))))
                 face_failure_stage = 'quality_filter_rejected' if quality_only else 'postprocessing_failed'
@@ -8903,15 +9243,33 @@ def _apply_client_processing_results(
                 or incomplete_candidates
                 or face_result.get('faceModelReady') is False
             )
+            # A pass is only worth *retrying* when it was cut short by a
+            # genuinely transient condition (throttled, model not warm yet,
+            # inference timeout). A pass that ran the models and merely
+            # filtered some candidates (e.g. a YOLO false positive MediaPipe
+            # rejected) is complete for what the image contains -- retrying is
+            # deterministic waste. Used below so a photo that embedded >=1 real
+            # face isn't buried as 'failed' by a losing secondary candidate.
+            transient_incomplete = bool(
+                face_background_throttled
+                or face_deferred_reason == 'inference_timeout'
+                or face_failure_stage in _TRANSIENT_FACE_FAILURE_STAGES
+                or face_result.get('faceModelReady') is False
+            )
             # Empty failures have nothing to publish and must not acquire a
             # filename-write lease or enumerate old rows just to preserve them.
-            stored_face_ids = _store_client_face_entities(
-                user_id, filename, faces_with_embeddings,
-                force_reconcile=face_was_forced and detection_genuinely_ran,
-            ) if faces_with_embeddings or detection_genuinely_ran else []
+            with processing_diagnostics.apply_phase(user_id, filename, 'face_persistence'):
+                stored_face_ids = _store_client_face_entities(
+                    user_id, filename, faces_with_embeddings,
+                    force_reconcile=face_was_forced and detection_genuinely_ran,
+                ) if faces_with_embeddings or detection_genuinely_ran else []
             if stored_face_ids:
                 rotation = int(metadata.get('rotation', 0) or 0) % 360
-                _start_face_crop_warming(user_id, filename, list(stored_face_ids), get_image_bytes, rotation)
+                from ipwork_image import crop_preview
+                preview = crop_preview(user_id, filename, metadata) if origin == 'ipworker' else None
+                # The immutable callable outlives inference's image/context.
+                crop_bytes = preview if preview is not None else get_image_bytes
+                _start_face_crop_warming(user_id, filename, list(stored_face_ids), crop_bytes, rotation)
             if faces_with_embeddings:
                 faces_for_metadata = [{k: v for k, v in f.items() if k != 'embedding'} for f in faces_with_embeddings]
                 if not detection_genuinely_ran:
@@ -8924,7 +9282,18 @@ def _apply_client_processing_results(
                     faces_for_metadata.extend(f for i, f in enumerate(prior_faces) if i not in matched_indices)
                 metadata['faces'] = json.dumps(faces_for_metadata, ensure_ascii=False, separators=(',', ':'))
                 status_updates['faceCount'] = max(len(faces_for_metadata), _bounded_face_count(metadata.get('faceCount'))) if not detection_genuinely_ran else len(faces_with_embeddings)
-                status_updates['face_status'] = 'failed' if not detection_genuinely_ran else 'done'
+                # >=1 real face was embedded, so the step met its primary
+                # purpose. A secondary candidate that failed postprocessing or
+                # was quality-rejected is a partial loss, not a photo-level
+                # 'failed' (that previously dragged a photo with a perfectly
+                # good stored face to 'failed' whenever one extra YOLO box
+                # didn't pan out). Only a genuinely transient shortfall stays
+                # retryable ('pending'); the partial-failure detail is still
+                # recorded in client_face below for diagnosis.
+                if detection_genuinely_ran or not transient_incomplete:
+                    status_updates['face_status'] = 'done'
+                else:
+                    status_updates['face_status'] = 'pending'
             elif face_background_throttled:
                 status_updates['face_status'] = 'pending'
             elif face_deferred_reason == 'inference_timeout' or face_failure_stage in _TRANSIENT_FACE_FAILURE_STAGES:
@@ -8935,6 +9304,20 @@ def _apply_client_processing_results(
                 # the user to manually re-run face detection. Mirrors the
                 # background-throttled handling above.
                 status_updates['face_status'] = 'pending'
+            elif face_failure_stage == 'quality_filter_rejected' and not prior_faces:
+                # Candidates were detected but none were a confirmable/usable
+                # face (e.g. YOLO boxes MediaPipe found no landmarks in, or
+                # alignment/geometry rejections) -- and there are no prior
+                # faces to contradict it. That is honestly "we looked and found
+                # no usable face" == no_data, not a retryable-looking 'failed'
+                # that conflates it with real embed/landmark crashes. When
+                # prior curated faces DO exist we fall through to the
+                # preserve-and-flag 'failed' path below instead of claiming the
+                # photo has no faces. Genuine runtime failures
+                # (postprocessing_failed) also still fall through to 'failed'.
+                metadata['faces'] = '[]'
+                status_updates['faceCount'] = 0
+                status_updates['face_status'] = 'no_data'
             elif face_failure_stage:
                 status_updates['face_status'] = 'failed'
             elif not detection_genuinely_ran:
@@ -9055,8 +9438,6 @@ def _apply_client_processing_results(
                 metadata['photoEmbedding'] = _json_compact(image_embedding)
                 metadata['photoEmbeddingVersion'] = PHOTO_EMBEDDING_MODEL_VERSION
                 metadata['photoEmbeddingDimension'] = len(image_embedding)
-            metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
-            metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
             mark_step_done(user_id, filename, 'ai_vision', result={
                 'source': origin,
                 'tags': tags,
@@ -9108,26 +9489,22 @@ def _apply_client_processing_results(
             })
             status_updates['ai_vision_status'] = 'failed'
 
-    _refresh_semantic_fields(filename, metadata)
+    derivatives_only = bool(payload) and not report and set(payload) <= {'preview', 'thumbnail'} and all(
+        isinstance(value, dict) and value.get('alreadyUploaded') is True for value in payload.values())
+    if not derivatives_only:
+        with processing_diagnostics.apply_phase(user_id, filename, 'semantic_refresh'):
+            _refresh_semantic_fields(filename, metadata)
 
     if status_updates:
         metadata.update(status_updates)
     metadata['processing_complete'] = _photo_processing_complete(metadata)
-    _extract_and_store_embeddings(user_id, filename, metadata)
-    # Deliberately NOT a conditional/etag-checked write: mark_step_done/
-    # mark_step_no_data calls above (see their call sites throughout this
-    # function) each do their OWN immediate, independent upsert against this
-    # same row as they run -- by design, per _unstick_claimed_steps_still_running's
-    # docstring, so partial work survives a crash before this function
-    # reaches its own final write. Those intermediate writes bump the row's
-    # real etag every time, but `metadata`'s etag was captured once, back
-    # when apply_client_processing_results_for_file first read it -- making
-    # a conditional write here conflict with this function's OWN earlier
-    # writes on virtually every call, not just genuine concurrent-writer
-    # races (confirmed live 2026-09-21: every ipwork message failed with
-    # UpdateConditionNotSatisfied during an 8600-photo upload). This final
-    # write is intentionally a blind overwrite of the aggregate result,
-    # matching mark_step_done's own upsert semantics.
+    with processing_diagnostics.apply_phase(user_id, filename, 'embedding_write'):
+        _extract_and_store_embeddings(user_id, filename, metadata)
+    # The worker commits this aggregate together with collected step statuses
+    # and lease release. Legacy/direct callers retain their existing upsert:
+    # immediate mark_step_* calls may already have invalidated their ETag.
+    if not persist_result:
+        return
     metadata_table_client.upsert_entity(metadata)
     # An eager refresh here would rescan the user's whole library on every
     # single photo. Just mark both search indexes stale for this one filename;
@@ -9195,6 +9572,7 @@ def apply_client_processing_results_for_file(
     thumbnail_already_uploaded: bool = False,
     origin: str = 'browser',
     claimed_steps: Optional[List[str]] = None,
+    lease_owner: Optional[str] = None,
 ) -> Dict:
     """Validate and apply late processing results to an existing asset.
 
@@ -9213,6 +9591,13 @@ def apply_client_processing_results_for_file(
     metadata = timed_call('metadata_read', metadata_table_client.get_entity, partition_key=user_id, row_key=filename)
     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
         raise RuntimeError('Photo has been deleted.')
+    consolidated = origin == 'ipworker'
+    baseline = metadata
+    if consolidated:
+        if lease_owner is None:
+            lease_owner = _metadata_lease_owner(baseline)
+        _check_result_lease(baseline, lease_owner)
+        metadata = dict(baseline)
     # Anonymized photos are stored under the anonymous UUID; resolve it from the
     # metadata row we just loaded so the byte read hits the real blob.
     source_blob = str(metadata.get('anonymousImageId') or '').strip() or filename
@@ -9220,18 +9605,32 @@ def apply_client_processing_results_for_file(
     # a download unless _apply_client_processing_results actually reaches a
     # fallback path (EXIF or thumbnail) that needs the bytes.
     image_bytes_cache: List[bytes] = []
+    from ipwork_image import original_input
+    # Resolve against the fresh apply row before handing the getter to any
+    # background crop thread; that thread does not inherit the job context.
+    reusable_original = original_input(user_id, filename, metadata) if consolidated else None
 
     def get_image_bytes() -> bytes:
+        if is_video_file(filename):
+            raise ValueError('Video processing is browser-only')
         if not image_bytes_cache:
-            image_bytes_cache.append(download_media_bytes('image', source_blob))
+            purpose = ('face_cover' if processing_diagnostics.media_download_context().get('purpose') == 'face_cover'
+                       else 'result_fallback')
+            with processing_diagnostics.media_download_scope(purpose, user=user_id, filename=filename):
+                if reusable_original is not None:
+                    image_bytes_cache.append(reusable_original)
+                    processing_diagnostics.emit('media_reuse', **processing_diagnostics.media_download_context(),
+                        role='vision', source='image', bytes=len(reusable_original))
+                else:
+                    image_bytes_cache.append(download_media_bytes('image', source_blob))
         return image_bytes_cache[0]
 
+    batch = []
     try:
-        # Batches every update_processing_status call _apply_client_processing_results
-        # makes (one per completed step -- thumbnail/exif/ocr/face/ai_vision/
-        # map_detection) into a single Table Storage read + write on exit,
-        # instead of one round trip per step. See batched_processing_status_updates.
-        with batched_processing_status_updates(user_id, filename):
+        # Workers own the final status flush; browser callers retain the
+        # separate on-exit flush, including partial progress on exceptions.
+        with batched_processing_status_updates(user_id, filename, flush=not consolidated) as batch:
+            options = {'persist_result': False} if consolidated else {}
             _apply_client_processing_results(
                 user_id,
                 filename,
@@ -9243,16 +9642,112 @@ def apply_client_processing_results_for_file(
                 thumbnail_already_uploaded=thumbnail_already_uploaded,
                 origin=origin,
                 claimed_steps=claimed_steps,
+                **options,
             )
     except Exception as exc:
-        _unstick_claimed_steps_still_running(user_id, filename, claimed_steps, str(exc))
+        if consolidated:
+            try:
+                timed_call('persistence', _commit_worker_processing_results,
+                           user_id, filename, baseline, dict(baseline), batch, lease_owner,
+                           failed_steps=claimed_steps, error=str(exc))
+            except Exception:
+                _LOGGER.warning('Worker partial-status commit failed')
+        else:
+            _unstick_claimed_steps_still_running(user_id, filename, claimed_steps, str(exc))
         raise
+    if consolidated:
+        return timed_call('persistence', _commit_worker_processing_results,
+                          user_id, filename, baseline, metadata, batch, lease_owner)
     timed_call('persistence', refresh_metadata_entity, user_id, filename, {
         'processing_lease_owner': '',
         'processing_lease': '',
         'processing_lease_expires_at': '',
     })
     return metadata
+
+
+def _metadata_lease_owner(entity: Dict) -> str:
+    return str(entity.get('processing_lease_owner') or entity.get('processing_lease') or '').strip()
+
+
+def _check_result_lease(entity: Dict, owner: str) -> None:
+    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+        raise RuntimeError('Photo has been deleted.')
+    if entity.get('processingIsolated') is True:
+        raise RuntimeError('Photo is isolated from processing.')
+    if _metadata_lease_owner(entity) != owner:
+        raise RuntimeError('Processing result lease owner changed.')
+
+
+def _commit_worker_processing_results(user_id, filename, baseline, result, updates, owner,
+                                      *, failed_steps=None, error=None):
+    """CAS only this attempt's delta, statuses and release in one row write.
+
+    External face/embedding/blob work is never replayed on conflict. The first
+    attempt uses the fresh apply read's ETag, not the earlier claim snapshot.
+    """
+    table = _CTX['metadata_table_client']
+    fields = {key: value for key, value in result.items()
+              if key not in {'PartitionKey', 'RowKey', 'processing_metadata'}
+              and (key not in baseline or value != baseline[key])}
+    before = _safe_json_load(baseline.get('processing_metadata'))
+    after = _safe_json_load(result.get('processing_metadata'))
+    changed_keys = {key for key in before.keys() | after.keys()
+                    if key not in before or key not in after or before[key] != after[key]}
+    current = baseline
+    reads = writes = conflicts = 0
+    outcome = 'error'
+    started = time.monotonic()
+    try:
+        for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+            _check_result_lease(current, owner)
+            if any(current.get(key) != baseline.get(key) for key in ('anonymousImageId', 'fileHash')):
+                raise RuntimeError('Processing source changed during result application.')
+            touched_steps = {key[:-7] for key in fields if key.endswith('_status')}
+            touched_steps.update(update['step'] for update in updates)
+            if any(_step_locked_done(current, step) and not _step_locked_done(baseline, step)
+                   for step in touched_steps):
+                raise RuntimeError('Processing step completed during result application.')
+            processing = _safe_json_load(current.get('processing_metadata'))
+            for key in changed_keys:
+                if key in after:
+                    processing[key] = after[key]
+                else:
+                    processing.pop(key, None)
+            # Preserve TableEntity's genuine ETag while rebuilding from fresh
+            # values on every retry; do not mutate the baseline/result delta.
+            entity = copy.copy(current)
+            entity.update(fields)
+            entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
+            _apply_processing_status_updates(entity, updates)
+            if error is not None:
+                for step in failed_steps if failed_steps is not None else BROWSER_PROCESSING_STEPS:
+                    if step in BROWSER_PROCESSING_STEPS and entity.get(f'{step}_status') == 'running':
+                        entity[f'{step}_status'] = 'failed'
+                entity['last_error'] = f'processing_failed_before_status_commit: {error}'[:1000]
+            entity.update(processing_lease_owner='', processing_lease='', processing_lease_expires_at='')
+            entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+            entity['processing_complete'] = _photo_processing_complete(entity)
+            try:
+                writes += 1
+                with processing_diagnostics.apply_phase(user_id, filename, 'metadata_cas'):
+                    table.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            except ResourceModifiedError:
+                conflicts += 1
+                if attempt + 1 == _METADATA_UPDATE_MAX_RETRIES:
+                    raise
+                time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
+                reads += 1
+                current = table.get_entity(partition_key=user_id, row_key=filename)
+                continue
+            outcome = 'partial' if error is not None else 'success'
+            with processing_diagnostics.apply_phase(user_id, filename, 'index_dirty'):
+                touch_user_search_indexes_state(user_id, filenames=filename)
+            return entity
+    finally:
+        processing_diagnostics.file_event('vision_metadata_commit', user_id, filename,
+            outcome=outcome, retry_reads=reads, write_attempts=writes, conflicts=conflicts,
+            status_updates=len(updates), milliseconds=(time.monotonic() - started) * 1000)
 
 
 def finalize_uploaded_file(
@@ -9276,8 +9771,8 @@ def finalize_uploaded_file(
         thumbnail attempt fails, the backend steps in reactively later, once
         the client's processing report actually says so (see
         _client_report_needs_server_thumbnail_fallback), not here;
-      * only video/RAW are downloaded eagerly, because they need a server-side
-        thumbnail or metadata the browser can't reliably produce on its own;
+      * videos require browser thumbnails/metadata and a client SHA-256;
+        their originals are never downloaded for preparation fallback;
       * the blob is only (re)written under a new name in the rare event a
         cross-tenant filename clash forces a rename.
       * anonymized images use the anonymous_blob_name instead of filename for storage.
@@ -9285,14 +9780,7 @@ def finalize_uploaded_file(
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
 
-    # Only video still needs eager bytes here (for the metadata extraction
-    # below). RAW used to be lumped in with video via _upload_needs_server_bytes
-    # -- forcing a blob re-download + synchronous decode inside this HTTP
-    # request even when the browser already sent a trustworthy hash -- but
-    # RAW's thumbnail/EXIF work is redundant with what ipworker's queued
-    # 'thumbnail'/'exif' steps already do for every upload (see
-    # _queue_upload_processing below), so there's no reason to also do it here,
-    # synchronously, on one of the backend's few gunicorn threads.
+    # Video preparation belongs to the browser even when generation fails.
     is_video = is_video_file(filename)
     blob_to_read = anonymous_blob_name or filename
 
@@ -9301,7 +9789,9 @@ def finalize_uploaded_file(
     # Fall back to reading the blob when there is no client hash to trust.
     image_bytes: Optional[bytes] = None
     client_hash = str(client_sha256 or '')
-    if is_video or not client_hash:
+    if is_video and not re.fullmatch(r'[a-f0-9]{64}', client_hash):
+        raise ValueError('Video uploads require a client SHA-256')
+    if not client_hash:
         image_bytes = timed_call('source_read', download_media_bytes, 'image', blob_to_read)
         file_hash = hashlib.sha256(image_bytes).hexdigest()
     else:
@@ -9311,6 +9801,8 @@ def finalize_uploaded_file(
     final_filename = timed_call('name_resolution', _resolve_filename_for_upload, user_id, filename, file_hash)
 
     if final_filename != filename and not anonymous_blob_name:
+        if is_video:
+            raise ValueError('Video filename collisions require anonymous storage')
         # Rare: a cross-tenant filename clash forced a unique name, so place the
         # bytes under it. (Non-renamed uploads are already stored in place, so the
         # common path moves no image data at all.)
@@ -9328,6 +9820,8 @@ def finalize_uploaded_file(
             pass
 
     metadata = timed_call('metadata_read', get_or_create_metadata, user_id, final_filename)
+    from benchmark_upload import isolated
+    benchmark_isolated = isolated(metadata)
     # The metadata row is usually pre-created at /upload/init (which records
     # upload_started_at but no uploadDate), so get_or_create_metadata returns it
     # without an uploadDate. Persist one here so the gallery has a stable
@@ -9365,17 +9859,28 @@ def finalize_uploaded_file(
     # just written two lines earlier, purely to set these fields and write it
     # right back. Same final state, one fewer read + write per file.
     file_is_video = is_video_file(final_filename)
-    video_status_overrides = {'preview': 'skipped', 'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped'}
+    video_status_overrides = {'preview': 'skipped', 'ocr': 'skipped', 'ai_vision': 'skipped', 'face': 'skipped',
+                              'thumbnail': 'failed', 'exif': 'failed', 'map_detection': 'skipped'}
     status_overrides = video_status_overrides if file_is_video else {}
     for step in PROCESSING_STEPS:
-        metadata[f'{step}_status'] = status_overrides.get(step, 'pending')
+        metadata[f'{step}_status'] = 'skipped' if benchmark_isolated else status_overrides.get(step, 'pending')
     metadata['processing_metadata'] = json.dumps({})
+    metadata.pop('uploadMetadataPacket', None)
     metadata['processing_state'] = 'active'
     metadata['processing_lease'] = ''
     metadata['processing_lease_expires_at'] = ''
     metadata['processing_lease_owner'] = ''
     metadata['retry_count'] = 0
+    if benchmark_isolated:
+        metadata['processing_complete'] = True
+        metadata['processing_metadata'] = json.dumps({'isolation': {'reason': 'upload_only_benchmark', 'runId': metadata.get('benchmarkRunId')}})
     metadata['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+    if file_is_video:
+        metadata['videoBrowserOnly'] = True
+        metadata['processing_complete'] = _photo_processing_complete(metadata)
+        if not benchmark_isolated:
+            metadata['processing_metadata'] = json.dumps({'video_preparation': {'source': 'browser',
+                'reason': 'browser_assets_required', 'backendFallback': False}})
 
     with upload_phase('persistence'):
         metadata_table_client.upsert_entity(metadata)
@@ -9393,41 +9898,10 @@ def finalize_uploaded_file(
     timed_call('persistence', touch_user_search_indexes_state, user_id, filenames=final_filename)
     # Keep the O(1) dedup/collision indexes current for the next upload -- see
     # detect_duplicates() and _resolve_filename_for_upload().
-    timed_call('persistence', _store_hash_index, user_id, file_hash, final_filename)
+    if not benchmark_isolated:
+        timed_call('persistence', _store_hash_index, user_id, file_hash, final_filename)
     timed_call('persistence', _store_filename_owner, user_id, final_filename, file_hash)
 
-    # Server-side thumbnail / metadata extraction, eagerly, here -- video only.
-    # RAW used to get this treatment too, but it's redundant: ipworker's queued
-    # 'thumbnail'/'exif' steps (_queue_upload_processing, below) call the exact
-    # same helpers for every uploaded photo, including RAW, so doing it again
-    # here just duplicated the work while holding a gunicorn thread for as long
-    # as the RAW decode took (measured multi-second to ~60s on real CR3 files).
-    # RAW capture dates and thumbnails now show up whenever ipworker gets to
-    # them instead of instantly -- an intentional trade (see the "own highway"
-    # discussion): correctness-only background work no longer blocks the
-    # upload-critical path.
-    if file_is_video and image_bytes is not None:
-        try:
-            thumbnail_bytes = _create_server_thumbnail_for_upload(image_bytes, final_filename)
-            if thumbnail_bytes:
-                # Use anonymous ID for thumbnail if image was anonymized
-                thumbnail_blob_name = metadata.get('anonymousImageId') or final_filename
-                upload_media_file('thumbnail', thumbnail_blob_name, thumbnail_bytes, 'image/jpeg')
-                mark_step_done(user_id, final_filename, 'thumbnail', result={
-                    'source': 'server',
-                    'reason': 'video_browser_unsupported',
-                })
-        except Exception:
-            pass
-        try:
-            _finalize_server_side_exif(
-                user_id,
-                final_filename,
-                image_bytes,
-                fallback_for='video_upload',
-            )
-        except Exception:
-            pass
     return duplicates, final_filename
 
 
@@ -9435,6 +9909,8 @@ def _finalize_server_side_exif(user_id: str, filename: str, image_bytes: bytes, 
     """Extract EXIF (exiftool) server-side so capture-date sort/search works
     immediately for formats the browser can't reliably self-report (video,
     RAW), instead of waiting on client-side processing."""
+    if is_video_file(filename):
+        return
     metadata_table_client = _CTX['metadata_table_client']
     try:
         entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
@@ -9495,17 +9971,18 @@ _STEP_UPDATE_BATCH: 'contextvars.ContextVar[Optional[List[Dict]]]' = contextvars
 
 
 @contextlib.contextmanager
-def batched_processing_status_updates(user_id: str, filename: str):
+def batched_processing_status_updates(user_id: str, filename: str, *, flush=True):
     """Collect every update_processing_status call made while this context is
     active and flush them as a single read + conditional-write on exit,
-    instead of one round trip per call. See _STEP_UPDATE_BATCH above."""
+    instead of one round trip per call. With flush=False, the caller owns
+    both successful and partial-failure persistence of the yielded list."""
     token = _STEP_UPDATE_BATCH.set([])
     try:
-        yield
+        yield _STEP_UPDATE_BATCH.get()
     finally:
         batch = _STEP_UPDATE_BATCH.get()
         _STEP_UPDATE_BATCH.reset(token)
-        if batch:
+        if batch and flush:
             timed_call('persistence', _flush_processing_status_batch, user_id, filename, batch)
 
 
@@ -9585,23 +10062,7 @@ def _flush_processing_status_batch(user_id: str, filename: str, updates: List[Di
         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
             return
 
-        processing = _safe_json_load(entity.get('processing_metadata'))
-        for update in updates:
-            step = update['step']
-            status = update['status']
-            result = update.get('result')
-            error = update.get('error')
-            entity[f'{step}_status'] = status
-            if result is not None:
-                processing[step] = result
-            elif status == 'no_data':
-                processing[step] = None
-            if error:
-                entity['last_error'] = str(error)
-                if update.get('increment_retry'):
-                    entity['retry_count'] = int(entity.get('retry_count', 0) or 0) + 1
-
-        entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
+        _apply_processing_status_updates(entity, updates)
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         entity['processing_complete'] = _photo_processing_complete(entity)
         try:
@@ -9614,6 +10075,22 @@ def _flush_processing_status_batch(user_id: str, filename: str, updates: List[Di
             continue
         except ResourceNotFoundError:
             return  # deleted between our read and this write -- nothing left to update
+
+
+def _apply_processing_status_updates(entity: Dict, updates: List[Dict]) -> None:
+    processing = _safe_json_load(entity.get('processing_metadata'))
+    for update in updates:
+        step, status = update['step'], update['status']
+        entity[f'{step}_status'] = status
+        if update.get('result') is not None:
+            processing[step] = update['result']
+        elif status == 'no_data':
+            processing[step] = None
+        if update.get('error'):
+            entity['last_error'] = str(update['error'])
+            if update.get('increment_retry'):
+                entity['retry_count'] = int(entity.get('retry_count', 0) or 0) + 1
+    entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
 
 
 def _processing_is_expired(entity: Dict) -> bool:
@@ -9668,6 +10145,8 @@ def claim_processing_lease(
             raise PhotoNotFoundError('Photo not found.')
         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
             raise PhotoNotFoundError('Photo has been deleted.')
+        if entity.get('processingIsolated') is True:
+            raise PhotoNotFoundError('Photo is isolated for an upload-only benchmark.')
 
         lease_expired = _processing_is_expired(entity)
         current_owner = str(entity.get('processing_lease_owner') or '').strip()
@@ -10205,6 +10684,7 @@ def reset_upload_tracking_and_reserve_blob(
     filename: str,
     total_size: int,
     expected_hash: Optional[str] = None,
+    initial_metadata: Optional[Dict] = None,
 ) -> Optional[str]:
     """Fresh-upload version of /upload/init's per-file bookkeeping: does the
     combined work of reset_received_ranges() + reserve_pending_anonymous_blob()
@@ -10241,10 +10721,13 @@ def reset_upload_tracking_and_reserve_blob(
 
     anonymous_blob_name = existing if reuse else _generate_anonymous_id()
     entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
+    entity.update(initial_metadata or {})
 
     try:
         metadata_table_client.upsert_entity(entity)
     except Exception:
+        if initial_metadata:
+            raise
         return anonymous_blob_name
     return anonymous_blob_name
 
@@ -10308,6 +10791,7 @@ def reset_upload_tracking_and_reserve_blobs_batch(
 
         anonymous_blob_name = existing_blob if reuse else _generate_anonymous_id()
         entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
+        entity.update(f.get('initial_metadata') or {})
         anonymous_blob_names[filename] = anonymous_blob_name
         operations.append(('upsert', entity))
 
@@ -10322,5 +10806,7 @@ def reset_upload_tracking_and_reserve_blobs_batch(
             try:
                 metadata_table_client.upsert_entity(entity)
             except Exception:
+                if entity.get('processingIsolated') is True:
+                    raise
                 pass
     return anonymous_blob_names

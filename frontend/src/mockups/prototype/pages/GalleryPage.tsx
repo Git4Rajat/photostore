@@ -189,7 +189,7 @@ export const GalleryPage: React.FC = () => {
         e.preventDefault();
         depth.current = 0;
         setDragging(false);
-        const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/') || f.type.startsWith('video/') || /\.(heic|heif|cr2|cr3|arw|nef|dng|raf)$/i.test(f.name));
+        const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/') || f.type.startsWith('video/') || /\.(heic|heif|hif|cr2|cr3|arw|nef|dng|raf)$/i.test(f.name));
         if (files.length) void startUpload(files);
     };
 

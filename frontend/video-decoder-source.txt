@@ -1,0 +1,19 @@
+Browser video runtime sources and licenses
+
+mediainfo.js 0.3.8 / MediaInfoLib: BSD-2-Clause
+https://github.com/buzz/mediainfo.js
+https://github.com/MediaArea/MediaInfoLib
+MediaInfo-BSD-2-Clause.txt is distributed alongside this notice.
+
+@ffmpeg/ffmpeg 0.12.15: MIT (JavaScript worker wrapper)
+@ffmpeg/core 0.12.10: GPL-2.0-or-later (single-threaded WASM core)
+https://github.com/ffmpegwasm/ffmpeg.wasm
+https://github.com/ffmpegwasm/ffmpeg.wasm/releases
+FFmpeg-core-GPL-2.0.txt is distributed alongside this notice.
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+The unchanged pinned npm distributions supply the runtime binaries.
+Versioned same-origin assets are prepared by scripts/sync-video-runtime.mjs.
+The core's upstream build configuration/source and component licensing are
+available in the ffmpeg.wasm source repository; the wrapper's MIT license
+does not replace the core or linked codec libraries' licenses.

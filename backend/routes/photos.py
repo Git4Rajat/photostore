@@ -286,13 +286,7 @@ def proxy_preview(filename: str):
         }), 503
 
     try:
-        image_bytes = app.download_media_bytes('image', preview_blob_name)
-        preview_bytes = app.convert_image_to_jpeg(image_bytes, safe_name)
-        if not preview_bytes or (app._filename_requires_backend_preview(safe_name) and not app._looks_like_jpeg(preview_bytes)):
-            return app.jsonify(app._preview_failure_payload(safe_name)), 422
-        resp = app.Response(preview_bytes, mimetype='image/jpeg')
-        resp.headers['Cache-Control'] = 'private, max-age=3600'
-        return resp
+        return proxy_thumbnail(safe_name)
     except Exception as exc:
         if app._is_missing_media_error(exc):
             return app.jsonify({
@@ -626,6 +620,12 @@ def photos_processing_status():
             'mapDetection': entity.get('map_detection_status'),
             'activeWorker': app._active_processing_worker(entity),
         }
+        # Additive: why each non-'done' step ended where it did, so a
+        # 'failed'/'no_data' tile is self-explaining instead of needing a
+        # server-side dig. Omitted entirely when nothing to report.
+        reasons = app._processing_step_reasons(entity)
+        if reasons:
+            statuses[filename]['reasons'] = reasons
     return app.jsonify({'statuses': statuses})
 
 @photos_bp.route('/photos/lookup/<path:filename>', methods=['GET'])
@@ -1626,7 +1626,7 @@ def get_photo_metadata(filename: str):
         liked_by = app.json.loads(metadata.get('likedBy', '[]'))
         exif_data = app.parse_exif_data(metadata.get('exifData', '{}'))
         resolution = app._resolution_from_exif(exif_data)
-        if not resolution['width'] or not resolution['height']:
+        if (not resolution['width'] or not resolution['height']) and not app.is_video_file(safe_name):
             # Not every camera/re-encoder writes EXIF dimension tags. This
             # endpoint is only called once per photo when the info panel is
             # opened (not in bulk listing), so a lazy header-only image read

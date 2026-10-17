@@ -1,0 +1,154 @@
+import json
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from upload_preparation_diagnostics import bounded_report, metadata_offer_reason, record_receipt, rejection_reason
+
+
+def report():
+    return {'version': 1, 'elapsedMs': 12.5, 'assets': {
+        asset: {'target': True, 'generation': 'generated', 'upload': 'uploaded', 'bytes': 100}
+        for asset in ('preview', 'thumbnail', 'metadata')}}
+
+
+def test_report_drops_untrusted_strings_and_unbounded_values():
+    raw = report()
+    raw.update(reason='secret url', elapsedMs=float('inf'), password='secret')
+    raw['assets']['preview'].update(generationReason='secret', uploadReason={'secret': True},
+                                  bytes=4_194_305, queueMs=True, httpStatus=600, uploadMs=float('nan'))
+    clean = bounded_report(raw)
+    assert set(clean) == {'version', 'assets'}
+    assert clean['assets']['preview'] == {'target': True, 'generation': 'generated', 'upload': 'uploaded'}
+    assert 'secret' not in json.dumps(clean)
+
+
+def test_report_preserves_embedded_video_runtime_and_bounded_reads():
+    raw = report()
+    raw['assets']['thumbnail'].update(runtime='embedded_video_jpeg', readBytes=12000, readCalls=14)
+    clean = bounded_report(raw)['assets']['thumbnail']
+    assert clean['runtime'] == 'embedded_video_jpeg'
+    assert clean['readBytes'] == 12000 and clean['readCalls'] == 14
+
+
+@pytest.mark.parametrize('value', [True, False, 'true', 1, {}, None])
+def test_passthrough_is_a_preview_only_boolean_claim(value):
+    raw = report()
+    for asset in raw['assets'].values():
+        asset['passthrough'] = value
+    clean = bounded_report(raw)['assets']
+    if type(value) is bool:
+        assert clean['preview']['passthrough'] is value
+    else:
+        assert 'passthrough' not in clean['preview']
+    assert 'passthrough' not in clean['thumbnail']
+    assert 'passthrough' not in clean['metadata']
+
+
+@pytest.mark.parametrize('value', [None, [], {'version': True}, {'version': 2}, 'secret'])
+def test_invalid_report_has_no_storage_side_effects(value):
+    app = Mock()
+    record_receipt(app, 'library', 'photo.cr3', {'preparationReport': value})
+    assert not app.mock_calls
+
+
+def test_unhashable_enum_inputs_are_ignored():
+    assert bounded_report({'version': 1, 'reason': [], 'assets': {'preview': {
+        'generation': {}, 'upload': [], 'generationReason': {}, 'target': 'true'}}}) == {'version': 1, 'assets': {'preview': {}}}
+    assert bounded_report({'version': 1, 'elapsedMs': 10 ** 1000, 'assets': {
+        'preview': {'bytes': 10 ** 1000}}}) == {'version': 1, 'assets': {'preview': {}}}
+
+
+def test_queue_latency_and_retry_attempts_are_bounded():
+    raw = report()
+    raw['admissionMs'] = 6000
+    raw['assets']['preview'].update(attempts=3, uploadReason='upload_timeout')
+    clean = bounded_report(raw)
+    assert clean['admissionMs'] == 6000
+    assert clean['assets']['preview']['attempts'] == 3
+    assert clean['assets']['preview']['uploadReason'] == 'upload_timeout'
+    raw['assets']['preview']['attempts'] = 4
+    raw['admissionMs'] = 10 ** 1000
+    clean = bounded_report(raw)
+    assert 'attempts' not in clean['assets']['preview']
+    assert 'admissionMs' not in clean
+
+
+def test_receipt_uses_backend_state_not_browser_success_claim():
+    row = {'preview_status': 'done', 'thumbnail_status': 'pending',
+           'processing_metadata': json.dumps({'client_preview': {'source': 'browser'}})}
+    app = SimpleNamespace(metadata_table_client=SimpleNamespace(get_entity=lambda **_: row),
+                          _update_metadata_entity_fields=Mock(), app=SimpleNamespace(logger=Mock()))
+    payload = {'preparationReport': report(), 'clientProcessing': {
+        'preview': {'alreadyUploaded': True}, 'thumbnail': {'alreadyUploaded': True}}, 'clientMetadata': {'version': 1}}
+    record_receipt(app, 'library', 'photo.cr3', payload, packet_rejection='binding_or_blob_mismatch',
+                   processing_rejection='storage_http_404')
+    record = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])
+    assert record['backendReceipt'] == {'preview': 'accepted', 'thumbnail': 'rejected',
+        'metadata': 'rejected', 'metadataReason': 'binding_or_blob_mismatch', 'processingReason': 'storage_http_404'}
+    assert record['browserClaim']['assets']['thumbnail']['upload'] == 'uploaded'
+    record_receipt(app, 'library', 'photo.cr3', payload, packet_accepted=True)
+    accepted = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])
+    assert accepted['backendReceipt']['metadata'] == 'accepted'
+    record_receipt(app, 'library', 'photo.cr3', payload, duplicate=True)
+    duplicate = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])
+    assert set(duplicate['backendReceipt'].values()) == {'duplicate'}
+
+
+def test_receipt_failure_does_not_reject_original():
+    app = SimpleNamespace(metadata_table_client=SimpleNamespace(get_entity=Mock(side_effect=RuntimeError('offline'))),
+                          _update_metadata_entity_fields=Mock(), app=SimpleNamespace(logger=Mock()))
+    record_receipt(app, 'library', 'photo.cr3', {'preparationReport': report()})
+    app._update_metadata_entity_fields.assert_not_called()
+    app.app.logger.info.assert_called_once()
+
+
+def test_receipt_preserves_independent_derivative_rejection_reason():
+    row = {'preview_status': 'done', 'thumbnail_status': 'pending', 'processing_metadata': json.dumps({
+        'client_preview': {'source': 'browser'},
+        'client_thumbnail_rejected': {'clientAssetId': 'upload-id', 'reason': 'derivative_byte_limit'}})}
+    app = SimpleNamespace(metadata_table_client=SimpleNamespace(get_entity=lambda **_: row),
+                          _update_metadata_entity_fields=Mock(), app=SimpleNamespace(logger=Mock()))
+    payload = {'uploadId': 'upload-id', 'preparationReport': report(), 'clientProcessing': {
+        'preview': {'alreadyUploaded': True}, 'thumbnail': {'alreadyUploaded': True}}}
+    record_receipt(app, 'library', 'photo.cr3', payload)
+    receipt = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])['backendReceipt']
+    assert receipt['preview'] == 'accepted'
+    assert receipt['thumbnail'] == 'rejected'
+    assert receipt['thumbnailReason'] == 'derivative_byte_limit'
+
+
+def test_offer_reports_runtime_and_qualification_gates(monkeypatch):
+    monkeypatch.setenv('BROWSER_UPLOAD_PREPARATION', 'false')
+    assert metadata_offer_reason(True, 'id', 'photo.cr3', None) == 'backend_disabled'
+    monkeypatch.setenv('BROWSER_UPLOAD_PREPARATION', 'true')
+    assert metadata_offer_reason(False, 'id', 'photo.cr3', None) == 'not_requested'
+    assert metadata_offer_reason(True, None, 'photo.cr3', None) == 'missing_binding'
+    assert metadata_offer_reason(True, 'id', 'photo.ari', None) == 'unqualified_family'
+    assert metadata_offer_reason(True, 'id', 'photo.orf', 'url') is None
+    assert metadata_offer_reason(True, 'id', 'photo.cr3', None) == 'target_unavailable'
+    assert metadata_offer_reason(True, 'id', 'photo.cr3', 'url') is None
+
+
+def test_metadata_report_cap_matches_transport_without_widening_derivative_cap():
+    from upload_metadata import MAX_PACKET_BYTES
+    value = report()
+    value['assets']['metadata']['bytes'] = 4_800_000
+    value['assets']['preview']['bytes'] = 4_800_000
+    clean = bounded_report(value)
+    assert clean['assets']['metadata']['bytes'] == 4_800_000
+    assert 'bytes' not in clean['assets']['preview']
+    value['assets']['metadata']['bytes'] = MAX_PACKET_BYTES + 1
+    assert 'bytes' not in bounded_report(value)['assets']['metadata']
+
+
+@pytest.mark.parametrize('message,reason', [
+    ('Direct derivative exceeds byte limit or is empty', 'derivative_byte_limit'),
+    ('Direct derivative must have image/jpeg content type', 'derivative_content_type'),
+    ('Direct derivative changed during verification', 'derivative_changed'),
+    ('Direct derivative exceeds pixel limit or is not JPEG', 'derivative_format_or_dimensions'),
+    ('Metadata source mismatch', 'binding_or_blob_mismatch'),
+])
+def test_rejection_codes_do_not_forward_exception_text(message, reason):
+    assert rejection_reason(ValueError(message)) == reason

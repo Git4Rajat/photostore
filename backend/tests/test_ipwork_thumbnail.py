@@ -53,17 +53,11 @@ def test_process_thumbnail_never_raises_on_broken_input():
     assert 'hasData' in result
 
 
-def test_process_thumbnail_routes_video_extension_through_video_path(monkeypatch):
-    # create_video_thumbnail_data is mocked out, so this doesn't touch ffmpeg --
-    # it only confirms is_video_file() routing sends .mp4 through the video
-    # path rather than create_thumbnail_data (which would try to open it as a
-    # still image and, per the fallback test above, "succeed" with a
-    # placeholder instead of correctly reporting no data).
+def test_process_thumbnail_never_decodes_video_in_backend(monkeypatch):
     calls = []
     monkeypatch.setattr(ipwork_thumbnail, 'create_video_thumbnail_data', lambda data, filename: calls.append((data, filename)) or None)
 
     result = ipwork_thumbnail.process_thumbnail('lib-A', 'clip.mp4', b'not-a-real-video')
 
-    assert len(calls) == 1
-    assert calls[0][1] == 'clip.mp4'
-    assert result == {'hasData': False}
+    assert calls == []
+    assert result == {'hasData': False, 'error': 'video_browser_only'}

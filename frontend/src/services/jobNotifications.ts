@@ -22,6 +22,23 @@ export type JobStatusRecord = {
     error?: string | null;
     updatedAt?: string;
     suppressNotification?: boolean;
+    indexScope?: 'full' | 'light' | 'people' | 'dedup' | 'dedup-idle';
+};
+
+// Index job IDs are reused. A later completion must be announced without
+// repeatedly announcing the same terminal row on every poll or page reload.
+export const jobNotificationKey = (job: JobStatusRecord): string => job.kind === 'index_build' && job.updatedAt
+    ? `${job.jobId}:${job.updatedAt}:${job.status}` : job.jobId;
+
+export const indexNotificationGroup = (job: JobStatusRecord): string | undefined => {
+    if (job.kind !== 'index_build' || !job.indexScope) return undefined;
+    const scope = job.indexScope === 'dedup-idle' ? 'dedup' : job.indexScope;
+    const suffix = `-${job.indexScope}`;
+    const owner = job.indexScope !== 'full' && job.jobId.endsWith(suffix)
+        ? job.jobId.slice(0, -suffix.length) : job.jobId;
+    // Keep failures visible even when another maintenance pass succeeds.
+    const group = `index:${owner}:${scope}`;
+    return job.status === 'failed' ? `${group}:failed:${job.jobId}` : group;
 };
 
 // 'skipped' (ipwork-only -- lease lost to another racer, or the photo was

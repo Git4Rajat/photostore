@@ -6,6 +6,7 @@
 // work without any further wiring.
 
 import { getRuntimeConfig } from '../config/appConfig';
+import { clearLibraryClientData } from './clientDataReset';
 
 const TOKEN_KEY = 'photostore.passwordAuthToken';
 // A non-sensitive hint (the owner's email) kept across logout so the login form
@@ -44,8 +45,22 @@ export const getToken = (): string | null => {
     }
 };
 
+// The `lib` claim of an arbitrary token (not necessarily the stored one), used
+// to detect an account/library switch when a new token is issued.
+const libOf = (token: string): string => String(decodePayload(token)?.lib || '');
+
 const setToken = (token: string): void => {
     try {
+        // A new token for a DIFFERENT library means the user switched accounts
+        // (login as another email, library switch, invite accept, Entra
+        // re-exchange). Drop the previous library's cached photos/indexes first
+        // so the gallery can't replay the old account's data under the new
+        // session. A later reload (triggered by the switch flows) then boots
+        // into the new account with a clean in-memory store too.
+        const previous = getToken();
+        if (previous && libOf(previous) && libOf(previous) !== libOf(token)) {
+            clearLibraryClientData();
+        }
         window.localStorage.setItem(TOKEN_KEY, token);
     } catch {
         // ignore storage failures
@@ -151,6 +166,16 @@ export const login = async (email: string, password: string): Promise<void> => {
 
 export const logout = (): void => {
     clearToken();
+    // Drop the previous account's cached library data so the next sign-in
+    // starts clean, and forget the email hint -- keeping it pre-filled the
+    // last account's address, which is how a logout could silently re-submit
+    // the wrong account on the next login (see clientDataReset.ts).
+    clearLibraryClientData();
+    try {
+        window.localStorage.removeItem(EMAIL_HINT_KEY);
+    } catch {
+        // ignore storage failures
+    }
 };
 
 export const requestPasswordReset = async (email = ''): Promise<void> => {

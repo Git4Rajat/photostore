@@ -3,12 +3,182 @@
 > `frontend`→`web` (`upload` unchanged). This doc still uses the OLD names —
 > translate via this table against current `deploy/resources.bicep`/`backend/app.py`.
 
+> **2026-10-11 image reuse experiments**: preview-first processing already
+> reuses JPEG bytes. Task-scoped RGB reuse and downloading a completed stored
+> preview now have separate, default-off flags. See
+> [the benchmark and adoption limits](vision-image-reuse-benchmark-20261011.md).
+> Results remain batched until processing finishes; early photo visibility is
+> outside the accepted scope.
+
 # Bounded face-index preparation
 
 The ipworker now supports bounded authoritative filename-index reconciliation
 before photo processing. See [ipworker-face-batch-reconciliation.md](ipworker-face-batch-reconciliation.md)
 for the generation safety contract, default batch size 8, rollback size 1,
 queue visibility/shutdown behavior, and batch/page diagnostics.
+
+## Face-Cover Preview Reuse and Download Accounting (Local Only, 2026-10-16)
+
+The worker retains a task-scoped reference to a fully decoded JPEG preview
+within 2048px and 1,500,000 bytes. Result application can use these immutable
+bytes for background face-cover generation when the current physical source
+identity and file hash still match. No image bytes are placed in the public
+processing payload, metadata table or queue. Browser-origin results do not
+opt into this worker-only handoff. Legacy sources without a stable identity,
+unavailable previews, changed source bindings and forced original-only runs
+retain the existing original-based crop path.
+
+The bounded crop thread owns its reference after inference's decoded image
+and context are released. JPEG previews under RAW filenames bypass RAW
+conversion. Existing EXIF-normalized pixels, manual rotation, coordinate
+scaling, crop size/quality, cover-cache checks and admission limits remain.
+Preview-derived covers can have less detail than original-derived covers;
+rotation/color fixtures do not establish universal face-crop quality parity.
+Existing cover entries are not rewritten and on-demand cover fallback remains.
+
+New `media_download` events account completed logical reads from the common
+media helper and metadata-packet transport. They carry bounded purpose
+(`inference`, `exif_fallback`, `result_fallback`, `face_cover`,
+`metadata_packet`, or `unattributed`), source kind, returned payload bytes,
+elapsed milliseconds and success/error. Failed partial transfers have unknown
+wire bytes, not a verified zero-byte network cost. HEAD content lengths,
+SDK range calls/retries, and cache-byte reuse are not counted as another
+completed download. These events are separate from legacy `vision_download`
+input events: do not sum both event families. They are not Azure billing data.
+
+Background crops inherit opaque photo/library and delivery correlation,
+without inheriting foreground timing scopes or retaining decoded PIL images.
+`face_cover_result` records generated/cached/failed counts and actual input
+source; `face_cover_admission` records busy skips. No filenames, blob paths,
+tokens, image bytes or processor error text are included in these events.
+Resource allocation, concurrency, scaling and shared-decoding flags stay
+unchanged. This change is local; cloud throughput and savings need a matched
+post-deployment test.
+
+## Original-Byte Handoff (Local Only, 2026-10-16)
+
+The post-hardening upload audit found eleven RAW/CRW originals fetched once
+during execution and again during result fallback: 286,600,768 duplicate bytes.
+Execution and result application previously owned independent original caches.
+
+An individual worker delivery now retains a reference to its existing immutable
+original buffer through result application. Reuse requires matching library,
+filename, physical identity/hash and positive recorded size, including actual
+buffer length. Result application checks the fresh metadata row, not just the
+earlier lease snapshot. Missing identity/size or changed bindings retain the
+existing download fallback. Browser-origin results cannot consume this handoff.
+No image bytes enter result payloads, queues or metadata tables.
+
+This is not a cross-job cache, extra copy or new prefetch. One original buffer
+is retained per active delivery and cleared on success/exception, including
+copied contexts. An already-admitted background crop getter can own its immutable
+reference after the worker context exits, under the existing crop admission
+limit. Preview-only jobs still fetch no original; forced-original jobs retain
+their source policy while avoiding the redundant result read.
+
+`media_reuse` reports the bounded purpose, source and reused byte count separately
+from actual `media_download` reads; do not count reused bytes as network traffic.
+Local real-handler regressions reproduce two reads before the fix and one after,
+while preserving extraction fallback, lease/CAS behavior and source-change safety.
+Local replay of all eleven affected RAW/CRW corpus sources uses real EXIF/geo
+processors with local-file blob reads and an in-memory metadata table: 22 reads
+and 573,201,536 bytes without the handoff become 11 reads and 286,600,768 bytes
+with it. EXIF/geo results and lease release are unchanged; no cloud calls or
+original uploads occur in the replay. This is not a full visual-inference replay.
+This fixes duplicate I/O only: it does not yet distinguish parser errors from
+confirmed EXIF absence, suppress parser warnings, expand decoding support, or
+change fallback retries/scaling. The historical byte amount is a potential
+reduction for this path, not a deployed measurement or Azure-invoice saving.
+
+## Lease Metadata Snapshot Reuse (Local Only, 2026-10-16)
+
+After a successful processing-lease claim, step execution reuses a copied
+metadata row for read-only input selection, metadata-packet binding and stored
+EXIF/geo decisions. Reuse requires matching PartitionKey/library and
+RowKey/filename; missing, malformed, deleted, isolated or mismatched snapshots
+retain the existing single source-metadata read. Direct step callers without
+a snapshot behave as before. Only the lease return value supplies the snapshot;
+queue/browser payload fields cannot opt into it.
+
+The snapshot is local to this execution, never a cross-job cache and never an
+input to result persistence. Result application still reads the current row
+and rejects deleted photos; conditional status updates, lease ownership/release
+checks and conflict retries are unchanged. Forced-original processing still
+uses original bytes while reusing the lease row for input addressing.
+
+`vision_metadata_read` reports `source=lease_snapshot, reads=0` or
+`source=table, reads=1` when input metadata is first needed. It uses opaque
+file/library/delivery identity, never row contents. For the prior five-GET
+normal path this targets one fewer metadata GET per photo, not fewer writes.
+The call reduction is locally verified; wall-clock and cost savings are not
+measured until a matched deployed run. The local write/renewal changes below
+build on this read reduction; original HEAD elimination remains separate.
+
+## Metadata Commit and Face Lease Writes (Local Only, 2026-10-16)
+
+Worker result application now collects aggregate fields, per-step statuses and
+lease release into one conditional metadata update. In the uncontended normal
+apply path this replaces three metadata reads and three writes with one fresh
+read and one CAS write. Including claim and the earlier input-snapshot change,
+the previously measured five-GET/four-write path targets two GETs/two writes.
+These counts exclude face/embedding tables, index-dirty markers and retries.
+Browser finalization and direct legacy result application are unchanged.
+
+The worker supplies its expected lease owner. Both the initial apply read and
+conflict retries reject another owner, deleted rows and processing isolation.
+Conflicts also reject source-identity changes and newly completed touched steps
+instead of overwriting the first result with stale work.
+Retries read fresh metadata and merge only this attempt's changed fields and
+processing-metadata keys, preserving unrelated concurrent edits. External
+face/embedding/blob work is not replayed by commit retries. Exhausted conflicts
+and storage failures propagate, never acknowledge an unconfirmed result.
+On an apply exception, completed status updates and remaining claimed-step
+failures are checkpointed with the same ownership/CAS checks and lease release;
+if persistence itself fails, queue retry/lease recovery remains necessary.
+
+Face-index mutation fences still read the durable generation, state, expiry
+and genuine ETag before every mutation. They skip renewal PUTs while more than
+90 seconds of the 120-second lease remain; due renewals and final publication
+remain conditional writes. No cached ownership, cross-job lease state or
+generation-protocol change is introduced. For a short two-face new-photo write,
+local tests retain all six fence/publication GETs but reduce lookup writes from
+six to two (acquisition and final publication). Long operations still renew.
+
+`vision_metadata_commit` records outcome, commit write attempts, conflict retry
+reads, status-update count and elapsed milliseconds; its read count excludes
+the existing initial apply read. `face_index_lease_check` records successful
+checks and whether they extended the lease. Both use opaque file/delivery
+identity, not photo contents. Allocations, concurrency and scaling are unchanged;
+actual deployed throughput and Azure cost savings have not been measured.
+
+## Remaining Apply Work (Local Only, 2026-10-16)
+
+The historical 28.69% apply share is not pure persistence: it includes the
+semantic text encoder in `_refresh_semantic_fields`, face reconciliation and
+embedding-table writes. It predates the local metadata/lease reductions above.
+OCR, EXIF-derived location, explicit geo and AI result branches no longer build
+intermediate semantic text/layers that the final refresh immediately replaces.
+A mixed OCR/geo/AI result now builds each once instead of four times; the final
+text, layers and embedding inputs remain identical. This is a local work-count
+reduction, not evidence of a particular wall-clock improvement.
+
+`processing_apply_phase` reports `face_persistence`, `semantic_refresh`,
+`embedding_write`, each attempted `metadata_cas`, and `index_dirty`. Events carry
+opaque file/library/delivery identity, success/error, wall milliseconds, current
+thread CPU milliseconds, and (when a PERF scope exists) SDK call-count/send-time
+deltas. They add no storage reads or worker-state transitions. No metadata,
+OCR text, embeddings, filenames or error strings are emitted.
+
+`semantic_refresh` includes text/layer construction, text-model inference and
+serialization. Current-thread CPU is not whole-process/native-pool CPU; SDK
+send latency is not complete body-transfer time or billing. A successful phase
+means its helper returned, not that every internally best-effort operation was
+confirmed. Phase timings are subsets of outer apply/commit timings; do not sum
+both. Claim/read time, conflict backoff/read time and other validation remain
+in the outer timing's residual. Background cover warming is measured separately.
+Use a retained matched upload to establish the new apply share before choosing
+cross-photo write batching or semantic-model batching; do not weaken generation
+fences or acknowledge unconfirmed writes to make apply appear faster.
 
 # ipworker background-processing architecture (as of 2026-08-28)
 
@@ -287,6 +457,76 @@ worth being aware of, not a reason found so far to revert.
 `build-essential` added to `ipworker.Dockerfile` — `tesserocr` compiles a
 Cython extension against these at `pip install` time, unlike pure-Python
 `pytesseract`.
+
+### Empty-word iteration hardening (2026-10-16, local only)
+
+The later upload study's 113 JPEG OCR failures reproduce locally on the same
+files regenerated through the study-style browser preview path. After successful
+recognition, `MapWordConfidences()` raises `No text returned` on empty layout
+entries. This is not proof of corrupted previews or failed recognition.
+
+`process_ocr` now checks recognition success and uses the result iterator at word
+level, calling `Empty` before reading text/confidence. Empty entries are skipped;
+recognition failures, unavailable iterators and iterator exceptions remain
+`ocr_engine_failed`. Decode failures remain `ocr_decode_failed`. The confidence
+threshold, segmentation mode, language, input resolution and per-thread engine
+reuse are unchanged; no OCR-skipping heuristic or blanket exception suppression.
+
+Local real-engine replay: all 113 study-style preview errors become ordinary
+empty results. Across both study-style and current preview paths, all 226 JPEG
+inputs complete without OCR errors; the 12 previously successful current-path
+results are unchanged (three with text, nine empty). Another 50 positive corpus
+controls retain identical outputs, as does the reviewed numeric-text control at
+1080 and 2048 pixels. Blank/text/blank/text reuse and genuine engine/iterator
+failure regressions pass. This establishes error handling, not corpus accuracy,
+universal text absence, CPU savings or deployment verification. Recognition still
+misses some reviewed text at 2K; these misses are unchanged by this fix.
+
+### Geo Outcome Classification (2026-10-16, Local Only)
+
+An explicit geo processor error is `failed`, not `no_data`. Malformed results,
+partial/invalid coordinates, non-finite values and boolean coordinates also
+fail. `no_data` is reserved for a result explicitly reporting no GPS, with no
+error or coordinates. Existing successful locations remain protected from late
+failed or malformed submissions.
+
+Persist only bounded diagnostics (`geo_processing_failed` or
+`geo_invalid_result`), never arbitrary processor error messages. Successful
+or confirmed-empty retries clear the prior diagnostic. An explicit geo result
+takes precedence over EXIF-derived geo status, including server EXIF fallback,
+so deferred status writes cannot hide a geo failure or cause duplicate lookup.
+EXIF-only submissions retain their existing geo behavior.
+
+Local regressions cover processor failure, persistence, an explicit retry lease,
+and successful recovery using stored EXIF without downloading the original.
+Failed steps remain eligible for explicit reprocessing; this does not add
+automatic retries or change the sweep, geocoder provider, worker scaling or
+original-download fallback policy. Historical rows are not repaired by this fix.
+
+### Deferred GPR Pixel Decoding (Far Future)
+
+Decision, 2026-10-16: defer SDK-enabled GoPro GPR decoding to the far-future
+backlog. It is not a near-term hardening task or a blocker for the current
+upload/EXIF/OCR fixes. No decoder build, dependency integration or deployment
+is scheduled by this decision.
+
+GPR (`.gpr`) is GoPro's RAW photo format. Pixel decoding turns its compressed
+sensor data into RGB pixels needed for thumbnails, previews, OCR, faces and
+vision. Reading headers or extracting EXIF does not establish pixel-decoding
+support; metadata extraction may work while visual preparation fails.
+
+The five GPR failures are separate and remain unresolved: browser LibRaw reports
+`unsupported_raw`; local rawpy/LibRaw reads their headers but cannot unpack the
+sensor data. ExifTool exposes no PreviewImage/JpgFromRaw/ThumbnailImage fallback
+for these five. LibRaw documents that GPR pixel decoding needs an SDK-enabled
+build: [GoPro integration](https://github.com/LibRaw/LibRaw/blob/master/README.GoPro.txt).
+Do not relabel these genuine decode failures as empty OCR, or replace their
+previews with placeholders. A decoder-build change needs its own bounded pixel,
+rotation, color, resource and format-regression validation.
+Retain the original and report unsupported preparation/processing accurately;
+do not reject the original upload solely because pixel decoding is unsupported.
+Known affected corpus files: `sample_003.gpr`, `sample_004.gpr`,
+`sample_012.gpr`, `sample_016.gpr` and `sample_017.gpr`.
 
 ## 7. OCR cost-reduction experiments, all rejected on real data so far
 

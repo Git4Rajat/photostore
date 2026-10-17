@@ -45,6 +45,7 @@ import {
 } from '../utils/blobIo';
 import { parseJpegGpsExif, parseRawGpsExif } from '../utils/exifGpsParser';
 import type { ParsedGpsExif } from '../utils/exifGpsParser';
+import { extractBrowserExif } from '../utils/browserExifTool';
 // Re-exported so AppServicesProvider's `withPhotoGalleryRuntime` lazy-import
 // boundary (`typeof import('./PhotoGallery')`) keeps resolving idbPut/idbGet/
 // idbDelete/dataUrlToBlob/readBlobArrayBuffer/sha256ArrayBuffer -- the actual
@@ -3406,6 +3407,29 @@ export const runBrowserProcessing = async (
             ...sourceFields,
         }));
     } else try {
+        // Authoritative in-browser ExifTool first (the SAME ExifTool version the
+        // backend pins): on success the backend trusts the result and never
+        // fetches the original from storage to re-parse. A null result means the
+        // WASM tool was unavailable/failed/too-slow -> fall through to the legacy
+        // DataView parser (which leaves the server EXIF fallback in charge).
+        // Geo for the authoritative path is derived server-side from this EXIF.
+        const browserAttempt = visionSource.imageSource
+            ? await extractBrowserExif(new Uint8Array(await file.arrayBuffer()), file.name)
+            : null;
+        const browserExif = browserAttempt?.ok ? browserAttempt.result : null;
+        const browserFallback = browserAttempt && !browserAttempt.ok
+            ? { browserExifReason: browserAttempt.reason, browserExifMs: browserAttempt.ms }
+            : {};
+        if (browserExif) {
+            clientProcessing.exif = {
+                ...browserExif,
+                ...(visionSource.isRaw ? { ...sourceFields, sourceKind: 'raw_exif_only' } : sourceFields),
+            };
+            clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'done', 'done', startedAt, {
+                runtime: 'browser-exiftool-wasm',
+                ...(visionSource.isRaw ? { ...sourceFields, sourceKind: 'raw_exif_only' as const } : sourceFields),
+            }));
+        } else {
         const exif = await withTimeout(
             visionSource.isRaw ? parseRawGpsExif(file, CLIENT_RAW_EXIF_SCAN_MAX_BYTES) : parseJpegGpsExif(file, file.name),
             CLIENT_BROWSER_STEP_BUDGET_MS,
@@ -3423,6 +3447,7 @@ export const runBrowserProcessing = async (
             };
             clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'done', 'done', startedAt, {
                 runtime: 'browser-dataview',
+                ...browserFallback,
                 ...(visionSource.isRaw ? { ...sourceFields, sourceKind: 'raw_exif_only' as const } : sourceFields),
             }));
         } else if (exif) {
@@ -3434,13 +3459,16 @@ export const runBrowserProcessing = async (
             };
             clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'done', 'done', startedAt, {
                 runtime: 'browser-dataview',
+                ...browserFallback,
                 ...(visionSource.isRaw ? { ...sourceFields, sourceKind: 'raw_exif_only' as const } : sourceFields),
             }));
         } else {
             clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'unsupported', visionSource.isRaw ? 'raw_container_unsupported' : 'unsupported_runtime', startedAt, {
                 runtime: 'browser-dataview',
+                ...browserFallback,
                 ...(visionSource.isRaw ? { ...sourceFields, sourceKind: 'unsupported' as const } : sourceFields),
             }));
+        }
         }
     } catch {
         clientProcessingReport.push(makeClientReport(clientAssetId, 'exif', 'failed', visionSource.isRaw ? 'raw_container_unsupported' : 'unknown_error', startedAt, {

@@ -397,6 +397,29 @@ def test_tools_build_enqueues_light_for_upload_dirty_indexes(monkeypatch, route_
     assert payload['ready'] is True and payload['building'] is True and payload['queued'] == 'queued'
 
 
+def test_upload_complete_queues_coalesced_build_without_waiting(monkeypatch, route_ctx):
+    monkeypatch.setattr(app, 'get_user_index_build_state', lambda uid: _build_state(
+        {'sort': True, 'lexical': True, 'albums': True, 'people': True}, needs_rebuild=True))
+    monkeypatch.setattr(app, 'index_build_needed', lambda uid: False)
+    monkeypatch.setattr(app, 'light_index_build_needed', lambda uid: True)
+    queued = []
+
+    def enqueue(uid, reason='', scope='full', *, coalesce=True):
+        queued.append((uid, reason, scope, coalesce))
+        return 'queued'
+
+    monkeypatch.setattr(app, 'enqueue_index_build', enqueue)
+    monkeypatch.setattr('routes.tools._wait_for_index_build', lambda *args: pytest.fail('Upload must not wait for indexing'))
+    with app.app.test_request_context('/api/tools/indexes/build', method='POST', json={
+        'scope': 'light', 'reason': 'upload-complete', 'wait': False,
+    }):
+        payload = tools_build_indexes().get_json()
+
+    assert queued == [('owner', 'upload-complete', 'light', True)]
+    assert payload['queued'] == 'queued' and payload['building'] is True
+    assert payload['wait'] is None
+
+
 def test_tools_build_enqueues_when_built_but_dirty_without_blocking_the_gate(monkeypatch, route_ctx):
     # All built (ready=True) but one dirty -> still queue a rebuild; ready stays
     # True so the frontend gate is not held.

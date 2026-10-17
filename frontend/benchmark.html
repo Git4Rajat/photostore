@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Upload Benchmark | Keepsake</title>
+    <script src="/env.js"></script>
+  </head>
+  <body>
+    <header><a href="/">Keepsake</a><span id="account"></span></header>
+    <main>
+      <h1>Upload Benchmark</h1>
+      <dl class="facts"><div><dt>Preview</dt><dd>2048 px / 1.5 MB</dd></div><div><dt>Thumbnail</dt><dd>120 px</dd></div><div><dt>RAW source</dt><dd>Sensor only</dd></div><div><dt>Processing</dt><dd id="isolation">Checking</dd></div></dl>
+      <section class="controls">
+        <label>RAW corpus <input id="photos" type="file" multiple /></label>
+        <output id="inventory">No files selected</output>
+        <div class="actions"><button id="pilot" disabled>Run pilot</button><button id="full" disabled>Run 1,808-file comparison</button><button id="stop" disabled>Stop after current files</button><button id="download" disabled>Download results</button></div>
+      </section>
+      <p role="status" id="status">Checking authenticated deployment</p>
+      <progress id="progress" max="1" value="0"></progress>
+      <div class="table-wrap"><table><thead><tr><th>Arm</th><th>Finalized</th><th>Rejected / Failed</th><th>Sensor Decoded</th><th>Verified</th><th>Wall Time</th></tr></thead><tbody id="summary"></tbody></table></div>
+      <section id="samples" class="samples"></section>
+      <h2>Recent Results</h2><pre id="events"></pre>
+    </main>
+    <script type="module" src="/src/benchmark/main.js"></script>
+  </body>
+</html>

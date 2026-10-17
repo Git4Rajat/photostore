@@ -3,6 +3,8 @@ set -e
 
 ROLE="${APP_ROLE:-core}"
 
+echo "EXIF runtime version=$(exiftool -ver)"
+
 if [ "${ROLE}" = "cluster" ]; then
     echo "Starting clustering worker..."
     exec python -u -c "import app; app.run_clustering_worker()"

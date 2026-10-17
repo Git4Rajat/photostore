@@ -27,6 +27,7 @@ import numpy as np
 
 import vision_utils
 from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
+from ipwork_image import rgb_image, sharing_enabled
 from search_utils import PERSON_SCORE_THRESHOLD, is_sensitive_auto_tag_label
 
 # Same vocabulary file the browser fetches at runtime (manifest.tagVocabularyUrl,
@@ -88,6 +89,8 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
     no generic PIL codec, so vision_utils.encode_image_embedding's Image.open()
     raises on the raw bytes unless it's handed the same embedded/rawpy preview
     ipwork_thumbnail.py already extracts."""
+    if image_bytes.startswith(b'\xff\xd8'):
+        return image_bytes  # already a JPEG preview, even under a RAW filename
     ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
     if ext in RAW_EXTENSIONS_RAWPY or ext in RAW_EXTENSIONS_CINEMA:
         preview = extract_raw_preview_bytes(image_bytes, filename)
@@ -102,7 +105,14 @@ def process_vision(user_id: str, filename: str, image_bytes: bytes) -> Optional[
     if not _load_vocabulary():
         return {'hasData': False, 'error': 'vocabulary_unavailable'}
 
-    image_embedding = vision_utils.encode_image_embedding(_decodable_image_bytes(image_bytes, filename))
+    if sharing_enabled():
+        try:
+            with rgb_image(image_bytes, filename, _decodable_image_bytes) as image:
+                image_embedding = vision_utils.encode_rgb_image_embedding(image)
+        except Exception:
+            return {'hasData': False, 'error': 'image_embedding_failed'}
+    else:
+        image_embedding = vision_utils.encode_image_embedding(_decodable_image_bytes(image_bytes, filename))
     if not image_embedding:
         return {'hasData': False, 'error': 'image_embedding_failed'}
 

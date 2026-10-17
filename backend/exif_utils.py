@@ -1,12 +1,16 @@
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import warnings
 from ast import literal_eval
+from contextlib import contextmanager
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 from PIL import ExifTags, Image
 
@@ -18,6 +22,22 @@ except Exception:
 MAX_EXIF_VALUE_LENGTH = 512
 MAX_EXIF_STORAGE_LENGTH = 60000
 EXIFTOOL_TIMEOUT_SECONDS = int(os.getenv('EXIFTOOL_TIMEOUT_SECONDS', '20'))
+_PILLOW_METADATA_LOCK = threading.RLock()
+
+
+class ExifExtractionError(RuntimeError):
+    """Extraction failed; category and message never include parser output."""
+
+    CATEGORIES = frozenset({
+        'unavailable', 'timeout', 'parser_error', 'invalid_output',
+        'execution_failed', 'read_failed', 'unsupported', 'storage_limit',
+    })
+
+    def __init__(self, category: str):
+        if not isinstance(category, str) or category not in self.CATEGORIES:
+            raise ValueError('Unknown EXIF extraction category')
+        self.category = category
+        super().__init__(f'EXIF extraction failed: {self.category}')
 
 
 def _stringify_exif_value(value) -> str:
@@ -77,6 +97,9 @@ def _gps_dms_to_decimal(values, ref: str) -> Optional[float]:
         seconds = _rational_to_float(values[2])
         if degrees is None or minutes is None or seconds is None:
             return None
+        if (not all(math.isfinite(value) for value in (degrees, minutes, seconds))
+                or degrees < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60):
+            return None
         decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
         if ref in ('S', 'W'):
             decimal *= -1.0
@@ -88,16 +111,19 @@ def _gps_dms_to_decimal(values, ref: str) -> Optional[float]:
 def extract_gps_decimal_from_exif(exif_data: Dict[str, str]) -> Tuple[str, str]:
     lat = exif_data.get('GPS.LatitudeDecimal', '')
     lon = exif_data.get('GPS.LongitudeDecimal', '')
-    if lat and lon:
-        return lat, lon
+    if lat is not None and lon is not None and str(lat).strip() and str(lon).strip():
+        return str(lat), str(lon)
 
-    lat_raw = exif_data.get('GPS.GPSLatitude', '') or exif_data.get('GPSLatitude', '') or exif_data.get('GPS.Latitude', '')
-    lon_raw = exif_data.get('GPS.GPSLongitude', '') or exif_data.get('GPSLongitude', '') or exif_data.get('GPS.Longitude', '')
+    def present(*keys):
+        return next((exif_data[key] for key in keys if key in exif_data
+                     and exif_data[key] is not None and str(exif_data[key]).strip()), '')
+    lat_raw = present('GPS.GPSLatitude', 'GPSLatitude', 'GPS.Latitude')
+    lon_raw = present('GPS.GPSLongitude', 'GPSLongitude', 'GPS.Longitude')
     lat_ref = (exif_data.get('GPS.GPSLatitudeRef', '') or exif_data.get('GPSLatitudeRef', '') or 'N').upper()[:1] or 'N'
     lon_ref = (exif_data.get('GPS.GPSLongitudeRef', '') or exif_data.get('GPSLongitudeRef', '') or 'E').upper()[:1] or 'E'
 
-    lat_decimal = _parse_decimal_or_dms(lat_raw, lat_ref, -90.0, 90.0) if lat_raw else None
-    lon_decimal = _parse_decimal_or_dms(lon_raw, lon_ref, -180.0, 180.0) if lon_raw else None
+    lat_decimal = _parse_decimal_or_dms(lat_raw, lat_ref, -90.0, 90.0) if str(lat_raw).strip() else None
+    lon_decimal = _parse_decimal_or_dms(lon_raw, lon_ref, -180.0, 180.0) if str(lon_raw).strip() else None
     if lat_decimal is None or lon_decimal is None:
         return '', ''
 
@@ -147,31 +173,29 @@ def _normalize_exiftool_key(key: str) -> str:
     return cleaned
 
 
-def _extract_exiftool_from_path(path: str) -> Dict[str, str]:
-    exiftool = shutil.which('exiftool')
-    if not exiftool:
-        return {}
-    try:
-        result = subprocess.run(
-            [exiftool, '-j', '-G1', '-n', path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=EXIFTOOL_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except Exception:
-        return {}
-    if result.returncode != 0 or not result.stdout:
-        return {}
-    try:
-        parsed = json.loads(result.stdout.decode('utf-8', errors='replace'))
-    except Exception:
-        return {}
-    if not isinstance(parsed, list) or not parsed or not isinstance(parsed[0], dict):
-        return {}
+def _exif_failure_category(exif_data: Dict) -> str:
+    parser_error = False
+    for raw_key, value in exif_data.items():
+        key = _normalize_exiftool_key(raw_key)
+        if key == 'Error':
+            if value in ('Unknown file type', 'Unsupported RAW file type', 'Unsupported file type'):
+                return 'unsupported'
+            parser_error = True
+        elif key == 'Warning' and value == 'Unsupported file type':
+            return 'unsupported'
+    return 'parser_error' if parser_error else ''
 
+
+def _exiftool_fields(obj: Dict) -> Dict[str, str]:
+    """Normalize an `exiftool -j -G1 -n` JSON object into stored EXIF fields.
+
+    No failure/empty raises -- callers decide how to treat an empty result. This
+    is the single normalization shared by the server's own extraction and by
+    browser-supplied ExifTool JSON, so a browser ExifTool (same version) yields
+    byte-identical stored fields.
+    """
     exif: Dict[str, str] = {}
-    for raw_key, raw_value in parsed[0].items():
+    for raw_key, raw_value in obj.items():
         key = _normalize_exiftool_key(str(raw_key))
         if not key or key in {'SourceFile', 'FileName', 'Directory'}:
             continue
@@ -180,7 +204,6 @@ def _extract_exiftool_from_path(path: str) -> Dict[str, str]:
             exif[key] = value
         elif key not in exif:
             exif[key] = value
-
     lat = exif.get('GPSLatitude') or exif.get('GPS.GPSLatitude') or exif.get('GPS.Latitude')
     lon = exif.get('GPSLongitude') or exif.get('GPS.GPSLongitude') or exif.get('GPS.Longitude')
     lat_ref = (exif.get('GPSLatitudeRef') or exif.get('GPS.GPSLatitudeRef') or 'N').upper()[:1] or 'N'
@@ -190,8 +213,135 @@ def _extract_exiftool_from_path(path: str) -> Dict[str, str]:
     if lat_decimal and lon_decimal:
         exif['GPS.LatitudeDecimal'] = lat_decimal
         exif['GPS.LongitudeDecimal'] = lon_decimal
+    return exif
 
+
+def _normalize_exiftool_parsed(obj: Dict, *, returncode: int = 0) -> Dict[str, str]:
+    """Shared normalization: failure-category + fields + non-empty check + trim."""
+    failure_category = _exif_failure_category(obj)
+    if failure_category:
+        raise ExifExtractionError(failure_category)
+    if returncode != 0:
+        raise ExifExtractionError('parser_error')
+    exif = _exiftool_fields(obj)
+    if not exif:
+        raise ExifExtractionError('invalid_output')
     return _trim_exif_for_storage(exif)
+
+
+def classify_browser_exiftool(obj) -> str:
+    """Failure category ('unsupported' | 'parser_error' | '') for a browser-
+    supplied `exiftool -j -G1 -n` JSON object. Identical to the server's own
+    verdict because it is the same ExifTool output. '' means usable (the file
+    may still legitimately carry no EXIF -- see browser_exiftool_fields)."""
+    if not isinstance(obj, dict):
+        return 'invalid_output'
+    return _exif_failure_category(obj)
+
+
+def browser_exiftool_fields(obj) -> Dict[str, str]:
+    """Stored EXIF fields from a browser-supplied ExifTool JSON object, empty if
+    the file genuinely carries no EXIF. Caller must call classify_browser_exiftool
+    first and handle 'unsupported'/'parser_error' before using this."""
+    if not isinstance(obj, dict):
+        return {}
+    return _trim_exif_for_storage(_exiftool_fields(obj))
+
+
+def _extract_exiftool_from_path(path: str, *, scan_jpeg: bool = False) -> Dict[str, str]:
+    exiftool = shutil.which('exiftool')
+    if not exiftool:
+        raise ExifExtractionError('unavailable')
+    try:
+        # ExtractEmbedded keeps JPEG parsing past SOS in ExifTool 13.55.
+        # Packet extraction leaves this off to preserve its qualified behavior.
+        result = subprocess.run(
+            [exiftool, '-j', '-G1', '-n', *(['-ee'] if scan_jpeg else []), path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=EXIFTOOL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise ExifExtractionError('timeout') from None
+    except FileNotFoundError:
+        raise ExifExtractionError('unavailable') from None
+    except OSError:
+        raise ExifExtractionError('execution_failed') from None
+    if not result.stdout:
+        raise ExifExtractionError('parser_error' if result.returncode else 'invalid_output')
+    try:
+        parsed = json.loads(result.stdout.decode('utf-8', errors='replace'))
+    except (UnicodeError, json.JSONDecodeError):
+        raise ExifExtractionError('parser_error' if result.returncode else 'invalid_output') from None
+    if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+        raise ExifExtractionError('parser_error' if result.returncode else 'invalid_output')
+    return _normalize_exiftool_parsed(parsed[0], returncode=result.returncode)
+
+
+def _exiftool_has_only_warning(path: str, expected: str) -> bool:
+    """Check every diagnostic before exempting a known, benign warning.
+
+    Ordinary JSON output hides duplicate Warning tags. Family 4 makes them
+    unique without changing the existing metadata extraction/normalization.
+    """
+    exiftool = shutil.which('exiftool')
+    if not exiftool:
+        return False
+    try:
+        result = subprocess.run(
+            [exiftool, '-j', '-G4', '-Warning', '-Error', path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=EXIFTOOL_TIMEOUT_SECONDS, check=False,
+        )
+        if result.returncode != 0 or result.stderr:
+            return False
+        parsed = json.loads(result.stdout.decode('utf-8'))
+        if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+            return False
+        warnings = []
+        for key, value in parsed[0].items():
+            if key == 'SourceFile':
+                continue
+            if key.rsplit(':', 1)[-1] != 'Warning':
+                return False
+            warnings.append(value)
+        return bool(warnings) and all(value == expected for value in warnings)
+    except Exception:
+        return False
+
+
+def _exiftool_has_only_warnings(path: str, expected: Iterable[str]) -> bool:
+    """Match an exact, nonempty warning multiset, including duplicate counts."""
+    exiftool = shutil.which('exiftool')
+    if not exiftool:
+        return False
+    try:
+        if isinstance(expected, (str, bytes)):
+            return False
+        expected_values = list(expected)
+        if not expected_values or not all(isinstance(value, str) for value in expected_values):
+            return False
+        result = subprocess.run(
+            [exiftool, '-j', '-G4', '-Warning', '-Error', path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=EXIFTOOL_TIMEOUT_SECONDS, check=False,
+        )
+        if result.returncode != 0 or result.stderr:
+            return False
+        parsed = json.loads(result.stdout.decode('utf-8'))
+        if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+            return False
+        warnings = []
+        for key, value in parsed[0].items():
+            if key == 'SourceFile':
+                continue
+            if key.rsplit(':', 1)[-1] != 'Warning' or not isinstance(value, str):
+                return False
+            warnings.append(value)
+        return sorted(warnings) == sorted(expected_values)
+    except Exception:
+        return False
 
 
 def _valid_decimal_from_exiftool(value, ref: str, minimum: float, maximum: float) -> str:
@@ -201,7 +351,7 @@ def _valid_decimal_from_exiftool(value, ref: str, minimum: float, maximum: float
         return ''
     if ref in {'S', 'W'} and parsed > 0:
         parsed *= -1
-    if parsed < minimum or parsed > maximum:
+    if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
         return ''
     return str(round(parsed, 7))
 
@@ -220,36 +370,116 @@ def _safe_temp_suffix(filename: str, default_ext: str) -> str:
     return f'.{ext}'
 
 
+@contextmanager
+def _pillow_metadata_read():
+    # Python 3.12 warning hooks are global. Serialize our captures and attribute
+    # warnings only to the parser thread, forwarding every warning as usual.
+    with _PILLOW_METADATA_LOCK:
+        parser_thread = threading.get_ident()
+        metadata_warning = False
+        with warnings.catch_warnings():
+            warnings.simplefilter('always', UserWarning)
+            previous_showwarning = warnings.showwarning
+
+            def showwarning(message, category, filename, lineno, file=None, line=None):
+                nonlocal metadata_warning
+                if threading.get_ident() == parser_thread and issubclass(category, UserWarning):
+                    metadata_warning = True
+                previous_showwarning(message, category, filename, lineno, file=file, line=line)
+
+            warnings.showwarning = showwarning
+            try:
+                yield
+            except Exception:
+                raise ExifExtractionError('read_failed') from None
+            if metadata_warning:
+                raise ExifExtractionError('read_failed')
+
+
 def extract_exif_from_path(path: str) -> Dict[str, str]:
-    exif = _extract_exiftool_from_path(path)
+    """Pillow can recover metadata from a missing tool, but cannot prove absence."""
+    tool_error = None
+    try:
+        with open(path, 'rb') as source:
+            is_jpeg = source.read(2) == b'\xff\xd8'
+    except OSError:
+        is_jpeg = False
+    try:
+        exif = (_extract_exiftool_from_path(path, scan_jpeg=True) if is_jpeg
+                else _extract_exiftool_from_path(path))
+    except ExifExtractionError as exc:
+        if exc.category != 'unavailable':
+            raise
+        tool_error = exc
+        exif = None
     if exif:
         return exif
     try:
-        with Image.open(path) as image:
-            return extract_exif_from_image(image)
-    except Exception:
-        return {}
+        with _pillow_metadata_read(), Image.open(path) as image:
+            pillow_exif = _extract_exif_from_image(image)
+    except ExifExtractionError:
+        if tool_error is not None:
+            raise tool_error from None
+        raise ExifExtractionError('read_failed') from None
+    if pillow_exif:
+        return pillow_exif
+    raise tool_error or ExifExtractionError('read_failed')
 
 
 def extract_exif_from_bytes(image_bytes: bytes, filename: str = '') -> Dict[str, str]:
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            return extract_exif_from_image(image)
-    except Exception:
-        pass
+    """JPEG/PNG require complete container extraction, not early Pillow tags.
+
+    This costs a temporary copy and subprocess for metadata-free originals. JPEG
+    uses -ee to scan APP1 after SOS; neither Pillow nor ExifTool defaults prove
+    absence from early JPEG headers. Packet extraction keeps its default command.
+    """
     if not image_bytes:
-        return {}
+        raise ExifExtractionError('read_failed')
+    is_png = image_bytes.startswith(b'\x89PNG\r\n\x1a\n')
+    is_jpeg = image_bytes.startswith(b'\xff\xd8')
+    # PNG getexif() can decode IDAT to discover trailing EXIF. ExifTool walks
+    # the complete container without decoding pixels or holding the Pillow lock.
+    if not is_png and not is_jpeg:
+        try:
+            with _pillow_metadata_read(), Image.open(io.BytesIO(image_bytes)) as image:
+                pillow_exif = _extract_exif_from_image(image)
+            if pillow_exif:
+                return pillow_exif
+        except ExifExtractionError:
+            pass
     suffix = _safe_temp_suffix(filename, 'raw')
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
             temp_file.write(image_bytes)
             temp_file.flush()
-            return extract_exif_from_path(temp_file.name)
-    except Exception:
-        return {}
+            if image_bytes.startswith(b'\xff\xd8'):
+                return _extract_exiftool_from_path(temp_file.name, scan_jpeg=True)
+            return _extract_exiftool_from_path(temp_file.name)
+    except ExifExtractionError:
+        raise
+    except OSError:
+        raise ExifExtractionError('read_failed') from None
 
 
 def extract_exif_from_image(image: Image.Image) -> Dict[str, str]:
+    with _pillow_metadata_read():
+        return _extract_exif_from_image(image)
+
+
+def _read_referenced_exif_ifd(raw_exif, tag_id):
+    if tag_id not in raw_exif:
+        return {}
+    ifd = raw_exif.get_ifd(tag_id)
+    if not ifd:
+        raise ExifExtractionError('read_failed')
+    return ifd
+
+
+def _extract_exif_from_image(image: Image.Image) -> Dict[str, str]:
+    if image.format == 'PNG':
+        # A partially read PNG cannot establish metadata absence; callers need
+        # the original bytes/path so ExifTool can also inspect chunks after IDAT.
+        raise ExifExtractionError('read_failed')
     exif: Dict[str, str] = {}
     raw_exif = image.getexif()
     if not raw_exif:
@@ -301,10 +531,7 @@ def extract_exif_from_image(image: Image.Image) -> Dict[str, str]:
     # automatically. Without this, DateTimeOriginal was silently absent for
     # every photo, so capture-date sort fell back to upload date even when
     # the file had a real EXIF-original date.
-    try:
-        exif_sub_ifd = raw_exif.get_ifd(0x8769)
-    except Exception:
-        exif_sub_ifd = None
+    exif_sub_ifd = _read_referenced_exif_ifd(raw_exif, 0x8769)
     if exif_sub_ifd:
         for tag_id, value in exif_sub_ifd.items():
             tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
@@ -312,10 +539,7 @@ def extract_exif_from_image(image: Image.Image) -> Dict[str, str]:
                 exif[tag_name] = _stringify_exif_value(value)
 
     if gps_lat is None or gps_lon is None:
-        try:
-            gps_ifd = raw_exif.get_ifd(0x8825)
-        except Exception:
-            gps_ifd = None
+        gps_ifd = _read_referenced_exif_ifd(raw_exif, 0x8825)
 
         if gps_ifd:
             for gps_tag, gps_value in gps_ifd.items():

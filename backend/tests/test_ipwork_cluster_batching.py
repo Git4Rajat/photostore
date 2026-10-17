@@ -139,6 +139,38 @@ def test_hard_fallback_flushes_even_when_reported_active(enqueued, monkeypatch):
     assert enqueued == [('lib-A', ['a.jpg'])]
 
 
+def test_max_wait_flushes_during_continuous_upload_or_video_activity(enqueued, monkeypatch):
+    monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS', 60)
+    monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS', 1800)
+    monkeypatch.setattr(app, '_is_upload_active', lambda user_id: True)
+    now = [1000.0]
+    monkeypatch.setattr(app.time, 'monotonic', lambda: now[0])
+    app._buffer_incremental_assign_filename('lib-A', 'a.jpg')
+    now[0] += 59
+    app._flush_stale_incremental_assign_buffers()
+    assert enqueued == []
+    app._buffer_incremental_assign_filename('lib-A', 'b.jpg')
+    now[0] += 1
+    app._flush_stale_incremental_assign_buffers()
+    assert enqueued == [('lib-A', ['a.jpg', 'b.jpg'])]
+
+
+def test_stale_snapshot_cannot_flush_replacement_buffer(enqueued, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(app.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_MAX_FILENAMES', 2)
+    def replaced_during_activity_read(user_id):
+        app._buffer_incremental_assign_filename(user_id, 'b.jpg')
+        now[0] += 1
+        app._buffer_incremental_assign_filename(user_id, 'new.jpg')
+        return False
+    monkeypatch.setattr(app, '_is_upload_active', replaced_during_activity_read)
+    app._buffer_incremental_assign_filename('lib-A', 'a.jpg')
+    app._flush_stale_incremental_assign_buffers()
+    assert enqueued == [('lib-A', ['a.jpg', 'b.jpg'])]
+    assert app._cluster_batch_buffers['lib-A'] == ['new.jpg']
+
+
 def test_flush_loop_stops_on_shutdown_event(enqueued, monkeypatch):
     monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_POLL_SECONDS', 0.03)
     monkeypatch.setattr(app, '_is_upload_active', lambda user_id: True)

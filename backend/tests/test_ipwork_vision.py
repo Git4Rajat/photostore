@@ -64,3 +64,12 @@ def test_process_vision_passes_decoded_bytes_to_encoder(monkeypatch):
 
     assert received['bytes'] == b'decoded-preview'
     assert result['hasData'] is True
+
+
+def test_shared_decode_failure_preserves_processor_failure_shape(monkeypatch):
+    from ipwork_image import image_job
+    monkeypatch.setattr(ipwork_vision.vision_utils, 'image_encoder_available', lambda: True)
+    monkeypatch.setattr(ipwork_vision, '_load_vocabulary', lambda: True)
+    with image_job(True):
+        result = ipwork_vision.process_vision('lib-A', 'broken.jpg', b'not-an-image')
+    assert result == {'hasData': False, 'error': 'image_embedding_failed'}

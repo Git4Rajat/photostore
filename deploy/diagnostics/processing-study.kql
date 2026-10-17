@@ -1,0 +1,50 @@
+// Run each section separately. Replace ago(6h) with the bounded upload-to-drain
+// range for a study; allow for ingestion lag before interpreting missing rows.
+let T = ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(6h) and ContainerAppName_s startswith 'forenklaprep-'
+| where Log_s contains 'processing telemetry '
+| extend m=parse_json(extract(@'processing telemetry (.*)', 1, Log_s))
+| extend at=todatetime(m.at), event=tostring(m.event), file=tostring(m.file_id), batch=tostring(m.batch_id);
+T | summarize Records=count(), First=min(at), Last=max(at) by ContainerAppName_s, event
+| order by ContainerAppName_s asc, event asc
+
+// Exact successful vision files: productive result joined to an ACK from the
+// same queue message/delivery/process. Excludes duplicate/noop/error ACKs.
+let T = ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(6h) and ContainerAppName_s startswith 'forenklaprep-'
+| where Log_s contains 'processing telemetry '
+| extend m=parse_json(extract(@'processing telemetry (.*)', 1, Log_s))
+| extend at=todatetime(m.at), event=tostring(m.event), file=tostring(m.file_id),
+    batch=tostring(m.batch_id), message=tostring(m.message_id), attempt=toint(m.attempt), process=tostring(m.process_instance);
+let Results = T | where event == 'vision_result' and tobool(m.productive)
+| project file, batch, message, attempt, process, resultAt=at, ms=todouble(m.total_ms);
+let Acks = T | where event == 'vision_acknowledged' and tostring(m.outcome) == 'done'
+| summarize ackAt=min(at) by file, message, attempt, process;
+Results | join kind=inner Acks on file, message, attempt, process
+| summarize firstSuccess=min(ackAt), ms=min(ms) by batch, file
+| summarize SuccessfulPhotos=count(), First=min(firstSuccess), Last=max(firstSuccess), percentile(ms, 50), percentile(ms, 95) by batch
+
+// Stage latency samples and actual downloaded payload bytes. Filter/join file
+// IDs from upload_finalized for a chosen batch when other libraries are active.
+let T = ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(6h) and ContainerAppName_s == 'forenklaprep-vision'
+| where Log_s contains 'processing telemetry '
+| extend m=parse_json(extract(@'processing telemetry (.*)', 1, Log_s));
+union
+(T | where tostring(m.event) == 'vision_step'
+ | summarize Samples=count(), Errors=countif(tobool(m.error)), P50=percentile(todouble(m.milliseconds), 50), P95=percentile(todouble(m.milliseconds), 95) by Kind=tostring(m.step)),
+(T | where tostring(m.event) == 'vision_download'
+ | summarize PayloadBytes=sum(tolong(m.bytes)), Downloads=count() by Kind=tostring(m.source))
+
+// Exclusive resident seconds: take the latest cumulative record per process,
+// not the sum of successive cumulative snapshots. Include old revisions until
+// their tails finish. Hard kills and clipped time ranges leave coverage gaps.
+let T = ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(6h) and ContainerAppName_s startswith 'forenklaprep-'
+| where Log_s contains 'processing telemetry '
+| extend m=parse_json(extract(@'processing telemetry (.*)', 1, Log_s))
+| where tostring(m.event) == 'worker_state';
+T | summarize arg_max(todatetime(m.at), *) by App=ContainerAppName_s, Process=tostring(m.process_instance)
+| project App, Process, Elapsed=todouble(m.elapsed_seconds), Startup=todouble(m.startup_seconds),
+    Idle=todouble(m.idle_seconds), Accumulating=todouble(m.accumulating_seconds),
+    Processing=todouble(m.processing_seconds), Checkpoint=todouble(m.checkpoint_seconds), PeakRSS=tolong(m.peak_rss_bytes)

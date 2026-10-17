@@ -169,8 +169,19 @@ def encode_image_embedding(image_bytes: bytes) -> List[float]:
             # carry an EXIF orientation tag rather than physically rotated
             # pixels, and CLIP's tagging/embedding is not orientation-invariant
             # (a sideways portrait can genuinely confuse "portrait"/person tags).
-            image = ImageOps.exif_transpose(image)
-            pixel_values = _PREPROCESS(image.convert('RGB')).unsqueeze(0).to(_device())
+            with ImageOps.exif_transpose(image) as oriented:
+                with oriented.convert('RGB') as rgb:
+                    return encode_rgb_image_embedding(rgb)
+    except Exception:
+        return []
+
+
+def encode_rgb_image_embedding(image) -> List[float]:
+    """Encode already-oriented RGB pixels without decoding JPEG again."""
+    if not _load_model():
+        return []
+    try:
+        pixel_values = _PREPROCESS(image).unsqueeze(0).to(_device())
         with torch.no_grad():
             with _MODEL_LOCK:
                 image_features = _MODEL.encode_image(pixel_values)

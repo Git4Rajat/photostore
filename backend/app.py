@@ -12,6 +12,7 @@ import signal
 import tempfile
 import zipfile
 import time
+_APP_IMPORT_STARTED_AT = time.monotonic()
 import logging
 import threading
 try:
@@ -22,6 +23,7 @@ import unicodedata
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
@@ -41,6 +43,7 @@ from auth_utils import validate_bearer_token as validate_entra_bearer_token
 import password_auth
 import email_utils
 import library_utils
+import processing_diagnostics
 from ipworker_metrics import Metrics as IpworkerMetrics, replica_identity, resource_sample
 from ordering_utils import (
     order_photo_entries,
@@ -2342,6 +2345,60 @@ def _active_processing_worker(metadata: Dict) -> Optional[str]:
     return 'ipworker'
 
 
+def _processing_step_reasons(metadata: Dict) -> Dict[str, str]:
+    """Compact, human-diagnosable reason per non-'done' step, read from the
+    row's own processing_metadata breadcrumbs.
+
+    Makes a 'failed'/'no_data' tile explain itself (e.g. face
+    'quality_filter_rejected', exif 'exif_processing_failed', ocr
+    'ocr_decode_failed') on the processing-status poller / Tools page, instead
+    of a status string that needs a server-side forensic dig to interpret. Only
+    non-'done' steps with an available reason are included, so the common
+    all-done response stays empty. Deeper per-candidate detail
+    (faceDiagnostics.reasonCounts) still lives in processing_metadata for the
+    rare case that needs it. Never raises; absent/malformed metadata -> {}.
+    """
+    try:
+        processing = json.loads(metadata.get('processing_metadata') or '{}')
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(processing, dict):
+        return {}
+
+    def _first(*values) -> str:
+        for value in values:
+            text = str(value or '').strip()
+            if text:
+                return text[:120]
+        return ''
+
+    def _section(key, *fields) -> str:
+        section = processing.get(key)
+        if not isinstance(section, dict):
+            return ''
+        return _first(*(section.get(field) for field in fields))
+
+    reasons: Dict[str, str] = {}
+
+    def _put(step: str, status_field: str, reason: str) -> None:
+        status = str(metadata.get(status_field) or '').strip().lower()
+        if reason and status not in ('', 'done'):
+            reasons[step] = reason
+
+    face = processing.get('client_face') if isinstance(processing.get('client_face'), dict) else {}
+    _put('face', 'face_status', _first(
+        face.get('faceFailureStage'), face.get('filteredReason'),
+        face.get('noDetectionReason'), face.get('deferredReason')))
+    _put('exif', 'exif_status', _first(_section('client_exif', 'errorCode'), _section('server_exif', 'errorCode')))
+    _put('ocr', 'ocr_status', _section('client_ocr', 'errorCode'))
+    _put('aiVision', 'ai_vision_status', _section('client_ai_vision_rejected', 'reason'))
+    _put('mapDetection', 'map_detection_status',
+         _first(_section('client_map_detection', 'errorCode'), _section('server_geo', 'errorCode')))
+    _put('thumbnail', 'thumbnail_status', _section('client_thumbnail_rejected', 'reason'))
+    _put('preview', 'preview_status', _section('client_preview_rejected', 'reason'))
+    return reasons
+
+
 def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_props: bool = True,
                          head_missing: bool = True, pid_to_name: Optional[Dict[str, str]] = None) -> Dict:
     # Prefer the size/last-modified persisted on the metadata row (stamped at
@@ -3124,16 +3181,32 @@ def _humanize_job(row: Dict) -> Dict:
         elif status == 'failed':
             title = 'Preview generation failed'
     elif job_type == INDEX_BUILD_JOB_TYPE:
-        # The library-index build the tools role runs on a cold account (or an
-        # ipworker-triggered rebuild). The frontend's own "Building your
-        # library index" gate is the primary UX for this -- the bell entry is
-        # just a secondary record, so keep it quiet and non-toasting.
         kind = 'index_build'
+        scope = str(row.get('indexScope') or result.get('scope') or '')
+        if scope not in {'full', 'light', 'people', 'dedup', 'dedup-idle'}:
+            # Older workers did not retain scope in result. Match the complete
+            # deterministic ID, not a suffix that could be part of a user ID.
+            base = _index_build_job_id(str(row.get('userId') or row.get('PartitionKey') or ''))
+            scope = next((name for name in ('light', 'people', 'dedup', 'dedup-idle')
+                          if row.get('jobId') == f'{base}-{name}'), 'full')
+        label, description = {
+            'full': ('Full library indexes', 'Photo browsing, search, albums and people indexes finished updating. '
+                     'Duplicate-check updates are reported separately.'),
+            'light': ('Photo browsing index', 'Photo ordering and library access refreshed. '
+                      'Search, people and album updates can finish separately.'),
+            'people': ('People and albums indexes', 'People and album listings refreshed. '
+                       'Photo analysis and face grouping can still be running.'),
+            'dedup': ('Duplicate-check index', 'Saved file hashes for checking future uploads for duplicates refreshed. '
+                      'This is separate from photo processing and search.'),
+            'dedup-idle': ('Duplicate-check index', 'The duplicate-check snapshot is current for the last observed uploads. '
+                           'This is separate from photo processing and search.'),
+        }[scope]
+        title = f'{label} updating'
         if status == 'done':
-            title = 'Library index ready'
-            message = 'Your library index finished building.'
+            title = f'{label} updated'
+            message = description
         elif status == 'failed':
-            title = 'Library index build failed'
+            title = f'{label} update failed'
     elif job_type == 'photo_soft_delete':
         kind = 'bulk_mutation'
         count = int(result.get('deleted') or row.get('totalItems') or 0)
@@ -3215,6 +3288,7 @@ def _humanize_job(row: Dict) -> Dict:
         'updatedAt': str(row.get('updatedAt') or ''),
         'suppressNotification': suppress_notification,
         'snapshotId': str(result.get('snapshotId') or ''),
+        **({'indexScope': scope} if job_type == INDEX_BUILD_JOB_TYPE else {}),
     }
 
 
@@ -3582,6 +3656,8 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
         try:
             clustering_queue_client.send_message(json.dumps(message, separators=(',', ':')))
             sent += 1
+            for name in chunk:
+                processing_diagnostics.file_event('cluster_enqueued', user_id, name, role='cluster')
         except Exception:
             app.logger.exception('Failed to enqueue incremental-assign job for %s filenames (user=%s, first=%s)',
                                  len(chunk), user_id, chunk[0])
@@ -3596,9 +3672,8 @@ IPWORK_CLUSTER_BATCH_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_MAX_FIL
 # measured live. ~128 keeps a typical photo's faces within the staged-batch
 # 256-face cap in _process_clustering_user_group.
 INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE = int(os.getenv('INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE', '128'))
-# The real trigger: flush once a user's upload has gone quiet for this long
-# (a GAP in incoming filenames) -- NOT "flush after this much total time has
-# passed," which would cut off a still-active upload. See _is_upload_active.
+# Upload quietness is an early flush signal; the separate maximum wait
+# below prevents active photo/video uploads from indefinitely delaying faces.
 UPLOAD_ACTIVITY_WINDOW_SECONDS = float(os.getenv('UPLOAD_ACTIVITY_WINDOW_SECONDS', '300'))
 # True last-resort ceiling, not a normal trigger -- only matters if the
 # activity-table read itself starts failing (_is_upload_active fails safe to
@@ -3610,6 +3685,9 @@ IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS = float(os.getenv('IPWORK_CLUSTER_BAT
 # not a single queue-depth call, so this can poll much more often than the
 # old fixed-timer design without meaningful extra cost.
 IPWORK_CLUSTER_BATCH_POLL_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_POLL_SECONDS', '15'))
+# Bound face-result latency even while unrelated uploads/videos keep the
+# library heartbeat active. The poll cadence adds at most one extra tick.
+IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS', '60'))
 
 
 def _mark_upload_activity_heartbeat(user_id: str) -> None:
@@ -3627,6 +3705,7 @@ def _mark_upload_activity_heartbeat(user_id: str) -> None:
             {'PartitionKey': 'clustering_maintenance', 'RowKey': user_id,
              'lastUploadActivityAt': datetime.now(timezone.utc).isoformat()},
             mode=UpdateMode.MERGE)
+        processing_diagnostics.emit('upload_heartbeat', library_id=processing_diagnostics.file_id(user_id, ''))
     except Exception:
         app.logger.exception('Failed to record upload activity heartbeat for %s', user_id)
 
@@ -3651,7 +3730,11 @@ def _is_upload_active(user_id: str) -> bool:
         last = datetime.fromisoformat(str(raw))
     except ValueError:
         return False
-    return (datetime.now(timezone.utc) - last).total_seconds() <= UPLOAD_ACTIVITY_WINDOW_SECONDS
+    age = (datetime.now(timezone.utc) - last).total_seconds()
+    active = age <= UPLOAD_ACTIVITY_WINDOW_SECONDS
+    processing_diagnostics.emit('cluster_upload_gate', library_id=processing_diagnostics.file_id(user_id, ''),
+        activity_age_seconds=age, active=active, window_seconds=UPLOAD_ACTIVITY_WINDOW_SECONDS)
+    return active
 
 # Per-user in-memory buffer of filenames awaiting an incremental-assign
 # flush. _queue_people_clustering_after_face_processing runs inside
@@ -3669,6 +3752,7 @@ def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
     IPWORK_CLUSTER_BATCH_MAX_FILENAMES (time-flushed via a background thread
     in run_ipworker, or on shutdown via _flush_all_incremental_assign_buffers,
     so a slow trickle or a scaling-to-zero replica never strands filenames)."""
+    processing_diagnostics.file_event('cluster_buffered', user_id, filename, role='vision')
     to_flush: Optional[List[str]] = None
     started_at = None
     with _cluster_batch_lock:
@@ -3683,18 +3767,14 @@ def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
             _cluster_batch_started_at.pop(user_id, None)
     if to_flush:
         age_s = (time.monotonic() - started_at) if started_at is not None else -1
+        processing_diagnostics.emit('cluster_buffer_flush', filenames=len(to_flush), reason='count_cap', seconds=age_s)
         worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=count_cap age_s=%.1f',
                            user_id, len(to_flush), age_s)
         _enqueue_incremental_assign_job(user_id, to_flush)
 
 
 def _flush_stale_incremental_assign_buffers() -> None:
-    """Flush any user's buffer whose upload has gone quiet (_is_upload_active
-    is False), or that's been waiting past the hard fallback ceiling
-    regardless of activity -- not a fixed timer. A sustained upload keeps
-    its buffer growing (toward the count cap) for as long as activity stays
-    recent, instead of being cut off every ~60s by a timer that couldn't
-    tell a live upload apart from a finished one."""
+    """Flush on inactivity, count cap, or bounded age even during active uploads."""
     now = time.monotonic()
     to_flush: List[Tuple[str, List[str], str, float]] = []
     with _cluster_batch_lock:
@@ -3702,18 +3782,21 @@ def _flush_stale_incremental_assign_buffers() -> None:
     for user_id, started_at in candidates:
         age_s = now - started_at
         hard_fallback = age_s >= IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS
-        if hard_fallback or not _is_upload_active(user_id):
+        max_wait = age_s >= IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS
+        if hard_fallback or max_wait or not _is_upload_active(user_id):
             with _cluster_batch_lock:
                 # Re-check under the lock -- the buffer may have already
                 # been flushed (count cap) or grown since the snapshot above.
-                if user_id not in _cluster_batch_started_at:
+                if _cluster_batch_started_at.get(user_id) != started_at:
                     continue
                 buffer = _cluster_batch_buffers.get(user_id)
                 if buffer:
-                    to_flush.append((user_id, buffer, 'hard_fallback' if hard_fallback else 'inactive', age_s))
+                    reason = 'hard_fallback' if hard_fallback else 'max_wait' if max_wait else 'inactive'
+                    to_flush.append((user_id, buffer, reason, age_s))
                 _cluster_batch_buffers[user_id] = []
                 _cluster_batch_started_at.pop(user_id, None)
     for user_id, filenames, reason, age_s in to_flush:
+        processing_diagnostics.emit('cluster_buffer_flush', filenames=len(filenames), reason=reason, seconds=age_s)
         worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=%s age_s=%.1f',
                            user_id, len(filenames), reason, age_s)
         _enqueue_incremental_assign_job(user_id, filenames)
@@ -3730,6 +3813,7 @@ def _flush_all_incremental_assign_buffers() -> None:
         _cluster_batch_buffers.clear()
         _cluster_batch_started_at.clear()
     for user_id, filenames, age_s in pending:
+        processing_diagnostics.emit('cluster_buffer_flush', filenames=len(filenames), reason='shutdown', seconds=age_s)
         worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=shutdown age_s=%.1f',
                            user_id, len(filenames), age_s)
         _enqueue_incremental_assign_job(user_id, filenames)
@@ -3836,12 +3920,17 @@ def _enqueue_processing_steps(
     force: bool = False,
     visibility_timeout: int = 0,
 ) -> Dict[str, Dict[str, str]]:
+    if is_video_file(filename):
+        return {step: {'status': 'skipped', 'reason': 'video_browser_only'} for step in steps}
     results: Dict[str, Dict[str, str]] = {}
     entity = _get_metadata_entity(user_id, filename)
     if entity is None:
         for step in steps:
             results[step] = {'status': 'error', 'reason': 'not found'}
         return results
+
+    if entity.get('processingIsolated') is True:
+        return {step: {'status': 'skipped', 'reason': 'upload_only_benchmark'} for step in steps}
 
     visibility_timeout = max(0, min(int(visibility_timeout or 0), 7 * 24 * 60 * 60))
     for step in steps:
@@ -10165,6 +10254,7 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
             delay = max(delay, int(max(0, minimum - elapsed)))
     _upsert_job_status(
         job_id, key, INDEX_BUILD_JOB_TYPE, 'queued',
+        indexScope=scope,
         result={'delayedSeconds': int(delay), 'reason': reason, 'scope': scope} if delay else None,
     )
     try:
@@ -10263,7 +10353,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             except Exception:
                 worker_logger.exception('Index build heartbeat failed for %s', user_id)
 
-    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running')
+    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running', indexScope=scope)
     heartbeat = threading.Thread(target=_heartbeat, name='index-build-heartbeat', daemon=True)
     heartbeat.start()
     try:
@@ -10391,6 +10481,12 @@ def _active_preview_job_for_file(user_id: str, filename: str) -> Optional[str]:
 
 
 def _enqueue_preview_generation_job(user_id: str, filename: str) -> Dict[str, str]:
+    if is_video_file(filename):
+        return {'status': 'skipped', 'reason': 'video_browser_only'}
+    if filename.startswith('rawbench-'):
+        entity = _get_metadata_entity(user_id, filename)
+        if not entity or entity.get('processingIsolated') is True:
+            return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
     existing_job_id = _active_preview_job_for_file(user_id, filename)
     if existing_job_id:
         return {'status': 'already_queued', 'jobId': existing_job_id}
@@ -10417,7 +10513,7 @@ def _enqueue_preview_generation_job(user_id: str, filename: str) -> Dict[str, st
 def _preview_failure_payload(filename: str) -> dict:
     """Build a structured, user-facing explanation for why a preview could not be made."""
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    if ext in {'heic', 'heif'}:
+    if ext in {'heic', 'heif', 'hif'}:
         reason = 'heic_decode_failed'
         detail = ('This HEIC/HEIF image could not be converted into a viewable preview. '
                   'It may be damaged or use an unsupported variant.')
@@ -11294,7 +11390,7 @@ def _create_scoped_blob_url(container_name: str, filename: str, *, minutes: int 
     )
 
 
-def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None) -> Dict[str, str]:
+def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None, *, use_original: bool = False) -> Dict[str, str]:
     """Send a real queue message so ipworker (also) processes this upload.
 
     No-op in 'browser' mode (the default) -- ipworker never needs to be
@@ -11307,6 +11403,13 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
     to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
     silently redo more than was asked.
     """
+    if is_video_file(filename):
+        processing_diagnostics.file_event('vision_excluded', user_id, filename, reason='video_browser_only')
+        return {'status': 'skipped', 'reason': 'video_browser_only'}
+    if filename.startswith('rawbench-'):
+        entity = _get_metadata_entity(user_id, filename)
+        if not entity or entity.get('processingIsolated') is True:
+            return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
     if PROCESSING_MODE == 'browser':
         return {'status': 'skipped', 'reason': 'browser_only_processing'}
     requested_steps = [s for s in (steps if steps is not None else IPWORK_STEPS) if s in IPWORK_STEPS]
@@ -11323,17 +11426,25 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
         'filename': filename,
         'steps': requested_steps,
     }
+    if use_original:
+        message['imageSource'] = 'original'
+    if processing_diagnostics.current_batch():
+        message['uploadBatchId'] = processing_diagnostics.current_batch()
     try:
         ipwork_queue_client.send_message(json.dumps(message, separators=(',', ':')))
     except Exception:
         app.logger.exception('Failed to enqueue ipwork job %s', job_id)
         return {'status': 'failed', 'jobId': job_id}
     _upsert_job_status(job_id, user_id, 'ipwork', 'queued')
+    processing_diagnostics.file_event('vision_enqueued', user_id, filename,
+        batch_id=processing_diagnostics.current_batch(), role='vision')
     return {'status': 'queued', 'jobId': job_id}
 
 
 def _queue_upload_processing(user_id: str, final_name: str) -> None:
     if is_video_file(final_name):
+        processing_diagnostics.file_event('vision_excluded', user_id, final_name,
+            batch_id=processing_diagnostics.current_batch(), reason='video_browser_only')
         return
     _enqueue_processing_steps(user_id, final_name, ['face'])
     _queue_ipwork_processing(user_id, final_name)
@@ -11431,6 +11542,30 @@ def _face_ids_awaiting_person_assignment(user_id: str, filename: str) -> List[st
     ]
 
 
+def _incremental_assignment_skip_reason(metadata) -> Optional[str]:
+    """Shared producer/consumer eligibility; only persisted partial results qualify."""
+    if not isinstance(metadata, dict):
+        return 'metadata_missing'
+    if metadata.get('processingIsolated') is True:
+        return 'processing_isolated'
+    if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
+        return 'deleted'
+    status = str(metadata.get('face_status') or '').strip().lower()
+    if status == 'done':
+        return None
+    if status == 'failed':
+        try:
+            processing = json.loads(metadata.get('processing_metadata') or '{}')
+            accepted = processing.get('client_face') or {}
+            ids = accepted.get('storedFaceIds')
+            if isinstance(ids, list) and ids and accepted.get('embeddingsReady'):
+                return None
+        except (ValueError, TypeError, AttributeError):
+            pass
+        return 'failed_without_persisted_embeddings'
+    return 'face_not_ready'
+
+
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
     """Queue face-to-person assignment for newly-detected faces, then queue a
     maintenance recluster if one's due.
@@ -11449,24 +11584,8 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
     _enqueue_incremental_assign_job) -- the maintenance-cooldown gate below,
     which is what actually fixed the runaway-loop bug, is untouched.
     """
-    if not _people_features_available() or not isinstance(metadata, dict):
+    if not _people_features_available() or _incremental_assignment_skip_reason(metadata):
         return None
-    if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
-        return None
-    if str(metadata.get('face_status') or '').strip().lower() != 'done':
-        # A partial pass is failed (not a verified complete set), but its
-        # validated/persisted embeddings can still take the normal assignment
-        # path. The worker reads canonical faces, never failed candidates.
-        try:
-            processing = json.loads(metadata.get('processing_metadata') or '{}')
-            accepted = processing.get('client_face') or {}
-            ids = accepted.get('storedFaceIds')
-            if (str(metadata.get('face_status') or '').lower() != 'failed'
-                    or not isinstance(ids, list) or not ids
-                    or not accepted.get('embeddingsReady')):
-                return None
-        except (ValueError, TypeError, AttributeError):
-            return None
 
     try:
         face_count = int(metadata.get('faceCount') or 0)
@@ -11536,6 +11655,7 @@ BROWSER_PROCESSING_STATUS_FIELDS = (
 BROWSER_PROCESSING_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout'}
 BROWSER_PROCESSING_PENDING_SELECT = [
     'RowKey',
+    'processingIsolated',
     'rotation',
     'processing_state',
     'processing_lease_owner',
@@ -11666,6 +11786,10 @@ def _browser_processing_face_version_stale(entity: Dict) -> bool:
 
 def _browser_processing_pending_item(entity: Dict) -> Optional[Dict]:
     filename = str(entity.get('RowKey') or '').strip()
+    if is_video_file(filename):
+        return None
+    if entity.get('processingIsolated') is True:
+        return None
     if not filename:
         return None
     if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
@@ -11786,7 +11910,8 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
     -- otherwise every sweep interval would pile a fresh duplicate message
     onto a perfectly healthy backlog.
     """
-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+    if (is_video_file(str(entity.get('RowKey') or '')) or entity.get('processingIsolated') is True
+            or str(entity.get('processing_state') or '').strip().lower() == 'deleted'):
         return []
     lease_expired = _browser_processing_lease_expired(entity)
     face_version_stale = _browser_processing_face_version_stale(entity)
@@ -12212,6 +12337,10 @@ def _delete_photo_blobs_if_present(blob_name: str, extra_blob_names: Optional[Li
             error = _delete_blob_if_present(container_name, name)
             if error:
                 errors.append(f'{label}: {error}')
+    for name in names:
+        error = _delete_blob_if_present(BLOB_THUMBNAIL_CONTAINER, f'metadata/{name}.bin')
+        if error:
+            errors.append(f'blob metadata: {error}')
     return errors
 
 
@@ -12769,11 +12898,15 @@ def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[
         if anonymous_id:
             blob_to_names.setdefault(safe_name, set()).add(safe_name)
     blob_names = list(blob_to_names.keys())
+    metadata_blob_to_names = {f'metadata/{name}.bin': owners for name, owners in blob_to_names.items()}
     blob_errors_by_name: Dict[str, List[str]] = {}
     for label, container_name in (('blob image', BLOB_IMAGE_CONTAINER), ('blob thumbnail', BLOB_THUMBNAIL_CONTAINER)):
         for failed_blob in _batch_delete_blobs(container_name, blob_names):
             for safe_name in blob_to_names.get(failed_blob, ()):
                 blob_errors_by_name.setdefault(safe_name, []).append(f'{label}: delete failed')
+    for failed_blob in _batch_delete_blobs(BLOB_THUMBNAIL_CONTAINER, list(metadata_blob_to_names)):
+        for safe_name in metadata_blob_to_names.get(failed_blob, ()):
+            blob_errors_by_name.setdefault(safe_name, []).append('blob metadata: delete failed')
 
     for safe_name, metadata in own_rows_by_name.items():
         if safe_name in shared_names:
@@ -13539,6 +13672,10 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         return
     if job_type == PREVIEW_JOB_TYPE:
         filename = _validate_media_filename(str(payload.get('filename') or ''))
+        if filename and is_video_file(filename):
+            if job_id:
+                _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'done', filename=filename)
+            return
         if not filename:
             if job_id:
                 _upsert_job_status(job_id, user_id, PREVIEW_JOB_TYPE, 'failed', error='invalid filename')
@@ -13971,20 +14108,24 @@ def _incremental_assign_message_filenames(payload) -> List[str]:
 def _prepare_incremental_assignment(payload, user_id) -> List[Tuple[str, List[str]]]:
     """Fresh per-photo preparation for every filename this message carries
     (one, or many -- see _incremental_assign_message_filenames); independent
-    reads may overlap in a batch. Filenames that fail validation or aren't
-    in a clusterable state are silently omitted from the result, matching
-    this function's previous single-filename behavior."""
+    reads may overlap in a batch. Non-clusterable files report bounded skip
+    reasons; preparation exceptions still propagate for queue retry."""
     if not _people_features_available():
+        for name in _incremental_assign_message_filenames(payload):
+            processing_diagnostics.file_event('cluster_skipped', user_id, name,
+                role='cluster', reason='features_disabled')
         return []
     prepared: List[Tuple[str, List[str]]] = []
     for raw_filename in _incremental_assign_message_filenames(payload):
         filename = _validate_media_filename(raw_filename)
         if not filename:
+            processing_diagnostics.file_event('cluster_skipped', user_id, raw_filename,
+                role='cluster', reason='invalid_filename')
             continue
         metadata = _get_metadata_entity(user_id, filename)
-        if (not isinstance(metadata, dict)
-                or str(metadata.get('processing_state') or '').strip().lower() == 'deleted'
-                or str(metadata.get('face_status') or '').strip().lower() != 'done'):
+        reason = _incremental_assignment_skip_reason(metadata)
+        if reason:
+            processing_diagnostics.file_event('cluster_skipped', user_id, filename, role='cluster', reason=reason)
             continue
         prepared.append((filename, _face_ids_awaiting_person_assignment(user_id, filename)))
     return prepared
@@ -14022,10 +14163,12 @@ def _poll_clustering_queue_once(
         messages[0], queue_client, queue_name, max_retries, deadletter_queue_client)
 
 
+@processing_diagnostics.measured('cluster', 'message', state='processing')
 def _process_clustering_queue_message(message, queue_client, queue_name, max_retries,
                                       deadletter_queue_client=None, *, dispatch=None):
     """Instrumented entry: one `scope_summary` line per queue message (wall time,
     storage round trips, duplicates, peak RSS) tagged with the job type."""
+    processing_diagnostics.message_event('cluster_started', message, role='cluster')
     job_type, user_id = '?', ''
     try:
         body = json.loads(getattr(message, 'content', '') or '{}')
@@ -14034,6 +14177,7 @@ def _process_clustering_queue_message(message, queue_client, queue_name, max_ret
             user_id = str(body.get('user_id') or body.get('userId') or '')
     except Exception:
         pass
+    processing_diagnostics.emit('cluster_job_started', role='cluster', job_type=job_type)
     with perf_instrumentation.scope(f'queue.{queue_name}.{job_type}', user=user_id,
                                     dequeue=getattr(message, 'dequeue_count', None)):
         return _process_clustering_queue_message_impl(
@@ -14218,11 +14362,16 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
             delete_started = time.monotonic()
             try:
                 queue_client.delete_message(final_message)
+                processing_diagnostics.message_event('cluster_acknowledged', message, role='cluster')
+                processing_diagnostics.count('cluster', 'acknowledged_messages')
+                processing_diagnostics.emit('cluster_job_acknowledged', role='cluster', job_type=job_type)
                 worker_logger.info('clustering message delete queue=%s delete_ms=%d',
                                    queue_name, int((time.monotonic() - delete_started) * 1000))
             except Exception:
                 worker_logger.exception('Failed to delete %s queue message', queue_name)
         else:
+            processing_diagnostics.message_event('cluster_retry', message, role='cluster')
+            processing_diagnostics.count('cluster', 'errors')
             worker_logger.info(
                 'Leaving %s queue message visible for retry (dequeue_count=%s, max_retries=%s)',
                 queue_name, dequeue_count, max_retries,
@@ -14247,7 +14396,7 @@ def _clustering_message_work_units(message) -> int:
 
 def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_size,
                                   idle_timeout_seconds, visibility_timeout, poll_seconds,
-                                  shutdown_requested=None):
+                                  shutdown_requested=None, max_wait_seconds=5.0):
     """Pool messages across possibly many receive_messages calls (Azure Queue
     Storage caps a single call at 32 -- page_size stays within that), so a
     caller can accumulate far more than one page before grouping/processing.
@@ -14257,7 +14406,9 @@ def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_
     carry many filenames (see _buffer_incremental_assign_filename); every
     other job type counts as one unit, same as a raw message count would
     give -- or once idle_timeout_seconds have passed since the last message
-    arrived. idle_timeout_seconds<=0
+    arrived. A separate max_wait_seconds bounds total held-work latency;
+    an empty initial poll returns immediately so priority work can be polled
+    again. idle_timeout_seconds<=0
     disables waiting entirely: exactly one receive_messages call is made and
     whatever it returns (including nothing) is the result -- this matches
     the previous single-page poll's behavior.
@@ -14293,51 +14444,89 @@ def _accumulate_clustering_batch(queue_client, queue_name, *, page_size, target_
                     if holder[1]:
                         holder[0] = renewed
 
+    def received(page):
+        processing_diagnostics.count('cluster', 'received_messages', len(page))
+        if not page:
+            processing_diagnostics.count('cluster', 'empty_receives')
+        for message in page:
+            processing_diagnostics.message_event('cluster_received', message, role='cluster')
+
     thread = threading.Thread(target=renew_pending, daemon=True)
     thread.start()
 
     started = time.monotonic()
-    if idle_timeout_seconds <= 0:
-        page = list(queue_client.receive_messages(
-            messages_per_page=page_size, max_messages=page_size,
-            visibility_timeout=visibility_timeout))
-        with lock:
-            for message in page:
-                holders.append([message, True])
-        receive_ms = int((time.monotonic() - started) * 1000)
-        return page, holders, lock, stop, thread, 'single_page', receive_ms
-
+    first_received = None
+    accumulation = ExitStack()
     messages: List = []
     last_received = started
-    stopped_reason = 'idle_timeout'
+    stopped_reason = 'empty'
     work_units = 0
-    while True:
-        if shutdown_requested is not None and shutdown_requested.is_set():
-            stopped_reason = 'shutdown'
-            break
-        page = list(queue_client.receive_messages(
-            messages_per_page=page_size, max_messages=page_size,
-            visibility_timeout=visibility_timeout))
-        now = time.monotonic()
-        if page:
-            with lock:
-                for message in page:
-                    messages.append(message)
-                    holders.append([message, True])
-            last_received = now
-            work_units += sum(_clustering_message_work_units(m) for m in page)
+    try:
+        while True:
+            if shutdown_requested is not None and shutdown_requested.is_set():
+                stopped_reason = 'shutdown'
+                break
+            if messages:
+                now = time.monotonic()
+                if now - first_received >= max_wait_seconds:
+                    stopped_reason = 'max_wait'
+                    break
+                if now - last_received >= idle_timeout_seconds:
+                    stopped_reason = 'idle_timeout'
+                    break
+            page = list(queue_client.receive_messages(
+                messages_per_page=page_size, max_messages=page_size,
+                visibility_timeout=visibility_timeout))
+            received(page)
+            now = time.monotonic()
+            if page:
+                with lock:
+                    for message in page:
+                        messages.append(message)
+                        holders.append([message, True])
+                if first_received is None:
+                    first_received = now
+                    accumulation.enter_context(processing_diagnostics.phase(
+                        'cluster', 'queue_accumulation', state='accumulating'))
+                last_received = now
+                work_units += sum(_clustering_message_work_units(m) for m in page)
+            if idle_timeout_seconds <= 0:
+                stopped_reason = 'single_page'
+                break
+            if not messages:
+                stopped_reason = 'empty'
+                break
             if work_units >= target_size:
                 stopped_reason = 'target_reached'
                 break
-        if now - last_received > idle_timeout_seconds:
-            stopped_reason = 'idle_timeout'
-            break
-        if not page:
-            time.sleep(poll_seconds)
+            remaining = min(idle_timeout_seconds - (now - last_received),
+                            max_wait_seconds - (now - first_received))
+            if remaining <= 0:
+                stopped_reason = 'max_wait' if now - first_received >= max_wait_seconds else 'idle_timeout'
+                break
+            if not page:
+                delay = min(poll_seconds, remaining)
+                if shutdown_requested is not None:
+                    shutdown_requested.wait(delay)
+                else:
+                    time.sleep(delay)
+    except BaseException:
+        # No caller receives holders on a failed receive. Stop its renewer
+        # so any already-held messages become visible for retry normally.
+        stop.set()
+        thread.join(timeout=5)
+        raise
+    finally:
+        accumulation.close()
     receive_ms = int((time.monotonic() - started) * 1000)
+    if messages:
+        processing_diagnostics.emit('cluster_accumulation', role='cluster', reason=stopped_reason,
+            initial_receive_ms=int((first_received - started) * 1000),
+            held_work_ms=int((time.monotonic() - first_received) * 1000))
     return messages, holders, lock, stop, thread, stopped_reason, receive_ms
 
 
+@processing_diagnostics.measured('cluster', 'user_group', state='processing')
 def _process_clustering_user_group(user, indices, messages, take, queue_client, queue_name,
                                    max_retries, deadletter_queue_client):
     """Prepare every message's pending filenames, flatten them into
@@ -14361,6 +14550,9 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         preparations = dict(zip(indices, pool.map(prepare, indices)))
     prepare_ms = int((time.monotonic() - prepare_started) * 1000)
+    processing_diagnostics.emit('cluster_prepare', role='cluster', messages=len(indices), milliseconds=prepare_ms)
+    for i in indices:
+        processing_diagnostics.message_event('cluster_started', messages[i], role='cluster')
     total_filenames = sum(len(p) for p in preparations.values() if not isinstance(p, Exception))
     worker_logger.info('clustering batch prepare user=%s messages=%d filenames=%d prepare_ms=%d concurrency=%d',
                        user, len(indices), total_filenames, prepare_ms, concurrency)
@@ -14424,12 +14616,15 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
                         completed.append(i)
                 acknowledged = 0
                 for i in completed:
+                    processing_diagnostics.cluster_applied(user, preparations[i], messages[i])
                     filenames = [filename for filename, _ids in preparations[i]]
                     if any(filename in assign.metadata_errors for filename in filenames):
                         continue
                     try:
                         queue_client.delete_message(take(i))
                         acknowledged += 1
+                        processing_diagnostics.message_event('cluster_acknowledged', messages[i], role='cluster')
+                        processing_diagnostics.count('cluster', 'acknowledged_messages')
                     except Exception:
                         worker_logger.exception('Failed to delete completed %s batch message', queue_name)
                 worker_logger.info('clustering staged batch done user=%s messages=%d filenames=%d acknowledged=%d '
@@ -14439,15 +14634,19 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
             with assigner.batch(user, all_ids) as assign:
                 for i in chunk:
                     prepared = preparations[i]
-                    def dispatch(payload, job_id, user_id, job_type, prepared=prepared):
+                    def dispatch(payload, job_id, user_id, job_type, prepared=prepared, message=messages[i]):
                         if isinstance(prepared, Exception):
                             raise prepared
                         _handle_clustering_queue_payload(payload, job_id, user_id, job_type,
                                                          incremental_assign=assign, prepared=prepared)
+                        processing_diagnostics.cluster_applied(user_id, prepared, message)
                     _process_clustering_queue_message(take(i), queue_client, queue_name,
                                                       max_retries, deadletter_queue_client,
                                                       dispatch=dispatch)
         except Exception:
+            processing_diagnostics.count('cluster', 'errors')
+            for i in chunk:
+                processing_diagnostics.message_event('cluster_retry', messages[i], role='cluster')
             # Setup/lease/prefetch failures acknowledge nothing not already
             # completed. Visibility expiry redelivers the remaining jobs.
             worker_logger.exception('FAISS microbatch failed user=%s messages=%d filenames=%d',
@@ -14457,7 +14656,7 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
 def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
                                       deadletter_queue_client=None, *, batch_size=8,
                                       target_size=None, idle_timeout_seconds=0.0,
-                                      poll_seconds=2.0, shutdown_requested=None):
+                                      poll_seconds=2.0, shutdown_requested=None, max_wait_seconds=5.0):
     """Accumulate messages (possibly across many receive_messages calls --
     see _accumulate_clustering_batch) then group by user ACROSS THE WHOLE
     accumulated pool, not just adjacent positions, so same-user jobs
@@ -14474,7 +14673,8 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
         queue_client, queue_name, page_size=batch_size, target_size=target_size,
         idle_timeout_seconds=idle_timeout_seconds,
         visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
-        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested)
+        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
+        max_wait_seconds=max_wait_seconds)
     if not messages:
         stop.set()
         thread.join(timeout=5)
@@ -14483,6 +14683,9 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
     worker_logger.info(
         'clustering batch accumulated queue=%s messages=%d receive_ms=%d stopped_reason=%s',
         queue_name, len(messages), receive_ms, stopped_reason)
+    processing_diagnostics.emit('cluster_batch', role='cluster', messages=len(messages),
+        work_units=sum(_clustering_message_work_units(m) for m in messages),
+        accumulation_ms=receive_ms, reason=stopped_reason)
 
     def take(index):
         with lock:
@@ -14539,8 +14742,10 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
     return True
 
 
+@processing_diagnostics.worker('cluster')
 def run_clustering_worker() -> None:
     """Poll clustering queue jobs in a standalone container."""
+    processing_diagnostics.emit('worker_import_complete', role='cluster', seconds=max(0, time.monotonic() - _APP_IMPORT_STARTED_AT))
     logging.basicConfig(
         level=os.getenv('LOG_LEVEL', 'INFO').upper(),
         format='%(asctime)s %(levelname)s %(name)s %(message)s',
@@ -14560,6 +14765,9 @@ def run_clustering_worker() -> None:
     idle_timeout_seconds = float(os.getenv('CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS', '300'))
     if not 0 <= idle_timeout_seconds <= 3600:
         raise ValueError('CLUSTERING_WORKER_IDLE_TIMEOUT_SECONDS must be between 0 and 3600')
+    max_accumulation_seconds = float(os.getenv('CLUSTERING_WORKER_MAX_ACCUMULATION_SECONDS', '5'))
+    if not 0 <= max_accumulation_seconds <= 60:
+        raise ValueError('CLUSTERING_WORKER_MAX_ACCUMULATION_SECONDS must be between 0 and 60')
     queue_service_client_local = queue_service_client
     if queue_service_client_local is None:
         _init_storage_clients()
@@ -14586,6 +14794,11 @@ def run_clustering_worker() -> None:
         CLUSTERING_QUEUE_NAME,
         poll_seconds,
     )
+    processing_diagnostics.ready('cluster', page_size=batch_size, target_size=target_batch_size,
+        accumulation_idle_seconds=idle_timeout_seconds, poll_seconds=poll_seconds,
+        accumulation_max_seconds=max_accumulation_seconds,
+        coalesced_writes=os.getenv('PEOPLE_FAISS_COALESCE_WRITES', 'false').lower() in ('true', '1', 'yes'),
+        assignment_engine=PEOPLE_ASSIGNMENT_ENGINE)
 
     # Unlike run_ipworker, this loop had no SIGTERM handler at all -- Python's
     # default disposition for an unhandled SIGTERM is to terminate the process
@@ -14635,7 +14848,8 @@ def run_clustering_worker() -> None:
                         queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
                         clustering_deadletter_client, batch_size=batch_size,
                         target_size=target_batch_size, idle_timeout_seconds=idle_timeout_seconds,
-                        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested)
+                        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
+                        max_wait_seconds=max_accumulation_seconds)
             if not processed_any and not shutdown_requested.is_set():
                 time.sleep(poll_seconds)
         except Exception:
@@ -14661,6 +14875,12 @@ def run_clustering_worker() -> None:
 # marked 'failed' with a clear reason instead of crashing the whole job, since
 # ipworker's model coverage ships incrementally rather than all at once.
 IPWORK_STEP_PROCESSORS: Dict[str, Callable[[str, str, bytes], Optional[Dict]]] = {}
+
+# Experimental until representative replay establishes quality and latency.
+IPWORK_SHARED_DECODE = os.getenv('IPWORK_SHARED_DECODE', 'false').lower() == 'true'
+IPWORK_REUSE_PREVIEW = os.getenv('IPWORK_REUSE_PREVIEW', 'false').lower() == 'true'
+IPWORK_REUSE_EXIF = os.getenv('IPWORK_REUSE_EXIF', 'false').lower() == 'true'
+IPWORK_REUSE_METADATA_PACKET = os.getenv('IPWORK_REUSE_METADATA_PACKET', 'false').lower() == 'true'
 
 # Scoped to the task's thread: browser/API calls do not enter worker metrics.
 _ipwork_metrics_context = threading.local()
@@ -14730,32 +14950,152 @@ def _register_ipwork_processors() -> None:
         worker_logger.exception('ipwork_vision unavailable; ai_vision step will report not_implemented')
 
 
-def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str, Dict]:
+_VISUAL_IPWORK_STEPS = frozenset({'thumbnail', 'ocr', 'face', 'ai_vision'})
+
+
+class _VisualSourceUndecodable(Exception):
+    """The one shared visual source for this photo could not be decoded by the
+    most-capable path (convert_image_to_jpeg), so every visual step
+    (thumbnail/ocr/face/ai_vision) fails identically with 'source_undecodable'
+    instead of each independently re-decoding the raw original and reporting
+    its own unrelated error -- the exotic-RAW (e.g. CRW) cascade. Raised once
+    per photo; the verdict is cached so later visual steps short-circuit."""
+
+
+def _run_ipwork_steps(user_id: str, filename: str, steps: List[str], *, use_original: bool = False,
+                     metadata_snapshot: Optional[Dict] = None) -> Dict[str, Dict]:
+    from ipwork_image import image_job
+    with image_job(IPWORK_SHARED_DECODE):
+        return _run_ipwork_steps_with_images(user_id, filename, steps, use_original=use_original,
+                                             metadata_snapshot=metadata_snapshot)
+
+
+def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str], *, use_original: bool = False,
+                                 metadata_snapshot: Optional[Dict] = None) -> Dict[str, Dict]:
     """Run each requested step's registered processor for one photo.
 
     Returns a dict shaped like the browser's `clientProcessing` payload so it
     can be handed straight to apply_client_processing_results_for_file.
     """
+    if is_video_file(filename):
+        return {step: {'hasData': False, 'error': 'video_browser_only'} for step in steps}
     client_processing: Dict[str, Dict] = {}
-    image_bytes_cache: List[bytes] = []
+    original_bytes_cache: List[bytes] = []
+    visual_bytes_cache: List[bytes] = []
+    # Non-empty once the single shared visual source has been determined
+    # undecodable (see _VisualSourceUndecodable), so later visual steps emit the
+    # same coherent failure instead of re-attempting the same doomed decode.
+    visual_undecodable: List[str] = []
+    source_metadata: List[Dict] = []
+    snapshot_matches = (isinstance(metadata_snapshot, dict)
+        and metadata_snapshot.get('PartitionKey') == user_id
+        and metadata_snapshot.get('RowKey') == filename
+        and str(metadata_snapshot.get('processing_state') or '').strip().lower() != 'deleted'
+        and metadata_snapshot.get('processingIsolated') is not True)
+    preview_attempted = False
     download_ms = 0
     _ipwork_metrics_context.source_bytes = 0
 
-    def get_image_bytes() -> bytes:
-        nonlocal download_ms
-        if not image_bytes_cache:
+    def get_source_metadata() -> Dict:
+        if not source_metadata:
+            # Read-only input decisions can reuse the successful lease claim.
+            # Persistence still fetches current rows and keeps its ETag guards.
+            source_metadata.append(dict(metadata_snapshot) if snapshot_matches else
+                                   _get_metadata_entity(user_id, filename) or {})
+            processing_diagnostics.file_event('vision_metadata_read', user_id, filename, role='vision',
+                source='lease_snapshot' if snapshot_matches else 'table', reads=0 if snapshot_matches else 1)
+        return source_metadata[0]
+
+    def get_image_bytes(step: str) -> bytes:
+        nonlocal download_ms, preview_attempted
+        visual = step in _VISUAL_IPWORK_STEPS
+        if visual and visual_bytes_cache:
+            return visual_bytes_cache[0]
+        if not original_bytes_cache or (visual and IPWORK_REUSE_PREVIEW and not use_original and not preview_attempted):
             started = time.monotonic()
             try:
-                entity = _get_metadata_entity(user_id, filename) or {}
+                entity = get_source_metadata()
                 source_blob = str(entity.get('anonymousImageId') or '').strip() or filename
-                image_bytes_cache.append(download_media_bytes('image', source_blob))
-                _ipwork_metrics_context.source_bytes = len(image_bytes_cache[0])
-                _ipwork_metric('source_download_bytes', count=_ipwork_metrics_context.source_bytes)
+                if (visual and IPWORK_REUSE_PREVIEW and not use_original and not preview_attempted and 'preview' not in steps
+                        and str(entity.get('preview_status') or '').lower() == 'done'
+                        and not is_video_file(filename)):
+                    preview_attempted = True
+                    try:
+                        # HEAD the original for source-volume accounting, without
+                        # crediting preview bytes as original bytes downloaded.
+                        source_size = int(get_media_properties('image', source_blob)['size'])
+                        if source_size <= 0:
+                            raise ValueError('Invalid source size')
+                        preview = download_media_bytes('thumbnail', _preview_cache_blob_name(source_blob))
+                        processing_diagnostics.file_event('vision_download', user_id, filename, role='vision',
+                            source='preview', bytes=len(preview))
+                        _ipwork_metric('preview_download_bytes', count=len(preview))
+                        if not _looks_like_jpeg(preview):
+                            raise ValueError('Invalid cached preview')
+                        from ipwork_image import rgb_image
+                        with rgb_image(preview, filename) as pixels:
+                            pixels.load()  # fully validate; seed the shared decode when enabled
+                            from ipwork_image import remember_crop_preview
+                            remember_crop_preview(user_id, filename, entity, preview, pixels.width, pixels.height)
+                        visual_bytes_cache.append(preview)
+                        _ipwork_metrics_context.source_bytes = source_size
+                        _ipwork_metric('preview_reused')
+                        return preview
+                    except Exception:
+                        _ipwork_metric('preview_reuse_failed')
+                        worker_logger.info('ipworker cached preview unavailable; falling back to original')
+                if not original_bytes_cache:
+                    purpose = 'exif_fallback' if step in {'exif', 'map_detection'} else 'inference'
+                    with processing_diagnostics.media_download_scope(purpose):
+                        original_bytes_cache.append(download_media_bytes('image', source_blob))
+                    from ipwork_image import remember_original_input
+                    remember_original_input(user_id, filename, entity, original_bytes_cache[0])
+                    processing_diagnostics.file_event('vision_download', user_id, filename, role='vision',
+                        source='original', bytes=len(original_bytes_cache[0]))
+                    _ipwork_metrics_context.source_bytes = len(original_bytes_cache[0])
+                    _ipwork_metric('source_download_bytes', count=_ipwork_metrics_context.source_bytes)
             finally:
                 elapsed_ms = (time.monotonic() - started) * 1000
-                download_ms = round(elapsed_ms)
+                download_ms += round(elapsed_ms)
                 _ipwork_metric('download', duration_ms=elapsed_ms, observation=True)
-        return image_bytes_cache[0]
+        if visual and not use_original and not visual_bytes_cache:
+            # No preview was available (the preview step produced none this
+            # pass, or there was no cached preview to reuse). Resolve ONE
+            # canonical visual source for every visual step via the most-capable
+            # decoder -- the same convert_image_to_jpeg the preview step uses --
+            # instead of handing each step the raw original to decode
+            # independently. For an undecodable RAW (e.g. CRW) that decode is
+            # exactly what already failed, so rather than four steps each
+            # re-failing with four different reasons, record one verdict and
+            # raise so all of them report a single coherent 'source_undecodable'.
+            # use_original repair passes are intentionally exempt: they keep the
+            # full raw original for higher-detail re-processing.
+            preview_result = client_processing.get('preview')
+            canonical = None
+            # Skip re-running the decode when the preview step already tried the
+            # very same convert_image_to_jpeg this pass and produced nothing.
+            if not (isinstance(preview_result, dict) and preview_result.get('hasData') is False):
+                from image_utils import convert_image_to_jpeg
+                try:
+                    produced = convert_image_to_jpeg(original_bytes_cache[0], filename)
+                except Exception:
+                    produced = None
+                if produced and _looks_like_jpeg(produced):
+                    try:
+                        from ipwork_image import rgb_image, remember_crop_preview
+                        with rgb_image(produced, filename) as pixels:
+                            pixels.load()  # fully validate; seed the shared decode when enabled
+                            remember_crop_preview(user_id, filename, get_source_metadata(),
+                                                  produced, pixels.width, pixels.height)
+                        canonical = produced
+                    except Exception:
+                        canonical = None
+            if canonical is not None:
+                visual_bytes_cache.append(canonical)
+                return canonical
+            visual_undecodable.append('source_undecodable')
+            raise _VisualSourceUndecodable(f'source_undecodable: {filename}')
+        return original_bytes_cache[0]
 
     def _failure_shape(step: str, error: str) -> Dict:
         # storage_utils's face block only resolves face_status to a terminal
@@ -14773,22 +15113,106 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
     # whichever step happens to trigger the lazy download) so a slow step
     # can't be blamed for I/O that's really the metadata read + blob fetch.
     step_ms: Dict[str, int] = {}
+    def packet_downloaded(size):
+        _ipwork_metric('metadata_packet_download_bytes', count=size)
+        processing_diagnostics.file_event('vision_download', user_id, filename, role='vision',
+            source='metadata_packet', bytes=size)
     for step in steps:
         if step not in IPWORK_STEPS:
             continue
         processor = IPWORK_STEP_PROCESSORS.get(step)
         if processor is None:
             client_processing[step] = _failure_shape(step, 'not_implemented')
+            processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                step=step, error=True, reason='not_implemented')
             continue
+        if step in _VISUAL_IPWORK_STEPS and visual_undecodable:
+            # The single shared visual source was already determined undecodable
+            # by an earlier visual step this pass -- report the SAME coherent
+            # reason for every visual step instead of re-decoding the raw
+            # original (the exotic-RAW cascade: N steps, N unrelated failures).
+            client_processing[step] = _failure_shape(step, 'source_undecodable')
+            processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                step=step, error=True, reason='source_undecodable')
+            continue
+        geo_exif = None
+        packet_exif = None
+        packet_outcome = None
         try:
-            image_bytes = get_image_bytes()
+            if step == 'exif' and IPWORK_REUSE_METADATA_PACKET and not use_original:
+                import ipwork_geo
+                if processor is ipwork_geo.process_exif and get_source_metadata().get('uploadMetadataPacket'):
+                    import storage_utils
+                    from upload_metadata import extract_candidate
+                    def packet_finished(reason):
+                        nonlocal packet_outcome
+                        packet_outcome = reason
+                        worker_logger.info('ipwork metadata outcome user=%s file=%s reason=%s', user_id, filename, reason)
+                    packet_started = time.monotonic()
+                    packet_exif = extract_candidate(storage_utils, filename, get_source_metadata(),
+                        on_download=packet_downloaded,
+                        on_outcome=packet_finished,
+                        on_diagnostic=lambda info: worker_logger.info('ipwork metadata diagnostic user=%s file=%s version=%s category=%s',
+                            user_id, filename, info['version'], info['category']))
+                    if packet_exif is not None:
+                        _ipwork_metrics_context.source_bytes = int(get_source_metadata().get('size') or 0)
+                    _ipwork_metric('metadata_packet', duration_ms=(time.monotonic() - packet_started) * 1000, observation=True)
+                    _ipwork_metric('metadata_packet_reused' if packet_exif is not None else 'metadata_packet_fallback')
+                elif processor is ipwork_geo.process_exif:
+                    worker_logger.info('ipwork metadata outcome user=%s file=%s reason=not_submitted', user_id, filename)
+            if step == 'map_detection' and IPWORK_REUSE_EXIF and not use_original:
+                import ipwork_geo
+                if processor is ipwork_geo.process_geo:
+                    exif_result = client_processing.get('exif')
+                    if isinstance(exif_result, dict) and (exif_result.get('error') or exif_result.get('errorCode')):
+                        # A failed extraction is not verified GPS absence, and
+                        # parsing the same bytes again cannot qualify it.
+                        client_processing[step] = _failure_shape(step, 'exif_dependency_failed')
+                        step_ms[step] = 0
+                        _ipwork_metric('step_' + step, duration_ms=0, observation=True)
+                        processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                            step=step, error=True, reason='exif_dependency_failed')
+                        continue
+                    if (isinstance(exif_result, dict) and exif_result.get('hasData') is True
+                            and not exif_result.get('error') and isinstance(exif_result.get('data'), dict)):
+                        geo_exif = exif_result['data']
+                    elif (isinstance(exif_result, dict) and exif_result.get('hasData') is False
+                          and exif_result.get('verifiedNoExif') is True
+                          and exif_result.get('source') == 'server_metadata'):
+                        geo_exif = {}
+                    else:
+                        geo_exif = ipwork_geo.geo_exif_from_metadata(get_source_metadata())
+                    if geo_exif is not None:
+                        _ipwork_metric('geo_metadata_reused')
+            image_bytes = get_image_bytes(step) if geo_exif is None and packet_exif is None else None
+            input_kind = ('metadata_packet' if packet_exif is not None else 'stored_exif' if geo_exif is not None
+                          else 'preview' if visual_bytes_cache and image_bytes is visual_bytes_cache[0] else 'original')
+            worker_logger.info('ipwork input user=%s file=%s step=%s source=%s bytes=%d',
+                               user_id, filename, step, input_kind, len(image_bytes) if image_bytes is not None else 0)
+            processing_diagnostics.file_event('vision_input', user_id, filename, role='vision',
+                step=step, source=input_kind, bytes=len(image_bytes) if image_bytes is not None else 0)
+        except _VisualSourceUndecodable:
+            # First visual step to discover the shared source won't decode: emit
+            # the coherent reason here; the loop-top guard above handles the
+            # rest of this pass's visual steps without re-attempting the decode.
+            client_processing[step] = _failure_shape(step, 'source_undecodable')
+            processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                step=step, error=True, reason='source_undecodable')
+            continue
         except Exception as exc:
             worker_logger.exception('ipworker image download failed for %s/%s', user_id, filename)
             client_processing[step] = _failure_shape(step, 'download_failed')
+            processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                step=step, error=True, reason='download_failed')
             continue
         step_started = time.monotonic()
         try:
-            result = processor(user_id, filename, image_bytes)
+            if packet_exif is not None:
+                result = {'hasData': True, 'data': packet_exif, 'source': 'browser_metadata_packet'}
+                if packet_outcome == 'reused_no_exif':
+                    result['verifiedNoExif'] = True
+            else:
+                result = ipwork_geo.process_geo_from_exif(geo_exif) if geo_exif is not None else processor(user_id, filename, image_bytes)
             client_processing[step] = result if isinstance(result, dict) else _failure_shape(step, 'invalid_result_shape')
         except Exception as exc:
             worker_logger.exception('ipworker step %r failed for %s/%s', step, user_id, filename)
@@ -14797,14 +15221,25 @@ def _run_ipwork_steps(user_id: str, filename: str, steps: List[str]) -> Dict[str
             elapsed_ms = (time.monotonic() - step_started) * 1000
             step_ms[step] = round(elapsed_ms)
             _ipwork_metric('step_' + step, duration_ms=elapsed_ms, observation=True)
+            diagnostic = {}
+            if step == 'exif' and client_processing.get(step, {}).get('error'):
+                from exif_utils import ExifExtractionError
+                code = client_processing[step].get('errorCode')
+                allowed = {'exif_' + category for category in ExifExtractionError.CATEGORIES}
+                diagnostic['reason'] = code if isinstance(code, str) and code in allowed else 'exif_processing_failed'
+            processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                step=step, milliseconds=elapsed_ms, error=bool(client_processing.get(step, {}).get('error')), **diagnostic)
         # 'preview' is meant to run first (see IPWORK_STEPS/callers): once it
-        # succeeds, swap the ~2048px shrunk bytes into the shared cache so
-        # every later step this call (thumbnail/face/ocr/ai_vision) decodes
+        # succeeds, put the ~2048px shrunk bytes into the visual cache so
+        # every later visual step (thumbnail/face/ocr/ai_vision) decodes
         # that instead of re-downloading/re-decoding the full original --
-        # this is the whole point of ordering it first (see ipwork_preview.py).
-        if step == 'preview' and client_processing[step].get('hasData'):
+        # Metadata steps still receive the original with its EXIF/GPS intact.
+        if step == 'preview' and client_processing[step].get('hasData') and not use_original:
             try:
-                image_bytes_cache[0] = base64.b64decode(str(client_processing[step].get('data') or ''))
+                visual_bytes_cache[:] = [base64.b64decode(str(client_processing[step].get('data') or ''))]
+                from ipwork_image import rgb_image, remember_crop_preview
+                with rgb_image(visual_bytes_cache[0], 'preview.jpg') as pixels:
+                    remember_crop_preview(user_id, filename, get_source_metadata(), visual_bytes_cache[0], pixels.width, pixels.height)
             except Exception:
                 worker_logger.exception('ipworker failed to swap in shrunk preview bytes for %s/%s', user_id, filename)
     worker_logger.info(
@@ -14826,6 +15261,14 @@ def _ipwork_result_face_count(client_processing) -> int:
 
 
 def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> str:
+    from ipwork_image import crop_input_job, original_input_job
+    filename = str(payload.get('filename') or '').strip()
+    with original_input_job(user_id, filename), crop_input_job(user_id, filename), processing_diagnostics.media_download_scope(
+            'inference', user=user_id, filename=filename):
+        return _handle_ipwork_queue_payload_impl(payload, job_id, user_id)
+
+
+def _handle_ipwork_queue_payload_impl(payload: Dict, job_id: str, user_id: str) -> str:
     """Process one ipwork queue message. Returns 'done', 'noop', 'lease_busy',
     or 'not_found'.
 
@@ -14861,6 +15304,10 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     filename = str(payload.get('filename') or '').strip()
     steps = [str(s).strip() for s in (payload.get('steps') or []) if str(s).strip() in IPWORK_STEPS]
     if not filename or not user_id or not steps:
+        return 'noop'
+    if is_video_file(filename):
+        if job_id:
+            _upsert_job_status(job_id, user_id, 'ipwork', 'done')
         return 'noop'
     message_started = time.monotonic()
     _ipwork_metrics_context.source_bytes = 0
@@ -14935,7 +15382,13 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     lease_cleared_by_apply = False
     try:
         steps_started = time.monotonic()
-        client_processing = _ipwork_timed_call('steps', _run_ipwork_steps, user_id, filename, runnable_steps)
+        step_options = {}
+        if isinstance(lease.get('entity'), dict):
+            step_options['metadata_snapshot'] = dict(lease['entity'])
+        if payload.get('imageSource') == 'original':
+            step_options['use_original'] = True
+        client_processing = _ipwork_timed_call('steps', _run_ipwork_steps,
+            user_id, filename, runnable_steps, **step_options)
         steps_ms = round((time.monotonic() - steps_started) * 1000)
         apply_started = time.monotonic()
         metadata = _ipwork_timed_call('apply', apply_client_processing_results_for_file,
@@ -14946,10 +15399,11 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
             client_asset_id=f'ipworker:{job_id}',
             origin='ipworker',
             claimed_steps=runnable_steps,
+            lease_owner=lease_owner,
         )
         apply_ms = round((time.monotonic() - apply_started) * 1000)
         # apply_client_processing_results_for_file already clears the lease
-        # fields unconditionally once it returns -- mark that here so the
+        # fields in the fenced result commit once it returns -- mark that here so the
         # finally block below doesn't pay a redundant read+write re-releasing
         # a lease that's already cleared (same waste class just fixed on the
         # browser side, see browser AI heartbeat/release redundancy).
@@ -14992,6 +15446,11 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
             for step in runnable_steps)
         _ipwork_metric('productive_completed' if results_ok else
                        'completed_with_step_error' if explicit_error else 'completed_result_unknown')
+        processing_diagnostics.file_event('vision_result', user_id, filename, role='vision',
+            batch_id=processing_diagnostics.batch_id(payload.get('uploadBatchId')), productive=results_ok,
+            step_error=explicit_error, total_ms=(time.monotonic() - message_started) * 1000,
+            lease_ms=lease_claim_ms, apply_ms=apply_ms, steps_ms=steps_ms, cluster_ms=cluster_ms,
+            face_count=_ipwork_result_face_count(client_processing) if 'face' in runnable_steps else 0)
         source_bytes = _ipwork_metrics_context.source_bytes
         if results_ok:
             _ipwork_metric('productive_source_bytes', count=source_bytes)
@@ -15040,6 +15499,7 @@ def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> st
     return 'done'
 
 
+@processing_diagnostics.measured('vision', 'model_prewarm')
 def _prewarm_ipwork_models() -> None:
     """Synchronously triggers every lazily-created ipwork singleton once,
     before the worker pool starts, so the unlocked check-then-set race in
@@ -15052,33 +15512,37 @@ def _prewarm_ipwork_models() -> None:
     unavailable at request time."""
     try:
         import ipwork_face
-        ipwork_face._get_yolo_session()
-        ipwork_face._get_adaface_session()
-        ipwork_face._get_face_landmarker()
+        processing_diagnostics.call('vision', 'warm_face_detector', ipwork_face._get_yolo_session)
+        processing_diagnostics.call('vision', 'warm_face_embedding', ipwork_face._get_adaface_session)
+        processing_diagnostics.call('vision', 'warm_face_landmarker', ipwork_face._get_face_landmarker)
     except Exception:
         worker_logger.exception('ipwork_face model pre-warm failed')
     try:
         import vision_utils
-        vision_utils._load_model()
+        processing_diagnostics.call('vision', 'warm_clip', vision_utils._load_model)
     except Exception:
         worker_logger.exception('vision_utils CLIP model pre-warm failed')
     try:
         import ipwork_vision
-        ipwork_vision._load_vocabulary()
+        processing_diagnostics.call('vision', 'warm_vocabulary', ipwork_vision._load_vocabulary)
     except Exception:
         worker_logger.exception('ipwork_vision vocabulary pre-warm failed')
     try:
         import maps_utils
-        maps_utils._get_geocoder()
-        maps_utils.prewarm_offline_geocoder()
+        processing_diagnostics.call('vision', 'warm_geocoder', maps_utils._get_geocoder)
+        processing_diagnostics.call('vision', 'warm_geo_index', maps_utils.prewarm_offline_geocoder)
     except Exception:
         worker_logger.exception('maps_utils geocoder pre-warm failed')
 
 
+@processing_diagnostics.measured('vision', 'message', state='processing')
 def _process_ipwork_message(message) -> str:
+    processing_diagnostics.message_event('vision_started', message, role='vision')
     try:
-        with perf_instrumentation.scope('ipwork.message', dequeue=getattr(message, 'dequeue_count', None)):
-            return _process_ipwork_message_impl(message)
+        with processing_diagnostics.trace(message), perf_instrumentation.scope('ipwork.message', dequeue=getattr(message, 'dequeue_count', None)):
+            outcome = _process_ipwork_message_impl(message)
+            processing_diagnostics.message_event('vision_attempt', message, role='vision', outcome=outcome)
+            return outcome
     finally:
         flush_all_dirty_filename_buffers()      # the worker that builds the indexes is another process: publish the marks now
 
@@ -15174,6 +15638,10 @@ class _IpworkThroughputWindow:
         self.window = self.collector.window
         self.identity = replica_identity()
         self.config = {'concurrency': IPWORKER_CONCURRENCY,
+                       'shared_decode': IPWORK_SHARED_DECODE,
+                       'reuse_preview': IPWORK_REUSE_PREVIEW,
+                       'reuse_exif': IPWORK_REUSE_EXIF,
+                       'reuse_metadata_packet': IPWORK_REUSE_METADATA_PACKET,
                        'face_reconcile_batch_size': IPWORKER_FACE_RECONCILE_BATCH_SIZE,
                        'visibility_timeout_seconds': IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
                        'task_timeout_seconds': IPWORKER_TASK_TIMEOUT_SECONDS,
@@ -15203,8 +15671,13 @@ class _IpworkThroughputWindow:
         metrics['productive_per_hour'] = round(metrics['window']['productive_completed'] * 3600 / elapsed, 3) if elapsed > 0 else 0
         metrics['throughput_units'] = 'MB/hour/replica; 1 MB = 1000000 bytes'
         for rate, counter in (('downloaded_mb_per_hour', 'source_download_bytes'),
+                              ('preview_downloaded_mb_per_hour', 'preview_download_bytes'),
+                              ('metadata_downloaded_mb_per_hour', 'metadata_packet_download_bytes'),
                               ('productive_mb_per_hour', 'productive_source_bytes')):
             metrics[rate] = round(metrics['window'][counter] * 3600 / (elapsed * 1000000), 3) if elapsed > 0 else 0
+        transferred = (metrics['window']['source_download_bytes'] + metrics['window']['preview_download_bytes']
+                       + metrics['window']['metadata_packet_download_bytes'])
+        metrics['total_downloaded_mb_per_hour'] = round(transferred * 3600 / (elapsed * 1000000), 3) if elapsed > 0 else 0
         # Keep each console record small; a fully populated pair of histograms
         # can exceed log transport line limits. Main record retains quantiles,
         # counts and sums; full bucket arrays get fixed-label phase records.
@@ -15346,8 +15819,10 @@ def _prepare_ipwork_face_indexes(messages, cancelled) -> None:
                        (time.monotonic() - started) * 1000)
 
 
+@processing_diagnostics.worker('vision')
 def run_ipworker() -> None:
     """Poll the ipwork queue for jobs in a standalone container."""
+    processing_diagnostics.emit('worker_import_complete', role='vision', seconds=max(0, time.monotonic() - _APP_IMPORT_STARTED_AT))
     logging.basicConfig(
         level=os.getenv('LOG_LEVEL', 'INFO').upper(),
         format='%(asctime)s %(levelname)s %(name)s %(message)s',
@@ -15419,6 +15894,8 @@ def run_ipworker() -> None:
     task_started = {}
     task_receipts = {}  # bounded by executor slots, monotonic timestamps only
     throughput = _IpworkThroughputWindow()
+    processing_diagnostics.ready('vision', concurrency=IPWORKER_CONCURRENCY,
+        preparation_batch_size=batch_size)
     collector = throughput.collector
     wave_started = None
     wave_receipt_at = None
@@ -15583,6 +16060,7 @@ def run_ipworker() -> None:
                     throughput.record('received', count=len(messages))
                     received_at = time.monotonic()
                     for message in messages:
+                        processing_diagnostics.message_event('vision_received', message, role='vision')
                         try:
                             collector.observe('retry_depth', int(getattr(message, 'dequeue_count', 0) or 0))
                         except (TypeError, ValueError, OverflowError):
@@ -15703,6 +16181,7 @@ def run_ipworker() -> None:
                         worker_logger.exception('Failed to delete ipwork queue message')
                     else:
                         throughput.record('ack', (time.monotonic() - ack_started) * 1000)
+                        processing_diagnostics.message_event('vision_acknowledged', message, role='vision', outcome=outcome)
                         collector.observe('receipt_to_ack', (time.monotonic() - received_at) * 1000)
             except Exception:
                 worker_logger.exception('ipwork queue polling iteration failed')

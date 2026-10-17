@@ -27,7 +27,7 @@ from image_utils import (
     is_video_file,
 )
 
-HEIF_EXTENSIONS = {'heic', 'heif'}
+HEIF_EXTENSIONS = {'heic', 'heif', 'hif'}
 
 
 def _filename_extension(filename: str) -> str:
@@ -40,7 +40,7 @@ def _looks_like_jpeg_bytes(data: bytes) -> bool:
 
 def _create_thumbnail_bytes(image_bytes: bytes, filename: str) -> Optional[bytes]:
     if is_video_file(filename):
-        return create_video_thumbnail_data(image_bytes, filename)
+        return None
     ext = _filename_extension(filename)
     if ext in HEIF_EXTENSIONS:
         preview_bytes = convert_image_to_jpeg(image_bytes, filename)
@@ -56,6 +56,8 @@ def _create_thumbnail_bytes(image_bytes: bytes, filename: str) -> Optional[bytes
 
 
 def process_thumbnail(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
+    if is_video_file(filename):
+        return {'hasData': False, 'error': 'video_browser_only'}
     try:
         thumbnail_bytes = _create_thumbnail_bytes(image_bytes, filename)
     except Exception as exc:

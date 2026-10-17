@@ -694,6 +694,67 @@ def test_expired_writer_cannot_renew_or_complete(lookup_ctx):
     assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') is None
 
 
+def test_short_face_write_keeps_fences_without_redundant_renewal_puts(lookup_ctx, caplog):
+    _, lookup = lookup_ctx
+    with caplog.at_level('INFO', logger='processing_diagnostics'):
+        storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0), _face(100)])
+    # Acquire + two fresh checks per face + final CAS publication.
+    assert len(lookup.gets) == 6
+    assert [row['state'] for row in lookup.writes] == ['writing', 'complete']
+    assert len(lookup.updates) == 1
+    events = [json.loads(record.getMessage().removeprefix('processing telemetry '))
+              for record in caplog.records if 'face_index_lease_check' in record.getMessage()]
+    assert len(events) == 4 and all(event['renewed'] is False for event in events)
+    assert 'photo.jpg' not in json.dumps(events)
+
+
+@pytest.mark.parametrize('seconds,renewed', [(100, False), (89, True), (1, True)])
+def test_face_lease_renewal_uses_durable_headroom(lookup_ctx, seconds, renewed):
+    _, lookup = lookup_ctx
+    generation, _ = storage_utils._begin_face_filename_write('u1', 'photo.jpg')
+    row = dict(lookup.rows[('u1', 'photo.jpg')])
+    row['leaseExpiresAt'] = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+    lookup.upsert_entity(row)
+    before = len(lookup.updates)
+    storage_utils._renew_face_filename_write('u1', 'photo.jpg', generation)
+    assert len(lookup.updates) - before == int(renewed)
+    if renewed:
+        expires = datetime.fromisoformat(lookup.rows[('u1', 'photo.jpg')]['leaseExpiresAt'])
+        assert (expires - datetime.now(timezone.utc)).total_seconds() > 110
+        storage_utils._renew_face_filename_write('u1', 'photo.jpg', generation)
+        assert len(lookup.updates) == before + 1
+
+
+def test_skipped_renewal_still_detects_generation_loss_before_face_write(lookup_ctx, monkeypatch):
+    faces, lookup = lookup_ctx
+    embeddings = AzureFaceTable()
+    monkeypatch.setitem(storage_utils._CTX, 'face_embeddings_table_client', embeddings)
+    original = embeddings.upsert_entity
+    def steal_after_embedding(entity):
+        original(entity)
+        successor = dict(lookup.rows[('u1', 'photo.jpg')])
+        successor['generation'] = 'b' * 32
+        lookup.upsert_entity(successor)
+    monkeypatch.setattr(embeddings, 'upsert_entity', steal_after_embedding)
+    with pytest.raises(storage_utils.FaceFilenameLookupRetryableError, match='lost its lease'):
+        storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0)])
+    assert len(embeddings.writes) == 1 and faces.writes == []
+    assert lookup.rows[('u1', 'photo.jpg')]['generation'] == 'b' * 32
+
+
+def test_due_face_renewal_still_requires_successful_cas(lookup_ctx, monkeypatch):
+    _, lookup = lookup_ctx
+    generation, _ = storage_utils._begin_face_filename_write('u1', 'photo.jpg')
+    row = dict(lookup.rows[('u1', 'photo.jpg')])
+    row['leaseExpiresAt'] = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+    lookup.upsert_entity(row)
+    def conflict(*a, **k):
+        raise ResourceModifiedError('renewal conflict')
+    monkeypatch.setattr(lookup, 'update_entity', conflict)
+    with pytest.raises(ResourceModifiedError):
+        storage_utils._renew_face_filename_write('u1', 'photo.jpg', generation)
+
+
 def test_completion_committed_but_response_failed_is_conditionally_dirtied(lookup_ctx, monkeypatch):
     _, lookup = lookup_ctx
     original_update = lookup.update_entity
@@ -815,7 +876,12 @@ def test_failed_forced_result_preserves_real_source_curation_and_lookup(lookup_c
         {'face': {'faces': [_face(0)] if partial else [], 'rawFaceCount': 2,
                   'faceFailureStage': 'postprocessing_failed', 'filteredFaceCount': 1 if partial else 2}},
         [], 'ipworker:failed-job', origin='ipworker', claimed_steps=['face'])
-    assert metadata['face_status'] == 'failed'
+    # partial=True embedded one real face, so the step met its primary purpose
+    # ('done') even though a secondary candidate failed; partial=False embedded
+    # nothing and stays 'failed'. Either way curation/source/lookup below are
+    # preserved identically (the real point of this test) -- the status value
+    # does not change those writes.
+    assert metadata['face_status'] == ('done' if partial else 'failed')
     assert metadata['faceCount'] == 2
     assert len(json.loads(metadata['faces'])) == 2
     assert faces.get_entity('u1', original_ids[1]) == curated

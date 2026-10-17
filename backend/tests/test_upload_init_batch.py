@@ -130,3 +130,25 @@ def test_batch_reuses_reservation_for_a_genuine_resume_of_the_same_content(batch
         {'filename': 'IP_image.heic', 'total_size': 900, 'expected_hash': 'h-same-photo', 'is_fresh': True},
     ])
     assert result['IP_image.heic'] == 'existing-uuid'
+
+
+def test_isolation_is_committed_atomically_with_blob_reservation(batch_ctx):
+    fields = {'processingIsolated': True, 'benchmarkRunId': 'run-12345678', 'benchmarkArm': 'originals'}
+    result = storage_utils.reset_upload_tracking_and_reserve_blobs_batch('lib-A', [
+        {'filename': 'rawbench-run-12345678-originals-00000.cr3', 'total_size': 100,
+         'expected_hash': 'a' * 64, 'is_fresh': True, 'initial_metadata': fields}])
+    row = batch_ctx.get_entity('lib-A', 'rawbench-run-12345678-originals-00000.cr3')
+    assert row['processingIsolated'] is True
+    assert row['pendingAnonymousBlob'] == next(iter(result.values()))
+    assert batch_ctx.transaction_calls == [1]
+
+
+def test_isolated_reservation_failure_is_not_silently_accepted(batch_ctx, monkeypatch):
+    def unavailable(*args):
+        raise RuntimeError('Storage unavailable')
+    monkeypatch.setattr(batch_ctx, 'submit_transaction', unavailable)
+    monkeypatch.setattr(batch_ctx, 'upsert_entity', unavailable)
+    with pytest.raises(RuntimeError):
+        storage_utils.reset_upload_tracking_and_reserve_blobs_batch('lib-A', [
+            {'filename': 'benchmark.cr3', 'total_size': 100, 'is_fresh': True,
+             'initial_metadata': {'processingIsolated': True}}])

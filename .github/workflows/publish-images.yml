@@ -34,6 +34,11 @@ on:
         description: 'Additional image tag to publish alongside :latest and the auto date-time tag (optional)'
         required: false
         default: ''
+      publish_latest:
+        description: 'Update the shared :latest tags (disable for sandbox branch deployments)'
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -120,7 +125,7 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:latest
+            ${{ inputs.publish_latest && format('ghcr.io/{0}/photostore-{1}:latest', steps.owner.outputs.owner, matrix.name) || '' }}
             ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ github.sha }}
             ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ steps.ts.outputs.tag }}
             ${{ inputs.tag != '' && format('ghcr.io/{0}/photostore-{1}:{2}', steps.owner.outputs.owner, matrix.name, inputs.tag) || '' }}

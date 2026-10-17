@@ -425,6 +425,14 @@ const PrototypeApp: React.FC = () => {
 
     const handleSignOut = useCallback(async () => {
         await signOut();
+        // signOut() wipes the token + this account's cached library data
+        // (see clientDataReset.ts). Reload rather than just refreshing auth
+        // state so the in-memory store drops the signed-out account's photos
+        // too -- otherwise they linger until the next login reboots the app.
+        if (typeof window !== 'undefined' && isAuthEnabled()) {
+            window.location.assign('/login');
+            return;
+        }
         await refreshAuthState();
     }, [refreshAuthState]);
 

@@ -1,14 +1,22 @@
 """Local-only diagnostics contracts: fake clocks, queues, and sweep phases."""
 from concurrent.futures import Future, ThreadPoolExecutor
 import base64
+import io
 import json
 import logging
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 import app
 import ipworker_metrics as metrics_module
+
+
+def _decodable_jpeg() -> bytes:
+    buffer = io.BytesIO()
+    Image.new('RGB', (8, 8), 'white').save(buffer, 'JPEG')
+    return buffer.getvalue()
 
 
 class _StopLoop(BaseException):
@@ -113,11 +121,14 @@ def test_byte_throughput_uses_decimal_mb_and_actual_replica_time(clock, memory_s
     caplog.set_level(logging.INFO, logger=app.worker_logger.name)
     window = app._IpworkThroughputWindow()
     window.record('source_download_bytes', count=3000000)
+    window.record('preview_download_bytes', count=500000)
     window.record('productive_source_bytes', count=2000000)
     clock.seconds += elapsed
     window.log(0, force=True)
     first, = _metrics(caplog)
     assert first['downloaded_mb_per_hour'] == (round(3 * 3600 / elapsed, 3) if elapsed else 0)
+    assert first['preview_downloaded_mb_per_hour'] == (round(.5 * 3600 / elapsed, 3) if elapsed else 0)
+    assert first['total_downloaded_mb_per_hour'] == (round(3.5 * 3600 / elapsed, 3) if elapsed else 0)
     assert first['productive_mb_per_hour'] == (round(2 * 3600 / elapsed, 3) if elapsed else 0)
     assert first['throughput_units'] == 'MB/hour/replica; 1 MB = 1000000 bytes'
     clock.seconds += 60
@@ -125,6 +136,7 @@ def test_byte_throughput_uses_decimal_mb_and_actual_replica_time(clock, memory_s
     second = _metrics(caplog)[1]
     assert second['window']['source_download_bytes'] == second['window']['productive_source_bytes'] == 0
     assert second['downloaded_mb_per_hour'] == second['productive_mb_per_hour'] == 0
+    assert second['preview_downloaded_mb_per_hour'] == second['total_downloaded_mb_per_hour'] == 0
     assert second['cumulative']['source_download_bytes'] == 3000000
     assert second['cumulative']['productive_source_bytes'] == 2000000
 
@@ -520,11 +532,15 @@ def test_step_and_failed_download_timing_without_storage_changes(monkeypatch, cl
     monkeypatch.setattr(app._ipwork_metrics_context, 'collector', collector, raising=False)
     monkeypatch.setattr(app, '_get_metadata_entity', lambda *a: {})
     downloads = []
+    # Decodable so the one shared canonical-decode step passes and both visual
+    # processors actually run (this test measures step/download timing, not the
+    # undecodable-source path, which is covered in test_run_ipwork_steps.py).
+    photo = _decodable_jpeg()
 
     def download(*args):
         downloads.append(args)
         clock.seconds += 0.02
-        return b'photo'
+        return photo
 
     def step(*args):
         clock.seconds += 0.03
@@ -532,11 +548,11 @@ def test_step_and_failed_download_timing_without_storage_changes(monkeypatch, cl
 
     monkeypatch.setattr(app, 'download_media_bytes', download)
     monkeypatch.setattr(app, 'IPWORK_STEP_PROCESSORS', {'ocr': step, 'face': step})
-    results = app._run_ipwork_steps('u', 'f', ['ocr', 'face'])
+    results = app._run_ipwork_steps('u', 'f.jpg', ['ocr', 'face'])
     assert results == {'ocr': {'hasData': False}, 'face': {'hasData': False}}
     assert len(downloads) == 1
     sample = collector.snapshot(1, 1)
-    assert sample['window']['source_download_bytes'] == len(b'photo')
+    assert sample['window']['source_download_bytes'] == len(photo)
     summary = sample['histograms']['window']
     assert summary['download']['count'] == 1
     assert summary['download']['sum'] == 20
