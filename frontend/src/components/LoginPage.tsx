@@ -27,7 +27,6 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
     const [resetSent, setResetSent] = useState(false);
-    const navigate = useNavigate();
 
     const handleLogin = async (event: React.FormEvent) => {
         event.preventDefault();
@@ -43,7 +42,12 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
             if (onAuthenticated) {
                 await onAuthenticated();
             }
-            navigate('/');
+            // Full reload rather than an SPA navigate: the store and the
+            // per-library caches are populated at boot, so a signed-in reboot
+            // is the clean way to load exactly this account's library. An SPA
+            // navigate would leave any previous session's in-memory photos in
+            // place (see clientDataReset.ts / the 2026-10-17 account-switch bug).
+            window.location.assign('/');
         } catch (error) {
             setErrorMessage(error instanceof Error ? error.message : 'Sign in failed.');
         } finally {

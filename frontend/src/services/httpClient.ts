@@ -2,6 +2,7 @@ import axios, { type AxiosHeaders, type AxiosRequestConfig, type InternalAxiosRe
 import { getAccessToken, isAuthEnabled } from './authClient';
 import { reportBackendReachable, reportBackendUnreachable } from './backendStatus';
 import { classifyApiError, newRequestId } from './apiError';
+import { reportUnauthorized } from './sessionExpiry';
 import { parseServerTiming, perf, perfEnabled, perfNow, requestKey, stripQuery } from './perf';
 
 const PERF_REPORT_PATH = '/api/perf/client';
@@ -220,6 +221,14 @@ export const requestJson = async <T = any>(
                     // wake, not just a warm-replica hiccup.
                     await sleep(Math.min(COLD_START_MAX_DELAY_MS, COLD_START_BASE_DELAY_MS * 2 ** attempt));
                     continue;
+                }
+                // A 401 means the session token is missing/invalid (the backend
+                // uses 403 for permission failures), so the app can't recover in
+                // place -- hand off to the global session-expiry handler, which
+                // clears the dead session and reloads into login exactly once.
+                // Guarded there against public routes and no-auth deployments.
+                if (axios.isAxiosError(error) && error.response?.status === 401) {
+                    reportUnauthorized();
                 }
                 // Terminal outcome: classify once, then feed the app-wide
                 // availability tracker and throw the typed error to the caller.
