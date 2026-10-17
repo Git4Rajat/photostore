@@ -876,7 +876,12 @@ def test_failed_forced_result_preserves_real_source_curation_and_lookup(lookup_c
         {'face': {'faces': [_face(0)] if partial else [], 'rawFaceCount': 2,
                   'faceFailureStage': 'postprocessing_failed', 'filteredFaceCount': 1 if partial else 2}},
         [], 'ipworker:failed-job', origin='ipworker', claimed_steps=['face'])
-    assert metadata['face_status'] == 'failed'
+    # partial=True embedded one real face, so the step met its primary purpose
+    # ('done') even though a secondary candidate failed; partial=False embedded
+    # nothing and stays 'failed'. Either way curation/source/lookup below are
+    # preserved identically (the real point of this test) -- the status value
+    # does not change those writes.
+    assert metadata['face_status'] == ('done' if partial else 'failed')
     assert metadata['faceCount'] == 2
     assert len(json.loads(metadata['faces'])) == 2
     assert faces.get_entity('u1', original_ids[1]) == curated

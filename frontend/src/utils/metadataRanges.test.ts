@@ -106,6 +106,137 @@ test('large metadata-bearing JPEG keeps bounded legacy header transport instead 
     expect(result.jpegPassthrough).toBeNull();
 });
 
+test('camera JPEG larger than packet payload can retain complete markers within its read budget', async () => {
+    const {bytes} = plainJpeg(10000);
+    const segment = [255, 225, 0, 8, 69, 120, 105, 102, 0, 0];
+    const source = new Uint8Array([...Array.from(bytes.slice(0, 2)), ...segment, ...Array.from(bytes.slice(2))]);
+    const {result} = await rebuild(source, 4096);
+    expect(result.chunks.at(-1)?.offset).toBe(source.length - 2);
+    expect(result.payloadBytes).toBeLessThan(4096);
+    expect(result.readBytes).toBeLessThan(4096 * 8);
+    expect(result.jpegPassthrough).toBeNull();
+});
+
+function mpfJpeg(imageCount = 2, little = false, scanSize = 800, child?: Uint8Array) {
+    const first = plainJpeg(scanSize), children = Array.from({length: imageCount - 1}, () => child || plainJpeg(scanSize).bytes);
+    const body = new Uint8Array(54 + imageCount * 16), view = new DataView(body.buffer);
+    body.set(new TextEncoder().encode(little ? 'MPF\0II' : 'MPF\0MM'));
+    view.setUint16(6, 42, little); view.setUint32(8, 8, little);
+    ifd(view, 12, [[0xb000, 7, 4, little ? 0x30303130 : 0x30313030],
+        [0xb001, 4, 1, imageCount], [0xb002, 7, imageCount * 16, 50]], little);
+    const segment = new Uint8Array(body.length + 4);
+    segment.set([255, 226]); new DataView(segment.buffer).setUint16(2, body.length + 2);
+    const firstLength = first.bytes.length + segment.length, tiffBase = 10;
+    const extents = [{offset: 0, length: firstLength, scanStart: first.scanStart + segment.length}];
+    let offset = firstLength;
+    for (const bytes of children) {
+        extents.push({offset, length: bytes.length, scanStart: offset + plainJpeg(scanSize).scanStart});
+        offset += bytes.length;
+    }
+    extents.forEach((image, i) => {
+        const pos = 54 + i * 16;
+        view.setUint32(pos, i === 0 ? 0x030000 : 0, little);
+        view.setUint32(pos + 4, image.length, little);
+        view.setUint32(pos + 8, i === 0 ? 0 : image.offset - tiffBase, little);
+    });
+    segment.set(body, 4);
+    const bytes = new Uint8Array(offset);
+    bytes.set(first.bytes.subarray(0, 2)); bytes.set(segment, 2); bytes.set(first.bytes.subarray(2), 2 + segment.length);
+    children.forEach((child, i) => bytes.set(child, extents[i + 1].offset));
+    return {bytes, view: new DataView(bytes.buffer), extents, entries: 60, tiffBase};
+}
+
+test.each([false, true])('MPF retains each JPEG metadata header and EOI without scan pixels (little=%s)', async little => {
+    const {bytes, extents} = mpfJpeg(3, little);
+    const {copy, result} = await rebuild(bytes);
+    for (const image of extents) {
+        expect(copy.slice(image.offset, image.scanStart)).toEqual(bytes.slice(image.offset, image.scanStart));
+        expect(copy.slice(image.scanStart, image.offset + image.length - 2)).toEqual(new Uint8Array(800));
+        expect(Array.from(copy.slice(image.offset + image.length - 2, image.offset + image.length))).toEqual([255, 217]);
+    }
+    expect(result.jpegPassthrough).toBeNull();
+    expect(result.chunks).toHaveLength(4);
+    expect(result.payloadBytes).toBe(bytes.length - 3 * 800);
+    expect(result.jpegStructureFailure).toBeNull();
+});
+
+test('MPF child JPEG preserves progressive headers and metadata after scans', async () => {
+    const after = [255, 254, 0, 6, 77, 69, 84, 65, 255, 218, 0, 8, 1, 1, 0, 1, 63, 0, 33, 33];
+    const child = plainJpeg(800, after); child.bytes[21] = 0xc2;
+    const {bytes, extents} = mpfJpeg(2, false, 800, child.bytes);
+    const {copy, result} = await rebuild(bytes);
+    const metadata = extents[1].offset + child.scanStart + 800;
+    expect(copy.slice(metadata, metadata + 18)).toEqual(bytes.slice(metadata, metadata + 18));
+    expect(copy.slice(extents[1].offset + child.scanStart, metadata)).toEqual(new Uint8Array(800));
+    expect(Array.from(copy.slice(-2))).toEqual([255, 217]);
+    expect(result.jpegPassthrough).toBeNull();
+});
+
+test('MPF supports 32 images within the shared metadata budget', async () => {
+    const {bytes, extents} = mpfJpeg(32);
+    const {copy, result} = await rebuild(bytes);
+    expect(extents.every(image => copy[image.offset + image.length - 2] === 255 && copy[image.offset + image.length - 1] === 217)).toBe(true);
+    expect(result.readBytes).toBeLessThan(128 * 1024);
+    await expect(rebuild(mpfJpeg(32, false, 4).bytes, 1024)).rejects.toThrow('budget');
+});
+
+test.each(['magic', 'ifd-offset', 'ifd-cycle', 'ifd-overlap', 'ifd-count', 'image-count', 'entry-type',
+    'entry-size', 'entry-offset', 'duplicate-count', 'first-offset', 'first-length', 'child-format',
+    'child-offset', 'child-length', 'duplicate-child', 'dependency', 'child-soi', 'child-eoi', 'primary-eoi', 'child-frame', 'primary-frame',
+    'extra-tail', 'too-many'])('unproven MPF %s retains only the legacy fallback', async fault => {
+    let {bytes, view, extents, entries} = mpfJpeg(3);
+    if (fault === 'magic') view.setUint16(12, 43);
+    if (fault === 'ifd-offset') view.setUint32(14, 0xffffffff);
+    if (fault === 'ifd-cycle') view.setUint32(56, 8);
+    if (fault === 'ifd-overlap') view.setUint32(52, 8);
+    if (fault === 'ifd-count') view.setUint16(18, 4097);
+    if (fault === 'image-count') view.setUint32(40, 4);
+    if (fault === 'entry-type') view.setUint16(46, 4);
+    if (fault === 'entry-size') view.setUint32(48, 31);
+    if (fault === 'entry-offset') view.setUint32(52, 0xffffffff);
+    if (fault === 'duplicate-count') view.setUint16(20, 0xb001);
+    if (fault === 'first-offset') view.setUint32(entries + 8, 1);
+    if (fault === 'first-length') view.setUint32(entries + 4, extents[0].length - 1);
+    if (fault === 'child-format') view.setUint32(entries + 16, 0x01000000);
+    if (fault === 'child-offset') view.setUint32(entries + 24, 0xffffffff);
+    if (fault === 'child-length') view.setUint32(entries + 20, bytes.length);
+    if (fault === 'duplicate-child') view.setUint32(entries + 40, view.getUint32(entries + 24));
+    if (fault === 'dependency') view.setUint16(entries + 12, 4);
+    if (fault === 'child-soi') bytes[extents[1].offset + 1] = 0;
+    if (fault === 'child-eoi') bytes[extents[1].offset + extents[1].length - 1] = 0;
+    if (fault === 'primary-eoi') bytes[extents[0].length - 1] = 0;
+    if (fault === 'child-frame') bytes[extents[1].offset + 21] = 0xfe;
+    if (fault === 'primary-frame') bytes[extents[0].scanStart - 22] = 0xfe;
+    if (fault === 'extra-tail') bytes = new Uint8Array([...Array.from(bytes), 0]);
+    if (fault === 'too-many') ({bytes} = mpfJpeg(33));
+    const {copy, result} = await rebuild(bytes);
+    expect(result.chunks).toHaveLength(1);
+    expect(copy.slice(-2)).toEqual(new Uint8Array(2));
+    expect(result.jpegPassthrough).toBeNull();
+    expect(result.jpegStructureFailure).toMatch(/MPF|JPEG/);
+});
+
+test('MPF nested indexes do not recursively expand the image traversal', async () => {
+    const {bytes} = mpfJpeg(2, false, 800, mpfJpeg().bytes);
+    const {result} = await rebuild(bytes);
+    expect(result.chunks).toHaveLength(1);
+    expect(result.jpegPassthrough).toBeNull();
+});
+
+test('MPF child attribute-only TIFF is retained without requiring a nested index', async () => {
+    const child = plainJpeg(800), body = new Uint8Array(30), view = new DataView(body.buffer);
+    body.set(new TextEncoder().encode('MPF\0II'));
+    view.setUint16(6, 42, true); view.setUint32(8, 8, true);
+    ifd(view, 12, [[0xb101, 4, 1, 2]]);
+    const segment = new Uint8Array(34); segment.set([255, 226, 0, 32]); segment.set(body, 4);
+    const withAttribute = new Uint8Array(child.bytes.length + segment.length);
+    withAttribute.set(child.bytes.subarray(0, 2)); withAttribute.set(segment, 2); withAttribute.set(child.bytes.subarray(2), 36);
+    const {bytes, extents} = mpfJpeg(2, false, 800, withAttribute);
+    const {copy} = await rebuild(bytes);
+    expect(copy.slice(extents[1].offset, extents[1].offset + 36)).toEqual(bytes.slice(extents[1].offset, extents[1].offset + 36));
+    expect(Array.from(copy.slice(-2))).toEqual([255, 217]);
+});
+
 function webp(imageSize = 600, lossless = false) {
     const parts: Uint8Array[] = [], offsets: Record<string, number> = {};
     let pos = 12;
@@ -538,4 +669,162 @@ test('Mamiya bad linked IFD is tolerated only inside a fully retained MakerNote'
     view.setUint32(454, 1024, true);
     view.setUint16(1804, 16, true);
     await expect(rebuild(bytes)).rejects.toThrow('Incomplete');
+});
+
+function samsungPreview() {
+    const bytes = new Uint8Array(16384), view = new DataView(bytes.buffer);
+    bytes.set([73, 73, 42, 0, 8, 0, 0, 0]);
+    ifd(view, 8, [[0x010f, 2, 8, 300], [0x0110, 2, 8, 320], [0x8769, 4, 1, 400],
+        [0x0111, 4, 1, 4096], [0x0117, 4, 1, 8192]]);
+    bytes.set(new TextEncoder().encode('SAMSUNG\0'), 300);
+    bytes.set(new TextEncoder().encode('NX mini\0'), 320);
+    ifd(view, 400, [[0x927c, 7, 256, 512]]);
+    ifd(view, 512, [[1, 7, 4, 0x30303130], [0x0035, 4, 1, 256]]);
+    const preview = plainJpeg(256);
+    ifd(view, 768, [[0x0103, 3, 1, 6], [0x011a, 5, 1, 600], [0x011b, 5, 1, 608],
+        [0x0201, 4, 1, 1000], [0x0202, 4, 1, preview.bytes.length]]);
+    bytes.set([72, 0, 0, 0, 1, 0, 0, 0, 96, 0, 0, 0, 1, 0, 0, 0], 1112);
+    bytes.set(preview.bytes, 1512);
+    bytes.fill(99, 4096, 12288);
+    return {bytes, view, scanStart: 1512 + preview.scanStart};
+}
+
+test('Samsung external PreviewIFD retains relative resolutions and JPEG metadata without pixels', async () => {
+    const {bytes, scanStart} = samsungPreview();
+    const {copy, result} = await rebuild(bytes, 1024);
+    expect(copy.slice(768, 834)).toEqual(bytes.slice(768, 834));
+    expect(copy.slice(1112, 1128)).toEqual(bytes.slice(1112, 1128));
+    expect(copy.slice(1512, scanStart)).toEqual(bytes.slice(1512, scanStart));
+    expect(copy.slice(scanStart, scanStart + 256)).toEqual(new Uint8Array(256));
+    expect(copy.slice(4096, 12288)).toEqual(new Uint8Array(8192));
+    expect(result.payloadBytes).toBeLessThan(1024);
+    expect(result.readBytes).toBeLessThan(2048);
+});
+
+test.each(['pointer-type', 'pointer-count', 'offset-base', 'directory-count', 'value-offset',
+    'jpeg-type', 'jpeg-length', 'missing-jpeg', 'next-ifd', 'maker-count'])('Samsung external preview rejects %s', async fault => {
+    const {bytes, view} = samsungPreview();
+    if (fault === 'pointer-type') view.setUint16(528, 3, true);
+    if (fault === 'pointer-count') view.setUint32(530, 2, true);
+    if (fault === 'offset-base') view.setUint32(534, 0xffffffff, true);
+    if (fault === 'directory-count') view.setUint16(768, 4097, true);
+    if (fault === 'value-offset') view.setUint32(790, 0xffffffff, true);
+    if (fault === 'jpeg-type') view.setUint16(808, 3, true);
+    if (fault === 'jpeg-length') view.setUint32(826, bytes.length, true);
+    if (fault === 'missing-jpeg') view.setUint32(814, 0, true);
+    if (fault === 'next-ifd') view.setUint32(830, 0xffffffff, true);
+    if (fault === 'maker-count') view.setUint16(512, 100, true);
+    await expect(rebuild(bytes)).rejects.toThrow('Incomplete');
+});
+
+test('Samsung external preview stays within read and merged payload budgets', async () => {
+    const {bytes, view} = samsungPreview();
+    await expect(rebuild(bytes, 512)).rejects.toThrow('budget');
+    view.setUint32(786, 1024, true);
+    await expect(rebuild(bytes, 1024)).rejects.toThrow('Incomplete');
+});
+
+test('Samsung Type2 traversal requires its make and version signatures', async () => {
+    const {bytes} = samsungPreview();
+    bytes[300] = 88;
+    expect((await rebuild(bytes)).copy.slice(768, 834)).toEqual(new Uint8Array(66));
+    bytes[300] = 83; bytes[522] = 88;
+    expect((await rebuild(bytes)).copy.slice(768, 834)).toEqual(new Uint8Array(66));
+});
+
+function kodakDirectories(little = true, legacy = true) {
+    const bytes = new Uint8Array(16384), view = new DataView(bytes.buffer);
+    bytes.set(little ? [73, 73, 42, 0, 8, 0, 0, 0] : [77, 77, 0, 42, 0, 0, 0, 8]);
+    const make = new TextEncoder().encode('EASTMAN KODAK COMPANY\0');
+    const model = new TextEncoder().encode('KODAK P712 ZOOM DIGITAL CAMERA\0');
+    ifd(view, 8, [[0x010f, 2, make.length, 300], [0x0110, 2, model.length, 324],
+        [0x8769, 4, 1, 400], [0xfe00, 4, 1, 2048], [0x0111, 4, 1, 4096], [0x0117, 4, 1, 8192]], little);
+    bytes.set(make, 300); bytes.set(model, 324);
+    ifd(view, 400, legacy ? [[0x927c, 7, 64, 512], [0xa005, 4, 1, 314]] : [], little);
+    ifd(view, 512, [[0xff00, 4, 1, 768], [0x0f00, 7, 16, 1000]], little);
+    ifd(view, 768, [[0xf900, 3, 1, little ? 3000 : 3000 << 16], [0xfa04, 2, 16, 1100]], little);
+    bytes.set(new TextEncoder().encode('CAMERA-12345678\0\0'), 1100);
+    bytes.fill(44, 1000, 1016);
+    ifd(view, 2048, [[0xfa00, 2, 16, 2200], [0xfa0d, 1, 1, little ? 3 : 3 << 24],
+        [0xfa25, 4, 3, 2300], [0xfa29, 4, 3, 2312]], little);
+    bytes.set(new TextEncoder().encode('SERIAL-12345678\0\0'), 2200);
+    for (let i = 0; i < 6; i++) view.setUint32(2300 + i * 4, 65536 + i * 100, little);
+    bytes.fill(99, 4096, 12288);
+    return {bytes, view};
+}
+
+test.each([true, false])('Kodak KDC_IFD retains serial and white balance values without sensor data (little=%s)', async little => {
+    const {bytes} = kodakDirectories(little, false);
+    const {copy, result} = await rebuild(bytes, 1024);
+    expect(copy.slice(2048, 2102)).toEqual(bytes.slice(2048, 2102));
+    expect(copy.slice(2200, 2216)).toEqual(bytes.slice(2200, 2216));
+    expect(copy.slice(2300, 2324)).toEqual(bytes.slice(2300, 2324));
+    expect(copy.slice(4096, 12288)).toEqual(new Uint8Array(8192));
+    expect(result.payloadBytes).toBeLessThan(1024);
+});
+
+test('Kodak legacy absolute CameraInfo and invalid Interop prefix survive outside MakerNote bounds', async () => {
+    const {bytes} = kodakDirectories();
+    const {copy, result} = await rebuild(bytes, 1024);
+    expect(copy.slice(314, 328)).toEqual(bytes.slice(314, 328));
+    expect(copy.slice(768, 794)).toEqual(bytes.slice(768, 794));
+    expect(copy.slice(1000, 1016)).toEqual(bytes.slice(1000, 1016));
+    expect(copy.slice(1100, 1116)).toEqual(bytes.slice(1100, 1116));
+    expect(copy.slice(4096, 12288)).toEqual(new Uint8Array(8192));
+    expect(result.readBytes).toBeLessThan(2048);
+});
+
+test.each(['make', 'model', 'outside-make', 'other-overlap', 'model-layout', 'valid-format', 'camera-type', 'camera-offset',
+    'camera-value', 'kdc-type', 'kdc-count', 'kdc-offset', 'kdc-entries', 'kdc-value'])('Kodak malformed/unknown profile rejects %s', async fault => {
+    const {bytes, view} = kodakDirectories();
+    if (fault === 'make') bytes[300] = 88;
+    if (fault === 'model') bytes[330] = 88;
+    if (fault === 'outside-make') view.setUint32(422, 12000, true);
+    if (fault === 'other-overlap') view.setUint32(422, 316, true);
+    if (fault === 'model-layout') {
+        bytes.copyWithin(1500, 324, 354);
+        view.setUint32(30, 1500, true);
+    }
+    if (fault === 'valid-format') view.setUint16(318, 3, true);
+    if (fault === 'camera-type') view.setUint16(516, 3, true);
+    if (fault === 'camera-offset') view.setUint32(522, 0xffffffff, true);
+    if (fault === 'camera-value') view.setUint32(790, 0xffffffff, true);
+    if (fault === 'kdc-type') view.setUint16(48, 3, true);
+    if (fault === 'kdc-count') view.setUint32(50, 2, true);
+    if (fault === 'kdc-offset') view.setUint32(54, 0xffffffff, true);
+    if (fault === 'kdc-entries') view.setUint16(2048, 4097, true);
+    if (fault === 'kdc-value') view.setUint32(2058, 0xffffffff, true);
+    // With an unknown Make, the ordinary invalid Interop traversal still fails.
+    await expect(rebuild(bytes)).rejects.toThrow();
+});
+
+test('Kodak external metadata remains subject to payload and value read budgets', async () => {
+    const {bytes, view} = kodakDirectories();
+    await expect(rebuild(bytes, 512)).rejects.toThrow('budget');
+    view.setUint32(2054, 1025, true);
+    await expect(rebuild(bytes, 1024)).rejects.toMatchObject({
+        message: 'Incomplete metadata traversal',
+        notices: expect.arrayContaining([expect.objectContaining({tag: 0xfa00, error: 'Metadata read budget exceeded'})]),
+    });
+});
+
+test('Kodak private fields are not standard EXIF or JPEG directory pointers', async () => {
+    const {bytes, view} = kodakDirectories();
+    ifd(view, 768, [[0xa005, 4, 1, 0xffffffff], [0x0201, 4, 1, 0xffffffff], [0x0202, 4, 1, 0xffffffff]]);
+    ifd(view, 2048, [[0x8769, 4, 1, 0xffffffff], [0x0201, 4, 1, 0xffffffff], [0x0202, 4, 1, 0xffffffff]]);
+    view.setUint32(2086, 0, true);
+    await expect(rebuild(bytes, 1024)).resolves.toBeDefined();
+});
+
+test('Samsung external preview cannot extend an IFD chain past the traversal budget', async () => {
+    const {bytes, view} = samsungPreview();
+    view.setUint32(830, 2048, true);
+    for (let i = 0; i < 30; i++) {
+        const pos = 512 + 2048 + i * 64;
+        ifd(view, pos, [[0x0201, 4, 1, 1000], [0x0202, 4, 1, plainJpeg(256).bytes.length]]);
+        view.setUint32(pos + 26, 2048 + (i + 1) * 64, true);
+    }
+    await expect(rebuild(bytes)).rejects.toMatchObject({
+        notices: expect.arrayContaining([expect.objectContaining({error: 'IFD traversal limit'})]),
+    });
 });

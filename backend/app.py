@@ -2345,6 +2345,60 @@ def _active_processing_worker(metadata: Dict) -> Optional[str]:
     return 'ipworker'
 
 
+def _processing_step_reasons(metadata: Dict) -> Dict[str, str]:
+    """Compact, human-diagnosable reason per non-'done' step, read from the
+    row's own processing_metadata breadcrumbs.
+
+    Makes a 'failed'/'no_data' tile explain itself (e.g. face
+    'quality_filter_rejected', exif 'exif_processing_failed', ocr
+    'ocr_decode_failed') on the processing-status poller / Tools page, instead
+    of a status string that needs a server-side forensic dig to interpret. Only
+    non-'done' steps with an available reason are included, so the common
+    all-done response stays empty. Deeper per-candidate detail
+    (faceDiagnostics.reasonCounts) still lives in processing_metadata for the
+    rare case that needs it. Never raises; absent/malformed metadata -> {}.
+    """
+    try:
+        processing = json.loads(metadata.get('processing_metadata') or '{}')
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(processing, dict):
+        return {}
+
+    def _first(*values) -> str:
+        for value in values:
+            text = str(value or '').strip()
+            if text:
+                return text[:120]
+        return ''
+
+    def _section(key, *fields) -> str:
+        section = processing.get(key)
+        if not isinstance(section, dict):
+            return ''
+        return _first(*(section.get(field) for field in fields))
+
+    reasons: Dict[str, str] = {}
+
+    def _put(step: str, status_field: str, reason: str) -> None:
+        status = str(metadata.get(status_field) or '').strip().lower()
+        if reason and status not in ('', 'done'):
+            reasons[step] = reason
+
+    face = processing.get('client_face') if isinstance(processing.get('client_face'), dict) else {}
+    _put('face', 'face_status', _first(
+        face.get('faceFailureStage'), face.get('filteredReason'),
+        face.get('noDetectionReason'), face.get('deferredReason')))
+    _put('exif', 'exif_status', _first(_section('client_exif', 'errorCode'), _section('server_exif', 'errorCode')))
+    _put('ocr', 'ocr_status', _section('client_ocr', 'errorCode'))
+    _put('aiVision', 'ai_vision_status', _section('client_ai_vision_rejected', 'reason'))
+    _put('mapDetection', 'map_detection_status',
+         _first(_section('client_map_detection', 'errorCode'), _section('server_geo', 'errorCode')))
+    _put('thumbnail', 'thumbnail_status', _section('client_thumbnail_rejected', 'reason'))
+    _put('preview', 'preview_status', _section('client_preview_rejected', 'reason'))
+    return reasons
+
+
 def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_props: bool = True,
                          head_missing: bool = True, pid_to_name: Optional[Dict[str, str]] = None) -> Dict:
     # Prefer the size/last-modified persisted on the metadata row (stamped at
@@ -14896,6 +14950,18 @@ def _register_ipwork_processors() -> None:
         worker_logger.exception('ipwork_vision unavailable; ai_vision step will report not_implemented')
 
 
+_VISUAL_IPWORK_STEPS = frozenset({'thumbnail', 'ocr', 'face', 'ai_vision'})
+
+
+class _VisualSourceUndecodable(Exception):
+    """The one shared visual source for this photo could not be decoded by the
+    most-capable path (convert_image_to_jpeg), so every visual step
+    (thumbnail/ocr/face/ai_vision) fails identically with 'source_undecodable'
+    instead of each independently re-decoding the raw original and reporting
+    its own unrelated error -- the exotic-RAW (e.g. CRW) cascade. Raised once
+    per photo; the verdict is cached so later visual steps short-circuit."""
+
+
 def _run_ipwork_steps(user_id: str, filename: str, steps: List[str], *, use_original: bool = False,
                      metadata_snapshot: Optional[Dict] = None) -> Dict[str, Dict]:
     from ipwork_image import image_job
@@ -14916,6 +14982,10 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
     client_processing: Dict[str, Dict] = {}
     original_bytes_cache: List[bytes] = []
     visual_bytes_cache: List[bytes] = []
+    # Non-empty once the single shared visual source has been determined
+    # undecodable (see _VisualSourceUndecodable), so later visual steps emit the
+    # same coherent failure instead of re-attempting the same doomed decode.
+    visual_undecodable: List[str] = []
     source_metadata: List[Dict] = []
     snapshot_matches = (isinstance(metadata_snapshot, dict)
         and metadata_snapshot.get('PartitionKey') == user_id
@@ -14938,7 +15008,7 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
 
     def get_image_bytes(step: str) -> bytes:
         nonlocal download_ms, preview_attempted
-        visual = step in {'thumbnail', 'ocr', 'face', 'ai_vision'}
+        visual = step in _VISUAL_IPWORK_STEPS
         if visual and visual_bytes_cache:
             return visual_bytes_cache[0]
         if not original_bytes_cache or (visual and IPWORK_REUSE_PREVIEW and not use_original and not preview_attempted):
@@ -14978,6 +15048,8 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                     purpose = 'exif_fallback' if step in {'exif', 'map_detection'} else 'inference'
                     with processing_diagnostics.media_download_scope(purpose):
                         original_bytes_cache.append(download_media_bytes('image', source_blob))
+                    from ipwork_image import remember_original_input
+                    remember_original_input(user_id, filename, entity, original_bytes_cache[0])
                     processing_diagnostics.file_event('vision_download', user_id, filename, role='vision',
                         source='original', bytes=len(original_bytes_cache[0]))
                     _ipwork_metrics_context.source_bytes = len(original_bytes_cache[0])
@@ -14986,6 +15058,43 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                 elapsed_ms = (time.monotonic() - started) * 1000
                 download_ms += round(elapsed_ms)
                 _ipwork_metric('download', duration_ms=elapsed_ms, observation=True)
+        if visual and not use_original and not visual_bytes_cache:
+            # No preview was available (the preview step produced none this
+            # pass, or there was no cached preview to reuse). Resolve ONE
+            # canonical visual source for every visual step via the most-capable
+            # decoder -- the same convert_image_to_jpeg the preview step uses --
+            # instead of handing each step the raw original to decode
+            # independently. For an undecodable RAW (e.g. CRW) that decode is
+            # exactly what already failed, so rather than four steps each
+            # re-failing with four different reasons, record one verdict and
+            # raise so all of them report a single coherent 'source_undecodable'.
+            # use_original repair passes are intentionally exempt: they keep the
+            # full raw original for higher-detail re-processing.
+            preview_result = client_processing.get('preview')
+            canonical = None
+            # Skip re-running the decode when the preview step already tried the
+            # very same convert_image_to_jpeg this pass and produced nothing.
+            if not (isinstance(preview_result, dict) and preview_result.get('hasData') is False):
+                from image_utils import convert_image_to_jpeg
+                try:
+                    produced = convert_image_to_jpeg(original_bytes_cache[0], filename)
+                except Exception:
+                    produced = None
+                if produced and _looks_like_jpeg(produced):
+                    try:
+                        from ipwork_image import rgb_image, remember_crop_preview
+                        with rgb_image(produced, filename) as pixels:
+                            pixels.load()  # fully validate; seed the shared decode when enabled
+                            remember_crop_preview(user_id, filename, get_source_metadata(),
+                                                  produced, pixels.width, pixels.height)
+                        canonical = produced
+                    except Exception:
+                        canonical = None
+            if canonical is not None:
+                visual_bytes_cache.append(canonical)
+                return canonical
+            visual_undecodable.append('source_undecodable')
+            raise _VisualSourceUndecodable(f'source_undecodable: {filename}')
         return original_bytes_cache[0]
 
     def _failure_shape(step: str, error: str) -> Dict:
@@ -15017,6 +15126,15 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
             processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
                 step=step, error=True, reason='not_implemented')
             continue
+        if step in _VISUAL_IPWORK_STEPS and visual_undecodable:
+            # The single shared visual source was already determined undecodable
+            # by an earlier visual step this pass -- report the SAME coherent
+            # reason for every visual step instead of re-decoding the raw
+            # original (the exotic-RAW cascade: N steps, N unrelated failures).
+            client_processing[step] = _failure_shape(step, 'source_undecodable')
+            processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                step=step, error=True, reason='source_undecodable')
+            continue
         geo_exif = None
         packet_exif = None
         packet_outcome = None
@@ -15046,9 +15164,22 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                 import ipwork_geo
                 if processor is ipwork_geo.process_geo:
                     exif_result = client_processing.get('exif')
+                    if isinstance(exif_result, dict) and (exif_result.get('error') or exif_result.get('errorCode')):
+                        # A failed extraction is not verified GPS absence, and
+                        # parsing the same bytes again cannot qualify it.
+                        client_processing[step] = _failure_shape(step, 'exif_dependency_failed')
+                        step_ms[step] = 0
+                        _ipwork_metric('step_' + step, duration_ms=0, observation=True)
+                        processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                            step=step, error=True, reason='exif_dependency_failed')
+                        continue
                     if (isinstance(exif_result, dict) and exif_result.get('hasData') is True
                             and not exif_result.get('error') and isinstance(exif_result.get('data'), dict)):
                         geo_exif = exif_result['data']
+                    elif (isinstance(exif_result, dict) and exif_result.get('hasData') is False
+                          and exif_result.get('verifiedNoExif') is True
+                          and exif_result.get('source') == 'server_metadata'):
+                        geo_exif = {}
                     else:
                         geo_exif = ipwork_geo.geo_exif_from_metadata(get_source_metadata())
                     if geo_exif is not None:
@@ -15060,6 +15191,14 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                                user_id, filename, step, input_kind, len(image_bytes) if image_bytes is not None else 0)
             processing_diagnostics.file_event('vision_input', user_id, filename, role='vision',
                 step=step, source=input_kind, bytes=len(image_bytes) if image_bytes is not None else 0)
+        except _VisualSourceUndecodable:
+            # First visual step to discover the shared source won't decode: emit
+            # the coherent reason here; the loop-top guard above handles the
+            # rest of this pass's visual steps without re-attempting the decode.
+            client_processing[step] = _failure_shape(step, 'source_undecodable')
+            processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
+                step=step, error=True, reason='source_undecodable')
+            continue
         except Exception as exc:
             worker_logger.exception('ipworker image download failed for %s/%s', user_id, filename)
             client_processing[step] = _failure_shape(step, 'download_failed')
@@ -15082,8 +15221,14 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
             elapsed_ms = (time.monotonic() - step_started) * 1000
             step_ms[step] = round(elapsed_ms)
             _ipwork_metric('step_' + step, duration_ms=elapsed_ms, observation=True)
+            diagnostic = {}
+            if step == 'exif' and client_processing.get(step, {}).get('error'):
+                from exif_utils import ExifExtractionError
+                code = client_processing[step].get('errorCode')
+                allowed = {'exif_' + category for category in ExifExtractionError.CATEGORIES}
+                diagnostic['reason'] = code if isinstance(code, str) and code in allowed else 'exif_processing_failed'
             processing_diagnostics.file_event('vision_step', user_id, filename, role='vision',
-                step=step, milliseconds=elapsed_ms, error=bool(client_processing.get(step, {}).get('error')))
+                step=step, milliseconds=elapsed_ms, error=bool(client_processing.get(step, {}).get('error')), **diagnostic)
         # 'preview' is meant to run first (see IPWORK_STEPS/callers): once it
         # succeeds, put the ~2048px shrunk bytes into the visual cache so
         # every later visual step (thumbnail/face/ocr/ai_vision) decodes
@@ -15116,9 +15261,9 @@ def _ipwork_result_face_count(client_processing) -> int:
 
 
 def _handle_ipwork_queue_payload(payload: Dict, job_id: str, user_id: str) -> str:
-    from ipwork_image import crop_input_job
+    from ipwork_image import crop_input_job, original_input_job
     filename = str(payload.get('filename') or '').strip()
-    with crop_input_job(user_id, filename), processing_diagnostics.media_download_scope(
+    with original_input_job(user_id, filename), crop_input_job(user_id, filename), processing_diagnostics.media_download_scope(
             'inference', user=user_id, filename=filename):
         return _handle_ipwork_queue_payload_impl(payload, job_id, user_id)
 

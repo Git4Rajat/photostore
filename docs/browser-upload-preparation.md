@@ -58,6 +58,13 @@ comparison before any wall-clock or Azure-cost improvement can be claimed.
 
 The worker's experimental family allowlist is ARW, CR2, CR3, DNG, ERF, GPR, MOS, MRW, NEF, PEF, RAF, RW2, RWL, 3FR, JPEG, CRW, FFF, IIQ, NRW, ORF, ORI, RAW, SRW, TIFF, STI, X3F, MEF, HEIC, HEIF, HIF, PNG and WebP. Extensions are not universal camera/version guarantees; the corpus qualification and parser checks remain acceptance gates. Init does not mint metadata SAS URLs for other families, avoiding a sidecar upload that cannot yet be reused. Initial activation should use backend processing mode; mixed browser/backend metadata ownership still needs rollout evaluation.
 
+Local follow-up, 2026-10-16: DCR/KDC packet families and narrowly qualified source
+warning profiles are added, with structural coverage guards for repaired Samsung
+and Kodak metadata subtrees. The fixed 622-file extractable cohort passes exact
+packet parity; 42 other corpus sources remain explicit reader exceptions. See
+[EXIF hardening study](exif-hardening-2026-10-16.md) for the full denominator,
+scenario matrix, browser verification and deployment limitations.
+
 ## Deferred GPR Decoding
 
 GoPro GPR (`.gpr`) pixel-decoder support is explicitly deferred to the far-future

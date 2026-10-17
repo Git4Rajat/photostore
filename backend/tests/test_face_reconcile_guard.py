@@ -179,6 +179,71 @@ def test_reconcile_always_disabled_when_not_forced(reconcile_ctx):
     assert calls.force_reconcile_calls == [False]
 
 
+def test_quality_rejected_with_no_prior_faces_is_no_data_not_failed(reconcile_ctx):
+    """#4: YOLO detected candidate(s) but none were a confirmable face (e.g.
+    MediaPipe found no landmarks -- a false positive). With no prior faces to
+    contradict it, that is honestly 'we looked, found no usable face' ==
+    no_data, not a retryable-looking 'failed' that conflates it with real
+    embed/landmark crashes (which still resolve to 'failed')."""
+    metadata, calls = reconcile_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(metadata, user_id, filename, forced=False)
+
+    _apply_face_result(user_id, filename, {
+        'hasData': False, 'faces': [], 'rawFaceCount': 1, 'filteredFaceCount': 1,
+        'faceFailureStage': 'quality_filter_rejected',
+        'filteredReason': 'landmark_detection_failed',
+    })
+
+    assert metadata.get_entity(user_id, filename)['face_status'] == 'no_data'
+
+
+def test_quality_rejected_with_prior_faces_stays_failed(reconcile_ctx):
+    """Guard: the no_data reclassification above only applies with no prior
+    faces. When curated faces already exist, a quality-rejected pass must not
+    claim the photo has no faces -- it preserves them and flags 'failed'."""
+    metadata, calls = reconcile_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    prior = json.dumps([{'bbox': {'left': 0, 'top': 0, 'width': 10, 'height': 10}, 'personId': 'curated'}])
+    _seed_row(metadata, user_id, filename, forced=True, faces=prior, faceCount=1)
+
+    _apply_face_result(user_id, filename, {
+        'hasData': False, 'faces': [], 'rawFaceCount': 1, 'filteredFaceCount': 1,
+        'faceFailureStage': 'quality_filter_rejected',
+    })
+
+    row = metadata.get_entity(user_id, filename)
+    assert row['face_status'] == 'failed'
+    assert row['faces'] == prior
+    assert row['faceCount'] == 1
+
+
+def test_embedded_face_survives_a_losing_secondary_candidate(reconcile_ctx):
+    """#5: a photo that embedded >=1 real face is 'done' even when a secondary
+    YOLO candidate was quality-rejected -- a losing extra box must not drag a
+    photo with a good stored face to 'failed' (the real DNG case: one real
+    face embedded alongside one false-positive box)."""
+    metadata, calls = reconcile_ctx
+    user_id, filename = 'lib-A', 'photo.jpg'
+    _seed_row(metadata, user_id, filename, forced=False)
+
+    _apply_face_result(user_id, filename, {
+        'hasData': True, 'rawFaceCount': 2, 'filteredFaceCount': 1,
+        'faceFailureStage': 'quality_filter_rejected',
+        'faces': [{
+            'bbox': {'left': 0, 'top': 0, 'width': 50, 'height': 50},
+            'confidence': 0.9, 'imageWidth': 200, 'imageHeight': 200,
+            'embedding': [0.1] * 8,
+        }],
+    })
+
+    row = metadata.get_entity(user_id, filename)
+    assert row['face_status'] == 'done'
+    assert len(json.loads(row['faces'])) == 1
+    # The partial-failure detail is still recorded for diagnosis.
+    assert json.loads(row['processing_metadata'])['client_face']['faceFailureStage'] == 'quality_filter_rejected'
+
+
 def _valid_face(left=0):
     return {'bbox': {'left': left, 'top': 0, 'width': 10, 'height': 10},
             'confidence': 0.9, 'imageWidth': 200, 'imageHeight': 200, 'embedding': [0.1] * 8}
@@ -221,7 +286,12 @@ def test_partial_outcome_never_forced_deletes_and_preserves_metadata(reconcile_c
     _apply_face_result('lib-A', 'photo.jpg', {'faces': [_valid_face()], 'rawFaceCount': 2, 'hasData': True, **extra})
     row = metadata.get_entity('lib-A', 'photo.jpg')
     assert calls.force_reconcile_calls == [False]
-    assert row['face_status'] == 'failed'
+    # A real face was embedded this pass, so the step met its primary purpose:
+    # 'done', not 'failed' (a losing secondary candidate no longer buries a
+    # photo that has a good stored face). The curated-face preservation
+    # invariant still holds -- nothing is force-deleted and the prior
+    # curated face is retained.
+    assert row['face_status'] == 'done'
     assert row['faceCount'] == 2
     assert len(json.loads(row['faces'])) == 2
     assert json.loads(row['faces'])[1]['personId'] == 'absent-curated'

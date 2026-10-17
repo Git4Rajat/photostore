@@ -12,6 +12,50 @@ from PIL import Image, ImageOps
 
 _JOB = ContextVar('ipwork_image_job', default=None)
 _CROP_INPUT = ContextVar('ipwork_crop_input', default=None)
+_ORIGINAL_INPUT = ContextVar('ipwork_original_input', default=None)
+
+
+@contextmanager
+def original_input_job(user, filename):
+    job = {'user': user, 'filename': filename, 'original': None}
+    token = _ORIGINAL_INPUT.set(job)
+    try:
+        yield
+    finally:
+        job['original'] = None
+        _ORIGINAL_INPUT.reset(token)
+
+
+def _original_binding(user, filename, metadata):
+    if (not isinstance(metadata, dict) or metadata.get('PartitionKey') != user
+            or metadata.get('RowKey') != filename):
+        return None
+    blob = str(metadata.get('anonymousImageId') or '')
+    source_hash = str(metadata.get('fileHash') or '')
+    size = metadata.get('size')
+    if (not (blob or source_hash) or not isinstance(size, int)
+            or isinstance(size, bool) or size <= 0):
+        return None
+    return blob, source_hash, size
+
+
+def remember_original_input(user, filename, metadata, data):
+    """Hand off the existing immutable buffer, not another copy or a shared cache."""
+    job = _ORIGINAL_INPUT.get()
+    binding = _original_binding(user, filename, metadata)
+    if (job is not None and (job['user'], job['filename']) == (user, filename)
+            and binding is not None and isinstance(data, bytes) and len(data) == binding[2]):
+        job['original'] = (binding, data)
+
+
+def original_input(user, filename, metadata):
+    job = _ORIGINAL_INPUT.get()
+    if job is None or (job['user'], job['filename']) != (user, filename):
+        return None
+    original = job['original']
+    if original is not None and original[0] == _original_binding(user, filename, metadata):
+        return original[1]
+    return None
 
 
 @dataclass(frozen=True)

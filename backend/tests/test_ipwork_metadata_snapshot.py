@@ -127,16 +127,28 @@ def test_parallel_jobs_do_not_share_metadata(monkeypatch):
     barrier = Barrier(2)
     monkeypatch.setattr(app, 'IPWORK_REUSE_PREVIEW', False)
     monkeypatch.setattr(app, '_get_metadata_entity', lambda *a: pytest.fail('No metadata GET'))
+    # A distinct decodable source per job (red for 'a', blue for 'b'), keyed by
+    # anonymousImageId, so we can prove each job decodes ITS OWN source and
+    # never the other's -- the shared canonical visual source is still per-job.
+    images = {}
+    for user, color in (('a', (220, 20, 20)), ('b', (20, 20, 220))):
+        buffer = io.BytesIO()
+        Image.new('RGB', (16, 16), color).save(buffer, 'JPEG', quality=95)
+        images[user] = buffer.getvalue()
     def download(kind, name):
         barrier.wait(timeout=5)
-        return name.encode()
+        return images[name]
     monkeypatch.setattr(app, 'download_media_bytes', download)
-    monkeypatch.setitem(app.IPWORK_STEP_PROCESSORS, 'ocr', lambda u, f, data: {'hasData': True, 'text': data.decode()})
+    def ocr(user, filename, data):
+        with Image.open(io.BytesIO(data)) as image:
+            red, _, blue = image.convert('RGB').getpixel((8, 8))
+        return {'hasData': True, 'dominant': 'red' if red > blue else 'blue'}
+    monkeypatch.setitem(app.IPWORK_STEP_PROCESSORS, 'ocr', ocr)
     def run(user):
         return app._run_ipwork_steps(user, 'same.jpg', ['ocr'], metadata_snapshot=snapshot(
-            user=user, filename='same.jpg', anonymousImageId=user))['ocr']['text']
+            user=user, filename='same.jpg', anonymousImageId=user))['ocr']['dominant']
     with ThreadPoolExecutor(max_workers=2) as pool:
-        assert list(pool.map(run, ['a', 'b'])) == ['a', 'b']
+        assert list(pool.map(run, ['a', 'b'])) == ['red', 'blue']
 
 
 class ReadCountingTable(FakeTable):

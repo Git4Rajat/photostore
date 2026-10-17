@@ -10,26 +10,56 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
-from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
+from exif_utils import ExifExtractionError, _exif_failure_category, extract_exif_from_bytes, extract_gps_decimal_from_exif
 import maps_utils
 
 
-def process_exif(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
-    exif_data = extract_exif_from_bytes(image_bytes, filename)
+def process_exif(user_id: str, filename: str, image_bytes: bytes) -> Dict:
+    try:
+        exif_data = extract_exif_from_bytes(image_bytes, filename)
+        if 'EXIF.Truncated' in exif_data:
+            raise ExifExtractionError('storage_limit')
+        failure_category = _exif_failure_category(exif_data)
+        if failure_category:
+            raise ExifExtractionError(failure_category)
+    except ExifExtractionError as exc:
+        return {'hasData': False, 'error': 'exif_extraction_failed', 'errorCode': 'exif_' + exc.category}
     if not exif_data:
-        return {'hasData': False}
+        return {'hasData': False, 'source': 'server_metadata', 'verifiedNoExif': True}
     return {'hasData': True, 'data': exif_data}
 
 
-def process_geo_from_exif(exif_data: Dict) -> Dict:
+def geo_coordinates_from_exif(exif_data: Dict) -> Optional[Tuple[float, float]]:
+    """None means no coordinates; present but unusable coordinates raise."""
+    for keys, allowed in ((('GPS.GPSLatitudeRef', 'GPSLatitudeRef'), {'N', 'S'}),
+                          (('GPS.GPSLongitudeRef', 'GPSLongitudeRef'), {'E', 'W'})):
+        if any(key in exif_data and str(exif_data[key]).strip().upper()[:1] not in allowed for key in keys):
+            raise ValueError('Invalid GPS reference')
+    if any(isinstance(exif_data.get(key), bool) for key in (
+            'GPS.LatitudeDecimal', 'GPS.LongitudeDecimal', 'GPSLatitude', 'GPSLongitude',
+            'GPS.GPSLatitude', 'GPS.GPSLongitude', 'GPS.Latitude', 'GPS.Longitude')):
+        raise ValueError('Invalid GPS coordinates')
     lat_str, lon_str = extract_gps_decimal_from_exif(exif_data)
     if not lat_str or not lon_str:
-        return {'hasData': False}
+        if any(key in exif_data for key in (
+                'GPS.LatitudeDecimal', 'GPS.LongitudeDecimal',
+                'GPS.GPSLatitude', 'GPS.GPSLongitude', 'GPSLatitude', 'GPSLongitude',
+                'GPS.Latitude', 'GPS.Longitude')):
+            raise ValueError('Invalid GPS coordinates')
+        return None
     lat, lon = float(lat_str), float(lon_str)
     if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
         raise ValueError('Invalid GPS coordinates')
+    return lat, lon
+
+
+def process_geo_from_exif(exif_data: Dict) -> Dict:
+    coordinates = geo_coordinates_from_exif(exif_data)
+    if coordinates is None:
+        return {'hasData': False}
+    lat, lon = coordinates
     place = maps_utils.reverse_geocode(lat, lon) or {}
     return {
         'hasData': True,
@@ -88,6 +118,8 @@ def process_geo_from_metadata(metadata: Dict) -> Optional[Dict]:
     return None if exif_data is None else process_geo_from_exif(exif_data)
 
 
-def process_geo(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
+def process_geo(user_id: str, filename: str, image_bytes: bytes) -> Dict:
     exif_result = process_exif(user_id, filename, image_bytes)
-    return process_geo_from_exif((exif_result or {}).get('data') or {})
+    if exif_result.get('error'):
+        return exif_result
+    return process_geo_from_exif(exif_result.get('data') or {})

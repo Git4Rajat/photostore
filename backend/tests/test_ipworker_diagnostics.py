@@ -1,14 +1,22 @@
 """Local-only diagnostics contracts: fake clocks, queues, and sweep phases."""
 from concurrent.futures import Future, ThreadPoolExecutor
 import base64
+import io
 import json
 import logging
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 import app
 import ipworker_metrics as metrics_module
+
+
+def _decodable_jpeg() -> bytes:
+    buffer = io.BytesIO()
+    Image.new('RGB', (8, 8), 'white').save(buffer, 'JPEG')
+    return buffer.getvalue()
 
 
 class _StopLoop(BaseException):
@@ -524,11 +532,15 @@ def test_step_and_failed_download_timing_without_storage_changes(monkeypatch, cl
     monkeypatch.setattr(app._ipwork_metrics_context, 'collector', collector, raising=False)
     monkeypatch.setattr(app, '_get_metadata_entity', lambda *a: {})
     downloads = []
+    # Decodable so the one shared canonical-decode step passes and both visual
+    # processors actually run (this test measures step/download timing, not the
+    # undecodable-source path, which is covered in test_run_ipwork_steps.py).
+    photo = _decodable_jpeg()
 
     def download(*args):
         downloads.append(args)
         clock.seconds += 0.02
-        return b'photo'
+        return photo
 
     def step(*args):
         clock.seconds += 0.03
@@ -536,11 +548,11 @@ def test_step_and_failed_download_timing_without_storage_changes(monkeypatch, cl
 
     monkeypatch.setattr(app, 'download_media_bytes', download)
     monkeypatch.setattr(app, 'IPWORK_STEP_PROCESSORS', {'ocr': step, 'face': step})
-    results = app._run_ipwork_steps('u', 'f', ['ocr', 'face'])
+    results = app._run_ipwork_steps('u', 'f.jpg', ['ocr', 'face'])
     assert results == {'ocr': {'hasData': False}, 'face': {'hasData': False}}
     assert len(downloads) == 1
     sample = collector.snapshot(1, 1)
-    assert sample['window']['source_download_bytes'] == len(b'photo')
+    assert sample['window']['source_download_bytes'] == len(photo)
     summary = sample['histograms']['window']
     assert summary['download']['count'] == 1
     assert summary['download']['sum'] == 20

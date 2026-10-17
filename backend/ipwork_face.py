@@ -679,7 +679,19 @@ def _process_face(user_id: str, filename: str, image_bytes: bytes, *, recovery=F
             reject('landmark_exception')
             continue
         if landmarks is None:
-            reject('landmark_detection_failed')
+            # MediaPipe ran but found no face mesh in YOLO's crop: the
+            # candidate is not a confirmable human face (overwhelmingly a YOLO
+            # false positive at the 0.35 score threshold), which is a quality/
+            # non-face rejection -- NOT a processing error. Counting it in
+            # failureCount (the old behavior) made a photo full of false
+            # positives report faceFailureStage='postprocessing_failed' ->
+            # face_status 'failed', indistinguishable from a real
+            # landmark/embed crash and buried as a retryable-looking error.
+            # Quality-class it (like alignment_transform_rejected below) so a
+            # photo with no usable face resolves to no_data; genuine errors
+            # (the exception/invalid branches here, and embed failures below)
+            # stay in failureCount -> postprocessing_failed.
+            reject('landmark_detection_failed', quality=True)
             continue
         if np.shape(landmarks) != (5, 2) or not np.all(np.isfinite(landmarks)):
             reject('landmark_invalid')

@@ -5,6 +5,7 @@ import gzip
 import io
 import hashlib
 import json
+import math
 import logging
 import os
 import re
@@ -7727,7 +7728,7 @@ def _valid_decimal(value, minimum: float, maximum: float) -> str:
         parsed = float(value)
     except Exception:
         return ''
-    if parsed < minimum or parsed > maximum:
+    if not math.isfinite(parsed) or isinstance(value, bool) or parsed < minimum or parsed > maximum:
         return ''
     return str(round(parsed, 7))
 
@@ -8096,6 +8097,8 @@ def _build_curated_ai_tag_payload(
 
 def _apply_exif_metadata(metadata: Dict, exif_data: Dict[str, str]) -> Tuple[str, str]:
     lat, lon = extract_gps_decimal_from_exif(exif_data)
+    if not _valid_decimal(lat, -90, 90) or not _valid_decimal(lon, -180, 180):
+        lat, lon = '', ''
     if lat and lon:
         exif_data['GPS.LatitudeDecimal'] = lat
         exif_data['GPS.LongitudeDecimal'] = lon
@@ -8109,10 +8112,13 @@ def _apply_exif_metadata(metadata: Dict, exif_data: Dict[str, str]) -> Tuple[str
 def _extract_server_exif_for_processing(image_bytes: bytes, filename: str) -> Dict[str, str]:
     if is_video_file(filename):
         return {}
-    try:
-        return extract_exif_from_bytes(image_bytes, filename)
-    except Exception:
-        return {}
+    return extract_exif_from_bytes(image_bytes, filename)
+
+
+def _exif_error_code(value) -> str:
+    allowed = {'exif_unavailable', 'exif_unsupported', 'exif_timeout', 'exif_parser_error', 'exif_invalid_output', 'exif_storage_limit',
+               'exif_execution_failed', 'exif_read_failed'}
+    return value if isinstance(value, str) and value in allowed else 'exif_processing_failed'
 
 
 def _client_model_provenance(value) -> Dict:
@@ -8273,9 +8279,38 @@ def _apply_server_exif_fallback(
     apply_geo: bool = True,
 ) -> Dict[str, object]:
     status_updates: Dict[str, object] = {}
-    server_exif = _extract_server_exif_for_processing(image_bytes, filename)
+    apply_geo = apply_geo and not _step_locked_done(metadata, 'map_detection')
+    try:
+        server_exif = _extract_server_exif_for_processing(image_bytes, filename)
+        from exif_utils import ExifExtractionError, _exif_failure_category
+        failure = _exif_failure_category(server_exif)
+        if failure:
+            raise ExifExtractionError(failure)
+        if 'EXIF.Truncated' in server_exif:
+            raise ExifExtractionError('storage_limit')
+    except Exception as error:
+        code = _exif_error_code('exif_' + str(getattr(error, 'category', 'processing_failed')))
+        _merge_processing_metadata(metadata, 'server_exif', {
+            'source': 'server', 'acceptedAt': _utc_now(), 'fallbackFor': fallback_for,
+            'errorCode': code,
+        })
+        status_updates['exif_status'] = 'failed'
+        if apply_geo and not _step_locked_done(metadata, 'map_detection'):
+            status_updates['map_detection_status'] = 'failed'
+        return status_updates
     if server_exif:
-        lat, lon = _apply_exif_metadata(metadata, server_exif)
+        invalid_gps = False
+        try:
+            from ipwork_geo import geo_coordinates_from_exif
+            geo_coordinates_from_exif(server_exif)
+        except (ValueError, TypeError, OverflowError):
+            invalid_gps = True
+        if invalid_gps:
+            lat, lon = '', ''
+            metadata['exifData'] = json.dumps(server_exif, ensure_ascii=False, separators=(',', ':'))
+            metadata['exifCount'] = len(server_exif)
+        else:
+            lat, lon = _apply_exif_metadata(metadata, server_exif)
         _merge_processing_metadata(metadata, 'server_exif', {
             'source': 'server',
             'acceptedAt': _utc_now(),
@@ -8283,7 +8318,12 @@ def _apply_server_exif_fallback(
             'hasGps': bool(lat and lon),
         })
         status_updates['exif_status'] = 'done'
-        if apply_geo and lat and lon and not _CTX.get('queue_map_on_upload'):
+        if apply_geo and invalid_gps and not _step_locked_done(metadata, 'map_detection'):
+            status_updates['map_detection_status'] = 'failed'
+            _merge_processing_metadata(metadata, 'server_geo', {
+                'source': 'server', 'acceptedAt': _utc_now(), 'errorCode': 'geo_invalid_result',
+            })
+        elif apply_geo and not invalid_gps and lat and lon and not _CTX.get('queue_map_on_upload'):
             place = _reverse_geocode_fallback(lat, lon)
             if place:
                 if place.get('address'):
@@ -8299,7 +8339,7 @@ def _apply_server_exif_fallback(
                 'longitude': lon,
             })
             status_updates['map_detection_status'] = 'done'
-        elif apply_geo and (not lat or not lon):
+        elif apply_geo and not invalid_gps and (not lat or not lon):
             mark_step_no_data(user_id, filename, 'map_detection')
             status_updates['map_detection_status'] = 'no_data'
     else:
@@ -8316,6 +8356,113 @@ def _apply_server_exif_fallback(
         if apply_geo:
             mark_step_no_data(user_id, filename, 'map_detection')
             status_updates['map_detection_status'] = 'no_data'
+    return status_updates
+
+
+def _apply_browser_exiftool_result(
+    user_id: str,
+    filename: str,
+    metadata: Dict,
+    exif_result: Dict,
+    client_asset_id: str,
+    *,
+    apply_geo: bool = True,
+) -> Dict[str, object]:
+    """Apply an authoritative in-browser ExifTool verdict without ever fetching
+    the original.
+
+    The browser ran the SAME ExifTool (same pinned version) on the full file, so
+    re-running server-side would yield identical results -- there is nothing to
+    gain from downloading the original. Normalization, GPS and reverse-geocoding
+    reuse the server's own paths, so stored fields match a native server
+    extraction byte-for-byte. Outcomes:
+      - unsupported format   -> exif_status 'unsupported' (shown in Additional Info)
+      - genuine parser error -> 'failed' (terminal; no re-fetch, same tool/result)
+      - no EXIF present       -> 'no_data' (verified absence)
+      - EXIF present          -> 'done' (+ reverse-geocode, as the server fallback does)
+    """
+    from exif_utils import classify_browser_exiftool, browser_exiftool_fields
+    status_updates: Dict[str, object] = {}
+    apply_geo = apply_geo and not _step_locked_done(metadata, 'map_detection')
+    provenance = _client_source_provenance(exif_result)
+    raw = exif_result.get('exifToolJson')
+    category = classify_browser_exiftool(raw)
+
+    if category == 'unsupported':
+        _merge_processing_metadata(metadata, 'client_exif', {
+            'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
+            'clientAssetId': client_asset_id, 'errorCode': 'exif_unsupported_format',
+            'unsupportedFormat': True, **provenance,
+        })
+        status_updates['exif_status'] = 'unsupported'
+        if apply_geo:
+            mark_step_no_data(user_id, filename, 'map_detection')
+            status_updates['map_detection_status'] = 'no_data'
+        return status_updates
+    if category:
+        _merge_processing_metadata(metadata, 'client_exif', {
+            'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
+            'clientAssetId': client_asset_id, 'errorCode': _exif_error_code('exif_' + category),
+            **provenance,
+        })
+        status_updates['exif_status'] = 'failed'
+        if apply_geo:
+            status_updates['map_detection_status'] = 'failed'
+        return status_updates
+
+    exif_data = browser_exiftool_fields(raw)
+    if not exif_data:
+        _apply_exif_metadata(metadata, {})
+        _merge_processing_metadata(metadata, 'client_exif', {
+            'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
+            'clientAssetId': client_asset_id, 'verifiedNoExif': True, 'hasGps': False,
+            **provenance,
+        })
+        status_updates['exif_status'] = 'no_data'
+        if apply_geo:
+            mark_step_no_data(user_id, filename, 'map_detection')
+            status_updates['map_detection_status'] = 'no_data'
+        return status_updates
+
+    invalid_gps = False
+    try:
+        from ipwork_geo import geo_coordinates_from_exif
+        geo_coordinates_from_exif(exif_data)
+    except (ValueError, TypeError, OverflowError):
+        invalid_gps = True
+    if invalid_gps:
+        lat, lon = '', ''
+        metadata['exifData'] = json.dumps(exif_data, ensure_ascii=False, separators=(',', ':'))
+        metadata['exifCount'] = len(exif_data)
+    else:
+        lat, lon = _apply_exif_metadata(metadata, exif_data)
+    _merge_processing_metadata(metadata, 'client_exif', {
+        'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
+        'clientAssetId': client_asset_id, 'hasGps': bool(lat and lon), **provenance,
+    })
+    status_updates['exif_status'] = 'done'
+    if apply_geo and invalid_gps:
+        status_updates['map_detection_status'] = 'failed'
+        _merge_processing_metadata(metadata, 'server_geo', {
+            'source': 'browser_exiftool', 'acceptedAt': _utc_now(), 'errorCode': 'geo_invalid_result',
+        })
+    elif apply_geo and lat and lon and not _CTX.get('queue_map_on_upload'):
+        place = _reverse_geocode_fallback(lat, lon)
+        if place:
+            if place.get('address'):
+                metadata['address'] = place['address']
+            metadata['locationCity'] = place.get('city', '')
+            metadata['locationRegion'] = place.get('region', '')
+            metadata['locationCountry'] = place.get('country', '')
+            metadata['semanticText'] = _build_client_semantic_text(filename, metadata)
+            metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
+        mark_step_done(user_id, filename, 'map_detection', result={
+            'source': 'browser_exiftool', 'latitude': lat, 'longitude': lon,
+        })
+        status_updates['map_detection_status'] = 'done'
+    elif apply_geo and (not lat or not lon):
+        mark_step_no_data(user_id, filename, 'map_detection')
+        status_updates['map_detection_status'] = 'no_data'
     return status_updates
 
 
@@ -8743,7 +8890,35 @@ def _apply_client_processing_results(
         pass
     elif isinstance(exif_result, dict):
         exif_provenance = _client_source_provenance(exif_result)
-        if exif_result.get('hasData') is False:
+        if exif_result.get('source') == 'browser_exiftool' and exif_result.get('verifiedComplete') is True:
+            # Authoritative in-browser ExifTool verdict: trust it and never fetch
+            # the original (re-running the same ExifTool server-side is identical).
+            # Covers data / verified-no-EXIF / unsupported-format / parser-error,
+            # all terminal without a download. The server fallback below still runs
+            # for clients that could NOT run the browser tool (no such result here).
+            status_updates.update(_apply_browser_exiftool_result(
+                user_id, filename, metadata, exif_result, client_asset_id,
+                apply_geo=map_result is None))
+        elif ((origin == 'ipworker' or exif_result.get('hasData') is True)
+                and (exif_result.get('error') or exif_result.get('errorCode'))):
+            status_updates['exif_status'] = 'failed'
+            _merge_processing_metadata(metadata, 'client_exif', {
+                'source': origin, 'acceptedAt': _utc_now(), 'clientAssetId': client_asset_id,
+                'errorCode': _exif_error_code(exif_result.get('errorCode')),
+            })
+            if map_result is None and not _step_locked_done(metadata, 'map_detection'):
+                status_updates['map_detection_status'] = 'failed'
+        elif (origin == 'ipworker' and exif_result.get('hasData') is False
+              and exif_result.get('verifiedNoExif') is True and exif_result.get('source') == 'server_metadata'):
+            _apply_exif_metadata(metadata, {})
+            _merge_processing_metadata(metadata, 'client_exif', {
+                'source': origin, 'acceptedAt': _utc_now(), 'clientAssetId': client_asset_id,
+                'verifiedNoExif': True, 'hasGps': False,
+            })
+            status_updates['exif_status'] = 'no_data'
+            if map_result is None and not _step_locked_done(metadata, 'map_detection'):
+                status_updates['map_detection_status'] = 'no_data'
+        elif exif_result.get('hasData') is False:
             source_bytes = _try_get_image_bytes(get_image_bytes)
             if source_bytes is not None:
                 status_updates.update(_apply_server_exif_fallback(
@@ -8757,13 +8932,19 @@ def _apply_client_processing_results(
             else:
                 status_updates['exif_status'] = 'failed'
         elif exif_result.get('hasData') is True:
-            if ((origin == 'ipworker' and exif_result.get('source') == 'browser_metadata_packet')
+            if (origin == 'ipworker'
                     or (origin == 'browser_video_metadata' and exif_result.get('source') == 'browser_video_metadata')):
                 from exif_utils import _trim_exif_for_storage, _stringify_exif_value
                 exif_data = _trim_exif_for_storage({str(key): _stringify_exif_value(value)
                     for key, value in (exif_result.get('data') or {}).items()})
             else:
                 exif_data = _sanitize_client_exif(exif_result.get('data') or {})
+            invalid_exif_gps = False
+            try:
+                from ipwork_geo import geo_coordinates_from_exif
+                geo_coordinates_from_exif(exif_data)
+            except (ValueError, TypeError, OverflowError):
+                invalid_exif_gps = True
             lat = _valid_decimal(exif_result.get('latitude') or exif_data.get('GPS.LatitudeDecimal'), -90.0, 90.0)
             lon = _valid_decimal(exif_result.get('longitude') or exif_data.get('GPS.LongitudeDecimal'), -180.0, 180.0)
             if lat and lon:
@@ -8784,7 +8965,10 @@ def _apply_client_processing_results(
             })
             # An explicit geo result is applied below. Do not geocode twice or
             # queue an EXIF-derived status that would overwrite it on batch flush.
-            if map_result is None and lat and lon and not _CTX.get('queue_map_on_upload'):
+            if map_result is None and invalid_exif_gps:
+                if not _step_locked_done(metadata, 'map_detection'):
+                    status_updates['map_detection_status'] = 'failed'
+            elif map_result is None and lat and lon and not _CTX.get('queue_map_on_upload'):
                 # Reverse geocode the EXIF GPS coordinates to populate location names
                 place = _reverse_geocode_fallback(lat, lon)
                 if place:
@@ -9020,6 +9204,11 @@ def _apply_client_processing_results(
                 quality_only = not backend_invalid and not face_diagnostics.get('failureCount', 0) and (
                     str(face_result.get('filteredReason') or '') in {
                         'quality_filter_rejected', 'alignment_transform_rejected', 'invalid_detection_boxes',
+                        # A candidate MediaPipe found no face mesh in is a
+                        # non-face/quality rejection, not a processing error --
+                        # mirrors ipwork_face.py's quality-class reject() for
+                        # the same reason so browser reports agree with ipworker.
+                        'landmark_detection_failed',
                     } or (backend_quality_rejected > 0 and reported_raw_face_count <= face_count
                           and not _bounded_face_count(face_result.get('filteredFaceCount'))))
                 face_failure_stage = 'quality_filter_rejected' if quality_only else 'postprocessing_failed'
@@ -9038,6 +9227,19 @@ def _apply_client_processing_results(
                 or face_deferred_reason
                 or face_failure_stage
                 or incomplete_candidates
+                or face_result.get('faceModelReady') is False
+            )
+            # A pass is only worth *retrying* when it was cut short by a
+            # genuinely transient condition (throttled, model not warm yet,
+            # inference timeout). A pass that ran the models and merely
+            # filtered some candidates (e.g. a YOLO false positive MediaPipe
+            # rejected) is complete for what the image contains -- retrying is
+            # deterministic waste. Used below so a photo that embedded >=1 real
+            # face isn't buried as 'failed' by a losing secondary candidate.
+            transient_incomplete = bool(
+                face_background_throttled
+                or face_deferred_reason == 'inference_timeout'
+                or face_failure_stage in _TRANSIENT_FACE_FAILURE_STAGES
                 or face_result.get('faceModelReady') is False
             )
             # Empty failures have nothing to publish and must not acquire a
@@ -9066,7 +9268,18 @@ def _apply_client_processing_results(
                     faces_for_metadata.extend(f for i, f in enumerate(prior_faces) if i not in matched_indices)
                 metadata['faces'] = json.dumps(faces_for_metadata, ensure_ascii=False, separators=(',', ':'))
                 status_updates['faceCount'] = max(len(faces_for_metadata), _bounded_face_count(metadata.get('faceCount'))) if not detection_genuinely_ran else len(faces_with_embeddings)
-                status_updates['face_status'] = 'failed' if not detection_genuinely_ran else 'done'
+                # >=1 real face was embedded, so the step met its primary
+                # purpose. A secondary candidate that failed postprocessing or
+                # was quality-rejected is a partial loss, not a photo-level
+                # 'failed' (that previously dragged a photo with a perfectly
+                # good stored face to 'failed' whenever one extra YOLO box
+                # didn't pan out). Only a genuinely transient shortfall stays
+                # retryable ('pending'); the partial-failure detail is still
+                # recorded in client_face below for diagnosis.
+                if detection_genuinely_ran or not transient_incomplete:
+                    status_updates['face_status'] = 'done'
+                else:
+                    status_updates['face_status'] = 'pending'
             elif face_background_throttled:
                 status_updates['face_status'] = 'pending'
             elif face_deferred_reason == 'inference_timeout' or face_failure_stage in _TRANSIENT_FACE_FAILURE_STAGES:
@@ -9077,6 +9290,20 @@ def _apply_client_processing_results(
                 # the user to manually re-run face detection. Mirrors the
                 # background-throttled handling above.
                 status_updates['face_status'] = 'pending'
+            elif face_failure_stage == 'quality_filter_rejected' and not prior_faces:
+                # Candidates were detected but none were a confirmable/usable
+                # face (e.g. YOLO boxes MediaPipe found no landmarks in, or
+                # alignment/geometry rejections) -- and there are no prior
+                # faces to contradict it. That is honestly "we looked and found
+                # no usable face" == no_data, not a retryable-looking 'failed'
+                # that conflates it with real embed/landmark crashes. When
+                # prior curated faces DO exist we fall through to the
+                # preserve-and-flag 'failed' path below instead of claiming the
+                # photo has no faces. Genuine runtime failures
+                # (postprocessing_failed) also still fall through to 'failed'.
+                metadata['faces'] = '[]'
+                status_updates['faceCount'] = 0
+                status_updates['face_status'] = 'no_data'
             elif face_failure_stage:
                 status_updates['face_status'] = 'failed'
             elif not detection_genuinely_ran:
@@ -9364,6 +9591,10 @@ def apply_client_processing_results_for_file(
     # a download unless _apply_client_processing_results actually reaches a
     # fallback path (EXIF or thumbnail) that needs the bytes.
     image_bytes_cache: List[bytes] = []
+    from ipwork_image import original_input
+    # Resolve against the fresh apply row before handing the getter to any
+    # background crop thread; that thread does not inherit the job context.
+    reusable_original = original_input(user_id, filename, metadata) if consolidated else None
 
     def get_image_bytes() -> bytes:
         if is_video_file(filename):
@@ -9372,7 +9603,12 @@ def apply_client_processing_results_for_file(
             purpose = ('face_cover' if processing_diagnostics.media_download_context().get('purpose') == 'face_cover'
                        else 'result_fallback')
             with processing_diagnostics.media_download_scope(purpose, user=user_id, filename=filename):
-                image_bytes_cache.append(download_media_bytes('image', source_blob))
+                if reusable_original is not None:
+                    image_bytes_cache.append(reusable_original)
+                    processing_diagnostics.emit('media_reuse', **processing_diagnostics.media_download_context(),
+                        role='vision', source='image', bytes=len(reusable_original))
+                else:
+                    image_bytes_cache.append(download_media_bytes('image', source_blob))
         return image_bytes_cache[0]
 
     batch = []

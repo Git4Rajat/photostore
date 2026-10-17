@@ -55,6 +55,41 @@ Resource allocation, concurrency, scaling and shared-decoding flags stay
 unchanged. This change is local; cloud throughput and savings need a matched
 post-deployment test.
 
+## Original-Byte Handoff (Local Only, 2026-10-16)
+
+The post-hardening upload audit found eleven RAW/CRW originals fetched once
+during execution and again during result fallback: 286,600,768 duplicate bytes.
+Execution and result application previously owned independent original caches.
+
+An individual worker delivery now retains a reference to its existing immutable
+original buffer through result application. Reuse requires matching library,
+filename, physical identity/hash and positive recorded size, including actual
+buffer length. Result application checks the fresh metadata row, not just the
+earlier lease snapshot. Missing identity/size or changed bindings retain the
+existing download fallback. Browser-origin results cannot consume this handoff.
+No image bytes enter result payloads, queues or metadata tables.
+
+This is not a cross-job cache, extra copy or new prefetch. One original buffer
+is retained per active delivery and cleared on success/exception, including
+copied contexts. An already-admitted background crop getter can own its immutable
+reference after the worker context exits, under the existing crop admission
+limit. Preview-only jobs still fetch no original; forced-original jobs retain
+their source policy while avoiding the redundant result read.
+
+`media_reuse` reports the bounded purpose, source and reused byte count separately
+from actual `media_download` reads; do not count reused bytes as network traffic.
+Local real-handler regressions reproduce two reads before the fix and one after,
+while preserving extraction fallback, lease/CAS behavior and source-change safety.
+Local replay of all eleven affected RAW/CRW corpus sources uses real EXIF/geo
+processors with local-file blob reads and an in-memory metadata table: 22 reads
+and 573,201,536 bytes without the handoff become 11 reads and 286,600,768 bytes
+with it. EXIF/geo results and lease release are unchanged; no cloud calls or
+original uploads occur in the replay. This is not a full visual-inference replay.
+This fixes duplicate I/O only: it does not yet distinguish parser errors from
+confirmed EXIF absence, suppress parser warnings, expand decoding support, or
+change fallback retries/scaling. The historical byte amount is a potential
+reduction for this path, not a deployed measurement or Azure-invoice saving.
+
 ## Lease Metadata Snapshot Reuse (Local Only, 2026-10-16)
 
 After a successful processing-lease claim, step execution reuses a copied

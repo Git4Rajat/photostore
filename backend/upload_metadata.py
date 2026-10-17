@@ -19,7 +19,66 @@ KINDS = {'tiff-ifd-ranges', 'ciff-directory-ranges', 'raf-header-jpeg-metadata-d
 QUALIFIED_EXTENSIONS = {'.arw', '.cr2', '.cr3', '.dng', '.erf', '.gpr', '.mos', '.mrw',
                         '.nef', '.pef', '.raf', '.rw2', '.rwl', '.3fr', '.jpg', '.jpeg',
                         '.crw', '.fff', '.iiq', '.nrw', '.orf', '.ori', '.raw', '.srw',
-                        '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif', '.png', '.webp'}
+                        '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif', '.png', '.webp', '.dcr', '.kdc'}
+
+
+def _verified_source_warning_profile(filename, exif):
+    """Exact source diagnostics qualified by original/packet corpus parity.
+
+    These warnings remain in the saved metadata; no -m or -ignoreMinorErrors.
+    The caller must independently check *all* diagnostics, including duplicates.
+    """
+    if (exif.get('ExifToolVersion') != '13.55'
+            or any(key in exif for key in ('Error', 'EXIF.Truncated'))):
+        return ()
+    ext = Path(filename).suffix.lower()
+    make, model, kind = (exif.get(key) for key in ('Make', 'Model', 'FileType'))
+    warning = None
+    if (ext == '.srw' and make == 'SAMSUNG' and kind == 'SRW'
+            and model in {'EX1', 'EX2F', 'NX mini', 'NX1000', 'NX100', 'NX10', 'NX1100',
+                          'NX11', 'NX200', 'NX20', 'NX210', 'NX3000', 'NX3300', 'NX5', 'WB2000'}):
+        warning = '[minor] Overlapping MakerNotes values'
+    elif ext == '.x3f' and make == 'SIGMA' and kind == 'X3F':
+        if model in {'SIGMA DP1 Merrill', 'SIGMA DP2 Merrill', 'SIGMA DP3 Merrill'}:
+            warning = 'Bad PrintIM size'
+        elif model == 'SIGMA SD15':
+            warning = 'Invalid EXIF text encoding for UserComment'
+    elif (ext == '.dng' and kind == 'DNG' and make == 'Arashi Vision'
+            and model == 'Insta360 One2' and exif.get('DNGVersion') == '1 1 0 0'):
+        warning = 'Invalid EXIF text encoding for UserComment'
+    elif ext == '.fff' and kind == 'FFF' and make == 'Hasselblad':
+        if model in {'Hasselblad CFV-50c', 'Hasselblad X2D 100C'}:
+            warning = 'Bad IPTC data tag (marker 0x0) [x2]'
+        elif model in {'Hasselblad H5D-40', 'Hasselblad H5D-50c'}:
+            warning = '[minor] Error reading value for IFD0 entry 26, ID 0xc519 HasselbladXML'
+        elif model == 'Hasselblad H6D-100cMS':
+            warning = '[minor] Error reading value for IFD0 entry 27, ID 0xc519 HasselbladXML'
+        elif (model == 'Hasselblad H4D-40'
+                and exif.get('Warning') == '[minor] Suspicious MakerNotes offset for tag 0x001a'):
+            return ('[minor] Suspicious MakerNotes offset for tag 0x001a',
+                    '[minor] Error reading value for IFD0 entry 27, ID 0xc519 HasselbladXML')
+    elif ext == '.iiq' and kind == 'IIQ':
+        if make == 'Phase One A/S' and model == 'H 25':
+            warning = 'ICC_Profile pointer references previous ICC_Profile directory'
+        elif make == 'Phase One' and model == 'iXM-RS150F':
+            warning = '[minor] Unrecognized PhaseOne format size 8 [x3]'
+    elif ext in {'.tif', '.tiff'} and kind == 'TIFF' and (make, model) in {
+            ('Canon', 'EOS D2000C'), ('Kodak', 'DCS520C')}:
+        warning = '[minor] Empty IPTC-NAA data'
+    elif ext == '.dcr' and kind == 'DCR' and make == 'Kodak':
+        if model == 'DCS Pro 14N' and exif.get('Warning') == '[Minor] Ignoring KodakIFD DiffTileGains24t852822 with excessive count':
+            return ('[Minor] Ignoring KodakIFD DiffTileGains24t852822 with excessive count',
+                    '[minor] Empty IPTC-NAA data')
+        if model in {'DCS Pro 14nx', 'DCS Pro SLR/c', 'DCS Pro SLR/n', 'DCS760C'}:
+            warning = '[minor] Empty IPTC-NAA data'
+    elif ext == '.kdc' and kind == 'KDC' and make == 'EASTMAN KODAK COMPANY':
+        warning = 'Suspicious SubIFD offset for tag 0xfd04'
+        if model in {'KODAK P712 ZOOM DIGITAL CAMERA', 'KODAK P880 ZOOM DIGITAL CAMERA'}:
+            return (warning, 'Bad format (20033) for InteropIFD entry 0') if exif.get('Warning') == warning else ()
+        if model not in {'KODAK EasyShare Z981 Digital Camera', 'KODAK EasyShare Z990 Digital Camera',
+                         'KODAK EASYSHARE Z1015 IS DIGITAL CAMERA'}:
+            warning = None
+    return (warning,) if warning and exif.get('Warning') == warning else ()
 
 
 def _verified_dng_array_warning(filename, exif):
@@ -62,7 +121,82 @@ def _qualified_png_metadata(filename, exif):
             and exif.get('Interlace') in {'0', '1'})
 
 
-def _verified_jpeg_structure(filename, ranges, source_size, exif, *, metadata=False):
+def _verified_seft_trailer(ranges, source_size, jpeg_end):
+    from metadata_tiff_coverage import _Ranges
+    try:
+        reader = _Ranges(ranges, source_size)
+        footer = reader.read(source_size - 8, 8)
+        length = int.from_bytes(footer[:4], 'little')
+        if footer[4:] != b'SEFT' or not 12 <= length < 65536 or length + 8 >= source_size:
+            return False
+        start = source_size - length - 8
+        directory = reader.read(start, length + 8)
+        count = int.from_bytes(directory[8:12], 'little')
+        if directory[:4] != b'SEFH' or not 0 < count <= 4096 or 12 + count * 12 > length:
+            return False
+        first = start
+        for index in range(count):
+            entry = directory[12 + index * 12:24 + index * 12]
+            backwards, size = int.from_bytes(entry[4:8], 'little'), int.from_bytes(entry[8:12], 'little')
+            if not 8 <= size <= backwards <= start:
+                return False
+            first = min(first, start - backwards)
+            block = reader.read(start - backwards, size)
+            if int.from_bytes(block[4:8], 'little') + 8 > size:
+                return False
+        # Reject gaps and unknown trailing payload, not just a matching footer.
+        reader.read(jpeg_end, source_size - jpeg_end)
+        return first == jpeg_end
+    except (ValueError, TypeError, IndexError):
+        return False
+
+
+def _mpf_extents(data, tiff_base, source_size):
+    """Bounded MP Index directory; all constituent images must be JPEG."""
+    if data[:4] != b'MPF\0' or len(data) < 12:
+        raise ValueError('Invalid MPF header')
+    block = data[4:]
+    order = {b'II': 'little', b'MM': 'big'}.get(block[:2])
+    def number(offset, length):
+        if offset < 0 or offset + length > len(block):
+            raise ValueError('MPF directory bounds')
+        return int.from_bytes(block[offset:offset + length], order)
+    if not order or number(2, 2) != 42:
+        raise ValueError('Invalid MPF TIFF header')
+    directory = number(4, 4)
+    count = number(directory, 2)
+    if not 1 <= count <= 128 or number(directory + 2 + count * 12, 4):
+        raise ValueError('Unsupported MPF directory')
+    tags = {}
+    for index in range(count):
+        pos = directory + 2 + index * 12
+        tag, kind, length, value = (number(pos, 2), number(pos + 2, 2), number(pos + 4, 4), number(pos + 8, 4))
+        if tag in tags:
+            raise ValueError('Duplicate MPF entry')
+        tags[tag] = (kind, length, value)
+    if 0xb001 not in tags and 0xb002 not in tags:
+        return None  # Attribute-only MPF directory, including a child JPEG.
+    kind, length, images = tags[0xb001]
+    if kind != 4 or length != 1 or not 2 <= images <= 32:
+        raise ValueError('Unsupported MPF image count')
+    kind, length, offset = tags[0xb002]
+    if kind != 7 or length != images * 16:
+        raise ValueError('Invalid MPF image table')
+    extents = []
+    for index in range(images):
+        pos = offset + index * 16
+        attributes, size, relative = number(pos, 4), number(pos + 4, 4), number(pos + 8, 4)
+        start = 0 if index == 0 and relative == 0 else tiff_base + relative
+        if attributes & 0x07000000 or size < 4 or start < 0 or start + size > source_size:
+            raise ValueError('Unsupported MPF image extent')
+        extents.append((start, start + size))
+    if (extents[0][0] != 0 or extents[-1][1] != source_size
+            or any(left[1] != right[0] for left, right in zip(extents, extents[1:]))):
+        raise ValueError('Incomplete or overlapping MPF image layout')
+    return extents
+
+
+def _verified_jpeg_structure(filename, ranges, source_size, exif, *, metadata=False, check_dimensions=True, _extent=None):
     """Validate every marker through EOI; metadata segments must be retained."""
     if Path(filename).suffix.lower() not in {'.jpg', '.jpeg'} or exif.get('FileType') != 'JPEG':
         return False
@@ -79,40 +213,51 @@ def _verified_jpeg_structure(filename, ranges, source_size, exif, *, metadata=Fa
             raise ValueError('Missing JPEG marker bytes')
         return data[relative:relative + length]
     try:
-        if read(0, 2) != b'\xff\xd8':
+        start, end = _extent or (0, source_size)
+        if read(start, 2) != b'\xff\xd8':
             return False
-        pos, frame, scans = 2, None, 0
+        pos, frame, scans, mpf = start + 2, None, 0, None
         for _ in range(1024):
             marker = read(pos, 2)
             if marker == b'\xff\xd9':
-                return bool(frame and scans and pos + 2 == source_size
-                            and index == len(ranges) - 1
-                            and ranges[index][0] + len(ranges[index][1]) == source_size)
+                if mpf:
+                    if mpf[0] != (0, pos + 2):
+                        return False
+                    return bool(frame and scans and all(_verified_jpeg_structure(
+                        filename, ranges, source_size, {'FileType': 'JPEG'}, metadata=True,
+                        check_dimensions=False, _extent=extent) for extent in mpf[1:]))
+                if _extent:
+                    return bool(frame and scans and pos + 2 == end)
+                complete_end = (pos + 2 == end and index == len(ranges) - 1
+                                and ranges[index][0] + len(ranges[index][1]) == source_size)
+                return bool(frame and scans and (complete_end or (metadata
+                    and _verified_seft_trailer(ranges, source_size, pos + 2))))
             application = metadata and (0xe0 <= marker[1] <= 0xef or marker[1] == 0xfe)
             if marker[0] != 255 or (not application and marker[1] not in {0xc0, 0xc2, 0xc4, 0xdb, 0xdd, 0xda, 0xe0}):
                 return False
             size = int.from_bytes(read(pos + 2, 2), 'big')
-            if size < 2:
+            if size < 2 or pos + size + 2 > end:
                 return False
             data = read(pos + 4, size - 2)
-            if marker[1] == 0xe0:
+            if marker[1] == 0xe2 and data.startswith(b'MPF\0'):
+                if not metadata:
+                    return False
+                image_index = _mpf_extents(data, pos + 8, source_size)
+                if image_index:
+                    if mpf or _extent:
+                        return False
+                    mpf = image_index
+            if marker[1] == 0xe0 and not metadata:
                 if len(data) < 14 or not data.startswith(b'JFIF\0') or len(data) != 14 + 3 * data[12] * data[13]:
                     return False
-            if application and marker[1] != 0xe0:
-                signatures = {
-                    0xe1: (b'Exif\x00\x00', b'http://ns.adobe.com/xap/1.0/\x00', b'http://ns.adobe.com/xmp/extension/\x00'),
-                    0xe2: (b'ICC_PROFILE\x00',), 0xec: (b'Ducky',),
-                    0xed: (b'Photoshop 3.0\x00',), 0xee: (b'Adobe',),
-                }
-                if marker[1] != 0xfe and not any(data.startswith(prefix) for prefix in signatures.get(marker[1], ())):
-                    return False
-                if marker[1] == 0xee and len(data) < 12:
-                    return False
+            # Camera/vendor application segments are opaque but fully retained.
+            # Only the stricter absence path requires a known marker vocabulary.
             if marker[1] in {0xc0, 0xc2}:
                 if frame or len(data) < 6 or data[0] != 8 or data[5] not in ({1, 3, 4} if metadata else {1, 3}) or len(data) != 6 + 3 * data[5]:
                     return False
                 height, width = int.from_bytes(data[1:3], 'big'), int.from_bytes(data[3:5], 'big')
-                if not width or not height or str(width) != exif.get('ImageWidth') or str(height) != exif.get('ImageHeight'):
+                if not width or not height or (check_dimensions and (
+                        str(width) != exif.get('ImageWidth') or str(height) != exif.get('ImageHeight'))):
                     return False
                 frame = data[5]
             if marker[1] == 0xdd and len(data) != 2:
@@ -129,7 +274,7 @@ def _verified_jpeg_structure(filename, ranges, source_size, exif, *, metadata=Fa
                 index += 1
                 pos = ranges[index][0]
         return False
-    except (ValueError, IndexError, TypeError):
+    except (ValueError, IndexError, TypeError, KeyError):
         return False
 
 
@@ -323,7 +468,8 @@ def _extraction_diagnostic(exif):
 def extract_candidate(storage, filename, row, on_download=None, on_outcome=None, on_diagnostic=None):
     """Return validated metadata or None for fallback; qualify absence structurally."""
     from azure.core import MatchConditions
-    from exif_utils import _extract_exiftool_from_path, _exiftool_has_only_warning
+    from exif_utils import (ExifExtractionError, _extract_exiftool_from_path, _exiftool_has_only_warning,
+                            _exiftool_has_only_warnings)
     def outcome(reason):
         if on_outcome:
             try:
@@ -364,9 +510,31 @@ def extract_candidate(storage, filename, row, on_download=None, on_outcome=None,
                 for offset, data in ranges:
                     handle.seek(offset)
                     handle.write(data)
-            exif = _extract_exiftool_from_path(path)
+            prefix = ranges[0][1][:2]
+            if len(prefix) == 1 and len(ranges) > 1 and ranges[1][0] == 1:
+                prefix += ranges[1][1][:1]
+            packet_jpeg = prefix == b'\xff\xd8'
+            if packet_jpeg:
+                if not _verified_jpeg_structure(filename, ranges, source_size,
+                        {'FileType': 'JPEG'}, metadata=True, check_dimensions=False):
+                    outcome('incomplete_jpeg_metadata')
+                    return None
+                exif = _extract_exiftool_from_path(path, scan_jpeg=True)
+            else:
+                exif = _extract_exiftool_from_path(path)
+            if packet_jpeg:
+                if not _verified_jpeg_structure(filename, ranges, source_size, exif, metadata=True):
+                    outcome('incomplete_jpeg_metadata')
+                    return None
+            from metadata_tiff_coverage import verified_camera_ranges
+            if not verified_camera_ranges(filename, exif, ranges, source_size):
+                outcome('incomplete_camera_metadata')
+                return None
             verified_warning = (bool(exif) and _verified_dng_array_warning(filename, exif)
                                 and _exiftool_has_only_warning(path, exif['Warning']))
+            expected_warnings = _verified_source_warning_profile(filename, exif or {})
+            if expected_warnings and not verified_warning:
+                verified_warning = _exiftool_has_only_warnings(path, expected_warnings)
         if on_diagnostic:
             try:
                 on_diagnostic(_extraction_diagnostic(exif or {}))
@@ -393,6 +561,14 @@ def extract_candidate(storage, filename, row, on_download=None, on_outcome=None,
             exif.pop(key, None)
         outcome('reused_no_exif' if no_exif else 'reused')
         return exif
+    except ExifExtractionError as error:
+        if on_diagnostic:
+            try:
+                on_diagnostic({'version': 'unknown', 'category': error.category})
+            except Exception:
+                pass
+        outcome('exiftool_' + error.category)
+        return None
     except Exception:
         outcome(phase + '_failed')
         return None

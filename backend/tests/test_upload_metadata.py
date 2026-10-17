@@ -355,7 +355,7 @@ def _jpeg_exif():
 def test_complete_jpeg_without_exif_reuses_structural_metadata(monkeypatch):
     import exif_utils
     storage, row, _, _ = _jpeg_candidate()
-    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: _jpeg_exif())
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _, **__: _jpeg_exif())
     outcomes = []
     assert transport.extract_candidate(storage, 'plain.JPEG', row, on_outcome=outcomes.append) == _jpeg_exif()
     assert outcomes == ['reused_no_exif']
@@ -389,8 +389,15 @@ def test_jpeg_absence_requires_complete_qualified_structure(monkeypatch, fault):
     else:
         ranges[-1] = (len(source) - 2, b'xx')
     storage, row, _, _ = _jpeg_candidate(ranges)
-    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: _jpeg_exif())
-    assert transport.extract_candidate(storage, 'plain.jpg', row) is None
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _, **__: _jpeg_exif())
+    outcomes = []
+    result = transport.extract_candidate(storage, 'plain.jpg', row, on_outcome=outcomes.append)
+    if fault in {'application', 'jfif'}:
+        assert result == _jpeg_exif()
+        assert outcomes == ['reused']
+        assert not transport._verified_jpeg_no_exif('plain.jpg', ranges, len(source), result)
+    else:
+        assert result is None
 
 
 @pytest.mark.parametrize('changes', [
@@ -400,7 +407,7 @@ def test_jpeg_absence_requires_complete_qualified_structure(monkeypatch, fault):
 def test_jpeg_no_exif_still_rejects_parser_errors_and_mismatched_dimensions(monkeypatch, changes):
     import exif_utils
     storage, row, _, _ = _jpeg_candidate()
-    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: {**_jpeg_exif(), **changes})
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _, **__: {**_jpeg_exif(), **changes})
     assert transport.extract_candidate(storage, 'plain.jpg', row) is None
 
 
@@ -435,7 +442,7 @@ def test_complete_metadata_jpeg_is_reused_but_not_reported_as_no_exif(monkeypatc
     _, _, _, source = _jpeg_candidate()
     segment = bytes([255, marker]) + (len(data) + 2).to_bytes(2, 'big') + data
     storage, row, ranges, source = _jpeg_candidate(source=source[:2] + segment + source[2:])
-    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _: _jpeg_exif())
+    monkeypatch.setattr(exif_utils, '_extract_exiftool_from_path', lambda _, **__: _jpeg_exif())
     outcomes = []
     assert transport.extract_candidate(storage, 'photo.jpg', row, on_outcome=outcomes.append) == _jpeg_exif()
     assert outcomes == ['reused']

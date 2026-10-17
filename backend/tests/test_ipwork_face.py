@@ -276,7 +276,9 @@ def test_all_alignment_rejected_is_quality_failure_not_zero(monkeypatch, candida
 
 
 @pytest.mark.parametrize('stage,mode,reason', [
-    ('landmark', 'none', 'landmark_detection_failed'),
+    # A genuine runtime error at any stage is a real failure (postprocessing_failed).
+    # landmark/'none' is deliberately absent here -- MediaPipe finding no mesh is
+    # a quality/non-face rejection, covered by the test below, not an error.
     ('landmark', 'exception', 'landmark_exception'),
     ('landmark', 'nonfinite', 'landmark_invalid'),
     ('align', 'exception', 'alignment_exception'),
@@ -300,6 +302,24 @@ def test_postprocessing_failure_is_explicit(monkeypatch, candidate_pipeline, ima
     assert result['faceDiagnostics']['reasonCounts'] == {reason: 1}
     assert result['faceDiagnostics']['failureCount'] == 1
     assert result['faceDiagnostics']['qualityRejectedCount'] == 0
+
+
+def test_landmark_detection_failure_is_quality_not_error(monkeypatch, candidate_pipeline, image_bytes):
+    # MediaPipe running and finding no face mesh in a YOLO crop is a non-face
+    # quality rejection (almost always a YOLO false positive), NOT a processing
+    # error. It must not count toward failureCount or report
+    # postprocessing_failed (which would resolve to a hard 'failed'); it belongs
+    # in qualityRejectedCount alongside alignment_transform_rejected so a photo
+    # with no usable face resolves to no_data.
+    monkeypatch.setattr(face_mod, 'detect_five_landmarks', lambda *args: None)
+    monkeypatch.setattr(face_mod, 'compute_face_embedding', lambda *args: pytest.fail('must not embed a landmark-less box'))
+    result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
+    assert result['faces'] == []
+    assert result['rawFaceCount'] == result['filteredFaceCount'] == 1
+    assert result['faceFailureStage'] == 'quality_filter_rejected'
+    assert result['faceDiagnostics']['reasonCounts'] == {'landmark_detection_failed': 1}
+    assert result['faceDiagnostics']['failureCount'] == 0
+    assert result['faceDiagnostics']['qualityRejectedCount'] == 1
 
 
 @pytest.mark.parametrize('failed_stage', ['landmark', 'embed'])
@@ -360,7 +380,9 @@ def test_valid_channel_major_yolo_contract_and_diagnostics(monkeypatch, image_by
     assert diagnostics['scorePassedCount'] == diagnostics['validBoxCount'] == 2
     assert diagnostics['nmsKeptCount'] == diagnostics['nmsRemovedCount'] == 1
     assert result['rawFaceCount'] == 1
-    assert result['faceFailureStage'] == 'postprocessing_failed'
+    # The single kept candidate yields no landmarks -> a non-face quality
+    # rejection, not a processing error (see detect_five_landmarks quality reject).
+    assert result['faceFailureStage'] == 'quality_filter_rejected'
 
 
 def test_score_passed_but_invalid_boxes_is_not_genuine_zero(monkeypatch, image_bytes):
@@ -430,7 +452,10 @@ def test_partial_primary_faces_are_preserved_without_recovery(monkeypatch, candi
     monkeypatch.setattr(face_mod, 'detect_recovery_faces', lambda image: pytest.fail('must preserve usable primary embeddings'))
     result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
     assert len(result['faces']) == 1
-    assert result['faceFailureStage'] == 'postprocessing_failed'
+    # One box embedded, the other yielded no landmarks -> a non-face quality
+    # rejection (not a processing error), so the surviving face is still a real
+    # embedded face alongside a quality_filter_rejected marker.
+    assert result['faceFailureStage'] == 'quality_filter_rejected'
 
 
 def test_landmark_zero_can_recover_with_independent_box(monkeypatch, candidate_pipeline, image_bytes):
@@ -482,7 +507,9 @@ def test_recovery_landmark_failure_cannot_be_accepted(monkeypatch, image_bytes):
     monkeypatch.setattr(face_mod, 'detect_five_landmarks', lambda *args: None)
     result = face_mod.process_face('lib-A', 'photo.jpg', image_bytes)
     assert result['faces'] == []
-    assert result['faceFailureStage'] == 'postprocessing_failed'
+    # The recovered box also yields no landmarks -> a non-face quality rejection,
+    # not a processing error; it is still not accepted as a face.
+    assert result['faceFailureStage'] == 'quality_filter_rejected'
     assert result['faceDiagnostics']['recoverySucceeded'] is False
 
 

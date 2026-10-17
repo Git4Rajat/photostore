@@ -41,10 +41,15 @@ def test_ready_preview_avoids_original_download(preview_ctx):
 @pytest.mark.parametrize('reason', ['missing', 'corrupt', 'truncated', 'unknown_size'])
 def test_unusable_preview_falls_back(monkeypatch, preview_ctx, reason):
     preview, calls, metrics = preview_ctx
+    # A genuinely decodable original so the fallback resolves to a usable shared
+    # visual source (distinct from the preview so we can tell them apart).
+    stream = io.BytesIO()
+    Image.new('RGB', (60, 30), 'blue').save(stream, 'JPEG')
+    original = stream.getvalue()
     def download(kind, blob):
         calls.append((kind, blob))
         if kind == 'image':
-            return b'original-with-exif'
+            return original
         if reason == 'missing':
             raise FileNotFoundError()
         return preview[:10] if reason == 'truncated' else b'bad'
@@ -52,7 +57,12 @@ def test_unusable_preview_falls_back(monkeypatch, preview_ctx, reason):
     if reason == 'unknown_size':
         monkeypatch.setattr(app, 'get_media_properties', lambda *_: {'size': 0})
     result = app._run_ipwork_steps('user', 'display.CR3', ['ocr', 'face'])
-    assert result['ocr']['received'] == result['face']['received'] == b'original-with-exif'
+    # #1: both visual steps consume ONE shared canonical visual source derived
+    # from the original (not the unusable preview), instead of each decoding the
+    # raw original independently.
+    received = result['ocr']['received']
+    assert received == result['face']['received']
+    assert received.startswith(b'\xff\xd8') and received != preview
     assert sum(kind == 'image' for kind, _ in calls) == 1
     assert sum(name == 'preview_reuse_failed' for name, _ in metrics) == 1
 
@@ -79,8 +89,15 @@ def test_generated_preview_keeps_original_for_metadata(monkeypatch, preview_ctx)
     ('a.CR3', 'running', True), ('a.CR3', 'done', False)])
 def test_preview_requires_enabled_ready_photo(monkeypatch, preview_ctx, filename, status, enabled):
     _, calls, _ = preview_ctx
+    stream = io.BytesIO()
+    Image.new('RGB', (60, 30), 'blue').save(stream, 'JPEG')
+    original = stream.getvalue()
     monkeypatch.setattr(app, 'IPWORK_REUSE_PREVIEW', enabled)
     monkeypatch.setattr(app, '_get_metadata_entity', lambda *_: {'preview_status': status})
+    monkeypatch.setattr(app, 'download_media_bytes',
+                        lambda kind, blob: calls.append((kind, blob)) or original)
     result = app._run_ipwork_steps('user', filename, ['ocr'])
-    assert result['ocr']['received'] == b'original-with-exif'
+    # No reusable preview (not ready / reuse disabled) -> the shared visual
+    # source is derived from the freshly downloaded original.
+    assert result['ocr']['received'].startswith(b'\xff\xd8')
     assert calls == [('image', filename)]

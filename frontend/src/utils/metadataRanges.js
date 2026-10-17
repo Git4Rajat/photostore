@@ -11,6 +11,7 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
     let readBytes = 0;
     let readCalls = 0;
     let jpegPassthrough = null;
+    let jpegStructureFailure = null;
     async function read(offset, length, retain = true) {
         if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 || offset + length > source.size) {
             const error = new Error('Out-of-bounds metadata reference');
@@ -87,7 +88,30 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         const makerNotes = [];
         const retainedMakerNotes = [];
         const badLinks = [];
+        const identityRanges = [];
         let make = '', model = '';
+        const kodakLegacy = () => make === 'EASTMAN KODAK COMPANY' && /^KODAK P(712|880) ZOOM DIGITAL CAMERA$/.test(model);
+        async function samsungPreview(bytes, pos, depth) {
+            // Samsung Type2 v0100 uses MakerNote-relative offsets. Its LE
+            // profile places PreviewIFD just beyond the declared MakerNote.
+            if (bytes.length < 14) return;
+            const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            if (view.getUint16(2, true) !== 1 || view.getUint16(4, true) !== 7
+                || view.getUint32(6, true) !== 4 || ascii(bytes, 10, 4) !== '0100') return;
+            const count = view.getUint16(0, true);
+            if (count > 4096 || 2 + count * 12 > bytes.length) throw new Error('Invalid Samsung maker notes');
+            for (let i = 0; i < count; i++) {
+                const entry = 2 + i * 12;
+                if (view.getUint16(entry, true) !== 0x0035) continue;
+                if (view.getUint16(entry + 2, true) !== 4 || view.getUint32(entry + 4, true) !== 1) {
+                    throw new Error('Invalid Samsung preview pointer');
+                }
+                const relative = view.getUint32(entry + 8, true);
+                if (relative < bytes.length) return; // already retained in the opaque block
+                if (relative !== bytes.length) throw new Error('Unsupported Samsung preview offset base');
+                await ifd(relative, depth + 1, pos, true, 'samsung-preview');
+            }
+        }
         async function ifd(relative, depth = 0, directoryBase = base, order = little, vendor = '', followNext = true) {
             const base = directoryBase, little = order;
             if (!relative || visited.has(base + relative)) return;
@@ -145,6 +169,12 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
                             else if (sig.startsWith('OLYMP\0') || sig.startsWith('EPSON\0')) {
                                 await ifd(pos + 8 - base, depth + 1, base, little, 'olympus', false);
                             }
+                            else if (make.trim().toUpperCase() === 'SAMSUNG') await samsungPreview(value, pos, depth);
+                            else if (kodakLegacy()) {
+                                // Type8a's values and CameraInfo use TIFF-absolute
+                                // offsets, including data outside the MakerNote.
+                                await ifd(pos - base, depth + 1, base, little, 'kodak-maker', false);
+                            }
                         }
                     }
                     catch (error) { notices.push({tag, error: error.message, reference: error.reference}); continue; }
@@ -154,8 +184,29 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
                 if (depth === 0 && type === 2) {
                     if (tag === 0x010f) make = ascii(value, 0, 128).replace(/\0.*$/, '');
                     if (tag === 0x0110) model = ascii(value, 0, 128).replace(/\0.*$/, '');
+                    if ((tag === 0x010f || tag === 0x0110) && size > 4) {
+                        identityRanges.push({offset: base + view.getUint32(entry + 8, little), tag});
+                    }
                 }
-                if (vendor === 'olympus' && OLYMPUS_POINTERS.has(tag)) {
+                if (!vendor && tag === 0xa005 && type === 4 && n === 1 && kodakLegacy()) {
+                    const target = base + view.getUint32(entry + 8, little);
+                    if (identityRanges.some(r => r.tag === 0x010f && target === r.offset + 14
+                        && identityRanges.some(m => m.tag === 0x0110 && m.offset === r.offset + 24))) {
+                        // These cameras point into Make. ExifTool stops at the
+                        // first invalid format; preserve exactly that evidence.
+                        const prefix = await read(target, 14);
+                        const pv = new DataView(prefix.buffer);
+                        if (pv.getUint16(0, little) > 4096 && pv.getUint16(4, little) > 255) continue;
+                        throw new Error('Unsupported Kodak Interop overlap');
+                    }
+                }
+                if (vendor === 'kodak-maker' && tag === 0xff00) {
+                    if (type !== 4 || n !== 1) throw new Error('Invalid Kodak CameraInfo pointer');
+                    await ifd(view.getUint32(entry + 8, little), depth + 1, base, little, 'kodak-camera', false);
+                } else if (!vendor && tag === 0xfe00 && make === 'EASTMAN KODAK COMPANY') {
+                    if (type !== 4 || n !== 1) throw new Error('Invalid Kodak directory pointer');
+                    await ifd(view.getUint32(entry + 8, little), depth + 1, base, little, 'kodak');
+                } else if (vendor === 'olympus' && OLYMPUS_POINTERS.has(tag)) {
                     // Old Olympus subdirectories are inline blocks with under-reported
                     // lengths; newer cameras store a single IFD pointer instead.
                     if ((type === 4 || type === 13) && n !== 1) throw new Error('Invalid Olympus directory pointer');
@@ -178,12 +229,18 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
                 }
                 if (tag === 0x7200 && size === 4) sr2Offset = view.getUint32(entry + 8, little);
                 if (tag === 0x7201 && size === 4) sr2Length = view.getUint32(entry + 8, little);
-                if (!vendor || vendor === 'nikon-preview') {
+                if (!vendor || vendor === 'nikon-preview' || vendor === 'samsung-preview') {
+                    if (vendor === 'samsung-preview' && (tag === 0x0201 || tag === 0x0202) && (type !== 4 || n !== 1)) {
+                        throw new Error('Invalid Samsung preview JPEG pointer');
+                    }
                     if (tag === 0x0201 && size === 4) jpegOffset = view.getUint32(entry + 8, little);
                     if (tag === 0x0202 && size === 4) jpegLength = view.getUint32(entry + 8, little);
                 }
             }
             if (sr2Offset && sr2Length) await read(base + sr2Offset, sr2Length);
+            if (vendor === 'samsung-preview' && (!jpegOffset || !jpegLength || base + jpegOffset + jpegLength > source.size)) {
+                throw new Error('Invalid Samsung preview JPEG extent');
+            }
             if (jpegOffset && jpegLength) await jpeg(base + jpegOffset, jpegLength);
             if (followNext) {
                 try { await ifd(view.getUint32(count * 12, little), depth + 1, base, little, vendor); }
@@ -422,19 +479,80 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         }
         throw new Error('Incomplete JPEG header');
     }
-    async function jpegStructure() {
+    function mpfImages(body, fileOffset, offset, length) {
+        const order = ascii(body, 4, 2), little = order === 'II';
+        if (!['II', 'MM'].includes(order) || body.length < 12) throw new Error('Invalid MPF TIFF header');
+        const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+        if (view.getUint16(6, little) !== 42) throw new Error('Invalid MPF TIFF magic');
+        let relative = view.getUint32(8, little), imageCount = null, entries = null;
+        const seen = new Set(), tables = [], values = [];
+        while (relative) {
+            const start = 4 + relative;
+            if (relative < 8 || start + 2 > body.length || seen.has(relative) || seen.size >= 24) throw new Error('Invalid MPF IFD');
+            seen.add(relative);
+            const count = view.getUint16(start, little), end = start + 2 + count * 12 + 4;
+            if (count > 4096 || end > body.length) throw new Error('Invalid MPF directory');
+            tables.push({start, end});
+            for (let i = 0; i < count; i++) {
+                const entry = start + 2 + i * 12;
+                const tag = view.getUint16(entry, little), type = view.getUint16(entry + 2, little);
+                const n = view.getUint32(entry + 4, little), size = TYPE_SIZES[type] * n;
+                if (!TYPE_SIZES[type]) throw new Error('Unsupported MPF value type');
+                const pos = size > 4 ? 4 + view.getUint32(entry + 8, little) : entry + 8;
+                if (pos < 12 || pos + size > body.length) throw new Error('Invalid MPF value');
+                if (size > 4) values.push({start: pos, end: pos + size});
+                if (tag === 0xb001) {
+                    if (imageCount !== null || type !== 4 || n !== 1) throw new Error('Invalid MPF image count');
+                    imageCount = view.getUint32(pos, little);
+                }
+                if (tag === 0xb002) {
+                    if (entries || type !== 7) throw new Error('Invalid MPF entries');
+                    entries = {pos, size};
+                }
+            }
+            relative = view.getUint32(end - 4, little);
+        }
+        if (tables.some((table, i) => tables.slice(i + 1).some(other => table.start < other.end && other.start < table.end))
+            || values.some(value => tables.some(table => value.start < table.end && table.start < value.end))) {
+            throw new Error('Overlapping MPF directory data');
+        }
+        if (imageCount === null && !entries) return null; // MP Attribute IFD only
+        if (!entries || imageCount < 2 || imageCount > 32 || entries.size !== imageCount * 16) throw new Error('Unsupported MPF image count');
+        const images = [];
+        let expected = offset;
+        for (let i = 0; i < imageCount; i++) {
+            const pos = entries.pos + i * 16;
+            const attributes = view.getUint32(pos, little), size = view.getUint32(pos + 4, little);
+            const relative = view.getUint32(pos + 8, little);
+            const start = i === 0 ? offset : fileOffset + 4 + relative;
+            if ((attributes & 0x07000000) || (i === 0 ? relative !== 0 : !relative)
+                || size < 4 || start !== expected || start + size > offset + length
+                || view.getUint16(pos + 12, little) > imageCount || view.getUint16(pos + 14, little) > imageCount) {
+                throw new Error('Unsupported MPF image layout');
+            }
+            images.push({offset: start, length: size});
+            expected = start + size;
+        }
+        if (expected !== offset + length) throw new Error('Incomplete MPF image layout');
+        return images;
+    }
+    async function jpegStructure(offset = 0, length = source.size, images = new Set()) {
         // Retain every marker, including between progressive scans, but not
         // entropy-coded pixels. Legacy header-only packets cannot prove absence.
-        ranges.length = 0;
-        await read(0, 2);
-        let pos = 2, scanBytes = new Uint8Array(), scanOffset = 0;
+        const primary = images.size === 0, end = offset + length;
+        if (images.has(offset) || images.size >= 32 || offset < 0 || length < 4 || end > source.size) throw new Error('JPEG image traversal limit');
+        images.add(offset);
+        if (primary) ranges.length = 0;
+        const signature = await read(offset, 2);
+        if (signature[0] !== 255 || signature[1] !== 216) throw new Error('Invalid JPEG signature');
+        let pos = offset + 2, scanBytes = new Uint8Array(), scanOffset = offset, compound = null;
         let safe = true, jfif = false, frame = null, scanned = false;
         async function nextMarker(start) {
             let cursor = start;
-            while (cursor + 1 < source.size) {
+            while (cursor + 1 < end) {
                 if (cursor < scanOffset || cursor + 1 >= scanOffset + scanBytes.length) {
                     scanOffset = cursor;
-                    scanBytes = await read(cursor, Math.min(65536, source.size - cursor), false);
+                    scanBytes = await read(cursor, Math.min(65536, maxBytes, end - cursor), false);
                 }
                 const index = scanBytes.indexOf(255, cursor - scanOffset);
                 if (index < 0) { cursor = scanOffset + scanBytes.length; continue; }
@@ -447,17 +565,38 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
             }
             throw new Error('Incomplete JPEG scan');
         }
-        for (let i = 0; i < 1024 && pos + 2 <= source.size; i++) {
+        for (let i = 0; i < 1024 && pos + 2 <= end; i++) {
             const marker = await read(pos, 2);
             if (marker[0] !== 255) throw new Error('Invalid JPEG marker');
             if (marker[1] === 0xd9) {
-                if (pos + 2 !== source.size) throw new Error('Unsupported JPEG trailer');
+                if ((!primary || compound) && (!frame || !scanned)) throw new Error('Incomplete MPF JPEG frame');
+                if (compound) {
+                    if (pos + 2 !== offset + compound[0].length) throw new Error('Invalid MPF primary JPEG extent');
+                    for (const child of compound.slice(1)) await jpegStructure(child.offset, child.length, images);
+                    return null;
+                }
+                if (pos + 2 !== end) {
+                    if (!primary || end !== source.size) throw new Error('Unsupported JPEG child trailer');
+                    const footer = await read(source.size - 8, 8, false);
+                    if (ascii(footer, 4, 4) !== 'SEFT') throw new Error('Unsupported JPEG trailer');
+                    // samsungTrailer validates and retains the complete metadata
+                    // trailer below. Extra data never permits JPEG passthrough.
+                    return null;
+                }
                 return safe && jfif && frame && scanned ? {width: frame.width, height: frame.height} : null;
             }
+            if (pos + 4 > end) throw new Error('Incomplete JPEG marker');
             const word = await read(pos + 2, 2);
             const size = new DataView(word.buffer).getUint16(0);
-            if (size < 2 || pos + size + 2 > source.size) throw new Error('Invalid JPEG segment');
+            if (size < 2 || pos + size + 2 > end) throw new Error('Invalid JPEG segment');
             const body = await read(pos + 4, size - 2);
+            if (marker[1] === 0xe2 && ascii(body, 0, 4) === 'MPF\0') {
+                const index = mpfImages(body, pos + 4, offset, length);
+                if (index) {
+                    if (!primary || compound) throw new Error('Duplicate or nested MPF index');
+                    compound = index;
+                }
+            }
             // This classification never changes packet ranges. It only allows
             // byte reuse where canvas rotation/profile conversion is unnecessary.
             if (![0xc0, 0xc2, 0xc4, 0xdb, 0xdd, 0xda, 0xe0].includes(marker[1])) safe = false;
@@ -596,12 +735,13 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
         kind = 'jpeg-header-ranges';
         const absenceCandidate = await jpeg(0, source.size);
         if (absenceCandidate) jpegPassthrough = await jpegStructure();
-        else if (source.size <= maxBytes) {
+        else if (source.size <= maxBytes * 4) {
             const headers = ranges.slice();
             try { jpegPassthrough = await jpegStructure(); }
-            catch {
+            catch (error) {
                 // Preserve legacy camera/trailer transport when a complete
                 // bounded scan cannot qualify the broader metadata-only path.
+                jpegStructureFailure = error.message;
                 ranges.splice(0, ranges.length, ...headers);
             }
         }
@@ -700,5 +840,5 @@ export async function extractRanges(source, maxBytes = 8 * 1024 * 1024) {
     if (payloadBytes > maxBytes) throw new Error('Metadata payload budget exceeded');
     const chunks = [];
     for (const r of merged) chunks.push({offset: r.offset, bytes: await read(r.offset, r.length, false)});
-    return {kind, notices, chunks, payloadBytes, readBytes, readCalls, jpegPassthrough};
+    return {kind, notices, chunks, payloadBytes, readBytes, readCalls, jpegPassthrough, jpegStructureFailure};
 }

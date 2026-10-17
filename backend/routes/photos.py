@@ -620,6 +620,12 @@ def photos_processing_status():
             'mapDetection': entity.get('map_detection_status'),
             'activeWorker': app._active_processing_worker(entity),
         }
+        # Additive: why each non-'done' step ended where it did, so a
+        # 'failed'/'no_data' tile is self-explaining instead of needing a
+        # server-side dig. Omitted entirely when nothing to report.
+        reasons = app._processing_step_reasons(entity)
+        if reasons:
+            statuses[filename]['reasons'] = reasons
     return app.jsonify({'statuses': statuses})
 
 @photos_bp.route('/photos/lookup/<path:filename>', methods=['GET'])
