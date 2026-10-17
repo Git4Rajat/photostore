@@ -63,7 +63,11 @@ def _scan_select() -> List[str]:
 
 def _spool_dir(user_id: str, build_id: str) -> str:
     base = index_files.WORK_DIR or os.path.join(tempfile.gettempdir(), 'photostore-index-build')
-    digest = hashlib.sha1(user_id.encode('utf-8')).hexdigest()[:12]
+    # Short, filesystem-safe label for the temp spool dir so the raw user id
+    # isn't spelled out in a world-readable temp path. Non-cryptographic use
+    # (just a deterministic name, recomputed identically on resume), but use
+    # SHA-256 rather than SHA-1 to satisfy py/weak-sensitive-data-hashing.
+    digest = hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:12]
     path = os.path.join(base, f'bootstrap-{digest}-{build_id}')
     os.makedirs(path, exist_ok=True)
     return path
