@@ -14877,10 +14877,10 @@ def run_clustering_worker() -> None:
 IPWORK_STEP_PROCESSORS: Dict[str, Callable[[str, str, bytes], Optional[Dict]]] = {}
 
 # Experimental until representative replay establishes quality and latency.
-IPWORK_SHARED_DECODE = os.getenv('IPWORK_SHARED_DECODE', 'false').lower() == 'true'
-IPWORK_REUSE_PREVIEW = os.getenv('IPWORK_REUSE_PREVIEW', 'false').lower() == 'true'
-IPWORK_REUSE_EXIF = os.getenv('IPWORK_REUSE_EXIF', 'false').lower() == 'true'
-IPWORK_REUSE_METADATA_PACKET = os.getenv('IPWORK_REUSE_METADATA_PACKET', 'false').lower() == 'true'
+IPWORK_SHARED_DECODE = os.getenv('IPWORK_SHARED_DECODE', 'true').lower() == 'true'
+IPWORK_REUSE_PREVIEW = os.getenv('IPWORK_REUSE_PREVIEW', 'true').lower() == 'true'
+IPWORK_REUSE_EXIF = os.getenv('IPWORK_REUSE_EXIF', 'true').lower() == 'true'
+IPWORK_REUSE_METADATA_PACKET = os.getenv('IPWORK_REUSE_METADATA_PACKET', 'true').lower() == 'true'
 
 # Scoped to the task's thread: browser/API calls do not enter worker metrics.
 _ipwork_metrics_context = threading.local()

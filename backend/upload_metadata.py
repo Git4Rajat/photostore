@@ -358,7 +358,7 @@ def _qualified_webp_metadata(filename, ranges, source_size, exif):
 
 def uploads_enabled(filename=''):
     from image_utils import is_video_file
-    return is_video_file(filename) or os.getenv('BROWSER_UPLOAD_PREPARATION', 'false').lower() == 'true'
+    return is_video_file(filename) or os.getenv('BROWSER_UPLOAD_PREPARATION', 'true').lower() == 'true'
 
 
 def qualified_family(filename):

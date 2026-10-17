@@ -55,7 +55,7 @@ param emailDataLocation string = 'Europe'
 param processingMode string = 'browser'
 
 @description('Prepare thumbnails, previews and metadata in the browser, and reuse accepted assets for backend processing.')
-param browserUploadPreparation bool = false
+param browserUploadPreparation bool = true
 
 @description('Public core API image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
 param coreImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
@@ -401,6 +401,7 @@ var backendEnv = [
   { name: 'IPWORK_REUSE_PREVIEW', value: browserUploadPreparation ? 'true' : 'false' }
   { name: 'IPWORK_REUSE_EXIF', value: browserUploadPreparation ? 'true' : 'false' }
   { name: 'IPWORK_REUSE_METADATA_PACKET', value: browserUploadPreparation ? 'true' : 'false' }
+  { name: 'IPWORK_SHARED_DECODE', value: browserUploadPreparation ? 'true' : 'false' }
   // v3 drops the 128-d face-api descriptor concatenated onto ArcFace's 512-d
   // output (it diluted ArcFace's signal) and 5-point-landmark-aligns the crop
   // fed to ArcFace instead of using a plain padded box. v2 stays in the
