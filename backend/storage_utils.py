@@ -8672,6 +8672,8 @@ def _apply_client_processing_results(
     # like "no existing thumbnail" even when a prior successful one exists.
     had_thumbnail_before = str(metadata.get('thumbnail_status') or '').strip().lower() == 'done'
     had_preview_before = str(metadata.get('preview_status') or '').strip().lower() == 'done'
+    # The report's own exif 'done' item must not count as an earlier result.
+    exif_done_before = _step_locked_done(metadata, 'exif')
     face_report_background_throttled = any(
         str(item.get('step') or '').strip() == 'face'
         and str(item.get('reason') or '').strip().lower() == 'background_throttled'
@@ -8894,7 +8896,7 @@ def _apply_client_processing_results(
         browser_exif_item.get('status'), browser_exif_item.get('browserExifReason'),
         browser_exif_item.get('browserExifMs'), _client_report_needs_server_exif_fallback(report),
     )
-    if isinstance(exif_result, dict) and _step_locked_done(metadata, 'exif'):
+    if isinstance(exif_result, dict) and exif_done_before:
         # Race guard, same as ocr/map_detection/face/ai_vision/thumbnail: the
         # browser's hand-rolled EXIF parser and the server's exiftool-based one
         # (exif_utils.py) are genuinely different implementations and can

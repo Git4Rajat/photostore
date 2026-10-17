@@ -37,3 +37,19 @@ def test_browser_exif_verdict_persists_exif_data_and_gps(browser_apply):
     assert float(row['latitude']) == pytest.approx(10.5)
     assert float(row['longitude']) == pytest.approx(20.25)
     assert row['processing_lease_owner'] == ''
+
+
+def test_browser_exif_verdict_with_done_report_item_still_persists(browser_apply):
+    storage_utils.apply_client_processing_results_for_file(
+        'private-user', 'private.jpg', origin='browser', lease_owner='worker',
+        client_processing={'exif': {
+            'source': 'browser_exiftool', 'verifiedComplete': True,
+            'exifToolJson': {'EXIF:Make': 'Test', 'Composite:GPSLatitude': 10.5, 'Composite:GPSLongitude': 20.25},
+        }},
+        client_processing_report=[{'step': 'exif', 'status': 'done', 'reason': 'done', 'runtime': 'browser-exiftool-wasm'}])
+    row = browser_apply.rows[('private-user', 'private.jpg')]
+    assert json.loads(row['exifData'])['Make'] == 'Test'
+    assert float(row['latitude']) == pytest.approx(10.5)
+    assert row['exif_status'] == 'done'
+    from ipwork_geo import geo_exif_from_metadata
+    assert geo_exif_from_metadata(dict(row)) is not None
