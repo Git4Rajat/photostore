@@ -6,16 +6,20 @@ import {createHash} from 'node:crypto';
 import {extractRanges} from '../src/utils/metadataRanges.js';
 
 const [rootArg, outputArg, pattern] = process.argv.slice(2);
-if (!rootArg || !outputArg) throw new Error('Usage: node scripts/exif-corpus-packets.mjs CORPUS OUTPUT [REGEX]');
+if (!rootArg || !outputArg) throw new Error('Usage: node scripts/exif-corpus-packets.mjs CORPUS OUTPUT [SUBSTRING]');
 const root = path.resolve(rootArg), output = path.resolve(outputArg);
 if (root === output || root.startsWith(output + path.sep) || output.startsWith(root + path.sep)) {
     throw new Error('Output must be separate from corpus');
 }
-const filter = pattern ? new RegExp(pattern) : null;
+// Plain substring match on the filename, not a regex: the optional filter is a
+// developer convenience and building a RegExp from an argv value is both a
+// ReDoS/regex-injection footgun (flagged by CodeQL js/regex-injection) and more
+// power than selecting a few corpus files needs.
+const filter = pattern || null;
 await fs.mkdir(output, {recursive: true, mode: 0o700});
 const rows = [];
 for (const entry of (await fs.readdir(root, {withFileTypes: true})).sort((a, b) => a.name.localeCompare(b.name))) {
-    if (!entry.isFile() || entry.name.startsWith('.') || (filter && !filter.test(entry.name))) continue;
+    if (!entry.isFile() || entry.name.startsWith('.') || (filter && !entry.name.includes(filter))) continue;
     const name = entry.name, sourcePath = path.join(root, name), handle = await fs.open(sourcePath, 'r');
     try {
         const stat = await handle.stat(), digest = createHash('sha256');
