@@ -34,6 +34,9 @@ type Pending = (value: BrowserExifOutcome) => void;
 let worker: Worker | null = null;
 let unavailable = false;
 let seq = 0;
+let parsesSinceBoot = 0;
+let queue: Promise<unknown> = Promise.resolve();
+const RECYCLE_AFTER_PARSES = 25;
 const pending = new Map<number, { resolve: Pending; timer: ReturnType<typeof setTimeout>; started: number }>();
 
 function failed(reason: string, started: number): BrowserExifOutcome {
@@ -50,6 +53,7 @@ function getWorker(): Worker | null {
   try {
     // Classic worker (served from public/) — it importScripts the Emscripten glue.
     const w = new Worker(WORKER_URL);
+    parsesSinceBoot = 0;
     w.onmessage = (event: MessageEvent) => {
       const data = (event.data || {}) as {
         id?: number; ok?: boolean; json?: Record<string, unknown>; outcome?: string;
@@ -106,14 +110,33 @@ export function browserExifToolAvailable(): boolean {
 /**
  * Extract EXIF in-browser. Never throws: a failed run reports its reason so the
  * caller can record it and fall back to the server EXIF path.
+ *
+ * Requests run one at a time (the worker is single-threaded anyway), so a recycle
+ * never fails a neighbouring file. A `parse_error` is retried once on a fresh
+ * worker, and the worker is recycled every RECYCLE_AFTER_PARSES parses because
+ * each parse leaves a little WASM call-stack behind.
  */
-export async function extractBrowserExif(
+export function extractBrowserExif(
   bytes: Uint8Array,
+  name = '',
   timeoutMs = 20000,
 ): Promise<BrowserExifOutcome> {
+  const run = queue.then(async () => {
+    const first = await parseOnce(bytes, name, timeoutMs);
+    if (first.ok || first.reason !== 'parse_error') return first;
+    recycleWorker();
+    return parseOnce(bytes, name, timeoutMs);
+  });
+  queue = run.catch(() => undefined);
+  return run;
+}
+
+function parseOnce(bytes: Uint8Array, name: string, timeoutMs: number): Promise<BrowserExifOutcome> {
   const started = performance.now();
+  if (parsesSinceBoot >= RECYCLE_AFTER_PARSES) recycleWorker();
   const w = getWorker();
-  if (!w) return failed(unavailable ? 'tool_unavailable' : 'unsupported_runtime', started);
+  if (!w) return Promise.resolve(failed(unavailable ? 'tool_unavailable' : 'unsupported_runtime', started));
+  parsesSinceBoot++;
   const id = ++seq;
   return new Promise<BrowserExifOutcome>((resolve) => {
     const timer = setTimeout(() => {
@@ -124,8 +147,7 @@ export async function extractBrowserExif(
     }, timeoutMs);
     pending.set(id, { resolve, timer, started });
     try {
-      // Transfer the buffer to avoid a copy; caller must not reuse `bytes` after.
-      w.postMessage({ id, type: 'parse', bytes }, [bytes.buffer]);
+      w.postMessage({ id, type: 'parse', bytes, name });
     } catch {
       pending.delete(id);
       clearTimeout(timer);

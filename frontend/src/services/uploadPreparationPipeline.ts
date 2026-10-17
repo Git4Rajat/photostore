@@ -244,7 +244,7 @@ export class UploadPreparationPipeline {
         const exifPromise = isVideoFilename(file.name) || signal.aborted ? Promise.resolve() : (async () => {
             const started = performance.now();
             const outcome = await file.arrayBuffer()
-                .then(buffer => extractBrowserExif(new Uint8Array(buffer)))
+                .then(buffer => extractBrowserExif(new Uint8Array(buffer), file.name))
                 .catch(() => ({ ok: false as const, reason: 'read_error', ms: 0 }));
             const durationMs = Math.round(performance.now() - started);
             if (outcome.ok) {

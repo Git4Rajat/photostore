@@ -3414,7 +3414,7 @@ export const runBrowserProcessing = async (
         // DataView parser (which leaves the server EXIF fallback in charge).
         // Geo for the authoritative path is derived server-side from this EXIF.
         const browserAttempt = visionSource.imageSource
-            ? await extractBrowserExif(new Uint8Array(await file.arrayBuffer()))
+            ? await extractBrowserExif(new Uint8Array(await file.arrayBuffer()), file.name)
             : null;
         const browserExif = browserAttempt?.ok ? browserAttempt.result : null;
         const browserFallback = browserAttempt && !browserAttempt.ok
