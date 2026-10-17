@@ -24,7 +24,7 @@ RESAMPLING_LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') el
 
 RAW_EXTENSIONS_RAWPY = {
     'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2',
-    'dng', 'orf', 'rw2', 'pef', 'ptx', 'raf', 'raw',
+    'dng', 'orf', 'ori', 'rw2', 'pef', 'ptx', 'raf', 'raw',
     'rwl', '3fr', 'fff', 'mrw', 'x3f', 'erf', 'mef',
     'mos', 'kdc', 'k25', 'dcr', 'dcs', 'drf', 'mdc',
     'srw', 'rwz', 'bay', 'cap', 'eip', 'gpr', 'pxn', 'iiq',

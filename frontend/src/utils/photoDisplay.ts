@@ -1,7 +1,7 @@
 export const SUPPORTED_RAW_EXTENSIONS = [
     '3fr', 'ari', 'arw', 'bay', 'cap', 'cr2', 'cr3', 'crw', 'dcr',
     'dcs', 'dng', 'drf', 'eip', 'erf', 'fff', 'gpr', 'iiq', 'k25', 'kdc',
-    'mdc', 'mef', 'mos', 'mrw', 'nef', 'nrw', 'orf', 'pef', 'ptx', 'pxn',
+    'mdc', 'mef', 'mos', 'mrw', 'nef', 'nrw', 'orf', 'ori', 'pef', 'ptx', 'pxn',
     'raf', 'raw', 'rw2', 'rwl', 'rwz', 'sr2', 'srf', 'srw', 'x3f',
 ] as const;
 
