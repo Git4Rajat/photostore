@@ -9562,6 +9562,12 @@ def _unstick_claimed_steps_still_running(
         pass
 
 
+_EXIF_RESULT_FIELDS = (
+    'exifData', 'exifCount', 'latitude', 'longitude', 'address', 'locationCity',
+    'locationRegion', 'locationCountry', 'semanticText', 'semanticLayers',
+)
+
+
 def apply_client_processing_results_for_file(
     user_id: str,
     filename: str,
@@ -9625,6 +9631,7 @@ def apply_client_processing_results_for_file(
                     image_bytes_cache.append(download_media_bytes('image', source_blob))
         return image_bytes_cache[0]
 
+    exif_baseline = {key: metadata.get(key) for key in _EXIF_RESULT_FIELDS}
     batch = []
     try:
         # Workers own the final status flush; browser callers retain the
@@ -9658,7 +9665,10 @@ def apply_client_processing_results_for_file(
     if consolidated:
         return timed_call('persistence', _commit_worker_processing_results,
                           user_id, filename, baseline, metadata, batch, lease_owner)
+    exif_updates = {key: metadata.get(key) for key in _EXIF_RESULT_FIELDS
+                    if metadata.get(key) != exif_baseline[key]}
     timed_call('persistence', refresh_metadata_entity, user_id, filename, {
+        **exif_updates,
         'processing_lease_owner': '',
         'processing_lease': '',
         'processing_lease_expires_at': '',
