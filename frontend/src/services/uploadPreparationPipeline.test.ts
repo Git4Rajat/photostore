@@ -1,11 +1,14 @@
 import {Blob as NodeBlob} from 'node:buffer';
 
-const mocks = vi.hoisted(() => ({prepare: vi.fn(), dispose: vi.fn(), fetch: vi.fn()}));
+const mocks = vi.hoisted(() => ({prepare: vi.fn(), dispose: vi.fn(), fetch: vi.fn(), exif: vi.fn()}));
 vi.mock('./uploadAssetPreparation', () => ({UploadAssetPreparer: class {
     prepare = mocks.prepare;
     dispose = mocks.dispose;
 }}));
+vi.mock('../utils/browserExifTool', () => ({extractBrowserExif: mocks.exif}));
 import {UploadPreparationPipeline} from './uploadPreparationPipeline';
+
+const browserVerdict = {ok: true, result: {source: 'browser_exiftool', verifiedComplete: true, exifToolJson: {'EXIF:Make': 'Canon'}}};
 
 const source = () => new File(['source'], 'photo.cr3');
 const targets = {previewBlobUrl: 'https://storage/preview', thumbnailBlobUrl: 'https://storage/thumb'};
@@ -18,6 +21,7 @@ beforeEach(() => {
     vi.stubGlobal('fetch', mocks.fetch);
     mocks.prepare.mockResolvedValue(assets());
     mocks.fetch.mockResolvedValue({ok: true, status: 201});
+    mocks.exif.mockResolvedValue(browserVerdict);
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
@@ -32,6 +36,62 @@ test('only successful uploads are attached to finalization', async () => {
     expect(result.preparationReport?.assets.thumbnail).toMatchObject({generation: 'generated', upload: 'failed', uploadReason: 'http_error', httpStatus: 403});
     expect(result.preparationReport?.assets.metadata).toMatchObject({generation: 'skipped', generationReason: 'missing_target'});
     expect(mocks.fetch.mock.calls[0][1].headers['x-ms-blob-type']).toBe('BlockBlob');
+    pipeline.dispose();
+});
+
+test.each(['IMG_0127.HEIC', 'photo.jpg', 'sample_001.cr3', 'sample_001.rw2', 'sample_001.3fr', 'sample_001.dng'])('browser EXIF runs for %s and attaches the verdict', async name => {
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(new File(['x'], name), 'a'.repeat(64), targets, new AbortController().signal);
+    expect(mocks.exif).toHaveBeenCalledTimes(1);
+    expect(result.clientProcessing?.exif).toEqual(browserVerdict.result);
+    expect(result.clientProcessingReport).toEqual([expect.objectContaining({step: 'exif', status: 'done', reason: 'done', runtime: 'browser-exiftool-wasm'})]);
+    pipeline.dispose();
+});
+
+test('browser EXIF runs on a file above the metadata packet size without changing its upload', async () => {
+    const big = new File([new Uint8Array(300 * 1024 * 1024)], 'sample_001.raf');
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(big, 'a'.repeat(64), targets, new AbortController().signal);
+    expect(mocks.exif).toHaveBeenCalledTimes(1);
+    expect(result.clientProcessing?.exif).toEqual(browserVerdict.result);
+    pipeline.dispose();
+});
+
+test.each([
+    ['timeout', 'failed', 'unknown_error'],
+    ['parse_error', 'failed', 'unknown_error'],
+    ['unsupported_runtime', 'unsupported', 'unsupported_runtime'],
+    ['tool_unavailable', 'unsupported', 'unsupported_runtime'],
+])('browser EXIF failure %s reports %s so the server fallback runs', async (reason, status, reportReason) => {
+    mocks.exif.mockResolvedValue({ok: false, reason, ms: 12});
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(new File(['x'], 'sample_001.cr3'), 'a'.repeat(64), targets, new AbortController().signal);
+    expect(result.clientProcessing?.exif).toBeUndefined();
+    expect(result.clientProcessingReport).toEqual([expect.objectContaining({
+        step: 'exif', status, reason: reportReason, browserExifReason: reason, browserExifMs: 12,
+    })]);
+    pipeline.dispose();
+});
+
+test('a file read failure reports browser EXIF failed so the server fallback runs', async () => {
+    const file = new File(['x'], 'sample_001.cr3');
+    vi.spyOn(file, 'arrayBuffer').mockRejectedValue(new DOMException('read failed', 'NotReadableError'));
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(file, 'a'.repeat(64), targets, new AbortController().signal);
+    expect(mocks.exif).not.toHaveBeenCalled();
+    expect(result.clientProcessing?.exif).toBeUndefined();
+    expect(result.clientProcessingReport).toEqual([expect.objectContaining({
+        step: 'exif', status: 'failed', reason: 'unknown_error', browserExifReason: 'read_error',
+    })]);
+    pipeline.dispose();
+});
+
+test('browser EXIF is not run for videos', async () => {
+    metadataWorker();
+    mocks.prepare.mockResolvedValue({status: 'generated', thumbnail: assets().thumbnail, runtime: 'ffmpeg_wasm'});
+    const pipeline = new UploadPreparationPipeline();
+    await pipeline.start(new File(['video'], 'clip.mkv'), 'a'.repeat(64), {thumbnailBlobUrl: 'https://storage/thumb'}, new AbortController().signal);
+    expect(mocks.exif).not.toHaveBeenCalled();
     pipeline.dispose();
 });
 
@@ -110,7 +170,7 @@ test('bounds PUT concurrency and abort drains waiting jobs', async () => {
     await vi.advanceTimersByTimeAsync(240_000);
     expect(maximum).toBe(2);
     const results = await Promise.all(jobs);
-    expect(results.map(({preparationReport, ...payload}) => payload)).toEqual(Array.from({length: 5}, () => ({})));
+    expect(results.every(result => !result.clientProcessing?.preview && !result.clientProcessing?.thumbnail)).toBe(true);
     expect(results.every(result => result.preparationReport?.assets.preview.upload === 'failed')).toBe(true);
     expect(results.every(result => result.preparationReport?.assets.preview.uploadReason === 'upload_timeout')).toBe(true);
     expect(results.every(result => result.preparationReport?.assets.thumbnail.uploadReason === 'upload_timeout')).toBe(true);
@@ -122,7 +182,8 @@ test('unsupported decoding and pre-aborted files keep original-only finalization
     const pipeline = new UploadPreparationPipeline();
     const controller = new AbortController();
     const failed = await pipeline.start(source(), 'a'.repeat(64), targets, controller.signal);
-    expect(failed.clientProcessing).toBeUndefined();
+    expect(failed.clientProcessing?.preview).toBeUndefined();
+    expect(failed.clientProcessing?.thumbnail).toBeUndefined();
     expect(failed.preparationReport?.assets.preview.generation).toBe('failed');
     controller.abort();
     expect(await pipeline.start(source(), 'a'.repeat(64), targets, controller.signal)).toMatchObject({preparationReport: {reason: 'caller_aborted'}});

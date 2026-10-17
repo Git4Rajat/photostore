@@ -1,10 +1,12 @@
 import {UploadAssetPreparer} from './uploadAssetPreparation';
 import type {UploadMetadataDescriptor, UploadMetadataPacket} from '../utils/uploadMetadata';
 import {isVideoFilename} from '../utils/photoDisplay';
+import {extractBrowserExif} from '../utils/browserExifTool';
 import {PREPARATION_ASSETS, type AssetPreparationDiagnostic, type PreparationAsset, type UploadPreparationReport} from '../utils/uploadPreparationDiagnostics';
 
 export interface PreparedUpload {
-    clientProcessing?: Record<string, {alreadyUploaded: true; source: string}>;
+    clientProcessing?: Record<string, any>;
+    clientProcessingReport?: Array<Record<string, unknown>>;
     clientMetadata?: UploadMetadataDescriptor;
     preparationReport?: UploadPreparationReport;
 }
@@ -239,7 +241,29 @@ export class UploadPreparationPipeline {
                 result.clientMetadata = packet.descriptor;
             }
         }) : Promise.resolve(null);
-        const outcomes = await Promise.allSettled([assetsPromise, packetPromise]);
+        const exifPromise = isVideoFilename(file.name) || signal.aborted ? Promise.resolve() : (async () => {
+            const started = performance.now();
+            const outcome = await file.arrayBuffer()
+                .then(buffer => extractBrowserExif(new Uint8Array(buffer)))
+                .catch(() => ({ ok: false as const, reason: 'read_error', ms: 0 }));
+            const durationMs = Math.round(performance.now() - started);
+            if (outcome.ok) {
+                result.clientProcessing ??= {};
+                result.clientProcessing.exif = outcome.result;
+                result.clientProcessingReport = [...(result.clientProcessingReport ?? []), {
+                    step: 'exif', status: 'done', reason: 'done', durationMs,
+                    runtime: 'browser-exiftool-wasm',
+                }];
+            } else {
+                const unsupported = outcome.reason === 'unsupported_runtime' || outcome.reason === 'tool_unavailable';
+                result.clientProcessingReport = [...(result.clientProcessingReport ?? []), {
+                    step: 'exif', status: unsupported ? 'unsupported' : 'failed',
+                    reason: unsupported ? 'unsupported_runtime' : 'unknown_error', durationMs,
+                    runtime: 'browser-exiftool-wasm', browserExifReason: outcome.reason, browserExifMs: outcome.ms,
+                }];
+            }
+        })();
+        const outcomes = await Promise.allSettled([assetsPromise, packetPromise, exifPromise]);
         if (outcomes.some(outcome => outcome.status === 'rejected')) report.reason ??= 'internal_error';
         return result;
     }
