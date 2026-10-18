@@ -16110,20 +16110,22 @@ def _trigger_indexer_rebuild(user_id: str, reason: str = 'trigger', scope: str =
     if not indexer_url:
         return
 
-    def _fire() -> None:
-        try:
-            import requests
-            token = _issue_session_for(key)
-            requests.post(
-                f"{indexer_url.rstrip('/')}/api/tools/indexes/build",
-                json={'scope': scope, 'reason': reason},
-                headers={'Authorization': f'Bearer {token}'},
-                timeout=float(os.getenv('INDEXER_INDEX_REBUILD_TIMEOUT_SECONDS', '600')),
-            )
-        except Exception:
-            worker_logger.exception('Failed to trigger indexer index rebuild for %s', key)
-
-    threading.Thread(target=_fire, name='index-rebuild-trigger', daemon=True).start()
+    # HTTP fallback (used when queue is unavailable). Make a best-effort POST with a
+    # short timeout to avoid blocking the caller. The indexer POST itself is
+    # fire-and-forget from our perspective: we return immediately after the
+    # HTTP request initiates (possibly before the indexer completes the build).
+    # This avoids orphaned daemon threads that die mid-build on container restart.
+    try:
+        import requests
+        token = _issue_session_for(key)
+        requests.post(
+            f"{indexer_url.rstrip('/')}/api/tools/indexes/build",
+            json={'scope': scope, 'reason': reason},
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=5.0,  # Short timeout: connection + initial response only
+        )
+    except Exception:
+        worker_logger.exception('Failed to trigger indexer index rebuild for %s', key)
 
 
 def _prepare_ipwork_face_indexes(messages, cancelled) -> None:

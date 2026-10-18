@@ -236,19 +236,65 @@ class _KeyedLockRegistry:
     expensive per-user rebuild can be coalesced across concurrent callers
     instead of each one redoing the same work -- a gap the vector index below
     still has (its rebuild path has no per-user lock at all); new per-user
-    caches in this module should use this instead of leaving that gap open."""
+    caches in this module should use this instead of leaving that gap open.
+
+    Protects against orphaned locks from dead daemon threads by tracking
+    lock acquisition timestamps and force-releasing locks older than
+    MAX_LOCK_AGE_SECONDS (indicating the holder crashed mid-operation)."""
+
+    MAX_LOCK_AGE_SECONDS = 3600  # 1 hour: if a rebuild takes longer, it's stuck
 
     def __init__(self) -> None:
         self._locks: Dict[str, threading.Lock] = {}
+        self._lock_acquired_at: Dict[str, float] = {}  # timestamp when lock was acquired
         self._guard = threading.Lock()
 
     def lock_for(self, key: str) -> threading.Lock:
         with self._guard:
             lock = self._locks.get(key)
+            acquired_at = self._lock_acquired_at.get(key)
+
+            # Force-release stuck locks (thread died while holding)
+            if acquired_at is not None:
+                age_seconds = time.monotonic() - acquired_at
+                if age_seconds > self.MAX_LOCK_AGE_SECONDS:
+                    _LOGGER.warning(
+                        'Releasing stuck lock for %s (held for %.0f seconds); '
+                        'likely orphaned from dead rebuild thread',
+                        key, age_seconds
+                    )
+                    self._lock_acquired_at.pop(key, None)
+                    acquired_at = None
+
             if lock is None:
                 lock = threading.Lock()
                 self._locks[key] = lock
             return lock
+
+    def mark_acquired(self, key: str) -> None:
+        """Called after successfully acquiring a lock, to timestamp it."""
+        with self._guard:
+            self._lock_acquired_at[key] = time.monotonic()
+
+    def mark_released(self, key: str) -> None:
+        """Called after releasing a lock, to clear the timestamp."""
+        with self._guard:
+            self._lock_acquired_at.pop(key, None)
+
+    @contextlib.contextmanager
+    def acquire_and_track(self, key: str):
+        """Context manager: acquire lock, track timestamp, auto-release on exit.
+        Yields True if lock was acquired, False if already held by another thread."""
+        lock = self.lock_for(key)
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            self.mark_acquired(key)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self.mark_released(key)
+                lock.release()
 
 
 _VECTOR_INDEX_CACHE_LOCK = threading.RLock()
@@ -3075,21 +3121,20 @@ def _rebuild_people_embedding_index_in_background(key: str, manifest: Dict[str, 
     """
     if _index_rebuild_in_cooldown(key, 'people_embedding'):
         return
-    lock = _PEOPLE_EMBEDDING_INDEX_REBUILD_LOCKS.lock_for(key)
-    if not lock.acquire(blocking=False):
-        return
 
-    def _worker() -> None:
-        try:
-            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-            refresh_user_people_embedding_index(key, source_version=source_version)
-            _mark_index_rebuild_completed(key, 'people_embedding')
-        except Exception:
-            _LOGGER.exception('Background people-embedding index rebuild failed for user %s', key)
-        finally:
-            lock.release()
+    with _PEOPLE_EMBEDDING_INDEX_REBUILD_LOCKS.acquire_and_track(key) as acquired:
+        if not acquired:
+            return
 
-    threading.Thread(target=_worker, name='people-embedding-index-rebuild', daemon=True).start()
+        def _worker() -> None:
+            try:
+                source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                refresh_user_people_embedding_index(key, source_version=source_version)
+                _mark_index_rebuild_completed(key, 'people_embedding')
+            except Exception:
+                _LOGGER.exception('Background people-embedding index rebuild failed for user %s', key)
+
+        threading.Thread(target=_worker, name='people-embedding-index-rebuild', daemon=True).start()
 
 
 def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True) -> Optional[Dict[str, object]]:
@@ -4820,21 +4865,20 @@ def _rebuild_lexical_index_in_background(key: str, manifest: Dict[str, str]) -> 
     background rebuild the instant each prior one finishes."""
     if _index_rebuild_in_cooldown(key, 'lexical'):
         return
-    lock = _LEXICAL_INDEX_REBUILD_LOCKS.lock_for(key)
-    if not lock.acquire(blocking=False):
-        return
 
-    def _worker() -> None:
-        try:
-            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-            refresh_user_lexical_index(key, source_version=source_version)
-            _mark_index_rebuild_completed(key, 'lexical')
-        except Exception:
-            _LOGGER.exception('Background lexical index rebuild failed for user %s', key)
-        finally:
-            lock.release()
+    with _LEXICAL_INDEX_REBUILD_LOCKS.acquire_and_track(key) as acquired:
+        if not acquired:
+            return
 
-    threading.Thread(target=_worker, name='lexical-index-rebuild', daemon=True).start()
+        def _worker() -> None:
+            try:
+                source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                refresh_user_lexical_index(key, source_version=source_version)
+                _mark_index_rebuild_completed(key, 'lexical')
+            except Exception:
+                _LOGGER.exception('Background lexical index rebuild failed for user %s', key)
+
+        threading.Thread(target=_worker, name='lexical-index-rebuild', daemon=True).start()
 
 
 def get_user_lexical_index(
@@ -5457,21 +5501,20 @@ def _rebuild_sort_index_in_background(key: str, manifest: Dict[str, str]) -> Non
     the same _index_rebuild_in_cooldown check."""
     if _index_rebuild_in_cooldown(key, 'sort'):
         return
-    lock = _SORT_INDEX_REBUILD_LOCKS.lock_for(key)
-    if not lock.acquire(blocking=False):
-        return
 
-    def _worker() -> None:
-        try:
-            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-            refresh_user_sort_index(key, source_version=source_version)
-            _mark_index_rebuild_completed(key, 'sort')
-        except Exception:
-            _LOGGER.exception('Background sort index rebuild failed for user %s', key)
-        finally:
-            lock.release()
+    with _SORT_INDEX_REBUILD_LOCKS.acquire_and_track(key) as acquired:
+        if not acquired:
+            return
 
-    threading.Thread(target=_worker, name='sort-index-rebuild', daemon=True).start()
+        def _worker() -> None:
+            try:
+                source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                refresh_user_sort_index(key, source_version=source_version)
+                _mark_index_rebuild_completed(key, 'sort')
+            except Exception:
+                _LOGGER.exception('Background sort index rebuild failed for user %s', key)
+
+        threading.Thread(target=_worker, name='sort-index-rebuild', daemon=True).start()
 
 
 def get_user_sort_index(
@@ -5838,21 +5881,20 @@ def _rebuild_access_index_in_background(key: str, manifest: Dict[str, str]) -> N
     same _index_rebuild_in_cooldown check."""
     if _index_rebuild_in_cooldown(key, 'access'):
         return
-    lock = _ACCESS_INDEX_REBUILD_LOCKS.lock_for(key)
-    if not lock.acquire(blocking=False):
-        return
 
-    def _worker() -> None:
-        try:
-            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-            refresh_user_access_index(key, source_version=source_version)
-            _mark_index_rebuild_completed(key, 'access')
-        except Exception:
-            _LOGGER.exception('Background access index rebuild failed for user %s', key)
-        finally:
-            lock.release()
+    with _ACCESS_INDEX_REBUILD_LOCKS.acquire_and_track(key) as acquired:
+        if not acquired:
+            return
 
-    threading.Thread(target=_worker, name='access-index-rebuild', daemon=True).start()
+        def _worker() -> None:
+            try:
+                source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                refresh_user_access_index(key, source_version=source_version)
+                _mark_index_rebuild_completed(key, 'access')
+            except Exception:
+                _LOGGER.exception('Background access index rebuild failed for user %s', key)
+
+        threading.Thread(target=_worker, name='access-index-rebuild', daemon=True).start()
 
 
 def get_user_access_index(
@@ -6338,21 +6380,20 @@ def _rebuild_albums_index_in_background(key: str, manifest: Dict[str, str]) -> N
     same _index_rebuild_in_cooldown check."""
     if _index_rebuild_in_cooldown(key, 'albums'):
         return
-    lock = _ALBUMS_INDEX_REBUILD_LOCKS.lock_for(key)
-    if not lock.acquire(blocking=False):
-        return
 
-    def _worker() -> None:
-        try:
-            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-            refresh_user_albums_index(key, source_version=source_version)
-            _mark_index_rebuild_completed(key, 'albums')
-        except Exception:
-            _LOGGER.exception('Background albums index rebuild failed for user %s', key)
-        finally:
-            lock.release()
+    with _ALBUMS_INDEX_REBUILD_LOCKS.acquire_and_track(key) as acquired:
+        if not acquired:
+            return
 
-    threading.Thread(target=_worker, name='albums-index-rebuild', daemon=True).start()
+        def _worker() -> None:
+            try:
+                source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                refresh_user_albums_index(key, source_version=source_version)
+                _mark_index_rebuild_completed(key, 'albums')
+            except Exception:
+                _LOGGER.exception('Background albums index rebuild failed for user %s', key)
+
+        threading.Thread(target=_worker, name='albums-index-rebuild', daemon=True).start()
 
 
 def get_user_albums_index(
@@ -6992,21 +7033,20 @@ def _rebuild_people_index_in_background(key: str, manifest: Dict[str, str]) -> N
     the same _index_rebuild_in_cooldown check."""
     if _index_rebuild_in_cooldown(key, 'people'):
         return
-    lock = _PEOPLE_INDEX_REBUILD_LOCKS.lock_for(key)
-    if not lock.acquire(blocking=False):
-        return
 
-    def _worker() -> None:
-        try:
-            source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
-            refresh_user_people_index(key, source_version=source_version)
-            _mark_index_rebuild_completed(key, 'people')
-        except Exception:
-            _LOGGER.exception('Background people index rebuild failed for user %s', key)
-        finally:
-            lock.release()
+    with _PEOPLE_INDEX_REBUILD_LOCKS.acquire_and_track(key) as acquired:
+        if not acquired:
+            return
 
-    threading.Thread(target=_worker, name='people-index-rebuild', daemon=True).start()
+        def _worker() -> None:
+            try:
+                source_version = str(manifest.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
+                refresh_user_people_index(key, source_version=source_version)
+                _mark_index_rebuild_completed(key, 'people')
+            except Exception:
+                _LOGGER.exception('Background people index rebuild failed for user %s', key)
+
+        threading.Thread(target=_worker, name='people-index-rebuild', daemon=True).start()
 
 
 def get_user_people_index(
