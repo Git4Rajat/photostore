@@ -34,6 +34,28 @@ def upload_telemetry():
     return app.jsonify({'recorded': True})
 
 
+@upload_bp.route('/api/upload/transfer-heartbeat', methods=['POST'])
+@upload_bp.route('/upload/transfer-heartbeat', methods=['POST'])
+def upload_transfer_heartbeat():
+    # A single large/slow file's direct-to-blob transfer (stageBlock loop in
+    # AppServicesProvider.tsx) never otherwise touches this backend between its
+    # /upload/init and /upload/finalize -- the bytes go straight to Blob Storage
+    # via SAS. Without a mid-transfer ping, that gap can exceed the quiet-upload
+    # detection window (IPWORK_RELEASE_IDLE_SECONDS / UPLOAD_ACTIVITY_WINDOW_SECONDS)
+    # on a slow connection, wrongly releasing vision work / flushing clustering
+    # buffers while the upload is still genuinely running. Deliberately minimal:
+    # no body, no cleanup-block check -- a stale ping during a blocked cleanup
+    # should still keep the "upload is active" signal alive, not fail.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    try:
+        app._mark_upload_activity_heartbeat(user_id)
+    except Exception:
+        app.app.logger.exception('Failed to record transfer heartbeat for %s', user_id)
+    return app.jsonify({'recorded': True})
+
+
 @upload_bp.route('/upload/benchmark/config', methods=['GET'])
 def benchmark_config():
     import os
@@ -406,6 +428,8 @@ def _queue_idle_hash_refresh(user_id):
         app.enqueue_index_build(user_id, reason='upload-quiet', scope='dedup-idle', coalesce=False)
     except Exception:
         app.app.logger.exception('Could not schedule upload hash refresh for %s', user_id)
+    if app.PROCESSING_MODE != 'browser':
+        app._queue_ipwork_release_check(user_id)
 
 
 @upload_bp.route('/upload/finalize', methods=['POST'])

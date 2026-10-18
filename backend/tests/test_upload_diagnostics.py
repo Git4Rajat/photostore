@@ -85,6 +85,17 @@ def test_processing_batch_id_is_stamped_and_passed_to_queue_without_extra_reads(
     assert processing.current_batch() is None
 
 
+def test_transfer_heartbeat_marks_activity_and_requires_auth(monkeypatch):
+    marked = []
+    monkeypatch.setattr(app, '_require_user_id', lambda **kwargs: ('u1', None))
+    monkeypatch.setattr(app, '_mark_upload_activity_heartbeat', lambda user_id: marked.append(user_id))
+    response = app.app.test_client().post('/upload/transfer-heartbeat')
+    assert response.status_code == 200 and marked == ['u1']
+
+    monkeypatch.setattr(app, '_require_user_id', lambda **kwargs: (None, (app.jsonify({'error': 'auth'}), 401)))
+    assert app.app.test_client().post('/upload/transfer-heartbeat').status_code == 401
+
+
 def test_browser_summary_requires_auth_and_logs_only_allowlisted_fields(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger='processing_diagnostics')
     called = []

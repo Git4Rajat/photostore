@@ -10370,9 +10370,6 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     }), visibility_timeout=max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)))
                     _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'queued')
                     return
-                # Uploads went quiet (tab closed, crash, network loss, other device): hand the
-                # deferred photos to vision. Its own message so a failure retries on its own.
-                enqueue_ipwork_release(user_id, 'upload-quiet')
                 activity = {}
                 if metadata_table_client is not None:
                     try:
@@ -11461,6 +11458,65 @@ def _queue_upload_processing(user_id: str, final_name: str) -> None:
 
 
 IPWORK_DEFER_UNTIL_UPLOAD_END = os.getenv('IPWORK_DEFER_UNTIL_UPLOAD_END', 'true').lower() == 'true'
+# Own setting, deliberately not UPLOAD_ACTIVITY_WINDOW_SECONDS: that value is
+# tuned for the clustering worker's incremental-flush tradeoff (batch latency
+# vs. re-clustering cost), not for "how long since the last upload byte before
+# vision should wake up". Sharing it meant retuning one silently changed the
+# other, and a single slow/large file's init-to-finalize gap (no heartbeat
+# touches the backend mid-transfer -- bytes go straight to blob via SAS) could
+# trip whichever threshold was smaller. Decoupled so each can be tuned for its
+# own cost: a short window wakes vision sooner after a real stop but risks an
+# extra replica cycle on a slow single file; a long one avoids that at the
+# cost of slower pickup after a genuine stop.
+IPWORK_RELEASE_IDLE_SECONDS = float(os.getenv('IPWORK_RELEASE_IDLE_SECONDS', '300'))
+
+
+def _ipwork_release_check_job_id(user_id: str) -> str:
+    return f'ipwork-release-check:{user_id}'
+
+
+def _queue_ipwork_release_check(user_id: str) -> None:
+    # One finalize call per uploaded file would otherwise each schedule their own
+    # independent self-rescheduling poll chain -- 664 files, 664 redundant chains
+    # all converging on the same (idempotent, so harmless) release. Dedupe the
+    # same way _run_index_build_job's dedup-idle job does: a deterministic job_id,
+    # skip scheduling a second chain while one is already fresh/in flight.
+    job_id = _ipwork_release_check_job_id(user_id)
+    if _job_row_fresh_active(user_id, job_id):
+        return
+    if library_ops_queue_client is None:
+        return
+    _upsert_job_status(job_id, user_id, 'ipwork_release_check', 'queued')
+    try:
+        library_ops_queue_client.send_message(json.dumps(
+            {'type': 'ipwork_release_check', 'userId': user_id, 'jobId': job_id}, separators=(',', ':')),
+            visibility_timeout=max(1, int(IPWORK_RELEASE_IDLE_SECONDS)))
+    except Exception:
+        app.logger.exception('Could not schedule ipwork release check for %s', user_id)
+        _upsert_job_status(job_id, user_id, 'ipwork_release_check', 'failed')
+
+
+def _run_ipwork_release_check_job(user_id: str, job_id: str) -> None:
+    """Durable delayed check, independent of the clustering worker's own idle
+    timer: survives browser crashes/tab closes/worker restarts the same way
+    _run_index_build_job's dedup-idle check does, by re-scheduling itself
+    rather than depending on the client to come back."""
+    if metadata_table_client is None:
+        return
+    try:
+        activity = metadata_table_client.get_entity('clustering_maintenance', user_id)
+    except Exception:
+        activity = {}
+    last = _parse_iso_date(str(activity.get('lastUploadActivityAt') or ''))
+    age = (datetime.now(timezone.utc) - last).total_seconds() if last is not None else None
+    if age is not None and age < IPWORK_RELEASE_IDLE_SECONDS:
+        _upsert_job_status(job_id, user_id, 'ipwork_release_check', 'running')
+        library_ops_queue_client.send_message(json.dumps(
+            {'type': 'ipwork_release_check', 'userId': user_id, 'jobId': job_id}, separators=(',', ':')),
+            visibility_timeout=max(1, int(IPWORK_RELEASE_IDLE_SECONDS)))
+        return
+    _upsert_job_status(job_id, user_id, 'ipwork_release_check', 'done')
+    enqueue_ipwork_release(user_id, 'upload-quiet')
 
 
 def _claim_ipwork_release(user_id: str) -> bool:
@@ -13878,6 +13934,10 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
 
     if job_type == 'ipwork_release':
         _run_ipwork_release_job(user_id, str(payload.get('reason') or ''), force=payload.get('force') is True)
+        return
+
+    if job_type == 'ipwork_release_check':
+        _run_ipwork_release_check_job(user_id, job_id or _ipwork_release_check_job_id(user_id))
         return
 
     if job_type == 'index_build':

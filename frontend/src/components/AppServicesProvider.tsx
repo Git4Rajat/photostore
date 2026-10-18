@@ -385,6 +385,16 @@ const TARGET_CONCURRENT_UPLOAD_BLOCKS = 6;
 // than this, so the cap only ever lowers the large desktop sizes.
 const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
 
+// A single file's block-staging loop (stageBlock/commitBlockList) goes straight
+// to Blob Storage and never otherwise touches the backend between /upload/init
+// and /upload/finalize. On a slow link a large file alone can run longer than
+// the backend's quiet-upload detection window, which would wrongly treat the
+// upload as finished while it's still genuinely transferring. This ping only
+// fires while that loop is actually running (armed right before it starts,
+// cleared the moment it ends either way) -- a fast file's loop finishes before
+// the first tick, so the common case never sends anything extra.
+const UPLOAD_TRANSFER_HEARTBEAT_MS = 90_000;
+
 // How many concurrent finalize-batch/client-processing/processing-claim
 // calls the shared uploadDispatchGateRef allows AT ONCE, TOTAL, ACROSS ALL
 // THREE. History: was capacity 2 (d8583a5, 2026-08-28), then briefly
@@ -2974,7 +2984,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
             };
 
-            await Promise.all(Array.from({ length: stageConcurrency }, () => stageWorker()));
+            const transferHeartbeat = setInterval(() => {
+                void postUpload('/upload/transfer-heartbeat', {}).catch(() => undefined);
+            }, UPLOAD_TRANSFER_HEARTBEAT_MS);
+            try {
+                await Promise.all(Array.from({ length: stageConcurrency }, () => stageWorker()));
+            } finally {
+                clearInterval(transferHeartbeat);
+            }
 
             const finalBlockIds = blockIds.filter(Boolean);
             if (finalBlockIds.length === 0) {
