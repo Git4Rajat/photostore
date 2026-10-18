@@ -209,6 +209,18 @@ export const ToolsPage: React.FC = () => {
         }
     };
 
+    const runProcessPending = async () => {
+        setBusy(true);
+        try {
+            await postTools('/api/tools/ipwork/release', {});
+            toast('Sent pending photos to server processing');
+        } catch {
+            toast('Couldn’t start server processing', undefined, undefined, 'error');
+        } finally {
+            setBusy(false);
+        }
+    };
+
     const runAdmin = async (label: string, path: string, body: Record<string, unknown>) => {
         const confirmed = await confirmDialog({
             title: `${label}?`,
@@ -289,6 +301,12 @@ export const ToolsPage: React.FC = () => {
                                 <span className="qchip">{activeJobs.length}</span>
                             </div>
                         </div>
+                    </div>
+
+                    <div className="card-glass pt-recover-card">
+                        <strong>Process pending photos</strong>
+                        <span>Server processing starts automatically after an upload ends. If photos are still waiting, start it now.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runProcessPending()}>Process now</button>
                     </div>
 
                     {activeJobs.length > 0 && (

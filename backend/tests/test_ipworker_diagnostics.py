@@ -360,7 +360,7 @@ def test_timed_sweep_phase_logs_error_and_reraises_original(clock, caplog):
 
 
 @pytest.mark.parametrize('lock_claimed, failure_phase', [
-    (False, None), (True, None), (True, 'claim_lock'), (True, 'stale_processing'),
+    (False, None), (True, None), (True, 'claim_lock'),
     (True, 'tag_embedding_indexes'), (True, 'trash_purge'),
 ])
 def test_sweep_loop_consumes_outcomes_without_changing_control_flow(
@@ -385,8 +385,6 @@ def test_sweep_loop_consumes_outcomes_without_changing_control_flow(
 
     monkeypatch.setattr(app.time, 'sleep', sleep)
     monkeypatch.setattr(app, '_try_claim_ipwork_sweep_lock', phase('claim_lock', lock_claimed))
-    monkeypatch.setattr(app, '_sweep_stale_processing_into_ipwork', phase(
-        'stale_processing', {'photosQueued': 2, 'stepsQueued': 3, 'libraries': 1}))
     monkeypatch.setattr(app, '_sweep_tag_embedding_indexes', phase(
         'tag_embedding_indexes', {'librariesChecked': 1, 'indexesAvailable': 1}))
     monkeypatch.setattr(app, '_run_trash_purge_sweep', phase(
@@ -394,7 +392,7 @@ def test_sweep_loop_consumes_outcomes_without_changing_control_flow(
     with pytest.raises(_StopLoop):
         app._ipwork_sweep_loop()
 
-    expected = ['claim_lock', 'stale_processing', 'tag_embedding_indexes', 'trash_purge']
+    expected = ['claim_lock', 'tag_embedding_indexes', 'trash_purge']
     if not lock_claimed:
         expected = expected[:1]
     elif failure_phase:
@@ -404,7 +402,6 @@ def test_sweep_loop_consumes_outcomes_without_changing_control_flow(
         outcome = 'error' if name == failure_phase else 'done'
         assert f'phase={name} outcome={outcome} duration_ms=10.000' in caplog.text
     if lock_claimed and not failure_phase:
-        assert 'released 2 stale photo(s), 3 step(s), across 1 librar(y/ies)' in caplog.text
         assert 'tag-embedding sweep: 1/1 librar(y/ies) have a usable index' in caplog.text
         assert 'trash sweep: purged 1 photo(s) and 0 album(s)' in caplog.text
     assert ('ipwork sweep iteration failed' in caplog.text) == bool(failure_phase)

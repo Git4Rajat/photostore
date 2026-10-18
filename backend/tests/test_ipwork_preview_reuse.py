@@ -38,6 +38,23 @@ def test_ready_preview_avoids_original_download(preview_ctx):
     assert not any(name == 'source_download_bytes' for name, _ in metrics)
 
 
+def test_stored_size_avoids_head_on_reuse(monkeypatch, preview_ctx):
+    preview, calls, metrics = preview_ctx
+    # The row already carries the original's size (persisted at finalize), so
+    # preview reuse must account for it from the entity without a per-photo
+    # Get-Blob-Properties HEAD against the original.
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *_: {
+        'anonymousImageId': 'physical.CR3', 'preview_status': 'done', 'size': '7777777'})
+    def forbidden_head(*_):
+        raise AssertionError('get_media_properties must not be called when size is on the row')
+    monkeypatch.setattr(app, 'get_media_properties', forbidden_head)
+    result = app._run_ipwork_steps('user', 'display.CR3', ['ocr', 'face'])
+    assert all(step['received'] == preview for step in result.values())
+    assert calls == [('thumbnail', app._preview_cache_blob_name('physical.CR3'))]
+    assert app._ipwork_metrics_context.source_bytes == 7_777_777
+    assert not any(name == 'source_download_bytes' for name, _ in metrics)
+
+
 @pytest.mark.parametrize('reason', ['missing', 'corrupt', 'truncated', 'unknown_size'])
 def test_unusable_preview_falls_back(monkeypatch, preview_ctx, reason):
     preview, calls, metrics = preview_ctx

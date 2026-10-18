@@ -10370,6 +10370,9 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     }), visibility_timeout=max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)))
                     _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'queued')
                     return
+                # Uploads went quiet (tab closed, crash, network loss, other device): hand the
+                # deferred photos to vision. Its own message so a failure retries on its own.
+                enqueue_ipwork_release(user_id, 'upload-quiet')
                 activity = {}
                 if metadata_table_client is not None:
                     try:
@@ -11390,7 +11393,8 @@ def _create_scoped_blob_url(container_name: str, filename: str, *, minutes: int 
     )
 
 
-def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None, *, use_original: bool = False) -> Dict[str, str]:
+def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[str]] = None, *, use_original: bool = False,
+                             ignore_processing_mode: bool = False) -> Dict[str, str]:
     """Send a real queue message so ipworker (also) processes this upload.
 
     No-op in 'browser' mode (the default) -- ipworker never needs to be
@@ -11410,7 +11414,7 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
         entity = _get_metadata_entity(user_id, filename)
         if not entity or entity.get('processingIsolated') is True:
             return {'status': 'skipped', 'reason': 'upload_only_benchmark'}
-    if PROCESSING_MODE == 'browser':
+    if PROCESSING_MODE == 'browser' and not ignore_processing_mode:
         return {'status': 'skipped', 'reason': 'browser_only_processing'}
     requested_steps = [s for s in (steps if steps is not None else IPWORK_STEPS) if s in IPWORK_STEPS]
     if not requested_steps:
@@ -11447,7 +11451,104 @@ def _queue_upload_processing(user_id: str, final_name: str) -> None:
             batch_id=processing_diagnostics.current_batch(), reason='video_browser_only')
         return
     _enqueue_processing_steps(user_id, final_name, ['face'])
+    if IPWORK_DEFER_UNTIL_UPLOAD_END and PROCESSING_MODE != 'browser':
+        # The row already records which steps are pending; _release_deferred_ipwork
+        # enqueues them once the upload ends, so vision isn't kept awake by a trickle.
+        processing_diagnostics.file_event('vision_deferred', user_id, final_name,
+            batch_id=processing_diagnostics.current_batch(), role='vision')
+        return
     _queue_ipwork_processing(user_id, final_name)
+
+
+IPWORK_DEFER_UNTIL_UPLOAD_END = os.getenv('IPWORK_DEFER_UNTIL_UPLOAD_END', 'true').lower() == 'true'
+
+
+def _claim_ipwork_release(user_id: str) -> bool:
+    """True if this caller should run the release. Many quiet-check messages (one per
+    finalized file) and explicit end events can all ask for it; only the first since
+    the library's last upload activity wins."""
+    if metadata_table_client is None:
+        return False
+    try:
+        row = metadata_table_client.get_entity('clustering_maintenance', user_id)
+    except Exception:
+        return True  # no activity row to arbitrate on; release is idempotent anyway
+    released = _parse_iso_date(str(row.get('ipworkReleasedAt') or ''))
+    activity = _parse_iso_date(str(row.get('lastUploadActivityAt') or ''))
+    if released is not None and (activity is None or released >= activity):
+        return False
+    try:
+        metadata_table_client.update_entity(
+            {'PartitionKey': 'clustering_maintenance', 'RowKey': user_id,
+             'ipworkReleasedAt': datetime.now(timezone.utc).isoformat()},
+            mode=UpdateMode.MERGE, etag=row.metadata['etag'], match_condition=MatchConditions.IfNotModified)
+        return True
+    except Exception:
+        return False
+
+
+def _unclaim_ipwork_release(user_id: str) -> None:
+    try:
+        metadata_table_client.update_entity(
+            {'PartitionKey': 'clustering_maintenance', 'RowKey': user_id, 'ipworkReleasedAt': ''},
+            mode=UpdateMode.MERGE)
+    except Exception:
+        worker_logger.warning('Could not clear ipwork release claim for %s', user_id, exc_info=True)
+
+
+def _release_deferred_ipwork(user_id: str, *, force: bool = False) -> Dict[str, int]:
+    """Enqueue vision work for photos whose enqueue was deferred at finalize. Idempotent:
+    photos already enqueued carry ipworkEnqueuedAt (see _ipwork_sweep_eligible_steps)."""
+    stats = {'photosQueued': 0, 'stepsQueued': 0, 'failed': 0}
+    for row in _iter_metadata_rows_for_user(user_id, select=BROWSER_PROCESSING_PENDING_SELECT, purpose='ipwork_release'):
+        filename = str(row.get('RowKey') or '').strip()
+        if not filename or is_video_file(filename):
+            continue
+        steps = _ipwork_sweep_eligible_steps(row, ignore_recent_enqueue=force)
+        if not steps:
+            continue
+        result = _queue_ipwork_processing(user_id, filename, steps=steps, ignore_processing_mode=True)
+        if result.get('status') != 'queued':
+            if result.get('status') in ('failed', 'unavailable'):
+                stats['failed'] += 1
+            continue
+        stats['photosQueued'] += 1
+        stats['stepsQueued'] += len(steps)
+        try:
+            metadata_table_client.update_entity(
+                {'PartitionKey': user_id, 'RowKey': filename, 'ipworkEnqueuedAt': datetime.now(timezone.utc).isoformat()},
+                mode=UpdateMode.MERGE)
+        except Exception:
+            worker_logger.warning('Could not mark %s/%s as enqueued for vision', user_id, filename, exc_info=True)
+    return stats
+
+
+def _run_ipwork_release_job(user_id: str, reason: str, force: bool = False) -> None:
+    if not force and not _claim_ipwork_release(user_id):
+        worker_logger.info('ipwork release skipped user=%s reason=%s (already released since last upload)', user_id, reason)
+        return
+    try:
+        stats = _release_deferred_ipwork(user_id, force=force)
+        if stats['failed']:
+            raise RuntimeError(f"{stats['failed']} photo(s) could not be enqueued for vision")
+    except Exception:
+        if not force:
+            _unclaim_ipwork_release(user_id)
+        raise
+    worker_logger.info('ipwork release user=%s reason=%s photos=%d steps=%d',
+                       user_id, reason, stats['photosQueued'], stats['stepsQueued'])
+
+
+def enqueue_ipwork_release(user_id: str, reason: str, force: bool = False) -> str:
+    if library_ops_queue_client is None:
+        return 'unavailable'
+    try:
+        library_ops_queue_client.send_message(json.dumps(
+            {'type': 'ipwork_release', 'userId': user_id, 'reason': reason, 'force': bool(force)}, separators=(',', ':')))
+    except Exception:
+        app.logger.exception('Failed to enqueue ipwork release for %s', user_id)
+        return 'unavailable'
+    return 'queued'
 
 
 def _verify_face_filename_indexes(user_id: str, filenames: List[str]) -> Dict:
@@ -11662,6 +11763,7 @@ BROWSER_PROCESSING_PENDING_SELECT = [
     'processing_lease_expires_at',
     'last_processing_update',
     'processing_metadata',
+    'ipworkEnqueuedAt',
     # Required so the source-image / thumbnail-upload SAS URLs resolve to the
     # anonymized (UUID) blob. Without it the projection drops anonymousImageId,
     # _blob_name_from_metadata falls back to the original filename, and the
@@ -11896,7 +11998,7 @@ def _try_claim_ipwork_sweep_lock(owner_id: str, ttl_seconds: int) -> bool:
         return False  # lost the race to steal an expired lease
 
 
-def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
+def _ipwork_sweep_eligible_steps(entity: Dict, *, ignore_recent_enqueue: bool = False) -> List[str]:
     """Which IPWORK_STEPS on this photo are safe to hand ipworker right now.
 
     Mirrors _browser_processing_pending_item's notion of "not done yet"
@@ -11913,6 +12015,10 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
     if (is_video_file(str(entity.get('RowKey') or '')) or entity.get('processingIsolated') is True
             or str(entity.get('processing_state') or '').strip().lower() == 'deleted'):
         return []
+    enqueued_at = _parse_iso_date(str(entity.get('ipworkEnqueuedAt') or ''))
+    if (enqueued_at is not None and not ignore_recent_enqueue
+            and (datetime.now(timezone.utc) - enqueued_at).total_seconds() < IPWORK_SWEEP_STALE_QUEUED_SECONDS):
+        return []  # a release/sweep message is plausibly still in flight
     lease_expired = _browser_processing_lease_expired(entity)
     face_version_stale = _browser_processing_face_version_stale(entity)
     last_update = str(entity.get('last_processing_update') or '').strip()
@@ -11956,50 +12062,6 @@ def _ipwork_sweep_eligible_steps(entity: Dict) -> List[str]:
     return eligible
 
 
-def _sweep_stale_processing_into_ipwork() -> Dict[str, int]:
-    """Self-heal orphaned photos: ones with no ipwork queue message ever
-    sent (or one that's long gone) sitting stuck pending/stale-queued/
-    stale-running across EVERY library, not just whichever one library a
-    currently-open browser tab happens to have active.
-
-    Without this, a photo that misses the one-time upload-time race (e.g.
-    uploaded while ipworker was admin-stopped, or PROCESSING_MODE was
-    briefly 'browser') stays invisible to both consumers forever: ipworker
-    only ever sees what's explicitly queued to it, and the browser's own
-    /upload/processing/pending poll is scoped to one library per open tab.
-    """
-    stats = {'libraries': 0, 'photosQueued': 0, 'stepsQueued': 0}
-    if library_store is None or metadata_table_client is None:
-        return stats
-    try:
-        library_ids = library_store.list_all_library_ids()
-    except Exception:
-        worker_logger.exception('ipwork sweep: failed to list libraries')
-        return stats
-
-    for library_id in library_ids:
-        stats['libraries'] += 1
-        try:
-            rows = _iter_metadata_rows_for_user(library_id, select=BROWSER_PROCESSING_PENDING_SELECT, purpose='ipwork_sweep')
-        except Exception:
-            worker_logger.warning('ipwork sweep: metadata scan failed for library %s', library_id, exc_info=True)
-            continue
-        for row in rows:
-            filename = str(row.get('RowKey') or '').strip()
-            if not filename or is_video_file(filename):
-                continue
-            steps = _ipwork_sweep_eligible_steps(row)
-            if not steps:
-                continue
-            try:
-                _queue_ipwork_processing(library_id, filename, steps=steps)
-                stats['photosQueued'] += 1
-                stats['stepsQueued'] += len(steps)
-            except Exception:
-                worker_logger.exception('ipwork sweep: failed to enqueue %s/%s', library_id, filename)
-    return stats
-
-
 def _deleted_at_past_cutoff(deleted_at: str, cutoff: datetime) -> bool:
     if not deleted_at:
         return False
@@ -12015,7 +12077,7 @@ def _deleted_at_past_cutoff(deleted_at: str, cutoff: datetime) -> bool:
 def _run_trash_purge_sweep() -> Dict[str, int]:
     """Hard-purges trashed photos AND trashed albums past TRASH_RETENTION_DAYS,
     across every library. Same "enumerate library_store, point-select just
-    what's needed" shape as _sweep_stale_processing_into_ipwork above -- runs
+    what's needed" shape as _sweep_tag_embedding_indexes -- runs
     from the same loop, under the same cluster-wide lock, so this reuses that
     guarantee rather than needing its own. Albums are a per-library partition
     query same as photos, but cheap -- album counts per user are nowhere near
@@ -12138,12 +12200,6 @@ def _ipwork_sweep_loop() -> None:
         try:
             if _timed_ipwork_sweep_phase('claim_lock', _try_claim_ipwork_sweep_lock,
                                          owner_id, ttl_seconds=IPWORK_SWEEP_INTERVAL_SECONDS):
-                stats = _timed_ipwork_sweep_phase('stale_processing', _sweep_stale_processing_into_ipwork)
-                if stats['photosQueued']:
-                    worker_logger.info(
-                        'ipwork sweep: released %d stale photo(s), %d step(s), across %d librar(y/ies)',
-                        stats['photosQueued'], stats['stepsQueued'], stats['libraries'],
-                    )
                 tag_embedding_stats = _timed_ipwork_sweep_phase('tag_embedding_indexes', _sweep_tag_embedding_indexes)
                 if tag_embedding_stats['librariesChecked']:
                     worker_logger.info(
@@ -13820,6 +13876,10 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 raise
         return
 
+    if job_type == 'ipwork_release':
+        _run_ipwork_release_job(user_id, str(payload.get('reason') or ''), force=payload.get('force') is True)
+        return
+
     if job_type == 'index_build':
         _run_index_build_job(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
         return
@@ -15021,9 +15081,20 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                         and not is_video_file(filename)):
                     preview_attempted = True
                     try:
-                        # HEAD the original for source-volume accounting, without
-                        # crediting preview bytes as original bytes downloaded.
-                        source_size = int(get_media_properties('image', source_blob)['size'])
+                        # Account for the original's volume without downloading it
+                        # (and without crediting preview bytes as original bytes).
+                        # The size is persisted on the row at finalize/backfill --
+                        # the same source the EXIF/packet path trusts below -- so
+                        # read it from the entity and only HEAD the original blob
+                        # as a fallback when it's somehow absent, instead of
+                        # paying a Get-Blob-Properties round-trip per photo on the
+                        # happy path.
+                        try:
+                            source_size = int(entity.get('size') or 0)
+                        except Exception:
+                            source_size = 0
+                        if source_size <= 0:
+                            source_size = int(get_media_properties('image', source_blob)['size'])
                         if source_size <= 0:
                             raise ValueError('Invalid source size')
                         preview = download_media_bytes('thumbnail', _preview_cache_blob_name(source_blob))

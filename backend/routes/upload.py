@@ -397,6 +397,7 @@ def refresh_known_upload_hashes():
     if reason not in ('completed', 'stopped', 'failed', 'interrupted', 'discarded'):
         return app.jsonify({'error': 'Invalid upload end reason'}), 400
     status = app.enqueue_index_build(user_id, reason=f'upload-{reason}', scope='dedup', coalesce=False)
+    app.enqueue_ipwork_release(user_id, f'upload-{reason}')
     return app.jsonify({'status': status}), 503 if status == 'unavailable' else 202
 
 

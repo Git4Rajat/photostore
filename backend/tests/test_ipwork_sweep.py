@@ -1,15 +1,8 @@
-"""Unit tests for the ipwork stale-processing sweep.
+"""Unit tests for which photo steps are eligible to be (re)offered to ipworker
+(_ipwork_sweep_eligible_steps) and for the cluster-wide sweep lock.
 
-A photo can miss the one-time upload-time race between the browser tab and
-ipworker (e.g. uploaded while ipworker was admin-stopped, or briefly while
-PROCESSING_MODE was 'browser') and end up stuck pending forever: ipworker
-only ever sees what's explicitly queued to it, and the browser's own
-/upload/processing/pending poll only covers whichever one library a
-currently-open tab has active. _sweep_stale_processing_into_ipwork runs on
-a background thread inside every ipworker replica and re-offers exactly
-that class of orphaned photo -- across every library, not just one -- back
-to ipworker, without re-touching photos that are already done or already
-have a message legitimately in flight.
+Eligibility is used by the upload-end release (_release_deferred_ipwork): it
+must skip finished photos and ones with a message legitimately in flight.
 """
 from __future__ import annotations
 
@@ -144,74 +137,6 @@ class TestEligibleSteps:
             }),
         )
         assert 'face' not in app._ipwork_sweep_eligible_steps(entity)
-
-
-class TestSweepLoop:
-    def test_sweeps_across_every_library_and_skips_done_photos(self, monkeypatch):
-        done_except_thumbnail = {f'{s}_status': 'done' for s in app.IPWORK_STEPS if s != 'thumbnail'}
-        rows_by_library = {
-            'lib-a': [
-                _entity(RowKey='stuck.jpg', thumbnail_status='pending', **done_except_thumbnail),
-                _entity(RowKey='finished.jpg', **{f'{s}_status': 'done' for s in app.IPWORK_STEPS}),
-            ],
-            'lib-b': [
-                _entity(RowKey='video.mov', thumbnail_status='pending', **done_except_thumbnail),
-            ],
-        }
-
-        class _FakeLibraryStore:
-            def list_all_library_ids(self):
-                return list(rows_by_library.keys())
-
-        queued_calls = []
-
-        monkeypatch.setattr(app, 'library_store', _FakeLibraryStore())
-        monkeypatch.setattr(app, 'metadata_table_client', object())
-        monkeypatch.setattr(
-            app, '_iter_metadata_rows_for_user',
-            lambda library_id, select=None, purpose='metadata': rows_by_library[library_id],
-        )
-        monkeypatch.setattr(app, 'is_video_file', lambda filename: filename.endswith('.mov'))
-        monkeypatch.setattr(
-            app, '_queue_ipwork_processing',
-            lambda user_id, filename, steps=None: queued_calls.append((user_id, filename, tuple(steps or ()))),
-        )
-
-        stats = app._sweep_stale_processing_into_ipwork()
-
-        assert queued_calls == [('lib-a', 'stuck.jpg', ('thumbnail',))]
-        assert stats == {'libraries': 2, 'photosQueued': 1, 'stepsQueued': 1}
-
-    def test_no_library_store_is_a_noop(self, monkeypatch):
-        monkeypatch.setattr(app, 'library_store', None)
-        stats = app._sweep_stale_processing_into_ipwork()
-        assert stats == {'libraries': 0, 'photosQueued': 0, 'stepsQueued': 0}
-
-    def test_one_librarys_scan_failure_does_not_stop_the_others(self, monkeypatch):
-        class _FakeLibraryStore:
-            def list_all_library_ids(self):
-                return ['broken-lib', 'lib-b']
-
-        def _scan(library_id, select=None, purpose='metadata'):
-            if library_id == 'broken-lib':
-                raise RuntimeError('table scan exploded')
-            return [_entity(RowKey='stuck.jpg', thumbnail_status='pending')]
-
-        monkeypatch.setattr(app, 'library_store', _FakeLibraryStore())
-        monkeypatch.setattr(app, 'metadata_table_client', object())
-        monkeypatch.setattr(app, '_iter_metadata_rows_for_user', _scan)
-        monkeypatch.setattr(app, 'is_video_file', lambda filename: False)
-        queued_calls = []
-        monkeypatch.setattr(
-            app, '_queue_ipwork_processing',
-            lambda user_id, filename, steps=None: queued_calls.append((user_id, filename)),
-        )
-
-        stats = app._sweep_stale_processing_into_ipwork()
-
-        assert queued_calls == [('lib-b', 'stuck.jpg')]
-        assert stats['libraries'] == 2
-        assert stats['photosQueued'] == 1
 
 
 class _FakeLockTable:

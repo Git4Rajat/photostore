@@ -184,6 +184,17 @@ def _wait_for_index_build(user_id: str, scope: str, timeout_seconds: float):
         app.time.sleep(min(1.0, remaining))
 
 
+@tools_bp.route('/api/tools/ipwork/release', methods=['POST'])
+def tools_release_ipwork():
+    # Manual counterpart to the automatic release at upload end: hands every photo
+    # in this library that still has pending vision steps to the vision worker.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    status = app.enqueue_ipwork_release(user_id, 'manual', force=True)
+    return app.jsonify({'status': status}), 503 if status == 'unavailable' else 202
+
+
 @tools_bp.route('/api/tools/indexes/status', methods=['GET'])
 def tools_indexes_status():
     # Read-only poll target. Readiness comes from the manifest blobs; `building`

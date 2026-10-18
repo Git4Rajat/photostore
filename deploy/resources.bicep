@@ -1582,8 +1582,11 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // Backend/worker keep the 20s default; only ipworker's per-photo
             // cadence outlasts it.
             { name: 'PEOPLE_SCAN_CACHE_TTL_SECONDS', value: '120' }
-            // How often the background orphaned-photo sweep runs per
-            // replica (backend/app.py, _ipwork_sweep_loop). Kept in sync
+            // How often the background maintenance sweep (tag-embedding
+            // index check, trash purge) runs per replica
+            // (backend/app.py, _ipwork_sweep_loop). It no longer re-offers
+            // stuck photos: that safety net was removed in favor of the
+            // upload-end release plus the Tools "Process now" button. Kept in sync
             // with the 'ipwork-sweep-wake' cron rule's ~5-day period below --
             // a replica only stays up for that rule's 5-minute window, so
             // this only needs to fire once per wake.
@@ -1600,14 +1603,12 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
       ]
       scale: {
         minReplicas: 0
-        // 4, not 1: at 1 replica, jobs process strictly one at a time (each
-        // runs YOLO + AdaFace + CLIP + OCR in sequence, so a large backlog
-        // -- e.g. from a library backfill -- drains for a very long time
-        // with only one replica). KEDA still scales to 0 between the
-        // queue-length rule below and the cron rule's wake windows, so this
-        // only costs more while there's actually a backlog or during a
-        // brief periodic wake.
-        maxReplicas: 4
+        // 1: uploads release their vision work in one burst at upload end
+        // (IPWORK_DEFER_UNTIL_UPLOAD_END), and a measured 1809-file run used
+        // ~0.5s of pure processing per photo at ~8% CPU, so one replica
+        // (IPWORKER_CONCURRENCY=2) drains a burst without the extra replicas.
+        // Raise it if library backfills drain too slowly.
+        maxReplicas: 1
         rules: [
           {
             name: 'ipwork-queue'
