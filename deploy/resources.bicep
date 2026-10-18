@@ -76,9 +76,20 @@ param clusterFileShareQuotaGiB int = 100
 @maxValue(1)
 param clusterMinReplicas int = 0
 
-@description('Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time.')
+@description('Secret used to sign login sessions. Always auto-generated fresh at deploy time -- intentionally not persisted. Every deployment therefore signs out all existing sessions (by design: simplest and safest default). What matters is that every app which validates these tokens restarts on the SAME new value together -- see revisionSuffix below -- so a login right after a deploy finishes always works.')
 @secure()
 param sessionSecretParam string = '${newGuid()}${newGuid()}'
+
+// Forces every session-token-validating app (core/upload/indexer/recovery/
+// archive) onto a fresh revision on every deployment, in lockstep with
+// sessionSecretParam above. Container Apps only re-reads secret values into
+// a container's env at container start, and changing a secret's value alone
+// (unlike template/image changes) does NOT trigger a new revision on its
+// own -- so without this, a redeploy could leave some of those apps' already-
+// warm replicas running the OLD secret indefinitely while others pick up the
+// new one, breaking logins unpredictably instead of just once, cleanly, at
+// deploy time.
+param deployRevisionTag string = toLower(uniqueString(newGuid()))
 
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps logs to. Leave blank (the one-click-deploy default) for no log destination -- opt in only where you have provisioned a workspace, since it is a separate billable resource.')
 param logAnalyticsWorkspaceName string = ''
@@ -93,9 +104,6 @@ param blobCoolAfterDays int = 30
 param blobColdAfterDays int = 90
 
 var suffix = uniqueString(resourceGroup().id)
-// Secret used to sign login sessions. High-entropy random value (two GUIDs,
-// ~244 bits) generated once at deploy time — NOT derived from uniqueString,
-// which is deterministic and predictable from public resource metadata.
 var sessionSecret = sessionSecretParam
 var storageAccountName = take(toLower(replace('${appName}${suffix}', '-', '')), 24)
 // Preserve the full unique suffix within the 24-character account-name limit.
@@ -635,6 +643,7 @@ resource core 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
+      revisionSuffix: deployRevisionTag
       containers: [
         {
           name: 'core'
@@ -942,6 +951,7 @@ resource indexer 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
+      revisionSuffix: deployRevisionTag
       containers: [
         {
           name: 'indexer'
@@ -1031,6 +1041,7 @@ resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
+      revisionSuffix: deployRevisionTag
       containers: [
         {
           name: 'recovery'
@@ -1123,6 +1134,7 @@ resource archive 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
+      revisionSuffix: deployRevisionTag
       containers: [
         {
           name: 'archive'
@@ -1231,6 +1243,7 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
+      revisionSuffix: deployRevisionTag
       containers: [
         {
           name: 'upload'

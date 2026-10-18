@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "4014795448386172753"
+      "templateHash": "10442139214117623758"
     }
   },
   "parameters": {
@@ -179,7 +179,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "17816054285942883786"
+              "templateHash": "15710203866450944740"
             }
           },
           "parameters": {
@@ -294,8 +294,12 @@
               "type": "securestring",
               "defaultValue": "[format('{0}{1}', newGuid(), newGuid())]",
               "metadata": {
-                "description": "Secret used to sign login sessions. Leave blank to auto-generate a strong random value at deploy time."
+                "description": "Secret used to sign login sessions. Always auto-generated fresh at deploy time -- intentionally not persisted. Every deployment therefore signs out all existing sessions (by design: simplest and safest default). What matters is that every app which validates these tokens restarts on the SAME new value together -- see revisionSuffix below -- so a login right after a deploy finishes always works."
               }
+            },
+            "deployRevisionTag": {
+              "type": "string",
+              "defaultValue": "[toLower(uniqueString(newGuid()))]"
             },
             "logAnalyticsWorkspaceName": {
               "type": "string",
@@ -636,6 +640,7 @@
                   ]
                 },
                 "template": {
+                  "revisionSuffix": "[parameters('deployRevisionTag')]",
                   "containers": [
                     {
                       "name": "core",
@@ -745,6 +750,7 @@
                   ]
                 },
                 "template": {
+                  "revisionSuffix": "[parameters('deployRevisionTag')]",
                   "containers": [
                     {
                       "name": "indexer",
@@ -830,6 +836,7 @@
                   ]
                 },
                 "template": {
+                  "revisionSuffix": "[parameters('deployRevisionTag')]",
                   "containers": [
                     {
                       "name": "recovery",
@@ -901,6 +908,7 @@
                   ]
                 },
                 "template": {
+                  "revisionSuffix": "[parameters('deployRevisionTag')]",
                   "containers": [
                     {
                       "name": "archive",
@@ -986,6 +994,7 @@
                   ]
                 },
                 "template": {
+                  "revisionSuffix": "[parameters('deployRevisionTag')]",
                   "containers": [
                     {
                       "name": "upload",
