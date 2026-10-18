@@ -25,6 +25,7 @@ import { getRuntimeConfig } from '../config/appConfig';
 import { requestJobPoll } from '../services/jobNotifications';
 import { queuePhotoBackfill } from '../services/photoBackfill';
 import { plural } from '../utils/format';
+import { useIndexStatus } from '../services/indexBuilding';
 import { confirmDialog } from './shared/dialogs';
 import { useAppServices, browserProcessingActionSteps, BROWSER_AI_GATED_STEPS } from './AppServicesProvider';
 import type { BrowserProcessingAction } from './AppServicesProvider';
@@ -1596,6 +1597,90 @@ const ToolsPage: React.FC = () => {
         </div>
     );
 
+    const renderIndexStatusPanel = () => {
+        const indexStatus = useIndexStatus();
+        const [rebuilding, setRebuilding] = useState<string | null>(null);
+
+        const handleRebuildIndex = async (kind: string) => {
+            setRebuilding(kind);
+            try {
+                await postTools(`/indexes/rebuild/${kind}`, {});
+                requestJobPoll();
+            } catch (error) {
+                console.error(`Failed to rebuild ${kind} index:`, error);
+            } finally {
+                setRebuilding(null);
+            }
+        };
+
+        const getStatusBadge = (kind: string) => {
+            const status = indexStatus[kind];
+            if (!status) return <span className="status dim">unknown</span>;
+            if (!status.ready) return <span className="status error">not built</span>;
+            if (status.dirty) return <span className="status warning">dirty</span>;
+            return <span className="status ok">ready</span>;
+        };
+
+        const kindLabels: Record<string, string> = {
+            sort: 'Sort index',
+            lexical: 'Search index',
+            albums: 'Albums index',
+            people: 'People index',
+        };
+
+        return (
+            <div className="tools-panel">
+                <div className="tools-panel-header">
+                    <div>
+                        <h2 className="tools-panel-title">Index status</h2>
+                        <p className="tools-panel-meta">Click Rebuild to manually refresh any index</p>
+                    </div>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px', padding: '12px' }}>
+                    {Object.entries(kindLabels).map(([kind, label]) => (
+                        <div
+                            key={kind}
+                            style={{
+                                border: '1px solid var(--color-border)',
+                                borderRadius: '8px',
+                                padding: '12px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '8px',
+                            }}
+                        >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <strong>{label}</strong>
+                                {getStatusBadge(kind)}
+                            </div>
+                            <button
+                                type="button"
+                                className="btn btn-soft btn-sm"
+                                onClick={() => handleRebuildIndex(kind)}
+                                disabled={rebuilding === kind}
+                                aria-label={`Rebuild ${label}`}
+                                style={{ marginTop: '4px' }}
+                            >
+                                {rebuilding === kind ? 'Rebuilding…' : 'Rebuild'}
+                            </button>
+                        </div>
+                    ))}
+                </div>
+                <div style={{ padding: '12px', borderTop: '1px solid var(--color-border)' }}>
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        onClick={() => handleRebuildIndex('all')}
+                        disabled={rebuilding === 'all'}
+                        style={{ width: '100%' }}
+                    >
+                        {rebuilding === 'all' ? 'Rebuilding all indexes…' : 'Rebuild all indexes'}
+                    </button>
+                </div>
+            </div>
+        );
+    };
+
     const renderOverviewPage = () => (
         <>
             <div className="tools-queue-wrapper">
@@ -1620,6 +1705,8 @@ const ToolsPage: React.FC = () => {
                     <span className="sr-only">Refresh queue status</span>
                 </button>
             </div>
+
+            {renderIndexStatusPanel()}
 
             <div className="tools-panel tools-actions-panel">
                 <div className="tools-panel-header">
