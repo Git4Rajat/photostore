@@ -174,8 +174,24 @@ export class UploadPreparationPipeline {
                 diagnostic.attempts = attempt;
                 let retryMs = 500 * 2 ** (attempt - 1);
                 try {
+                    // These PUTs (sub-1.5MB preview/thumbnail/metadata) share
+                    // *.blob.core.windows.net's real ~6-connection-per-origin
+                    // ceiling with the much larger, much slower original-file
+                    // chunk PUTs (which can legitimately run many more than 6
+                    // concurrent lanes for a big batch -- see
+                    // TARGET_CONCURRENT_UPLOAD_BLOCKS's lane-budget comment in
+                    // AppServicesProvider.tsx, that's deliberate, not a bug).
+                    // Without a priority hint, a tiny request that would finish
+                    // almost instantly can land behind a queue of multi-second
+                    // chunk PUTs with no way to jump ahead -- confirmed live via
+                    // HAR capture 2026-10-18: median 96% of a preview/thumbnail
+                    // PUT's wall time was spent purely queued for a connection,
+                    // not transferring. 'priority' (Fetch Priority API, Chrome/
+                    // Edge 101+) is a hint, not a guarantee, and simply ignored
+                    // by runtimes that predate it -- safe to set unconditionally.
                     const response = await fetch(url, {method: 'PUT', body: blob, signal: controller.signal,
-                        headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': blob.type}});
+                        priority: 'high',
+                        headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': blob.type}} as RequestInit);
                     diagnostic.httpStatus = response.status;
                     if (response.ok) { diagnostic.upload = 'uploaded'; delete diagnostic.uploadReason; return true; }
                     diagnostic.uploadReason = 'http_error';

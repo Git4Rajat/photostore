@@ -39,6 +39,16 @@ test('only successful uploads are attached to finalization', async () => {
     pipeline.dispose();
 });
 
+test('asset PUTs are marked high priority so they are not stuck behind slower chunk PUTs sharing the same origin', async () => {
+    const pipeline = new UploadPreparationPipeline();
+    await pipeline.start(source(), 'a'.repeat(64), targets, new AbortController().signal);
+    expect(mocks.fetch.mock.calls.length).toBeGreaterThan(0);
+    for (const call of mocks.fetch.mock.calls) {
+        expect(call[1].priority).toBe('high');
+    }
+    pipeline.dispose();
+});
+
 test.each(['IMG_0127.HEIC', 'photo.jpg', 'sample_001.cr3', 'sample_001.rw2', 'sample_001.3fr', 'sample_001.dng'])('browser EXIF runs for %s and attaches the verdict', async name => {
     const pipeline = new UploadPreparationPipeline();
     const result = await pipeline.start(new File(['x'], name), 'a'.repeat(64), targets, new AbortController().signal);
