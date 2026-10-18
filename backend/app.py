@@ -3633,8 +3633,8 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
                            len(filenames), filenames[0], user_id)
         return {'status': 'unavailable'}
     # Split a large buffered batch into bounded messages instead of one fat
-    # message. A backfill flush can carry >1000 filenames
-    # (IPWORK_CLUSTER_BATCH_MAX_FILENAMES); as a single message that is one
+    # message. An idle-triggered flush can carry many thousands of filenames
+    # (IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES); as a single message that is one
     # atomic assignment unit -- it holds the library lease for its whole run,
     # and ANY one filename's failure re-raises and redelivers the WHOLE thing
     # (measured live at ~19k table round trips / ~260s for a single ~1,200-
@@ -3665,29 +3665,58 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
     return {'status': 'queued', 'messages': sent}
 
 
-IPWORK_CLUSTER_BATCH_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_MAX_FILENAMES', '1500'))
-# Per-queue-message ceiling for incremental-assign: a buffered flush of up to
-# IPWORK_CLUSTER_BATCH_MAX_FILENAMES is split into messages of at most this many
+# Defensive ceiling, not the normal trigger: a buffer only reaches this while
+# the vision/face pipeline is continuously active (the idle flush below is
+# what fires in the ordinary case), so this just bounds one ipworker
+# replica's in-memory exposure -- memory held per user, and filenames lost if
+# the replica dies before an idle/manual flush -- during an unusually long,
+# uninterrupted run. Deliberately well above a typical idle-triggered flush
+# so it almost never fires in practice.
+IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES', '15000'))
+# Per-queue-message ceiling for incremental-assign: any flush (idle, manual,
+# or the safety ceiling above) is split into messages of at most this many
 # filenames so no single message becomes the ~260s / ~19k-round-trip monster
 # measured live. ~128 keeps a typical photo's faces within the staged-batch
-# 256-face cap in _process_clustering_user_group.
+# 256-face cap in _process_clustering_user_group. A large flush still dispatches
+# all of its messages at once -- the clustering worker wakes once and drains
+# them back-to-back, rather than waking once per 1500-ish filenames while
+# vision is still actively running.
 INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE = int(os.getenv('INCREMENTAL_ASSIGN_MAX_FILENAMES_PER_MESSAGE', '128'))
-# Upload quietness is an early flush signal; the separate maximum wait
-# below prevents active photo/video uploads from indefinitely delaying faces.
+# Used elsewhere (dedup-idle index snapshot, ipwork release idle-check) for an
+# upload-quietness window -- NOT read by the cluster-batch flush below. That
+# flush tracks the vision/face pipeline's own idleness instead, since an
+# unrelated ongoing upload says nothing about whether more faces are coming.
 UPLOAD_ACTIVITY_WINDOW_SECONDS = float(os.getenv('UPLOAD_ACTIVITY_WINDOW_SECONDS', '300'))
-# True last-resort ceiling, not a normal trigger -- only matters if the
-# activity-table read itself starts failing (_is_upload_active fails safe to
-# False on error, so this would rarely even be reached in practice). Set far
-# above UPLOAD_ACTIVITY_WINDOW_SECONDS so it never interrupts a genuinely
-# active, continuously-uploading session.
-IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS', '1800'))
-# Flush-loop check cadence -- a cheap per-buffered-user table point-read now,
+# Flush-loop check cadence -- a cheap per-buffered-user in-memory check now,
 # not a single queue-depth call, so this can poll much more often than the
 # old fixed-timer design without meaningful extra cost.
 IPWORK_CLUSTER_BATCH_POLL_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_POLL_SECONDS', '15'))
-# Bound face-result latency even while unrelated uploads/videos keep the
-# library heartbeat active. The poll cadence adds at most one extra tick.
-IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS = float(os.getenv('IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS', '60'))
+# Flush a buffer once no new face-identified filename has been added to it
+# for this long -- independent of upload activity, since the vision pipeline
+# (ipworker) going quiet, not the upload finishing, is what actually means
+# "no more faces are coming soon."
+IPWORK_CLUSTER_IDLE_SECONDS = float(os.getenv('IPWORK_CLUSTER_IDLE_SECONDS', '300'))
+# A manual "Cluster now" request (Tools) is a wall-clock timestamp written to
+# the clustering_maintenance row, not a direct call into this process's
+# in-memory buffer -- multiple ipworker replicas may each hold part of a
+# user's buffer, so every replica's poll tick checks this shared signal and
+# flushes its own local piece once it sees a recent-enough request.
+IPWORK_CLUSTER_FORCE_FLUSH_WINDOW_SECONDS = float(os.getenv('IPWORK_CLUSTER_FORCE_FLUSH_WINDOW_SECONDS', '120'))
+# A SIGTERM (deploy, KEDA scale-down) gives _flush_all_incremental_assign_buffers
+# a chance to drain everything, but a SIGKILL (OOM, grace-period exhaustion)
+# does not -- Python gets no notice at all. CLUSTER_BUFFER_CHECKPOINT_DIR, when
+# set (a mounted shared volume -- see the 'vision' container app's
+# 'index-cache' AzureFile mount), makes the in-memory buffer recoverable
+# across a hard kill: the flush loop periodically mirrors each buffered
+# user's current filenames to a small file here, clears it once that user's
+# buffer is actually flushed, and recovers/re-enqueues any leftover file a
+# dead process never got to clear. Unset (the default) disables checkpointing
+# entirely -- same in-memory-only behavior as before.
+CLUSTER_BUFFER_CHECKPOINT_DIR = os.getenv('CLUSTER_BUFFER_CHECKPOINT_DIR', '').strip()
+# A checkpoint file older than this is treated as abandoned (its writer is
+# presumed dead) and recovered -- several multiples of IPWORK_CLUSTER_BATCH_POLL_SECONDS
+# so a live process's own routine rewrite always wins the race.
+CLUSTER_BUFFER_CHECKPOINT_STALE_SECONDS = float(os.getenv('CLUSTER_BUFFER_CHECKPOINT_STALE_SECONDS', '90'))
 
 
 def _mark_upload_activity_heartbeat(user_id: str) -> None:
@@ -3743,15 +3772,147 @@ def _is_upload_active(user_id: str) -> bool:
 _cluster_batch_lock = threading.Lock()
 _cluster_batch_buffers: Dict[str, List[str]] = {}
 _cluster_batch_started_at: Dict[str, float] = {}
+_cluster_batch_last_activity_at: Dict[str, float] = {}
+# This process's stable identity for the checkpoint files it writes -- reusing
+# processing_diagnostics' own per-process id rather than inventing a second one.
+_cluster_buffer_writer_id = processing_diagnostics._INSTANCE
+
+
+def _cluster_buffer_checkpoint_path(user_id: str, writer_id: Optional[str] = None) -> Optional[str]:
+    if not CLUSTER_BUFFER_CHECKPOINT_DIR:
+        return None
+    return os.path.join(CLUSTER_BUFFER_CHECKPOINT_DIR, user_id, f'{writer_id or _cluster_buffer_writer_id}.json')
+
+
+def _write_cluster_buffer_checkpoint(user_id: str, filenames: List[str]) -> None:
+    """Best-effort mirror of one user's current in-memory buffer to the
+    shared volume, so a SIGKILL (which _flush_all_incremental_assign_buffers
+    never gets a chance to run for) doesn't silently lose filenames whose
+    faces are already durably stored but never got their clustering message
+    sent. Called once per poll tick, not per filename -- see
+    _run_incremental_assign_flush_loop -- so this never adds per-photo I/O."""
+    path = _cluster_buffer_checkpoint_path(user_id)
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f'{path}.tmp-{os.getpid()}'
+        with open(tmp_path, 'w') as f:
+            json.dump({'filenames': filenames, 'updatedAt': datetime.now(timezone.utc).isoformat()}, f)
+        os.replace(tmp_path, path)  # atomic on the same filesystem, including AzureFile SMB
+    except Exception:
+        worker_logger.exception('Failed to checkpoint cluster buffer for %s', user_id)
+
+
+def _clear_cluster_buffer_checkpoint(user_id: str) -> None:
+    path = _cluster_buffer_checkpoint_path(user_id)
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        worker_logger.exception('Failed to clear cluster buffer checkpoint for %s', user_id)
+        return
+    _rmdir_if_empty(os.path.dirname(path))
+
+
+def _rmdir_if_empty(dir_path: str) -> None:
+    """Best-effort: a user's checkpoint directory on the shared volume
+    otherwise accumulates forever (one empty dir per user who ever had a
+    buffer), growing every future os.listdir() scan in
+    _recover_stranded_cluster_buffer_checkpoints indefinitely. Safe to race --
+    os.rmdir only succeeds on a genuinely empty directory, so a concurrent
+    writer's file (e.g. another replica, once maxReplicas > 1) just fails
+    this harmlessly instead of losing anything."""
+    try:
+        os.rmdir(dir_path)
+    except OSError:
+        pass  # not empty (concurrent writer) or already gone -- both fine
+
+
+def _checkpoint_all_cluster_buffers() -> None:
+    """Called once per flush-loop poll tick -- mirrors every currently
+    buffered user, not just ones about to flush, so the checkpoint always
+    reflects what's actually sitting in memory right now."""
+    if not CLUSTER_BUFFER_CHECKPOINT_DIR:
+        return
+    with _cluster_batch_lock:
+        snapshot = {user_id: list(filenames) for user_id, filenames in _cluster_batch_buffers.items() if filenames}
+    for user_id, filenames in snapshot.items():
+        _write_cluster_buffer_checkpoint(user_id, filenames)
+
+
+def _recover_stranded_cluster_buffer_checkpoints() -> None:
+    """Finds checkpoint files whose writer is presumed dead (old enough that
+    a live process would have rewritten or cleared it by now -- see
+    CLUSTER_BUFFER_CHECKPOINT_STALE_SECONDS) and re-enqueues their filenames
+    directly, skipping the in-memory buffer entirely since nothing is tracking
+    them anymore. No claim/lock step: two processes racing on the same stale
+    file might both enqueue it, but duplicate incremental-assign enqueues are
+    idempotent (_prepare_incremental_assignment re-derives each filename's
+    still-unassigned face_ids fresh at processing time, so whichever message
+    runs second finds nothing left to do) -- so there is nothing to protect
+    against here, and no intermediate claimed-but-not-yet-deleted state that
+    a second crash could orphan forever."""
+    if not CLUSTER_BUFFER_CHECKPOINT_DIR:
+        return
+    try:
+        user_dirs = os.listdir(CLUSTER_BUFFER_CHECKPOINT_DIR)
+    except FileNotFoundError:
+        return
+    except Exception:
+        worker_logger.exception('Failed to list cluster buffer checkpoint dir')
+        return
+    now = time.time()
+    for user_id in user_dirs:
+        user_dir = os.path.join(CLUSTER_BUFFER_CHECKPOINT_DIR, user_id)
+        try:
+            entries = os.listdir(user_dir)
+        except Exception:
+            continue
+        for entry in entries:
+            if not entry.endswith('.json'):
+                continue
+            path = os.path.join(user_dir, entry)
+            try:
+                age = now - os.path.getmtime(path)
+            except FileNotFoundError:
+                continue
+            if age < CLUSTER_BUFFER_CHECKPOINT_STALE_SECONDS:
+                continue  # its writer is presumably still alive and refreshing it
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                filenames = data.get('filenames') or []
+                if filenames:
+                    worker_logger.info('Recovering %d stranded cluster-buffer filename(s) for user=%s (age=%.0fs)',
+                                       len(filenames), user_id, age)
+                    processing_diagnostics.emit('cluster_buffer_flush', filenames=len(filenames),
+                                                 reason='recovered_checkpoint', seconds=age)
+                    _enqueue_incremental_assign_job(user_id, filenames)
+            except FileNotFoundError:
+                continue  # another process already recovered/cleared it
+            except Exception:
+                worker_logger.exception('Failed to recover cluster buffer checkpoint %s', path)
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            _rmdir_if_empty(user_dir)
 
 
 def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
     """Accumulate one photo's filename into its user's pending batch instead
     of sending it as its own queue message immediately -- cuts queue PUT/
-    DELETE traffic from one-per-photo to roughly one-per-
-    IPWORK_CLUSTER_BATCH_MAX_FILENAMES (time-flushed via a background thread
-    in run_ipworker, or on shutdown via _flush_all_incremental_assign_buffers,
-    so a slow trickle or a scaling-to-zero replica never strands filenames)."""
+    DELETE traffic from one-per-photo to roughly one-per-flush. The normal
+    flush trigger is the idle check in _flush_stale_incremental_assign_buffers
+    (so clustering wakes once per quiet gap, not repeatedly during a long
+    active run); IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES here is only a
+    defensive backstop, same as the shutdown flush below, so a slow trickle
+    or a scaling-to-zero replica never strands filenames indefinitely."""
     processing_diagnostics.file_event('cluster_buffered', user_id, filename, role='vision')
     to_flush: Optional[List[str]] = None
     started_at = None
@@ -3760,75 +3921,133 @@ def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
         if not buffer:
             _cluster_batch_started_at[user_id] = time.monotonic()
         buffer.append(filename)
-        if len(buffer) >= IPWORK_CLUSTER_BATCH_MAX_FILENAMES:
+        _cluster_batch_last_activity_at[user_id] = time.monotonic()
+        if len(buffer) >= IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES:
             to_flush = buffer
             started_at = _cluster_batch_started_at.get(user_id)
             _cluster_batch_buffers[user_id] = []
             _cluster_batch_started_at.pop(user_id, None)
+            _cluster_batch_last_activity_at.pop(user_id, None)
     if to_flush:
         age_s = (time.monotonic() - started_at) if started_at is not None else -1
-        processing_diagnostics.emit('cluster_buffer_flush', filenames=len(to_flush), reason='count_cap', seconds=age_s)
-        worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=count_cap age_s=%.1f',
+        processing_diagnostics.emit('cluster_buffer_flush', filenames=len(to_flush), reason='safety_cap', seconds=age_s)
+        worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=safety_cap age_s=%.1f',
                            user_id, len(to_flush), age_s)
         _enqueue_incremental_assign_job(user_id, to_flush)
+        _clear_cluster_buffer_checkpoint(user_id)
+
+
+def request_cluster_batch_flush(user_id: str) -> str:
+    """Manual "Cluster now" trigger (Tools): records a wall-clock request so
+    every ipworker replica's background flush loop picks it up on its next
+    poll tick (see _flush_stale_incremental_assign_buffers), since a buffer
+    for this user may be split across multiple replicas' in-memory state."""
+    if metadata_table_client is None:
+        return 'unavailable'
+    try:
+        metadata_table_client.upsert_entity(
+            {'PartitionKey': 'clustering_maintenance', 'RowKey': user_id,
+             'forceClusterFlushAt': datetime.now(timezone.utc).isoformat()},
+            mode=UpdateMode.MERGE)
+    except Exception:
+        app.logger.exception('Failed to record manual cluster-flush request for %s', user_id)
+        return 'unavailable'
+    return 'queued'
+
+
+def _cluster_flush_recently_requested(user_id: str) -> bool:
+    if metadata_table_client is None:
+        return False
+    try:
+        row = metadata_table_client.get_entity('clustering_maintenance', user_id)
+    except Exception:
+        return False
+    raw = row.get('forceClusterFlushAt')
+    if not raw:
+        return False
+    try:
+        requested_at = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return False
+    age = (datetime.now(timezone.utc) - requested_at).total_seconds()
+    return 0 <= age <= IPWORK_CLUSTER_FORCE_FLUSH_WINDOW_SECONDS
 
 
 def _flush_stale_incremental_assign_buffers() -> None:
-    """Flush on inactivity, count cap, or bounded age even during active uploads."""
+    """Flush once the vision/face pipeline itself has gone quiet for this
+    user (no new filename buffered in IPWORK_CLUSTER_IDLE_SECONDS), or on a
+    manual "Cluster now" request -- never on upload activity, which says
+    nothing about whether more faces are still coming from ipworker."""
     now = time.monotonic()
     to_flush: List[Tuple[str, List[str], str, float]] = []
     with _cluster_batch_lock:
         candidates = list(_cluster_batch_started_at.items())
     for user_id, started_at in candidates:
         age_s = now - started_at
-        hard_fallback = age_s >= IPWORK_CLUSTER_BATCH_HARD_FALLBACK_SECONDS
-        max_wait = age_s >= IPWORK_CLUSTER_BATCH_MAX_WAIT_SECONDS
-        if hard_fallback or max_wait or not _is_upload_active(user_id):
+        last_activity = _cluster_batch_last_activity_at.get(user_id, started_at)
+        idle = (now - last_activity) >= IPWORK_CLUSTER_IDLE_SECONDS
+        forced = (not idle) and _cluster_flush_recently_requested(user_id)
+        if idle or forced:
             with _cluster_batch_lock:
                 # Re-check under the lock -- the buffer may have already
-                # been flushed (count cap) or grown since the snapshot above.
+                # been flushed (safety cap) or grown since the snapshot above.
                 if _cluster_batch_started_at.get(user_id) != started_at:
                     continue
                 buffer = _cluster_batch_buffers.get(user_id)
                 if buffer:
-                    reason = 'hard_fallback' if hard_fallback else 'max_wait' if max_wait else 'inactive'
+                    reason = 'idle' if idle else 'manual'
                     to_flush.append((user_id, buffer, reason, age_s))
                 _cluster_batch_buffers[user_id] = []
                 _cluster_batch_started_at.pop(user_id, None)
+                _cluster_batch_last_activity_at.pop(user_id, None)
     for user_id, filenames, reason, age_s in to_flush:
         processing_diagnostics.emit('cluster_buffer_flush', filenames=len(filenames), reason=reason, seconds=age_s)
         worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=%s age_s=%.1f',
                            user_id, len(filenames), reason, age_s)
         _enqueue_incremental_assign_job(user_id, filenames)
+        _clear_cluster_buffer_checkpoint(user_id)
 
 
 def _flush_all_incremental_assign_buffers() -> None:
     """Flush every remaining non-empty buffer regardless of age -- called on
     ipworker shutdown so a scale-to-zero replica never strands filenames
-    that were waiting on either the count cap or the time-based flush."""
+    that were waiting on either the safety cap or the time-based flush."""
     now = time.monotonic()
     with _cluster_batch_lock:
         pending = [(user_id, filenames, now - _cluster_batch_started_at.get(user_id, now))
                   for user_id, filenames in _cluster_batch_buffers.items() if filenames]
         _cluster_batch_buffers.clear()
         _cluster_batch_started_at.clear()
+        _cluster_batch_last_activity_at.clear()
     for user_id, filenames, age_s in pending:
         processing_diagnostics.emit('cluster_buffer_flush', filenames=len(filenames), reason='shutdown', seconds=age_s)
         worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=shutdown age_s=%.1f',
                            user_id, len(filenames), age_s)
         _enqueue_incremental_assign_job(user_id, filenames)
+        _clear_cluster_buffer_checkpoint(user_id)
 
 
 def _run_incremental_assign_flush_loop(shutdown_requested: threading.Event) -> None:
     """Background daemon loop started once in run_ipworker; polls every
-    IPWORK_CLUSTER_BATCH_POLL_SECONDS -- cheap now that each check is a
-    per-buffered-user table point-read (_is_upload_active) rather than a
-    fixed timer, so this can run far more often without meaningful cost."""
+    IPWORK_CLUSTER_BATCH_POLL_SECONDS -- cheap now that each check is an
+    in-memory per-user last-activity lookup rather than a fixed timer, so
+    this can run far more often without meaningful cost. Also mirrors every
+    buffered user's filenames to the shared-volume checkpoint (if configured)
+    and recovers any checkpoint left behind by a process that never got to
+    clean up -- see CLUSTER_BUFFER_CHECKPOINT_DIR."""
     while not shutdown_requested.wait(IPWORK_CLUSTER_BATCH_POLL_SECONDS):
         try:
             _flush_stale_incremental_assign_buffers()
         except Exception:
             worker_logger.exception('Incremental-assign activity-based flush failed')
+        try:
+            _checkpoint_all_cluster_buffers()
+        except Exception:
+            worker_logger.exception('Incremental-assign checkpoint write failed')
+        try:
+            _recover_stranded_cluster_buffer_checkpoints()
+        except Exception:
+            worker_logger.exception('Incremental-assign checkpoint recovery failed')
 
 
 def _enqueue_propagate_job(user_id: str, person_id: str) -> Dict[str, str]:
@@ -16006,6 +16225,14 @@ def run_ipworker() -> None:
     # never happen outside a burst. Stops via the same shutdown_requested
     # Event; _flush_all_incremental_assign_buffers below catches whatever
     # this loop's own cadence didn't get to before exit.
+    try:
+        # Recover eagerly at startup (rather than waiting for the loop's
+        # first poll tick) so filenames checkpointed by a replica that got
+        # SIGKILLed before this one started don't sit stranded through a
+        # whole cold-start-to-first-poll gap.
+        _recover_stranded_cluster_buffer_checkpoints()
+    except Exception:
+        worker_logger.exception('Startup cluster-buffer checkpoint recovery failed')
     incremental_assign_flush_thread = threading.Thread(
         target=_run_incremental_assign_flush_loop, args=(shutdown_requested,),
         name='ipwork-cluster-batch-flush', daemon=True)

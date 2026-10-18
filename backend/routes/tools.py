@@ -195,6 +195,19 @@ def tools_release_ipwork():
     return app.jsonify({'status': status}), 503 if status == 'unavailable' else 202
 
 
+@tools_bp.route('/api/tools/cluster/flush', methods=['POST'])
+def tools_flush_cluster_batch():
+    # Manual counterpart to the automatic idle/count-cap flush: asks every
+    # ipworker replica to drain this library's pending incremental-assign
+    # buffer on its next poll tick, rather than waiting for the 1500-filename
+    # cap or the vision-pipeline idle timer.
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    status = app.request_cluster_batch_flush(user_id)
+    return app.jsonify({'status': status}), 503 if status == 'unavailable' else 202
+
+
 @tools_bp.route('/api/tools/indexes/status', methods=['GET'])
 def tools_indexes_status():
     # Read-only poll target. Readiness comes from the manifest blobs; `building`

@@ -4105,7 +4105,7 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
     }, []);
     const [totalAvailable, setTotalAvailable] = useState<number>(cachedBoot?.totalAvailable || 0);
     const [serverTotalLoaded, setServerTotalLoaded] = useState<boolean>(false);
-    const [loading, setLoading] = useState<boolean>(false);
+    const [loading, setLoading] = useState<boolean>(!cachedBoot);
     const [loadingMore, setLoadingMore] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
     const [warmingUp, setWarmingUp] = useState<boolean>(false);
@@ -4727,6 +4727,16 @@ const PhotoGallery: React.FC<PhotoGalleryProps> = ({
         } finally {
             setDeleting(false);
             setDeleteProgress(null);
+        }
+
+        // Deleting everything currently loaded can empty `photos` even though
+        // more still exist server-side (hasMore) -- without this, the grid
+        // falls straight into the "Your library is empty" EmptyState instead
+        // of paging in the next batch, which is misleading since the library
+        // isn't actually empty.
+        const remainingAfterDelete = snapshot.filter(p => !(toDeleteSet.has(p.filename) && succeeded.has(p.filename))).length;
+        if (remainingAfterDelete === 0 && hasMore) {
+            fetchPhotos(sortBy, 0, false, searchQuery);
         }
     };
 

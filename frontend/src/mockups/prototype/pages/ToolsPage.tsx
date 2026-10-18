@@ -221,6 +221,18 @@ export const ToolsPage: React.FC = () => {
         }
     };
 
+    const runFlushCluster = async () => {
+        setBusy(true);
+        try {
+            await postTools('/api/tools/cluster/flush', {});
+            toast('Sent buffered faces to clustering');
+        } catch {
+            toast('Couldn’t start clustering', undefined, undefined, 'error');
+        } finally {
+            setBusy(false);
+        }
+    };
+
     const runAdmin = async (label: string, path: string, body: Record<string, unknown>) => {
         const confirmed = await confirmDialog({
             title: `${label}?`,
@@ -307,6 +319,12 @@ export const ToolsPage: React.FC = () => {
                         <strong>Process pending photos</strong>
                         <span>Server processing starts automatically after an upload ends. If photos are still waiting, start it now.</span>
                         <button type="button" className="btn" disabled={busy} onClick={() => void runProcessPending()}>Process now</button>
+                    </div>
+
+                    <div className="card-glass pt-recover-card">
+                        <strong>Cluster buffered faces</strong>
+                        <span>Faces are grouped and sent to clustering automatically once face detection goes quiet for 5 minutes. To send what's buffered right now, cluster it now.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runFlushCluster()}>Cluster now</button>
                     </div>
 
                     {activeJobs.length > 0 && (

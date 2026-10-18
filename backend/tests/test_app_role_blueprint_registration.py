@@ -86,6 +86,9 @@ def test_indexer_role_serves_only_tools_routes():
         # is the 2vCPU/4Gi role that can safely scan a full metadata partition.
         '/api/tools/indexes/build',
         '/api/tools/indexes/status',
+        # Manual counterparts to the automatic release/flush triggers.
+        '/api/tools/ipwork/release',
+        '/api/tools/cluster/flush',
         # jobs_status moved here from core (2026-10-01): polled
         # continuously by every session, indefinitely -- competed with
         # interactive gallery traffic for core's thin GUNICORN_WORKERS=2/

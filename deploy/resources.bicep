@@ -1525,9 +1525,19 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             cpu: json('2.0')
             memory: '4Gi'
           }
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+          ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'vision' }
             { name: 'IPWORKER_POLL_SECONDS', value: '2' }
+            // Shared Azure Files volume, same share indexer/worker/clustering
+            // already mount: a crash (SIGKILL/OOM, not a graceful SIGTERM
+            // drain) between buffering a face-identified filename and the
+            // idle/manual flush sending it to clustering would otherwise lose
+            // it silently, since _cluster_batch_buffers is in-memory only.
+            // See _write_cluster_buffer_checkpoint / _recover_stranded_cluster_buffer_checkpoints.
+            { name: 'CLUSTER_BUFFER_CHECKPOINT_DIR', value: '/mnt/photostore/shared/cluster-buffers' }
             // How many photos one replica processes concurrently (see
             // IPWORKER_CONCURRENCY in backend/app.py). Was raised live to 3
             // out-of-band at some point (found as bicep/live drift on
@@ -1600,6 +1610,9 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             { name: 'INDEXER_INTERNAL_URL', value: 'https://${indexer.properties.configuration.ingress.fqdn}' }
           ])
         }
+      ]
+      volumes: [
+        { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
         minReplicas: 0

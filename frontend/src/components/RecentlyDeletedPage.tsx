@@ -42,12 +42,22 @@ const RecentlyDeletedPage: React.FC = () => {
         try {
             const fetched: TrashedPhoto[] = [];
             let reportedTotal = 0;
-            for (;;) {
-                const data = await get(`/photos/trash?limit=200&offset=${fetched.length}`);
+            const PAGE_LIMIT = 200;
+            // Walk the raw index offset (a fixed stride), not fetched.length --
+            // a page can come back shorter than PAGE_LIMIT because some of its
+            // entries were stale (already restored/purged) and got filtered
+            // out server-side, not because we've reached the end of the trash
+            // index. Using fetched.length as the next offset would re-request
+            // the wrong slice, and stopping on `page.length < PAGE_LIMIT`
+            // would quit early and strand the rest of trash unloaded -- which
+            // is exactly the "badge shows only what loaded" bug. A page is
+            // only genuinely the end once it comes back empty.
+            for (let rawOffset = 0; ; rawOffset += PAGE_LIMIT) {
+                const data = await get(`/photos/trash?limit=${PAGE_LIMIT}&offset=${rawOffset}`);
                 const page: TrashedPhoto[] = Array.isArray(data?.photos) ? data.photos : [];
                 fetched.push(...page);
                 reportedTotal = Number(data?.total ?? fetched.length);
-                if (page.length < 200 || fetched.length >= reportedTotal) break;
+                if (page.length === 0) break;
             }
             setPhotos(fetched);
             setTotal(reportedTotal);
