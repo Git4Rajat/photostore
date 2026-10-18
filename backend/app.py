@@ -10742,7 +10742,26 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             if scope in ('light', 'people'):
                 # Incremental maintenance: cost follows what changed, not library size.
                 kinds = ('sort', 'access') if scope == 'light' else ('people', 'albums')
+
+                # For scope='people', read dirty-sets to enable incremental rebuilds
+                if scope == 'people':
+                    dirty_people = get_dirty_people(user_id)
+                    dirty_albums = get_dirty_albums(user_id)
+                    # Store in context so refresh functions can access them
+                    storage_utils_module._CTX['dirty_people_ids'] = dirty_people if dirty_people else None
+                    storage_utils_module._CTX['dirty_albums_ids'] = dirty_albums if dirty_albums else None
+
                 bad = prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+
+                # Clear dirty-sets after rebuild
+                if scope == 'people':
+                    if storage_utils_module._CTX.get('dirty_people_ids'):
+                        clear_dirty_people(user_id)
+                    if storage_utils_module._CTX.get('dirty_albums_ids'):
+                        clear_dirty_albums(user_id)
+                    # Clean up context
+                    storage_utils_module._CTX.pop('dirty_people_ids', None)
+                    storage_utils_module._CTX.pop('dirty_albums_ids', None)
                 if bad:
                     raise RuntimeError(f'index build produced no {", ".join(bad)} index')
                 try:

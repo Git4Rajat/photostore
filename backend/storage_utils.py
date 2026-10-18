@@ -6287,13 +6287,117 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
     )
 
 
-def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
+def _incremental_albums_index_snapshot(
+    user_id: str, source_version: str, affected_album_ids: set, prev_rows: List[Dict[str, object]],
+) -> Optional[LexicalIndexSnapshot]:
+    """Rebuild only the specified albums and merge with previous snapshot.
+    Much faster than full rebuild for bulk operations (e.g., moving 100 photos to one album)."""
+    albums_table_client = _CTX.get('albums_table_client')
+    if albums_table_client is None:
+        return None
+
+    import search_db
+    try:
+        library_db = search_db.open_database(user_id)
+    except Exception:
+        library_db = None
+
+    def _cover(names: List[str]) -> str:
+        if not names:
+            return ''
+        if library_db is not None:
+            try:
+                best = library_db.top_rated(names, limit=1)
+                if best:
+                    return best[0]
+            except Exception:
+                pass
+        return names[0] if names else ''
+
+    # Fetch only affected albums
+    try:
+        affected_rows = {}
+        for album_id in affected_album_ids:
+            try:
+                row = albums_table_client.get_entity(partition_key=user_id, row_key=str(album_id))
+                affected_rows[str(album_id)] = row
+            except Exception:
+                # Album deleted, will be filtered out below
+                pass
+    except Exception:
+        return None
+
+    # Build updated rows for affected albums
+    updated_rows: Dict[str, Dict[str, object]] = {}
+    for album_id, row in affected_rows.items():
+        if str(row.get('deleted') or '').strip().lower() in ('true', '1'):
+            # Album was deleted, skip it
+            continue
+        filenames = album_store.sample(row) if album_store.is_table_backed(row) else album_store.read_filenames(row)
+        updated_rows[album_id] = {
+            'albumId': album_id,
+            'name': str(row.get('name') or ''),
+            'photoCount': album_store.count(row),
+            'coverFilename': _cover(filenames),
+            'updatedAt': str(row.get('updatedAt') or ''),
+            **_album_share_fields(row),
+        }
+
+    # Merge with previous rows (everything except affected albums)
+    merged_rows = []
+    by_id = {str(row.get('albumId', '')): row for row in prev_rows if isinstance(row, dict)}
+
+    # Keep all non-affected rows
+    for row in prev_rows:
+        if isinstance(row, dict):
+            album_id = str(row.get('albumId', ''))
+            if album_id and album_id not in affected_album_ids:
+                merged_rows.append(row)
+
+    # Add updated rows
+    merged_rows.extend(updated_rows.values())
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_ALBUMS_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=merged_rows,
+    )
+
+
+def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = None, affected_album_ids: Optional[set] = None) -> Optional[LexicalIndexSnapshot]:
+    """Refresh albums index, optionally incrementally for specific albums.
+
+    If affected_album_ids is provided, only those albums are recomputed and merged
+    with the previous snapshot, avoiding a full library scan. Falls back to full
+    rebuild if affected set is too large or previous snapshot missing."""
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
 
-    snapshot = _build_user_albums_index_snapshot(key, source_version)
+    # Get affected IDs from context if not provided (used during incremental build jobs)
+    if affected_album_ids is None:
+        affected_album_ids = _CTX.get('dirty_albums_ids')
+
+    # Try incremental if affected IDs provided
+    if affected_album_ids:
+        prev_manifest = _load_albums_index_manifest(key)
+        prev_snapshot = _load_albums_index_blob(key) if prev_manifest else None
+        if (prev_snapshot and
+            prev_snapshot.schema_version == _ALBUMS_INDEX_SCHEMA_VERSION and
+            prev_snapshot.source_version == str(prev_manifest.get('sourceVersion') or '') and
+            len(affected_album_ids) <= 100):  # Cap affected albums to avoid degradation
+            snapshot = _incremental_albums_index_snapshot(key, source_version, affected_album_ids, prev_snapshot.rows)
+            if snapshot is not None:
+                perf_instrumentation.log_event('albums_index_incremental', user=key, ok=True, albums=len(affected_album_ids))
+            else:
+                snapshot = _build_user_albums_index_snapshot(key, source_version)
+        else:
+            snapshot = _build_user_albums_index_snapshot(key, source_version)
+    else:
+        snapshot = _build_user_albums_index_snapshot(key, source_version)
     if snapshot is None:
         return None
     container_name = _lexical_index_container_name()
@@ -6921,7 +7025,71 @@ def _incremental_people_index_snapshot(
     )
 
 
-def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[LexicalIndexSnapshot]:
+def _incremental_people_index_snapshot_by_ids(
+    user_id: str, source_version: str, affected_person_ids: set, prev_rows: List[Dict[str, object]],
+) -> Optional[LexicalIndexSnapshot]:
+    """Rebuild only the specified people and merge with previous snapshot.
+    Faster than timestamp-based incremental for bulk operations."""
+    person_table_client = _CTX.get('person_table_client')
+    face_table_client = _CTX.get('face_table_client')
+    if person_table_client is None or face_table_client is None:
+        return None
+
+    try:
+        # Fetch only affected people
+        affected_people = {}
+        for person_id in affected_person_ids:
+            try:
+                person = person_table_client.get_entity(partition_key=user_id, row_key=str(person_id))
+                affected_people[str(person_id)] = person
+            except Exception:
+                # Person deleted, will be filtered out
+                pass
+    except Exception:
+        return None
+
+    # Rebuild only affected people
+    try:
+        fresh_rows = _people_index_rows_from_scan(
+            user_id, source_version,
+            list(affected_people.values()),
+            _PointReadFaces(), person_table_client, face_table_client,
+        )
+        if fresh_rows is None:
+            return None
+    except Exception:
+        return None
+
+    # Merge with previous rows (everything except affected people)
+    merged_rows = []
+    affected_ids = {str(pid) for pid in affected_person_ids}
+
+    # Keep all non-affected rows
+    for row in prev_rows:
+        if isinstance(row, dict):
+            person_id = str(row.get('personId', ''))
+            if person_id and person_id not in affected_ids:
+                merged_rows.append(row)
+
+    # Add updated rows
+    if fresh_rows:
+        merged_rows.extend(fresh_rows)
+
+    return LexicalIndexSnapshot(
+        user_id=str(user_id),
+        source_version=source_version,
+        schema_version=_PEOPLE_INDEX_SCHEMA_VERSION,
+        updated_at=source_version,
+        rows=merged_rows,
+    )
+
+
+def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None, affected_person_ids: Optional[set] = None) -> Optional[LexicalIndexSnapshot]:
+    """Refresh people index, optionally incrementally for specific people.
+
+    If affected_person_ids is provided, only those people are recomputed and merged
+    with the previous snapshot, avoiding a full library scan. Falls back to full
+    rebuild if affected set is too large or previous snapshot missing."""
     key = str(user_id or '').strip()
     if not key:
         return None
@@ -6930,21 +7098,39 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
 
     snapshot = None
     previous_manifest = _load_people_index_manifest(key)
-    since = str(previous_manifest.get('builtThrough') or '')
-    full_at = str(previous_manifest.get('fullBuiltAt') or '')
-    try:
-        full_age_hours = (started - datetime.fromisoformat(full_at)).total_seconds() / 3600 if full_at else None
-    except ValueError:
-        full_age_hours = None
-    incremental_ok = full_age_hours is not None and 0 <= full_age_hours < _PEOPLE_FULL_REBUILD_HOURS
-    if since and incremental_ok and previous_manifest.get('schemaVersion') == _PEOPLE_INDEX_SCHEMA_VERSION:
+
+    # Get affected IDs from context if not provided (used during incremental build jobs)
+    if affected_person_ids is None:
+        affected_person_ids = _CTX.get('dirty_people_ids')
+
+    # Try incremental with affected IDs first
+    if affected_person_ids and len(affected_person_ids) <= 100:
         prev = _load_people_index_blob(key)
         if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
                 and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
-            snapshot = _incremental_people_index_snapshot(key, source_version, since, prev.rows)
-            perf_instrumentation.log_event(
-                'people_index_incremental', user=key, ok=snapshot is not None,
-                rows=len(snapshot.rows) if snapshot else 0)
+            snapshot = _incremental_people_index_snapshot_by_ids(key, source_version, affected_person_ids, prev.rows)
+            if snapshot is not None:
+                perf_instrumentation.log_event(
+                    'people_index_incremental_by_ids', user=key, ok=True,
+                    people=len(affected_person_ids))
+
+    # Fall back to timestamp-based incremental if ID-based didn't work
+    if snapshot is None:
+        since = str(previous_manifest.get('builtThrough') or '')
+        full_at = str(previous_manifest.get('fullBuiltAt') or '')
+        try:
+            full_age_hours = (started - datetime.fromisoformat(full_at)).total_seconds() / 3600 if full_at else None
+        except ValueError:
+            full_age_hours = None
+        incremental_ok = full_age_hours is not None and 0 <= full_age_hours < _PEOPLE_FULL_REBUILD_HOURS
+        if since and incremental_ok and previous_manifest.get('schemaVersion') == _PEOPLE_INDEX_SCHEMA_VERSION:
+            prev = _load_people_index_blob(key)
+            if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
+                    and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
+                snapshot = _incremental_people_index_snapshot(key, source_version, since, prev.rows)
+                perf_instrumentation.log_event(
+                    'people_index_incremental', user=key, ok=snapshot is not None,
+                    rows=len(snapshot.rows) if snapshot else 0)
     full_built_at = str(previous_manifest.get('fullBuiltAt') or '') if snapshot is not None else started.isoformat()
     if snapshot is None:
         snapshot = _build_user_people_index_snapshot(key, source_version)
