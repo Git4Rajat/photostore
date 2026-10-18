@@ -10385,6 +10385,14 @@ INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MI
 # either publish dirty rows or compact a non-empty delta log; reaching this
 # limit means forward progress is not converging and should be queue-retried.
 INDEX_BUILD_INCREMENTAL_MAX_PASSES = int(os.getenv('INDEX_BUILD_INCREMENTAL_MAX_PASSES', '100'))
+# Scope-aware stale timeouts: slow scopes (people/full) can legitimately take
+# longer than fast scopes (light/dedup). Prevents false "job dead" declarations.
+INDEX_BUILD_STALE_MINUTES_BY_SCOPE = {
+    'full': int(os.getenv('INDEX_BUILD_FULL_STALE_MINUTES', '45')),
+    'people': int(os.getenv('INDEX_BUILD_PEOPLE_STALE_MINUTES', '45')),
+    'light': int(os.getenv('INDEX_BUILD_LIGHT_STALE_MINUTES', '20')),
+    'dedup': int(os.getenv('INDEX_BUILD_DEDUP_STALE_MINUTES', '20')),
+}
 
 
 def _job_row_fresh_active(key: str, job_id: str) -> bool:
@@ -10399,15 +10407,17 @@ def _job_row_fresh_active(key: str, job_id: str) -> bool:
 
 def _index_build_job_active(user_id: str) -> bool:
     """True if this library has an index_build job that is queued/running and
-    fresh (not past the same staleness cutoff /jobs/status uses to declare a
-    dead job failed)."""
+    fresh (not past scope-aware staleness cutoff). Slow scopes (full/people) get
+    longer tolerance to avoid false "dead job" declarations on large libraries."""
     key = str(user_id or '').strip()
     if not key or jobs_table_client is None:
         return False
     row = _get_job_row(key, _index_build_job_id(key))
     if not row or str(row.get('status') or '').lower() not in {'queued', 'running'}:
         return False
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)).isoformat()
+    scope = str(row.get('indexScope') or 'full').lower()
+    stale_minutes = INDEX_BUILD_STALE_MINUTES_BY_SCOPE.get(scope, 45)
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
     return str(row.get('updatedAt') or '') >= cutoff
 
 
@@ -10562,7 +10572,17 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     stop = threading.Event()
 
     def _heartbeat() -> None:
-        while not stop.wait(INDEX_BUILD_HEARTBEAT_SECONDS):
+        # Scope-aware heartbeat frequency: slow scopes get more frequent updates
+        # to prevent false staleness timeouts on large libraries.
+        heartbeat_intervals = {
+            'full': 30,   # Slow: full table scan, may have long pauses
+            'people': 60, # Slow: people index reads full cluster/face tables
+            'light': 30,  # Fast: incremental sort/access refresh
+            'dedup': 30,  # Fast: small hash snapshot
+        }
+        heartbeat_interval = heartbeat_intervals.get(scope, 30)
+
+        while not stop.wait(heartbeat_interval):
             try:
                 _upsert_job_status(
                     job_id, user_id, INDEX_BUILD_JOB_TYPE, 'running',
