@@ -28,6 +28,7 @@ RAW_EXTENSIONS_RAWPY = {
     'rwl', '3fr', 'fff', 'mrw', 'x3f', 'erf', 'mef',
     'mos', 'kdc', 'k25', 'dcr', 'dcs', 'drf', 'mdc',
     'srw', 'rwz', 'bay', 'cap', 'eip', 'gpr', 'pxn', 'iiq',
+    'sti', 'lri',
 }
 
 RAW_EXTENSIONS_CINEMA = {
