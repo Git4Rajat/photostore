@@ -486,6 +486,8 @@ FACE_EMBEDDINGS_TABLE = os.getenv('FACE_EMBEDDINGS_TABLE', 'photofaceembeddings'
 # dirty set doesn't blind the lexical rebuild to the same changes (they run on
 # independent schedules). See touch_user_search_indexes_state.
 SEARCH_INDEX_DIRTY_TABLE = os.getenv('SEARCH_INDEX_DIRTY_TABLE', 'photosearchdirty')
+PEOPLE_DIRTY_SET_TABLE = os.getenv('PEOPLE_DIRTY_SET_TABLE', 'peopledirtyset')  # Tracks which people need incremental rebuild
+ALBUMS_DIRTY_SET_TABLE = os.getenv('ALBUMS_DIRTY_SET_TABLE', 'albumsdirtyset')  # Tracks which albums need incremental rebuild
 ALBUMS_TABLE = os.getenv('ALBUMS_TABLE', 'photoalbums')
 # Public-share-link index: PartitionKey=publicToken, RowKey='owner' -> (userId,
 # albumId), so a public share view is an O(1) point read instead of an
@@ -1100,6 +1102,8 @@ merge_table_client = None
 jobs_table_client = None
 album_token_index_table_client = None
 workbench_actions_table_client = None
+people_dirty_set_table_client = None  # Track which people were modified for incremental rebuild
+albums_dirty_set_table_client = None  # Track which albums were modified for incremental rebuild
 image_names_table_client = None
 hash_index_table_client = None
 filename_owners_table_client = None
@@ -1404,6 +1408,7 @@ def _init_storage_clients():
     global album_token_index_table_client
     global jobs_table_client
     global workbench_actions_table_client
+    global people_dirty_set_table_client, albums_dirty_set_table_client
     global image_names_table_client
     global hash_index_table_client, filename_owners_table_client, trash_index_table_client
     global embeddings_table_client
@@ -1445,6 +1450,8 @@ def _init_storage_clients():
         invites_table_client_local = tbl_svc.get_table_client(INVITES_TABLE)
         audit_table_client_local = tbl_svc.get_table_client(AUDIT_TABLE)
         clean_requests_table_client_local = tbl_svc.get_table_client(CLEAN_REQUESTS_TABLE)
+        people_dirty_set_table_client_local = tbl_svc.get_table_client(PEOPLE_DIRTY_SET_TABLE)
+        albums_dirty_set_table_client_local = tbl_svc.get_table_client(ALBUMS_DIRTY_SET_TABLE)
 
         if BLOB_CONNECTION_STRING:
             blob_service_client_local = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
@@ -1514,6 +1521,8 @@ def _init_storage_clients():
         invites_table_client_local = tbl_svc.get_table_client(INVITES_TABLE)
         audit_table_client_local = tbl_svc.get_table_client(AUDIT_TABLE)
         clean_requests_table_client_local = tbl_svc.get_table_client(CLEAN_REQUESTS_TABLE)
+        people_dirty_set_table_client_local = tbl_svc.get_table_client(PEOPLE_DIRTY_SET_TABLE)
+        albums_dirty_set_table_client_local = tbl_svc.get_table_client(ALBUMS_DIRTY_SET_TABLE)
 
     # assign to globals
     metadata_table_client = metadata_table_client_local
@@ -1535,6 +1544,8 @@ def _init_storage_clients():
     merge_table_client = merge_table_client_local
     jobs_table_client = jobs_table_client_local
     workbench_actions_table_client = workbench_actions_table_client_local
+    people_dirty_set_table_client = people_dirty_set_table_client_local
+    albums_dirty_set_table_client = albums_dirty_set_table_client_local
     image_names_table_client = image_names_table_client_local
     hash_index_table_client = hash_index_table_client_local
     filename_owners_table_client = filename_owners_table_client_local
@@ -10516,6 +10527,110 @@ def _index_build_progress_callback(user_id: str):
             result={'indexes': indexes, 'ready': ready},
         )
     return _cb
+
+
+def mark_people_dirty(user_id: str, person_ids: list) -> None:
+    """Mark people as dirty for incremental rebuild. Call this when people are merged,
+    faces reassigned, or person metadata changes. Use bulk writes for better efficiency."""
+    if not person_ids or people_dirty_set_table_client is None:
+        return
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    try:
+        for person_id in person_ids:
+            people_dirty_set_table_client.upsert_entity({
+                'PartitionKey': key,
+                'RowKey': str(person_id or '').strip(),
+                'op': 'modified',
+            })
+    except Exception:
+        worker_logger.exception('Failed to mark people dirty for %s', key)
+
+
+def mark_albums_dirty(user_id: str, album_ids: list) -> None:
+    """Mark albums as dirty for incremental rebuild. Call this when photos are moved
+    to albums or album properties change."""
+    if not album_ids or albums_dirty_set_table_client is None:
+        return
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    try:
+        for album_id in album_ids:
+            albums_dirty_set_table_client.upsert_entity({
+                'PartitionKey': key,
+                'RowKey': str(album_id or '').strip(),
+                'op': 'modified',
+            })
+    except Exception:
+        worker_logger.exception('Failed to mark albums dirty for %s', key)
+
+
+def get_dirty_people(user_id: str) -> set:
+    """Get all dirty people IDs for incremental rebuild."""
+    if people_dirty_set_table_client is None:
+        return set()
+    key = str(user_id or '').strip()
+    if not key:
+        return set()
+    try:
+        people = set()
+        for entity in people_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"):
+            pid = str(entity.get('RowKey') or '').strip()
+            if pid:
+                people.add(pid)
+        return people
+    except Exception:
+        worker_logger.exception('Failed to get dirty people for %s', key)
+        return set()
+
+
+def get_dirty_albums(user_id: str) -> set:
+    """Get all dirty album IDs for incremental rebuild."""
+    if albums_dirty_set_table_client is None:
+        return set()
+    key = str(user_id or '').strip()
+    if not key:
+        return set()
+    try:
+        albums = set()
+        for entity in albums_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"):
+            aid = str(entity.get('RowKey') or '').strip()
+            if aid:
+                albums.add(aid)
+        return albums
+    except Exception:
+        worker_logger.exception('Failed to get dirty albums for %s', key)
+        return set()
+
+
+def clear_dirty_people(user_id: str) -> None:
+    """Clear dirty people set after rebuild."""
+    if people_dirty_set_table_client is None:
+        return
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    try:
+        for entity in people_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"):
+            people_dirty_set_table_client.delete_entity(key, str(entity.get('RowKey') or ''))
+    except Exception:
+        worker_logger.exception('Failed to clear dirty people for %s', key)
+
+
+def clear_dirty_albums(user_id: str) -> None:
+    """Clear dirty albums set after rebuild."""
+    if albums_dirty_set_table_client is None:
+        return
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    try:
+        for entity in albums_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"):
+            albums_dirty_set_table_client.delete_entity(key, str(entity.get('RowKey') or ''))
+    except Exception:
+        worker_logger.exception('Failed to clear dirty albums for %s', key)
 
 
 def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
