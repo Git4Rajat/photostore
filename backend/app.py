@@ -10748,25 +10748,29 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                 # Incremental maintenance: cost follows what changed, not library size.
                 kinds = ('sort', 'access') if scope == 'light' else ('people', 'albums')
 
-                # For scope='people', read dirty-sets to enable incremental rebuilds
-                if scope == 'people':
-                    dirty_people = get_dirty_people(user_id)
-                    dirty_albums = get_dirty_albums(user_id)
-                    # Store in context so refresh functions can access them
-                    storage_utils_module._CTX['dirty_people_ids'] = dirty_people if dirty_people else None
-                    storage_utils_module._CTX['dirty_albums_ids'] = dirty_albums if dirty_albums else None
+                # For scope='people', read dirty-sets to enable incremental rebuilds.
+                # Passed as explicit call arguments (not through shared module
+                # state) since this job may run in the same process as another
+                # user's -- or another job's -- index build.
+                dirty_people = get_dirty_people(user_id) if scope == 'people' else None
+                dirty_albums = get_dirty_albums(user_id) if scope == 'people' else None
 
-                bad = prime_all_user_indexes_sequentially(user_id, wait=True, kinds=kinds)
+                bad = prime_all_user_indexes_sequentially(
+                    user_id, wait=True, kinds=kinds,
+                    affected_person_ids=dirty_people or None,
+                    affected_album_ids=dirty_albums or None,
+                )
 
-                # Clear dirty-sets after rebuild
+                # Clear dirty-sets only for kinds that actually rebuilt -- a
+                # failed people/albums rebuild (kind present in `bad`) must
+                # leave its dirty-set alone so the next attempt still knows
+                # which ids need picking back up, instead of silently
+                # dropping that work on the floor.
                 if scope == 'people':
-                    if storage_utils_module._CTX.get('dirty_people_ids'):
+                    if dirty_people and 'people' not in bad:
                         clear_dirty_people(user_id)
-                    if storage_utils_module._CTX.get('dirty_albums_ids'):
+                    if dirty_albums and 'albums' not in bad:
                         clear_dirty_albums(user_id)
-                    # Clean up context
-                    storage_utils_module._CTX.pop('dirty_people_ids', None)
-                    storage_utils_module._CTX.pop('dirty_albums_ids', None)
                 if bad:
                     raise RuntimeError(f'index build produced no {", ".join(bad)} index')
                 try:

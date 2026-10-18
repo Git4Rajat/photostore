@@ -30,6 +30,17 @@ const AI_STEPS = new Set<BrowserProcessingAction>(['ocr', 'vision', 'faces']);
 
 interface HistoryEntry { actionId?: string; action?: string; steps?: string[]; scope?: string; filenameCount?: number; createdAt?: string; }
 
+const INDEX_KIND_LABELS: Record<string, string> = {
+    sort: 'Sort index',
+    lexical: 'Search index',
+    albums: 'Albums index',
+    people: 'People index',
+};
+
+interface IndexDetail { ready: boolean; dirty: boolean; updated_at?: string; }
+type IndexStatusMap = Record<string, IndexDetail>;
+const INDEX_STATUS_POLL_MS = 8000;
+
 interface VerifyFaceIndexResult {
     checked: number;
     mismatches: number;
@@ -83,6 +94,28 @@ export const ToolsPage: React.FC = () => {
     const [verifyInput, setVerifyInput] = useState('');
     const [verifyResult, setVerifyResult] = useState<VerifyFaceIndexResult | null>(null);
     const [verifyLoading, setVerifyLoading] = useState(false);
+    const [indexStatus, setIndexStatus] = useState<IndexStatusMap>({});
+    const [rebuildingIndex, setRebuildingIndex] = useState<string | null>(null);
+
+    const loadIndexStatus = async () => {
+        try {
+            const res = await getTools<{ indexes?: IndexStatusMap }>('/api/tools/indexes/status');
+            setIndexStatus(res?.indexes ?? {});
+        } catch {
+            // Keep the last known status rather than clearing it on a transient failure.
+        }
+    };
+
+    // Self-contained poll, not the shared gallery/search index-building
+    // service: that one only fetches /api/tools/indexes/status when another
+    // page has already reported a dirty index, so opening Tools on its own
+    // would otherwise show nothing but the hardcoded "not built" default.
+    useEffect(() => {
+        if (tab !== 'Overview') return;
+        void loadIndexStatus();
+        const interval = setInterval(() => { void loadIndexStatus(); }, INDEX_STATUS_POLL_MS);
+        return () => clearInterval(interval);
+    }, [tab]);
 
     // A deep link ("Open in Workbench" from the gallery) pre-selects those
     // photos, but any photo in the loaded library can be searched for and
@@ -253,6 +286,19 @@ export const ToolsPage: React.FC = () => {
         }
     };
 
+    const handleRebuildIndex = async (kind: string) => {
+        setRebuildingIndex(kind);
+        try {
+            await postTools(`/api/tools/indexes/rebuild/${kind}`, {});
+            toast(kind === 'all' ? 'Rebuilding all indexes…' : `Rebuilding ${kind} index…`);
+            await loadIndexStatus();
+        } catch {
+            toast(`Couldn’t rebuild ${kind === 'all' ? 'indexes' : `${kind} index`}`, undefined, undefined, 'error');
+        } finally {
+            setRebuildingIndex(null);
+        }
+    };
+
     const runVerifyFaceIndex = async () => {
         const filenames = verifyInput.split(/[\n,]/).map((f) => f.trim()).filter(Boolean);
         if (!filenames.length) return;
@@ -313,6 +359,38 @@ export const ToolsPage: React.FC = () => {
                                 <span className="qchip">{activeJobs.length}</span>
                             </div>
                         </div>
+                    </div>
+
+                    <div className="pt-queue-grid">
+                        {Object.entries(INDEX_KIND_LABELS).map(([kind, label]) => {
+                            const status = indexStatus[kind];
+                            const badgeLabel = !status || !status.ready ? 'not built' : status.dirty ? 'dirty' : 'ready';
+                            const badgeClass = !status || !status.ready ? 'warn' : status.dirty ? 'warn' : '';
+                            return (
+                                <div key={kind} className="card-glass pt-queue-card">
+                                    <div className="pt-queue-title">{label}</div>
+                                    <div className="pt-queue-counts">
+                                        <span className={`qchip${badgeClass ? ` ${badgeClass}` : ''}`}>{badgeLabel}</span>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        className="btn"
+                                        disabled={rebuildingIndex === kind}
+                                        onClick={() => void handleRebuildIndex(kind)}
+                                    >
+                                        {rebuildingIndex === kind ? 'Rebuilding…' : 'Rebuild'}
+                                    </button>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    <div className="card-glass pt-recover-card">
+                        <strong>Rebuild all indexes</strong>
+                        <span>Force a full rebuild of sort, search, albums, and people indexes.</span>
+                        <button type="button" className="btn" disabled={rebuildingIndex === 'all'} onClick={() => void handleRebuildIndex('all')}>
+                            {rebuildingIndex === 'all' ? 'Rebuilding…' : 'Rebuild all'}
+                        </button>
                     </div>
 
                     <div className="card-glass pt-recover-card">

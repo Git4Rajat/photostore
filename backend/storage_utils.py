@@ -254,8 +254,12 @@ class _KeyedLockRegistry:
             lock = self._locks.get(key)
             acquired_at = self._lock_acquired_at.get(key)
 
-            # Force-release stuck locks (thread died while holding)
-            if acquired_at is not None:
+            # Force-release stuck locks (thread died while holding). A dead
+            # thread never calls .release(), so the only way to actually free
+            # this up is to discard the Lock object itself and hand out a
+            # fresh, unlocked one -- clearing just the timestamp leaves the
+            # real lock permanently un-acquirable.
+            if lock is not None and acquired_at is not None:
                 age_seconds = time.monotonic() - acquired_at
                 if age_seconds > self.MAX_LOCK_AGE_SECONDS:
                     _LOGGER.warning(
@@ -264,7 +268,7 @@ class _KeyedLockRegistry:
                         key, age_seconds
                     )
                     self._lock_acquired_at.pop(key, None)
-                    acquired_at = None
+                    lock = None
 
             if lock is None:
                 lock = threading.Lock()
@@ -6345,7 +6349,6 @@ def _incremental_albums_index_snapshot(
 
     # Merge with previous rows (everything except affected albums)
     merged_rows = []
-    by_id = {str(row.get('albumId', '')): row for row in prev_rows if isinstance(row, dict)}
 
     # Keep all non-affected rows
     for row in prev_rows:
@@ -6376,10 +6379,6 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
-
-    # Get affected IDs from context if not provided (used during incremental build jobs)
-    if affected_album_ids is None:
-        affected_album_ids = _CTX.get('dirty_albums_ids')
 
     # Try incremental if affected IDs provided
     if affected_album_ids:
@@ -7099,10 +7098,6 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     snapshot = None
     previous_manifest = _load_people_index_manifest(key)
 
-    # Get affected IDs from context if not provided (used during incremental build jobs)
-    if affected_person_ids is None:
-        affected_person_ids = _CTX.get('dirty_people_ids')
-
     # Try incremental with affected IDs first
     if affected_person_ids and len(affected_person_ids) <= 100:
         prev = _load_people_index_blob(key)
@@ -7306,6 +7301,8 @@ def prime_all_user_indexes_sequentially(
     on_progress: Optional[Callable[[Dict[str, bool], bool], None]] = None,
     wait: bool = False,
     kinds: Optional[Sequence[str]] = None,
+    affected_person_ids: Optional[set] = None,
+    affected_album_ids: Optional[set] = None,
 ) -> List[str]:
     """Returns (wait=True) the kinds whose build raised or produced nothing, else [].
 
@@ -7338,7 +7335,15 @@ def prime_all_user_indexes_sequentially(
     doesn't stall the others (--threads 4), and the liveness probe runs on an
     independent sidecar port, so this doesn't reintroduce the thread-
     starvation issue --timeout 600 / the frontend's 600s client timeout were
-    already sized to cover a full cold-account build."""
+    already sized to cover a full cold-account build.
+
+    affected_person_ids / affected_album_ids (optional): passed straight
+    through to refresh_user_people_index / refresh_user_albums_index so a
+    caller that already knows exactly which rows changed (e.g. a dirty-set
+    from a bulk merge/delete) gets an incremental rebuild instead of a full
+    scan. Passed as explicit arguments rather than through module-level
+    state, since this function's caller may run concurrently with another
+    user's (or another job's) build in the same process."""
     key = str(user_id or '').strip()
     failed: List[str] = []
     if not key:
@@ -7403,8 +7408,13 @@ def prime_all_user_indexes_sequentially(
                 if not kind_lock.acquire(blocking=False):
                     continue
                 try:
+                    extra_kwargs: Dict[str, object] = {}
+                    if kind == 'people' and affected_person_ids:
+                        extra_kwargs['affected_person_ids'] = affected_person_ids
+                    elif kind == 'albums' and affected_album_ids:
+                        extra_kwargs['affected_album_ids'] = affected_album_ids
                     with perf_instrumentation.step(f'index.prime.{kind}', user=key):
-                        result = refresh_fn(key, source_version=source_version)
+                        result = refresh_fn(key, source_version=source_version, **extra_kwargs)
                     if result is None and kind in ('albums', 'people'):
                         failed.append(kind)
                         _LOGGER.error('Index priming produced no %s index user=%s', kind, key)
