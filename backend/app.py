@@ -8544,7 +8544,11 @@ def _save_album_entity(entity: Dict) -> None:
     # add/remove photos, share/revoke, autocreate) already runs through -- see
     # routes/albums.py -- so hooking the albums index's dirty-marking in here
     # once covers all of them without scattering the call across every route.
-    touch_user_albums_index_state(str(entity.get('PartitionKey') or ''))
+    partition_key = str(entity.get('PartitionKey') or '')
+    touch_user_albums_index_state(partition_key)
+    row_key = str(entity.get('RowKey') or '')
+    if row_key:
+        mark_albums_dirty(partition_key, [row_key])
 
 
 def _store_album_token_index(token: str, user_id: str, album_id: str) -> None:
@@ -8596,6 +8600,7 @@ def _hard_delete_album_now(user_id: str, album_id: str, existing: Optional[Dict]
     # Unlike every other mutation (see _save_album_entity), a hard delete
     # never upserts the row, so it needs its own dirty-marking call.
     touch_user_albums_index_state(user_id)
+    mark_albums_dirty(user_id, [album_id])
     return True
 
 

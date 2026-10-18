@@ -648,6 +648,7 @@ def delete_person_cluster(person_id: str):
     result = app._delete_person_cluster(user_id, person_id)
     if not result.get('deleted'):
         return app.jsonify({'error': 'person not found'}), 404
+    app.mark_people_dirty(user_id, [person_id])
     # The table-client wrapper marks the People manifest dirty, but serving
     # roles cannot rebuild it themselves. Queue the narrow people/albums job
     # now instead of waiting for a later page read to request a full rebuild.
@@ -688,6 +689,7 @@ def delete_person_clusters():
 
     metadata_rebuild = app._rebuild_metadata_faces_for_filenames(user_id, affected_filenames)
     if deleted_person_ids:
+        app.mark_people_dirty(user_id, deleted_person_ids)
         # One coalesced trigger for the whole request. Large batches must not
         # enqueue one index job per cluster.
         try:
@@ -718,6 +720,7 @@ def merge_persons(person_id: str):
     if core is None:
         return app.jsonify({'error': 'base person not found'}), 404
     merge_id = core['mergeId']
+    app.mark_people_dirty(user_id, [person_id, *merge_ids])
     try:
         app.touch_user_people_index_state(user_id)
     except Exception:
@@ -783,6 +786,7 @@ def merge_persons_batch():
     results = []
     named_target_ids: app.List[str] = []
     seen_targets = set()
+    dirty_person_ids: set = set()
     # One face-ownership snapshot for the whole batch (every merge's own writes invalidate the
     # shared cache, which would otherwise force a full face-table rescan per pair).
     face_summary = app._load_user_face_summary_by_id(user_id)
@@ -797,6 +801,8 @@ def merge_persons_batch():
             results.append({'targetPersonId': target_id, 'success': False, 'error': 'base person not found'})
             continue
         results.append({'targetPersonId': target_id, 'success': True, 'mergeId': core['mergeId']})
+        dirty_person_ids.add(target_id)
+        dirty_person_ids.update(source_ids)
         if target_id not in seen_targets and app._person_is_named(user_id, target_id):
             seen_targets.add(target_id)
             named_target_ids.append(target_id)
@@ -818,6 +824,7 @@ def merge_persons_batch():
                     app.app.logger.exception('Identity propagation after batch merge failed for %s', target_id)
 
     if any(result.get('success') for result in results):
+        app.mark_people_dirty(user_id, list(dirty_person_ids))
         try:
             app.touch_user_people_index_state(user_id)
         except Exception:
