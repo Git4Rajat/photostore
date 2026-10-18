@@ -210,19 +210,81 @@ def tools_flush_cluster_batch():
 
 @tools_bp.route('/api/tools/indexes/status', methods=['GET'])
 def tools_indexes_status():
-    # Read-only poll target. Readiness comes from the manifest blobs; `building`
-    # from the shared index_build job row (cross-replica, unlike the old
-    # per-process prime lock).
+    # Read-only poll target. Returns detailed per-index status and current build status.
+    # Readiness comes from manifest blobs; building status from shared index_build job row.
     user_id, error = app._require_user_id()
     if error:
         return error
-    indexes = app.get_user_index_readiness(user_id)
-    ready = all(indexes.values())
-    return jsonify_status(ready, indexes, app._index_build_job_active(user_id))
+
+    # Enhanced status with per-index details
+    status = app.storage_utils_module.get_user_index_status_detailed(user_id)
+
+    # Add current build status if one is in progress
+    building_job = None
+    if app._index_build_job_active(user_id):
+        job_row = app._get_job_row(user_id, app._index_build_job_id(user_id))
+        if job_row:
+            scope = str(job_row.get('indexScope') or 'full').lower()
+            started_at = job_row.get('Timestamp')  # Table Storage auto-timestamp
+            building_job = {
+                'scope': scope,
+                'started_at': started_at,
+            }
+
+    result = {
+        'ready': status['ready'],
+        'needs_rebuild': status['needs_rebuild'],
+        'indexes': status['indexes'],
+        'building': building_job is not None,
+    }
+    if building_job:
+        result['building_job'] = building_job
+
+    return app.jsonify(result)
 
 
 def jsonify_status(ready, indexes, building):
     return app.jsonify({'ready': ready, 'building': bool(building), 'indexes': indexes})
+
+
+@tools_bp.route('/api/tools/indexes/rebuild/<index_kind>', methods=['POST'])
+def tools_rebuild_index(index_kind: str):
+    """Manually trigger a rebuild for a specific index type.
+    Scopes: sort/lexical (light), albums/people (people), all (full)."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    kind = str(index_kind or '').strip().lower()
+    if kind not in ('sort', 'lexical', 'albums', 'people', 'all'):
+        return app.jsonify({'error': 'invalid index_kind'}), 400
+
+    # Map index kinds to build scopes
+    scope_map = {
+        'sort': 'light',     # light scope rebuilds sort + access
+        'lexical': 'light',
+        'albums': 'people',  # people scope rebuilds albums + people
+        'people': 'people',
+        'all': 'full',       # full scope rebuilds everything
+    }
+    scope = scope_map.get(kind, 'full')
+
+    # Enqueue the build
+    outcome = app.enqueue_index_build(
+        user_id,
+        reason=f'user-rebuild-{kind}',
+        scope=scope,
+        force=True,  # User explicitly requested rebuild
+    )
+
+    # Return current status
+    status = app.storage_utils_module.get_user_index_status_detailed(user_id)
+    return app.jsonify({
+        'ok': outcome != 'unavailable',
+        'queued': outcome in ('queued', 'already_active'),
+        'status': outcome,
+        'indexes': status['indexes'],
+    }), 202 if outcome in ('queued', 'already_active') else 200
 
 
 # Moved from routes/system.py (APP_ROLE=core) 2026-10-01: polled

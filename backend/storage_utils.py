@@ -7352,6 +7352,38 @@ def get_user_index_build_state(user_id: str) -> Dict[str, object]:
     return {'ready': all(indexes.values()), 'needs_rebuild': needs_rebuild, 'indexes': indexes}
 
 
+def get_user_index_status_detailed(user_id: str) -> Dict[str, object]:
+    """Enhanced index status with per-index details: {ready, indexes, needs_rebuild}.
+    Each index entry includes: {ready, dirty, updated_at, schema_version}."""
+    key = str(user_id or '').strip()
+    indexes_detail: Dict[str, Dict[str, object]] = {}
+    ready_all = True
+    needs_rebuild = False
+
+    for kind, loader in _index_manifest_loaders().items():
+        manifest = loader(key) if key else {}
+        built = bool(str(manifest.get('sourceVersion') or '').strip())
+        dirty = bool(manifest.get('dirty')) if manifest else False
+        updated_at = manifest.get('updatedAt') or manifest.get('sourceVersion') if manifest else None
+
+        indexes_detail[kind] = {
+            'ready': built,
+            'dirty': dirty,
+            'updated_at': updated_at,
+        }
+
+        if not built:
+            ready_all = False
+        if not built or dirty:
+            needs_rebuild = True
+
+    return {
+        'ready': ready_all,
+        'needs_rebuild': needs_rebuild,
+        'indexes': indexes_detail,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Explore summary (Places + Things for the Explore page)
 #
