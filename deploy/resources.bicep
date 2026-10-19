@@ -1553,6 +1553,11 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
   }
   properties: {
     managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      secrets: [
+        { name: 'session-secret', value: sessionSecret }
+      ]
+    }
     template: {
       containers: [
         {
@@ -1647,6 +1652,7 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // via a direct service-to-service POST authenticated with a session
             // token it mints itself (SESSION_SECRET is shared across all
             // roles). See _trigger_tools_index_rebuild in backend/app.py.
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
             { name: 'INDEXER_INTERNAL_URL', value: 'https://${indexer.properties.configuration.ingress.fqdn}' }
           ])
         }
