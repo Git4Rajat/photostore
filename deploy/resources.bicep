@@ -1249,8 +1249,14 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'upload'
           image: coreImage
           resources: {
-            cpu: json('0.75')
-            memory: '1.5Gi'
+            // Right-sized 2026-10-19 from observed usage: sustained peaks
+            // ~30-40% of the old 0.75 vCPU / 1.5Gi allocation, memory peak
+            // 424MB (22% of 1.5Gi). The one 96% CPU spike seen (one-minute
+            // SHA-256 hash of a large RAW file during dedup check) will
+            // throttle slightly at 0.5 vCPU, but that only slows one hash
+            // op by a few seconds -- not worth 50% more idle-replica cost.
+            cpu: json('0.5')
+            memory: '1Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'upload' }
@@ -1483,6 +1489,13 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
                 accountName: storageAccountName
                 queueName: 'photostore-clustering'
                 queueLength: '1'
+                // Defensive, mirroring library-ops-queue's fix below: nothing
+                // sends a deliberately-delayed message here today, but a
+                // future self-rescheduling batch trigger (e.g. the planned
+                // "N faces or N minutes" cluster-batch check) would hit the
+                // exact same false-wake bug if this is left on the KEDA
+                // default ('all', which counts invisible/delayed messages).
+                queueLengthStrategy: 'visibleonly'
               }
               identity: 'system'
             }
@@ -1499,6 +1512,20 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
                 accountName: storageAccountName
                 queueName: 'photostore-library-ops'
                 queueLength: '1'
+                // _queue_ipwork_release_check (backend/app.py) deliberately
+                // delays its self-rescheduling "is upload quiet yet?" message
+                // with visibility_timeout=IPWORK_RELEASE_IDLE_SECONDS so it
+                // isn't receivable until that window elapses. The KEDA
+                // default strategy ('all') counts that message anyway via
+                // Azure's approximate-message-count, which includes
+                // not-yet-visible messages -- so this rule was scaling the
+                // cluster app up for the ENTIRE duration of every upload,
+                // not just when real library-ops work existed. 'visibleonly'
+                // (same fix as ipwork-queue above) makes KEDA ignore the
+                // delayed message until it's actually receivable, so cluster
+                // only wakes for the ~instant it takes to re-send the check
+                // every IPWORK_RELEASE_IDLE_SECONDS, not continuously.
+                queueLengthStrategy: 'visibleonly'
               }
               identity: 'system'
             }
