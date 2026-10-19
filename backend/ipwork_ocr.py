@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import glob
 import os
+import queue
 import threading
 from typing import Dict, Optional
 
@@ -77,6 +78,17 @@ _TESSDATA_PATH = _resolve_tessdata_path()
 # doesn't have the corpus on hand to run.
 OCR_MIN_WORD_CONFIDENCE = float(os.getenv('OCR_MIN_WORD_CONFIDENCE', '40'))
 
+# Confirmed in production (2026-10-19): a single image hit the ipworker task
+# watchdog's hard 120s ceiling on 4 independent, separately-dequeued attempts,
+# always within ~10ms of exactly 120s -- libtesseract's Recognize() hung
+# inside its C++ core with no cooperative-cancellation API, and since the
+# watchdog's recovery is "kill the whole worker process, let the message
+# redeliver," the same poison image re-hung every time and blocked the
+# entire queue behind it indefinitely (2,368 backlogged messages observed).
+# This bounds just the one call, well under that outer ceiling, so a hang
+# fails this one photo's OCR step instead of the whole task/queue.
+OCR_CALL_TIMEOUT_SECONDS = float(os.getenv('OCR_CALL_TIMEOUT_SECONDS', '30'))
+
 _thread_local = threading.local()
 
 
@@ -114,36 +126,75 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
     return image_bytes
 
 
+def _recognize(image, outcome: 'queue.Queue') -> None:
+    """Runs on its own daemon thread (see process_ocr) so a hang inside
+    libtesseract's C++ core can be bounded. Puts exactly one
+    (status, payload) pair on `outcome`; never raises out to the thread
+    boundary since there's nothing on the other end to catch it once the
+    caller has given up waiting."""
+    try:
+        api = _get_api()
+        api.SetImage(image)
+        if not api.Recognize():
+            outcome.put(('error', RuntimeError('OCR recognition failed')))
+            return
+        iterator = api.GetIterator()
+        if iterator is None:
+            outcome.put(('error', RuntimeError('OCR result iterator unavailable')))
+            return
+        word_confidences = []
+        level = tesserocr.RIL.WORD
+        while True:
+            # MapWordConfidences reads empty layout entries as words and
+            # raises "No text returned" on valid text-free images.
+            if not iterator.Empty(level):
+                word_confidences.append((iterator.GetUTF8Text(level), iterator.Confidence(level)))
+            if not iterator.Next(level):
+                break
+        outcome.put(('ok', word_confidences))
+    except Exception as exc:
+        outcome.put(('error', exc))
+
+
 def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
     if tesserocr is None:
         return {'hasData': False, 'error': 'tesserocr_unavailable', 'errorCode': 'tesserocr_unavailable'}
     error_code = 'ocr_decode_failed'
+    context = rgb_image(image_bytes, filename, _decodable_image_bytes)
     try:
-        with rgb_image(image_bytes, filename, _decodable_image_bytes) as image:
-            error_code = 'ocr_engine_failed'
-            # Phone photos are commonly stored with an EXIF orientation tag
-            # rather than physically rotated pixels (confirmed against real
-            # photos during face-pipeline validation -- see ipwork_face.py);
-            # without correcting for it, OCR would read sideways/upside-down
-            # text on any photo with a non-default orientation.
-            api = _get_api()
-            api.SetImage(image)
-            if not api.Recognize():
-                raise RuntimeError('OCR recognition failed')
-            iterator = api.GetIterator()
-            if iterator is None:
-                raise RuntimeError('OCR result iterator unavailable')
-            word_confidences = []
-            level = tesserocr.RIL.WORD
-            while True:
-                # MapWordConfidences reads empty layout entries as words and
-                # raises "No text returned" on valid text-free images.
-                if not iterator.Empty(level):
-                    word_confidences.append((iterator.GetUTF8Text(level), iterator.Confidence(level)))
-                if not iterator.Next(level):
-                    break
+        image = context.__enter__()
     except Exception as exc:
         return {'hasData': False, 'error': str(exc), 'errorCode': error_code}
+    error_code = 'ocr_engine_failed'
+    # Phone photos are commonly stored with an EXIF orientation tag rather
+    # than physically rotated pixels (confirmed against real photos during
+    # face-pipeline validation -- see ipwork_face.py); without correcting
+    # for it, OCR would read sideways/upside-down text on any photo with a
+    # non-default orientation. exif_transpose already applied inside
+    # rgb_image()/_decode(), same as before this function was restructured.
+    outcome: 'queue.Queue' = queue.Queue(maxsize=1)
+    worker = threading.Thread(target=_recognize, args=(image, outcome), daemon=True)
+    worker.start()
+    try:
+        status, payload = outcome.get(timeout=OCR_CALL_TIMEOUT_SECONDS)
+    except queue.Empty:
+        # Recognize() never returned within budget. tesserocr/libtesseract
+        # has no cooperative-cancellation API, so `worker` is abandoned, not
+        # joined or killed -- it leaks until the hang resolves or the
+        # process exits. Deliberately skips context.__exit__() (which would
+        # call image.close()): SetImage() may still hold a live reference
+        # into that image from inside the stuck call, and closing it out
+        # from under an abandoned thread risks a use-after-free crash in
+        # native code instead of a clean, contained timeout. Leaking one
+        # image's memory for a rare poison photo is the safer trade.
+        return {'hasData': False, 'error': f'OCR recognition exceeded {OCR_CALL_TIMEOUT_SECONDS}s', 'errorCode': 'ocr_timeout'}
+    try:
+        context.__exit__(None, None, None)
+    except Exception:
+        pass
+    if status == 'error':
+        return {'hasData': False, 'error': str(payload), 'errorCode': error_code}
+    word_confidences = payload
     # Word-level confidences (not full-page GetUTF8Text()) so low-confidence
     # words -- texture/grain tesseract hallucinated as "text", the dominant
     # false-positive mode documented in docs/ipworker-architecture.md's PSM

@@ -210,6 +210,59 @@ def test_process_ocr_calls_recognize_before_reading_confidences(monkeypatch):
     assert calls == ['SetImage', 'Recognize', 'GetIterator']
 
 
+def test_process_ocr_times_out_a_hung_recognize_without_closing_the_image(monkeypatch):
+    """Confirmed live (2026-10-19): one image hung Recognize() inside
+    libtesseract's C++ core on 4 independent attempts, each only resolved by
+    the outer ipworker task watchdog killing the whole worker process --
+    redelivering the same poison message forever and blocking the entire
+    queue behind it. This is the fix: process_ocr must give up on its own,
+    well under that outer ceiling, and must NOT close the image out from
+    under the still-running (abandoned) worker thread."""
+    jpeg_bytes = _make_jpeg_bytes()
+    monkeypatch.setattr(ipwork_ocr, 'OCR_CALL_TIMEOUT_SECONDS', 0.05)
+    release = threading.Event()
+    closed = threading.Event()
+
+    class HangingApi:
+        def SetImage(self, image):
+            pass
+
+        def Recognize(self):
+            release.wait(timeout=5)  # Simulates the real hang; bounded so the test can't actually wedge.
+            return True
+
+        def GetIterator(self):
+            return _WordIterator([('REAL', 95.0)])
+
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(RIL=SimpleNamespace(WORD=3)))
+    monkeypatch.setattr(ipwork_ocr, '_get_api', lambda: HangingApi())
+
+    real_context = ipwork_ocr.rgb_image
+
+    def tracking_context(*args, **kwargs):
+        cm = real_context(*args, **kwargs)
+        image = cm.__enter__()
+        original_close = image.close
+        def tracked_close():
+            closed.set()
+            original_close()
+        image.close = tracked_close
+        class _Ctx:
+            def __enter__(self):
+                return image
+            def __exit__(self, *exc):
+                return cm.__exit__(*exc)
+        return _Ctx()
+
+    monkeypatch.setattr(ipwork_ocr, 'rgb_image', tracking_context)
+
+    result = ipwork_ocr.process_ocr('owner', 'photo.jpg', jpeg_bytes)
+
+    assert result == {'hasData': False, 'error': 'OCR recognition exceeded 0.05s', 'errorCode': 'ocr_timeout'}
+    assert not closed.is_set(), 'image must not be closed while the abandoned worker thread may still reference it'
+    release.set()  # Let the simulated hang resolve so the background thread doesn't outlive the test.
+
+
 def test_resolve_tessdata_path_prefers_env_override(monkeypatch):
     monkeypatch.setenv('TESSDATA_PREFIX', '/custom/tessdata')
     assert ipwork_ocr._resolve_tessdata_path() == '/custom/tessdata'

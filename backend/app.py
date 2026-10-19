@@ -1801,6 +1801,22 @@ def create_filename_owners_table() -> None:
         pass
 
 
+def create_people_dirty_set_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=PEOPLE_DIRTY_SET_TABLE)
+    except AzureError:
+        pass
+
+
+def create_albums_dirty_set_table() -> None:
+    try:
+        svc = _ensure_table_service_client()
+        svc.create_table_if_not_exists(table_name=ALBUMS_DIRTY_SET_TABLE)
+    except AzureError:
+        pass
+
+
 def create_blob_containers() -> None:
     if blob_service_client is None:
         return
@@ -16742,7 +16758,7 @@ def _remove_file_quietly(path: str) -> None:
 
 
 # Guard other optional startup helpers to avoid import-time failures
-for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_face_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table', 'create_trash_index_table'):
+for _fn in ('create_blob_containers', 'create_metadata_table', 'create_embeddings_table', 'create_face_embeddings_table', 'create_search_index_dirty_table', 'create_albums_table', 'create_album_token_index_table', 'create_face_table', 'create_person_table', 'create_merge_table', 'create_jobs_table', 'create_workbench_actions_table', 'create_image_names_table', 'create_hash_index_table', 'create_filename_owners_table', 'create_trash_index_table', 'create_people_dirty_set_table', 'create_albums_dirty_set_table'):
     if _fn in globals() and callable(globals().get(_fn)):
         try:
             globals().get(_fn)()
