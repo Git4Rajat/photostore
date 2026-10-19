@@ -235,9 +235,15 @@ def _normalize_preview_bytes(image_bytes: bytes) -> Optional[bytes]:
     if not image_bytes:
         return None
     try:
+        # image.verify() only checks the container structure, not the scan
+        # data -- a byte-scanned candidate whose SOI/EOI markers bracket a
+        # truncated or otherwise corrupt JPEG stream can pass verify() and
+        # still fail (or partially fail) to decode, rendering as correct
+        # rows followed by solid green/olive blocks where data runs out.
+        # load() forces a full pixel decode so a truncated candidate is
+        # rejected here instead of being shipped to the client.
         with Image.open(io.BytesIO(image_bytes)) as image:
-            image.verify()
-        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.load()
             if image.format == 'JPEG':
                 return image_bytes
             return _encode_preview_jpeg(image)

@@ -68,16 +68,37 @@ test('returns busy fallback instead of growing an unbounded queue', async () => 
     expect(await queued).toEqual({status: 'fallback', reason: 'disposed'});
 });
 
-test('each decoder gets its own timeout after queue admission', async () => {
+test('each decoder gets its own timeout after queue admission, retrying once before falling back', async () => {
     const service = new UploadAssetPreparer(factory, 4, 100);
     const active = service.prepare(new File(['raw'], 'a.CR3'));
     const queued = service.prepare(new File(['raw'], 'b.CR3'));
     await vi.advanceTimersByTimeAsync(100);
+    expect(factory).toHaveBeenCalledTimes(2); // first attempt + one retry, both still for a.CR3
+    await vi.advanceTimersByTimeAsync(100);
     expect(await active).toEqual({status: 'fallback', reason: 'timeout', failureReason: 'generation_timeout'});
-    expect(factory).toHaveBeenCalledTimes(2);
-    complete(1);
+    expect(factory).toHaveBeenCalledTimes(3); // b.CR3 only starts once a.CR3's retry also times out
+    complete(2);
     expect((await queued).status).toBe('generated');
     expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
+    service.dispose();
+});
+
+test('does not retry a worker-reported decode failure, only timeout/worker-error', async () => {
+    const service = new UploadAssetPreparer(factory);
+    const pending = service.prepare(new File(['raw'], 'a.CR3'));
+    complete(0, {status: 'failed', error: 'Unsupported file format or not RAW file'});
+    expect(await pending).toMatchObject({status: 'fallback', reason: 'generation_failed', failureReason: 'unsupported_raw'});
+    expect(factory).toHaveBeenCalledTimes(1);
+    service.dispose();
+});
+
+test('retries once on a worker error before falling back', async () => {
+    const service = new UploadAssetPreparer(factory);
+    const pending = service.prepare(new File(['raw'], 'a.CR3'));
+    workers[0].onerror?.call(workers[0], {} as ErrorEvent);
+    expect(factory).toHaveBeenCalledTimes(2);
+    complete(1);
+    expect((await pending).status).toBe('generated');
     service.dispose();
 });
 

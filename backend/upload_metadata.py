@@ -19,7 +19,7 @@ KINDS = {'tiff-ifd-ranges', 'ciff-directory-ranges', 'raf-header-jpeg-metadata-d
 QUALIFIED_EXTENSIONS = {'.arw', '.cr2', '.cr3', '.dng', '.erf', '.gpr', '.mos', '.mrw',
                         '.nef', '.pef', '.raf', '.rw2', '.rwl', '.3fr', '.jpg', '.jpeg',
                         '.crw', '.fff', '.iiq', '.nrw', '.orf', '.ori', '.raw', '.srw',
-                        '.tif', '.tiff', '.sti', '.x3f', '.mef', '.heic', '.heif', '.hif', '.png', '.webp', '.dcr', '.kdc'}
+                        '.tif', '.tiff', '.sti', '.lri', '.x3f', '.mef', '.heic', '.heif', '.hif', '.png', '.webp', '.dcr', '.kdc'}
 
 
 def _verified_source_warning_profile(filename, exif):

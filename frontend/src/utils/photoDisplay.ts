@@ -1,8 +1,13 @@
+// .ari (ARRIRAW), .gpr (GoPro VC-5), and .lri (Light L16) are deliberately excluded:
+// LibRaw has no decoder for .ari/.lri at all, and the bundled WASM build only ships
+// a stub VC-5 decoder for .gpr (the real one requires GoPro's non-free gpr_sdk) --
+// all three always fail decoder.open()/unpack(), so listing them here only costs
+// every upload a guaranteed-failed browser attempt before falling back to the backend.
 export const SUPPORTED_RAW_EXTENSIONS = [
-    '3fr', 'ari', 'arw', 'bay', 'cap', 'cr2', 'cr3', 'crw', 'dcr',
-    'dcs', 'dng', 'drf', 'eip', 'erf', 'fff', 'gpr', 'iiq', 'k25', 'kdc',
-    'lri', 'mdc', 'mef', 'mos', 'mrw', 'nef', 'nrw', 'orf', 'ori', 'pef', 'ptx', 'pxn',
-    'raf', 'raw', 'rw2', 'rwl', 'rwz', 'sr2', 'srf', 'srw', 'sti', 'x3f',
+    '3fr', 'arw', 'bay', 'cap', 'cr2', 'cr3', 'crw', 'dcr',
+    'dcs', 'dng', 'drf', 'eip', 'erf', 'fff', 'iiq', 'k25', 'kdc',
+    'mdc', 'mef', 'mos', 'mrw', 'nef', 'nrw', 'orf', 'ori', 'pef', 'ptx', 'pxn',
+    'raf', 'raw', 'rw2', 'rwl', 'rwz', 'sr2', 'srf', 'srw', 'sti', 'tif', 'tiff', 'x3f',
 ] as const;
 
 export const SUPPORTED_VIDEO_EXTENSIONS = [
