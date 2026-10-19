@@ -33,12 +33,27 @@ const createPreparationWorker: WorkerFactory = (raw, heif = false) => raw
 // The caller starts this only after dedup/init, without awaiting it in a transfer lane.
 export class UploadAssetPreparer {
     private queue: Job[] = [];
-    private active: Job | null = null;
+    private active = new Set<Job>();
     private disposed = false;
-    constructor(private workerFactory: WorkerFactory = createPreparationWorker, private maxQueued = 4, private timeoutMs = 30_000) {}
+    // Previously only one decoder ran at a time, so in a large batch a file near
+    // the back of the queue could burn most of its own 30s budget just waiting
+    // for its turn -- not because it, or its format, was slow. Running a small
+    // number of decoders concurrently cuts that queue wait roughly proportionally,
+    // leaving each job more of its budget for actual decode time. Kept modest
+    // (not scaled to hardwareConcurrency) because each RAW/HEIC decode is a
+    // memory-heavy WASM instance, and mobile Safari has tighter per-tab memory
+    // limits than desktop.
+    constructor(
+        private workerFactory: WorkerFactory = createPreparationWorker, private maxQueued = 4,
+        private timeoutMs = 30_000, private maxActive = 2,
+    ) {}
 
     prepare(file: File, options: PreparationOptions = {}): Promise<UploadPreparationResult> {
-        if (this.disposed || options.signal?.aborted || this.queue.length >= this.maxQueued) {
+        // maxQueued bounds work waiting for a slot, not total in-flight capacity --
+        // active jobs no longer always number exactly 1, so the busy check has to
+        // account for maxActive too or a concurrency bump silently raises how much
+        // work callers can queue up beyond what they sized their admission gate for.
+        if (this.disposed || options.signal?.aborted || this.active.size + this.queue.length >= this.maxActive + this.maxQueued) {
             return Promise.resolve({status: 'fallback', reason: this.disposed ? 'disposed' : options.signal?.aborted ? 'aborted' : 'busy'});
         }
         return new Promise(resolve => {
@@ -52,7 +67,7 @@ export class UploadAssetPreparer {
 
     dispose(): void {
         this.disposed = true;
-        for (const job of [...this.queue, ...(this.active ? [this.active] : [])]) this.finish(job, {status: 'fallback', reason: 'disposed'});
+        for (const job of [...this.queue, ...Array.from(this.active)]) this.finish(job, {status: 'fallback', reason: 'disposed'});
     }
 
     private finish(job: Job, result: UploadPreparationResult): void {
@@ -63,16 +78,18 @@ export class UploadAssetPreparer {
         job.worker?.terminate();
         job.controller.abort();
         this.queue = this.queue.filter(item => item !== job);
-        if (this.active === job) this.active = null;
+        this.active.delete(job);
         job.resolve(result);
         this.pump();
     }
 
     private pump(): void {
-        if (this.disposed || this.active || !this.queue.length) return;
-        const job = this.queue.shift()!;
-        this.active = job;
-        this.runJob(job);
+        if (this.disposed) return;
+        while (this.active.size < this.maxActive && this.queue.length) {
+            const job = this.queue.shift()!;
+            this.active.add(job);
+            this.runJob(job);
+        }
     }
 
     // Retries exactly once, only for failure reasons that plausibly stem from

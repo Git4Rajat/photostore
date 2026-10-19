@@ -23,8 +23,8 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-test('serializes decoding and starts the next file after completion', async () => {
-    const service = new UploadAssetPreparer(factory);
+test('with maxActive=1, serializes decoding and starts the next file after completion', async () => {
+    const service = new UploadAssetPreparer(factory, 4, 30_000, 1);
     const first = service.prepare(new File(['raw'], 'a.CR3'));
     const second = service.prepare(new File(['jpeg'], 'b.jpg'));
     expect(factory).toHaveBeenCalledTimes(1);
@@ -36,6 +36,23 @@ test('serializes decoding and starts the next file after completion', async () =
     expect((await first).status).toBe('generated');
     expect((await second).status).toBe('generated');
     expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
+    service.dispose();
+});
+
+test('by default, runs more than one decoder concurrently instead of fully serializing', async () => {
+    const service = new UploadAssetPreparer(factory);
+    const first = service.prepare(new File(['raw'], 'a.CR3'));
+    const second = service.prepare(new File(['raw'], 'b.CR3'));
+    const third = service.prepare(new File(['raw'], 'c.CR3'));
+    // First two dispatch immediately side by side; the third waits for a free slot.
+    expect(factory).toHaveBeenCalledTimes(2);
+    complete(0);
+    expect(factory).toHaveBeenCalledTimes(3);
+    complete(1);
+    complete(2);
+    expect((await first).status).toBe('generated');
+    expect((await second).status).toBe('generated');
+    expect((await third).status).toBe('generated');
     service.dispose();
 });
 
@@ -59,7 +76,7 @@ test.each(['heic', 'heif', 'hif', 'HIF'])('routes %s to the bounded HEIF worker'
 });
 
 test('returns busy fallback instead of growing an unbounded queue', async () => {
-    const service = new UploadAssetPreparer(factory, 1);
+    const service = new UploadAssetPreparer(factory, 1, 30_000, 1);
     const active = service.prepare(new File(['raw'], 'a.CR3'));
     const queued = service.prepare(new File(['raw'], 'b.CR3'));
     expect(await service.prepare(new File(['raw'], 'c.CR3'))).toEqual({status: 'fallback', reason: 'busy'});
@@ -69,7 +86,7 @@ test('returns busy fallback instead of growing an unbounded queue', async () => 
 });
 
 test('each decoder gets its own timeout after queue admission, retrying once before falling back', async () => {
-    const service = new UploadAssetPreparer(factory, 4, 100);
+    const service = new UploadAssetPreparer(factory, 4, 100, 1);
     const active = service.prepare(new File(['raw'], 'a.CR3'));
     const queued = service.prepare(new File(['raw'], 'b.CR3'));
     await vi.advanceTimersByTimeAsync(100);
