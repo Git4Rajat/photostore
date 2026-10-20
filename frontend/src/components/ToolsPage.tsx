@@ -970,15 +970,11 @@ const ToolsPage: React.FC = () => {
                 }
             }
             setMessage(`Running ${label} on ${plural(filenames.length, 'photo')}…`);
-            // PROCESSING_MODE 'backend'/'both': startBrowserProcessing alone can no
-            // longer (fully) do these steps -- it self-gates every step to a no-op
-            // once processingMode !== 'browser' (see runBrowserProcessing in
-            // PhotoGallery.tsx). Also enqueue real ipworker jobs for exactly this
-            // selection, mirroring what runBrowserActionsOnLibrary already does for
-            // the "entire library" scope. Best-effort: a network failure here
-            // shouldn't block the in-browser run below, which still works
-            // standalone in 'both' mode.
+            // Backend mode queues server work only; both mode also attempts the
+            // browser pass. Queueing is not completion, and enqueue errors must
+            // remain visible even if the browser pass succeeds.
             let ipworkQueued = 0;
+            let backendEnqueueError = '';
             if (processingMode !== 'browser') {
                 try {
                     const ipworkResponse = await postAdmin('/api/admin/ipwork/enqueue', {
@@ -987,18 +983,26 @@ const ToolsPage: React.FC = () => {
                         force: forceRun,
                     });
                     ipworkQueued = Number(ipworkResponse?.queued ?? 0);
+                    if (ipworkQueued > 0) {
+                        requestJobPoll();
+                    }
                 } catch (err) {
-                    setMessage(`Backend enqueue for '${label}' failed: ${String(err)}`);
+                    backendEnqueueError = `Backend enqueue for '${label}' failed: ${String(err)}`;
                 }
             }
-            const processed = await startBrowserProcessing({
+            const processed = processingMode === 'backend' ? 0 : await startBrowserProcessing({
                 actions,
                 filenames,
                 items,
                 force: forceRun,
             });
             const backendNote = ipworkQueued > 0 ? ` ${plural(ipworkQueued, 'photo')} queued to the backend.` : '';
-            setMessage(`Finished ${label}: ${processed} of ${plural(filenames.length, 'photo')} processed in-browser.${backendNote}`);
+            const resultMessage = processingMode === 'backend'
+                ? (ipworkQueued > 0
+                    ? `Queued ${label} for ${plural(ipworkQueued, 'photo')} on the backend. Processing has not finished yet; check processing status for completion.`
+                    : `No photos queued for ${label} on the backend. Check processing status before retrying.`)
+                : `${processed > 0 ? 'Finished' : 'No browser processing completed for'} ${label}: ${processed} of ${plural(filenames.length, 'photo')} processed in-browser.${backendNote}`;
+            setMessage(backendEnqueueError ? `${backendEnqueueError}. ${resultMessage}` : resultMessage);
             await refreshPhotosByFilename(filenames);
             await loadQueueStatus();
             void postTools('/api/tools/workbench/actions', {

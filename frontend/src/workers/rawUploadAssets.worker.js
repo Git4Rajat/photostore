@@ -4,6 +4,27 @@ import { generateUploadPreview, generateUploadThumbnail } from '../utils/uploadD
 
 const clock = () => performance.now();
 
+// Nikon's "High Efficiency"/"High Efficiency*" NEF compression (Z50 II, Z5 II, and any
+// body outside LibRaw's hardcoded allowlist of Z9/Z8/Zf/Z6III) wraps the sensor-data strip
+// in a JPEG-XS codestream (ISO 21122) starting with this SOC+CAP marker. LibRaw-WASM here
+// is built on the same LibRaw as the backend's rawpy/dcraw_emu tiers, which confirmed
+// decoding this as ordinary lossless-compressed data either raises mid-unpack or -- unlike
+// rawpy, which raises cleanly -- silently renders noise with no error at all. Bailing out
+// before decoder.unpack() lets the file fall through to the backend's exiftool-based
+// embedded-preview extraction, which never touches the HE bitstream.
+const NIKON_HE_SOC_MARKER = [0xff, 0x10, 0xff, 0x50];
+
+const containsNikonHeMarker = buffer => {
+  const bytes = new Uint8Array(buffer);
+  outer: for (let i = 0; i <= bytes.length - NIKON_HE_SOC_MARKER.length; i += 1) {
+    for (let j = 0; j < NIKON_HE_SOC_MARKER.length; j += 1) {
+      if (bytes[i + j] !== NIKON_HE_SOC_MARKER[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+};
+
 self.onmessage = async ({ data: { file, maxMegapixels = 120, maxBytes = Infinity } }) => {
   const start = clock();
   const result = { filename: file.name, originalBytes: file.size, source: 'sensor_raw', embeddedAllowed: false };
@@ -13,6 +34,9 @@ self.onmessage = async ({ data: { file, maxMegapixels = 120, maxBytes = Infinity
     const readStart = clock();
     const buffer = await file.arrayBuffer();
     result.readMs = clock() - readStart;
+    if (/\.(nef|nrw)$/i.test(file.name) && containsNikonHeMarker(buffer)) {
+      throw new Error('Unsupported file format: Nikon High Efficiency NEF compression');
+    }
     const initStart = clock();
     await LibRaw.initialize(fetch(wasmUrl));
     result.wasmInitMs = clock() - initStart;

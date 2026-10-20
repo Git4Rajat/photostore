@@ -2199,6 +2199,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         browserProcessingStartInFlightRef.current = true;
         browserProcessingCancelRef.current = false;
         let processedCount = 0;
+        let isAutomaticPull = false;
         try {
             const requestedItems = Array.isArray(options.items) && options.items.length > 0
                 ? Array.from(new Map(options.items
@@ -2216,7 +2217,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     : [];
             const requestedFilenames = requestedItems.map((item) => item.filename);
             const requestedSteps = buildRequestedBrowserProcessingSteps(options.actions);
-            const isAutomaticPull = requestedFilenames.length === 0;
+            isAutomaticPull = requestedFilenames.length === 0;
             // Turbo processes several photos at once; pull enough pending work to
             // keep every concurrent slot fed. Off (concurrency 1) preserves the
             // original one-at-a-time drain exactly.
@@ -2248,6 +2249,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // in that mode, rather than relying solely on that indirect side effect.
             if (isAutomaticPull && getRuntimeConfig().processingMode === 'backend') {
                 keepAliveRef.current?.stop();
+                return 0;
+            }
+            // Explicit workbench runs can also contain only backend-owned or
+            // model-gated steps. Do not create a browser progress notification
+            // (or claim leases) when this browser cannot run any of them.
+            const initialSteps = restrictStepsForModel(
+                restrictStepsForProcessingMode(requestedSteps, getRuntimeConfig().processingMode || 'browser'),
+                browserAiModelStateRef.current.status === 'available',
+            );
+            if (initialSteps && initialSteps.size === 0) {
                 return 0;
             }
             // Note: automatic pulls used to also bail out entirely here whenever the
@@ -2587,14 +2598,24 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     const finalReconciledCount = notificationToFinalize.processedCount
                         + notificationToFinalize.failedCount
                         + notificationToFinalize.skippedCount;
-                    if (finalReconciledCount < notificationToFinalize.totalCount) {
-                        notificationToFinalize.totalCount = finalReconciledCount;
+                    if (finalReconciledCount === 0) {
+                        // A lost lease or eligibility change is not successful
+                        // processing. Keep the result visible without a fake 0/0 bar.
+                        updateNotification(notificationToFinalize.id, {
+                            title: 'No photos processed',
+                            details: 'No photos were processed in this browser. Another processor may hold the work, or the selected steps may not be available here. Check processing status before retrying.',
+                            progress: undefined,
+                        });
+                    } else {
+                        if (finalReconciledCount < notificationToFinalize.totalCount) {
+                            notificationToFinalize.totalCount = finalReconciledCount;
+                        }
+                        syncBrowserProcessingNotification(
+                            notificationToFinalize,
+                            undefined,
+                            'Processing photos finished',
+                        );
                     }
-                    syncBrowserProcessingNotification(
-                        notificationToFinalize,
-                        undefined,
-                        'Processing photos finished',
-                    );
                     if (browserProcessingNotificationRef.current === notificationToFinalize) {
                         browserProcessingNotificationRef.current = null;
                     }
@@ -2604,7 +2625,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             console.warn('Browser processing scheduler failed.', err);
         } finally {
             browserProcessingStartInFlightRef.current = false;
-            const isAutomaticPull = !Array.isArray(options.filenames) || options.filenames.length === 0;
             if (isAutomaticPull && processedCount > 0 && !browserProcessingCancelRef.current) {
                 window.setTimeout(() => {
                     void startBrowserProcessing();

@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+    get: vi.fn(),
     getUpload: vi.fn(),
     postUpload: vi.fn(),
     postTools: vi.fn(),
@@ -17,15 +18,17 @@ const mocks = vi.hoisted(() => ({
     prepared: vi.fn(),
     pollAuthenticated: false,
     jobs: vi.fn(),
+    processingMode: 'backend',
+    runBrowserProcessing: vi.fn(),
 }));
 
-vi.mock('../config/appConfig', () => ({ getRuntimeConfig: () => ({ processingMode: 'backend', browserUploadPreparation: mocks.preparationEnabled }) }));
+vi.mock('../config/appConfig', () => ({ getRuntimeConfig: () => ({ processingMode: mocks.processingMode, browserUploadPreparation: mocks.preparationEnabled }) }));
 vi.mock('../services/uploadPreparationPipeline', () => ({UploadPreparationPipeline: class {
     start = mocks.prepared;
     dispose() {}
 }}));
 vi.mock('../services/apiClient', () => ({
-    get: vi.fn().mockResolvedValue({}),
+    get: mocks.get,
     post: vi.fn().mockResolvedValue({}),
     postTools: mocks.postTools,
     getUpload: mocks.getUpload,
@@ -55,6 +58,7 @@ vi.mock('./PhotoGallery', () => ({
     readBlobArrayBuffer: async (file: File) => new TextEncoder().encode(file.name).buffer,
     sha256ArrayBuffer: async (buffer: ArrayBuffer) => Array.from(new Uint8Array(buffer)).join('-'),
     createBrowserThumbnail: vi.fn().mockResolvedValue(null),
+    runBrowserProcessing: mocks.runBrowserProcessing,
 }));
 vi.mock('@azure/storage-blob', () => ({
     BlockBlobClient: class {
@@ -108,6 +112,9 @@ beforeEach(() => {
     vi.clearAllMocks();
     mocks.preparationEnabled = false;
     mocks.pollAuthenticated = false;
+    mocks.processingMode = 'backend';
+    mocks.get.mockResolvedValue({});
+    mocks.runBrowserProcessing.mockResolvedValue({ clientProcessing: {}, clientProcessingReport: [] });
     mocks.jobs.mockResolvedValue([]);
     mocks.postTools.mockResolvedValue({});
     mocks.prepared.mockResolvedValue({});
@@ -232,6 +239,73 @@ describe('index completion notifications', () => {
         await advance(40000);
         expect(services.notifications.find(n => n.title === 'Server photo processing finished')?.details)
             .toContain('Index updates and people grouping are reported separately');
+    });
+});
+
+describe('browser processing completion notifications', () => {
+    const rerun = { actions: ['thumbnails', 'preview'] as const, items: [{ filename: 'gallery.jpg', rotation: 90 }], force: true };
+    const startRerun = async () => {
+        let processed = -1;
+        await act(async () => {
+            processed = await services.startBrowserProcessing({ ...rerun, actions: [...rerun.actions] });
+        });
+        return processed;
+    };
+
+    it('does not announce browser processing for backend-owned thumbnail and preview reruns', async () => {
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(0);
+        expect(await startRerun()).toBe(0);
+        await advance(16000);
+        expect(services.notifications).toEqual([]);
+        expect(mocks.postUpload).not.toHaveBeenCalled();
+        expect(mocks.runBrowserProcessing).not.toHaveBeenCalled();
+    });
+
+    it('does not announce an AI-only run when the browser model is unavailable', async () => {
+        mocks.processingMode = 'browser';
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(0);
+        await act(async () => {
+            await services.startBrowserProcessing({ filenames: ['gallery.jpg'], actions: ['faces'], force: true });
+        });
+        await advance(16000);
+        expect(services.notifications).toEqual([]);
+        expect(mocks.postUpload).not.toHaveBeenCalled();
+    });
+
+    it('reports a denied lease without claiming that zero photos finished processing', async () => {
+        mocks.processingMode = 'browser';
+        mocks.postUpload.mockResolvedValue({ claimed: false, reason: 'lease_held' });
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(0);
+        expect(await startRerun()).toBe(0);
+        await advance(16000);
+        expect(services.notifications).toHaveLength(1);
+        expect(services.notifications[0]).toMatchObject({ title: 'No photos processed', progress: undefined });
+        expect(services.notifications[0].details).not.toContain('0/0');
+        expect(mocks.runBrowserProcessing).not.toHaveBeenCalled();
+    });
+
+    it('reports a successful forced rerun and does not auto-pull unrelated photos for an items-only request', async () => {
+        mocks.processingMode = 'browser';
+        mocks.get.mockResolvedValue({ url: 'https://images.test/gallery.jpg' });
+        mocks.postUpload.mockResolvedValue({ claimed: true, leaseId: 'browser-lease' });
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(['image'], { type: 'image/jpeg' }) }));
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(0);
+        // Ignore the provider's independent startup queue probe.
+        mocks.getUpload.mockClear();
+        expect(await startRerun()).toBe(1);
+        await advance(16000);
+        expect(services.notifications[0]).toMatchObject({
+            title: 'Processing photos finished', details: 'Processed 1/1 photo.',
+        });
+        expect(mocks.runBrowserProcessing).toHaveBeenCalledTimes(1);
+        expect(mocks.runBrowserProcessing.mock.calls[0][5]).toMatchObject({
+            thumbnailRotationDegrees: 90, requestedSteps: new Set(['thumbnail', 'preview']),
+        });
+        expect(mocks.getUpload.mock.calls.some(([url]) => String(url).startsWith('/upload/processing/pending'))).toBe(false);
     });
 });
 

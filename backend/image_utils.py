@@ -352,6 +352,14 @@ def _run_preview_command(args: list[str]) -> Optional[bytes]:
         )
     except Exception:
         return None
+    # A non-zero exit means the decoder itself flagged a problem (e.g. dcraw_emu
+    # warns "data corrupted" on a RAW format/compression it can't fully decode)
+    # -- whatever it wrote to stdout up to that point can still be a structurally
+    # valid, _normalize_preview_bytes-passing image full of decoded garbage rather
+    # than a clean failure. Confirmed 2026-10-20: Nikon Z50 II/Z5 II "High
+    # Efficiency" NEFs (see _NIKON_HE_SOC_MARKER) hit exactly this.
+    if result.returncode != 0:
+        return None
     return _normalize_preview_bytes(result.stdout)
 
 
@@ -655,6 +663,34 @@ def extract_embedded_jpeg_from_path(path: str, raw_flip: int = 0) -> Optional[by
         return None
 
 
+# Nikon's "High Efficiency"/"High Efficiency*" NEF compression (Z50 II, Z5 II, and
+# any other body outside LibRaw's hardcoded allowlist of Z9/Z8/Zf/Z6III) wraps the
+# sensor-data strip in a JPEG-XS codestream (ISO 21122) starting with this SOC+CAP
+# marker. LibRaw sniffs for the same marker but only honors it on that allowlist --
+# on every other body it misdetects the strip as ordinary lossless-compressed data,
+# which either raises mid-decode (rawpy: confirmed "data corrupted" on real Z50
+# II/Z5 II files) or silently renders noise (dcraw_emu, and the WASM build the
+# browser uses). Detecting it ourselves lets every LibRaw-based tier be skipped in
+# favor of the embedded-JPEG extractors, which read the container's own
+# preview/thumbnail tags and never touch the HE bitstream.
+_NIKON_HE_SOC_MARKER = b'\xff\x10\xff\x50'
+
+
+def _is_nikon_he_nef(ext: str, content: bytes) -> bool:
+    return ext in ('nef', 'nrw') and _NIKON_HE_SOC_MARKER in content
+
+
+def _is_nikon_he_nef_path(path: str) -> bool:
+    ext = path.rsplit('.', 1)[-1].lower() if '.' in path else ''
+    if ext not in ('nef', 'nrw'):
+        return False
+    try:
+        with open(path, 'rb') as file_handle:
+            return _NIKON_HE_SOC_MARKER in file_handle.read()
+    except Exception:
+        return False
+
+
 def extract_raw_preview_from_path(path: str) -> Optional[bytes]:
     # Computed once up front (cheap header-only read) and passed to whichever extractors
     # return sensor-orientation embedded previews/thumbnails; see _RAW_FLIP_TRANSPOSE.
@@ -664,6 +700,7 @@ def extract_raw_preview_from_path(path: str) -> Optional[bytes]:
     # risk a blind correction on.
     raw_flip = _raw_container_flip_from_path(path)
     candidates = []
+    extractors = [(_extract_exiftool_preview_from_path, (path, raw_flip))]
     # rawpy/libraw are structural parsers (they read the container's own IFD/offset
     # tables), so they're tried before the blind byte-scan fallback. The byte scan just
     # hunts for FFD8..FFD9 pairs and picks the largest one that happens to decode -- for
@@ -671,14 +708,17 @@ def extract_raw_preview_from_path(path: str) -> Optional[bytes]:
     # auxiliary frame (e.g. Apple ProRAW's embedded HDR gain map), a stray marker-like
     # byte elsewhere in the file can corrupt the real preview's apparent boundary, and
     # the scanner falls through past dozens of undecodable raw-tile candidates straight
-    # to that small, technically-decodable-but-wrong auxiliary frame.
-    for extractor, args in (
-        (_extract_exiftool_preview_from_path, (path, raw_flip)),
-        (_extract_rawpy_preview_from_path, (path,)),
-        (_extract_libraw_preview_from_path, (path, raw_flip)),
+    # to that small, technically-decodable-but-wrong auxiliary frame. Skipped entirely
+    # for Nikon HE NEFs -- see _NIKON_HE_SOC_MARKER.
+    if not _is_nikon_he_nef_path(path):
+        extractors += [
+            (_extract_rawpy_preview_from_path, (path,)),
+            (_extract_libraw_preview_from_path, (path, raw_flip)),
+        ]
+    for extractor, args in extractors + [
         (extract_embedded_jpeg_from_path, (path, raw_flip)),
         (_extract_ffmpeg_preview_from_path, (path,)),
-    ):
+    ]:
         preview = extractor(*args)
         if _preview_good_enough_for_vision(preview):
             return preview
@@ -758,11 +798,13 @@ def extract_raw_preview_bytes(image_bytes: bytes, filename: str = '') -> Optiona
         return preview
     if preview:
         candidates.append(preview)
-    preview = _extract_rawpy_preview_from_bytes(image_bytes)
-    if _preview_good_enough_for_vision(preview):
-        return preview
-    if preview:
-        candidates.append(preview)
+    ext = filename.rsplit('.', 1)[-1].lower() if filename and '.' in filename else ''
+    if not _is_nikon_he_nef(ext, image_bytes):
+        preview = _extract_rawpy_preview_from_bytes(image_bytes)
+        if _preview_good_enough_for_vision(preview):
+            return preview
+        if preview:
+            candidates.append(preview)
     return _best_preview(candidates)
 
 
