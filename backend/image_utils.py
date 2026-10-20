@@ -454,6 +454,31 @@ def _extract_libraw_preview_from_path(path: str, raw_flip: int = 0) -> Optional[
     return _best_preview(candidates)
 
 
+# Some very recently released camera bodies (confirmed: Sony DSC-RX1R III ARW)
+# aren't yet in LibRaw's per-model active-area table, so raw.sizes.width/height
+# report the full raw sensor readout -- including the opaque/masked calibration
+# border columns/rows outside the photographed area -- instead of the real active
+# image. postprocess() demosaics that border too, and because it's unexposed
+# sensor data (reads near-zero across all three Bayer-filtered channels, with a
+# green bias from the CFA's 2-green-per-2x2-cell ratio), it renders as a solid
+# green band along the image's right/bottom edge. raw.sizes.crop_* is the
+# DNG-style "actually photographed" rect LibRaw does parse correctly even when it
+# doesn't yet know to apply it automatically, so crop to it ourselves whenever
+# it's a strict subset of what postprocess() actually returned.
+def _crop_rawpy_active_area(rgb, raw) -> 'np.ndarray':
+    sizes = raw.sizes
+    left, top = getattr(sizes, 'crop_left_margin', 0), getattr(sizes, 'crop_top_margin', 0)
+    width, height = getattr(sizes, 'crop_width', 0), getattr(sizes, 'crop_height', 0)
+    if width <= 0 or height <= 0:
+        return rgb
+    if left < 0 or top < 0 or left + width > rgb.shape[1] or top + height > rgb.shape[0]:
+        return rgb
+    if left == 0 and top == 0 and width == rgb.shape[1] and height == rgb.shape[0]:
+        return rgb
+    import numpy as np
+    return np.ascontiguousarray(rgb[top:top + height, left:left + width])
+
+
 def _extract_rawpy_preview_from_path(path: str) -> Optional[bytes]:
     try:
         import rawpy
@@ -462,6 +487,7 @@ def _extract_rawpy_preview_from_path(path: str) -> Optional[bytes]:
             if _preview_good_enough_for_vision(preview):
                 return preview
             rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
+            rgb = _crop_rawpy_active_area(rgb, raw)
         return _encode_preview_jpeg(Image.fromarray(rgb))
     except Exception:
         return None
@@ -475,6 +501,7 @@ def _extract_rawpy_preview_from_bytes(image_bytes: bytes) -> Optional[bytes]:
             if _preview_good_enough_for_vision(preview):
                 return preview
             rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
+            rgb = _crop_rawpy_active_area(rgb, raw)
         return _encode_preview_jpeg(Image.fromarray(rgb))
     except Exception:
         return None

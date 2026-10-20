@@ -25,6 +25,17 @@ const containsNikonHeMarker = buffer => {
   return false;
 };
 
+// Camera bodies where this LibRaw-WASM build doesn't expose the active-image crop
+// rect (LibRaw's raw_inset_crop) through its public API -- confirmed: Sony DSC-RX1R
+// III. getActiveWidth/Height, getIWidth/Height, and the margin getters all silently
+// report the full raw sensor readout for these bodies instead of the real
+// photographed area, so decoder.dcrawMakeMemImage() would demosaic (and ship) the
+// sensor's opaque calibration border as a solid green band along the image's
+// right/bottom edge. The backend's rawpy-based fallback reads raw.sizes.crop_* (the
+// same data under a different name) correctly and crops to it -- bail out here and
+// let it handle these bodies instead of shipping a cropped-wrong preview.
+const ACTIVE_AREA_UNKNOWN_MODELS = new Set(['DSC-RX1RM3']);
+
 self.onmessage = async ({ data: { file, maxMegapixels = 120, maxBytes = Infinity } }) => {
   const start = clock();
   const result = { filename: file.name, originalBytes: file.size, source: 'sensor_raw', embeddedAllowed: false };
@@ -62,6 +73,9 @@ self.onmessage = async ({ data: { file, maxMegapixels = 120, maxBytes = Infinity
       focalLength: metadata.focal_len,
       timestamp: typeof metadata.timestamp === 'bigint' ? metadata.timestamp.toString() : metadata.timestamp,
     };
+    if (ACTIVE_AREA_UNKNOWN_MODELS.has(camera.normalized_model || camera.model)) {
+      throw new Error('Unsupported file format: active image area unknown for this camera body');
+    }
     result.openAndMetadataMs = clock() - openStart;
     result.halfSize = Math.max(...result.activeDimensions) >= 4096 ? 1 : 0;
     decoder.setHalfSize(result.halfSize);
