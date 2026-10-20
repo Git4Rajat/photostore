@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
     get: vi.fn(), post: vi.fn(), index: vi.fn(), token: vi.fn(),
+    albumsIndex: vi.fn(),
 }));
 vi.mock('../../services/apiClient', () => ({ get: mocks.get, post: mocks.post }));
 vi.mock('../../services/localSortIndex', () => ({
@@ -19,7 +20,7 @@ vi.mock('../../services/indexBuilding', () => ({ reportIndexBuilding: vi.fn(), o
 vi.mock('../../services/faceService', () => ({ default: {} }));
 vi.mock('../../services/libraryClient', () => ({}));
 vi.mock('../../services/thumbnailAccessCache', () => ({ resolveThumbnailAccessUrls: vi.fn() }));
-vi.mock('../../services/localAlbumsIndex', () => ({ getLocalAlbumsIndex: vi.fn(), invalidateLocalAlbumsIndex: vi.fn() }));
+vi.mock('../../services/localAlbumsIndex', () => ({ getLocalAlbumsIndex: mocks.albumsIndex, invalidateLocalAlbumsIndex: vi.fn() }));
 vi.mock('../../services/localPeopleIndex', () => ({ invalidateLocalPeopleIndex: vi.fn() }));
 vi.mock('../../services/jobNotifications', () => ({ requestJobPoll: vi.fn() }));
 
@@ -42,8 +43,9 @@ describe('index-backed gallery', () => {
         mocks.post.mockReset().mockResolvedValue({ photos: [] });
         mocks.index.mockReset().mockResolvedValue(rows());
         mocks.token.mockReset().mockResolvedValue({ baseUrl: 'https://storage.invalid', sas: 'token' });
+        mocks.albumsIndex.mockReset().mockResolvedValue([]);
     });
-    afterEach(cleanup);
+    afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
     it('loads and scrolls complete tiles without metadata requests', async () => {
         render(<StoreProvider><Probe /></StoreProvider>);
@@ -87,5 +89,87 @@ describe('index-backed gallery', () => {
             liked: true, rotation: 90, thumbnailRotation: 0, tags: ['beach'],
             personIds: ['p1'], processing: { thumbnail: 'done' },
         });
+    });
+
+    it('reuses loaded albums on repeat visits, including an empty list', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        await act(async () => { await store.fetchAlbums(); });
+        expect(store.albumsLoading).toBe(false);
+        await act(async () => { await store.fetchAlbums(); });
+        expect(mocks.albumsIndex).toHaveBeenCalledTimes(1);
+        expect(mocks.get.mock.calls.some(([path]) => path === '/albums')).toBe(false);
+    });
+
+    it('shares overlapping album loads and keeps loaded albums visible during forced refresh', async () => {
+        mocks.albumsIndex.mockResolvedValue([{ albumId: 'a1', name: 'Trip', photoCount: 2 }]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        await act(async () => { await store.fetchAlbums(); });
+        let resolve!: (value: unknown[]) => void;
+        mocks.albumsIndex.mockImplementation(() => new Promise(r => { resolve = r; }));
+        let first!: Promise<void>;
+        let second!: Promise<void>;
+        act(() => { first = store.fetchAlbums(true); second = store.fetchAlbums(); });
+        expect(first).toBe(second);
+        expect(store.albumsLoading).toBe(false);
+        expect(store.albums[0].name).toBe('Trip');
+        await act(async () => { resolve([{ albumId: 'a1', name: 'Renamed', photoCount: 2 }]); await first; });
+        expect(store.albums[0].name).toBe('Renamed');
+        expect(mocks.albumsIndex).toHaveBeenCalledTimes(2);
+    });
+
+    it('refreshes again if invalidation arrives during an in-flight read', async () => {
+        let resolve!: (value: unknown[]) => void;
+        mocks.albumsIndex.mockImplementationOnce(() => new Promise(r => { resolve = r; }))
+            .mockResolvedValue([{ albumId: 'a1', name: 'Latest', photoCount: 1 }]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        let request!: Promise<void>;
+        act(() => { request = store.fetchAlbums(); store.reloadAlbums(); });
+        await act(async () => { resolve([]); await request; });
+        expect(mocks.albumsIndex).toHaveBeenCalledTimes(2);
+        expect(store.albums[0].name).toBe('Latest');
+    });
+
+    it('uses legacy data without repeating cold-index waits on warm refreshes', async () => {
+        mocks.albumsIndex.mockResolvedValue([{ albumId: 'a1', name: 'Trip', photoCount: 2 }]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        await act(async () => { await store.fetchAlbums(); });
+        mocks.albumsIndex.mockClear().mockResolvedValue(null);
+        mocks.get.mockResolvedValue({ albums: [{ id: 'a1', name: 'Legacy', photoCount: 2 }] });
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(mocks.albumsIndex).toHaveBeenCalledTimes(1);
+        expect(store.albums[0].name).toBe('Legacy');
+        await act(async () => { await store.fetchAlbums(); });
+        expect(mocks.albumsIndex).toHaveBeenCalledTimes(1);
+    });
+
+    it('retains cached albums on refresh failure and allows an explicit retry', async () => {
+        mocks.albumsIndex.mockResolvedValue([{ albumId: 'a1', name: 'Trip', photoCount: 2 }]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        await act(async () => { await store.fetchAlbums(); });
+        mocks.albumsIndex.mockResolvedValue(null);
+        mocks.get.mockRejectedValue(new Error('offline'));
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums[0].name).toBe('Trip');
+        expect(store.albumsLoading).toBe(false);
+        mocks.albumsIndex.mockResolvedValue([]);
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums).toEqual([]);
+    });
+
+    it('revalidates an older list in the background after the navigation cache expires', async () => {
+        const now = Date.now();
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        await act(async () => { await store.fetchAlbums(); });
+        clock.mockReturnValue(now + 60001);
+        await act(async () => { await store.fetchAlbums(); });
+        expect(mocks.albumsIndex).toHaveBeenCalledTimes(2);
+        expect(store.albumsLoading).toBe(false);
     });
 });

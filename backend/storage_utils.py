@@ -6124,12 +6124,16 @@ def _load_albums_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
     try:
         payload = blob_client.download_blob().readall()
     except Exception:
+        _LOGGER.warning('Albums index data download failed user=%s', user_id, exc_info=True)
         return None
     try:
-        parsed = json.loads(gzip.decompress(payload).decode('utf-8'))
+        # Blob SDK reads may already decode Content-Encoding:gzip, whereas
+        # shared write-through files can still contain the original gzip bytes.
+        raw = gzip.decompress(payload) if payload.startswith(b'\x1f\x8b') else payload
+        parsed = json.loads(raw.decode('utf-8'))
         rows = parsed.get('rows')
-        if not isinstance(rows, list):
-            return None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('Albums index rows must be a list of objects')
         return LexicalIndexSnapshot(
             user_id=str(user_id),
             source_version=str(parsed.get('sourceVersion') or ''),
@@ -6138,6 +6142,7 @@ def _load_albums_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
             rows=rows,
         )
     except Exception:
+        _LOGGER.warning('Albums index data decode failed user=%s', user_id, exc_info=True)
         return None
 
 

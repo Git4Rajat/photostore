@@ -374,7 +374,7 @@ interface Store {
     albumsLoading: boolean;
     reloadAlbums: () => void;
     // Promise-returning counterpart of reloadAlbums -- see fetchExplore above.
-    fetchAlbums: () => Promise<void>;
+    fetchAlbums: (force?: boolean) => Promise<void>;
     openAlbum: (id: string) => void;
     albumPhotosById: (id: string) => Photo[] | undefined;
     isAlbumPhotosLoading: (id: string) => boolean;
@@ -473,11 +473,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const pendingResetRef = useRef(false);
     const [albums, setAlbums] = useState<Album[]>([]);
     const [albumsLoading, setAlbumsLoading] = useState<boolean>(true);
-    // Populated by fetchAlbums's primary (local-index) path -- lets openAlbum
-    // resolve an album's photos via the existing batched
-    // /api/photos/lookup-batch instead of GET /albums/<id>'s sequential
-    // per-photo point-read loop. Empty (album not found here) means the
-    // fallback path (GET /albums/<id>) should be used instead.
+    const albumsLoadedAtRef = useRef<number | null>(null);
+    const albumsFetchRef = useRef<Promise<void> | null>(null);
+    const albumsRefreshPendingRef = useRef(false);
+    // Album pages live in the session store, so navigation preserves them.
     const [albumPhotos, setAlbumPhotos] = useState<Record<string, Photo[]>>({});
     // Keyed per album id -- a single shared flag raced when switching albums
     // quickly: a fast fetch for album B finishing after a slow fetch for album
@@ -1059,10 +1058,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setAlbums(Array.isArray(res?.albums) ? res.albums : []);
     }, []);
 
-    const fetchAlbums = useCallback(async () => {
-        setAlbumsLoading(true);
+    const loadAlbums = useCallback(async () => {
+        const hasCachedAlbums = albumsLoadedAtRef.current !== null;
+        // Keep even a successfully loaded empty list visible during revalidation.
+        if (!hasCachedAlbums) setAlbumsLoading(true);
         try {
-            const rows = await withIndexRetry(getLocalAlbumsIndex);
+            // Only a genuinely cold visit waits for a just-started index build.
+            // Warm refreshes fall back immediately rather than repeating 6s of sleeps.
+            const rows = await (hasCachedAlbums ? getLocalAlbumsIndex() : withIndexRetry(getLocalAlbumsIndex));
             if (!rows) {
                 throw new Error('albums index unavailable');
             }
@@ -1098,9 +1101,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 isExpired: r.isExpired,
             }));
             setAlbums(mapped);
+            albumsLoadedAtRef.current = Date.now();
         } catch {
             try {
                 await fetchAlbumsViaLegacyEndpoint();
+                albumsLoadedAtRef.current = Date.now();
             } catch {
                 // leave the current list in place on transient failures
             }
@@ -1109,7 +1114,28 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, [fetchAlbumsViaLegacyEndpoint]);
 
-    const reloadAlbums = useCallback(() => { void fetchAlbums(); }, [fetchAlbums]);
+    const fetchAlbums = useCallback((force = false): Promise<void> => {
+        if (albumsFetchRef.current) {
+            // A mutation/index-ready event during a read must get one fresh pass
+            // afterwards; ordinary overlapping tab visits just share the read.
+            if (force) albumsRefreshPendingRef.current = true;
+            return albumsFetchRef.current;
+        }
+        if (!force && albumsLoadedAtRef.current !== null
+            && Date.now() - albumsLoadedAtRef.current < 60000) {
+            return Promise.resolve();
+        }
+        const request = (async () => {
+            do {
+                albumsRefreshPendingRef.current = false;
+                await loadAlbums();
+            } while (albumsRefreshPendingRef.current);
+        })().finally(() => { albumsFetchRef.current = null; });
+        albumsFetchRef.current = request;
+        return request;
+    }, [loadAlbums]);
+
+    const reloadAlbums = useCallback(() => { void fetchAlbums(true); }, [fetchAlbums]);
 
     // Rating/liking a photo can change which photo is an album's auto-picked
     // cover (backend picks the highest-rated/most-liked photo in the album),
@@ -2193,7 +2219,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         reloadPhotos();
         void fetchTimeline();
         void fetchPeople();
-        void fetchAlbums();
+        void fetchAlbums(true);
         void fetchExplore();
     }), [reloadPhotos, fetchTimeline, fetchPeople, fetchAlbums, fetchExplore]);
 

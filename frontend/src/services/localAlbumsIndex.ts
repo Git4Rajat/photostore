@@ -143,6 +143,7 @@ const indexKey = (): string => getActiveLibraryFromToken() || '__default__';
 let cachedKey: string | null = null;
 let cachedIndex: AlbumIndexRow[] | null = null;
 let inFlight: Promise<AlbumIndexRow[] | null> | null = null;
+let generation = 0;
 
 const fetchLocalAlbumsIndex = async (key: string): Promise<AlbumIndexRow[] | null> => {
     const totalStarted = perfNow();
@@ -175,19 +176,22 @@ export const getLocalAlbumsIndex = async (): Promise<AlbumIndexRow[] | null> => 
     if (inFlight && cachedKey === key) {
         return inFlight;
     }
+    cachedIndex = null;
     cachedKey = key;
-    inFlight = fetchLocalAlbumsIndex(key)
+    const requestGeneration = ++generation;
+    const request = fetchLocalAlbumsIndex(key)
         .then((result) => {
-            cachedIndex = result;
+            if (generation === requestGeneration) cachedIndex = result;
             return result;
         })
         .catch(() => {
-            cachedIndex = null;
+            if (generation === requestGeneration) cachedIndex = null;
             return null;
         })
         .finally(() => {
-            inFlight = null;
+            if (inFlight === request) inFlight = null;
         });
+    inFlight = request;
     return inFlight;
 };
 
@@ -199,6 +203,8 @@ export const getLocalAlbumsIndex = async (): Promise<AlbumIndexRow[] | null> => 
 // (see touch_user_albums_index_state), but this session's in-memory cache
 // needs its own explicit invalidation the same way localSortIndex.ts does.
 export const invalidateLocalAlbumsIndex = (): void => {
+    generation += 1;
     cachedIndex = null;
     cachedKey = null;
+    inFlight = null;
 };

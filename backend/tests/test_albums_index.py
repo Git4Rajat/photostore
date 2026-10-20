@@ -276,6 +276,36 @@ def test_refresh_then_get_round_trips_through_the_fake_blob_service(albums_ctx):
     assert result['rows'][0]['albumId'] == 'alb-1'
 
 
+@pytest.mark.parametrize('compressed', [False, True])
+def test_cold_reader_accepts_sdk_decoded_json_and_raw_gzip(albums_ctx, compressed):
+    albums_table, _, blob_service = albums_ctx
+    user_id = f'lib-reader-{compressed}'
+    _seed_album(albums_table, user_id, 'alb-1', name='Trip')
+    storage_utils.refresh_user_albums_index(user_id, source_version='v1')
+    storage_utils.invalidate_user_albums_index_cache(user_id)
+    key = f'lexical-index/{storage_utils._albums_index_json_blob_name(user_id)}'
+    if not compressed:
+        # azure-storage-blob automatically decodes Content-Encoding:gzip.
+        blob_service.blobs[key] = gzip.decompress(blob_service.blobs[key])
+
+    result = storage_utils.get_user_albums_index(user_id, allow_refresh=False)
+
+    assert result is not None
+    assert result['source_version'] == 'v1'
+    assert [row['albumId'] for row in result['rows']] == ['alb-1']
+
+
+@pytest.mark.parametrize('payload', [b'not json', b'{"rows":{}}', b'{"rows":[null]}', b'{"rows":["album"]}'])
+def test_cold_reader_logs_invalid_album_snapshots(albums_ctx, caplog, payload):
+    _, _, blob_service = albums_ctx
+    user_id = 'lib-invalid-reader'
+    key = f'lexical-index/{storage_utils._albums_index_json_blob_name(user_id)}'
+    blob_service.blobs[key] = payload
+
+    assert storage_utils._load_albums_index_blob(user_id) is None
+    assert 'Albums index data decode failed' in caplog.text
+
+
 def test_get_user_albums_index_returns_none_without_refresh_when_never_built(albums_ctx):
     assert storage_utils.get_user_albums_index('lib-never-built', allow_refresh=False) is None
 
@@ -303,21 +333,26 @@ def test_get_user_albums_index_returned_rows_are_a_copy_not_the_shared_cache(alb
 
 # --- cold + non-blocking (allow_sync_build=False) -----------------------------
 
-def test_get_user_albums_index_cold_non_blocking_returns_none_then_builds_in_background(albums_ctx):
+def test_get_user_albums_index_cold_non_blocking_returns_none_then_builds_in_background(albums_ctx, monkeypatch):
     albums_table, _, _ = albums_ctx
     _seed_album(albums_table, 'lib-cold', 'alb-1')
+    completed = threading.Event()
+    refresh = storage_utils.refresh_user_albums_index
+
+    def tracked_refresh(*args, **kwargs):
+        try:
+            return refresh(*args, **kwargs)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(storage_utils, 'refresh_user_albums_index', tracked_refresh)
 
     result = storage_utils.get_user_albums_index('lib-cold', allow_refresh=True, allow_sync_build=False)
     assert result is None  # did NOT block on a synchronous build
 
-    lock = storage_utils._ALBUMS_INDEX_REBUILD_LOCKS.lock_for('lib-cold')
-    for _ in range(50):
-        if lock.acquire(blocking=False):
-            lock.release()
-            break
-        time.sleep(0.05)
-    else:
-        pytest.fail('background albums index build never completed')
+    # The launcher lock may be free before the new thread has entered refresh.
+    # Wait for actual publication rather than racing that scheduling window.
+    assert completed.wait(2.5), 'background albums index build never completed'
 
     built = storage_utils.get_user_albums_index('lib-cold', allow_refresh=False)
     assert built is not None
