@@ -27,6 +27,22 @@ def test_bicep_worker_floor_matches_compiled_default():
         assert 'param clusterMinReplicas int = 0' in (root / 'deploy' / filename).read_text()
 
 
+def test_dedicated_index_queue_wakes_an_isolated_single_publisher_sidecar():
+    template = json.loads((Path(__file__).parents[2] / 'deploy' / 'azuredeploy.json').read_text())
+    assert template['parameters']['dedicatedIndexWorker']['defaultValue'] is True
+    module = next(r for r in template['resources'] if r['type'] == 'Microsoft.Resources/deployments')['properties']['template']
+    indexer = next(r for r in module['resources'] if r.get('name') == "[variables('indexerAppName')]")
+    spec = indexer['properties']['template']
+    assert spec['terminationGracePeriodSeconds'] == 180
+    assert spec['scale']['maxReplicas'] == "[if(parameters('dedicatedIndexWorker'), 1, 2)]"
+    containers = spec['containers']
+    assert "'index-maintenance'" in containers and "'index-worker'" in containers
+    assert "'image', parameters('coreImage')" in containers
+    rules = spec['scale']['rules']
+    assert "'azure-queue'" in rules and "'photostore-index-maintenance'" in rules
+    assert "'identity', 'system'" in rules and "'queueLengthStrategy', 'visibleonly'" in rules
+
+
 def test_all_container_apps_allow_scale_to_zero_by_default():
     template = json.loads((Path(__file__).parents[2] / 'deploy' / 'azuredeploy.json').read_text())
     deployment = next(r for r in template['resources']

@@ -958,7 +958,9 @@ def search_photos():
     end_day = capture_end.date().toordinal() if capture_end else None
     match_terms = search_db.match_terms(tokens)
     person_ids = [pid for group in matched_person_groups for pid in group]
-    cache_key = (user_id, db.path, db.applied_seq(), query, start_day, end_day)
+    # Person names are joined at read time. A rename changes ranking/filtering
+    # even though no photo delta or database revision is needed.
+    cache_key = (user_id, db.path, db.applied_seq(), tuple(sorted(pid_to_name.items())), query, start_day, end_day)
     window = _search_window_cached(cache_key)
     if window is None:
         window = _build_search_window(

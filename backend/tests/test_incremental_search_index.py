@@ -113,7 +113,8 @@ def test_get_dirty_filenames_returns_none_when_table_unconfigured(monkeypatch):
 def test_clear_removes_only_named_filenames(ctx):
     _metadata, dirty, _blobs = ctx
     storage_utils.touch_user_search_indexes_state('u1', filenames=['a.jpg', 'b.jpg'])
-    storage_utils._clear_dirty_search_index_filenames('u1', 'lexical', {'a.jpg'})
+    snapshot = storage_utils._get_dirty_search_index_filenames('u1', 'lexical')
+    storage_utils._clear_dirty_search_index_filenames('u1', 'lexical', snapshot.subset(['a.jpg']))
 
     assert storage_utils._get_dirty_search_index_filenames('u1', 'lexical') == {'b.jpg'}
     # Clearing the lexical partition must not touch the other kinds' partitions.
@@ -181,18 +182,16 @@ def test_dedupes_the_same_filename_marked_dirty_repeatedly(ctx):
     assert len(dirty.submit_transaction_calls[0]) == 1
 
 
-def test_clearing_flushes_buffered_entries_before_deleting(ctx):
-    """A filename can be marked dirty and still be sitting only in the
-    in-memory buffer (never yet written to the table) when a clear call for
-    it comes in -- the clear must flush first or it silently no-ops and the
-    buffered copy resurrects the mark on the next flush."""
+def test_new_buffered_edit_survives_acknowledging_an_older_snapshot(ctx):
     _metadata, dirty, _blobs = ctx
     storage_utils.touch_user_search_indexes_state('u1', filenames=['a.jpg'])
     assert dirty.rows == {}  # still only buffered, not yet in the table
 
-    storage_utils._clear_dirty_search_index_filenames('u1', 'lexical', {'a.jpg'})
+    snapshot = storage_utils._get_dirty_search_index_filenames('u1', 'lexical')
+    storage_utils.touch_user_search_indexes_state('u1', filenames=['a.jpg'])
+    storage_utils._clear_dirty_search_index_filenames('u1', 'lexical', snapshot)
 
-    assert storage_utils._get_dirty_search_index_filenames('u1', 'lexical') == set()
+    assert storage_utils._get_dirty_search_index_filenames('u1', 'lexical') == {'a.jpg'}
 
 
 # --- manifest dirty-flag debounce (Part 1) -----------------------------------

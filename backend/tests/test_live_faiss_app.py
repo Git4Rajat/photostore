@@ -572,7 +572,7 @@ def test_live_upload_queue_schedules_assignment_but_never_maintenance(monkeypatc
             {'processing_state': 'active', 'face_status': 'done', 'faceCount': 1},
         ) == {'status': 'incremental_only'}
     assert [call.args for call in enqueue.call_args_list] == [
-        ('lib-live', 'first.jpg'), ('lib-live', 'second.jpg')]
+        ('lib-live', 'first.jpg', 1), ('lib-live', 'second.jpg', 1)]
     due.assert_not_called()
     maintenance.assert_not_called()
 

@@ -124,6 +124,9 @@ def tools_build_indexes():
         return error
     data = app.request.get_json(silent=True) or {}
     requested_scope = str(data.get('scope') or '').strip().lower()
+    import index_updates
+    if requested_scope not in ('', 'auto') and requested_scope not in index_updates.SCOPE_KINDS:
+        return app.jsonify({'error': 'invalid index scope'}), 400
     wait_seconds = 0.0
     try:
         wait_seconds = max(0.0, min(90.0, float(data.get('waitSeconds') or 0)))
@@ -134,10 +137,25 @@ def tools_build_indexes():
 
     outcome = 'not_needed'
     scope = 'none'
-    if app.index_build_needed(user_id):
+    if requested_scope not in ('', 'auto'):
+        scope = requested_scope
+        outcome = app.enqueue_index_build(
+            user_id, reason=str(data.get('reason') or 'client'), scope=scope,
+            coalesce=not bool(data.get('force') or data.get('forceImmediate')),
+        )
+    elif app.index_build_needed(user_id):
         scope = 'full'
         outcome = app.enqueue_index_build(user_id, reason=str(data.get('reason') or 'client'))
-    elif requested_scope in ('', 'auto', 'light') and app.light_index_build_needed(user_id):
+    elif app.INDEX_MAINTENANCE_QUEUE_NAME:
+        details = app.storage_utils_module.get_user_index_status_detailed(user_id)
+        wanted = [index_updates.scope_for_index(kind) for kind, info in details['indexes'].items()
+                  if not info.get('ready') or info.get('dirty')]
+        outcomes = [app.enqueue_index_build(user_id, reason='client', scope=kind) for kind in wanted]
+        if wanted:
+            scope = wanted[0] if len(wanted) == 1 else 'multiple'
+            outcome = ('queued' if 'queued' in outcomes else
+                       ('already_active' if 'already_active' in outcomes else 'unavailable'))
+    elif app.light_index_build_needed(user_id):
         scope = 'light'
         outcome = app.enqueue_index_build(
             user_id,
@@ -147,7 +165,7 @@ def tools_build_indexes():
         )
 
     wait_result = None
-    if wait_seconds > 0 and outcome in ('queued', 'already_active') and scope != 'none':
+    if wait_seconds > 0 and outcome in ('queued', 'already_active') and scope not in ('none', 'multiple'):
         wait_result = _wait_for_index_build(user_id, scope, wait_seconds)
     state = app.get_user_index_build_state(user_id)
     building = outcome in ('queued', 'already_active')
@@ -221,7 +239,21 @@ def tools_indexes_status():
 
     # Add current build status if one is in progress
     building_job = None
-    if app._index_build_job_active(user_id):
+    if app.INDEX_MAINTENANCE_QUEUE_NAME:
+        import index_updates
+        base = app._index_build_job_id(user_id)
+        for scope in index_updates.SCOPE_KINDS:
+            job_id = base + (f'-{scope}' if scope != 'full' else '')
+            row = app._get_job_row(user_id, job_id)
+            if not row or row.get('status') not in ('queued', 'running'):
+                continue
+            cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(
+                minutes=app.INDEX_BUILD_STALE_MINUTES_BY_SCOPE.get(scope, 45))).isoformat()
+            if row['status'] == 'running' and str(row.get('updatedAt') or '') < cutoff:
+                continue
+            building_job = {'scope': scope, 'started_at': row.get('Timestamp')}
+            break
+    elif app._index_build_job_active(user_id):
         job_row = app._get_job_row(user_id, app._index_build_job_id(user_id))
         if job_row:
             scope = str(job_row.get('indexScope') or 'full').lower()
@@ -250,7 +282,7 @@ def jsonify_status(ready, indexes, building):
 @tools_bp.route('/api/tools/indexes/rebuild/<index_kind>', methods=['POST'])
 def tools_rebuild_index(index_kind: str):
     """Manually trigger a rebuild for a specific index type.
-    Scopes: sort/lexical (light), albums/people (people), all (full)."""
+    The selected index never expands to unrelated kinds."""
     user_id, error = app._require_user_id()
     if error:
         return error
@@ -261,11 +293,11 @@ def tools_rebuild_index(index_kind: str):
 
     # Map index kinds to build scopes
     scope_map = {
-        'sort': 'light',     # light scope rebuilds sort + access
-        'lexical': 'light',
-        'albums': 'people',  # people scope rebuilds albums + people
+        'sort': 'sort',
+        'lexical': 'search',
+        'albums': 'albums',
         'people': 'people',
-        'all': 'full',       # full scope rebuilds everything
+        'all': 'full',
     }
     scope = scope_map.get(kind, 'full')
 
@@ -274,7 +306,7 @@ def tools_rebuild_index(index_kind: str):
         user_id,
         reason=f'user-rebuild-{kind}',
         scope=scope,
-        force=True,  # User explicitly requested rebuild
+        coalesce=False,
     )
 
     # Return current status
@@ -285,6 +317,33 @@ def tools_rebuild_index(index_kind: str):
         'status': outcome,
         'indexes': status['indexes'],
     }), 202 if outcome in ('queued', 'already_active') else 200
+
+
+@tools_bp.route('/api/tools/indexes/recover-pending', methods=['POST'])
+def recover_pending_indexes():
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app.INDEX_MAINTENANCE_QUEUE_NAME:
+        return app.jsonify({'error': 'Dedicated index maintenance is not enabled'}), 409
+    data = app.request.get_json(silent=True) or {}
+    try:
+        count = app.recover_pending_index_work(user_id, retry_failed=data.get('retryFailed') is True)
+        return app.jsonify({'queued': count}), 202
+    except Exception:
+        app.app.logger.exception('Pending index recovery failed')
+        return app.jsonify({'error': 'Pending index recovery unavailable'}), 503
+
+
+@tools_bp.route('/api/tools/indexes/maintenance/<scope>', methods=['POST'])
+def schedule_index_maintenance(scope):
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if scope not in ('compact', 'reconcile'):
+        return app.jsonify({'error': 'invalid maintenance scope'}), 400
+    outcome = app.enqueue_index_build(user_id, reason='user-maintenance', scope=scope, coalesce=False)
+    return app.jsonify({'status': outcome}), 503 if outcome == 'unavailable' else 202
 
 
 # Moved from routes/system.py (APP_ROLE=core) 2026-10-01: polled
@@ -343,7 +402,15 @@ def jobs_status():
             status = str(row.get('status') or '').lower()
             updated_at = str(row.get('updatedAt') or '')
             job_type = str(row.get('jobType') or '')
-            if status in {'queued', 'running'} and updated_at and updated_at < stale_cutoff:
+            row_stale_cutoff = stale_cutoff
+            eligible_for_expiry = status in {'queued', 'running'}
+            if job_type == app.INDEX_BUILD_JOB_TYPE:
+                # A queued job has not crashed: it may be waiting for a stopped
+                # worker or a bulk batch. Only expired running heartbeats fail.
+                eligible_for_expiry = status == 'running'
+                minutes = app.INDEX_BUILD_STALE_MINUTES_BY_SCOPE.get(str(row.get('indexScope') or 'full'), 45)
+                row_stale_cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(minutes=minutes)).isoformat()
+            if eligible_for_expiry and updated_at and updated_at < row_stale_cutoff:
                 # Passing libraryId through (when present) re-derives the same
                 # authoritative partition_key as the original write, so this
                 # updates the real (library_clean/library_download) row, not

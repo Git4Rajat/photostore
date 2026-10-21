@@ -1,23 +1,4 @@
-"""ipworker's producer-side filename batching.
-
-Before this, every detected-face photo enqueued its own
-'people_incremental_assign' queue message immediately -- one Azure Queue
-PUT/DELETE pair per photo, regardless of how well the clustering worker
-batched the processing side afterward. _buffer_incremental_assign_filename
-accumulates filenames per user in memory. The normal flush trigger is the
-vision/face pipeline itself going quiet for IPWORK_CLUSTER_IDLE_SECONDS
-(tracked per-user via _cluster_batch_last_activity_at, bumped on every
-buffered filename) -- deliberately NOT tied to upload activity, since an
-unrelated ongoing upload says nothing about whether more faces are still
-coming from ipworker, and deliberately NOT a count cap either: flushing
-mid-run every time some fixed count of filenames buffers would wake the
-clustering worker repeatedly during one long upload instead of once, after
-it goes quiet. IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES is only a
-defensive backstop against unbounded in-memory growth during an unusually
-long continuous run, not a normal trigger. A manual "Cluster now" request
-(request_cluster_batch_flush) can also force an early flush via a shared
-recency signal every replica's poll loop checks.
-"""
+"""Per-library batches flush at the face cap or oldest-pending deadline."""
 import json
 import os
 import threading
@@ -34,10 +15,14 @@ def clean_buffers():
     """Module-level buffers are shared mutable state -- never leak between
     tests regardless of how a test exits."""
     app._cluster_batch_buffers.clear()
+    app._cluster_batch_face_counts.clear()
+    app._cluster_batch_inflight.clear()
     app._cluster_batch_started_at.clear()
     app._cluster_batch_last_activity_at.clear()
     yield
     app._cluster_batch_buffers.clear()
+    app._cluster_batch_face_counts.clear()
+    app._cluster_batch_inflight.clear()
     app._cluster_batch_started_at.clear()
     app._cluster_batch_last_activity_at.clear()
 
@@ -116,17 +101,27 @@ def test_buffers_are_independent_per_user(enqueued, monkeypatch):
     assert app._cluster_batch_buffers['lib-B'] == ['x.jpg']
 
 
-def test_buffer_keeps_growing_past_the_old_1500_default_while_active(enqueued, monkeypatch):
-    # The safety cap defaults far above any normal session size, so a long
-    # continuous run of faces (e.g. >1500 photos in one upload) must not
-    # trigger a mid-run flush -- only the idle gap or a manual request should.
+def test_active_buffer_flushes_at_1500_faces(enqueued, monkeypatch):
+    monkeypatch.setattr(app.processing_diagnostics, 'file_event', lambda *a, **kw: None)
+    monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_MAX_FACES', 1500)
     now = [1000.0]
     monkeypatch.setattr(app.time, 'monotonic', lambda: now[0])
     for i in range(2000):
         app._buffer_incremental_assign_filename('lib-A', f'{i}.jpg')
         now[0] += 0.01  # stays well under the idle window throughout
-    assert enqueued == []
-    assert len(app._cluster_batch_buffers['lib-A']) == 2000
+    assert enqueued == [('lib-A', [f'{i}.jpg' for i in range(1500)])]
+    assert len(app._cluster_batch_buffers['lib-A']) == 500
+
+
+def test_face_count_not_filename_count_controls_flush(enqueued, monkeypatch):
+    monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_MAX_FACES', 1500)
+    app._buffer_incremental_assign_filename('lib-A', 'a.jpg', 750)
+    app._buffer_incremental_assign_filename('lib-A', 'a.jpg', 750)
+    assert enqueued == []  # A repeated result does not double-count a photo.
+    app._buffer_incremental_assign_filename('lib-B', 'other.jpg', 750)
+    app._buffer_incremental_assign_filename('lib-A', 'b.jpg', 750)
+    assert enqueued == [('lib-A', ['a.jpg', 'b.jpg'])]
+    assert app._cluster_batch_buffers['lib-B'] == ['other.jpg']
 
 
 def test_flush_skips_buffer_while_vision_pipeline_is_still_active(enqueued, monkeypatch):
@@ -154,23 +149,16 @@ def test_flush_fires_once_vision_pipeline_goes_idle(enqueued, monkeypatch):
     assert 'lib-A' not in app._cluster_batch_started_at
 
 
-def test_idle_clock_resets_on_each_new_buffered_filename(enqueued, monkeypatch):
-    # A buffer that keeps receiving faces should never go idle just because
-    # it started a while ago -- the clock tracked is time-since-last-face,
-    # not time-since-buffer-started. Unrelated upload/video activity must
-    # play no role in this decision at all.
+def test_oldest_pending_deadline_does_not_reset_with_new_faces(enqueued, monkeypatch):
     monkeypatch.setattr(app, 'IPWORK_CLUSTER_IDLE_SECONDS', 300)
+    monkeypatch.setattr(app, 'IPWORK_CLUSTER_MAX_WAIT_SECONDS', 300)
     monkeypatch.setattr(app, '_cluster_flush_recently_requested', lambda user_id: False)
     now = [1000.0]
     monkeypatch.setattr(app.time, 'monotonic', lambda: now[0])
     app._buffer_incremental_assign_filename('lib-A', 'a.jpg')
     now[0] += 299
     app._buffer_incremental_assign_filename('lib-A', 'b.jpg')  # resets idle clock
-    now[0] += 299
-    app._flush_stale_incremental_assign_buffers()
-    assert enqueued == []
-    assert app._cluster_batch_buffers['lib-A'] == ['a.jpg', 'b.jpg']
-    now[0] += 2
+    now[0] += 1
     app._flush_stale_incremental_assign_buffers()
     assert enqueued == [('lib-A', ['a.jpg', 'b.jpg'])]
 
@@ -278,6 +266,36 @@ def test_flush_all_drains_every_remaining_buffer_regardless_of_age(enqueued):
 def test_flush_all_is_a_noop_when_nothing_buffered(enqueued):
     app._flush_all_incremental_assign_buffers()
     assert enqueued == []
+
+
+@pytest.mark.parametrize('status', ['unavailable', 'failed', 'partial'])
+def test_failed_batch_stays_buffered_and_checkpointed(monkeypatch, tmp_path, status):
+    monkeypatch.setattr(app, 'CLUSTER_BUFFER_CHECKPOINT_DIR', str(tmp_path))
+    monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_MAX_FACES', 2)
+    monkeypatch.setattr(app, '_enqueue_incremental_assign_job', lambda *a: {'status': status, 'messages': 1})
+    app._buffer_incremental_assign_filename('lib-A', 'a.jpg', 2)
+    assert app._cluster_batch_buffers['lib-A'] == ['a.jpg']
+    assert app._cluster_batch_face_counts['lib-A']['a.jpg'] == 2
+    with open(app._cluster_buffer_checkpoint_path('lib-A')) as checkpoint:
+        assert json.load(checkpoint)['filenames'] == ['a.jpg']
+
+
+def test_successful_send_preserves_faces_arriving_during_send(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, 'CLUSTER_BUFFER_CHECKPOINT_DIR', str(tmp_path))
+    monkeypatch.setattr(app, 'IPWORK_CLUSTER_BATCH_MAX_FACES', 2)
+
+    def send(user, filenames):
+        with open(app._cluster_buffer_checkpoint_path(user)) as checkpoint:
+            assert json.load(checkpoint)['filenames'] == ['a.jpg']
+        app._buffer_incremental_assign_filename(user, 'new.jpg')
+        app._checkpoint_all_cluster_buffers()
+        return {'status': 'queued'}
+
+    monkeypatch.setattr(app, '_enqueue_incremental_assign_job', send)
+    app._buffer_incremental_assign_filename('lib-A', 'a.jpg', 2)
+    assert app._cluster_batch_buffers['lib-A'] == ['new.jpg']
+    with open(app._cluster_buffer_checkpoint_path('lib-A')) as checkpoint:
+        assert json.load(checkpoint)['filenames'] == ['new.jpg']
 
 
 @pytest.fixture
@@ -424,6 +442,16 @@ def test_recovery_re_enqueues_and_removes_stale_checkpoint_files(checkpoint_dir,
     app._recover_stranded_cluster_buffer_checkpoints()
     assert enqueued == [('lib-A', ['a.jpg', 'b.jpg'])]
     assert not os.path.exists(path)
+
+
+def test_recovery_preserves_checkpoint_when_queue_send_fails(checkpoint_dir, monkeypatch):
+    app._write_cluster_buffer_checkpoint('lib-A', ['a.jpg'])
+    path = app._cluster_buffer_checkpoint_path('lib-A')
+    stale = time.time() - app.CLUSTER_BUFFER_CHECKPOINT_STALE_SECONDS - 1
+    os.utime(path, (stale, stale))
+    monkeypatch.setattr(app, '_enqueue_incremental_assign_job', lambda *a: {'status': 'partial'})
+    app._recover_stranded_cluster_buffer_checkpoints()
+    assert os.path.exists(path)
 
 
 def test_recovery_handles_empty_checkpoint_dir(checkpoint_dir, enqueued):

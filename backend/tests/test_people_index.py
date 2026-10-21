@@ -360,21 +360,24 @@ def test_get_user_people_index_returned_rows_are_a_copy_not_the_shared_cache(peo
 
 # --- cold + non-blocking (allow_sync_build=False) -----------------------------
 
-def test_get_user_people_index_cold_non_blocking_returns_none_then_builds_in_background(people_ctx):
+def test_get_user_people_index_cold_non_blocking_returns_none_then_builds_in_background(people_ctx, monkeypatch):
     person_table, face_table, _ = people_ctx
     _seed_person(person_table, 'lib-cold', 'p1', name='Alice')
+    finished = threading.Event()
+    refresh = storage_utils.refresh_user_people_index
+
+    def track_refresh(*args, **kwargs):
+        try:
+            return refresh(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(storage_utils, 'refresh_user_people_index', track_refresh)
 
     result = storage_utils.get_user_people_index('lib-cold', allow_refresh=True, allow_sync_build=False)
     assert result is None  # did NOT block on a synchronous build
 
-    lock = storage_utils._PEOPLE_INDEX_REBUILD_LOCKS.lock_for('lib-cold')
-    for _ in range(50):
-        if lock.acquire(blocking=False):
-            lock.release()
-            break
-        time.sleep(0.05)
-    else:
-        pytest.fail('background people index build never completed')
+    assert finished.wait(timeout=5), 'background people index build never completed'
 
     built = storage_utils.get_user_people_index('lib-cold', allow_refresh=False)
     assert built is not None

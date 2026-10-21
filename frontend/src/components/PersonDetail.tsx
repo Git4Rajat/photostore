@@ -233,15 +233,8 @@ const PersonDetail: React.FC = () => {
         setPerson((prev) => (prev ? { ...prev, name } : prev));
         showToast('Name saved');
         try {
-            const res = await faceService.labelPerson(personId, name);
-            // Naming triggers server-side identity propagation: if it pulled this
-            // person's faces out of unnamed clusters, reflect them right away.
-            const autoAssigned = Number((res as { autoAssignedFaces?: number })?.autoAssignedFaces || 0);
-            if (autoAssigned > 0) {
-                showToast(`Added ${autoAssigned} matching face${autoAssigned === 1 ? '' : 's'}`);
-                await load();
-                void loadMergeCandidates();
-            }
+            await faceService.labelPerson(personId, name);
+            requestJobPoll();
         } catch (e: unknown) {
             setPerson((prev) => (prev ? { ...prev, name: previousName } : prev));
             setName(previousName);

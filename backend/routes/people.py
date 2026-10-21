@@ -312,21 +312,37 @@ def _confirm_faces_for_person(user_id: str, face_ids) -> set:
     return affected_files
 
 
-def _queue_label_index_refresh(user_id: str, person_id: str, affected_files: set) -> None:
-    app.mark_people_dirty(user_id, [person_id])
-    # The worker runs in another process and cannot see buffered photo marks.
-    for kind in ('lexical', 'sort', 'access'):
-        app.storage_utils_module._flush_dirty_filename_buffer(user_id, kind)
-    scopes = ['people']
-    if affected_files and app.light_index_build_needed(user_id):
-        scopes.append('light')
-    for scope in scopes:
+def _save_person_label(user_id, person_id, name):
+    """Save the label and its recoverable publication intent in one source write."""
+    table = getattr(app.person_table_client, '_table_client', app.person_table_client)
+    for _ in range(5):
         try:
-            outcome = app.enqueue_index_build(user_id, reason='person-label', scope=scope)
-            if outcome == 'unavailable':
-                app.app.logger.warning('Could not queue %s index refresh after person label', scope)
-        except Exception:
-            app.app.logger.exception('Could not queue %s index refresh after person label', scope)
+            person = table.get_entity(partition_key=user_id, row_key=person_id)
+        except app.ResourceNotFoundError:
+            return None
+        if str(person.get('name') or '') == name and not person.get('labelPending'):
+            return dict(person)
+        old_named = app._person_entity_is_named(person)
+        new_named = bool(name.strip()) and not app._is_unnamed_name(name)
+        pending = str(app.uuid.uuid4())
+        changed = dict(person, name=name, labelPending=pending,
+                       labelMembershipPending=bool(person.get('labelMembershipPending') or old_named != new_named))
+        revision_required = (old_named != new_named and app.PEOPLE_ASSIGNMENT_ENGINE == 'faiss'
+                             and app.blob_service_client is not None)
+        if revision_required:
+            from clustering_lease import mark_library_changed
+            mark_library_changed(app.blob_service_client, app.BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, user_id)
+        try:
+            table.update_entity(changed, etag=person.metadata['etag'],
+                                match_condition=app.MatchConditions.IfNotModified)
+        except app.ResourceModifiedError:
+            continue
+        finally:
+            if revision_required:
+                mark_library_changed(app.blob_service_client, app.BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, user_id)
+        app._invalidate_people_scan_cache(user_id)
+        return changed
+    raise RuntimeError('Concurrent person label update')
 
 
 @people_bp.route('/api/persons/<person_id>/label', methods=['POST'])
@@ -340,43 +356,12 @@ def label_person(person_id: str):
     name = data.get('name', '')
     if not isinstance(name, str):
         return app.jsonify({'error': 'Invalid name'}), 400
-    ok = app._update_person_entity(user_id, person_id, {'name': name})
-    if not ok:
+    person = _save_person_label(user_id, person_id, name)
+    if person is None:
         return app.jsonify({'error': 'Not found'}), 404
-    try:
-        person = app.person_table_client.get_entity(partition_key=user_id, row_key=person_id)
-        face_ids = app.json.loads(person.get('faceIds', '[]') or '[]')
-    except Exception:
-        face_ids = []
-    with app.perf_instrumentation.step('label.confirm_faces', faces=len(face_ids)):
-        affected_files = _confirm_faces_for_person(user_id, face_ids)
-    with app.perf_instrumentation.step('label.rep_embedding'):
-        app._update_person_rep_embedding(user_id, person_id)
-    with app.perf_instrumentation.step('label.rebuild_metadata_faces', files=len(affected_files)):
-        app._rebuild_metadata_faces_for_filenames(user_id, affected_files)
-    _queue_label_index_refresh(user_id, person_id, affected_files)
-
-    # Naming a cluster is a strong identity signal: use its learned rep to pull
-    # this person's faces out of unnamed clusters automatically. Best-effort so a
-    # propagation hiccup never fails the label action itself.
-    auto_assigned = 0
-    propagate_job_id = None
-    if name.strip() and not app._is_unnamed_name(name):
-        # Reclaiming this person's faces from unnamed clusters scans the whole face table, so (like
-        # merge) it runs on the queue-scaled worker instead of inside this request. Only without a
-        # worker is it run inline.
-        queued = app._enqueue_propagate_job(user_id, person_id)
-        if queued.get('status') == 'queued':
-            propagate_job_id = queued.get('jobId')
-        else:
-            try:
-                with app.perf_instrumentation.step('label.propagate_identity'):
-                    propagation = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
-                auto_assigned = int(propagation.get('autoAssignedCount') or 0)
-            except Exception:
-                app.app.logger.exception('Identity propagation after label failed for %s', person_id)
-    return app.jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': auto_assigned,
-                        'propagateJobId': propagate_job_id})
+    queued = app.publish_person_label_intent(user_id, person_id, person)
+    return app.jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': 0,
+                        'propagateJobId': None, 'indexRefreshPending': not queued})
 
 @people_bp.route('/api/faces/crop/<face_id>', methods=['GET'])
 def face_crop(face_id: str):

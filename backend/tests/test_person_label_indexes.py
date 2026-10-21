@@ -1,5 +1,4 @@
-"""Labels schedule scoped index maintenance without waiting for propagation."""
-import json
+"""Names are source records, not instructions to rediscover/rewrite faces."""
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,165 +10,129 @@ from tests.fakes import FakeTable
 
 
 @pytest.fixture
-def label_env(monkeypatch):
-    table = FakeTable()
-    table.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'person-1', 'faceIds': '["face-1"]'})
-    env = SimpleNamespace(
-        table=table, affected={'photo.jpg'}, queued=[], dirty=[], flushed=[],
-        light=False, propagate=Mock(return_value={'status': 'queued', 'jobId': 'propagate-1'}),
-        enqueue=app.enqueue_index_build, mark_dirty=app.mark_people_dirty,
-        flush=app.storage_utils_module._flush_dirty_filename_buffer,
-    )
+def env(monkeypatch):
+    table, dirty = FakeTable(), FakeTable()
+    table.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'p1', 'name': 'Alice', 'faceIds': '["f1"]'})
+    state = SimpleNamespace(table=table, dirty=dirty, queued=[], outcome='queued')
     monkeypatch.setattr(app, '_require_user_id', lambda: ('u1', None))
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
     monkeypatch.setattr(app, 'person_table_client', table)
-
-    def update(user, person_id, changes):
-        try:
-            row = table.get_entity(user, person_id)
-        except Exception:
-            return False
-        table.upsert_entity({**row, **changes})
-        return True
-
-    monkeypatch.setattr(app, '_update_person_entity', update)
-    monkeypatch.setattr(people, '_confirm_faces_for_person', lambda *a: env.affected)
-    monkeypatch.setattr(app, '_update_person_rep_embedding', lambda *a: None)
-    monkeypatch.setattr(app, '_rebuild_metadata_faces_for_filenames', Mock())
-    monkeypatch.setattr(app, 'mark_people_dirty', lambda user, ids: env.dirty.extend(ids))
-    monkeypatch.setattr(app.storage_utils_module, '_flush_dirty_filename_buffer',
-                        lambda user, kind: env.flushed.append((user, kind)))
-    monkeypatch.setattr(app, 'light_index_build_needed', lambda user: env.light)
+    monkeypatch.setattr(app, 'people_dirty_set_table_client', dirty)
+    monkeypatch.setattr(app, 'albums_dirty_set_table_client', FakeTable())
+    monkeypatch.setattr(app, 'blob_service_client', None)
+    monkeypatch.setattr(app, '_invalidate_people_scan_cache', Mock())
+    for name in ('_update_person_rep_embedding', '_rebuild_metadata_faces_for_filenames',
+                 '_enqueue_propagate_job', '_propagate_person_identity', 'light_index_build_needed'):
+        monkeypatch.setattr(app, name, Mock(side_effect=AssertionError('unexpected ' + name)))
+    monkeypatch.setattr(people, '_confirm_faces_for_person', Mock(side_effect=AssertionError('face confirmation')))
     monkeypatch.setattr(app, 'enqueue_index_build',
-                        lambda user, **kw: env.queued.append((user, kw)) or 'queued')
-    monkeypatch.setattr(app, '_enqueue_propagate_job', env.propagate)
-    return env
+                        lambda user, **kw: state.queued.append((user, kw)) or state.outcome)
+    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', Mock(side_effect=AssertionError('sort upgrade')))
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', Mock(return_value=[]))
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda user: {'status': 'noop'})
+    return state
 
 
-def label(name='Alice', person_id='person-1'):
+def label(name='Bob', person_id='p1'):
     with app.app.test_request_context('/api/persons/test/label', method='POST', json={'name': name}):
         return people.label_person(person_id)
 
 
-def test_label_queues_people_search_refresh_before_propagation(label_env):
-    env = label_env
-
-    def propagate(*args):
-        assert env.queued == [('u1', {'reason': 'person-label', 'scope': 'people'})]
-        assert env.dirty == ['person-1']
-        assert env.flushed == [('u1', kind) for kind in ('lexical', 'sort', 'access')]
-        assert env.table.get_entity('u1', 'person-1')['name'] == 'Alice'
-        return {'status': 'queued', 'jobId': 'propagate-1'}
-
-    env.propagate.side_effect = propagate
-    response = label()
-    assert response.get_json()['propagateJobId'] == 'propagate-1'
-    app._rebuild_metadata_faces_for_filenames.assert_called_once_with('u1', {'photo.jpg'})
+def test_rename_only_saves_name_and_queues_people(env):
+    result = label().get_json()
+    assert result['success'] and result['propagateJobId'] is None and result['autoAssignedFaces'] == 0
+    row = env.table.get_entity('u1', 'p1')
+    assert row['name'] == 'Bob' and row['faceIds'] == '["f1"]'
+    assert row['labelPending'] and not row['labelMembershipPending']
+    assert env.queued == [('u1', {'reason': 'person-label', 'scope': 'people'})]
 
 
-def test_label_queues_light_refresh_only_when_photo_metadata_dirtied_sort(label_env):
-    label_env.light = True
-    assert label().get_json()['success'] is True
-    assert [kw['scope'] for _, kw in label_env.queued] == ['people', 'light']
+def test_repeated_identical_name_is_a_noop(env):
+    assert label('Alice').get_json()['success']
+    assert not env.queued
+    assert env.table.versions[('u1', 'p1')] == 1
 
 
 @pytest.mark.parametrize('name', ['', 'Unnamed'])
-def test_clearing_a_name_still_schedules_indexes_without_propagation(label_env, name):
-    assert label(name).get_json()['success'] is True
-    assert [kw['scope'] for _, kw in label_env.queued] == ['people']
-    label_env.propagate.assert_not_called()
+def test_removing_name_defers_legacy_membership_sync_without_discovery(env, name):
+    assert label(name).get_json()['success']
+    assert env.table.get_entity('u1', 'p1')['labelMembershipPending']
+    assert [kwargs['scope'] for _, kwargs in env.queued] == ['people']
 
 
-def test_person_without_photos_still_refreshes_people_not_sort(label_env):
-    label_env.affected = set()
-    label_env.light = True
-    assert label().get_json()['success'] is True
-    assert [kw['scope'] for _, kw in label_env.queued] == ['people']
+def test_first_name_requires_membership_sync_but_not_request_path_work(env):
+    env.table.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'p1', 'name': '', 'faceIds': '["f1"]'})
+    label()
+    assert env.table.get_entity('u1', 'p1')['labelMembershipPending']
 
 
-@pytest.mark.parametrize('name,person_id,status', [(None, 'person-1', 400), ('Alice', 'missing', 404)])
-def test_rejected_label_does_not_queue_indexes(label_env, name, person_id, status):
+@pytest.mark.parametrize('name,person_id,status', [(None, 'p1', 400), ('Bob', 'missing', 404)])
+def test_invalid_or_missing_person_does_not_schedule(env, name, person_id, status):
     _, actual = label(name, person_id)
-    assert actual == status
-    assert label_env.queued == [] and label_env.dirty == []
+    assert actual == status and not env.queued
 
 
-@pytest.mark.parametrize('outcome', ['unavailable', RuntimeError('queue failure')])
-def test_queue_failure_does_not_undo_saved_name_or_skip_other_scope(label_env, monkeypatch, outcome):
-    label_env.light = True
-
-    def enqueue(user, **kwargs):
-        label_env.queued.append((user, kwargs))
-        if kwargs['scope'] == 'people':
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-        return 'queued'
-
-    monkeypatch.setattr(app, 'enqueue_index_build', enqueue)
-    assert label().get_json()['success'] is True
-    assert label_env.table.get_entity('u1', 'person-1')['name'] == 'Alice'
-    assert [kw['scope'] for _, kw in label_env.queued] == ['people', 'light']
+def test_queue_failure_retains_source_outbox(env):
+    env.outcome = 'unavailable'
+    result = label().get_json()
+    assert result['success'] and result['indexRefreshPending']
+    assert env.table.get_entity('u1', 'p1')['labelPending']
+    assert app._pending_person_labels('u1') == {'p1'}
 
 
-def test_burst_of_labels_coalesces_queue_messages_but_retains_every_person(label_env, monkeypatch):
-    jobs, dirty = FakeTable(), FakeTable()
-    sent = []
-    monkeypatch.setattr(app, 'jobs_table_client', jobs)
-    monkeypatch.setattr(app, 'people_dirty_set_table_client', dirty)
-    monkeypatch.setattr(app, 'library_ops_queue_client', SimpleNamespace(
-        send_message=lambda body, **kw: sent.append(json.loads(body))))
-    monkeypatch.setattr(app, 'enqueue_index_build', label_env.enqueue)
-    monkeypatch.setattr(app, 'mark_people_dirty', label_env.mark_dirty)
-    for i in range(3):
-        person_id = f'person-{i}'
-        label_env.table.upsert_entity({'PartitionKey': 'u1', 'RowKey': person_id, 'faceIds': '[]'})
-        assert label(f'Name {i}', person_id).get_json()['success'] is True
-    assert len(sent) == 1 and sent[0]['scope'] == 'people'
-    assert {row['RowKey'] for row in dirty.query_entities("PartitionKey eq 'u1'")} == {
-        'person-0', 'person-1', 'person-2'}
+def test_rename_worker_clears_only_its_source_intent_after_publication(env):
+    label()
+    app._run_index_build_job('u1', 'job', 'people')
+    row = env.table.get_entity('u1', 'p1')
+    assert row['name'] == 'Bob' and not row['labelPending']
+    assert row['faceIds'] == '["f1"]'
+    assert app.get_dirty_people('u1') == set()
+    assert app._pending_person_labels('u1') == set()
+    assert app.prime_all_user_indexes_sequentially.call_args.kwargs['kinds'] == ('people',)
 
 
-def test_affected_photo_marks_reach_storage_before_worker_is_queued(label_env, monkeypatch):
-    storage = app.storage_utils_module
-    dirty = FakeTable()
-    monkeypatch.setitem(storage._CTX, 'search_index_dirty_table_client', dirty)
-    monkeypatch.setattr(storage, '_flush_dirty_filename_buffer', label_env.flush)
-    monkeypatch.setattr(app, '_rebuild_metadata_faces_for_filenames',
-                        lambda user, files: storage._mark_search_index_dirty_filenames(user, files))
-
-    def enqueue(user, **kwargs):
-        for kind in ('lexical', 'sort', 'access'):
-            partition = storage._search_index_dirty_partition_key(user, kind)
-            assert dirty.get_entity(partition, 'photo.jpg')['RowKey'] == 'photo.jpg'
-        return 'queued'
-
-    monkeypatch.setattr(app, 'enqueue_index_build', enqueue)
-    assert label().get_json()['success'] is True
+def test_rename_arriving_during_publication_survives_old_ack(env):
+    label()
+    app.prime_all_user_indexes_sequentially.side_effect = lambda *a, **kw: label('Carol') and []
+    app._run_index_build_job('u1', 'job', 'people')
+    assert env.table.get_entity('u1', 'p1')['name'] == 'Carol'
+    assert env.table.get_entity('u1', 'p1')['labelPending']
+    assert app.get_dirty_people('u1') == {'p1'}
+    assert app._pending_person_labels('u1') == {'p1'}
+    app.prime_all_user_indexes_sequentially.side_effect = None
+    app._run_index_build_job('u1', 'job', 'people')
+    assert not env.table.get_entity('u1', 'p1')['labelPending']
 
 
-def test_label_refresh_does_not_depend_on_successful_identity_propagation(label_env, monkeypatch):
-    label_env.propagate.return_value = {'status': 'unavailable'}
-    monkeypatch.setattr(app, '_propagate_person_identity', Mock(side_effect=RuntimeError('propagation failed')))
-    assert label().get_json()['success'] is True
-    assert [kw['scope'] for _, kw in label_env.queued] == ['people']
+def test_membership_sync_is_background_and_scoped_to_this_person(env, monkeypatch):
+    env.table.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'p1', 'name': '', 'faceIds': '["f1"]'})
+    label()
+    rebuild = Mock()
+    monkeypatch.setattr(app, '_load_face_rows_by_ids', lambda user, ids: {'f1': {'filename': 'one.jpg'}})
+    monkeypatch.setattr(app, '_rebuild_metadata_faces_for_filenames', rebuild)
+    app._run_index_build_job('u1', 'job', 'people')
+    rebuild.assert_called_once_with('u1', {'one.jpg'}, strict=True)
 
 
-def test_label_job_refreshes_people_and_incremental_search_without_full_build(label_env, monkeypatch):
-    assert label().get_json()['success'] is True
-    primed, searched = [], []
-    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda user: None)
-    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
-    monkeypatch.setattr(app, 'get_dirty_people', lambda user: {'person-1'})
-    monkeypatch.setattr(app, 'get_dirty_albums', lambda user: set())
-    monkeypatch.setattr(app, 'clear_dirty_people', Mock())
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially',
-                        lambda user, **kwargs: primed.append(kwargs) or [])
-    monkeypatch.setattr(app.storage_utils_module, 'reconcile_search_db', lambda user: None)
-    monkeypatch.setattr(app, 'refresh_user_search_db_incremental',
-                        lambda user: searched.append(user) or {'status': 'delta', 'published': 1})
-    for user, kwargs in label_env.queued:
-        app._run_index_build_job(user, f'index-build-{user}-{kwargs["scope"]}', kwargs['scope'])
-    assert primed == [{'wait': True, 'kinds': ('people', 'albums'),
-                       'affected_person_ids': {'person-1'}, 'affected_album_ids': None}]
-    assert searched == ['u1']
+def test_membership_read_failure_does_not_ack_source_intent(env, monkeypatch):
+    env.table.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'p1', 'name': '', 'faceIds': '["f1"]'})
+    label()
+    monkeypatch.setattr(app, '_load_face_rows_by_ids', Mock(side_effect=RuntimeError('storage down')))
+    with pytest.raises(RuntimeError, match='storage down'):
+        app._run_index_build_job('u1', 'job', 'people')
+    assert env.table.get_entity('u1', 'p1')['labelPending']
+    assert app._pending_person_labels('u1') == {'p1'}
+
+
+def test_search_retry_preserves_people_ids_for_targeted_rebuild(env, monkeypatch):
+    label()
+    monkeypatch.setattr(app, 'INDEX_MAINTENANCE_QUEUE_NAME', 'index-work')
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda user: {'status': 'unavailable'})
+    with pytest.raises(RuntimeError, match='must retry'):
+        app._run_index_build_job('u1', 'job', 'people')
+    assert app.get_dirty_people('u1') == {'p1'}
+    assert app._pending_person_labels('u1') == {'p1'}
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda user: {'status': 'noop'})
+    app._run_index_build_job('u1', 'job', 'people')
+    assert app.prime_all_user_indexes_sequentially.call_args.kwargs['affected_person_ids'] == {'p1'}

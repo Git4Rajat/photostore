@@ -86,6 +86,9 @@ def test_indexer_role_serves_only_tools_routes():
         # is the 2vCPU/4Gi role that can safely scan a full metadata partition.
         '/api/tools/indexes/build',
         '/api/tools/indexes/status',
+        '/api/tools/indexes/rebuild/<index_kind>',
+        '/api/tools/indexes/recover-pending',
+        '/api/tools/indexes/maintenance/<scope>',
         # Manual counterparts to the automatic release/flush triggers.
         '/api/tools/ipwork/release',
         '/api/tools/cluster/flush',
@@ -96,6 +99,11 @@ def test_indexer_role_serves_only_tools_routes():
         '/api/jobs/status',
         '/jobs/status',
     }
+
+
+def test_index_worker_registers_no_public_api_routes():
+    paths = _rule_paths_for_role('index-worker')
+    assert {p for p in paths if not p.startswith('/static')} == {'/health'}
 
 
 def test_core_role_does_not_serve_jobs_status():

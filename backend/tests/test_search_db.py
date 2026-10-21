@@ -230,6 +230,19 @@ def test_route_filters_by_named_person_and_location(monkeypatch, db):
     assert [p['filename'] for p in payload['photos']] == ['IMG_1.jpg'] and payload['matchedLocations']
 
 
+def test_person_rename_changes_search_without_a_photo_delta(monkeypatch, db):
+    _route_ctx(monkeypatch, db)
+    names = {'p1': 'Alice'}
+    monkeypatch.setattr(app, '_load_people_name_index', lambda uid: (
+        dict(names), {name.lower(): [pid] for pid, name in names.items()}))
+    seq = db.applied_seq()
+    assert [p['filename'] for p in _search('alice')['photos']] == ['IMG_1.jpg']
+    names['p1'] = 'Beatrice'
+    assert [p['filename'] for p in _search('beatrice')['photos']] == ['IMG_1.jpg']
+    assert _search('alice')['photos'] == []
+    assert db.applied_seq() == seq
+
+
 def test_route_year_in_query_narrows_to_that_year(monkeypatch, db):
     _route_ctx(monkeypatch, db)
     payload = _search('dog 2022')

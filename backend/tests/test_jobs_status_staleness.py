@@ -106,3 +106,14 @@ def test_another_users_stale_job_is_not_touched(jobs_table):
 
     assert jobs == []
     assert jobs_table.rows[('other', 'ipwork:other:stale-3')]['status'] == 'running'
+
+
+def test_queued_index_job_does_not_time_out_before_a_worker_claims_it(jobs_table):
+    _seed_job(jobs_table, 'index-build-owner-people', 'index_build', 'queued', age_minutes=100)
+    assert _poll()[0]['status'] == 'queued'
+    assert jobs_table.rows[('owner', 'index-build-owner-people')]['status'] == 'queued'
+
+
+def test_index_running_heartbeat_uses_its_scope_timeout(jobs_table):
+    _seed_job(jobs_table, 'index-build-owner', 'index_build', 'running', age_minutes=20)
+    assert _poll()[0]['status'] == 'running'

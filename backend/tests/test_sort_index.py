@@ -384,10 +384,26 @@ def test_update_metadata_fields_tag_change_still_dirties_search_indexes_not_sort
 
 # --- serve-stale-while-rebuilding-in-background ------------------------------
 
-def test_touch_marks_dirty_and_serves_stale_while_rebuilding_in_background(sort_ctx):
+@pytest.fixture
+def background_sort_finished(monkeypatch):
+    finished = threading.Event()
+    refresh = storage_utils.refresh_user_sort_index
+
+    def track_refresh(*args, **kwargs):
+        try:
+            return refresh(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(storage_utils, 'refresh_user_sort_index', track_refresh)
+    return finished
+
+
+def test_touch_marks_dirty_and_serves_stale_while_rebuilding_in_background(sort_ctx, background_sort_finished):
     table, _, _ = sort_ctx
     _seed_row(table, 'lib-H', 'a.jpg', rating=1)
     storage_utils.get_user_sort_index('lib-H', allow_refresh=True)
+    background_sort_finished.clear()
 
     _seed_row(table, 'lib-H', 'a.jpg', rating=9)  # rating changed
     storage_utils.touch_user_sort_index_dirty('lib-H', ['a.jpg'])
@@ -395,14 +411,7 @@ def test_touch_marks_dirty_and_serves_stale_while_rebuilding_in_background(sort_
     immediate = storage_utils.get_user_sort_index('lib-H', allow_refresh=True)
     assert immediate['rows'][0]['rating'] == 1  # stale snapshot, served immediately
 
-    lock = storage_utils._SORT_INDEX_REBUILD_LOCKS.lock_for('lib-H')
-    for _ in range(50):
-        if lock.acquire(blocking=False):
-            lock.release()
-            break
-        time.sleep(0.05)
-    else:
-        pytest.fail('background sort index rebuild never completed')
+    assert background_sort_finished.wait(timeout=5), 'background sort index rebuild never completed'
 
     result = storage_utils.get_user_sort_index('lib-H', allow_refresh=True)
     assert result['rows'][0]['rating'] == 9
@@ -715,7 +724,7 @@ def test_build_snapshot_selects_only_narrow_columns(sort_ctx, monkeypatch):
         assert required in captured['select'], f'{required} missing from sort-index select'
 
 
-def test_get_user_sort_index_cold_non_blocking_returns_none_then_builds_in_background(sort_ctx):
+def test_get_user_sort_index_cold_non_blocking_returns_none_then_builds_in_background(sort_ctx, background_sort_finished):
     """With allow_sync_build=False, a cold library (no snapshot ever built)
     returns None immediately WITHOUT running the full build inline, and kicks
     the build off-thread so the next read is fast. If it had built
@@ -726,16 +735,7 @@ def test_get_user_sort_index_cold_non_blocking_returns_none_then_builds_in_backg
     result = storage_utils.get_user_sort_index('lib-cold', allow_refresh=True, allow_sync_build=False)
     assert result is None  # did NOT block on a synchronous build
 
-    # The background rebuild it kicked off populates the blob; wait for the
-    # rebuild lock to free, then a non-refreshing read should serve it.
-    lock = storage_utils._SORT_INDEX_REBUILD_LOCKS.lock_for('lib-cold')
-    for _ in range(50):
-        if lock.acquire(blocking=False):
-            lock.release()
-            break
-        time.sleep(0.05)
-    else:
-        pytest.fail('background sort index build never completed')
+    assert background_sort_finished.wait(timeout=5), 'background sort index build never completed'
 
     built = storage_utils.get_user_sort_index('lib-cold', allow_refresh=False)
     assert built is not None

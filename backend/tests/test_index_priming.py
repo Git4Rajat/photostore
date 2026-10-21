@@ -55,7 +55,7 @@ def _patch_refreshers(monkeypatch, calls, *, slow_kind=None, entered=None, relea
                 entered.set()
                 release.wait(timeout=5)
             calls.append(kind)
-            return None
+            return object()
         return _fn
 
     monkeypatch.setattr(storage_utils, 'refresh_user_sort_index', _make('sort'))
@@ -158,10 +158,8 @@ def test_prime_all_user_indexes_sequentially_wait_runs_on_calling_thread(monkeyp
 
 
 def test_prime_all_user_indexes_sequentially_wait_blocks_for_in_flight_prime(monkeypatch):
-    # If another prime for the same user is already running (e.g. two
-    # overlapping triggers on the same replica), wait=True must block until
-    # it finishes rather than returning immediately -- and must not re-run
-    # the build itself once it does.
+    # The in-flight job may own a different scope: wait=True must actually
+    # run this caller's requested work after waiting, not just report success.
     calls = []
     entered = threading.Event()
     release = threading.Event()
@@ -184,7 +182,7 @@ def test_prime_all_user_indexes_sequentially_wait_blocks_for_in_flight_prime(mon
     release.set()
     waiter_thread.join(timeout=5)
     assert waited_done.is_set()
-    assert calls == ['sort', 'access', 'lexical', 'albums', 'people']  # only ran once, not re-run by the waiter
+    assert calls == ['sort', 'access', 'lexical', 'albums', 'people'] * 2
 
 
 def test_prime_emits_progress_at_start_each_step_and_end(monkeypatch):
@@ -469,8 +467,8 @@ def test_progress_callback_marks_failed_when_not_ready(monkeypatch):
 # --- GET /api/tools/indexes/status --------------------------------------------
 
 def test_tools_status_reports_ready_without_building(monkeypatch, route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': True, 'lexical': True, 'albums': True, 'people': True,
+    monkeypatch.setattr(app.storage_utils_module, 'get_user_index_status_detailed', lambda uid: {
+        'ready': True, 'needs_rebuild': False, 'indexes': {},
     })
     monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
 
@@ -483,10 +481,11 @@ def test_tools_status_reports_ready_without_building(monkeypatch, route_ctx):
 
 
 def test_tools_status_reports_building_from_the_shared_job_row(monkeypatch, route_ctx):
-    monkeypatch.setattr(app, 'get_user_index_readiness', lambda uid: {
-        'sort': True, 'lexical': False, 'albums': False, 'people': False,
+    monkeypatch.setattr(app.storage_utils_module, 'get_user_index_status_detailed', lambda uid: {
+        'ready': False, 'needs_rebuild': True, 'indexes': {},
     })
     monkeypatch.setattr(app, '_index_build_job_active', lambda uid: True)
+    monkeypatch.setattr(app, '_get_job_row', lambda *args: {'status': 'running', 'indexScope': 'full'})
 
     with app.app.test_request_context('/api/tools/indexes/status'):
         response = tools_indexes_status()
@@ -611,7 +610,7 @@ def test_index_build_job_active_requires_fresh_queued_or_running_row(monkeypatch
     from datetime import datetime, timedelta, timezone
     monkeypatch.setattr(app, 'jobs_table_client', object())
     fresh = datetime.now(timezone.utc).isoformat()
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=app.CLUSTERING_ACTIVE_JOB_STALE_MINUTES + 1)).isoformat()
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=app.INDEX_BUILD_STALE_MINUTES_BY_SCOPE['full'] + 1)).isoformat()
     for status, updated, expected in (('running', fresh, True), ('queued', fresh, True), ('done', fresh, False), ('running', stale, False)):
         monkeypatch.setattr(app, '_get_job_row', lambda pk, jid, s=status, u=updated: {'status': s, 'updatedAt': u})
         assert app._index_build_job_active('lib-1') is expected
@@ -816,11 +815,11 @@ def test_transient_search_db_statuses_dont_fail_the_light_job(monkeypatch, statu
     assert primed == [('sort', 'access')] and job_status[-1] == 'done'
 
 
-def test_people_job_refreshes_people_and_albums_not_the_whole_library(monkeypatch):
+def test_people_job_without_album_changes_only_refreshes_people(monkeypatch):
     primed, _ = _job_env(monkeypatch)
     monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda uid: {'status': 'noop'})
     app._run_index_build_job('lib-1', 'index-build-lib-1-people', 'people')
-    assert primed == [('people', 'albums')]
+    assert primed == [('people',)]
 
 
 def test_an_oversized_dirty_set_is_progressively_compacted_until_drained(monkeypatch):

@@ -50,7 +50,7 @@ def dispatch_ctx(monkeypatch):
     # the resulting 'people_incremental_assign' job.
     monkeypatch.setattr(
         app, '_buffer_incremental_assign_filename',
-        lambda user_id, filename: calls.incremental_assign.append((user_id, filename)),
+        lambda user_id, filename, face_count=1: calls.incremental_assign.append((user_id, filename)),
     )
     yield calls
 

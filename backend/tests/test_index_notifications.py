@@ -7,7 +7,7 @@ import app
 
 @pytest.mark.parametrize('scope,label', [
     ('full', 'Full library indexes'), ('light', 'Photo browsing index'),
-    ('people', 'People and albums indexes'), ('dedup', 'Duplicate-check index'),
+    ('people', 'People index'), ('dedup', 'Duplicate-check index'),
     ('dedup-idle', 'Duplicate-check index'),
 ])
 @pytest.mark.parametrize('status', ['queued', 'running', 'done', 'failed'])
@@ -60,10 +60,18 @@ def test_enqueue_persists_scope_without_needing_a_delayed_result(monkeypatch, sc
 def test_worker_persists_scope_before_work_or_failure(monkeypatch):
     rows = []
     monkeypatch.setattr(app, '_upsert_job_status', lambda *args, **fields: rows.append((args, fields)))
-    def fail(_):
+    def fail(*args, **kwargs):
         raise RuntimeError('test worker failure')
-    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', fail)
+    monkeypatch.setattr(app, 'get_dirty_people', fail)
     with pytest.raises(RuntimeError, match='test worker failure'):
         app._run_index_build_job('owner', 'custom-job', scope='people')
     assert rows[0][1]['indexScope'] == 'people'
     assert rows[-1][0][3] == 'failed'
+
+
+@pytest.mark.parametrize('status', ['deferred', 'no_base'])
+def test_search_waiting_for_repair_does_not_claim_to_be_updated(status):
+    result = app._humanize_job({'jobId': 'job', 'jobType': app.INDEX_BUILD_JOB_TYPE,
+                               'indexScope': 'search', 'status': 'done', 'result': {'status': status}})
+    assert result['title'] == 'Search index maintenance scheduled'
+    assert 'not yet current' in result['message']

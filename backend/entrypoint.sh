@@ -5,6 +5,11 @@ ROLE="${APP_ROLE:-core}"
 
 echo "EXIF runtime version=$(exiftool -ver)"
 
+if [ "${ROLE}" = "index-worker" ]; then
+    echo "Starting index maintenance worker..."
+    exec python -u -c "import app; app.run_index_worker()"
+fi
+
 if [ "${ROLE}" = "cluster" ]; then
     echo "Starting clustering worker..."
     exec python -u -c "import app; app.run_clustering_worker()"

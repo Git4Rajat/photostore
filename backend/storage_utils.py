@@ -309,9 +309,9 @@ _VECTOR_INDEX_CACHE_LOCK = threading.RLock()
 # ~70MB, and nothing ever evicted them -- so a worker building for many libraries
 # (or a replica serving many) only ever grew until the OOM killer. These keep at most
 # INDEX_CACHE_MAX_ENTRIES libraries per kind (oldest evicted). Processes that BUILD
-# indexes but never serve them (cluster/vision) keep none of the serve-only kinds.
+# indexes but never serve them keep none of the serve-only kinds.
 INDEX_CACHE_MAX_ENTRIES = int(os.getenv('INDEX_CACHE_MAX_ENTRIES', '2'))
-_BUILD_ROLE_NAMES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'cluster,vision').split(',') if r.strip()}
+_BUILD_ROLE_NAMES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'cluster,vision,index-worker').split(',') if r.strip()}
 _IS_BUILD_ROLE = os.getenv('APP_ROLE', 'core').strip().lower() in _BUILD_ROLE_NAMES
 
 
@@ -408,27 +408,28 @@ def _cache_image_name(library_id: str, anonymous_id: str, original_filename: str
 
 # --- Where index builds may run ------------------------------------------------------
 # Index builds scan whole partitions and hold embeddings; one OOM-crash-looped the
-# 1Gi `archive` replica (and would any serving process). Only the build roles
-# (cluster, vision) may run them. Every other process -- core, archive, recovery,
-# upload, indexer -- serves whatever index blob already exists and, when one is
-# missing or stale, ASKS the cluster worker to build it (INDEX_BUILD_REQUEST_HOOK, set by
-# app.py to enqueue an index_build job) instead of scanning in-process.
-_INDEX_BUILD_ROLES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'cluster,vision').split(',') if r.strip()}
+# 1Gi `archive` replica (and would any serving process). Only configured build
+# roles may run them: index-worker in dedicated mode, cluster/vision in legacy
+# mode. Serving processes request the affected scope instead of scanning.
+_INDEX_BUILD_ROLES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'cluster,vision,index-worker').split(',') if r.strip()}
 _ROLE_MAY_BUILD_INDEXES = os.getenv('APP_ROLE', 'core').strip().lower() in _INDEX_BUILD_ROLES
-INDEX_BUILD_REQUEST_HOOK: Optional[Callable[[str], object]] = None
+INDEX_BUILD_REQUEST_HOOK: Optional[Callable[..., object]] = None
 
 
 def index_build_allowed() -> bool:
     return _ROLE_MAY_BUILD_INDEXES
 
 
-def request_index_build(user_id: str) -> None:
-    """Best-effort: ask the worker to (re)build this library's indexes."""
+def request_index_build(user_id: str, kind: Optional[str] = None) -> None:
+    """Ask for the affected index, not a full-library build on a stale read."""
     hook = INDEX_BUILD_REQUEST_HOOK
     if hook is None or not user_id:
         return
     try:
-        hook(str(user_id))
+        if kind is None:
+            hook(str(user_id))
+        else:
+            hook(str(user_id), kind=kind)
     except Exception:
         _LOGGER.warning('Index build request failed for user %s', user_id, exc_info=True)
 
@@ -441,7 +442,8 @@ def _builds_only_where_allowed(fn):
     @functools.wraps(fn)
     def wrapper(key, *args, **kwargs):
         if not index_build_allowed():
-            request_index_build(key)
+            kind = fn.__name__.removeprefix('_rebuild_').removesuffix('_index_in_background')
+            request_index_build(key, kind=kind)
             return None
         return fn(key, *args, **kwargs)
     return wrapper
@@ -870,6 +872,92 @@ def metadata_updates_affect_sort_index(updates: Dict) -> bool:
     return bool(_SORT_INDEX_RELEVANT_FIELDS.intersection(updates.keys()))
 
 
+DURABLE_INDEX_UPDATES = bool(os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip())
+METADATA_INDEX_REQUEST_HOOK = None
+
+
+def metadata_index_kinds(updates):
+    """Dependencies of the actual projections, not a generic metadata fan-out."""
+    fields = set(updates)
+    kinds = set()
+    if fields.intersection(_STREAM_SELECT_FIELDS):
+        kinds.add('lexical')
+    sort_fields = _SORT_INDEX_RELEVANT_FIELDS - {'address', 'locationCity', 'locationCountry', 'locationRegion'}
+    if fields.intersection(sort_fields):
+        kinds.add('sort')
+    if fields.intersection({'anonymousImageId', 'thumbnail_status', 'preview_status'}):
+        kinds.add('access')
+    if fields.intersection(_VECTOR_META_COLUMNS):
+        kinds.add('vector')
+    if fields.intersection(_TAG_META_COLUMNS):
+        kinds.add('tag_embedding')
+    if fields.intersection({'rating', 'likes', 'exifData', 'clientLastModified', 'uploadDate', 'processing_state'}):
+        kinds.add('albums')
+    return kinds
+
+
+def prepare_metadata_index_intent(entity, updates):
+    """Stored atomically with the source row, before any queue/dirty-table write."""
+    if not DURABLE_INDEX_UPDATES:
+        return
+    kinds = metadata_index_kinds(updates)
+    previous = _safe_json_load(entity.get('indexPending'))
+    kinds.update(previous.get('kinds') or [])
+    if kinds:
+        entity['indexPending'] = json.dumps({'revision': str(uuid.uuid4()), 'kinds': sorted(kinds)})
+
+
+def publish_metadata_index_intent(user_id, filename, entity):
+    pending = str(entity.get('indexPending') or '')
+    if not DURABLE_INDEX_UPDATES or not pending:
+        return True
+    try:
+        kinds = set(json.loads(pending)['kinds'])
+        touchers = {
+            'lexical': touch_user_lexical_index_state, 'access': touch_user_access_index_state,
+            'vector': touch_user_vector_index_state, 'tag_embedding': touch_user_tag_embedding_index_state,
+            'albums': touch_user_albums_index_state,
+        }
+        for kind in kinds:
+            if kind in ('vector', 'tag_embedding'):
+                # Their owner is another process; its successful rebuild
+                # cannot clear this writer's process-local debounce flag.
+                _clear_manifest_dirty_flag(user_id, kind)
+            if kind == 'sort':
+                if not sort_index_skipped(user_id):
+                    touch_user_sort_index_state(user_id, touch_albums=False)
+            elif kind in touchers:
+                touchers[kind](user_id)
+        marked = kinds.intersection(_SEARCH_INDEX_KINDS)
+        _mark_search_index_dirty_filenames(user_id, [filename], kinds=marked)
+        for kind in marked:
+            _flush_dirty_filename_buffer(user_id, kind)
+        if METADATA_INDEX_REQUEST_HOOK is None:
+            raise RuntimeError('Metadata index scheduler unavailable')
+        import index_updates
+        for kind in sorted(kinds):
+            # These retain specialized ownership: tag embeddings need the
+            # vision model, and the legacy photo vector artifact is on-demand.
+            if kind in ('tag_embedding', 'vector'):
+                continue
+            if kind == 'sort' and sort_index_skipped(user_id):
+                continue
+            if METADATA_INDEX_REQUEST_HOOK(user_id, index_updates.scope_for_index(kind)) == 'unavailable':
+                raise RuntimeError('Metadata index schedule unavailable')
+        # Queue/intent persistence succeeded. Clear only this source outbox
+        # version, never an edit written while the publication was in flight.
+        table = _CTX.get('metadata_table_client')
+        current = table.get_entity(user_id, filename)
+        if current.get('indexPending') == pending:
+            table.update_entity({'PartitionKey': user_id, 'RowKey': filename, 'indexPending': ''},
+                                mode=UpdateMode.MERGE, etag=current.metadata['etag'],
+                                match_condition=MatchConditions.IfNotModified)
+        return True
+    except Exception:
+        _LOGGER.warning('Metadata index intent retained for recovery user=%s', user_id, exc_info=True)
+        return False
+
+
 def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
@@ -881,16 +969,27 @@ def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
             raise RuntimeError(f'Metadata entity not found for {user_id}/{filename}') from exc
         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
             raise RuntimeError('Photo has been deleted.')
+        if (DURABLE_INDEX_UPDATES and all(entity.get(k) == v for k, v in (updates or {}).items())
+                and entity.get('processing_complete') == _photo_processing_complete(entity)):
+            publish_metadata_index_intent(user_id, filename, entity)
+            return dict(entity)
+        changed = {k: v for k, v in (updates or {}).items() if entity.get(k) != v}
         entity.update(updates or {})
+        complete = _photo_processing_complete(entity)
+        if entity.get('processing_complete') != complete:
+            changed['processing_complete'] = complete
+        prepare_metadata_index_intent(entity, changed)
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-        entity['processing_complete'] = _photo_processing_complete(entity)
+        entity['processing_complete'] = complete
         try:
             # Conditional on the etag just read -- a concurrent writer (another
             # processing step, a user edit, a lease race) between our get_entity
             # above and this write now loses this attempt instead of silently
             # clobbering it, and gets retried against a fresh read.
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
-            if metadata_updates_affect_search_indexes(updates):
+            if DURABLE_INDEX_UPDATES:
+                publish_metadata_index_intent(user_id, filename, entity)
+            elif metadata_updates_affect_search_indexes(updates):
                 touch_user_search_indexes_state(user_id, filenames=filename)
             elif metadata_updates_affect_sort_index(updates):
                 touch_user_sort_index_dirty(user_id, [filename])
@@ -1993,6 +2092,8 @@ def _get_blob_client(container_name: str, filename: str):
         return None
     # The SQLite search DB must live on LOCAL EPHEMERAL disk (search_db.py), never
     # on the SMB share -- so it bypasses the share-backed client.
+    import index_publication
+    client = index_publication.fenced(client)
     if INDEX_DISK_CACHE_DIR and container_name in _index_container_names() and '-searchdb' not in filename:
         return _ShareBackedBlob(client, container_name, filename)
     return client
@@ -2781,7 +2882,7 @@ def get_user_vector_index(user_id: str, *, allow_refresh: bool = True) -> Option
         return None
     if not index_build_allowed():
         # Serving process: never scan the library here. The worker builds it.
-        request_index_build(key)
+        request_index_build(key, kind='vector')
         return None
 
     source_version = manifest_source_version or datetime.now(timezone.utc).isoformat()
@@ -3193,7 +3294,7 @@ def get_user_people_embedding_index(user_id: str, *, allow_refresh: bool = True)
         return None
     if not index_build_allowed():
         # Serving process: never scan the library here. The worker builds it.
-        request_index_build(key)
+        request_index_build(key, kind='people_embedding')
         return None
 
     source_version = manifest_source_version or datetime.now(timezone.utc).isoformat()
@@ -3501,9 +3602,12 @@ def get_user_tag_embedding_index(user_id: str, *, allow_refresh: bool = True) ->
 
     if not allow_refresh:
         return None
-    if not index_build_allowed():
-        # Serving process: never scan the library here. The worker builds it.
-        request_index_build(key)
+    model_owner = (DURABLE_INDEX_UPDATES and os.getenv('APP_ROLE', '').strip().lower() == 'vision'
+                   and vision_utils.image_encoder_available())
+    if not index_build_allowed() and not model_owner:
+        # Model-dependent tag maintenance stays with the vision owner.
+        if not DURABLE_INDEX_UPDATES:
+            request_index_build(key, kind='tag_embedding')
         return None
 
     source_version = manifest_source_version or datetime.now(timezone.utc).isoformat()
@@ -4178,7 +4282,7 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
                     deletes.append(name)
             if search_db.publish_delta(key, upserts, deletes) is None:
                 return {'status': 'conflict', 'published': published}
-            _clear_dirty_search_index_filenames(key, 'lexical', chunk)
+            _clear_dirty_search_index_filenames(key, 'lexical', dirty.subset(chunk))
             published += 1
             upserted += len(upserts)
             removed += len(deletes)
@@ -4200,10 +4304,11 @@ _RECONCILE_LAST: Dict[str, float] = {}
 
 
 def reconcile_search_db(user_id: str, *, force: bool = False) -> Dict[str, object]:
-    """Self-heal: photos that exist in the metadata table but not in the library database (dirty
-    marks lost to a restart, a database built from a half-processed table, ...) are marked dirty so
-    the next delta publishes them. Reads only RowKeys (no payloads) and the local database's
-    filenames, so it is cheap; rate-limited per library."""
+    """Explicit repair scan: relay source outboxes and mark missing catalog rows.
+
+    Projects only keys/state/outbox fields, but still scans library-sized
+    state. Never invoke this scan as a dependency of an ordinary edit.
+    """
     import search_db
     key = str(user_id or '').strip()
     table = _CTX.get('metadata_table_client')
@@ -4219,10 +4324,13 @@ def reconcile_search_db(user_id: str, *, force: bool = False) -> Dict[str, objec
     try:
         known = db.all_filenames()
         missing: List[str] = []
+        pending_failed = 0
         pk = _escape_odata(key)
         for row in table_scan.scan_partition(
-                table.query_entities, f"PartitionKey eq '{pk}'", select=['RowKey', 'processing_state']):
+                table.query_entities, f"PartitionKey eq '{pk}'", select=['RowKey', 'processing_state', 'indexPending']):
             name = str(row.get('RowKey') or '')
+            if name and row.get('indexPending'):
+                pending_failed += int(not publish_metadata_index_intent(key, name, row))
             if not name or name in known:
                 continue
             if str(row.get('processing_state') or '').strip().lower() == 'deleted':
@@ -4236,6 +4344,8 @@ def reconcile_search_db(user_id: str, *, force: bool = False) -> Dict[str, objec
     if missing:
         _mark_search_index_dirty_filenames(key, missing, kinds=('lexical',))
         _flush_dirty_filename_buffer(key, 'lexical')
+    if pending_failed:
+        return {'status': 'unavailable', 'pendingFailed': pending_failed}
     perf_instrumentation.log_event('search_db_reconcile', user=key, missing=len(missing), known=len(known))
     return {'status': 'ok', 'missing': len(missing)}
 
@@ -4399,6 +4509,8 @@ def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
     the buffer is purely a write-side coalescing optimization, never a
     source of truth a reader relies on directly."""
     table = _CTX.get('search_index_dirty_table_client')
+    if table is None and DURABLE_INDEX_UPDATES:
+        raise RuntimeError('Index dirty storage unavailable')
     with _DIRTY_FILENAME_BUFFER_LOCK:
         pending = _DIRTY_FILENAME_BUFFER.pop((user_id, index_kind), None)
     if not pending or table is None:
@@ -4420,10 +4532,11 @@ def _flush_dirty_filename_buffer(user_id: str, index_kind: str) -> None:
                 for entity in entities:
                     table.upsert_entity(entity)
         except Exception:
-            # Best-effort, same as before batching -- these filenames' dirty
-            # state is lost for this cycle; the next real change to any of
-            # them re-marks it dirty (see _mark_search_index_dirty_filenames).
+            with _DIRTY_FILENAME_BUFFER_LOCK:
+                _DIRTY_FILENAME_BUFFER.setdefault((user_id, index_kind), set()).update(pending_list[start:])
             _LOGGER.warning('Dirty-mark write failed partition=%s names=%d', partition_key, len(chunk), exc_info=True)
+            _schedule_dirty_flush()
+            raise
 
 
 def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> None:
@@ -4441,10 +4554,9 @@ def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> N
     batch once a partition's buffer reaches _DIRTY_FILENAME_BATCH_SIZE (see
     _flush_dirty_filename_buffer), collapsing what could be tens of
     thousands of individual writes during one large upload into a much
-    smaller number of batched transactions. Best-effort: a failed flush just
-    means the next real change to an affected filename re-marks it dirty,
-    not wrong results -- same tolerance _get_dirty_search_index_filenames
-    already documented before this buffering existed."""
+    smaller number of batched transactions. A failed flush restores unsent
+    names and raises so callers cannot acknowledge work that was not saved.
+    """
     if not filenames:
         return
     to_flush: List[Tuple[str, str]] = []
@@ -4470,8 +4582,9 @@ def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> N
 def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional[Set[str]]:
     """Filenames marked dirty for this user's index_kind since its last
     successful rebuild, or None if the dirty table isn't usable (unconfigured,
-    or the query failed). Callers must treat None as "can't do an incremental
-    merge, fall back to a full rebuild" -- never as "nothing changed".
+    or the query failed). None never means "nothing changed". Dedicated
+    Sort/Access maintenance retries rather than promoting failure to a scan;
+    legacy builders can still fall back to a full rebuild.
 
     Flushes the in-memory dirty-filename buffer for this (user, kind) first
     (see _mark_search_index_dirty_filenames) so a rebuild reading "what's
@@ -4486,57 +4599,19 @@ def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional
         rows = list(table.query_entities(f"PartitionKey eq '{_escape_odata(partition_key)}'"))
     except Exception:
         return None
-    return {str(row.get('RowKey') or '') for row in rows if row.get('RowKey')}
+    from index_work import DirtySnapshot
+    return DirtySnapshot(rows)
 
 
 def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames) -> None:
-    """Clear filenames as no-longer-dirty for this user's index_kind.
-
-    Flushes the in-memory dirty-filename buffer first, same reasoning as
-    _get_dirty_search_index_filenames: a filename can be marked dirty (see
-    _mark_search_index_dirty_filenames) and still be sitting only in memory,
-    never yet written to the table. Deleting straight from the table without
-    flushing first would silently no-op on that filename -- its buffered
-    copy would survive and get flushed later, resurrecting a mark this call
-    was meant to clear.
-
-    Batched the same way _flush_dirty_filename_buffer writes dirty marks
-    (submit_transaction, chunked to _DIRTY_FILENAME_BATCH_SIZE/100 -- Azure
-    Table's own transaction-size cap) instead of one delete_entity call per
-    filename -- a full index_build was measured spending 75% of its wall
-    time (768 individual deletes, ~7.5s) clearing exactly this table after a
-    large upload."""
+    """Acknowledge captured versions, leaving concurrent and buffered edits alone."""
     table = _CTX.get('search_index_dirty_table_client')
     if table is None or not filenames:
         return
-    _flush_dirty_filename_buffer(user_id, index_kind)
-    partition_key = _search_index_dirty_partition_key(user_id, index_kind)
-    filenames_list = list(filenames)
-    submit_transaction = getattr(table, 'submit_transaction', None)
-    for start in range(0, len(filenames_list), _DIRTY_FILENAME_BATCH_SIZE):
-        chunk = filenames_list[start:start + _DIRTY_FILENAME_BATCH_SIZE]
-        try:
-            if submit_transaction is not None:
-                submit_transaction([
-                    ('delete', {'PartitionKey': partition_key, 'RowKey': filename})
-                    for filename in chunk
-                ])
-            else:
-                for filename in chunk:
-                    table.delete_entity(partition_key=partition_key, row_key=filename)
-        except Exception:
-            # Best-effort, same tolerance as before batching -- a filename
-            # that fails to clear here just gets re-scanned as still-dirty
-            # next time (see _get_dirty_search_index_filenames), not wrong
-            # results, and a transaction failing on one already-deleted row
-            # (e.g. a retry) must not block the rest of the chunk from
-            # clearing -- fall back to per-filename deletes for this chunk
-            # only, each independently tolerant of a 404.
-            for filename in chunk:
-                try:
-                    table.delete_entity(partition_key=partition_key, row_key=filename)
-                except Exception:
-                    pass
+    import index_publication
+    from index_work import acknowledge_dirty
+    index_publication.check()
+    acknowledge_dirty(table, filenames)
 
 
 # Past this many photos the sort index has no consumer: the browser pages from the server instead of
@@ -4753,11 +4828,12 @@ def refresh_user_lexical_index(
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
 
     snapshot = None
+    dirty_before = _get_dirty_search_index_filenames(key, 'lexical')
     dirty_to_clear: Optional[Set[str]] = None
     if not force_full:
         existing = _load_lexical_index_blob(key)
         if existing is not None and existing.schema_version == _LEXICAL_INDEX_SCHEMA_VERSION:
-            dirty = _get_dirty_search_index_filenames(key, 'lexical')
+            dirty = dirty_before
             if dirty is not None and not _dirty_set_too_large_to_merge(key, len(dirty)):
                 snapshot = _merge_user_lexical_index_snapshot(key, existing, dirty, source_version)
                 if snapshot is not None:
@@ -4770,9 +4846,7 @@ def refresh_user_lexical_index(
     if snapshot is None:
         snapshot = _build_user_lexical_index_snapshot(key, source_version)
         if snapshot is not None:
-            # A full rebuild reflects every currently-dirty filename too -- see
-            # the identical comment in refresh_user_vector_index.
-            dirty_to_clear = _get_dirty_search_index_filenames(key, 'lexical') or set()
+            dirty_to_clear = dirty_before
     if snapshot is None:
         return None
     container_name = _lexical_index_container_name()
@@ -5033,7 +5107,7 @@ def delete_user_sort_index_data(user_id: str) -> None:
     invalidate_user_sort_index_cache(key)
 
 
-def touch_user_sort_index_state(user_id: str) -> str:
+def touch_user_sort_index_state(user_id: str, *, touch_albums: bool = True) -> str:
     """Mark the sort index's own manifest dirty with a fresh sourceVersion --
     mirrors touch_user_lexical_index_state, but writes the sort index's own
     manifest blob, independent of the lexical one."""
@@ -5067,7 +5141,8 @@ def touch_user_sort_index_state(user_id: str) -> str:
     # touch_user_search_indexes_state's fan-out) can change which photo an
     # album's cover should be, so keep the albums index in lockstep here
     # rather than duplicating this trigger at every photo-mutation call site.
-    touch_user_albums_index_state(key)
+    if touch_albums:
+        touch_user_albums_index_state(key)
     return source_version
 
 
@@ -5304,7 +5379,10 @@ def _refresh_rows_index_on_disk(
     if metadata_table_client is None:
         return None
     blob_client = _get_blob_client(container_name, blob_name) if container_name else None
-    dirty = None if force_full else _get_dirty_search_index_filenames(key, kind)
+    dirty_before = _get_dirty_search_index_filenames(key, kind)
+    if DURABLE_INDEX_UPDATES and dirty_before is None:
+        raise RuntimeError('Index dirty state unavailable')
+    dirty = None if force_full else dirty_before
     if dirty is not None and not dirty and blob_client is not None:
         # Nothing changed since the last build and the manifest is clean: rewriting the whole file
         # (a full streamed pass) would only refresh its timestamp.
@@ -5374,7 +5452,7 @@ def _refresh_rows_index_on_disk(
                             row = row_fn(dict(entity))
                             if row is not None:
                                 writer.add(row)
-                    dirty_to_clear = _get_dirty_search_index_filenames(key, kind) or set()
+                    dirty_to_clear = dirty_before
                 count = writer.close()
             except BaseException:
                 writer.abort()
@@ -6790,7 +6868,7 @@ def _people_index_face_bbox(face: Dict) -> Dict[str, object]:
 _PEOPLE_INDEX_PERSON_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds']
 _PEOPLE_INDEX_FACE_COLUMNS = [
     'PartitionKey', 'RowKey', 'personId', 'rejected', 'reviewStatus', 'confidence',
-    'confirmedByUser', 'filename', 'bbox',
+    'confirmedByUser', 'filename', 'bbox', 'sourceDeleted',
 ]
 
 
@@ -7046,9 +7124,11 @@ def _incremental_people_index_snapshot_by_ids(
             try:
                 person = person_table_client.get_entity(partition_key=user_id, row_key=str(person_id))
                 affected_people[str(person_id)] = person
-            except Exception:
-                # Person deleted, will be filtered out
+            except ResourceNotFoundError:
+                # Only a confirmed deletion removes the previous projection.
                 pass
+            except Exception:
+                return None
     except Exception:
         return None
 
@@ -7075,9 +7155,16 @@ def _incremental_people_index_snapshot_by_ids(
             if person_id and person_id not in affected_ids:
                 merged_rows.append(row)
 
-    # Add updated rows
-    if fresh_rows:
-        merged_rows.extend(fresh_rows)
+    # The scan returns a snapshot, not an iterable of rows.
+    merged_rows.extend(fresh_rows.rows)
+    merged_rows.sort(key=lambda row: str(row.get('personId') or ''))
+    counter = 1
+    for index, row in enumerate(merged_rows):
+        if row.get('autoName'):
+            row = {**row, 'name': f'Unnamed {counter}'}
+            merged_rows[index] = row
+            counter += 1
+    merged_rows.sort(key=lambda row: 0 if row.get('isNamed') else 1)
 
     return LexicalIndexSnapshot(
         user_id=str(user_id),
@@ -7356,14 +7443,11 @@ def prime_all_user_indexes_sequentially(
     lock = _INDEX_PRIME_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
         if wait:
-            # Another prime is already running (in this process) -- block
-            # until it releases rather than returning immediately, so the
-            # caller's HTTP request still spans the actual build. Nothing
-            # left for this call to do once it does: re-running the build
-            # here would just redundantly redo the work that just finished.
+            # A different scope may own the lock. Waiting for it is not
+            # evidence that this caller's requested indexes were updated.
             lock.acquire(blocking=True)
-            lock.release()
-        return failed
+        else:
+            return failed
 
     # Fetched once (when anyone's actually listening) instead of inside _emit
     # -- that used to call get_user_index_readiness fresh on every call (once
@@ -7401,16 +7485,8 @@ def prime_all_user_indexes_sequentially(
             ):
                 if kinds is not None and kind not in kinds:
                     continue
-                # Go through this kind's own rebuild lock (not just this
-                # function's own priming lock) so a concurrent page-level
-                # request (e.g. GET /api/photos/sort-index) sees the lock
-                # held and no-ops instead of kicking a second, parallel
-                # rebuild of the same kind -- the exact concurrent-scan
-                # pile-up this function exists to avoid. Non-blocking: if
-                # something else already holds it, that rebuild is already
-                # in flight, so this step is skipped rather than queued.
                 kind_lock = kind_locks.lock_for(key)
-                if not kind_lock.acquire(blocking=False):
+                if not kind_lock.acquire(blocking=wait):
                     continue
                 try:
                     extra_kwargs: Dict[str, object] = {}
@@ -7420,7 +7496,7 @@ def prime_all_user_indexes_sequentially(
                         extra_kwargs['affected_album_ids'] = affected_album_ids
                     with perf_instrumentation.step(f'index.prime.{kind}', user=key):
                         result = refresh_fn(key, source_version=source_version, **extra_kwargs)
-                    if result is None and kind in ('albums', 'people'):
+                    if result is None:
                         failed.append(kind)
                         _LOGGER.error('Index priming produced no %s index user=%s', kind, key)
                     else:
@@ -7563,6 +7639,19 @@ def get_user_index_status_detailed(user_id: str) -> Dict[str, object]:
 
     for kind, loader in _index_manifest_loaders().items():
         manifest = loader(key) if key else {}
+        if kind == 'lexical' and key and DURABLE_INDEX_UPDATES:
+            import search_db
+            manifest = search_db.load_manifest(key)
+            table = _CTX.get('search_index_dirty_table_client')
+            dirty = True
+            if table is not None:
+                try:
+                    partition = _search_index_dirty_partition_key(key, 'lexical')
+                    dirty = next(iter(table.query_entities(
+                        f"PartitionKey eq '{_escape_odata(partition)}'", select=['RowKey'])), None) is not None
+                except Exception:
+                    pass
+            manifest = dict(manifest, dirty=dirty)
         built = bool(str(manifest.get('sourceVersion') or '').strip())
         dirty = bool(manifest.get('dirty')) if manifest else False
         updated_at = manifest.get('updatedAt') or manifest.get('sourceVersion') if manifest else None

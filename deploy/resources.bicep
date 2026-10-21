@@ -76,6 +76,9 @@ param clusterFileShareQuotaGiB int = 100
 @maxValue(1)
 param clusterMinReplicas int = 0
 
+@description('Move index maintenance to a dedicated queue consumer in the indexer app; legacy cluster messages are forwarded during rollout.')
+param dedicatedIndexWorker bool = true
+
 @description('Secret used to sign login sessions. Always auto-generated fresh at deploy time -- intentionally not persisted. Every deployment therefore signs out all existing sessions (by design: simplest and safest default). What matters is that every app which validates these tokens restarts on the SAME new value together -- see revisionSuffix below -- so a login right after a deploy finishes always works.')
 @secure()
 param sessionSecretParam string = '${newGuid()}${newGuid()}'
@@ -379,6 +382,8 @@ resource workerCheckpointStorage 'Microsoft.App/managedEnvironments/storages@202
 
 // Shared backend/worker environment variables.
 var backendEnv = [
+  { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: dedicatedIndexWorker ? 'photostore-index-maintenance' : '' }
+  { name: 'INDEX_BUILD_ROLES', value: dedicatedIndexWorker ? 'index-worker' : 'cluster,vision' }
   { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
   { name: 'USE_MANAGED_IDENTITY', value: 'true' }
   // 'sas': browsers fetch media straight from blob storage via short-lived
@@ -927,7 +932,7 @@ resource core 'Microsoft.App/containerApps@2024-03-01' = {
 // registration differs, not the module's own startup), sized much smaller
 // since this traffic is low-volume, best-effort history logging, not the
 // gallery/upload hot path.
-resource indexer 'Microsoft.App/containerApps@2024-03-01' = {
+resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
   name: indexerAppName
   location: location
   identity: {
@@ -951,22 +956,20 @@ resource indexer 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
+      terminationGracePeriodSeconds: 180
       revisionSuffix: deployRevisionTag
-      containers: [
+      containers: concat([
         {
           name: 'indexer'
           image: coreImage
           volumeMounts: [
             { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
           ]
-          // 2vCPU/4Gi (was 0.5/1Gi): indexer is now the derived-index builder
-          // (POST /api/tools/indexes/build). Building the lexical index scans
-          // a user's full metadata partition (OCR/tags/faces per row) -- the
-          // exact work that OOM-ed the 1Gi backend, so it gets worker-class
-          // headroom here. See prime_all_user_indexes_sequentially.
+          // Keep API threads separate from the worker's memory/CPU budget.
+          // Together the two containers retain the previous 2 CPU/4Gi total.
           resources: {
-            cpu: json('2.0')
-            memory: '4Gi'
+            cpu: dedicatedIndexWorker ? json('0.5') : json('2.0')
+            memory: dedicatedIndexWorker ? '1Gi' : '4Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'indexer' }
@@ -981,14 +984,39 @@ resource indexer 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
           ])
         }
-      ]
+      ], dedicatedIndexWorker ? [
+        {
+          name: 'index-maintenance'
+          image: coreImage
+          resources: {
+            cpu: json('1.5')
+            memory: '3Gi'
+          }
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+          ]
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'index-worker' }
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
+            { name: 'INDEX_BUILD_WORK_DIR', value: '/mnt/photostore/shared/index-build' }
+            { name: 'SEARCH_DB_DIR', value: '/tmp/photostore-index-search' }
+            { name: 'SEARCH_DB_MAX_CACHE_MB', value: '3500' }
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
+            { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+          ])
+        }
+      ] : [])
       volumes: [
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
         minReplicas: 0
-        maxReplicas: 2
-        rules: [
+        // One publisher process during migration; API and queue work are
+        // isolated containers, while work leases protect restart overlap.
+        maxReplicas: dedicatedIndexWorker ? 1 : 2
+        rules: concat([
           {
             name: 'http-scaler'
             http: {
@@ -997,7 +1025,21 @@ resource indexer 'Microsoft.App/containerApps@2024-03-01' = {
               }
             }
           }
-        ]
+        ], dedicatedIndexWorker ? [
+          {
+            name: 'index-maintenance-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-index-maintenance'
+                queueLength: '1'
+                queueLengthStrategy: 'visibleonly'
+              }
+              identity: 'system'
+            }
+          }
+        ] : [])
       }
     }
   }

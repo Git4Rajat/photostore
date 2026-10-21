@@ -8,16 +8,24 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
 
 
-class ResourceNotFound(Exception):
+class ResourceNotFound(ResourceNotFoundError):
     pass
+
+
+class _Entity(dict):
+    def __init__(self, row, version):
+        super().__init__(row)
+        self.metadata = {'etag': str(version)}
 
 
 class FakeTable:
     def __init__(self) -> None:
         self.rows: dict = {}  # (pk, rk) -> dict
         self.stamps: dict = {}  # (pk, rk) -> datetime of the last write (the service-side Timestamp)
+        self.versions: dict = {}
         self.clock = None  # tests may set a callable returning a datetime
         self.submit_transaction_calls: list = []  # list of the operations lists passed in
 
@@ -25,7 +33,9 @@ class FakeTable:
         pass
 
     def upsert_entity(self, entity, mode=None, **kwargs):
-        self.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
+        key = entity['PartitionKey'], entity['RowKey']
+        self.versions[key] = self.versions.get(key, 0) + 1
+        self.rows[key] = dict(entity)
         self.stamps[(entity['PartitionKey'], entity['RowKey'])] = self.clock() if self.clock else datetime.now(timezone.utc)
 
     def submit_transaction(self, operations):
@@ -35,32 +45,44 @@ class FakeTable:
         # the "N upserts become 1 call" behavior storage_utils's dirty-
         # filename batching relies on (see _flush_dirty_filename_buffer).
         self.submit_transaction_calls.append(list(operations))
-        for op_type, entity in operations:
+        for operation in operations:
+            op_type, entity = operation[:2]
+            kwargs = operation[2] if len(operation) > 2 else {}
             if op_type == 'upsert':
-                self.upsert_entity(entity)
+                self.upsert_entity(entity, **kwargs)
             elif op_type == 'delete':
-                self.delete_entity(entity['PartitionKey'], entity['RowKey'])
+                self.delete_entity(entity['PartitionKey'], entity['RowKey'], **kwargs)
             else:
                 raise ValueError(f'Unsupported fake transaction op: {op_type}')
 
     def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
-        # No real etag/optimistic-concurrency simulation here -- tests that
-        # need to exercise a genuine conflict use a dedicated fake (see
-        # test_metadata_write_concurrency.py). This just enforces update's
-        # real difference from upsert: the row must already exist.
+        # Match conditional writes, including projected MERGE entities.
         key = (entity['PartitionKey'], entity['RowKey'])
         if key not in self.rows:
             raise ResourceNotFound(f'{key} not found')
-        self.rows[key] = dict(entity)
+        expected = etag or getattr(entity, 'metadata', {}).get('etag')
+        if match_condition is not None and expected != str(self.versions.get(key, 0)):
+            raise ResourceModifiedError('changed')
+        self.rows[key] = {**self.rows[key], **entity} if mode == 'merge' else dict(entity)
+        self.versions[key] = self.versions.get(key, 0) + 1
 
     def get_entity(self, partition_key, row_key):
         key = (partition_key, row_key)
         if key not in self.rows:
             raise ResourceNotFound(f'{key} not found')
-        return dict(self.rows[key])
+        return _Entity(self.rows[key], self.versions.get(key, 0))
 
-    def delete_entity(self, partition_key, row_key):
-        self.rows.pop((partition_key, row_key), None)
+    def delete_entity(self, partition_key, row_key, *, etag=None, match_condition=None):
+        key = partition_key, row_key
+        if match_condition is not None and etag != str(self.versions.get(key, 0)):
+            raise ResourceModifiedError('changed')
+        self.rows.pop(key, None)
+
+    def _project(self, rows, select):
+        for i, row in enumerate(rows):
+            rows[i] = _Entity({k: v for k, v in row.items() if not select or k in select},
+                              self.versions.get((row.get('PartitionKey'), row.get('RowKey')), 0))
+        return rows
 
     def query_entities(self, filter_str, select=None, **kwargs):
         # Compound clause checked first -- the plain-PartitionKey pattern's
@@ -72,9 +94,7 @@ class FakeTable:
         if m:
             pk, since = m.group(1), datetime.strptime(m.group(2), '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
             rows = [dict(v) for (p, r), v in self.rows.items() if p == pk and self.stamps.get((p, r), since) >= since]
-            if select:
-                rows = [{k: v[k] for k in select if k in v} for v in rows]
-            return rows
+            return self._project(rows, select)
         m = re.match(r"PartitionKey eq '([^']*)' and \((.+)\)$", filter_str.strip())
         if m:
             # "PartitionKey eq 'x' and (a ge 'v' or b eq 'w' or ...)"
@@ -93,9 +113,7 @@ class FakeTable:
                 dict(v) for (p, _), v in self.rows.items()
                 if p == pk and any(ops[op](str(v.get(f, '')), val) for f, op, val in clauses)
             ]
-            if select:
-                rows = [{k: v[k] for k in select if k in v} for v in rows]
-            return rows
+            return self._project(rows, select)
         m = re.match(r"PartitionKey eq '(.*)' and (\w+) eq '(.*)'$", filter_str.strip())
         if m:
             pk, field, value = m.group(1), m.group(2), m.group(3)
@@ -115,9 +133,7 @@ class FakeTable:
                 raise ValueError(f'Unsupported filter: {filter_str}')
             pk = m.group(1)
             rows = [dict(v) for (p, _), v in self.rows.items() if p == pk]
-        if select:
-            rows = [{k: v[k] for k in select if k in v} for v in rows]
-        return rows
+        return self._project(rows, select)
 
 
 def make_store():

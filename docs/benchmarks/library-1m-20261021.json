@@ -1,0 +1,106 @@
+{
+  "started_utc": "2026-10-21T17:14:08.135579+00:00",
+  "scope": "one synthetic library, production DatabaseBuilder/SearchDatabase, local disk; no HTTP/Azure/AI",
+  "photos": 1000000,
+  "python": "3.13.2 (main, Feb  4 2025, 14:51:09) [Clang 16.0.0 (clang-1600.0.26.6)]",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "sqlite": "3.53.1",
+  "cpu_count": 14,
+  "git_revision": "252d573bfdce059520839ff5c750f9683a45c299",
+  "fixture": "10 subjects; travel/outdoor on every row; four cities; 10 years; ratings 0-5; 1/3 person membership; no OCR, media or embeddings",
+  "build_seconds": 122.661,
+  "database_bytes": 645472256,
+  "gzip_bytes": 178892123,
+  "gzip_seconds": 9.691,
+  "serial": {
+    "gallery_capture_first": {
+      "first_call_ms": 5.037,
+      "samples": 12,
+      "p50_ms": 0.106,
+      "p95_ms": 0.327,
+      "max_ms": 0.327
+    },
+    "gallery_capture_middle": {
+      "first_call_ms": 871.597,
+      "samples": 12,
+      "p50_ms": 782.805,
+      "p95_ms": 817.203,
+      "max_ms": 817.203
+    },
+    "gallery_capture_tail": {
+      "first_call_ms": 1559.353,
+      "samples": 12,
+      "p50_ms": 1572.397,
+      "p95_ms": 1622.006,
+      "max_ms": 1622.006
+    },
+    "gallery_name_first": {
+      "first_call_ms": 80.177,
+      "samples": 12,
+      "p50_ms": 81.241,
+      "p95_ms": 82.31,
+      "max_ms": 82.31
+    },
+    "gallery_rating_first": {
+      "first_call_ms": 1.894,
+      "samples": 12,
+      "p50_ms": 0.066,
+      "p95_ms": 0.097,
+      "max_ms": 0.097
+    },
+    "gallery_filtered_first": {
+      "first_call_ms": 9.081,
+      "samples": 12,
+      "p50_ms": 7.929,
+      "p95_ms": 8.2,
+      "max_ms": 8.2
+    },
+    "search_beach_candidates_score_count": {
+      "first_call_ms": 682.741,
+      "samples": 12,
+      "p50_ms": 679.328,
+      "p95_ms": 686.92,
+      "max_ms": 686.92
+    },
+    "search_common_candidates_count": {
+      "first_call_ms": 729.022,
+      "samples": 12,
+      "p50_ms": 725.701,
+      "p95_ms": 771.635,
+      "max_ms": 771.635
+    }
+  },
+  "concurrent": [
+    {
+      "threads": 1,
+      "operations": 80,
+      "wall_seconds": 42.926,
+      "ops_per_second": 1.864,
+      "samples": 80,
+      "p50_ms": 573.424,
+      "p95_ms": 951.679,
+      "max_ms": 988.037
+    },
+    {
+      "threads": 4,
+      "operations": 80,
+      "wall_seconds": 36.998,
+      "ops_per_second": 2.162,
+      "samples": 80,
+      "p50_ms": 1578.879,
+      "p95_ms": 3477.607,
+      "max_ms": 3603.851
+    },
+    {
+      "threads": 16,
+      "operations": 80,
+      "wall_seconds": 54.405,
+      "ops_per_second": 1.47,
+      "samples": 80,
+      "p50_ms": 10226.488,
+      "p95_ms": 18520.702,
+      "max_ms": 19193.288
+    }
+  ],
+  "peak_process_rss_bytes": 688324608
+}

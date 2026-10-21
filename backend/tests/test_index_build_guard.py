@@ -31,7 +31,7 @@ class _ExplodingTable:
 def serving_process(monkeypatch):
     monkeypatch.setattr(su, '_ROLE_MAY_BUILD_INDEXES', False)
     requested = []
-    monkeypatch.setattr(su, 'INDEX_BUILD_REQUEST_HOOK', lambda uid: requested.append(uid))
+    monkeypatch.setattr(su, 'INDEX_BUILD_REQUEST_HOOK', lambda uid, **kw: requested.append(uid))
     for client in ('metadata_table_client', 'person_table_client', 'face_table_client', 'embeddings_table_client',
                    'albums_table_client'):
         monkeypatch.setitem(su._CTX, client, _ExplodingTable())
@@ -72,7 +72,7 @@ def test_background_kickers_become_build_requests(serving_process, kicker):
 def test_build_roles_still_build(monkeypatch):
     monkeypatch.setattr(su, '_ROLE_MAY_BUILD_INDEXES', True)
     requested = []
-    monkeypatch.setattr(su, 'INDEX_BUILD_REQUEST_HOOK', lambda uid: requested.append(uid))
+    monkeypatch.setattr(su, 'INDEX_BUILD_REQUEST_HOOK', lambda uid, **kw: requested.append(uid))
     ran = []
     monkeypatch.setattr(su, 'refresh_user_sort_index', lambda key, **k: ran.append(key))
     monkeypatch.setattr(su, '_load_sort_index_manifest', lambda key: {})
@@ -212,7 +212,7 @@ def test_serving_process_does_not_scan_person_rows_to_build_the_assignment_index
     import app
     monkeypatch.setattr(su, '_ROLE_MAY_BUILD_INDEXES', False)
     requested = []
-    monkeypatch.setattr(su, 'INDEX_BUILD_REQUEST_HOOK', lambda uid: requested.append(uid))
+    monkeypatch.setattr(su, 'INDEX_BUILD_REQUEST_HOOK', lambda uid, **kw: requested.append(uid))
     monkeypatch.setattr(app, 'person_table_client', _ExplodingTable())
     monkeypatch.setattr(app, 'get_user_people_embedding_index', lambda uid, allow_refresh=True: None)  # no durable blob yet
     app._people_embedding_index_cache.invalidate('lib-3')

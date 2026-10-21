@@ -22,7 +22,8 @@ export type JobStatusRecord = {
     error?: string | null;
     updatedAt?: string;
     suppressNotification?: boolean;
-    indexScope?: 'full' | 'light' | 'people' | 'dedup' | 'dedup-idle';
+    indexScope?: 'full' | 'light' | 'people' | 'albums' | 'sort' | 'access' | 'search'
+        | 'vector' | 'tag_embedding' | 'people_embedding' | 'compact' | 'reconcile' | 'dedup' | 'dedup-idle';
 };
 
 // Index job IDs are reused. A later completion must be announced without

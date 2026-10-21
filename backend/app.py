@@ -744,6 +744,10 @@ CLUSTERING_WORKER_MAX_RETRIES = int(os.getenv('CLUSTERING_WORKER_MAX_RETRIES', '
 # run_clustering_worker), so a clean/download request gets picked up within
 # one poll cycle regardless of how deep the clustering queue is.
 LIBRARY_OPS_QUEUE_NAME = os.getenv('LIBRARY_OPS_QUEUE_NAME', 'photostore-library-ops')
+# Empty preserves legacy deployments until their indexer queue worker exists.
+INDEX_MAINTENANCE_QUEUE_NAME = os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip()
+INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME = os.getenv(
+    'INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME', 'photostore-index-maintenance-deadletter')
 # _execute_library_clean (and _execute_library_download) are naturally
 # idempotent/resumable -- they walk-and-delete/export whatever's still there,
 # so redelivering the same message is always safe, unlike a generic
@@ -1120,6 +1124,7 @@ clustering_queue_client = None
 queue_service_client = None
 ipwork_queue_client = None
 library_ops_queue_client = None
+index_maintenance_queue_client = None
 clustering_deadletter_queue_client = None
 library_ops_deadletter_queue_client = None
 
@@ -1418,6 +1423,7 @@ def _init_storage_clients():
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
     global clustering_queue_client, queue_service_client, ipwork_queue_client, library_ops_queue_client
+    global index_maintenance_queue_client
     global clustering_deadletter_queue_client, library_ops_deadletter_queue_client
 
     account_name = STORAGE_ACCOUNT_NAME or os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
@@ -1559,6 +1565,9 @@ def _init_storage_clients():
     clustering_queue_client = clustering_queue_client_local
     ipwork_queue_client = ipwork_queue_client_local
     library_ops_queue_client = library_ops_queue_client_local
+    index_maintenance_queue_client = (
+        queue_service_client_local.get_queue_client(INDEX_MAINTENANCE_QUEUE_NAME)
+        if INDEX_MAINTENANCE_QUEUE_NAME else None)
     clustering_deadletter_queue_client = clustering_deadletter_queue_client_local
     library_ops_deadletter_queue_client = library_ops_deadletter_queue_client_local
     queue_service_client = queue_service_client_local
@@ -1596,6 +1605,8 @@ def _init_storage_clients():
         lambda q=clustering_deadletter_queue_client: q.create_queue(),
         lambda q=library_ops_deadletter_queue_client: q.create_queue(),
     ]
+    if index_maintenance_queue_client is not None:
+        _ensure_fns.append(index_maintenance_queue_client.create_queue)
     if AUTH_MODE == 'password':
         _ensure_fns.append(lambda: config_table_client.create_table())
     with ThreadPoolExecutor(max_workers=len(_ensure_fns)) as _ensure_pool:
@@ -3208,21 +3219,31 @@ def _humanize_job(row: Dict) -> Dict:
         elif status == 'failed':
             title = 'Preview generation failed'
     elif job_type == INDEX_BUILD_JOB_TYPE:
+        import index_updates
         kind = 'index_build'
         scope = str(row.get('indexScope') or result.get('scope') or '')
-        if scope not in {'full', 'light', 'people', 'dedup', 'dedup-idle'}:
+        if scope not in index_updates.SCOPE_KINDS:
             # Older workers did not retain scope in result. Match the complete
             # deterministic ID, not a suffix that could be part of a user ID.
             base = _index_build_job_id(str(row.get('userId') or row.get('PartitionKey') or ''))
-            scope = next((name for name in ('light', 'people', 'dedup', 'dedup-idle')
+            scope = next((name for name in index_updates.SCOPE_KINDS if name != 'full'
                           if row.get('jobId') == f'{base}-{name}'), 'full')
         label, description = {
             'full': ('Full library indexes', 'Photo browsing, search, albums and people indexes finished updating. '
                      'Duplicate-check updates are reported separately.'),
             'light': ('Photo browsing index', 'Photo ordering and library access refreshed. '
                       'Search, people and album updates can finish separately.'),
-            'people': ('People and albums indexes', 'People and album listings refreshed. '
+            'people': ('People index', 'People listings and pending search changes refreshed. '
                        'Photo analysis and face grouping can still be running.'),
+            'albums': ('Albums index', 'Album listings refreshed.'),
+            'sort': ('Photo ordering index', 'Photo ordering and gallery fields refreshed.'),
+            'access': ('Photo access index', 'Photo media availability refreshed.'),
+            'search': ('Search index', 'Pending photo search changes refreshed.'),
+            'compact': ('Search database compaction', 'Search database maintenance completed.'),
+            'reconcile': ('Library reconciliation', 'Missing catalog records checked and queued for repair.'),
+            'vector': ('Photo vector index', 'Photo embedding lookup refreshed.'),
+            'tag_embedding': ('Tag embedding index', 'Tag embedding lookup refreshed.'),
+            'people_embedding': ('People embedding index', 'People embedding lookup refreshed.'),
             'dedup': ('Duplicate-check index', 'Saved file hashes for checking future uploads for duplicates refreshed. '
                       'This is separate from photo processing and search.'),
             'dedup-idle': ('Duplicate-check index', 'The duplicate-check snapshot is current for the last observed uploads. '
@@ -3232,6 +3253,9 @@ def _humanize_job(row: Dict) -> Dict:
         if status == 'done':
             title = f'{label} updated'
             message = description
+            if result.get('status') in ('deferred', 'no_base'):
+                title = f'{label} maintenance scheduled'
+                message = 'Repair work is queued; this index is not yet current.'
         elif status == 'failed':
             title = f'{label} update failed'
     elif job_type == 'photo_soft_delete':
@@ -3330,15 +3354,26 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             return None
         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
             return None
+        if (storage_utils_module.DURABLE_INDEX_UPDATES and all(entity.get(k) == v for k, v in (updates or {}).items())
+                and entity.get('processing_complete') == _photo_processing_complete(entity)):
+            storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
+            return entity
+        changed = {k: v for k, v in (updates or {}).items() if entity.get(k) != v}
         entity.update(updates or {})
+        complete = _photo_processing_complete(entity)
+        if entity.get('processing_complete') != complete:
+            changed['processing_complete'] = complete
+        storage_utils_module.prepare_metadata_index_intent(entity, changed)
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-        entity['processing_complete'] = _photo_processing_complete(entity)
+        entity['processing_complete'] = complete
         try:
             # Conditional on the etag just read -- see _update_metadata_fields's
             # identical comment in storage_utils.py.
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             _invalidate_metadata_scan_cache(user_id)
-            if metadata_updates_affect_search_indexes(updates or {}):
+            if storage_utils_module.DURABLE_INDEX_UPDATES:
+                storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
+            elif metadata_updates_affect_search_indexes(updates or {}):
                 touch_user_search_indexes_state(user_id, filenames=filename)
             elif metadata_updates_affect_sort_index(updates or {}):
                 touch_user_sort_index_dirty(user_id, [filename])
@@ -3692,14 +3727,10 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
     return {'status': 'queued', 'messages': sent}
 
 
-# Defensive ceiling, not the normal trigger: a buffer only reaches this while
-# the vision/face pipeline is continuously active (the idle flush below is
-# what fires in the ordinary case), so this just bounds one ipworker
-# replica's in-memory exposure -- memory held per user, and filenames lost if
-# the replica dies before an idle/manual flush -- during an unusually long,
-# uninterrupted run. Deliberately well above a typical idle-triggered flush
-# so it almost never fires in practice.
+# Filename safety ceiling is independent of the normal face-count deadline.
 IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES = int(os.getenv('IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES', '15000'))
+IPWORK_CLUSTER_BATCH_MAX_FACES = max(1, int(os.getenv('IPWORK_CLUSTER_BATCH_MAX_FACES', '1500')))
+IPWORK_CLUSTER_MAX_WAIT_SECONDS = max(1, float(os.getenv('IPWORK_CLUSTER_MAX_WAIT_SECONDS', '300')))
 # Per-queue-message ceiling for incremental-assign: any flush (idle, manual,
 # or the safety ceiling above) is split into messages of at most this many
 # filenames so no single message becomes the ~260s / ~19k-round-trip monster
@@ -3798,6 +3829,8 @@ def _is_upload_active(user_id: str) -> bool:
 # actual send_message call happens outside the lock.
 _cluster_batch_lock = threading.Lock()
 _cluster_batch_buffers: Dict[str, List[str]] = {}
+_cluster_batch_face_counts: Dict[str, Dict[str, int]] = {}
+_cluster_batch_inflight: Dict[str, List[List[str]]] = {}
 _cluster_batch_started_at: Dict[str, float] = {}
 _cluster_batch_last_activity_at: Dict[str, float] = {}
 # This process's stable identity for the checkpoint files it writes -- reusing
@@ -3866,9 +3899,46 @@ def _checkpoint_all_cluster_buffers() -> None:
     if not CLUSTER_BUFFER_CHECKPOINT_DIR:
         return
     with _cluster_batch_lock:
-        snapshot = {user_id: list(filenames) for user_id, filenames in _cluster_batch_buffers.items() if filenames}
-    for user_id, filenames in snapshot.items():
-        _write_cluster_buffer_checkpoint(user_id, filenames)
+        for user_id in _cluster_batch_buffers.keys() | _cluster_batch_inflight.keys():
+            _checkpoint_cluster_buffer_locked(user_id)
+
+
+def _checkpoint_cluster_buffer_locked(user_id):
+    filenames = list(_cluster_batch_buffers.get(user_id, []))
+    for sending in _cluster_batch_inflight.get(user_id, []):
+        filenames.extend(sending)
+    if filenames:
+        _write_cluster_buffer_checkpoint(user_id, list(dict.fromkeys(filenames)))
+    else:
+        _clear_cluster_buffer_checkpoint(user_id)
+
+
+def _send_cluster_batch(user_id, filenames, age_s=0, counts=None):
+    """Keep in-flight batches checkpointed; retry partial sends idempotently."""
+    with _cluster_batch_lock:
+        _cluster_batch_inflight.setdefault(user_id, []).append(filenames)
+        _checkpoint_cluster_buffer_locked(user_id)
+    sent = False
+    try:
+        result = _enqueue_incremental_assign_job(user_id, filenames)
+        sent = result is None or result.get('status') in ('queued', 'noop')
+    finally:
+        with _cluster_batch_lock:
+            inflight = _cluster_batch_inflight[user_id]
+            inflight.remove(filenames)
+            if not inflight:
+                _cluster_batch_inflight.pop(user_id, None)
+            if not sent:
+                buffer = _cluster_batch_buffers.setdefault(user_id, [])
+                current_counts = _cluster_batch_face_counts.setdefault(user_id, {})
+                for filename in filenames:
+                    if filename not in buffer:
+                        buffer.append(filename)
+                    current_counts[filename] = max(current_counts.get(filename, 0), (counts or {}).get(filename, 1))
+                started = time.monotonic() - max(0, age_s)
+                _cluster_batch_started_at[user_id] = min(_cluster_batch_started_at.get(user_id, started), started)
+                _cluster_batch_last_activity_at.setdefault(user_id, time.monotonic())
+            _checkpoint_cluster_buffer_locked(user_id)
 
 
 def _recover_stranded_cluster_buffer_checkpoints() -> None:
@@ -3918,7 +3988,9 @@ def _recover_stranded_cluster_buffer_checkpoints() -> None:
                                        len(filenames), user_id, age)
                     processing_diagnostics.emit('cluster_buffer_flush', filenames=len(filenames),
                                                  reason='recovered_checkpoint', seconds=age)
-                    _enqueue_incremental_assign_job(user_id, filenames)
+                    result = _enqueue_incremental_assign_job(user_id, filenames)
+                    if result is not None and result.get('status') not in ('queued', 'noop'):
+                        continue  # Preserve the abandoned checkpoint for retry.
             except FileNotFoundError:
                 continue  # another process already recovered/cleared it
             except Exception:
@@ -3931,15 +4003,8 @@ def _recover_stranded_cluster_buffer_checkpoints() -> None:
             _rmdir_if_empty(user_dir)
 
 
-def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
-    """Accumulate one photo's filename into its user's pending batch instead
-    of sending it as its own queue message immediately -- cuts queue PUT/
-    DELETE traffic from one-per-photo to roughly one-per-flush. The normal
-    flush trigger is the idle check in _flush_stale_incremental_assign_buffers
-    (so clustering wakes once per quiet gap, not repeatedly during a long
-    active run); IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES here is only a
-    defensive backstop, same as the shutdown flush below, so a slow trickle
-    or a scaling-to-zero replica never strands filenames indefinitely."""
+def _buffer_incremental_assign_filename(user_id: str, filename: str, face_count: int = 1) -> None:
+    """Accumulate per-library photos until the face cap or oldest deadline."""
     processing_diagnostics.file_event('cluster_buffered', user_id, filename, role='vision')
     to_flush: Optional[List[str]] = None
     started_at = None
@@ -3947,21 +4012,27 @@ def _buffer_incremental_assign_filename(user_id: str, filename: str) -> None:
         buffer = _cluster_batch_buffers.setdefault(user_id, [])
         if not buffer:
             _cluster_batch_started_at[user_id] = time.monotonic()
-        buffer.append(filename)
+            _cluster_batch_face_counts[user_id] = {}
+        counts = _cluster_batch_face_counts.setdefault(user_id, {})
+        if filename not in counts:
+            buffer.append(filename)
+        counts[filename] = max(counts.get(filename, 0), max(1, int(face_count)))
         _cluster_batch_last_activity_at[user_id] = time.monotonic()
-        if len(buffer) >= IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES:
+        face_limit = sum(counts.values()) >= IPWORK_CLUSTER_BATCH_MAX_FACES
+        if face_limit or len(buffer) >= IPWORK_CLUSTER_BATCH_SAFETY_MAX_FILENAMES:
             to_flush = buffer
             started_at = _cluster_batch_started_at.get(user_id)
             _cluster_batch_buffers[user_id] = []
             _cluster_batch_started_at.pop(user_id, None)
             _cluster_batch_last_activity_at.pop(user_id, None)
+            _cluster_batch_face_counts.pop(user_id, None)
     if to_flush:
         age_s = (time.monotonic() - started_at) if started_at is not None else -1
-        processing_diagnostics.emit('cluster_buffer_flush', filenames=len(to_flush), reason='safety_cap', seconds=age_s)
-        worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=safety_cap age_s=%.1f',
-                           user_id, len(to_flush), age_s)
-        _enqueue_incremental_assign_job(user_id, to_flush)
-        _clear_cluster_buffer_checkpoint(user_id)
+        reason = 'face_limit' if face_limit else 'safety_cap'
+        processing_diagnostics.emit('cluster_buffer_flush', filenames=len(to_flush), reason=reason, seconds=age_s)
+        worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=%s age_s=%.1f',
+                           user_id, len(to_flush), reason, age_s)
+        _send_cluster_batch(user_id, to_flush, age_s, counts)
 
 
 def request_cluster_batch_flush(user_id: str) -> str:
@@ -4006,15 +4077,16 @@ def _flush_stale_incremental_assign_buffers() -> None:
     manual "Cluster now" request -- never on upload activity, which says
     nothing about whether more faces are still coming from ipworker."""
     now = time.monotonic()
-    to_flush: List[Tuple[str, List[str], str, float]] = []
+    to_flush = []
     with _cluster_batch_lock:
         candidates = list(_cluster_batch_started_at.items())
     for user_id, started_at in candidates:
         age_s = now - started_at
         last_activity = _cluster_batch_last_activity_at.get(user_id, started_at)
         idle = (now - last_activity) >= IPWORK_CLUSTER_IDLE_SECONDS
-        forced = (not idle) and _cluster_flush_recently_requested(user_id)
-        if idle or forced:
+        expired = age_s >= IPWORK_CLUSTER_MAX_WAIT_SECONDS
+        forced = (not idle and not expired) and _cluster_flush_recently_requested(user_id)
+        if idle or forced or expired:
             with _cluster_batch_lock:
                 # Re-check under the lock -- the buffer may have already
                 # been flushed (safety cap) or grown since the snapshot above.
@@ -4022,17 +4094,17 @@ def _flush_stale_incremental_assign_buffers() -> None:
                     continue
                 buffer = _cluster_batch_buffers.get(user_id)
                 if buffer:
-                    reason = 'idle' if idle else 'manual'
-                    to_flush.append((user_id, buffer, reason, age_s))
+                    reason = 'idle' if idle else ('deadline' if expired else 'manual')
+                    to_flush.append((user_id, buffer, reason, age_s, _cluster_batch_face_counts.get(user_id, {})))
                 _cluster_batch_buffers[user_id] = []
                 _cluster_batch_started_at.pop(user_id, None)
                 _cluster_batch_last_activity_at.pop(user_id, None)
-    for user_id, filenames, reason, age_s in to_flush:
+                _cluster_batch_face_counts.pop(user_id, None)
+    for user_id, filenames, reason, age_s, counts in to_flush:
         processing_diagnostics.emit('cluster_buffer_flush', filenames=len(filenames), reason=reason, seconds=age_s)
         worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=%s age_s=%.1f',
                            user_id, len(filenames), reason, age_s)
-        _enqueue_incremental_assign_job(user_id, filenames)
-        _clear_cluster_buffer_checkpoint(user_id)
+        _send_cluster_batch(user_id, filenames, age_s, counts)
 
 
 def _flush_all_incremental_assign_buffers() -> None:
@@ -4041,17 +4113,18 @@ def _flush_all_incremental_assign_buffers() -> None:
     that were waiting on either the safety cap or the time-based flush."""
     now = time.monotonic()
     with _cluster_batch_lock:
-        pending = [(user_id, filenames, now - _cluster_batch_started_at.get(user_id, now))
+        pending = [(user_id, filenames, now - _cluster_batch_started_at.get(user_id, now),
+                    _cluster_batch_face_counts.get(user_id, {}))
                   for user_id, filenames in _cluster_batch_buffers.items() if filenames]
         _cluster_batch_buffers.clear()
         _cluster_batch_started_at.clear()
         _cluster_batch_last_activity_at.clear()
-    for user_id, filenames, age_s in pending:
+        _cluster_batch_face_counts.clear()
+    for user_id, filenames, age_s, counts in pending:
         processing_diagnostics.emit('cluster_buffer_flush', filenames=len(filenames), reason='shutdown', seconds=age_s)
         worker_logger.info('ipwork cluster batch flush user=%s filenames=%d reason=shutdown age_s=%.1f',
                            user_id, len(filenames), age_s)
-        _enqueue_incremental_assign_job(user_id, filenames)
-        _clear_cluster_buffer_checkpoint(user_id)
+        _send_cluster_batch(user_id, filenames, age_s, counts)
 
 
 def _run_incremental_assign_flush_loop(shutdown_requested: threading.Event) -> None:
@@ -7260,12 +7333,17 @@ def _rebuild_metadata_faces_for_filename(
     searchable_person_index: Optional[Dict[str, str]] = None,
     dry_run: bool = False,
     face_summary: Optional[Dict[str, Dict]] = None,
+    strict: bool = False,
 ) -> Dict:
     if metadata_table_client is None or face_table_client is None:
         return {'updated': False, 'missingMetadata': True}
     try:
         metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
+    except Exception as error:
+        if strict and not isinstance(error, ResourceNotFoundError):
+            raise
+        return {'updated': False, 'missingMetadata': True}
+    if str(metadata.get('processing_state') or '').lower() == 'deleted':
         return {'updated': False, 'missingMetadata': True}
     # Was an uncached query_entities("PartitionKey eq user and filename eq X")
     # -- same bug class as _store_client_face_entities's (storage_utils.py)
@@ -7295,13 +7373,19 @@ def _rebuild_metadata_faces_for_filename(
         try:
             indexed_ids = get_face_ids_for_filename(user_id, filename)
         except Exception:
+            if strict:
+                raise
             indexed_ids = None
+        if strict and indexed_ids is None:
+            raise RuntimeError('Face filename lookup unavailable')
         if indexed_ids is not None:
             rows = []
             for face_id in indexed_ids:
                 try:
                     rows.append(face_table_client.get_entity(partition_key=user_id, row_key=str(face_id)))
-                except Exception:
+                except Exception as error:
+                    if strict and not isinstance(error, ResourceNotFoundError):
+                        raise
                     continue
     if rows is None:
         summary = face_summary if face_summary is not None else _load_user_face_summary_by_id(user_id)
@@ -7343,15 +7427,19 @@ def _rebuild_metadata_faces_for_filename(
         'peopleIdsRemoved': len([pid for pid in before_people_ids if pid not in people_ids]),
         'stalePeopleIdsRemoved': len([pid for pid in before_people_ids if pid not in people_ids]),
     }
-    if dry_run:
+    if dry_run or not changed:
         return result
     try:
-        _update_metadata_entity_fields(user_id, filename, {
+        written = _update_metadata_entity_fields(user_id, filename, {
             'faces': json.dumps(faces_payload),
             'faceCount': len(faces_payload),
             'peopleIds': after_people_json,
         })
+        if strict and written is None:
+            raise RuntimeError('Photo membership update failed')
     except Exception:
+        if strict:
+            raise
         pass
     return result
 
@@ -7362,6 +7450,7 @@ def _rebuild_metadata_faces_for_filenames(
     *,
     searchable_person_index: Optional[Dict[str, str]] = None,
     dry_run: bool = False,
+    strict: bool = False,
 ) -> Dict:
     if searchable_person_index is None:
         searchable_person_index = _load_searchable_person_name_index(user_id)
@@ -7378,6 +7467,7 @@ def _rebuild_metadata_faces_for_filenames(
             filename,
             searchable_person_index=searchable_person_index,
             dry_run=dry_run,
+            strict=strict,
         ),
         unique_filenames,
     )
@@ -8954,7 +9044,15 @@ def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None)
 storage_utils_module.LEXICAL_BUILD_HOOK = _streaming_lexical_build
 import library_build as _library_build_module
 _library_build_module.FINALIZE_HOOK = _finalize_library_summaries
-storage_utils_module.INDEX_BUILD_REQUEST_HOOK = lambda user_id: enqueue_index_build(user_id, reason='serving-process')
+def _request_scoped_index_build(user_id: str, kind: Optional[str] = None):
+    import index_updates
+    scope = index_updates.scope_for_index(kind) if kind is not None else 'full'
+    return enqueue_index_build(user_id, reason='serving-process', scope=scope)
+
+
+storage_utils_module.INDEX_BUILD_REQUEST_HOOK = _request_scoped_index_build
+storage_utils_module.METADATA_INDEX_REQUEST_HOOK = lambda user_id, scope: enqueue_index_build(
+    user_id, reason='metadata-change', scope=scope)
 
 
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))
@@ -10413,6 +10511,8 @@ INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS',
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
 # The people/albums rebuild reads every cluster and face, so repeated clustering runs coalesce harder.
 INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '180'))
+# Index bugs must not inherit the destructive library-clean retry budget.
+INDEX_BUILD_MAX_RETRIES = max(1, int(os.getenv('INDEX_BUILD_MAX_RETRIES', '5')))
 # Safety ceiling for progressive search-database maintenance. Each pass must
 # either publish dirty rows or compact a non-empty delta log; reaching this
 # limit means forward progress is not converging and should be queue-retried.
@@ -10461,6 +10561,8 @@ def index_build_needed(user_id: str) -> bool:
     every upload burst. All cheap manifest reads."""
     import search_db
     key = str(user_id or '').strip()
+    if INDEX_MAINTENANCE_QUEUE_NAME:
+        return search_db.needs_build(key)
     if not get_user_index_build_state(key)['ready']:
         return True
     sort_manifest = _load_sort_index_manifest(key)
@@ -10490,7 +10592,27 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
     key = str(user_id or '').strip()
     if not key:
         return 'unavailable'
-    scope = scope if scope in ('full', 'light', 'people', 'dedup', 'dedup-idle') else 'full'
+    import index_updates
+    scope = index_updates.validate_scope(scope)
+    if INDEX_MAINTENANCE_QUEUE_NAME:
+        if index_maintenance_queue_client is None or jobs_table_client is None:
+            return 'unavailable'
+        import index_work
+        store = index_work.WorkStore(jobs_table_client)
+        try:
+            delay = (max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)) if scope == 'dedup-idle'
+                     else (2 if coalesce and reason not in index_updates.READ_REASONS else 0))
+            token = store.request(key, scope, advance=reason not in index_updates.READ_REASONS, delay=delay)
+            sent = store.notify(token, lambda library, kind, revision, wait: _send_index_wakeup(
+                library, kind, revision, wait, reason=reason))
+            if not sent and reason in index_updates.READ_REASONS:
+                current = store._get(token)
+                if current and current.get('failed'):
+                    return 'unavailable'
+            return 'queued' if sent else 'already_active'
+        except Exception:
+            worker_logger.exception('Maintenance intent/queue publication failed for %s', key)
+            return 'unavailable'
     light = scope != 'full'
     if not light and _index_build_job_active(key):
         return 'already_active'
@@ -10528,6 +10650,73 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
         _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'failed', error='Could not queue the index build')
         return 'unavailable'
     return 'queued'
+
+
+def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery'):
+    import index_work
+    queue = index_maintenance_queue_client
+    if queue is None:
+        raise RuntimeError('Index maintenance queue unavailable')
+    job = _index_build_job_id(library) + (f'-{scope}' if scope != 'full' else '')
+    # Publish queued status first: a fast consumer must not have its terminal
+    # status overwritten by the producer after receiving the wakeup.
+    _upsert_job_status(job, library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope)
+    queue.send_message(json.dumps({
+        'type': INDEX_BUILD_JOB_TYPE, 'userId': library, 'jobId': job,
+        'scope': scope, 'reason': reason,
+        'maintenanceKey': index_work.WorkStore.key(library, scope), 'intentRevision': revision,
+    }), visibility_timeout=delay or None)
+
+
+def recover_pending_index_work(library=None, *, retry_failed=False):
+    import index_work
+    if jobs_table_client is None or index_maintenance_queue_client is None:
+        return 0
+    store = index_work.WorkStore(jobs_table_client)
+    if retry_failed:
+        # Explicit user repair only; poison jobs never restart on a polling read.
+        query = f"PartitionKey eq '{index_work.PARTITION}' and libraryId eq '{_escape_odata(library)}'"
+        for row in jobs_table_client.query_entities(query):
+            if row.get('failed'):
+                store.request(row['libraryId'], row['scope'])
+    return store.recover(_send_index_wakeup, library=library)
+
+
+def _run_index_maintenance_payload(payload):
+    import index_work
+    import index_publication
+    store = index_work.WorkStore(jobs_table_client)
+    library, scope = str(payload['userId']), str(payload['scope'])
+    key = index_work.WorkStore.key(library, scope)
+    if payload.get('maintenanceKey') != key:
+        raise ValueError('Maintenance identity mismatch')
+    claim = store.claim(key)
+    if claim is None:
+        return
+    try:
+        if claim.attempt > INDEX_BUILD_MAX_RETRIES:
+            deadletter = queue_service_client.get_queue_client(INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME)
+            deadletter.send_message(json.dumps({
+                'originalPayload': payload, 'reason': 'Index maintenance attempts exhausted',
+                'intentRevision': claim.revision, 'attempts': claim.attempt - 1,
+            }))
+            if store.finish(claim, failed=True):
+                store.notify(key, _send_index_wakeup)
+            else:
+                _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'failed',
+                                   indexScope=scope, error='Index maintenance attempts exhausted')
+            return
+        with index_publication.publication(store, claim):
+            _run_index_build_job(library, str(payload['jobId']), scope)
+        newer = store.finish(claim)
+    except Exception:
+        try:
+            store.release(claim)
+        except Exception:
+            worker_logger.warning('Maintenance lease could not be released', exc_info=True)
+        raise
+    if newer:
+        store.notify(key, _send_index_wakeup)
 
 
 def _index_build_progress_callback(user_id: str):
@@ -10569,6 +10758,91 @@ def mark_people_dirty(user_id: str, person_ids: list) -> None:
         worker_logger.exception('Failed to mark people dirty for %s', key)
 
 
+def _label_dirty_partition(user_id):
+    return 'labels:' + hashlib.sha256(user_id.encode()).hexdigest()
+
+
+def publish_person_label_intent(user_id, person_id, person):
+    if not person.get('labelPending'):
+        return True
+    try:
+        if people_dirty_set_table_client is None:
+            raise RuntimeError('People dirty storage unavailable')
+        people_dirty_set_table_client.upsert_entity({
+            'PartitionKey': _label_dirty_partition(user_id), 'RowKey': person_id,
+            'pendingToken': person['labelPending'],
+        })
+        mark_people_dirty(user_id, [person_id])
+        if enqueue_index_build(user_id, reason='person-label', scope='people') == 'unavailable':
+            raise RuntimeError('People maintenance queue unavailable')
+        return True
+    except Exception:
+        worker_logger.warning('Person label intent retained for recovery user=%s', user_id, exc_info=True)
+        return False
+
+
+def _pending_person_labels(user_id):
+    from index_work import DirtySnapshot
+    if people_dirty_set_table_client is None:
+        if INDEX_MAINTENANCE_QUEUE_NAME:
+            raise RuntimeError('Person label dirty storage unavailable')
+        return DirtySnapshot()
+    return DirtySnapshot(people_dirty_set_table_client.query_entities(
+        f"PartitionKey eq '{_label_dirty_partition(user_id)}'"))
+
+
+def _update_label_memberships(user_id, labels):
+    for person_id in labels:
+        try:
+            person = person_table_client.get_entity(user_id, person_id)
+        except ResourceNotFoundError:
+            continue
+        if not person.get('labelMembershipPending'):
+            continue
+        ids = json.loads(person.get('faceIds') or '[]')
+        faces = _load_face_rows_by_ids(user_id, ids)
+        for face_id in ids:
+            if str(face_id) not in faces:
+                try:
+                    faces[str(face_id)] = face_table_client.get_entity(user_id, str(face_id))
+                except ResourceNotFoundError:
+                    continue
+        filenames = {str(face.get('filename')) for face in faces.values() if face.get('filename')}
+        _person_scan_cache.invalidate(user_id)
+        _rebuild_metadata_faces_for_filenames(user_id, filenames, strict=True)
+
+
+def _ack_person_labels(user_id, labels):
+    from index_work import acknowledge_dirty
+    import index_publication
+    index_publication.check()
+    table = getattr(person_table_client, '_table_client', person_table_client)
+    for person_id, intent in labels.rows.items():
+        try:
+            person = table.get_entity(user_id, person_id)
+            if person.get('labelPending') == intent.get('pendingToken'):
+                table.update_entity({
+                    'PartitionKey': user_id, 'RowKey': person_id,
+                    'labelPending': '', 'labelMembershipPending': False,
+                }, mode=UpdateMode.MERGE, etag=person.metadata['etag'],
+                    match_condition=MatchConditions.IfNotModified)
+        except (ResourceNotFoundError, ResourceModifiedError):
+            pass
+    acknowledge_dirty(people_dirty_set_table_client, labels)
+
+
+def recover_person_label_intents(user_id):
+    if person_table_client is None:
+        return 0
+    failed = 0
+    for row in person_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'", select=[
+                'PartitionKey', 'RowKey', 'labelPending', 'labelMembershipPending']):
+        if row.get('labelPending'):
+            failed += int(not publish_person_label_intent(user_id, row['RowKey'], row))
+    return failed
+
+
 def mark_albums_dirty(user_id: str, album_ids: list) -> None:
     """Mark albums as dirty for incremental rebuild. Call this when photos are moved
     to albums or album properties change."""
@@ -10591,67 +10865,51 @@ def mark_albums_dirty(user_id: str, album_ids: list) -> None:
 def get_dirty_people(user_id: str) -> set:
     """Get all dirty people IDs for incremental rebuild."""
     if people_dirty_set_table_client is None:
+        if INDEX_MAINTENANCE_QUEUE_NAME:
+            raise RuntimeError('People dirty storage unavailable')
         return set()
     key = str(user_id or '').strip()
     if not key:
         return set()
     try:
-        people = set()
-        for entity in people_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"):
-            pid = str(entity.get('RowKey') or '').strip()
-            if pid:
-                people.add(pid)
-        return people
+        from index_work import DirtySnapshot
+        return DirtySnapshot(people_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"))
     except Exception:
         worker_logger.exception('Failed to get dirty people for %s', key)
-        return set()
+        raise RuntimeError('People dirty state unavailable')
 
 
 def get_dirty_albums(user_id: str) -> set:
     """Get all dirty album IDs for incremental rebuild."""
     if albums_dirty_set_table_client is None:
+        if INDEX_MAINTENANCE_QUEUE_NAME:
+            raise RuntimeError('Albums dirty storage unavailable')
         return set()
     key = str(user_id or '').strip()
     if not key:
         return set()
     try:
-        albums = set()
-        for entity in albums_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"):
-            aid = str(entity.get('RowKey') or '').strip()
-            if aid:
-                albums.add(aid)
-        return albums
+        from index_work import DirtySnapshot
+        return DirtySnapshot(albums_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"))
     except Exception:
         worker_logger.exception('Failed to get dirty albums for %s', key)
-        return set()
+        raise RuntimeError('Albums dirty state unavailable')
 
 
-def clear_dirty_people(user_id: str) -> None:
-    """Clear dirty people set after rebuild."""
-    if people_dirty_set_table_client is None:
-        return
-    key = str(user_id or '').strip()
-    if not key:
-        return
-    try:
-        for entity in people_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"):
-            people_dirty_set_table_client.delete_entity(key, str(entity.get('RowKey') or ''))
-    except Exception:
-        worker_logger.exception('Failed to clear dirty people for %s', key)
+def clear_dirty_people(user_id: str, snapshot) -> None:
+    from index_work import acknowledge_dirty
+    import index_publication
+    index_publication.check()
+    if people_dirty_set_table_client is not None:
+        acknowledge_dirty(people_dirty_set_table_client, snapshot)
 
 
-def clear_dirty_albums(user_id: str) -> None:
-    """Clear dirty albums set after rebuild."""
-    if albums_dirty_set_table_client is None:
-        return
-    key = str(user_id or '').strip()
-    if not key:
-        return
-    try:
-        for entity in albums_dirty_set_table_client.query_entities(f"PartitionKey eq '{_escape_odata(key)}'"):
-            albums_dirty_set_table_client.delete_entity(key, str(entity.get('RowKey') or ''))
-    except Exception:
-        worker_logger.exception('Failed to clear dirty albums for %s', key)
+def clear_dirty_albums(user_id: str, snapshot) -> None:
+    from index_work import acknowledge_dirty
+    import index_publication
+    index_publication.check()
+    if albums_dirty_set_table_client is not None:
+        acknowledge_dirty(albums_dirty_set_table_client, snapshot)
 
 
 def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
@@ -10673,6 +10931,10 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
         if status == 'more':
             continue
         if status == 'needs_full':
+            if INDEX_MAINTENANCE_QUEUE_NAME:
+                if enqueue_index_build(user_id, reason='search-delta-capacity', scope='compact') == 'unavailable':
+                    raise RuntimeError('Could not schedule search compaction')
+                return {'status': 'deferred', 'nextScope': 'compact'}
             if search_db.compact_database(user_id) is None:
                 raise RuntimeError('search database compaction made no progress')
             compacted = True
@@ -10686,9 +10948,15 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
             # raising, so the light job still completes (sort/access, which it
             # handles regardless) instead of crash-looping on every light pass
             # until something else happens to trigger a full rebuild.
-            _trigger_indexer_rebuild(user_id, reason='search-db-no-base', scope='full')
+            if INDEX_MAINTENANCE_QUEUE_NAME:
+                if enqueue_index_build(user_id, reason='search-db-no-base', scope='full') == 'unavailable':
+                    raise RuntimeError('Could not schedule search bootstrap')
+            else:
+                _trigger_indexer_rebuild(user_id, reason='search-db-no-base', scope='full')
             return outcome
         if status in ('unavailable', 'conflict'):
+            if INDEX_MAINTENANCE_QUEUE_NAME:
+                raise RuntimeError(f'Search maintenance must retry: {status}')
             # Both are expected transients (a storage read blip / a concurrent
             # rebuild winning a race) that self-resolve on the next light pass --
             # not a reason to mark this job failed.
@@ -10704,6 +10972,8 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     search-database build) runs, so /jobs/status never declares a live build
     dead -- and if the process really dies the heartbeat stops and the normal
     staleness sweep (plus queue redelivery) takes over."""
+    import index_updates
+    scope = index_updates.validate_scope(scope)
     started = time.monotonic()
     stop = threading.Event()
 
@@ -10716,7 +10986,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             'light': 30,  # Fast: incremental sort/access refresh
             'dedup': 30,  # Fast: small hash snapshot
         }
-        heartbeat_interval = heartbeat_intervals.get(scope, 30)
+        heartbeat_interval = min(INDEX_BUILD_HEARTBEAT_SECONDS, heartbeat_intervals.get(scope, 30))
 
         while not stop.wait(heartbeat_interval):
             try:
@@ -10737,6 +11007,11 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             if scope == 'dedup-idle':
                 if _is_upload_active(user_id):
                     # Durable delayed check survives browser crashes and worker restarts.
+                    if INDEX_MAINTENANCE_QUEUE_NAME:
+                        if enqueue_index_build(user_id, reason='upload-quiet', scope=scope) == 'unavailable':
+                            raise RuntimeError('Could not defer upload hash maintenance')
+                        _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'queued')
+                        return
                     if library_ops_queue_client is None:
                         raise RuntimeError('upload hash refresh queue is not configured')
                     library_ops_queue_client.send_message(json.dumps({
@@ -10759,42 +11034,71 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     raise RuntimeError('upload hash index is not configured')
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
                 return
-            storage_utils_ensure_sort_current(user_id)  # schema upgrade (full rebuild if stale)
-            if scope in ('light', 'people'):
-                # Incremental maintenance: cost follows what changed, not library size.
-                kinds = ('sort', 'access') if scope == 'light' else ('people', 'albums')
+            if scope in ('compact', 'reconcile'):
+                if scope == 'compact':
+                    import search_db
+                    if search_db.compact_database(user_id) is None:
+                        raise RuntimeError('Search compaction could not publish')
+                else:
+                    result = storage_utils_module.reconcile_search_db(user_id, force=True)
+                    if result.get('status') == 'no_db':
+                        if enqueue_index_build(user_id, reason='search-db-no-base', scope='full') == 'unavailable':
+                            raise RuntimeError('Could not schedule reconciliation bootstrap')
+                        raise RuntimeError('Reconciliation must retry after bootstrap')
+                    if result.get('status') not in ('ok', 'skipped'):
+                        raise RuntimeError('Library reconciliation unavailable')
+                    if recover_person_label_intents(user_id):
+                        raise RuntimeError('Person label recovery unavailable')
+                if enqueue_index_build(user_id, reason='post-' + scope, scope='search', coalesce=False) == 'unavailable':
+                    raise RuntimeError('Could not schedule catalog catch-up')
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+                return
+            if scope in ('full', 'light', 'sort'):
+                storage_utils_ensure_sort_current(user_id)
+            if scope in ('vector', 'tag_embedding', 'people_embedding'):
+                if (scope == 'tag_embedding' and INDEX_MAINTENANCE_QUEUE_NAME
+                        and not vision_utils.image_encoder_available()):
+                    raise RuntimeError('Tag embedding maintenance requires the vision model owner')
+                refresher = getattr(storage_utils_module, f'refresh_user_{scope}_index')
+                if refresher(user_id) is None:
+                    raise RuntimeError(f'index build produced no {scope} index')
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+                return
+            if scope != 'full':
+                kinds = index_updates.SCOPE_KINDS[scope]
+                labels = _pending_person_labels(user_id) if scope == 'people' else None
+                if labels:
+                    _update_label_memberships(user_id, labels)
 
                 # For scope='people', read dirty-sets to enable incremental rebuilds.
                 # Passed as explicit call arguments (not through shared module
                 # state) since this job may run in the same process as another
                 # user's -- or another job's -- index build.
                 dirty_people = get_dirty_people(user_id) if scope == 'people' else None
-                dirty_albums = get_dirty_albums(user_id) if scope == 'people' else None
+                dirty_albums = get_dirty_albums(user_id) if scope in ('people', 'albums') else None
+                # Legacy clustering producers mark both sets. A name-only
+                # refresh must not rebuild an unrelated albums snapshot.
+                if scope == 'people' and dirty_albums:
+                    kinds += ('albums',)
 
                 bad = prime_all_user_indexes_sequentially(
                     user_id, wait=True, kinds=kinds,
-                    affected_person_ids=dirty_people or None,
+                    affected_person_ids=(set(dirty_people or ()) | set(labels or ())) or None,
                     affected_album_ids=dirty_albums or None,
                 )
 
-                # Clear dirty-sets only for kinds that actually rebuilt -- a
-                # failed people/albums rebuild (kind present in `bad`) must
-                # leave its dirty-set alone so the next attempt still knows
-                # which ids need picking back up, instead of silently
-                # dropping that work on the floor.
-                if scope == 'people':
-                    if dirty_people and 'people' not in bad:
-                        clear_dirty_people(user_id)
-                    if dirty_albums and 'albums' not in bad:
-                        clear_dirty_albums(user_id)
                 if bad:
                     raise RuntimeError(f'index build produced no {", ".join(bad)} index')
-                try:
-                    storage_utils_module.reconcile_search_db(user_id)
-                except Exception:
-                    worker_logger.warning('Library reconcile failed for %s', user_id, exc_info=True)
-                _drain_incremental_search_db(user_id, scope)
-                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+                result = _drain_incremental_search_db(user_id, scope) if scope in index_updates.SEARCH_SCOPES else {}
+                # Keep IDs until every dependency succeeds: losing them on a
+                # Search retry would turn a targeted People repair into a scan.
+                if dirty_people:
+                    clear_dirty_people(user_id, dirty_people)
+                if dirty_albums:
+                    clear_dirty_albums(user_id, dirty_albums)
+                if labels:
+                    _ack_person_labels(user_id, labels)
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done', result=result)
             else:
                 # Full scope = a library with no usable database (new, or a schema upgrade). The
                 # chunked, resumable build makes the search/sort/access indexes in ONE scan; the
@@ -10814,12 +11118,10 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     user_id, on_progress=callback, wait=True, kinds=('sort', 'access', 'albums', 'people'))
                 if bad:
                     raise RuntimeError(f'index build produced no {", ".join(bad)} index')
-            if scope != 'people' and storage_utils_module._CTX.get('hash_index_table_client') is not None:
-                # Optional dedup refresh has its own retry lifecycle, not the gallery build's.
-                try:
-                    enqueue_index_build(user_id, reason='index-maintenance', scope='dedup', coalesce=False)
-                except Exception:
-                    worker_logger.warning('Could not queue upload hash snapshot for %s', user_id, exc_info=True)
+                if INDEX_MAINTENANCE_QUEUE_NAME:
+                    if enqueue_index_build(user_id, reason='post-bootstrap', scope='search') == 'unavailable':
+                        raise RuntimeError('Could not schedule post-bootstrap catalog updates')
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')
@@ -12159,7 +12461,7 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
         return None
 
     try:
-        _buffer_incremental_assign_filename(user_id, filename)
+        _buffer_incremental_assign_filename(user_id, filename, face_count)
     except Exception:
         app.logger.exception('Failed to queue incremental face-to-person assignment for %s/%s', user_id, filename)
 
@@ -14339,7 +14641,15 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         return
 
     if job_type == 'index_build':
-        _run_index_build_job(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
+        if INDEX_MAINTENANCE_QUEUE_NAME and os.getenv('APP_ROLE') != 'index-worker':
+            # Drain old library-ops messages without running their builds here.
+            if enqueue_index_build(user_id, reason='legacy-index-handoff',
+                                   scope=str(payload.get('scope') or 'full')) == 'unavailable':
+                raise RuntimeError('Index handoff unavailable')
+        elif payload.get('maintenanceKey'):
+            _run_index_maintenance_payload(payload)
+        else:
+            _run_index_build_job(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
         return
 
     if job_type == 'photo_soft_delete':
@@ -14650,7 +14960,7 @@ def _prepare_incremental_assignment(payload, user_id) -> List[Tuple[str, List[st
 
 
 def _poll_clustering_queue_once(
-    queue_client, queue_name: str, max_retries: int, deadletter_queue_client=None,
+    queue_client, queue_name: str, max_retries: int, deadletter_queue_client=None, *, dispatch=None,
 ) -> bool:
     """Receive and fully process at most one message from ``queue_client``.
 
@@ -14678,7 +14988,7 @@ def _poll_clustering_queue_once(
     if not messages:
         return False
     return _process_clustering_queue_message(
-        messages[0], queue_client, queue_name, max_retries, deadletter_queue_client)
+        messages[0], queue_client, queue_name, max_retries, deadletter_queue_client, dispatch=dispatch)
 
 
 @processing_diagnostics.measured('cluster', 'message', state='processing')
@@ -14695,6 +15005,8 @@ def _process_clustering_queue_message(message, queue_client, queue_name, max_ret
             user_id = str(body.get('user_id') or body.get('userId') or '')
     except Exception:
         pass
+    if job_type == INDEX_BUILD_JOB_TYPE:
+        max_retries = min(max_retries, INDEX_BUILD_MAX_RETRIES)
     processing_diagnostics.emit('cluster_job_started', role='cluster', job_type=job_type)
     with perf_instrumentation.scope(f'queue.{queue_name}.{job_type}', user=user_id,
                                     dequeue=getattr(message, 'dequeue_count', None)):
@@ -14720,13 +15032,20 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
                 job_type = str(payload.get('type') or '').strip()
         except Exception:
             pass
+        if not isinstance(payload, dict):
+            payload = {}
         reason = (
             f'Exceeded max retries ({max_retries}); '
             f'redelivered {dequeue_count} times without completing. '
             'Retry manually if this job is still wanted.'
         )
         raw_library_id = str(payload.get('libraryId') or '') if isinstance(payload, dict) else ''
-        if job_id and user_id:
+        report_failure = True
+        if payload.get('maintenanceKey') and jobs_table_client is not None:
+            import index_work
+            current = index_work.WorkStore(jobs_table_client)._get(payload['maintenanceKey'])
+            report_failure = bool(current and current['revision'] == payload.get('intentRevision'))
+        if job_id and user_id and report_failure:
             try:
                 # libraryId must be passed through for library_clean/
                 # library_download so this lands on the authoritative
@@ -14774,6 +15093,10 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
                     'originalPayload': payload,
                     'originalBody': message.content,
                 }, separators=(',', ':')))
+                if payload.get('maintenanceKey') and jobs_table_client is not None:
+                    import index_work
+                    index_work.WorkStore(jobs_table_client).fail_revision(
+                        payload['maintenanceKey'], payload.get('intentRevision'))
             except Exception:
                 worker_logger.exception('Failed to dead-letter %s queue message', queue_name)
                 return True  # Preserve source until durable publication succeeds.
@@ -14853,7 +15176,9 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
         )
         if job_id and user_id:
             try:
-                _upsert_job_status(job_id, user_id, 'clustering', 'failed', error='Clustering failed')
+                failed_type = INDEX_BUILD_JOB_TYPE if job_type == INDEX_BUILD_JOB_TYPE else 'clustering'
+                error = 'Index build failed' if job_type == INDEX_BUILD_JOB_TYPE else 'Clustering failed'
+                _upsert_job_status(job_id, user_id, failed_type, 'failed', error=error)
             except Exception:
                 pass
         worker_logger.exception('Failed to process %s queue message', queue_name)
@@ -15258,6 +15583,47 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
                            queue_name, len(messages), receive_ms,
                            int((time.monotonic() - whole_batch_started) * 1000))
     return True
+
+
+@processing_diagnostics.worker('indexer')
+def run_index_worker() -> None:
+    """Dedicated indexer sidecar; never consumes face or library-clean jobs."""
+    if not INDEX_MAINTENANCE_QUEUE_NAME:
+        raise RuntimeError('INDEX_MAINTENANCE_QUEUE_NAME must be configured')
+    if queue_service_client is None:
+        _init_storage_clients()
+    queue = index_maintenance_queue_client
+    if queue is None:
+        raise RuntimeError('Index maintenance queue unavailable')
+    deadletter = queue_service_client.get_queue_client(INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME)
+    from azure.core.exceptions import ResourceExistsError
+    for client in (queue, deadletter):
+        try:
+            client.create_queue()
+        except ResourceExistsError:
+            pass
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *args: stop.set())
+    signal.signal(signal.SIGINT, lambda *args: stop.set())
+    last_recovery = -60.0
+    processing_diagnostics.ready('indexer', queue=INDEX_MAINTENANCE_QUEUE_NAME)
+    def dispatch(payload, job_id, user_id, job_type):
+        if job_type != INDEX_BUILD_JOB_TYPE:
+            raise ValueError('Index queue cannot dispatch other job types')
+        _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
+    while not stop.is_set():
+        try:
+            now = time.monotonic()
+            if now - last_recovery >= 60:
+                recover_pending_index_work()
+                last_recovery = now
+            processed = _poll_clustering_queue_once(
+                queue, INDEX_MAINTENANCE_QUEUE_NAME, INDEX_BUILD_MAX_RETRIES, deadletter, dispatch=dispatch)
+            if not processed:
+                stop.wait(2)
+        except Exception:
+            worker_logger.exception('Index maintenance polling failed')
+            stop.wait(2)
 
 
 @processing_diagnostics.worker('cluster')
@@ -16805,7 +17171,9 @@ from routes.suggestions import suggestions_bp
 # 'cluster'/'vision' already falls through to gunicorn, so a dedicated
 # container just runs this same image with a different APP_ROLE.
 _app_role = os.getenv('APP_ROLE', 'core').strip().lower() or 'core'
-if _app_role == 'indexer':
+if _app_role == 'index-worker':
+    pass  # Queue-only sidecar, no public routes.
+elif _app_role == 'indexer':
     app.register_blueprint(tools_bp)
 elif _app_role == 'upload':
     app.register_blueprint(upload_bp)
