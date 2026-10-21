@@ -279,6 +279,81 @@ def test_checkpoint_rejects_unsnapshotted_committed_assignment(tmp_path):
     assert result['third'] == h.faces.rows['u', 'second']['personId']
 
 
+@pytest.mark.parametrize('entry', ['direct', 'batch', 'staged'])
+@pytest.mark.parametrize('other_adapter', [False, True])
+@pytest.mark.parametrize('save_fails', [False, True])
+def test_library_switch_checkpoints_dirty_outgoing_before_incoming_lease(
+        tmp_path, monkeypatch, entry, other_adapter, save_fails):
+    from clustering_lease import BlobLibraryLeaseFactory
+    from test_clustering_lease import FakeService
+
+    config = AssignmentConfig(checkpoint_dir=str(tmp_path / 'share'))
+    h = Harness(config=config)
+    other = Harness(config=config) if other_adapter else h
+    service = FakeService()
+    factory = BlobLibraryLeaseFactory(service, 'container')
+
+    def recording_lease(harness):
+        @contextmanager
+        def lease(user):
+            assert not any(blob.active is not None for blob in service.blobs.values()), \
+                'outgoing and incoming library leases must never overlap'
+            with factory(user) as guard:
+                class RecordedGuard:
+                    cache_generation = guard.cache_generation
+
+                    @property
+                    def checkpoint_revision(self):
+                        return guard.checkpoint_revision
+
+                    def check(self):
+                        harness.events.append('check')
+                        guard.check()
+
+                    def begin_assignment(self):
+                        guard.begin_assignment()
+
+                yield RecordedGuard()
+        return lease
+
+    for harness in (h, other):
+        harness.assigner.lease = recording_lease(harness)
+
+    def assign(harness, user, face):
+        if entry == 'direct':
+            return harness.assign(face, user=user)
+        with harness.assigner.batch(user, [face], staged=entry == 'staged') as run:
+            return run('photo.jpg', [face])
+
+    h.face('first')
+    assign(h, 'u', 'first')
+    pointer = next((tmp_path / 'share').glob('*/CURRENT'))
+    baseline = pointer.read_bytes()
+    h.face('second', vector=(0, 1))
+    assign(h, 'u', 'second')
+    assert pointer.read_bytes() == baseline
+    assert assignment._ACTIVE.completed_revision != assignment._ACTIVE.saved_revision
+
+    other.face('other', user='other')
+    with monkeypatch.context() as patch:
+        if save_fails:
+            def fail_save(*args, **kwargs):
+                raise OSError('share unavailable')
+            patch.setattr(assignment.LiveFaceIndex, 'save_checkpoint', fail_save)
+        assign(other, 'other', 'other')
+    assert (pointer.read_bytes() == baseline) == save_fails
+
+    scans = len(h.faces.queries)
+    if not save_fails:
+        h.faces.fail_query = RuntimeError('returning library must restore without cloud scans')
+        monkeypatch.setattr(assignment.LiveFaceIndex, 'build',
+                            lambda *a, **kw: pytest.fail('returning library must not train'))
+    h.face('third', vector=(0, 1))
+    result, _ = assign(h, 'u', 'third')
+    assert result['third'] == h.faces.rows['u', 'second']['personId']
+    assert len(h.faces.queries) == scans + int(save_fails)
+
+
 def test_checkpoint_default_is_thirty_minutes():
     assert AssignmentConfig().checkpoint_interval_seconds == 1800
 

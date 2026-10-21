@@ -254,6 +254,14 @@ class FaissAssigner:
     def invalidate(self, user_id=None):
         invalidate(user_id)
 
+    def _assignment_lease(self, user_id):
+        # Called under _LOCK, before acquiring the incoming library's lease.
+        # Never nest library leases or save an outgoing cache with the wrong guard.
+        active = _ACTIVE
+        if active is not None and (active.owner is not self or active.user_id != user_id):
+            active.owner.final_checkpoint()
+        return self.lease(user_id)
+
     @contextmanager
     def batch(self, user_id, face_ids=(), *, staged=False):
         """One library lease/revision for a bounded group; ordered decisions.
@@ -263,7 +271,7 @@ class FaissAssigner:
         Checkpoint only after all calls succeed; queue callers retain failed jobs.
         """
         started = time.monotonic()
-        with _LOCK, self.lease(user_id) as guard:
+        with _LOCK, self._assignment_lease(user_id) as guard:
             lease_ms = int((time.monotonic() - started) * 1000)
             guard.check()
             prefetch_started = time.monotonic()
@@ -624,7 +632,7 @@ class FaissAssigner:
         metadata_ms = 0
         newly_assigned_faces = 0
         already_owned_faces = 0
-        with _LOCK, (self.lease(user_id) if _guard is None else nullcontext(_guard)) as guard:
+        with _LOCK, (self._assignment_lease(user_id) if _guard is None else nullcontext(_guard)) as guard:
             if not callable(getattr(guard, 'check', None)):
                 raise TypeError('lease must yield a guard with check()')
             guard.check()

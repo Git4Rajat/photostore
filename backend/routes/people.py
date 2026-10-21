@@ -312,6 +312,23 @@ def _confirm_faces_for_person(user_id: str, face_ids) -> set:
     return affected_files
 
 
+def _queue_label_index_refresh(user_id: str, person_id: str, affected_files: set) -> None:
+    app.mark_people_dirty(user_id, [person_id])
+    # The worker runs in another process and cannot see buffered photo marks.
+    for kind in ('lexical', 'sort', 'access'):
+        app.storage_utils_module._flush_dirty_filename_buffer(user_id, kind)
+    scopes = ['people']
+    if affected_files and app.light_index_build_needed(user_id):
+        scopes.append('light')
+    for scope in scopes:
+        try:
+            outcome = app.enqueue_index_build(user_id, reason='person-label', scope=scope)
+            if outcome == 'unavailable':
+                app.app.logger.warning('Could not queue %s index refresh after person label', scope)
+        except Exception:
+            app.app.logger.exception('Could not queue %s index refresh after person label', scope)
+
+
 @people_bp.route('/api/persons/<person_id>/label', methods=['POST'])
 def label_person(person_id: str):
     user_id, error = app._require_user_id()
@@ -337,6 +354,7 @@ def label_person(person_id: str):
         app._update_person_rep_embedding(user_id, person_id)
     with app.perf_instrumentation.step('label.rebuild_metadata_faces', files=len(affected_files)):
         app._rebuild_metadata_faces_for_filenames(user_id, affected_files)
+    _queue_label_index_refresh(user_id, person_id, affected_files)
 
     # Naming a cluster is a strong identity signal: use its learned rep to pull
     # this person's faces out of unnamed clusters automatically. Best-effort so a
