@@ -2193,6 +2193,7 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
         'id': entity.get('RowKey'),
         'name': entity.get('name', ''),
         'photoCount': album_store.count(entity),
+        'updatedAt': entity.get('updatedAt') or '',
         'filenames': filenames,
         'membersPaged': table_backed,
         'isPublic': is_public and not is_expired,
@@ -8656,12 +8657,16 @@ def _albums_table_available() -> bool:
     return albums_table_client is not None
 
 
-def _load_album_entity(user_id: str, album_id: str) -> Optional[Dict]:
+def _load_album_entity(user_id: str, album_id: str, *, strict: bool = False) -> Optional[Dict]:
     if albums_table_client is None:
         return None
     try:
         return albums_table_client.get_entity(partition_key=user_id, row_key=album_id)
+    except ResourceNotFoundError:
+        return None
     except Exception:
+        if strict:
+            raise
         return None
 
 
@@ -8675,6 +8680,22 @@ def _mark_album_dirty(entity: Dict) -> None:
     row_key = str(entity.get('RowKey') or '')
     if row_key:
         mark_albums_dirty(partition_key, [row_key])
+    # The per-album dirty row above is durable, but without this the only
+    # thing that ever rebuilds the albums index is an incidental GET landing
+    # on the same process that holds the in-memory manifest-dirty flag
+    # (touch_user_albums_index_state). If that GET never arrives, or arrives
+    # on a different process, the dirty row can sit unindexed indefinitely
+    # (see docs/audits/red-dress-album-incident-2026-10-22.md). Queuing a
+    # durable rebuild here, mirroring publish_person_label_intent's
+    # enqueue_index_build(..., scope='people') call, closes that gap. A
+    # queue-send failure still leaves the dirty row for
+    # reconcile_dirty_albums to pick up later, so this is best-effort.
+    if partition_key:
+        try:
+            if enqueue_index_build(partition_key, reason='album-mutation', scope='albums') == 'unavailable':
+                worker_logger.warning('Album index enqueue unavailable for %s; dirty row retained for recovery', partition_key)
+        except Exception:
+            worker_logger.warning('Album index enqueue failed for %s; dirty row retained for recovery', partition_key, exc_info=True)
 
 
 def _save_album_entity(entity: Dict) -> None:
@@ -11098,6 +11119,31 @@ def clear_dirty_albums(user_id: str, snapshot) -> None:
         acknowledge_dirty(albums_dirty_set_table_client, snapshot)
 
 
+def reconcile_dirty_albums(user_id: str) -> bool:
+    """Catch albumsdirtyset rows left behind with no durable rebuild intent
+    to consume them -- e.g. rows written before enqueue_index_build was
+    wired into _mark_album_dirty, or a queue-send failure that still left
+    the dirty row (see docs/audits/red-dress-album-incident-2026-10-22.md).
+    Returns True if a rebuild was (re)scheduled, False if there was nothing
+    stranded. Never clears dirty rows itself -- only the actual rebuild
+    (clear_dirty_albums) does that -- so this is safe to call repeatedly."""
+    try:
+        dirty = get_dirty_albums(user_id)
+    except RuntimeError:
+        return False
+    if not dirty:
+        return False
+    if INDEX_MAINTENANCE_QUEUE_NAME and jobs_table_client is not None:
+        import index_work
+        store = index_work.WorkStore(jobs_table_client)
+        existing = store._get(store.key(user_id, 'albums'))
+        if existing is not None and not existing.get('failed'):
+            return False  # a live or recoverable intent already covers this
+    if enqueue_index_build(user_id, reason='stranded-dirty-reconcile', scope='albums', coalesce=False) == 'unavailable':
+        raise RuntimeError('Could not schedule stranded albums reconciliation')
+    return True
+
+
 def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
     """Consume all currently dirty search rows using bounded delta periods."""
     import search_db
@@ -11235,6 +11281,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                         raise RuntimeError('Library reconciliation unavailable')
                     if recover_person_label_intents(user_id):
                         raise RuntimeError('Person label recovery unavailable')
+                    reconcile_dirty_albums(user_id)
                 if enqueue_index_build(user_id, reason='post-' + scope, scope='search', coalesce=False) == 'unavailable':
                     raise RuntimeError('Could not schedule catalog catch-up')
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
@@ -11285,6 +11332,23 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                 if labels:
                     _ack_person_labels(user_id, labels)
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done', result=result)
+                # A mutation landing after this job captured its dirty-row
+                # snapshot (see docs/audits/album-persistence-2026-10-22.md
+                # finding #1) survives the conditional acknowledgement above
+                # -- the newer row keeps its own ETag -- but nothing then
+                # re-triggers processing of it. The dedicated-queue path
+                # self-heals this via the revision mismatch check in
+                # _run_index_maintenance_payload (`if newer: store.notify(...)`),
+                # but the legacy queue path has no equivalent. Recheck now
+                # that this job is marked done, so enqueue_index_build's
+                # already-active short-circuit no longer blocks a follow-up.
+                try:
+                    if scope == 'people' and get_dirty_people(user_id):
+                        enqueue_index_build(user_id, reason='dirty-recheck', scope='people', coalesce=False)
+                    if scope in ('people', 'albums') and get_dirty_albums(user_id):
+                        enqueue_index_build(user_id, reason='dirty-recheck', scope='albums', coalesce=False)
+                except Exception:
+                    worker_logger.warning('Dirty recheck after index build failed for %s/%s', user_id, scope, exc_info=True)
             else:
                 # Full scope = a library with no usable database (new, or a schema upgrade). The
                 # chunked, resumable build makes the search/sort/access indexes in ONE scan; the

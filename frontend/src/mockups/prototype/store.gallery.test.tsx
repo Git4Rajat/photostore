@@ -1,5 +1,5 @@
 import React from 'react';
-import { act, cleanup, render, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -25,7 +25,9 @@ vi.mock('../../services/localAlbumsIndex', () => ({ getLocalAlbumsIndex: mocks.a
 vi.mock('../../services/localPeopleIndex', () => ({ invalidateLocalPeopleIndex: vi.fn() }));
 vi.mock('../../services/jobNotifications', () => ({ requestJobPoll: mocks.poll }));
 
-import { __resetPendingEditsForTests, beginPendingEdit, confirmPendingEdit, pendingEditScope } from '../../services/pendingEdits';
+import { __resetPendingEditsForTests, beginPendingEdit, confirmPendingEdit, rollbackPendingEdit, pendingEditScope } from '../../services/pendingEdits';
+import { AlbumsPage } from './pages/AlbumsPage';
+import { __resetAlbumOperationsForTests, beginAlbumDelete, updateAlbumCreateReceipt, hasAlbumDeleteTombstone, clearAlbumDeleteTombstone } from '../../services/albumOperations';
 import { galleryIndexPhoto, StoreProvider, useStore } from './store';
 
 let store: ReturnType<typeof useStore>;
@@ -42,6 +44,7 @@ const rows = () => Array.from({ length: 800 }, (_, i) => ({
 describe('index-backed gallery', () => {
     beforeEach(() => {
         __resetPendingEditsForTests();
+        __resetAlbumOperationsForTests();
         mocks.get.mockReset().mockResolvedValue({ years: {} });
         mocks.post.mockReset().mockResolvedValue({ photos: [] });
         mocks.index.mockReset().mockResolvedValue(rows());
@@ -52,6 +55,318 @@ describe('index-backed gallery', () => {
         mocks.postTools.mockReset().mockRejectedValue(new Error('Source unavailable'));
     });
     afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+
+    it('audit: purging an album deleted in another browser must create local protection', async () => {
+        mocks.get.mockResolvedValue({albums:[{id:'a1',name:'Old',photoCount:1,deleted:true}]});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.reloadAlbumTrash();});
+        expect(store.albumTrash.length).toBe(1);
+        await act(async()=>{store.purgeAlbum('a1');});
+        mocks.albumsIndex.mockResolvedValue([{albumId:'a1',name:'Old',photoCount:1,coverFilename:''}]);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums).toEqual([]);
+    });
+    it('audit: a legacy fallback cannot retire protection against a stale index', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        mocks.get.mockResolvedValue({albums:[{id:'a1',name:'Birthday',photoCount:0}]});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        mocks.albumsIndex.mockRejectedValueOnce(new Error('index unavailable'));
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.some(a=>a.id==='a1')).toBe(true);
+        mocks.albumsIndex.mockResolvedValue([]);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.some(a=>a.id==='a1')).toBe(true);
+    });
+    it('audit: a failed explicit album read presents retry instead of endless resolving', async () => {
+        mocks.get.mockImplementation(async (url:string) => {
+            if(url.startsWith('/albums/a1')) throw {status:503};
+            return {years:{}};
+        });
+        render(<StoreProvider><Probe /><AlbumsPage /></StoreProvider>);
+        await act(async()=>{store.navigate('albums',{albumId:'a1'});});
+        await waitFor(()=>expect(mocks.get.mock.calls.some(([url])=>String(url).startsWith('/albums/a1'))).toBe(true));
+        await waitFor(()=>expect(store.isAlbumPhotosLoading('a1')).toBe(false));
+        expect(screen.getByText('Opening album…')).toBeTruthy();
+        expect(screen.queryByRole('button',{name:/retry/i})).not.toBeNull();
+    });
+    it('audit: purged albums remain hidden from older index snapshots', async () => {
+        mocks.albumsIndex.mockResolvedValue([{albumId:'a1',name:'Old',photoCount:1,coverFilename:''}]);
+        beginAlbumDelete('a1');
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums).toEqual([]);
+        await act(async()=>{store.purgeAlbum('a1');});
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums).toEqual([]);
+    });
+    it('audit: a pending created album retains its saved membership count', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        mocks.get.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:2},photos:[]});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        await act(async()=>{store.addPhotosToAlbum('a1',['p0.jpg','p1.jpg']);});
+        expect(store.albums.find(a=>a.id==='a1')?.photoCount).toBe(2);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.find(a=>a.id==='a1')?.photoCount).toBe(2);
+    });
+
+    it('audit: confirming one index presence cannot let a later old index erase the album', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        mocks.albumsIndex.mockResolvedValue([{albumId:'a1',name:'Birthday',photoCount:0,coverFilename:''}]);
+        await act(async()=>{await store.fetchAlbums(true);});
+        mocks.albumsIndex.mockResolvedValue([]);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.some(a=>a.id==='a1')).toBe(true);
+    });
+    it('audit: a failed delete must preserve the pending create receipt', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        mocks.post.mockRejectedValue(new Error('offline'));
+        await act(async()=>{store.deleteAlbum('a1');});
+        expect(store.albums.some(a=>a.id==='a1')).toBe(true);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.some(a=>a.id==='a1')).toBe(true);
+    });
+    it('audit: confirmed add count persists even if detail refresh fails', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        mocks.post.mockResolvedValue({success:true,added:['p0.jpg','p1.jpg'],album:{id:'a1',name:'Birthday',photoCount:2}});
+        mocks.get.mockImplementation(async (url:string)=>{if(url.startsWith('/albums/a1')) throw {status:503}; return {years:{}};});
+        await act(async()=>{store.addPhotosToAlbum('a1',['p0.jpg','p1.jpg']);});
+        expect(store.albums.find(a=>a.id==='a1')?.photoCount).toBe(2);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.find(a=>a.id==='a1')?.photoCount).toBe(2);
+    });
+
+    it('audit: a confirmed missing source album must not be re-injected forever', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        mocks.get.mockImplementation(async (url:string)=>{if(url.startsWith('/albums/a1')) throw {status:404}; return {years:{}};});
+        await act(async()=>{await store.openAlbum('a1');});
+        expect(store.isAlbumMissing('a1')).toBe(true);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.some(a=>a.id==='a1')).toBe(false);
+    });
+    it('audit: a stale present index row cannot revert a confirmed membership count', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        mocks.post.mockResolvedValue({success:true,added:['p0.jpg','p1.jpg'],album:{id:'a1',name:'Birthday',photoCount:2}});
+        mocks.get.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:2},photos:[]});
+        await act(async()=>{store.addPhotosToAlbum('a1',['p0.jpg','p1.jpg']);});
+        expect(store.albums.find(a=>a.id==='a1')?.photoCount).toBe(2);
+        mocks.albumsIndex.mockResolvedValue([{albumId:'a1',name:'Birthday',photoCount:0,coverFilename:''}]);
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.find(a=>a.id==='a1')?.photoCount).toBe(2);
+    });
+    it('audit: a stale missing index row must not undo the newly created album name', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        await act(async()=>{store.renameAlbum('a1','New name');});
+        expect(store.albums.find(a=>a.id==='a1')?.name).toBe('New name');
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.find(a=>a.id==='a1')?.name).toBe('New name');
+    });
+
+// StoreProvider reproduction; insert inside store.gallery.test.tsx describe block.
+    it('audit: a current source read must supersede an older create draft', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        // Another client has subsequently renamed it and added photos.
+        mocks.albumsIndex.mockRejectedValueOnce(new Error('index unavailable'));
+        mocks.get.mockResolvedValue({albums:[{id:'a1',name:'Remote name',photoCount:5}]});
+        await act(async()=>{await store.fetchAlbums(true);});
+        expect(store.albums.find(a=>a.id==='a1')).toMatchObject({name:'Remote name',photoCount:5});
+    });
+
+    it('keeps an album visible after a retryable detail failure and recovers on retry', async () => {
+        mocks.post.mockResolvedValue({album: {id: 'a1', name: 'Birthday', photoCount: 0}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.createAlbum('Birthday'); });
+        mocks.get.mockRejectedValue({status: 503});
+        await act(async () => { await store.openAlbum('a1'); });
+        expect(store.isAlbumMissing('a1')).toBe(false);
+        expect(store.isAlbumOpenFailed('a1')).toBe(true);
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums.find(a => a.id === 'a1')).toBeDefined();
+        mocks.get.mockResolvedValue({album: {id: 'a1', name: 'Birthday', photoCount: 5}, photos: []});
+        await act(async () => { await store.openAlbum('a1'); });
+        expect(store.isAlbumOpenFailed('a1')).toBe(false);
+        expect(store.albums.find(a => a.id === 'a1')?.photoCount).toBe(5);
+    });
+
+    it('advances the creation draft from a newer index without losing older-index protection', async () => {
+        mocks.post.mockResolvedValue({album: {id: 'a1', name: 'Birthday', photoCount: 0, updatedAt: '2026-10-22T10:00:00+00:00'}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.createAlbum('Birthday'); });
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'a1', name: 'Remote', photoCount: 5, coverFilename: '', updatedAt: '2026-10-22T10:00:01+00:00'}]);
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums.find(a => a.id === 'a1')).toMatchObject({name: 'Remote', photoCount: 5});
+        mocks.albumsIndex.mockResolvedValue([]);
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums.find(a => a.id === 'a1')).toMatchObject({name: 'Remote', photoCount: 5});
+    });
+
+    it.each(['network', 'partial', 'unacknowledged'])('rolls back a failed delete of an unloaded album (%s)', async (failure) => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        if (failure === 'network') mocks.post.mockRejectedValue(new Error('offline'));
+        else mocks.post.mockResolvedValue(failure === 'partial'
+            ? {deletedAlbums: [], albumErrors: [{albumId: 'unloaded', error: 'write failed'}], success: false}
+            : {success: false});
+        await act(async () => { store.deleteAlbum('unloaded'); });
+        expect(hasAlbumDeleteTombstone('unloaded')).toBe(false);
+        expect(store.toasts.at(-1)?.message).toBe('Couldn’t delete album');
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'unloaded', name: 'Still exists', photoCount: 1, coverFilename: ''}]);
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums.map(album => album.id)).toContain('unloaded');
+    });
+
+    it('keeps confirmed unloaded deletes hidden while rolling back failed ids', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        mocks.post.mockResolvedValue({deletedAlbums: ['deleted'], albumErrors: [{albumId: 'failed', error: 'write failed'}], success: false});
+        await act(async () => { store.deleteAlbums(['deleted', 'failed']); });
+        expect(hasAlbumDeleteTombstone('deleted')).toBe(true);
+        expect(hasAlbumDeleteTombstone('failed')).toBe(false);
+        expect(store.toasts.at(-1)?.message).toBe('Deleted 1 of 2 albums — 1 failed');
+    });
+
+    it('never saves an optimistic name into the creation draft when a legacy read loses its observation token', async () => {
+        mocks.post.mockResolvedValue({album: {id: 'a1', name: 'Birthday', photoCount: 0, updatedAt: '2026-10-22T10:00:00+00:00'}});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.createAlbum('Birthday'); await store.fetchAlbums(true); });
+        let finish!: (value: unknown) => void;
+        mocks.get.mockImplementation((url: string) => url === '/albums' ? new Promise(resolve => { finish = resolve; }) : Promise.resolve({years: {}}));
+        mocks.albumsIndex.mockResolvedValueOnce(null);
+        let read!: Promise<void>;
+        await act(async () => { read = store.fetchAlbums(true); });
+        await waitFor(() => expect(finish).toBeDefined());
+        const rename = beginPendingEdit('album', 'a1', {name: 'Unsaved'});
+        updateAlbumCreateReceipt('a1', {photoCount: 1, updatedAt: '2026-10-22T10:00:01+00:00'});
+        await act(async () => {
+            finish({albums: [{id: 'a1', name: 'Remote', photoCount: 5, updatedAt: '2026-10-22T10:00:02+00:00'}]});
+            await read;
+        });
+        expect(store.albums[0].name).toBe('Unsaved');
+        rollbackPendingEdit(rename);
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums[0]).toMatchObject({name: 'Remote', photoCount: 5});
+    });
+
+    it.each([400, 403])('shows a terminal album error without retry or deletion for status %s', async (status) => {
+        mocks.get.mockImplementation(async (url: string) => {
+            if (url.startsWith('/albums/a1')) throw {status};
+            return {years: {}};
+        });
+        render(<StoreProvider><Probe /><AlbumsPage /></StoreProvider>);
+        await act(async () => { store.navigate('albums', {albumId: 'a1'}); });
+        await waitFor(() => expect(screen.getByText('This album cannot be opened.')).toBeTruthy());
+        expect(screen.queryByRole('button', {name: /retry/i})).toBeNull();
+        expect(hasAlbumDeleteTombstone('a1')).toBe(false);
+    });
+
+    it.each([true, false])('restores a loaded album after overlapping delete failures (older first: %s)', async (olderFirst) => {
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'a1', name: 'Still exists', photoCount: 1, coverFilename: ''}]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); });
+        const failures: Array<(error: Error) => void> = [];
+        mocks.post.mockImplementation(() => new Promise((_resolve, reject) => { failures.push(reject); }));
+        await act(async () => { store.deleteAlbum('a1'); });
+        await act(async () => { store.deleteAlbum('a1'); });
+        await act(async () => { failures[olderFirst ? 0 : 1](new Error('offline')); });
+        await act(async () => { failures[olderFirst ? 1 : 0](new Error('offline')); });
+        expect(hasAlbumDeleteTombstone('a1')).toBe(false);
+        expect(store.albums.map(album => album.id)).toEqual(['a1']);
+    });
+
+    it('keeps an already loaded album visible when its photo request is rejected', async () => {
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'a1', name: 'Birthday', photoCount: 1, coverFilename: ''}]);
+        mocks.get.mockImplementation(async (url: string) => {
+            if (url.startsWith('/albums/a1')) throw {status: 403};
+            return {years: {}};
+        });
+        render(<StoreProvider><Probe /><AlbumsPage /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); store.navigate('albums', {albumId: 'a1'}); });
+        await waitFor(() => expect(store.isAlbumOpenTerminal('a1')).toBe(true));
+        expect(screen.queryByText('This album cannot be opened.')).toBeNull();
+        expect(screen.getAllByText('Birthday').length).toBeGreaterThan(0);
+    });
+
+    it.each([false, true])('does not reuse a snapshot after out-of-band tombstone clearing (next delete overlaps: %s)', async (overlap) => {
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'a1', name: 'Old', photoCount: 1, coverFilename: ''}]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); });
+        const failures: Array<(error: Error) => void> = [];
+        mocks.post.mockImplementation(() => new Promise((_resolve, reject) => { failures.push(reject); }));
+        await act(async () => { store.deleteAlbum('a1'); });
+        clearAlbumDeleteTombstone('a1'); // restore/storage event supersedes the first attempt
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'a1', name: 'Restored', photoCount: 5, coverFilename: ''}]);
+        await act(async () => { await store.fetchAlbums(true); });
+        if (!overlap) await act(async () => { failures[0](new Error('old request failed')); });
+        await act(async () => { store.deleteAlbum('a1'); });
+        if (overlap) await act(async () => { failures[0](new Error('old request failed')); });
+        await act(async () => { failures[1](new Error('new request failed')); });
+        expect(store.albums).toHaveLength(1);
+        expect(store.albums[0]).toMatchObject({name: 'Restored', photoCount: 5});
+        expect(hasAlbumDeleteTombstone('a1')).toBe(false);
+    });
+
+    it('does not resurrect an album when a detail GET finishes during delete', async () => {
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'a1', name: 'Birthday', photoCount: 1, coverFilename: ''}]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); });
+        let finishGet!: (value: unknown) => void;
+        mocks.get.mockImplementation((url: string) => url.startsWith('/albums/a1')
+            ? new Promise(resolve => { finishGet = resolve; }) : Promise.resolve({years: {}}));
+        let finishDelete!: (value: unknown) => void;
+        mocks.post.mockImplementation(() => new Promise(resolve => { finishDelete = resolve; }));
+        let read!: Promise<void>;
+        await act(async () => { read = store.openAlbum('a1'); });
+        await act(async () => { store.deleteAlbum('a1'); });
+        await act(async () => {
+            finishGet({album: {id: 'a1', name: 'Birthday', photoCount: 1}, photos: []});
+            await read;
+        });
+        expect(store.albums).toEqual([]);
+        expect(store.isAlbumPhotosLoading('a1')).toBe(false);
+        expect(hasAlbumDeleteTombstone('a1')).toBe(true);
+        await act(async () => { finishDelete({deletedAlbums: ['a1']}); });
+    });
+
+    it('does not open or add photos to an album already covered by a tombstone', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        beginAlbumDelete('a1');
+        mocks.get.mockClear(); mocks.post.mockClear();
+        await act(async () => { await store.openAlbum('a1'); store.addPhotosToAlbum('a1', ['p0.jpg']); });
+        expect(mocks.get.mock.calls.filter(([url]) => String(url).startsWith('/albums/a1'))).toHaveLength(0);
+        expect(mocks.post).not.toHaveBeenCalled();
+    });
+
+    it('does not reopen an album when a photo-add response arrives during delete', async () => {
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'a1', name: 'Birthday', photoCount: 0, coverFilename: ''}]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); });
+        let finishAdd!: (value: unknown) => void;
+        let finishDelete!: (value: unknown) => void;
+        mocks.post.mockImplementation((url: string) => new Promise(resolve => {
+            if (url.endsWith('/photos/add')) finishAdd = resolve;
+            else finishDelete = resolve;
+        }));
+        mocks.get.mockClear();
+        await act(async () => { store.addPhotosToAlbum('a1', ['p0.jpg']); });
+        await act(async () => { store.deleteAlbum('a1'); });
+        await act(async () => { finishAdd({album: {id: 'a1', name: 'Birthday', photoCount: 1}, added: ['p0.jpg']}); });
+        expect(store.albums).toEqual([]);
+        expect(mocks.get.mock.calls.filter(([url]) => String(url).startsWith('/albums/a1'))).toHaveLength(0);
+        await act(async () => { finishDelete({deletedAlbums: ['a1']}); });
+    });
 
     it.each(['Remote', 'Unnamed 1'])('keeps reconciled person name %s after a later rename fails', async (remoteName) => {
         const actual = await vi.importActual<typeof import('../../services/faceService')>('../../services/faceService');

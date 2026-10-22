@@ -219,17 +219,20 @@ const fetchLocalAlbumsIndex = async (key: string, scope: string, requestGenerati
     return rows;
 };
 
-export const getLocalAlbumsIndex = async (): Promise<AlbumIndexRow[] | null> => {
+// Raw rows let whole-row persistence reconcile server revisions before scalar
+// optimistic edits are applied. Never persist an optimistic name as source data.
+export const getLocalAlbumsIndex = async (options: { raw?: boolean } = {}): Promise<AlbumIndexRow[] | null> => {
     const key = indexKey();
     if (cachedIndex && cachedKey === key) {
         const snapshot = cachedIndex;
         const scope = pendingEditScope();
         mergeRows(snapshot, snapshotVersions.get(snapshot), scope, pendingEditReadTokens(scope, false));
         schedulePendingEditsReconciliation();
-        return scope === pendingEditScope() ? mergeRows(snapshot, undefined, scope) : null;
+        return scope === pendingEditScope() ? (options.raw ? snapshot : mergeRows(snapshot, undefined, scope)) : null;
     }
     if (inFlight && cachedKey === key) {
-        return inFlight;
+        const scope = pendingEditScope();
+        return inFlight.then(result => scope !== pendingEditScope() ? null : result && !options.raw ? mergeRows(result, undefined, scope) : result);
     }
     cachedIndex = null;
     cachedKey = key;
@@ -243,7 +246,7 @@ export const getLocalAlbumsIndex = async (): Promise<AlbumIndexRow[] | null> => 
             schedulePendingEditsReconciliation();
             if (scope !== pendingEditScope()) return null;
             if (generation === requestGeneration) cachedIndex = result;
-            return result ? mergeRows(result, undefined, scope) : result;
+            return result;
         })
         .catch(() => {
             if (generation === requestGeneration) cachedIndex = null;
@@ -253,7 +256,7 @@ export const getLocalAlbumsIndex = async (): Promise<AlbumIndexRow[] | null> => 
             if (inFlight === request) inFlight = null;
         });
     inFlight = request;
-    return inFlight;
+    return request.then(result => scope !== pendingEditScope() ? null : result && !options.raw ? mergeRows(result, undefined, scope) : result);
 };
 
 // Called after any album mutation (create/rename/delete/add-photos/

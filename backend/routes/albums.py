@@ -7,6 +7,7 @@ the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
 from flask import Blueprint
+from azure.core.exceptions import HttpResponseError, ServiceRequestError, ServiceResponseError
 
 import app
 
@@ -53,7 +54,12 @@ def delete_multiple_albums_people():
     updated_files = []
 
     for album_id in album_ids:
-        existing = app._load_album_entity(user_id, str(album_id))
+        try:
+            existing = app._load_album_entity(user_id, str(album_id), strict=True)
+        except Exception:
+            app.app.logger.warning('Album delete lookup failed for %s/%s', user_id, album_id, exc_info=True)
+            album_errors.append({'albumId': album_id, 'error': 'lookup failed'})
+            continue
         if not existing:
             album_errors.append({'albumId': album_id, 'error': 'Not found'})
             continue
@@ -206,7 +212,24 @@ def get_album(album_id: str):
         return error
     if not app._albums_table_available():
         return app.jsonify({'error': 'Albums not configured'}), 503
-    entity = app._load_album_entity(user_id, album_id)
+    # Only a genuinely absent/deleted row may produce a 404: clients retain
+    # that result as deletion evidence across index refreshes and reloads.
+    try:
+        entity = app._load_album_entity(user_id, album_id, strict=True)
+    except (ServiceRequestError, ServiceResponseError):
+        app.app.logger.warning('Album source temporarily unavailable for %s/%s', user_id, album_id, exc_info=True)
+        return app.jsonify({'error': 'Album temporarily unavailable'}), 503
+    except HttpResponseError as error:
+        status = error.status_code
+        if status and 400 <= status < 500 and status not in (404, 408, 429):
+            return app.jsonify({'error': 'Album request rejected'}), status
+        app.app.logger.warning('Album storage read failed for %s/%s', user_id, album_id, exc_info=True)
+        return app.jsonify({'error': 'Album temporarily unavailable'}), 503
+    except ValueError:
+        return app.jsonify({'error': 'Invalid album request'}), 400
+    except Exception:
+        app.app.logger.exception('Unexpected album source read failure for %s/%s', user_id, album_id)
+        return app.jsonify({'error': 'Failed to load album'}), 500
     if not entity or app._coerce_bool(entity.get('deleted')):
         return app.jsonify({'error': 'Album not found'}), 404
     cover = app._album_cover_thumbnail_url(user_id, app.album_store.sample(entity, 50))

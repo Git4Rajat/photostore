@@ -44,7 +44,7 @@ const randomCode = () => Math.random().toString(16).slice(2, 6).toUpperCase();
 /** Albums — list first on mobile, detail view on larger screens. */
 export const AlbumsPage: React.FC = () => {
     const {
-        albums, albumsLoading, route, navigate, openAlbum, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosHasMore,
+        albums, albumsLoading, route, navigate, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosHasMore,
         createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
         selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums,
     } = useStore();
@@ -69,14 +69,44 @@ export const AlbumsPage: React.FC = () => {
     const [smartCreatingRule, setSmartCreatingRule] = useState<string | null>(null);
     const [smartSheetOpen, setSmartSheetOpen] = useState(false);
     const [albumTile, setAlbumTile] = useTileSize('photostore.albumTileSize');
-    const selectedId = route.params.albumId ?? albums[0]?.id;
-    const album = albums.find((a) => a.id === selectedId) ?? albums[0];
+    // An explicit albumId (deep link, Ask-page navigation, browser back/
+    // forward) must resolve to that exact album or an explicit not-found/
+    // loading state -- never silently substitute an unrelated album[0] just
+    // because the requested id isn't loaded yet (see
+    // docs/audits/red-dress-album-incident-2026-10-22.md). Only the
+    // no-selection case (plain "Albums" tab) falls back to the first album
+    // for the desktop preview pane.
+    const explicitAlbumId = route.params.albumId;
+    const album = explicitAlbumId ? albums.find((a) => a.id === explicitAlbumId) : albums[0];
+    const explicitAlbumMissing = explicitAlbumId ? isAlbumMissing(explicitAlbumId) : false;
+    // A transient (network/5xx) failure is distinct from both "still
+    // resolving" and a confirmed 404: it must present a retry action rather
+    // than spin forever (see docs/audits/album-persistence-2026-10-22.md
+    // finding #6) or get silently retried by the fetch effect below.
+    const explicitAlbumFailed = explicitAlbumId ? isAlbumOpenFailed(explicitAlbumId) : false;
+    const albumOpenTerminal = explicitAlbumId ? !album && isAlbumOpenTerminal(explicitAlbumId) : false;
+    const albumResolving = Boolean(explicitAlbumId) && !album && !explicitAlbumMissing && !explicitAlbumFailed && !albumOpenTerminal;
+    const albumMissing = Boolean(explicitAlbumId) && !album && explicitAlbumMissing;
+    const albumOpenFailed = Boolean(explicitAlbumId) && !album && explicitAlbumFailed;
     const [copied, setCopied] = useState(false);
     const [expiry, setExpiry] = useState('7');
     const covers = useProtectedBlobUrls(albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
     // The backend never returns an album's access code back (it's a stored
     // secret), so remember codes we generate this session to show the owner.
     const [codes, setCodes] = useState<Record<string, string>>({});
+
+    // An explicit albumId not present in the currently loaded `albums` list
+    // (fresh deep link, or an index that hasn't caught up with a just-created
+    // album yet) needs its own direct-by-id resolution -- the effect below
+    // only fires once `album` already exists, so without this a stale list
+    // would otherwise leave the id unresolved forever instead of fetching it.
+    useEffect(() => {
+        if (!albumResolving || !explicitAlbumId) return;
+        const controller = new AbortController();
+        void enqueueBackgroundRequest(async () => { await openAlbum(explicitAlbumId); }, { signal: controller.signal }).catch(() => {});
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [albumResolving, explicitAlbumId]);
 
     // Fetch the active album's photos whenever the selection changes, unless
     // this album's first page is already cached from a prior visit -- and
@@ -100,6 +130,7 @@ export const AlbumsPage: React.FC = () => {
     };
 
     const confirmDeleteAlbum = async () => {
+        if (!album) return;
         const confirmed = await confirmDialog({
             title: `Delete “${album.name}”?`,
             message: 'The photos inside stay in your library — only the album is removed.',
@@ -178,6 +209,41 @@ export const AlbumsPage: React.FC = () => {
             </div>
         </BottomSheet>
     );
+
+    if (albumMissing) {
+        return (
+            <div className="pt-empty-page">
+                <p>Album not found.</p>
+                <p className="pt-empty-page-hint">It may have been deleted, or the link may be wrong.</p>
+                <button type="button" className="btn" onClick={() => navigate('albums', {})}>Back to albums</button>
+            </div>
+        );
+    }
+
+    if (albumOpenTerminal) {
+        return (
+            <div className="pt-empty-page">
+                <p>This album cannot be opened.</p>
+                <p className="pt-empty-page-hint">Check the link and your access to this album.</p>
+                <button type="button" className="btn" onClick={() => navigate('albums', {})}>Back to albums</button>
+            </div>
+        );
+    }
+
+    if (albumResolving || albumOpenFailed) {
+        return (
+            <div className="pt-empty-page">
+                <Spinner label="Opening album…" />
+                {albumOpenFailed && explicitAlbumId && (
+                    <div className="pt-arrive-actions">
+                        <p className="pt-empty-page-hint">Something went wrong loading this album.</p>
+                        <button type="button" className="btn" onClick={() => void openAlbum(explicitAlbumId)}>Retry</button>
+                        <button type="button" className="btn" onClick={() => navigate('albums', {})}>Back to albums</button>
+                    </div>
+                )}
+            </div>
+        );
+    }
 
     if (!album) {
         return (

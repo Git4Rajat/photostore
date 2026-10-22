@@ -8,6 +8,11 @@ import { setPhotoRotation } from './media';
 import { clearLocalSortIndexRemovals, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
+import {
+    beginAlbumCreate, beginAlbumDelete, rollbackAlbumDelete, previousAlbumDeleteAttempt, clearAlbumDeleteTombstone, hasAlbumDeleteTombstone,
+    applyAlbumOperationOverlay, updateAlbumCreateReceipt, albumCreateReadTokens, observeAlbumSourceRows,
+    type AlbumCreateReceipt, type AlbumDeleteTombstone,
+} from '../../services/albumOperations';
 import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { enqueueBackgroundRequest } from '../../services/backgroundRequestQueue';
@@ -412,7 +417,10 @@ interface Store {
     reloadAlbums: () => void;
     // Promise-returning counterpart of reloadAlbums -- see fetchExplore above.
     fetchAlbums: (force?: boolean) => Promise<void>;
-    openAlbum: (id: string) => void;
+    openAlbum: (id: string) => Promise<void>;
+    isAlbumMissing: (id: string) => boolean;
+    isAlbumOpenFailed: (id: string) => boolean;
+    isAlbumOpenTerminal: (id: string) => boolean;
     albumPhotosById: (id: string) => Photo[] | undefined;
     isAlbumPhotosLoading: (id: string) => boolean;
     loadMoreAlbumPhotos: (id: string) => void;
@@ -520,6 +528,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // A was still in flight cleared the flag for both, so A's still-loading,
     // still-undefined photo list briefly read as "no photos in this album".
     const [albumPhotosLoadingIds, setAlbumPhotosLoadingIds] = useState<Record<string, boolean>>({});
+    // Distinguishes "still resolving" from "the backend confirmed this id
+    // doesn't exist" so AlbumsPage can show an explicit not-found state
+    // instead of silently substituting an unrelated album (see item 7,
+    // docs/audits/red-dress-album-incident-2026-10-22.md).
+    const [albumNotFoundIds, setAlbumNotFoundIds] = useState<Record<string, boolean>>({});
+    // A transient failure (network/5xx) is not "not found" -- it must stay
+    // retryable rather than silently leaving the page spinning forever (see
+    // docs/audits/album-persistence-2026-10-22.md finding #6).
+    const [albumOpenTerminalIds, setAlbumOpenTerminalIds] = useState<Record<string, boolean>>({});
+    const [albumOpenFailedIds, setAlbumOpenFailedIds] = useState<Record<string, boolean>>({});
     const [placesState, setPlacesState] = useState<Place[]>([]);
     const [thingsState, setThingsState] = useState<ThingTag[]>([]);
     const [exploreLoading, setExploreLoading] = useState<boolean>(true);
@@ -1140,6 +1158,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             .catch(() => { /* viewer will show its own empty/loading state */ });
     }, [photos, openViewer, registerPhotos]);
 
+    // Minimal rendering of a pending-create receipt until the index confirms
+    // the real row (see reconcileAlbumCreateReceipts/applyAlbumOperationOverlay).
+    const albumFromCreateReceipt = useCallback((receipt: AlbumCreateReceipt): Album => ({
+        id: receipt.id,
+        name: receipt.draft.name,
+        photoCount: receipt.draft.photoCount,
+        coverThumbnailUrl: receipt.draft.coverThumbnailUrl,
+        updatedAt: receipt.draft.updatedAt,
+    }), []);
+
     // Primary path: the whole-library albums index (see localAlbumsIndex.ts),
     // downloaded once per session -- covers picked from the sort index, not
     // list_albums's whole-library scan. Falls back to the legacy GET /albums
@@ -1151,10 +1179,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         // and this fallback keeps masking a later rename from another client.
         const scope = pendingEditScope();
         const tokens = pendingEditReadTokens(scope);
+        const createTokens = albumCreateReadTokens(scope);
         const res = await get<{ albums?: Album[] }>('/albums');
-        setAlbums(Array.isArray(res?.albums) ? res.albums.map(album => applyPendingEdits('album', album.id, album, undefined, scope, tokens)) : []);
+        if (scope !== pendingEditScope()) return;
+        const sourceRows = Array.isArray(res?.albums) ? res.albums : [];
+        // A source read can refresh the draft, but must retain the receipt:
+        // the next index may still predate this album or this newer state.
+        observeAlbumSourceRows(sourceRows, createTokens, scope);
+        // Observe scalar read evidence, but feed only raw server fields into
+        // whole-row revision reconciliation. Optimistic values are applied last.
+        sourceRows.forEach(album => applyPendingEdits('album', album.id, album, undefined, scope, tokens));
+        setAlbums(applyAlbumOperationOverlay(sourceRows, albumFromCreateReceipt)
+            .map(album => applyPendingEdits('album', album.id, album)));
         schedulePendingEditsReconciliation();
-    }, []);
+    }, [albumFromCreateReceipt]);
 
     const loadAlbums = useCallback(async () => {
         const hasCachedAlbums = albumsLoadedAtRef.current !== null;
@@ -1163,7 +1201,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         try {
             // Only a genuinely cold visit waits for a just-started index build.
             // Warm refreshes fall back immediately rather than repeating 6s of sleeps.
-            const rows = await (hasCachedAlbums ? getLocalAlbumsIndex() : withIndexRetry(getLocalAlbumsIndex));
+            const rows = await (hasCachedAlbums ? getLocalAlbumsIndex({ raw: true }) : withIndexRetry(() => getLocalAlbumsIndex({ raw: true })));
             if (!rows) {
                 throw new Error('albums index unavailable');
             }
@@ -1191,6 +1229,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 id: r.albumId,
                 name: r.name,
                 photoCount: r.photoCount,
+                updatedAt: r.updatedAt,
                 coverThumbnailUrl: r.coverFilename ? covers.get(r.coverFilename) || undefined : undefined,
                 isPublic: r.isPublic,
                 publicUrl: r.publicUrl || undefined,
@@ -1198,7 +1237,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 hasAccessCode: r.hasAccessCode,
                 isExpired: r.isExpired,
             }));
-            setAlbums(mapped.map(album => applyPendingEdits('album', album.id, album)));
+            // Reconcile raw source fields first. Scalar optimistic edits must
+            // never become the creation receipt's confirmed baseline.
+            const withCreateOverlay = applyAlbumOperationOverlay(mapped, albumFromCreateReceipt)
+                .map(album => applyPendingEdits('album', album.id, album));
+            setAlbums(withCreateOverlay);
             albumsLoadedAtRef.current = Date.now();
         } catch {
             try {
@@ -1210,7 +1253,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         } finally {
             setAlbumsLoading(false);
         }
-    }, [fetchAlbumsViaLegacyEndpoint]);
+    }, [fetchAlbumsViaLegacyEndpoint, albumFromCreateReceipt]);
 
     const fetchAlbums = useCallback((force = false): Promise<void> => {
         if (albumsFetchRef.current) {
@@ -1623,10 +1666,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const restored = snapshot.find((t) => t.album.id === id);
         setAlbumTrash((prev) => prev.filter((t) => t.album.id !== id));
         if (restored) setAlbums((prev) => [restored.album, ...prev]);
+        // The active-albums overlay hides any id with a delete tombstone
+        // regardless of what the index says, so a restored album must clear
+        // its tombstone or it stays invisible until the (7-day) TTL expires.
+        clearAlbumDeleteTombstone(id);
         invalidateLocalAlbumsIndex();
         void post(`/albums/${encodeURIComponent(id)}/restore`, {}).catch(() => {
             setAlbumTrash(snapshot);
             if (restored) setAlbums((prev) => prev.filter((a) => a.id !== id));
+            beginAlbumDelete(id); // still soft-deleted server-side; keep hiding it
             toast('Couldn’t restore album', undefined, undefined, 'error');
         });
     }, [albumTrash, toast]);
@@ -1634,6 +1682,17 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const purgeAlbum = useCallback((id: string) => {
         const snapshot = albumTrash;
         setAlbumTrash((prev) => prev.filter((t) => t.album.id !== id));
+        // Unconditionally establish a tombstone, not just preserve one that
+        // might already exist: the preceding soft delete can have happened
+        // in another browser/device, or before this browser's local storage
+        // was cleared, so there is no guarantee one is already present (see
+        // docs/audits/album-persistence-recheck-2026-10-22.md finding #2).
+        // Deliberately never cleared, before or after the request: a
+        // permanent backend delete does not retroactively remove this id
+        // from an already-downloaded stale index snapshot, so the active-
+        // albums overlay must keep hiding it regardless of outcome -- the
+        // tombstone is left to expire via its own TTL instead.
+        beginAlbumDelete(id);
         invalidateLocalAlbumsIndex();
         void post(`/albums/${encodeURIComponent(id)}/purge`, {}).catch(() => {
             setAlbumTrash(snapshot);
@@ -1682,21 +1741,81 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         return { page, album: res?.album };
     }, []);
     const openAlbum = useCallback(async (id: string) => {
+        const scope = pendingEditScope();
+        const deleted = () => hasAlbumDeleteTombstone(id, scope);
+        if (deleted()) return;
         const seq = (albumLoadSeq.current[id] ?? 0) + 1;
         albumLoadSeq.current[id] = seq;
-        const stale = () => albumLoadSeq.current[id] !== seq;
+        const createTokens = albumCreateReadTokens(scope);
+        const stale = () => albumLoadSeq.current[id] !== seq || scope !== pendingEditScope();
         setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: true }));
+        setAlbumNotFoundIds((prev) => (prev[id] ? { ...prev, [id]: false } : prev));
+        setAlbumOpenFailedIds((prev) => (prev[id] ? { ...prev, [id]: false } : prev));
+        setAlbumOpenTerminalIds((prev) => (prev[id] ? { ...prev, [id]: false } : prev));
         try {
             const { page, album } = await fetchAlbumPage(id, 0);
-            if (stale()) return;
+            if (stale() || deleted()) return;
             setAlbumPhotos((prev) => ({ ...prev, [id]: page }));
-            if (album) setAlbums((prev) => prev.map((a) => (a.id === id ? applyPendingEdits('album', id, { ...a, ...album }) : a)));
-        } catch {
+            if (album) {
+                // .map alone silently drops this fetch when `id` isn't already
+                // loaded (e.g. a deep link opened before the albums list ever
+                // loaded, or one the index hasn't caught up on yet) -- insert
+                // it instead of discarding the direct-by-id fetch we just paid
+                // for. See AlbumsPage's selectedId resolution, which relies on
+                // this to resolve an unloaded album rather than substituting
+                // an arbitrary other one.
+                setAlbums((prev) => {
+                    // The updater can run after a delete even when the GET
+                    // resolved first; recheck deletion at state-application time.
+                    if (stale() || deleted()) return prev;
+                    return prev.some((a) => a.id === id)
+                        ? prev.map((a) => (a.id === id ? applyPendingEdits('album', id, { ...a, ...album }) : a))
+                        : [...prev, applyPendingEdits('album', id, album)];
+                });
+                // Keep a pending creation receipt's draft in sync with this
+                // confirmed server state -- otherwise, if a stale index miss
+                // later forces the overlay to reconstruct the row from the
+                // receipt alone, it would regress back to the empty-at-
+                // creation draft (e.g. photoCount 0) despite a successful
+                // save (see docs/audits/album-persistence-2026-10-22.md
+                // finding #5).
+                observeAlbumSourceRows([album], createTokens, scope);
+            }
+        } catch (error) {
+            if (stale() || deleted()) return;
             setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
+            // Only a confirmed 404 means "this album doesn't exist" -- a
+            // network/5xx failure must stay resolvable-by-retry, not flip to
+            // a dead-end not-found state.
+            const status = (error as { status?: number })?.status;
+            if (status === 404) {
+                setAlbumNotFoundIds((prev) => ({ ...prev, [id]: true }));
+                // A direct by-id read returning 404 is as authoritative as
+                // existence checks get -- someone else may have deleted or
+                // purged this album. Treat it exactly like a confirmed
+                // delete: tombstone it so a stale cached index can't
+                // resurrect it, and drop it from the in-memory list (which
+                // may still hold it from this session's own optimistic
+                // createAlbum) instead of leaving a ghost row that only
+                // isAlbumMissing flags but nothing actually removes (see
+                // docs/audits/album-persistence-recheck2-2026-10-22.md
+                // finding #2).
+                beginAlbumDelete(id);
+                setAlbums((prev) => prev.filter((a) => a.id !== id));
+            } else if (status && status >= 400 && status < 500 && status !== 408 && status !== 429) {
+                // Rejected requests need a terminal UI, but are not evidence
+                // that the album was deleted and must not create tombstones.
+                setAlbumOpenTerminalIds((prev) => ({ ...prev, [id]: true }));
+            } else {
+                setAlbumOpenFailedIds((prev) => ({ ...prev, [id]: true }));
+            }
         } finally {
             if (!stale()) setAlbumPhotosLoadingIds((prev) => ({ ...prev, [id]: false }));
         }
     }, [fetchAlbumPage]);
+    const isAlbumMissing = useCallback((id: string) => Boolean(albumNotFoundIds[id]), [albumNotFoundIds]);
+    const isAlbumOpenTerminal = useCallback((id: string) => Boolean(albumOpenTerminalIds[id]), [albumOpenTerminalIds]);
+    const isAlbumOpenFailed = useCallback((id: string) => Boolean(albumOpenFailedIds[id]), [albumOpenFailedIds]);
     const loadMoreAlbumPhotos = useCallback((id: string) => {
         if (albumLoadingMore.current[id] || !albumPaging[id]?.hasMore) return;
         albumLoadingMore.current[id] = true;
@@ -1726,6 +1845,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const res = await post<{ album?: Album }>('/albums', { name: finalName });
                 const created = res?.album;
                 if (created) {
+                    // Persist a creation receipt *before* invalidating the index
+                    // cache: a loadAlbums() triggered by the invalidation (or by
+                    // navigating straight to this album, or by another tab) can
+                    // otherwise read a snapshot that predates this write and
+                    // silently drop the new album (see
+                    // docs/audits/birthday-album-incident-2026-10-22.md). The
+                    // receipt retains its latest confirmed draft even if an older
+                    // index is read after a newer source response.
+                    beginAlbumCreate(created.id, { name: created.name, photoCount: created.photoCount, coverThumbnailUrl: created.coverThumbnailUrl, updatedAt: created.updatedAt });
                     setAlbums((prev) => [...prev, created]);
                     invalidateLocalAlbumsIndex();
                     publishLibraryChange('album-created', ['albums'], { itemCount: 1 });
@@ -1820,7 +1948,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const addPhotosToAlbum = useCallback(
         (albumId: string, ids: string[]) => {
-            if (!ids.length) return;
+            const scope = pendingEditScope();
+            const deleted = () => hasAlbumDeleteTombstone(albumId, scope);
+            if (!ids.length || deleted()) return;
             const album = albums.find((a) => a.id === albumId);
             const idSet = new Set(ids);
             const added = photosByIds(ids);
@@ -1838,8 +1968,24 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 });
             }
             invalidateLocalAlbumsIndex();
-            void post(`/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids })
-                .then(() => {
+            void post<{ success?: boolean; added?: string[]; errors?: string[]; album?: Album }>(
+                `/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids },
+            )
+                .then((res) => {
+                    if (scope !== pendingEditScope()) return;
+                    // Update the creation receipt straight from this response,
+                    // not just from the follow-up detail refresh below: the
+                    // membership is already confirmed saved at this point, so
+                    // a failed/slow detail GET must not be able to make the
+                    // persisted draft regress back to its empty-at-creation
+                    // count if a stale index later forces a reconstruction
+                    // from the receipt (see
+                    // docs/audits/album-persistence-recheck-2026-10-22.md
+                    // finding #4).
+                    if (res?.album) {
+                        updateAlbumCreateReceipt(albumId, { name: res.album.name, photoCount: res.album.photoCount, coverThumbnailUrl: res.album.coverThumbnailUrl, updatedAt: res.album.updatedAt });
+                    }
+                    if (deleted()) return;
                     publishLibraryChange('album-photos-added', ['albums'], { itemCount: ids.length });
                     toast(`Added ${ids.length} to “${album?.name ?? 'album'}”`);
                     // Reconcile with the server (cover, ordering). The cache is
@@ -1847,6 +1993,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     void openAlbum(albumId);
                 })
                 .catch(() => {
+                    if (scope !== pendingEditScope() || deleted()) return;
                     setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: Math.max(0, a.photoCount - ids.length) } : a)));
                     setAlbumPhotos((prev) => (prev[albumId]
                         ? { ...prev, [albumId]: prev[albumId].filter((p) => !idSet.has(p.id)) }
@@ -1857,37 +2004,80 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [albums, photosByIds, openAlbum, toast],
     );
 
-    const deleteAlbum = useCallback((id: string) => {
-        const removed = albums.find((a) => a.id === id);
-        setAlbums((prev) => prev.filter((a) => a.id !== id));
-        invalidateLocalAlbumsIndex();
-        void post('/albums/delete-multiple', { albumIds: [id] })
-            .then(() => {
-                publishLibraryChange('album-deleted', ['albums'], { itemCount: 1 });
-                toast(`Deleted “${removed?.name ?? 'album'}”`);
-            })
-            .catch(() => {
-                if (removed) setAlbums((prev) => [...prev, removed]);
-                toast('Couldn’t delete album', undefined, undefined, 'error');
-            });
-    }, [albums, toast]);
+    // /albums/delete-multiple deliberately returns HTTP 200 with success:false
+    // and a populated albumErrors on a per-album lookup/write failure -- see
+    // docs/audits/red-dress-album-incident-2026-10-22.md, where two such
+    // responses were treated as full successes because nothing inspected
+    // the body. deletedAlbums/albumErrors must be read on every call.
+    type DeleteMultipleResponse = { deletedAlbums?: string[]; albumErrors?: { albumId: string; error: string }[]; success?: boolean };
 
+    // A snapshot belongs to a live delete attempt, not to the album ID.
+    // Out-of-band restore/purge breaks the chain; a later delete must capture
+    // its own current row. Snapshots need only outlive their pending requests.
+    const albumDeleteBaselines = useRef(new WeakMap<AlbumDeleteTombstone, Album>());
     const deleteAlbums = useCallback((ids: string[]) => {
         if (!ids.length) return;
-        const idSet = new Set(ids);
+        const scope = pendingEditScope();
+        const requested = Array.from(new Set(ids));
+        const idSet = new Set(requested);
         const removed = albums.filter((a) => idSet.has(a.id));
+        const removedById = new Map(removed.map(album => [album.id, album]));
         setAlbums((prev) => prev.filter((a) => !idSet.has(a.id)));
+        const attempts = requested.map((id) => {
+            const attempt = beginAlbumDelete(id);
+            const previous = previousAlbumDeleteAttempt(attempt);
+            const baseline = removedById.get(id)
+                ?? (previous ? albumDeleteBaselines.current.get(previous) : undefined);
+            if (baseline) albumDeleteBaselines.current.set(attempt, baseline);
+            return attempt;
+        });
+        const rollback = (failedIds: Set<string>) => {
+            const rows = attempts.flatMap(attempt => {
+                if (!failedIds.has(attempt.id) || !rollbackAlbumDelete(attempt)) return [];
+                const album = albumDeleteBaselines.current.get(attempt);
+                return album ? [album] : [];
+            });
+            if (scope !== pendingEditScope()) return;
+            setAlbums(prev => {
+                const present = new Set(prev.map(album => album.id));
+                return [...prev, ...rows.filter(album => !present.has(album.id))];
+            });
+        };
         invalidateLocalAlbumsIndex();
-        void post('/albums/delete-multiple', { albumIds: ids })
-            .then(() => {
-                publishLibraryChange('albums-deleted', ['albums'], { itemCount: ids.length });
-                toast(`Deleted ${removed.length} album${removed.length === 1 ? '' : 's'}`);
+        void post<DeleteMultipleResponse>('/albums/delete-multiple', { albumIds: requested })
+            .then((res) => {
+                const errors = new Set((res?.albumErrors ?? []).map(error => error.albumId));
+                const confirmed = new Set(res?.deletedAlbums ?? []);
+                // An omitted acknowledgement is not a confirmed deletion.
+                const failedIds = new Set(requested.filter(id => !confirmed.has(id) || errors.has(id)));
+                rollback(failedIds);
+                if (scope !== pendingEditScope()) return;
+                const succeededCount = requested.length - failedIds.size;
+                if (succeededCount > 0) {
+                    publishLibraryChange('albums-deleted', ['albums'], { itemCount: succeededCount });
+                }
+                if (failedIds.size) {
+                    toast(
+                        succeededCount > 0
+                            ? `Deleted ${succeededCount} of ${requested.length} albums — ${failedIds.size} failed`
+                            : `Couldn’t delete ${failedIds.size === 1 ? 'album' : 'albums'}`,
+                        undefined, undefined, succeededCount > 0 ? undefined : 'error',
+                    );
+                } else if (succeededCount === 1 && removed.length === 1) {
+                    toast(`Deleted “${removed[0].name}”`);
+                } else {
+                    toast(`Deleted ${succeededCount} album${succeededCount === 1 ? '' : 's'}`);
+                }
             })
             .catch(() => {
-                if (removed.length) setAlbums((prev) => [...prev, ...removed]);
-                toast('Couldn’t delete albums', undefined, undefined, 'error');
-            });
+                rollback(idSet);
+                if (scope !== pendingEditScope()) return;
+                toast(`Couldn’t delete ${requested.length === 1 ? 'album' : 'albums'}`, undefined, undefined, 'error');
+            })
+            .finally(() => { attempts.forEach(attempt => albumDeleteBaselines.current.delete(attempt)); });
     }, [albums, toast]);
+
+    const deleteAlbum = useCallback((id: string) => { deleteAlbums([id]); }, [deleteAlbums]);
 
     const shareAlbum = useCallback(async (id: string, opts: { expiresInDays: number; accessCode?: string }) => {
         try {
@@ -2564,6 +2754,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             reloadAlbums,
             fetchAlbums,
             openAlbum,
+            isAlbumMissing,
+            isAlbumOpenFailed,
+            isAlbumOpenTerminal,
             albumPhotosById,
             isAlbumPhotosLoading,
             loadMoreAlbumPhotos,
@@ -2611,7 +2804,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, savePhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
-            albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
+            albumsLoading, reloadAlbums, fetchAlbums, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
             renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, applyExternalPeopleRemoval, reloadMembers, fetchMembers, invite, revokeInvite,

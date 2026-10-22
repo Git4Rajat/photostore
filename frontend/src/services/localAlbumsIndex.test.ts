@@ -5,6 +5,7 @@ vi.mock('./apiClient', () => ({ get: mocks.get }));
 vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => mocks.library }));
 vi.mock('./perf', () => ({ perf: { recordSpan: vi.fn() }, perfNow: () => 0 }));
 
+import { __resetPendingEditsForTests, beginPendingEdit } from './pendingEdits';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from './localAlbumsIndex';
 
 const manifest = (version: string) => ({ available: true, indexUrl: `https://storage.test/${version}`, sourceVersion: version });
@@ -16,6 +17,7 @@ const response = (albumId: string) => ({
 describe('Albums index session cache', () => {
     beforeEach(() => {
         invalidateLocalAlbumsIndex();
+        __resetPendingEditsForTests();
         mocks.library = 'library-a';
         mocks.get.mockReset().mockResolvedValue(manifest('v1'));
         // Exercise the supported memory-only fallback without browser persistence.
@@ -35,6 +37,18 @@ describe('Albums index session cache', () => {
         await Promise.all([getLocalAlbumsIndex(), getLocalAlbumsIndex()]);
         expect(mocks.get).toHaveBeenCalledTimes(1);
         expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([true, false])('keeps source fields separate from optimistic fields for concurrent readers (raw first: %s)', async (rawFirst) => {
+        beginPendingEdit('album', 'a1', {name: 'Optimistic'});
+        const first = getLocalAlbumsIndex({raw: rawFirst});
+        const second = getLocalAlbumsIndex({raw: !rawFirst});
+        const [one, two] = await Promise.all([first, second]);
+        expect(one?.[0].name).toBe(rawFirst ? 'a1' : 'Optimistic');
+        expect(two?.[0].name).toBe(rawFirst ? 'Optimistic' : 'a1');
+        expect((await getLocalAlbumsIndex({raw: true}))?.[0].name).toBe('a1');
+        expect((await getLocalAlbumsIndex())?.[0].name).toBe('Optimistic');
+        expect(mocks.get).toHaveBeenCalledTimes(1);
     });
 
     it('does not let a pre-invalidation response overwrite a newer cache', async () => {

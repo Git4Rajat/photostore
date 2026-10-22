@@ -54,7 +54,7 @@ def test_adding_beyond_capacity_is_a_clear_413_not_a_500(monkeypatch):
     monkeypatch.setattr(app, '_albums_table_available', lambda: True)
     entity = {'PartitionKey': 'u1', 'RowKey': 'al', 'filenames': '[]'}
     album_store.write_filenames(entity, album_store.fit(names)[0])         # already at capacity
-    monkeypatch.setattr(app, '_load_album_entity', lambda uid, aid: entity)
+    monkeypatch.setattr(app, '_load_album_entity', lambda uid, aid, **kwargs: entity)
     monkeypatch.setattr(app, '_save_album_entity', lambda e: table.upsert_entity(e))
     with app.app.test_request_context('/api/albums/al/photos/add', method='POST', json={'filenames': names[-50:]}):
         response = albums.add_photos_to_album('al')
@@ -89,7 +89,7 @@ def _album_world(monkeypatch, count=50):
     monkeypatch.setattr(app, 'metadata_table_client', meta)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
     monkeypatch.setattr(app, '_albums_table_available', lambda: True)
-    monkeypatch.setattr(app, '_load_album_entity', lambda uid, aid: entity)
+    monkeypatch.setattr(app, '_load_album_entity', lambda uid, aid, **kwargs: entity)
     monkeypatch.setattr(app, '_album_cover_thumbnail_url', lambda uid, names: '')
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
     monkeypatch.setattr(app, '_build_photo_summaries_page', lambda uid, items, pn: [{'filename': n} for n, _ in items])

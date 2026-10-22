@@ -54,6 +54,8 @@ export interface Photo {
 }
 
 export interface Album {
+    /** Source row revision, used to distinguish newer data from stale indexes. */
+    updatedAt?: string;
     id: string;
     name: string;
     photoCount: number;
