@@ -79,6 +79,9 @@ param clusterMinReplicas int = 0
 @description('Move index maintenance to a dedicated queue consumer in the indexer app; legacy cluster messages are forwarded during rollout.')
 param dedicatedIndexWorker bool = true
 
+@description('Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback.')
+param enableIndexPush bool = false
+
 @description('Secret used to sign login sessions. Always auto-generated fresh at deploy time -- intentionally not persisted. Every deployment therefore signs out all existing sessions (by design: simplest and safest default). What matters is that every app which validates these tokens restarts on the SAME new value together -- see revisionSuffix below -- so a login right after a deploy finishes always works.')
 @secure()
 param sessionSecretParam string = '${newGuid()}${newGuid()}'
@@ -380,8 +383,21 @@ resource workerCheckpointStorage 'Microsoft.App/managedEnvironments/storages@202
   }
 }
 
+// Managed WebSockets keep long-lived browser connections off Flask request threads.
+resource indexPush 'Microsoft.SignalRService/webPubSub@2024-03-01' = if (enableIndexPush) {
+  name: '${appName}-index-events'
+  location: location
+  sku: { name: 'Standard_S1', tier: 'Standard', capacity: 1 }
+  properties: {
+    disableLocalAuth: true
+    publicNetworkAccess: 'Enabled'
+    tls: { clientCertEnabled: false }
+  }
+}
+
 // Shared backend/worker environment variables.
 var backendEnv = [
+  { name: 'INDEX_EVENTS_ENDPOINT', value: enableIndexPush ? 'https://${indexPush!.properties.hostName}' : '' }
   { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: dedicatedIndexWorker ? 'photostore-index-maintenance' : '' }
   { name: 'INDEX_BUILD_ROLES', value: dedicatedIndexWorker ? 'index-worker' : 'cluster,vision' }
   { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
@@ -1871,6 +1887,17 @@ resource archiveStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01
     }
   }
 ]
+
+// The API negotiates subscriptions; dedicated and legacy index consumers publish.
+resource indexPushRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for appRole in ['indexer', 'cluster']: if (enableIndexPush) {
+  name: guid(indexPush!.id, appRole, 'index-events-owner')
+  scope: indexPush
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '12cf5a90-567b-43ae-8102-96cf46c7d9b4')
+    principalId: appRole == 'indexer' ? indexer.identity.principalId : cluster.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}]
 
 @description('Open this URL in your browser to use Photostore.')
 output appUrl string = webUrl

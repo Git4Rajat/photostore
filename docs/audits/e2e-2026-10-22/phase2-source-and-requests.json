@@ -1,0 +1,823 @@
+{
+  "version": "2026-10-22T01:00:00Z",
+  "photos": {
+    "audit-1.jpg": {
+      "PartitionKey": "__default__",
+      "RowKey": "audit-1.jpg",
+      "filename": "audit-1.jpg",
+      "rating": 1,
+      "likes": 0,
+      "likedBy": "[]",
+      "rotation": 0,
+      "captureDate": "2026-10-20T12:00:00Z",
+      "processing_state": "done"
+    },
+    "audit-2.jpg": {
+      "PartitionKey": "__default__",
+      "RowKey": "audit-2.jpg",
+      "filename": "audit-2.jpg",
+      "rating": 1,
+      "likes": 0,
+      "likedBy": "[]",
+      "rotation": 0,
+      "captureDate": "2026-10-20T12:00:00Z",
+      "processing_state": "done"
+    },
+    "audit-3.jpg": {
+      "PartitionKey": "__default__",
+      "RowKey": "audit-3.jpg",
+      "filename": "audit-3.jpg",
+      "rating": 1,
+      "likes": 0,
+      "likedBy": "[]",
+      "rotation": 0,
+      "captureDate": "2026-10-20T12:00:00Z",
+      "processing_state": "done"
+    }
+  },
+  "albums": {
+    "audit-album": {
+      "PartitionKey": "__default__",
+      "RowKey": "audit-album",
+      "id": "audit-album",
+      "name": "Audit Original",
+      "photoCount": 3
+    }
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/persons/page"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/index-events/negotiate",
+      "body": {}
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "GET",
+      "path": "/api/persons/audit-person/photos"
+    },
+    {
+      "method": "GET",
+      "path": "/api/persons/page"
+    },
+    {
+      "method": "POST",
+      "path": "/api/persons/audit-person/label",
+      "body": {
+        "name": "Audit Renamed"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/perf/client",
+      "body": {
+        "session": "fcgks0ox",
+        "events": [
+          {
+            "t": "view",
+            "name": "gallery",
+            "ms": 117982,
+            "requests": 43,
+            "netMs": 276,
+            "dups": 21,
+            "bytes": 1611,
+            "resources": 0,
+            "cachedResources": 0,
+            "longTasks": 0,
+            "longTaskMs": 0
+          },
+          {
+            "t": "view",
+            "name": "people",
+            "ms": 5205,
+            "requests": 2,
+            "netMs": 11,
+            "dups": 0,
+            "bytes": 190,
+            "resources": 1,
+            "cachedResources": 1,
+            "longTasks": 0,
+            "longTaskMs": 0
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/page",
+            "status": 0,
+            "ok": false,
+            "ms": 9,
+            "bytes": 0,
+            "rid": "fcgk-1m",
+            "attempt": 0,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/audit-person/photos",
+            "status": 0,
+            "ok": false,
+            "ms": 10,
+            "bytes": 0,
+            "rid": "fcgk-1n",
+            "attempt": 0,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/audit-person/photos",
+            "status": 0,
+            "ok": false,
+            "ms": 15,
+            "bytes": 0,
+            "rid": "fcgk-1p",
+            "attempt": 1,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/persons/audit-person/photos",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/page",
+            "status": 0,
+            "ok": false,
+            "ms": 16,
+            "bytes": 0,
+            "rid": "fcgk-1o",
+            "attempt": 1,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/persons/page",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/audit-person/photos",
+            "status": 200,
+            "ok": true,
+            "ms": 3,
+            "bytes": 2,
+            "rid": "fcgk-1q",
+            "attempt": 2,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/persons/audit-person/photos",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/page",
+            "status": 200,
+            "ok": true,
+            "ms": 3,
+            "bytes": 171,
+            "rid": "fcgk-1r",
+            "attempt": 2,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/persons/page",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/explore",
+            "status": 0,
+            "ok": false,
+            "ms": 6,
+            "bytes": 0,
+            "rid": "fcgk-1y",
+            "attempt": 0,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/albums/index",
+            "status": 0,
+            "ok": false,
+            "ms": 9,
+            "bytes": 0,
+            "rid": "fcgk-1w",
+            "attempt": 0,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/media-token",
+            "status": 0,
+            "ok": false,
+            "ms": 10,
+            "bytes": 0,
+            "rid": "fcgk-1v",
+            "attempt": 0,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/sort-index",
+            "status": 0,
+            "ok": false,
+            "ms": 10,
+            "bytes": 0,
+            "rid": "fcgk-1u",
+            "attempt": 0,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/page",
+            "status": 0,
+            "ok": false,
+            "ms": 11,
+            "bytes": 0,
+            "rid": "fcgk-1x",
+            "attempt": 0,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/persons/page",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/albums/index",
+            "status": 0,
+            "ok": false,
+            "ms": 11,
+            "bytes": 0,
+            "rid": "fcgk-20",
+            "attempt": 1,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/page",
+            "status": 0,
+            "ok": false,
+            "ms": 9,
+            "bytes": 0,
+            "rid": "fcgk-23",
+            "attempt": 1,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/persons/page",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/sort-index",
+            "status": 0,
+            "ok": false,
+            "ms": 12,
+            "bytes": 0,
+            "rid": "fcgk-22",
+            "attempt": 1,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/media-token",
+            "status": 0,
+            "ok": false,
+            "ms": 16,
+            "bytes": 0,
+            "rid": "fcgk-21",
+            "attempt": 1,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/explore",
+            "status": 0,
+            "ok": false,
+            "ms": 19,
+            "bytes": 0,
+            "rid": "fcgk-1z",
+            "attempt": 1,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /explore",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/sort-index",
+            "status": 0,
+            "ok": false,
+            "ms": 29,
+            "bytes": 0,
+            "rid": "fcgk-26",
+            "attempt": 2,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/page",
+            "status": 0,
+            "ok": false,
+            "ms": 31,
+            "bytes": 0,
+            "rid": "fcgk-25",
+            "attempt": 2,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/persons/page",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/albums/index",
+            "status": 0,
+            "ok": false,
+            "ms": 32,
+            "bytes": 0,
+            "rid": "fcgk-24",
+            "attempt": 2,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/media-token",
+            "status": 0,
+            "ok": false,
+            "ms": 28,
+            "bytes": 0,
+            "rid": "fcgk-27",
+            "attempt": 2,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/explore",
+            "status": 0,
+            "ok": false,
+            "ms": 32,
+            "bytes": 0,
+            "rid": "fcgk-28",
+            "attempt": 2,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /explore",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/albums/index",
+            "status": 0,
+            "ok": false,
+            "ms": 8,
+            "bytes": 0,
+            "rid": "fcgk-2b",
+            "attempt": 3,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/albums/index",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/page",
+            "status": 0,
+            "ok": false,
+            "ms": 10,
+            "bytes": 0,
+            "rid": "fcgk-2a",
+            "attempt": 3,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/sort-index",
+            "status": 0,
+            "ok": false,
+            "ms": 16,
+            "bytes": 0,
+            "rid": "fcgk-29",
+            "attempt": 3,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/photos/sort-index",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/media-token",
+            "status": 0,
+            "ok": false,
+            "ms": 14,
+            "bytes": 0,
+            "rid": "fcgk-2c",
+            "attempt": 3,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/explore",
+            "status": 0,
+            "ok": false,
+            "ms": 10,
+            "bytes": 0,
+            "rid": "fcgk-2d",
+            "attempt": 3,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /explore",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/jobs/status",
+            "status": 0,
+            "ok": false,
+            "ms": 5,
+            "bytes": 0,
+            "rid": "fcgk-2e",
+            "attempt": 0,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/jobs/status",
+            "status": 200,
+            "ok": true,
+            "ms": 6,
+            "bytes": 11,
+            "rid": "fcgk-2f",
+            "attempt": 1,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/persons/page",
+            "status": 0,
+            "ok": true,
+            "ms": 0,
+            "bytes": 0,
+            "rid": "",
+            "attempt": 0,
+            "coalesced": true,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/persons/page",
+            "n": 5,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/explore",
+            "status": 0,
+            "ok": true,
+            "ms": 0,
+            "bytes": 0,
+            "rid": "",
+            "attempt": 0,
+            "coalesced": true,
+            "view": "person"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /explore",
+            "n": 5,
+            "windowMs": 15000,
+            "view": "person"
+          },
+          {
+            "t": "view",
+            "name": "person",
+            "ms": 13869,
+            "requests": 30,
+            "netMs": 417,
+            "dups": 14,
+            "bytes": 332,
+            "resources": 0,
+            "cachedResources": 0,
+            "longTasks": 0,
+            "longTaskMs": 0
+          },
+          {
+            "t": "resource",
+            "kind": "other",
+            "host": "127.0.0.1",
+            "n": 1,
+            "cached": 1,
+            "ms": 5,
+            "bytes": 725,
+            "view": "gallery"
+          },
+          {
+            "t": "summary",
+            "windowMs": 140034,
+            "requests": 87,
+            "failed": 45,
+            "dups": 10,
+            "bytes": 2316,
+            "slowest": "GET /api/albums/index:32,GET /explore:32,GET /api/persons/page:31,GET /api/photos/sort-index:29,GET /api/photos/media-token:28",
+            "chattiest": "POST /api/photos/access-batch:20,GET /api/jobs/status:9,GET /api/persons/page:9,GET /api/photos/media-token:8,GET /api/albums/index:7",
+            "dupBlobs": 0,
+            "resources": 0,
+            "cachedResources": 0,
+            "longTasks": 0,
+            "longTaskMs": 0
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/persons/page"
+    },
+    {
+      "method": "GET",
+      "path": "/api/albums/index"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/pending-edits/reconcile",
+      "body": {
+        "edits": [
+          {
+            "kind": "person",
+            "id": "audit-person",
+            "fields": {
+              "name": "1792662927051-1-ofj6ad4cxs"
+            },
+            "projections": {
+              "name": {
+                "version": "2026-10-22T01:00:00Z",
+                "value": "\"Audit Person\""
+              }
+            },
+            "projectionVersions": {
+              "name": "2026-10-22T01:00:00Z"
+            },
+            "readOrders": {}
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/sort-index"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/media-token"
+    },
+    {
+      "method": "GET",
+      "path": "/explore"
+    },
+    {
+      "method": "GET",
+      "path": "/fixture/albums.json"
+    },
+    {
+      "method": "GET",
+      "path": "/fixture/sort.json"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/sort-index"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/media-token"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/albums/index"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/media-token"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/persons/page"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/upload/processing/pending"
+    },
+    {
+      "method": "GET",
+      "path": "/upload/processing/pending"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/index-events/negotiate",
+      "body": {}
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/index-status"
+    },
+    {
+      "method": "GET",
+      "path": "/fixture/people.json"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/pending-edits/reconcile",
+      "body": {
+        "edits": [
+          {
+            "kind": "person",
+            "id": "audit-person",
+            "fields": {
+              "name": "audit"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/audit/state"
+    }
+  ]
+}

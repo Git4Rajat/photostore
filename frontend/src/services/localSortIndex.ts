@@ -1,6 +1,8 @@
+import { schedulePendingEditsReconciliation } from './reconcilePendingEdits';
 import { get } from './apiClient';
 import { perf, perfNow } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
+import { applyPendingEdits, beginPendingEdit, confirmPendingEdit, pendingEditScope, pendingEditReadTokens, observePhotoGeneration, pendingEntityIds } from './pendingEdits';
 import type { Photo } from '../types/uiTypes';
 
 /**
@@ -48,11 +50,14 @@ interface SortIndexResponse {
 }
 
 interface StoredSortIndex {
+    payloadVersion?: string;
     sourceVersion: string;
     updatedAt: string;
     rows: SortIndexRow[];
     removedRows?: Record<string, string>;
 }
+
+const snapshotVersions = new WeakMap<object, string>();
 
 const DB_NAME = 'photostore-sort-index';
 const DB_STORE = 'indexes';
@@ -86,6 +91,37 @@ const idbPutStored = async (key: string, value: StoredSortIndex): Promise<void> 
     await new Promise<void>((resolve, reject) => {
         const tx = db.transaction(DB_STORE, 'readwrite');
         tx.objectStore(DB_STORE).put(value, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Failed to persist sort index.'));
+    });
+    db.close();
+};
+
+// `generation` below is per-tab -- another tab downloading the same library
+// concurrently has its own counter that's always "valid" from its own point
+// of view, so it can't fence a write against a newer snapshot a *different*
+// tab just persisted. `updatedAt` is the manifest's publish timestamp, not
+// the payload's: a dirty index rebuilding back to a clean state can republish
+// the same manifest timestamp/sourceVersion label over genuinely different
+// content, so two different payloads can carry an identical `updatedAt` --
+// comparing it can't tell stale and rebuilt bodies apart. `payloadVersion`
+// (embedded in the downloaded body itself, the same version the in-memory
+// `snapshotVersions`/pending-edits overlay compare against) is the one value
+// that actually identifies *which* content this is, so compare that instead,
+// inside a single transaction to avoid racing another tab's read-then-write.
+const idbPutStoredIfNewer = async (key: string, value: StoredSortIndex): Promise<void> => {
+    const db = await openSortIndexDb();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        const store = tx.objectStore(DB_STORE);
+        const getReq = store.get(key);
+        getReq.onsuccess = () => {
+            const current = getReq.result as StoredSortIndex | undefined;
+            if (!current?.payloadVersion || !value.payloadVersion || current.payloadVersion <= value.payloadVersion) {
+                store.put(value, key);
+            }
+        };
+        getReq.onerror = () => reject(getReq.error || new Error('Failed to read sort index before persisting.'));
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error || new Error('Failed to persist sort index.'));
     });
@@ -133,7 +169,7 @@ const fetchWithTimeout = async (url: string, timeoutMs: number): Promise<ArrayBu
     }
 };
 
-const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> => {
+const downloadSortIndexBlob = async (indexUrl: string, scope: string, current: () => boolean, readTokens: ReadonlySet<string>): Promise<SortIndexRow[]> => {
     const downloadStarted = perfNow();
     const buffer = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     perf.recordSpan('index.sort.blob_download', perfNow() - downloadStarted, { bytes: buffer.byteLength });
@@ -148,14 +184,26 @@ const downloadSortIndexBlob = async (indexUrl: string): Promise<SortIndexRow[]> 
         const parsed = JSON.parse(text);
         if (parsed && Array.isArray(parsed.rows)) {
             perf.recordSpan('index.sort.parse', perfNow() - parseStarted, { rows: parsed.rows.length });
-            return normalizeRows(parsed.rows);
+            const rows = normalizeRows(parsed.rows);
+            if (typeof parsed.sourceVersion === 'string') snapshotVersions.set(rows, parsed.sourceVersion);
+            if (current()) {
+                rows.forEach(row => observePhotoGeneration(row.filename, row.thumb, scope, parsed.sourceVersion));
+                applyRowPatches(rows, parsed.sourceVersion, scope, readTokens);
+            }
+            return rows;
         }
     } catch {
         // fall through to manual gunzip
     }
     const text = await decompressGzip(buffer);
     const parsed = JSON.parse(text);
-    return normalizeRows(Array.isArray(parsed?.rows) ? parsed.rows : []);
+    const rows = normalizeRows(Array.isArray(parsed?.rows) ? parsed.rows : []);
+    if (typeof parsed.sourceVersion === 'string') snapshotVersions.set(rows, parsed.sourceVersion);
+    if (current()) {
+        rows.forEach(row => observePhotoGeneration(row.filename, row.thumb, scope, parsed.sourceVersion));
+        applyRowPatches(rows, parsed.sourceVersion, scope, readTokens);
+    }
+    return rows;
 };
 
 // Keyed by active library, same reasoning as the former browser search index's indexKey/
@@ -166,6 +214,25 @@ const indexKey = (): string => getActiveLibraryFromToken() || '__default__';
 let cachedKey: string | null = null;
 let cachedIndex: SortIndexRow[] | null = null;
 let inFlight: Promise<SortIndexRow[] | null> | null = null;
+let generation = 0;
+type RowPatch = { rating?: number; likes?: number; liked?: boolean; rotation?: number };
+const applyRowPatches = (rows: SortIndexRow[], version?: string, scope = pendingEditScope(), readTokens?: ReadonlySet<string>): SortIndexRow[] => {
+    const edited = new Set(pendingEntityIds('photo', scope));
+    if (!edited.size) return rows;
+    let changed = false;
+    const merged = rows.map(row => {
+        if (!edited.has(row.filename)) return row;
+        const original = { rating: row.rating, likes: row.likes, liked: row.gallery?.liked, rotation: row.gallery?.rotation };
+        const tile = applyPendingEdits('photo', row.filename, original, version, scope, readTokens);
+        if (tile === original) return row;
+        changed = true;
+        return { ...row, rating: tile.rating, likes: tile.likes,
+            ...(row.gallery ? { gallery: { ...row.gallery, liked: tile.liked ?? row.gallery.liked,
+                rotation: tile.rotation ?? row.gallery.rotation } } : {}),
+        };
+    });
+    return changed ? merged : rows;
+};
 // Keep authoritative local deletes hidden while the server snapshot catches up.
 // The blob name identifies a generation, so a re-upload can reuse its filename.
 const removedRows = new Map<string, Map<string, string>>();
@@ -193,13 +260,13 @@ const filterRemovedRows = (key: string, rows: SortIndexRow[], freshDownload = fa
     return removed.size ? rows.filter((row) => !removed.has(row.filename)) : rows;
 };
 
-const fetchLocalSortIndex = async (key: string): Promise<SortIndexRow[] | null> => {
+const fetchLocalSortIndex = async (key: string, requestGeneration: number, editScope: string, readTokens: ReadonlySet<string>): Promise<SortIndexRow[] | null> => {
     const totalStarted = perfNow();
     const manifestStarted = perfNow();
     const response: SortIndexResponse = await get('/api/photos/sort-index');
     perf.recordSpan('index.sort.manifest', perfNow() - manifestStarted);
     if (response?.reason === 'library_too_large') {
-        serverPaged = true;      // nothing to download: the gallery pages from the server
+        if (generation === requestGeneration) serverPaged = true;
         return null;
     }
     if (!response?.available || !response.indexUrl) {
@@ -214,42 +281,74 @@ const fetchLocalSortIndex = async (key: string): Promise<SortIndexRow[] | null> 
         // Unchanged since the last download for this library -- skip the
         // blob re-fetch entirely, this is the whole point of persisting it.
         perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
-        return filterRemovedRows(key, stored.rows);
+        if (stored.payloadVersion) snapshotVersions.set(stored.rows, stored.payloadVersion);
+        if (generation === requestGeneration) stored.rows.forEach(row =>
+            observePhotoGeneration(row.filename, row.thumb, editScope, stored.payloadVersion));
+        const visible = filterRemovedRows(key, stored.rows);
+        if (stored.payloadVersion) snapshotVersions.set(visible, stored.payloadVersion);
+        return visible;
     }
-    const rows = await downloadSortIndexBlob(response.indexUrl);
-    filterRemovedRows(key, rows, true);
-    const writeStarted = perfNow();
-    await idbPutStored(key, { sourceVersion, updatedAt: response.updatedAt || '', rows,
-        removedRows: Object.fromEntries(removalsFor(key)) }).catch(() => {
-        // Best-effort persistence -- an in-memory-only session still works,
-        // it just re-downloads next reload instead of skipping the fetch.
-    });
-    perf.recordSpan('index.sort.idb_write', perfNow() - writeStarted, { rows: rows.length });
+    const rows = await downloadSortIndexBlob(response.indexUrl, editScope, () => generation === requestGeneration, readTokens);
+    filterRemovedRows(key, rows, generation === requestGeneration);
+    // An invalidation (bumping `generation`) during this download can let a
+    // newer request's write land in IndexedDB first, then have this now-stale
+    // download finish writing last and overwrite it with older data. The
+    // in-memory cache is already fenced by `generation` (see getLocalSortIndex);
+    // the persistent write needs the same fence, checked as late as possible.
+    // `generation` is only per-tab though -- idbPutStoredIfNewer additionally
+    // guards against a *different* tab's concurrent, independently-fenced
+    // write regressing this one (or vice versa).
+    if (generation === requestGeneration) {
+        const writeStarted = perfNow();
+        await idbPutStoredIfNewer(key, { sourceVersion, payloadVersion: snapshotVersions.get(rows), updatedAt: response.updatedAt || '', rows,
+            removedRows: Object.fromEntries(removalsFor(key)) }).catch(() => {
+            // Best-effort persistence -- an in-memory-only session still works,
+            // it just re-downloads next reload instead of skipping the fetch.
+        });
+        perf.recordSpan('index.sort.idb_write', perfNow() - writeStarted, { rows: rows.length });
+    }
     perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: false, rows: rows.length });
-    return filterRemovedRows(key, rows);
+    const visible = filterRemovedRows(key, rows);
+    const version = snapshotVersions.get(rows);
+    if (version) snapshotVersions.set(visible, version);
+    return visible;
 };
 
 export const getLocalSortIndex = async (): Promise<SortIndexRow[] | null> => {
     const key = indexKey();
     if (cachedIndex && cachedKey === key) {
-        return cachedIndex;
+        const snapshot = cachedIndex;
+        const scope = pendingEditScope();
+        applyRowPatches(snapshot, snapshotVersions.get(snapshot), scope, pendingEditReadTokens(scope, false));
+        schedulePendingEditsReconciliation();
+        return scope === pendingEditScope() ? applyRowPatches(snapshot, undefined, scope) : null;
     }
     if (inFlight && cachedKey === key) {
         return inFlight;
     }
+    cachedIndex = null;
     cachedKey = key;
-    inFlight = fetchLocalSortIndex(key)
+    serverPaged = false;
+    const requestGeneration = ++generation;
+    const editScope = pendingEditScope();
+    const readTokens = pendingEditReadTokens(editScope);
+    const request = fetchLocalSortIndex(key, requestGeneration, editScope, readTokens)
         .then((result) => {
-            cachedIndex = result;
-            return result;
+            if (editScope !== pendingEditScope()) return null;
+            if (result) applyRowPatches(result, snapshotVersions.get(result), editScope, readTokens);
+            schedulePendingEditsReconciliation();
+            if (editScope !== pendingEditScope()) return null;
+            if (generation === requestGeneration) cachedIndex = result;
+            return result ? applyRowPatches(result, undefined, editScope) : result;
         })
         .catch(() => {
-            cachedIndex = null;
+            if (generation === requestGeneration) cachedIndex = null;
             return null;
         })
         .finally(() => {
-            inFlight = null;
+            if (inFlight === request) inFlight = null;
         });
+    inFlight = request;
     return inFlight;
 };
 
@@ -275,8 +374,10 @@ export const getCachedSortThumb = (filename: string): string => {
 };
 
 export const invalidateLocalSortIndex = (): void => {
+    generation += 1;
     cachedIndex = null;
     cachedKey = null;
+    inFlight = null;
 };
 
 // Optimistic local remove after a delete/purge. The backend dirty-marks and
@@ -332,28 +433,6 @@ export const clearLocalSortIndexRemovals = (filenames: string[]): void => {
 // the same session reflects the change without waiting on the backend's
 // independent sort-index manifest to catch up (see touch_user_sort_index_dirty
 // in storage_utils.py, which is near-instant but still a round trip).
-export const patchLocalSortIndexRow = (filename: string, patch: { rating?: number; likes?: number; liked?: boolean; rotation?: number }): void => {
-    if (!cachedIndex) return;
-    const key = cachedKey;
-    const patchRow = (row: SortIndexRow): SortIndexRow => row.filename === filename
-        ? {
-            ...row, rating: patch.rating ?? row.rating, likes: patch.likes ?? row.likes,
-            ...(row.gallery ? { gallery: {
-                ...row.gallery, liked: patch.liked ?? row.gallery.liked,
-                rotation: patch.rotation ?? row.gallery.rotation,
-            } } : {}),
-        } : row;
-    cachedIndex = cachedIndex.map(patchRow);
-    if (key) {
-        idbGetStored(key)
-            .then((stored) => {
-                if (!stored) return;
-                const rows = stored.rows.map(patchRow);
-                return idbPutStored(key, { ...stored, rows });
-            })
-            .catch(() => {
-                // Best-effort -- the in-memory patch above is what matters
-                // for this session; IndexedDB just avoids one stale reload.
-            });
-    }
+export const patchLocalSortIndexRow = (filename: string, patch: RowPatch): void => {
+    confirmPendingEdit(beginPendingEdit('photo', filename, patch));
 };

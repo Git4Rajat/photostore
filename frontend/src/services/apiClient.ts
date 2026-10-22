@@ -1,5 +1,5 @@
 import { getRuntimeConfig } from '../config/appConfig';
-import { createHttpClient, requestJson } from './httpClient';
+import { createHttpClient, requestJson, type RequestConfig } from './httpClient';
 import { configureBackendStatus } from './backendStatus';
 import { perf } from './perf';
 const runtimeConfig = getRuntimeConfig();
@@ -151,7 +151,7 @@ export const postUpload = async <T = any, D = unknown>(url: string, data: D, con
 export const getUploadJson = async <T = any>(url: string) => requestJson<T>(uploadClient, 'get', url);
 export const postUploadJson = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
 export const getTools = async <T = any>(url: string, config?: Parameters<typeof indexerClient.get>[1]) => requestJson<T>(indexerClient, 'get', url, undefined, config);
-export const postTools = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(indexerClient, 'post', url, data);
+export const postTools = async <T = any, D = unknown>(url: string, data: D, config?: RequestConfig) => requestJson<T>(indexerClient, 'post', url, data, config);
 export const getAdmin = async <T = any>(url: string, config?: Parameters<typeof recoveryClient.get>[1]) => requestJson<T>(recoveryClient, 'get', url, undefined, config);
 export const postAdmin = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(recoveryClient, 'post', url, data);
 export const getExtras = async <T = any>(url: string, config?: Parameters<typeof archiveClient.get>[1]) => requestJson<T>(archiveClient, 'get', url, undefined, config);

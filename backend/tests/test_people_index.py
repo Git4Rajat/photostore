@@ -686,6 +686,36 @@ def test_full_rebuild_is_forced_once_the_last_full_build_is_old(people_ctx, monk
     assert built == [1]
 
 
+def test_dirty_people_manifest_requires_full_coverage_not_just_explicit_ids(people_ctx, monkeypatch):
+    people, faces, _ = people_ctx
+    _seed_person(people, 'rename', 'p1', name='Alice', faceIds='["f1"]')
+    _seed_person(people, 'rename', 'p2', name='Unchanged', faceIds='[]')
+    _seed_face(faces, 'rename', 'f1', filename='one.jpg', personId='p1')
+    storage_utils.refresh_user_people_index('rename', source_version='v1')
+    _seed_person(people, 'rename', 'p1', name='Beatrice', faceIds='["f1"]')
+    storage_utils.touch_user_people_index_state('rename')
+    calls = []
+    full = storage_utils._build_user_people_index_snapshot
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *args: (calls.append(args), full(*args))[1])
+    snapshot = storage_utils.refresh_user_people_index('rename', source_version='v2', affected_person_ids={'p1'})
+    assert calls
+    assert {row['personId']: row['name'] for row in snapshot.rows} == {'p1': 'Beatrice', 'p2': 'Unchanged'}
+
+
+def test_clean_manifest_mismatch_does_not_qualify_as_an_incremental_base(people_ctx, monkeypatch):
+    people, _, blobs = people_ctx
+    _seed_person(people, 'mismatch', 'p1', name='Alice')
+    storage_utils.refresh_user_people_index('mismatch', source_version='v1')
+    manifest_key = 'lexical-index/' + storage_utils._people_index_manifest_blob_name('mismatch')
+    manifest = json.loads(blobs.blobs[manifest_key])
+    blobs.blobs[manifest_key] = json.dumps({**manifest, 'sourceVersion': 'different'}).encode()
+    calls = []
+    full = storage_utils._build_user_people_index_snapshot
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *args: (calls.append(args), full(*args))[1])
+    storage_utils.refresh_user_people_index('mismatch', source_version='v2', affected_person_ids={'p1'})
+    assert calls
+
+
 def test_people_page_route_pages_filters_and_looks_up_ids(monkeypatch):
     from routes import people as people_routes
     rows = [{'personId': f'p{i:03d}', 'name': ('Ann %d' % i) if i < 5 else f'Unnamed {i}', 'isNamed': i < 5,

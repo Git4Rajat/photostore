@@ -79,9 +79,9 @@ EOF
 # redirects off to HF's CDN on a *.hf.co subdomain (e.g. us.aws.cdn.hf.co) --
 # confirmed via `curl -I .../resolve/main/model_quantized.onnx` -- hence the
 # wildcard rather than just huggingface.co.
-CONNECT_SRC="'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
+CONNECT_SRC="wss://*.webpubsub.azure.com 'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
 if [ -n "$API_BASE_URL" ]; then
-  CONNECT_SRC="'self' ${API_BASE_URL} https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
+  CONNECT_SRC="${CONNECT_SRC} ${API_BASE_URL}"
 fi
 # INDEXER_API_BASE_URL/UPLOAD_BASE_URL both fall back to API_BASE_URL above
 # when no dedicated container app is deployed for that path, so this is a

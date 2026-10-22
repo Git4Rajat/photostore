@@ -1,3 +1,5 @@
+import { hasPendingEdits } from '../services/pendingEdits';
+import { startIndexReadyPush } from '../services/indexReadyPush';
 import { reportIndexBuilding } from '../services/indexBuilding';
 import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
@@ -1254,6 +1256,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // Guards startJobPolling itself against a second caller racing in before the
     // first has finished setting up jobPollTimerRef — see startJobPolling below.
     const jobPollStartingRef = useRef<boolean>(false);
+    const jobPollRequestedUntilRef = useRef(0);
+    const jobPollHadActiveRef = useRef(false);
     const notifiedJobIdsRef = useRef<Set<string>>(loadSeenJobIds());
     const indexNotificationTimesRef = useRef<Map<string, number>>(new Map());
     // In-flight jobs from the latest poll, surfaced to the UI for live progress.
@@ -1285,15 +1289,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // browser downloaded at session start are now stale. Bursts of completions collapse into one refresh.
     const scheduleDataRefresh = useCallback((delayMs = 3000) => {
         if (dataRefreshTimerRef.current !== null) {
+            if (delayMs > 0) return; // Bursts must not postpone refresh indefinitely.
             window.clearTimeout(dataRefreshTimerRef.current);
         }
         dataRefreshTimerRef.current = window.setTimeout(() => {
             dataRefreshTimerRef.current = null;
             Array.from(dataRefreshHandlersRef.current).forEach((handler) => {
-                void Promise.resolve(handler()).catch(() => undefined);
+                void Promise.resolve().then(handler).catch(() => undefined);
             });
         }, delayMs);
     }, []);
+
+    useEffect(() => startIndexReadyPush(() => scheduleDataRefresh(0)), [scheduleDataRefresh]);
 
     const flushClusterCompletions = useCallback(() => {
         if (clusterFlushTimerRef.current !== null) {
@@ -1371,6 +1378,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             let active = false;
             let changed = false;
             let finishedServerWork = false;
+            let finishedIndexWork = false;
             let bulkMutationFinished = false;
             for (const job of jobs) {
                 if (!TERMINAL_JOB_STATUSES.has(job.status)) {
@@ -1395,6 +1403,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (job.kind !== 'preview' && job.status !== 'failed') {
                     finishedServerWork = true;
                 }
+                if (job.kind === 'index_build' && job.status === 'done') finishedIndexWork = true;
                 if (job.kind === 'bulk_mutation' && job.status !== 'failed') {
                     bulkMutationFinished = true;
                 }
@@ -1440,7 +1449,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 persistSeenJobIds(seen);
             }
             if (finishedServerWork) {
-                scheduleDataRefresh();
+                scheduleDataRefresh(finishedIndexWork ? 0 : 3000);
             }
             if (bulkMutationFinished) {
                 publishLibraryChange('bulk-mutation-complete', ['photos', 'people', 'albums', 'explore', 'trash']);
@@ -1487,9 +1496,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 const signature = (list: JobStatusRecord[]) => list.map((job) => `${job.jobId}:${job.status}`).join('|');
                 return signature(prev) === signature(inFlight) ? prev : inFlight;
             });
-            return active;
+            if (!active && hasPendingEdits()) scheduleDataRefresh(0);
+            jobPollHadActiveRef.current = active;
+            return active || hasPendingEdits() || Date.now() < jobPollRequestedUntilRef.current;
         } catch {
-            return false;
+            // A transient status failure must not require a window refocus
+            // before we can observe a running job's eventual completion.
+            return jobPollHadActiveRef.current || hasPendingEdits() || Date.now() < jobPollRequestedUntilRef.current;
         } finally {
             jobPollInFlightRef.current = false;
         }
@@ -1541,7 +1554,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [pollJobStatusesOnce, stopJobPolling]);
 
     useEffect(() => {
-        const unsubscribe = onJobPollRequested(startJobPolling);
+        const unsubscribe = onJobPollRequested(() => {
+            // A mutation can precede visibility of its queued job. Allow a
+            // bounded grace period, without polling idle sessions forever.
+            jobPollRequestedUntilRef.current = Date.now() + 30000;
+            if (jobPollTimerRef.current !== null) void pollJobStatusesOnce();
+            startJobPolling();
+        });
         const handleVisibility = () => {
             if (document.visibilityState === 'visible') {
                 startJobPolling();
@@ -1569,7 +1588,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 ipworkProcessingFinalizeTimerRef.current = null;
             }
         };
-    }, [startJobPolling, stopJobPolling]);
+    }, [startJobPolling, stopJobPolling, pollJobStatusesOnce]);
 
     // `pendingRemaining` is a live "not yet processed" count re-queried from the
     // server on every poll -- it shrinks as work completes and can look small at

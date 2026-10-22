@@ -7194,7 +7194,10 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     if affected_person_ids and len(affected_person_ids) <= 100:
         prev = _load_people_index_blob(key)
         if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
+                and not previous_manifest.get('dirty')
                 and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
+            # The IDs are only complete relative to a known clean base. A dirty
+            # manifest may include visibility changes that have no per-person ID.
             snapshot = _incremental_people_index_snapshot_by_ids(key, source_version, affected_person_ids, prev.rows)
             if snapshot is not None:
                 perf_instrumentation.log_event(
@@ -7210,7 +7213,8 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
         except ValueError:
             full_age_hours = None
         incremental_ok = full_age_hours is not None and 0 <= full_age_hours < _PEOPLE_FULL_REBUILD_HOURS
-        if since and incremental_ok and previous_manifest.get('schemaVersion') == _PEOPLE_INDEX_SCHEMA_VERSION:
+        if (not previous_manifest.get('dirty') and since and incremental_ok
+                and previous_manifest.get('schemaVersion') == _PEOPLE_INDEX_SCHEMA_VERSION):
             prev = _load_people_index_blob(key)
             if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
                     and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):

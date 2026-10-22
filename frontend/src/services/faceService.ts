@@ -3,6 +3,8 @@
 // 'archive' resource comment) -- plain get/post (API_BASE_URL) now, not
 // getExtras/postExtras.
 import { get, post } from './apiClient';
+import { applyPendingEdits, beginPendingEdit, confirmPendingEdit, rollbackPendingEdit, savePendingEdits } from './pendingEdits';
+import { requestJobPoll } from './jobNotifications';
 
 type PeoplePageRow = {
     personId?: string;
@@ -178,11 +180,18 @@ const listAllPersons = async (): Promise<PersonRosterEntry[]> => {
 };
 
 const getPerson = async (personId: string) => {
-    return await get(`/api/persons/${personId}`);
+    const row = await get(`/api/persons/${personId}`);
+    return applyPendingEdits('person', personId, row);
 };
 
 const labelPerson = async (personId: string, name: string) => {
-    return await post(`/api/persons/${personId}/label`, { name });
+    const edit = beginPendingEdit('person', personId, { name });
+    try {
+        const result = await savePendingEdits([edit], () => post(`/api/persons/${personId}/label`, { name }));
+        confirmPendingEdit(edit);
+        requestJobPoll();
+        return result;
+    } catch (error) { rollbackPendingEdit(edit); throw error; }
 };
 
 const mergePersons = async (personId: string, mergeIds: string[]) => {

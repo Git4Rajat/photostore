@@ -88,6 +88,8 @@ def test_indexer_role_serves_only_tools_routes():
         '/api/tools/indexes/status',
         '/api/tools/indexes/rebuild/<index_kind>',
         '/api/tools/indexes/recover-pending',
+        '/api/tools/index-events/negotiate',
+        '/api/tools/pending-edits/reconcile',
         '/api/tools/indexes/maintenance/<scope>',
         # Manual counterparts to the automatic release/flush triggers.
         '/api/tools/ipwork/release',

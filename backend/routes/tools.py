@@ -335,6 +335,21 @@ def recover_pending_indexes():
         return app.jsonify({'error': 'Pending index recovery unavailable'}), 503
 
 
+@tools_bp.route('/api/tools/index-events/negotiate', methods=['POST'])
+def negotiate_index_events():
+    library, error = app._require_user_id()
+    if error:
+        return error
+    import index_events
+    try:
+        response = app.jsonify(index_events.negotiate(library))
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception:
+        app.app.logger.warning('Index push negotiation unavailable', exc_info=True)
+        return app.jsonify({'available': False}), 503
+
+
 @tools_bp.route('/api/tools/indexes/maintenance/<scope>', methods=['POST'])
 def schedule_index_maintenance(scope):
     user_id, error = app._require_user_id()
@@ -426,8 +441,64 @@ def jobs_status():
             # against the cutoff is a valid recency test.
             if status in {'queued', 'running'} or updated_at >= cutoff:
                 jobs.append(app._humanize_job(row))
-        jobs.sort(key=lambda job: job.get('updatedAt') or '', reverse=True)
+        # Per-photo processing rows must not crowd an index completion out of
+        # the bounded response: that completion also drives browser refreshes.
+        jobs.sort(key=lambda job: (job.get('kind') == 'index_build', job.get('updatedAt') or ''), reverse=True)
         return app.jsonify({'jobs': jobs[:50]})
     except Exception as exc:
         app.app.logger.exception('Job status route failed')
         return app.jsonify({'jobs': [], 'error': 'Internal server error'}), 500
+
+
+@tools_bp.route('/api/tools/pending-edits/reconcile', methods=['POST'])
+def reconcile_pending_edits():
+    """Read exact authoritative rows; never infer mutation completion from an index timestamp."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    data = app.request.get_json(silent=True) or {}
+    edits = data.get('edits') if isinstance(data, dict) else None
+    allowed = {'photo': {'rating', 'likes', 'liked', 'rotation'}, 'person': {'name'}, 'album': {'name'}}
+    if not isinstance(edits, list) or len(edits) > 50:
+        return app.jsonify({'error': 'At most 50 edits are required'}), 400
+    for edit in edits:
+        if (not isinstance(edit, dict) or not isinstance(edit.get('kind'), str) or edit['kind'] not in allowed
+                or not isinstance(edit.get('id'), str) or not edit['id'] or len(edit['id']) > 1024
+                or not isinstance(edit.get('fields'), dict) or not edit['fields']
+                or not set(edit['fields']).issubset(allowed[edit['kind']])
+                or any(not isinstance(token, str) or len(token) > 256 for token in edit['fields'].values())):
+            return app.jsonify({'error': 'Invalid edit'}), 400
+
+    def read(edit):
+        kind, entity_id = edit['kind'], edit['id']
+        table = {'photo': app.metadata_table_client, 'person': app.person_table_client,
+                 'album': app.albums_table_client}[kind]
+        if table is None:
+            return None
+        try:
+            entity = table.get_entity(partition_key=user_id, row_key=entity_id)
+            deleted = (str(entity.get('processing_state') or '').lower() == 'deleted' if kind == 'photo'
+                       else app._coerce_bool(entity.get('deleted')) or bool(entity.get('deletedAt')))
+            if kind == 'photo':
+                liked_by = entity.get('likedBy') or '[]'
+                if isinstance(liked_by, str):
+                    liked_by = app.json.loads(liked_by)
+                values = {'rating': entity.get('rating') or 0, 'likes': entity.get('likes') or 0,
+                          'liked': user_id in liked_by, 'rotation': app._normalize_rotation(entity.get('rotation', 0))}
+            else:
+                values = {'name': str(entity.get('name') or '')}
+            return {'kind': kind, 'id': entity_id, 'deleted': deleted,
+                    'values': {name: values[name] for name in edit['fields']}}
+        except app.ResourceNotFoundError:
+            return {'kind': kind, 'id': entity_id, 'deleted': True, 'values': {}}
+        except Exception:
+            # Partial unavailability is not proof of deletion or confirmation.
+            app.app.logger.warning('Pending edit source check failed', exc_info=True)
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        rows = [row for row in executor.map(read, edits) if row is not None]
+    response = app.jsonify({'libraryId': user_id, 'rows': rows})
+    response.headers['Cache-Control'] = 'no-store'
+    return response

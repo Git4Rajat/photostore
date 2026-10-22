@@ -117,3 +117,12 @@ def test_queued_index_job_does_not_time_out_before_a_worker_claims_it(jobs_table
 def test_index_running_heartbeat_uses_its_scope_timeout(jobs_table):
     _seed_job(jobs_table, 'index-build-owner', 'index_build', 'running', age_minutes=20)
     assert _poll()[0]['status'] == 'running'
+
+
+def test_photo_processing_burst_cannot_hide_an_index_completion(jobs_table):
+    _seed_job(jobs_table, 'index-build-owner-people', 'index_build', 'done', age_minutes=1)
+    for number in range(60):
+        _seed_job(jobs_table, f'ipwork-{number}', 'ipwork', 'done')
+    jobs = _poll()
+    assert len(jobs) == 50
+    assert jobs[0]['jobId'] == 'index-build-owner-people'

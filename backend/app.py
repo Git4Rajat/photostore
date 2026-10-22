@@ -10717,6 +10717,23 @@ def _run_index_maintenance_payload(payload):
         raise
     if newer:
         store.notify(key, _send_index_wakeup)
+    _notify_index_ready(library, str(payload['jobId']), scope)
+
+
+def _notify_index_ready(library, job_id, scope):
+    import index_events
+    if not index_events.enabled():
+        return
+    # Deferred Search/quiet-window work is not a publication receipt.
+    try:
+        row = _get_job_row(library, job_id) or {}
+        result = row.get('result') or {}
+        if isinstance(result, str):
+            result = json.loads(result)
+        if row.get('status') == 'done' and result.get('status') not in ('deferred', 'no_base'):
+            index_events.publish(library, scope, job_id)
+    except Exception:
+        worker_logger.warning('Index-ready notification unavailable', exc_info=True)
 
 
 def _index_build_progress_callback(user_id: str):
@@ -14650,6 +14667,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             _run_index_maintenance_payload(payload)
         else:
             _run_index_build_job(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
+            _notify_index_ready(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
         return
 
     if job_type == 'photo_soft_delete':

@@ -1,0 +1,1996 @@
+{
+  "version": "2026-10-22T09:53:27.007183+00:00",
+  "photos": {
+    "audit-1.jpg": {
+      "PartitionKey": "__default__",
+      "RowKey": "audit-1.jpg",
+      "filename": "audit-1.jpg",
+      "rating": 5,
+      "likes": 1,
+      "likedBy": "[\"__default__\"]",
+      "rotation": 90,
+      "captureDate": "2026-10-20T12:00:00Z",
+      "processing_state": "done",
+      "thumbnail_status": "pending"
+    },
+    "audit-2.jpg": {
+      "PartitionKey": "__default__",
+      "RowKey": "audit-2.jpg",
+      "filename": "audit-2.jpg",
+      "rating": 4,
+      "likes": 0,
+      "likedBy": "[]",
+      "rotation": 0,
+      "captureDate": "2026-10-20T12:00:00Z",
+      "processing_state": "done"
+    },
+    "audit-3.jpg": {
+      "PartitionKey": "__default__",
+      "RowKey": "audit-3.jpg",
+      "filename": "audit-3.jpg",
+      "rating": 1,
+      "likes": 0,
+      "likedBy": "[]",
+      "rotation": 0,
+      "captureDate": "2026-10-20T12:00:00Z",
+      "processing_state": "done"
+    }
+  },
+  "albums": {
+    "audit-album": {
+      "PartitionKey": "__default__",
+      "RowKey": "audit-album",
+      "id": "audit-album",
+      "name": "Audit Saved",
+      "photoCount": 3,
+      "updatedAt": "2026-10-22T09:50:56.588516+00:00"
+    }
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-2.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/perf/client",
+      "body": {
+        "session": "otsupjx6",
+        "events": [
+          {
+            "t": "view",
+            "name": "albums",
+            "ms": 49109,
+            "requests": 26,
+            "netMs": 165,
+            "dups": 10,
+            "bytes": 2231,
+            "resources": 1,
+            "cachedResources": 1,
+            "longTasks": 0,
+            "longTaskMs": 0
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"image\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"thumbnail\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "summary",
+            "windowMs": 60028,
+            "requests": 36,
+            "failed": 6,
+            "dups": 7,
+            "bytes": 2683,
+            "slowest": "GET /api/jobs/status:14,POST /api/tools/index-events/negotiate:8,GET /api/photos/sort-index:8,GET /api/photos/media-token:8,GET /upload/processing/pending:7",
+            "chattiest": "GET /api/jobs/status:10,POST /api/photos/access-batch:8,GET /api/photos/media-token:5,GET /api/photos/sort-index:3,GET /api/albums/index:3",
+            "dupBlobs": 0,
+            "resources": 0,
+            "cachedResources": 0,
+            "longTasks": 0,
+            "longTaskMs": 0
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/index-events/negotiate",
+      "body": {}
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-2.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/photos/audit-1.jpg/like",
+      "body": {}
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-2.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/albums/index"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/media-token"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/audit-1.jpg/rotation",
+      "body": {
+        "rotation": 90
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/perf/client",
+      "body": {
+        "session": "otsupjx6",
+        "events": [
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"image\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"thumbnail\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-2.jpg\"]}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/jobs/status",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-2.jpg\"]}",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "index.albums.manifest",
+            "ms": 6,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "index.albums.idb_read",
+            "ms": 13,
+            "view": "gallery",
+            "cached": true
+          },
+          {
+            "t": "span",
+            "name": "index.albums.total",
+            "ms": 20,
+            "view": "gallery",
+            "cached": true,
+            "rows": 1
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/tools/pending-edits/reconcile",
+            "status": 0,
+            "ok": false,
+            "ms": 9,
+            "bytes": 0,
+            "rid": "otsu-1c",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/media-token",
+            "status": 0,
+            "ok": false,
+            "ms": 9,
+            "bytes": 0,
+            "rid": "otsu-1d",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/tools/pending-edits/reconcile",
+            "status": 0,
+            "ok": false,
+            "ms": 12,
+            "bytes": 0,
+            "rid": "otsu-1e",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/audit-1.jpg/rotation",
+            "status": 0,
+            "ok": false,
+            "ms": 45,
+            "bytes": 0,
+            "rid": "otsu-1f",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/media-token",
+            "status": 200,
+            "ok": true,
+            "ms": 10,
+            "bytes": 19,
+            "rid": "otsu-1g",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "media_token.fetch",
+            "ms": 821,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"thumbnail\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/audit-1.jpg/rotation",
+            "status": 200,
+            "ok": true,
+            "ms": 5,
+            "bytes": 55,
+            "rid": "otsu-1i",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/audit-1.jpg/rotation|{\"rotation\":90}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/jobs/status",
+            "n": 5,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "summary",
+            "windowMs": 80029,
+            "requests": 57,
+            "failed": 10,
+            "dups": 9,
+            "bytes": 3873,
+            "slowest": "POST /api/photos/audit-1.jpg/rotation:45,GET /api/jobs/status:14,POST /api/tools/pending-edits/reconcile:12,GET /api/photos/media-token:10,POST /api/tools/index-events/negotiate:8",
+            "chattiest": "GET /api/jobs/status:16,POST /api/photos/access-batch:14,GET /api/photos/media-token:7,GET /api/albums/index:4,GET /api/photos/sort-index:3",
+            "dupBlobs": 0,
+            "resources": 0,
+            "cachedResources": 0,
+            "longTasks": 0,
+            "longTaskMs": 0
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/audit/state"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/upload/processing/pending"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-2.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-2.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/perf/client",
+      "body": {
+        "session": "otsupjx6",
+        "events": [
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 12,
+            "bytes": 0,
+            "rid": "otsu-1r",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 13,
+            "bytes": 0,
+            "rid": "otsu-1q",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/jobs/status",
+            "status": 0,
+            "ok": false,
+            "ms": 5,
+            "bytes": 0,
+            "rid": "otsu-1s",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 12,
+            "bytes": 0,
+            "rid": "otsu-1u",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 13,
+            "bytes": 0,
+            "rid": "otsu-1t",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/jobs/status",
+            "status": 200,
+            "ok": true,
+            "ms": 4,
+            "bytes": 131,
+            "rid": "otsu-1v",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 200,
+            "ok": true,
+            "ms": 6,
+            "bytes": 23,
+            "rid": "otsu-1w",
+            "attempt": 2,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 200,
+            "ok": true,
+            "ms": 5,
+            "bytes": 23,
+            "rid": "otsu-1x",
+            "attempt": 2,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 4,
+            "bytes": 0,
+            "rid": "otsu-25",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-2.jpg\"]}",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/photos/rate-multiple",
+            "status": 0,
+            "ok": false,
+            "ms": 5,
+            "bytes": 0,
+            "rid": "otsu-26",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/photos/rate-multiple",
+            "status": 0,
+            "ok": false,
+            "ms": 7,
+            "bytes": 0,
+            "rid": "otsu-28",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /photos/rate-multiple|{\"filenames\":[\"audit-1.jpg\"],\"rating\":4}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 9,
+            "bytes": 0,
+            "rid": "otsu-27",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-2.jpg\"]}",
+            "n": 5,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 18,
+            "bytes": 0,
+            "rid": "otsu-29",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 5,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 200,
+            "ok": true,
+            "ms": 6,
+            "bytes": 23,
+            "rid": "otsu-2a",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/photos/rate-multiple",
+            "status": 0,
+            "ok": false,
+            "ms": 6,
+            "bytes": 0,
+            "rid": "otsu-2d",
+            "attempt": 2,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /photos/rate-multiple|{\"filenames\":[\"audit-1.jpg\"],\"rating\":4}",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 8,
+            "bytes": 0,
+            "rid": "otsu-2e",
+            "attempt": 2,
+            "view": "gallery"
+          },
+          {
+            "t": "summary",
+            "windowMs": 120028,
+            "requests": 86,
+            "failed": 22,
+            "dups": 10,
+            "bytes": 4891,
+            "slowest": "POST /api/photos/audit-1.jpg/rotation:45,POST /api/photos/access-batch:13,GET /api/jobs/status:12,POST /api/tools/pending-edits/reconcile:12,GET /api/photos/media-token:10",
+            "chattiest": "POST /api/photos/access-batch:32,GET /api/jobs/status:23,GET /api/photos/media-token:7,GET /api/albums/index:4,GET /upload/processing/pending:3",
+            "dupBlobs": 0,
+            "resources": 0,
+            "cachedResources": 0,
+            "longTasks": 0,
+            "longTaskMs": 0
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/index-events/negotiate",
+      "body": {}
+    },
+    {
+      "method": "POST",
+      "path": "/photos/rate-multiple",
+      "body": {
+        "filenames": [
+          "audit-1.jpg"
+        ],
+        "rating": 4
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-2.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/index-status"
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "GET",
+      "path": "/upload/processing/pending"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/index-events/negotiate",
+      "body": {}
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/index-status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/albums/index"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/sort-index"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/media-token"
+    },
+    {
+      "method": "GET",
+      "path": "/photos/timeline"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "POST",
+      "path": "/photos/rate-multiple",
+      "body": {
+        "filenames": [
+          "audit-2.jpg"
+        ],
+        "rating": 4
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/audit/state"
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/sort-index"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/media-token"
+    },
+    {
+      "method": "GET",
+      "path": "/api/albums/index"
+    },
+    {
+      "method": "GET",
+      "path": "/api/persons/page"
+    },
+    {
+      "method": "GET",
+      "path": "/explore"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/pending-edits/reconcile",
+      "body": {
+        "edits": [
+          {
+            "kind": "photo",
+            "id": "audit-1.jpg",
+            "fields": {
+              "liked": "1792662733792-1-dofwk3w1mm6",
+              "rotation": "1792662733844-2-dhh4j0ntg9k",
+              "likes": "1792662733792-1-dofwk3w1mm6"
+            },
+            "projections": {
+              "liked": {
+                "version": "2026-10-22T01:00:00Z",
+                "value": "false"
+              },
+              "rotation": {
+                "version": "2026-10-22T01:00:00Z",
+                "value": "0"
+              },
+              "likes": {
+                "version": "2026-10-22T01:00:00Z",
+                "value": "0"
+              }
+            },
+            "projectionVersions": {
+              "liked": "2026-10-22T01:00:00Z",
+              "rotation": "2026-10-22T01:00:00Z",
+              "likes": "2026-10-22T01:00:00Z"
+            },
+            "readOrders": {}
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/fixture/sort.json"
+    },
+    {
+      "method": "GET",
+      "path": "/fixture/albums.json"
+    },
+    {
+      "method": "GET",
+      "path": "/api/photos/media-token"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/perf/client",
+      "body": {
+        "session": "fcgks0ox",
+        "events": [
+          {
+            "t": "vital",
+            "name": "TTFB",
+            "value": 5,
+            "view": "boot"
+          },
+          {
+            "t": "vital",
+            "name": "DOMContentLoaded",
+            "value": 0,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/index-status",
+            "status": 0,
+            "ok": false,
+            "ms": 7,
+            "bytes": 0,
+            "rid": "fcgk-1",
+            "attempt": 0,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/upload/processing/pending",
+            "status": 0,
+            "ok": false,
+            "ms": 7,
+            "bytes": 0,
+            "rid": "fcgk-4",
+            "attempt": 0,
+            "view": "boot"
+          },
+          {
+            "t": "vital",
+            "name": "FCP",
+            "value": 52,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/tools/index-events/negotiate",
+            "status": 0,
+            "ok": false,
+            "ms": 13,
+            "bytes": 0,
+            "rid": "fcgk-2",
+            "attempt": 0,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/jobs/status",
+            "status": 0,
+            "ok": false,
+            "ms": 13,
+            "bytes": 0,
+            "rid": "fcgk-3",
+            "attempt": 0,
+            "view": "boot"
+          },
+          {
+            "t": "vital",
+            "name": "LCP",
+            "value": 60,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/jobs/status",
+            "status": 0,
+            "ok": false,
+            "ms": 6,
+            "bytes": 0,
+            "rid": "fcgk-8",
+            "attempt": 1,
+            "view": "boot"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/jobs/status",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/index-status",
+            "status": 0,
+            "ok": false,
+            "ms": 13,
+            "bytes": 0,
+            "rid": "fcgk-5",
+            "attempt": 1,
+            "view": "boot"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/photos/index-status",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/upload/processing/pending",
+            "status": 0,
+            "ok": false,
+            "ms": 12,
+            "bytes": 0,
+            "rid": "fcgk-6",
+            "attempt": 1,
+            "view": "boot"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /upload/processing/pending",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/tools/index-events/negotiate",
+            "status": 0,
+            "ok": false,
+            "ms": 11,
+            "bytes": 0,
+            "rid": "fcgk-7",
+            "attempt": 1,
+            "view": "boot"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/tools/index-events/negotiate|{}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/upload/processing/pending",
+            "status": 200,
+            "ok": true,
+            "ms": 7,
+            "bytes": 2,
+            "rid": "fcgk-b",
+            "attempt": 2,
+            "view": "boot"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /upload/processing/pending",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/tools/index-events/negotiate",
+            "status": 200,
+            "ok": true,
+            "ms": 5,
+            "bytes": 19,
+            "rid": "fcgk-c",
+            "attempt": 2,
+            "view": "boot"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/tools/index-events/negotiate|{}",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/jobs/status",
+            "status": 200,
+            "ok": true,
+            "ms": 10,
+            "bytes": 131,
+            "rid": "fcgk-9",
+            "attempt": 2,
+            "view": "boot"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/jobs/status",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "boot"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/index-status",
+            "status": 200,
+            "ok": true,
+            "ms": 9,
+            "bytes": 31,
+            "rid": "fcgk-a",
+            "attempt": 2,
+            "view": "boot"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/photos/index-status",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "boot"
+          },
+          {
+            "t": "view",
+            "name": "boot",
+            "ms": 2442,
+            "requests": 12,
+            "netMs": 113,
+            "dups": 8,
+            "bytes": 183,
+            "resources": 9,
+            "cachedResources": 1,
+            "longTasks": 0,
+            "longTaskMs": 0
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/albums/index",
+            "status": 0,
+            "ok": false,
+            "ms": 5,
+            "bytes": 0,
+            "rid": "fcgk-f",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/sort-index",
+            "status": 0,
+            "ok": false,
+            "ms": 13,
+            "bytes": 0,
+            "rid": "fcgk-e",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/media-token",
+            "status": 0,
+            "ok": false,
+            "ms": 13,
+            "bytes": 0,
+            "rid": "fcgk-d",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "vital",
+            "name": "LCP",
+            "value": 2492,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/albums/index",
+            "status": 200,
+            "ok": true,
+            "ms": 6,
+            "bytes": 112,
+            "rid": "fcgk-g",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/albums/index",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "index.albums.manifest",
+            "ms": 813,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/sort-index",
+            "status": 200,
+            "ok": true,
+            "ms": 6,
+            "bytes": 110,
+            "rid": "fcgk-h",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/photos/sort-index",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "index.sort.manifest",
+            "ms": 819,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/api/photos/media-token",
+            "status": 200,
+            "ok": true,
+            "ms": 5,
+            "bytes": 19,
+            "rid": "fcgk-i",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/photos/media-token",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "media_token.fetch",
+            "ms": 819,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "index.albums.idb_read",
+            "ms": 8,
+            "view": "gallery",
+            "cached": true
+          },
+          {
+            "t": "span",
+            "name": "index.albums.total",
+            "ms": 821,
+            "view": "gallery",
+            "cached": true,
+            "rows": 1
+          },
+          {
+            "t": "span",
+            "name": "index.sort.idb_read",
+            "ms": 3,
+            "view": "gallery",
+            "cached": true
+          },
+          {
+            "t": "span",
+            "name": "index.sort.total",
+            "ms": 822,
+            "view": "gallery",
+            "cached": true,
+            "rows": 3
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/tools/pending-edits/reconcile",
+            "status": 0,
+            "ok": false,
+            "ms": 11,
+            "bytes": 0,
+            "rid": "fcgk-j",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/photos/timeline",
+            "status": 0,
+            "ok": false,
+            "ms": 11,
+            "bytes": 0,
+            "rid": "fcgk-k",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/tools/pending-edits/reconcile",
+            "status": 0,
+            "ok": false,
+            "ms": 7,
+            "bytes": 0,
+            "rid": "fcgk-l",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "vital",
+            "name": "LCP",
+            "value": 3312,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "GET",
+            "path": "/photos/timeline",
+            "status": 200,
+            "ok": true,
+            "ms": 12,
+            "bytes": 12,
+            "rid": "fcgk-m",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /photos/timeline",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/jobs/status",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/jobs/status",
+            "n": 5,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/photos/sort-index",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "index.sort.manifest",
+            "ms": 8,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/photos/media-token",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "media_token.fetch",
+            "ms": 9,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/albums/index",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "index.albums.manifest",
+            "ms": 9,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/tools/pending-edits/reconcile|{\"edits\":[{\"kind\":\"photo\",\"id\":\"audit-1.jpg\",\"fields\":{\"liked\":\"1792662733792-1-dofwk3w1mm6\",\"rotati",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "index.sort.idb_read",
+            "ms": 8,
+            "view": "gallery",
+            "cached": false
+          },
+          {
+            "t": "span",
+            "name": "index.albums.idb_read",
+            "ms": 7,
+            "view": "gallery",
+            "cached": false
+          },
+          {
+            "t": "span",
+            "name": "index.sort.blob_download",
+            "ms": 2,
+            "view": "gallery",
+            "bytes": 810
+          },
+          {
+            "t": "span",
+            "name": "index.sort.parse",
+            "ms": 0,
+            "view": "gallery",
+            "rows": 3
+          },
+          {
+            "t": "span",
+            "name": "index.albums.blob_download",
+            "ms": 2,
+            "view": "gallery",
+            "bytes": 163
+          },
+          {
+            "t": "span",
+            "name": "index.albums.parse",
+            "ms": 0,
+            "view": "gallery",
+            "rows": 1
+          },
+          {
+            "t": "span",
+            "name": "index.sort.idb_write",
+            "ms": 1,
+            "view": "gallery",
+            "rows": 3
+          },
+          {
+            "t": "span",
+            "name": "index.sort.total",
+            "ms": 18,
+            "view": "gallery",
+            "cached": false,
+            "rows": 3
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "GET /api/photos/media-token",
+            "n": 4,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "span",
+            "name": "media_token.fetch",
+            "ms": 2,
+            "view": "gallery"
+          },
+          {
+            "t": "resource",
+            "kind": "script",
+            "host": "127.0.0.1",
+            "n": 3,
+            "cached": 0,
+            "ms": 16,
+            "bytes": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "resource",
+            "kind": "link",
+            "host": "127.0.0.1",
+            "n": 1,
+            "cached": 0,
+            "ms": 13,
+            "bytes": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "resource",
+            "kind": "other",
+            "host": "127.0.0.1",
+            "n": 5,
+            "cached": 1,
+            "ms": 14,
+            "bytes": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "summary",
+            "windowMs": 20037,
+            "requests": 32,
+            "failed": 14,
+            "dups": 9,
+            "bytes": 1306,
+            "slowest": "GET /api/photos/index-status:13,POST /api/tools/index-events/negotiate:13,GET /api/jobs/status:13,GET /api/photos/sort-index:13,GET /api/photos/media-token:13",
+            "chattiest": "GET /api/jobs/status:5,GET /api/photos/media-token:4,GET /api/photos/index-status:3,GET /upload/processing/pending:3,POST /api/tools/index-events/negotiate:3",
+            "dupBlobs": 0,
+            "resources": 0,
+            "cachedResources": 0,
+            "longTasks": 0,
+            "longTaskMs": 0
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/jobs/status"
+    },
+    {
+      "method": "GET",
+      "path": "/upload/processing/pending"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools/index-events/negotiate",
+      "body": {}
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-2.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/perf/client",
+      "body": {
+        "session": "fcgks0ox",
+        "events": [
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 6,
+            "bytes": 0,
+            "rid": "fcgk-10",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 6,
+            "bytes": 0,
+            "rid": "fcgk-11",
+            "attempt": 0,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 8,
+            "bytes": 0,
+            "rid": "fcgk-12",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-2.jpg\"]}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 0,
+            "ok": false,
+            "ms": 10,
+            "bytes": 0,
+            "rid": "fcgk-13",
+            "attempt": 1,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 2,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 200,
+            "ok": true,
+            "ms": 5,
+            "bytes": 23,
+            "rid": "fcgk-14",
+            "attempt": 2,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-2.jpg\"]}",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "req",
+            "method": "POST",
+            "path": "/api/photos/access-batch",
+            "status": 200,
+            "ok": true,
+            "ms": 2,
+            "bytes": 23,
+            "rid": "fcgk-15",
+            "attempt": 2,
+            "view": "gallery"
+          },
+          {
+            "t": "dup",
+            "kind": "request",
+            "key": "POST /api/photos/access-batch|{\"kind\":\"preview\",\"filenames\":[\"audit-1.jpg\"]}",
+            "n": 3,
+            "windowMs": 15000,
+            "view": "gallery"
+          },
+          {
+            "t": "summary",
+            "windowMs": 80035,
+            "requests": 43,
+            "failed": 18,
+            "dups": 10,
+            "bytes": 1585,
+            "slowest": "GET /api/photos/index-status:13,POST /api/tools/index-events/negotiate:13,GET /api/jobs/status:13,GET /api/photos/sort-index:13,GET /api/photos/media-token:13",
+            "chattiest": "POST /api/photos/access-batch:9,GET /api/jobs/status:6,GET /upload/processing/pending:4,POST /api/tools/index-events/negotiate:4,GET /api/photos/media-token:4",
+            "dupBlobs": 0,
+            "resources": 0,
+            "cachedResources": 0,
+            "longTasks": 0,
+            "longTaskMs": 0
+          }
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/upload/processing/pending"
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "preview",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "image",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/photos/access-batch",
+      "body": {
+        "kind": "thumbnail",
+        "filenames": [
+          "audit-1.jpg"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/audit/state"
+    }
+  ]
+}

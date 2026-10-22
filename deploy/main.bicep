@@ -69,6 +69,9 @@ param clusterMinReplicas int = 0
 @description('Run derived-index maintenance on the indexer queue sidecar. Disable only for a coordinated rollback to the legacy cluster worker.')
 param dedicatedIndexWorker bool = true
 
+@description('Provision managed WebSocket notifications when library indexes are published.')
+param enableIndexPush bool = false
+
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps console/system logs to. Leave blank (the one-click-deploy default) for no log destination. Required on every redeploy of an EXISTING environment that already has this wired up -- the managedEnvironment resource replaces its properties wholesale, so omitting this on a redeploy silently disconnects logging even if it was set up out-of-band or by a previous deploy.')
 param logAnalyticsWorkspaceName string = ''
 
@@ -95,6 +98,7 @@ module app 'resources.bicep' = {
     clusterFileShareQuotaGiB: clusterFileShareQuotaGiB
     clusterMinReplicas: clusterMinReplicas
     dedicatedIndexWorker: dedicatedIndexWorker
+    enableIndexPush: enableIndexPush
     logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
   }
 }

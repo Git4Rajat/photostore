@@ -1,3 +1,4 @@
+import { sessionScope } from './sessionScope';
 import axios, { type AxiosHeaders, type AxiosRequestConfig, type InternalAxiosRequestConfig } from 'axios';
 import { getAccessToken, isAuthEnabled } from './authClient';
 import { reportBackendReachable, reportBackendUnreachable } from './backendStatus';
@@ -22,6 +23,11 @@ export const createHttpClient = (baseURL: string, timeout = 600000) => {
     });
 
     const attachAuth = async (config: InternalAxiosRequestConfig) => {
+        const expectedScope = (config as InternalAxiosRequestConfig & { expectedSessionScope?: string }).expectedSessionScope ?? sessionScope();
+        const assertScope = () => {
+            if (expectedScope !== sessionScope()) throw new axios.CanceledError('The active account or library changed.');
+        };
+        assertScope();
         const passwordToken = typeof window !== 'undefined'
             ? window.localStorage.getItem('photostore.passwordAuthToken')
             : '';
@@ -36,6 +42,7 @@ export const createHttpClient = (baseURL: string, timeout = 600000) => {
 
         if (isAuthEnabled()) {
             const token = await getAccessToken();
+            assertScope();
             if (token) {
                 headers.set?.('Authorization', `Bearer ${token}`);
                 if (typeof headers.set !== 'function') {
@@ -144,6 +151,7 @@ const isCanceled = (error: unknown): boolean =>
 // opted in.
 export interface RequestConfig extends AxiosRequestConfig {
     singleAttempt?: boolean;
+    expectedSessionScope?: string;
 }
 
 export const requestJson = async <T = any>(
@@ -155,6 +163,7 @@ export const requestJson = async <T = any>(
 ): Promise<T> => {
     // One correlation id for the whole call, shared across cold-start retries,
     // so a user-visible "ref" ties to a single logical request.
+    config = { ...config, expectedSessionScope: config?.expectedSessionScope ?? sessionScope() };
     const requestId = newRequestId();
     const traced = perfEnabled() && !url.includes(PERF_REPORT_PATH);
     const perfKey = traced ? requestKey(method, normalizePath(url), data) : '';
@@ -197,6 +206,7 @@ export const requestJson = async <T = any>(
                         : method === 'put'
                             ? await client.put<T>(normalizePath(url), data, tracedConfig)
                             : await client.delete<T>(normalizePath(url), tracedConfig);
+                if (config?.expectedSessionScope !== sessionScope()) throw new axios.CanceledError('The active account or library changed.');
                 recordPerf(started, attempt, response.status, true, rid, response.headers as Record<string, unknown>, response.data);
                 // A real response (any status) proves the backend is up; clear
                 // any outstanding "backend unavailable" state immediately.
@@ -248,7 +258,7 @@ export const requestJson = async <T = any>(
         return performRequest();
     }
 
-    const dedupeKey = `${client.defaults.baseURL || ''}|${normalizePath(url)}`;
+    const dedupeKey = `${config.expectedSessionScope}|${client.defaults.baseURL || ''}|${normalizePath(url)}`;
     const existing = inFlightGets.get(dedupeKey);
     if (existing) {
         // Shared an already in-flight identical GET: no network cost, but record it so

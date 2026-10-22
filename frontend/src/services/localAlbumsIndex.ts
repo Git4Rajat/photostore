@@ -1,3 +1,5 @@
+import { schedulePendingEditsReconciliation } from './reconcilePendingEdits';
+import { applyPendingEdits, pendingEditScope, pendingEditReadTokens } from './pendingEdits';
 import { get } from './apiClient';
 import { perf, perfNow } from './perf';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
@@ -35,10 +37,13 @@ interface AlbumsIndexResponse {
 }
 
 interface StoredAlbumsIndex {
+    payloadVersion?: string;
     sourceVersion: string;
     updatedAt: string;
     rows: AlbumIndexRow[];
 }
+
+const snapshotVersions = new WeakMap<object, string>();
 
 const DB_NAME = 'photostore-albums-index';
 const DB_STORE = 'indexes';
@@ -72,6 +77,33 @@ const idbPutStored = async (key: string, value: StoredAlbumsIndex): Promise<void
     await new Promise<void>((resolve, reject) => {
         const tx = db.transaction(DB_STORE, 'readwrite');
         tx.objectStore(DB_STORE).put(value, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Failed to persist albums index.'));
+    });
+    db.close();
+};
+
+// `generation` is per-tab, so it can't fence a write against a newer
+// snapshot a *different* tab just persisted -- see localSortIndex.ts's
+// idbPutStoredIfNewer for the full reasoning. `updatedAt` is the manifest's
+// publish timestamp, not the payload's, and a dirty index rebuilding back to
+// a clean state can republish the same timestamp/sourceVersion label over
+// genuinely different content -- compare `payloadVersion` (embedded in the
+// downloaded body itself) instead, since that's what actually identifies
+// which content this is.
+const idbPutStoredIfNewer = async (key: string, value: StoredAlbumsIndex): Promise<void> => {
+    const db = await openAlbumsIndexDb();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        const store = tx.objectStore(DB_STORE);
+        const getReq = store.get(key);
+        getReq.onsuccess = () => {
+            const current = getReq.result as StoredAlbumsIndex | undefined;
+            if (!current?.payloadVersion || !value.payloadVersion || current.payloadVersion <= value.payloadVersion) {
+                store.put(value, key);
+            }
+        };
+        getReq.onerror = () => reject(getReq.error || new Error('Failed to read albums index before persisting.'));
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error || new Error('Failed to persist albums index.'));
     });
@@ -114,7 +146,12 @@ const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => 
     return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
 };
 
-const downloadAlbumsIndexBlob = async (indexUrl: string): Promise<AlbumIndexRow[]> => {
+const mergeRows = (rows: AlbumIndexRow[], version?: string, scope = pendingEditScope(), tokens?: ReadonlySet<string>): AlbumIndexRow[] => rows.map(row => {
+    const merged = applyPendingEdits('album', row.albumId, row, version, scope, tokens);
+    return merged;
+});
+
+const downloadAlbumsIndexBlob = async (indexUrl: string, scope: string, tokens: ReadonlySet<string>, current: () => boolean): Promise<AlbumIndexRow[]> => {
     const downloadStarted = perfNow();
     const response = await fetchWithTimeout(indexUrl, BLOB_FETCH_TIMEOUT_MS);
     if (!response.ok) {
@@ -128,14 +165,20 @@ const downloadAlbumsIndexBlob = async (indexUrl: string): Promise<AlbumIndexRow[
         const parsed = JSON.parse(text);
         if (parsed && Array.isArray(parsed.rows)) {
             perf.recordSpan('index.albums.parse', perfNow() - parseStarted, { rows: parsed.rows.length });
-            return normalizeRows(parsed.rows);
+            const rows = normalizeRows(parsed.rows);
+            if (typeof parsed.sourceVersion === 'string') snapshotVersions.set(rows, parsed.sourceVersion);
+            if (current()) mergeRows(rows, parsed.sourceVersion, scope, tokens);
+            return rows;
         }
     } catch {
         // fall through to manual gunzip
     }
     const text = await decompressGzip(buffer);
     const parsed = JSON.parse(text);
-    return normalizeRows(Array.isArray(parsed?.rows) ? parsed.rows : []);
+    const rows = normalizeRows(Array.isArray(parsed?.rows) ? parsed.rows : []);
+    if (typeof parsed.sourceVersion === 'string') snapshotVersions.set(rows, parsed.sourceVersion);
+    if (current()) mergeRows(rows, parsed.sourceVersion, scope, tokens);
+    return rows;
 };
 
 const indexKey = (): string => getActiveLibraryFromToken() || '__default__';
@@ -145,7 +188,7 @@ let cachedIndex: AlbumIndexRow[] | null = null;
 let inFlight: Promise<AlbumIndexRow[] | null> | null = null;
 let generation = 0;
 
-const fetchLocalAlbumsIndex = async (key: string): Promise<AlbumIndexRow[] | null> => {
+const fetchLocalAlbumsIndex = async (key: string, scope: string, requestGeneration: number, tokens: ReadonlySet<string>): Promise<AlbumIndexRow[] | null> => {
     const totalStarted = perfNow();
     const manifestStarted = perfNow();
     const response: AlbumsIndexResponse = await get('/api/albums/index');
@@ -159,19 +202,31 @@ const fetchLocalAlbumsIndex = async (key: string): Promise<AlbumIndexRow[] | nul
     perf.recordSpan('index.albums.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
     if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
         perf.recordSpan('index.albums.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
+        if (stored.payloadVersion) snapshotVersions.set(stored.rows, stored.payloadVersion);
         return stored.rows;
     }
-    const rows = await downloadAlbumsIndexBlob(response.indexUrl);
-    await idbPutStored(key, { sourceVersion, updatedAt: response.updatedAt || '', rows }).catch(() => {
-        // Best-effort persistence -- an in-memory-only session still works.
-    });
+    const rows = await downloadAlbumsIndexBlob(response.indexUrl, scope, tokens, () => generation === requestGeneration);
+    // An invalidation during this download can let a newer request's write
+    // land first, then have this now-stale download overwrite it when it
+    // finishes last -- same race as localSortIndex.ts's fetchLocalSortIndex.
+    // idbPutStoredIfNewer additionally guards against a different tab's
+    // concurrent, independently-fenced write regressing this one.
+    if (generation === requestGeneration) {
+        await idbPutStoredIfNewer(key, { sourceVersion, payloadVersion: snapshotVersions.get(rows), updatedAt: response.updatedAt || '', rows }).catch(() => {
+            // Best-effort persistence -- an in-memory-only session still works.
+        });
+    }
     return rows;
 };
 
 export const getLocalAlbumsIndex = async (): Promise<AlbumIndexRow[] | null> => {
     const key = indexKey();
     if (cachedIndex && cachedKey === key) {
-        return cachedIndex;
+        const snapshot = cachedIndex;
+        const scope = pendingEditScope();
+        mergeRows(snapshot, snapshotVersions.get(snapshot), scope, pendingEditReadTokens(scope, false));
+        schedulePendingEditsReconciliation();
+        return scope === pendingEditScope() ? mergeRows(snapshot, undefined, scope) : null;
     }
     if (inFlight && cachedKey === key) {
         return inFlight;
@@ -179,10 +234,16 @@ export const getLocalAlbumsIndex = async (): Promise<AlbumIndexRow[] | null> => 
     cachedIndex = null;
     cachedKey = key;
     const requestGeneration = ++generation;
-    const request = fetchLocalAlbumsIndex(key)
+    const scope = pendingEditScope();
+    const readTokens = pendingEditReadTokens(scope);
+    const request = fetchLocalAlbumsIndex(key, scope, requestGeneration, readTokens)
         .then((result) => {
+            if (scope !== pendingEditScope()) return null;
+            if (result) mergeRows(result, snapshotVersions.get(result), scope, readTokens);
+            schedulePendingEditsReconciliation();
+            if (scope !== pendingEditScope()) return null;
             if (generation === requestGeneration) cachedIndex = result;
-            return result;
+            return result ? mergeRows(result, undefined, scope) : result;
         })
         .catch(() => {
             if (generation === requestGeneration) cachedIndex = null;

@@ -1,8 +1,11 @@
+import { schedulePendingEditsReconciliation, subscribeSourceEdits } from '../../services/reconcilePendingEdits';
+import { applyPendingEdits, beginPendingEdit, confirmPendingEdit, rollbackPendingEdit, pendingEditScope, pendingEditReadTokens, pendingPeopleEnrichmentIds, hasSourceConfirmation, savePendingEdits, applyPendingPhotoCollection } from '../../services/pendingEdits';
 import { onIndexReady, reportIndexBuilding } from '../../services/indexBuilding';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
-import { clearLocalSortIndexRemovals, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, patchLocalSortIndexRow, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
+import { setPhotoRotation } from './media';
+import { clearLocalSortIndexRemovals, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
@@ -15,6 +18,7 @@ import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
 import type { PersonFace, PersonSummary } from '../../types/people';
+import { isNamedLabel } from '../../utils/people';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
 import type {
     Album,
@@ -73,6 +77,7 @@ const swatchFor = (filename: string): SwatchKey => {
 };
 
 export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMediaToken()): Photo => {
+    b = applyPendingEdits('photo', b.filename, b);
     const iso = b.captureDate || b.uploadDate || b.lastModified || null;
     const date = iso ? new Date(iso) : null;
     const valid = date && !Number.isNaN(date.getTime()) ? date : null;
@@ -101,6 +106,8 @@ export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMe
 // v4 snapshots carry the complete tile; older snapshots use enrichment only
 // while the indexer upgrades them in the background.
 export const galleryIndexPhoto = (row: SortIndexRow, token: MediaToken | null): Photo => {
+    const edit = applyPendingEdits('photo', row.filename, { rating: row.rating, likes: row.likes, ...row.gallery });
+    row = { ...row, rating: edit.rating, likes: edit.likes, ...(row.gallery ? { gallery: { ...row.gallery, ...edit } } : {}) };
     const iso = row.captureDate || row.uploadDate || null;
     const date = iso ? new Date(iso) : null;
     const valid = date && !Number.isNaN(date.getTime()) ? date : null;
@@ -148,20 +155,49 @@ const sortRowsForGallery = (rows: SortIndexRow[]): SortIndexRow[] => (
 
 interface PeoplePageRow { personId: string; name: string; isNamed: boolean; faceCount: number; coverFaceId?: string }
 interface PeoplePageResponse {
-    available?: boolean; rows?: PeoplePageRow[]; total?: number; hasMore?: boolean;
+    available?: boolean; rows?: PeoplePageRow[]; total?: number; hasMore?: boolean; sourceVersion?: string; consumedRows?: number;
     namedCount?: number; unnamedCount?: number;
 }
+const readPeoplePage = async (url: string): Promise<PeoplePageResponse> => {
+    const scope = pendingEditScope();
+    const tokens = pendingEditReadTokens(scope);
+    const response = await get<PeoplePageResponse>(url);
+    const consumedRows = response.rows?.length ?? 0;
+    const rows = response.rows?.map(row => applyPendingEdits('person', row.personId, row, response.sourceVersion, scope, tokens));
+    const params = new URL(url, 'https://local.invalid').searchParams;
+    const needle = params.get('q')?.trim().toLowerCase() || '';
+    if (!params.has('ids') && Number(params.get('offset') || 0) === 0 && response.available && rows) {
+        const present = new Set(rows.map(row => row.personId));
+        const missing = pendingPeopleEnrichmentIds(present, needle, scope);
+        for (let start = 0; start < missing.length; start += 50) {
+            const extra = await get<PeoplePageResponse>(`/api/persons/page?ids=${encodeURIComponent(missing.slice(start,start+50).join(','))}&limit=50`);
+            for (const row of extra.rows || []) {
+                const patched = applyPendingEdits('person', row.personId, row, extra.sourceVersion, scope, tokens);
+                if (!present.has(row.personId) && (!needle || patched.name?.toLowerCase().includes(needle))) {
+                    rows.push(patched); present.add(row.personId);
+                }
+            }
+        }
+    }
+    const matching = needle ? rows?.filter(row => row.name?.toLowerCase().includes(needle)) : rows;
+    schedulePendingEditsReconciliation();
+    return { ...response, consumedRows, rows: matching };
+};
 const PEOPLE_PAGE = 120;
-const mapPersonRow = (r: PeoplePageRow): Person => ({
-    id: r.personId,
-    name: r.isNamed && (r.name ?? '').trim() ? r.name : null,
-    swatch: swatchFor(r.personId),
-    photoIds: [],
-    // The avatar loader turns this into a direct storage URL (face-crop token); the path is only the
-    // fallback that generates a crop that doesn't exist yet.
-    coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
-    faceCount: r.faceCount,
-});
+const mapPersonRow = (r: PeoplePageRow): Person => {
+    r = applyPendingEdits('person', r.personId, r);
+    const named = isNamedLabel(r.name);
+    return {
+        id: r.personId,
+        name: named ? r.name : null,
+        swatch: swatchFor(r.personId),
+        photoIds: [],
+        // The avatar loader turns this into a direct storage URL (face-crop token); the path is only the
+        // fallback that generates a crop that doesn't exist yet.
+        coverThumbnailUrl: r.coverFaceId ? `/api/faces/crop/${encodeURIComponent(r.coverFaceId)}` : undefined,
+        faceCount: r.faceCount,
+    };
+};
 
 const facesToPhotos = (faces: PersonFace[]): Photo[] => {
     const seen = new Set<string>();
@@ -360,6 +396,7 @@ interface Store {
     ratePhotos: (ids: string[], rating: number) => void;
     toggleLike: (id: string) => void;
     applyPhotoRotation: (filename: string, rotation: number) => void;
+    savePhotoRotation: (filename: string, rotation: number, previous: number) => void;
     deletePhotos: (ids: string[]) => void;
     restorePhotos: (ids: string[]) => void;
     restoreAllTrash: () => void;
@@ -495,6 +532,34 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [extraPeople, setExtraPeople] = useState<Record<string, Person>>({});
     const peopleOffsetRef = useRef(0);
     const peopleLoadingMoreRef = useRef(false);
+    // `previous` chains to the edit this one superseded, so a failed rename
+    // can walk back past other failed predecessors to the nearest edit that
+    // actually saved (or off the end of the chain) instead of reinstalling a
+    // predecessor that never saved either -- see renamePerson's catch.
+    // `serverName` carries the baseline from *before the whole chain started*
+    // forward through every edit in it: once the first edit's optimistic
+    // setPeople/setExtraPeople call runs, re-reading `people`/`extraPeople`
+    // from a later edit in the same chain would only observe that still-
+    // unsaved optimistic name, not the true last-confirmed one.
+    type PersonNameEdit = { name: string | null; saved: boolean; failed?: boolean; observedRead?: number; scope: string; previous?: PersonNameEdit; serverName: string | null };
+    const personNameEditsRef = useRef(new Map<string, PersonNameEdit>());
+    const peopleReadSequenceRef = useRef(0);
+    const peopleFetchSequenceRef = useRef(0);
+    const reconcilePersonName = useCallback((person: Person, read: number): Person => {
+        const edit = personNameEditsRef.current.get(person.id);
+        if (!edit) return person;
+        if (edit.scope !== pendingEditScope() || (edit.saved && hasSourceConfirmation('person', person.id, 'name'))) {
+            personNameEditsRef.current.delete(person.id);
+            return person;
+        }
+        if (edit.observedRead !== undefined && read > edit.observedRead && person.name !== edit.name) {
+            // A later read may contain a subsequent edit from another client.
+            personNameEditsRef.current.delete(person.id);
+            return person;
+        }
+        if (edit.saved && person.name === edit.name) edit.observedRead = Math.max(edit.observedRead ?? 0, read);
+        return { ...person, name: edit.name };
+    }, []);
     // Photo deletion updates loaded person counts immediately. Keep the
     // resulting upper bound until the People index publishes a count at or
     // below it, so an older snapshot cannot put the deleted face back.
@@ -544,6 +609,22 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         });
     }, []);
 
+    useEffect(() => subscribeSourceEdits((scope) => {
+        if (scope !== pendingEditScope()) return;
+        const patchPhoto = (photo: Photo) => applyPendingEdits('photo', photo.id, photo, undefined, scope);
+        const patchPerson = (person: Person): Person => {
+            const updated = applyPendingEdits('person', person.id, person, undefined, scope);
+            return { ...updated, name: isNamedLabel(updated.name ?? '') ? updated.name : null };
+        };
+        setPhotos(prev => prev.map(patchPhoto));
+        setExtraPhotos(prev => Object.fromEntries(Object.entries(prev).map(([id, photo]) => [id, patchPhoto(photo)])));
+        setAlbumPhotos(prev => Object.fromEntries(Object.entries(prev).map(([id, list]) => [id, list.map(patchPhoto)])));
+        setPersonPhotos(prev => Object.fromEntries(Object.entries(prev).map(([id, list]) => [id, list.map(patchPhoto)])));
+        setAlbums(prev => prev.map(album => applyPendingEdits('album', album.id, album, undefined, scope)));
+        setPeople(prev => prev.map(patchPerson));
+        setExtraPeople(prev => Object.fromEntries(Object.entries(prev).map(([id, person]) => [id, patchPerson(person)])));
+    }), []);
+
     const photoIndex = useMemo(() => {
         const m = new Map<string, Photo>();
         for (const p of Object.values(extraPhotos)) m.set(p.id, p);
@@ -555,12 +636,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         return m;
     }, [photos, albumPhotos, personPhotos, extraPhotos]);
 
-    const photoById = useCallback((id: string) => photoIndex.get(id), [photoIndex]);
+    const photoById = useCallback((id: string) => {
+        const photo = photoIndex.get(id);
+        return photo ? applyPendingEdits('photo', id, photo) : undefined;
+    }, [photoIndex]);
     const photosByIds = useCallback(
-        (ids: string[]) => ids.map((id) => photoIndex.get(id)).filter((p): p is Photo => Boolean(p)),
-        [photoIndex],
+        (ids: string[]) => ids.map((id) => photoById(id)).filter((p): p is Photo => Boolean(p)),
+        [photoById],
     );
-    const albumById = useCallback((id: string) => albums.find((a) => a.id === id), [albums]);
+    const albumById = useCallback((id: string) => {
+        const album = albums.find((a) => a.id === id);
+        return album ? applyPendingEdits('album', id, album) : undefined;
+    }, [albums]);
     const personById = useCallback((id: string) => (
         deletedPeopleRef.current.has(id) ? undefined : people.find((p) => p.id === id) ?? extraPeople[id]
     ), [people, extraPeople]);
@@ -613,6 +700,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // a page costs the same at 10k or 10M photos. With the media token, thumbnails are built
     // client-side from the returned blob names (directMedia), and a page is sized to the screen.
     const fetchPhotosViaLegacyEndpoint = useCallback(async (offset: number, reset: boolean) => {
+        const scope = pendingEditScope();
+        const tokens = pendingEditReadTokens(scope);
         const range = captureRangeRef.current;
         const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
         const filters = galleryFiltersRef.current;
@@ -622,6 +711,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const res = await get<{ photos?: BackendPhoto[]; total?: number; indexBuilding?: boolean; indexPartial?: boolean }>(
             `/photos?sort=capture&offset=${offset}&limit=${pageSize}${rangeQuery}${filterQuery}${token ? '&directMedia=1' : ''}`,
         );
+        res.photos?.forEach(photo => applyPendingEdits('photo', photo.filename, photo, undefined, scope, tokens));
+        schedulePendingEditsReconciliation();
         reportIndexBuilding('gallery', Boolean(res?.indexBuilding || res?.indexPartial));
         const list = Array.isArray(res?.photos) ? res.photos.map((p) => mapPhoto(p)) : [];
         photoOffsetRef.current = offset + list.length;
@@ -1054,8 +1145,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // list_albums's whole-library scan. Falls back to the legacy GET /albums
     // on any failure (cold index, network error) so the page never breaks.
     const fetchAlbumsViaLegacyEndpoint = useCallback(async () => {
+        // Same scoped fresh-read observation as the server-paged photo/people
+        // fallbacks (see fetchPhotosViaLegacyEndpoint): without registering a
+        // read token here, an acknowledged name receipt stays passive forever
+        // and this fallback keeps masking a later rename from another client.
+        const scope = pendingEditScope();
+        const tokens = pendingEditReadTokens(scope);
         const res = await get<{ albums?: Album[] }>('/albums');
-        setAlbums(Array.isArray(res?.albums) ? res.albums : []);
+        setAlbums(Array.isArray(res?.albums) ? res.albums.map(album => applyPendingEdits('album', album.id, album, undefined, scope, tokens)) : []);
+        schedulePendingEditsReconciliation();
     }, []);
 
     const loadAlbums = useCallback(async () => {
@@ -1100,7 +1198,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 hasAccessCode: r.hasAccessCode,
                 isExpired: r.isExpired,
             }));
-            setAlbums(mapped);
+            setAlbums(mapped.map(album => applyPendingEdits('album', album.id, album)));
             albumsLoadedAtRef.current = Date.now();
         } catch {
             try {
@@ -1149,12 +1247,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             // Keep the local sort-index in step so a re-sort/re-scroll this
             // session reflects the new rating immediately, without waiting on
             // the backend's independent sort-index manifest to catch up.
-            ids.forEach((id) => patchLocalSortIndexRow(id, { rating }));
-            void post('/photos/rate-multiple', { filenames: ids, rating })
-                .then(() => { invalidateLocalAlbumsIndex(); reloadAlbums(); })
+            const edits = ids.map(id => beginPendingEdit('photo', id, { rating }));
+            void savePendingEdits(edits, () => post('/photos/rate-multiple', { filenames: ids, rating }))
+                .then(() => {
+                    edits.forEach(edit => confirmPendingEdit(edit));
+                    if (edits[0]?.scope !== pendingEditScope()) return;
+                    requestJobPoll();
+                    invalidateLocalAlbumsIndex();
+                    reloadAlbums();
+                })
                 .catch(() => {
-                    setPhotos((prev) => prev.map((p) => (prevRatings.has(p.id) ? { ...p, rating: prevRatings.get(p.id)! } : p)));
-                    prevRatings.forEach((prevRating, id) => patchLocalSortIndexRow(id, { rating: prevRating }));
+                    edits.forEach(edit => rollbackPendingEdit(edit));
+                    if (edits[0]?.scope !== pendingEditScope()) return;
+                    setPhotos((prev) => prev.map((p) => (prevRatings.has(p.id) ? applyPendingEdits('photo', p.id, { ...p, rating: prevRatings.get(p.id)! }) : p)));
+                    invalidateLocalSortIndex();
                     toast('Couldn’t save rating', undefined, undefined, 'error');
                 });
         },
@@ -1168,22 +1274,26 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const prevLikes = current?.likes ?? 0;
             const optimisticLikes = Math.max(0, prevLikes + (nextLiked ? 1 : -1));
             setPhotos((prev) => prev.map((p) => (p.id === id ? { ...p, liked: nextLiked, likes: optimisticLikes } : p)));
-            patchLocalSortIndexRow(id, { likes: optimisticLikes, liked: nextLiked });
-            void post<{ liked?: boolean; likes?: number }>(`/photos/${encodeURIComponent(id)}/like`, {})
+            const edit = beginPendingEdit('photo', id, { likes: optimisticLikes, liked: nextLiked });
+            void savePendingEdits([edit], () => post<{ liked?: boolean; likes?: number }>(`/photos/${encodeURIComponent(id)}/like`, {}))
                 .then((res) => {
+                    requestJobPoll();
                     const likes = res.likes ?? optimisticLikes;
+                    confirmPendingEdit(edit, { likes, liked: res.liked ?? nextLiked });
+                    if (edit.scope !== pendingEditScope()) return;
                     setPhotos((prev) => prev.map((p) => (p.id === id
-                        ? { ...p, liked: res.liked ?? nextLiked, likes }
+                        ? applyPendingEdits('photo', p.id, { ...p, liked: res.liked ?? nextLiked, likes })
                         : p)));
-                    patchLocalSortIndexRow(id, { likes, liked: res.liked ?? nextLiked });
                     invalidateLocalAlbumsIndex();
                     reloadAlbums();
                 })
                 .catch(() => {
+                    rollbackPendingEdit(edit);
+                    if (edit.scope !== pendingEditScope()) return;
                     setPhotos((prev) => prev.map((p) => (p.id === id
-                        ? { ...p, liked: Boolean(current?.liked), likes: prevLikes }
+                        ? applyPendingEdits('photo', p.id, { ...p, liked: Boolean(current?.liked), likes: prevLikes })
                         : p)));
-                    patchLocalSortIndexRow(id, { likes: prevLikes, liked: Boolean(current?.liked) });
+                    invalidateLocalSortIndex();
                     toast('Couldn’t update like', undefined, undefined, 'error');
                 });
         },
@@ -1197,7 +1307,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // value stored here is what the viewer/grid apply as a CSS transform.
     const applyPhotoRotation = useCallback((filename: string, rotation: number) => {
         const norm = ((rotation % 360) + 360) % 360;
-        patchLocalSortIndexRow(filename, { rotation: norm });
         const patch = (p: Photo): Photo => (p.id === filename && p.rotation !== norm ? { ...p, rotation: norm } : p);
         setPhotos((prev) => prev.map(patch));
         setAlbumPhotos((prev) => {
@@ -1216,6 +1325,63 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             return { ...prev, [filename]: { ...existing, rotation: norm } };
         });
     }, []);
+
+    // Tracks the rotation transaction chain per photo, same shape/reasoning as
+    // personNameEditsRef: `previous` lets an overlapping failure walk back
+    // past other failed attempts to the last value that actually saved,
+    // instead of reapplying whichever optimistic value the caller happened
+    // to capture (that value is only correct for the first edit in a chain --
+    // a later overlapping edit captures an already-optimistic, possibly
+    // never-saved, predecessor). `baseline` carries the rotation from before
+    // the whole chain started forward through every edit in it, same reason
+    // personNameEdit.serverName does: once the chain's walk-back runs off the
+    // end (every edit failed), the true pre-chain value is what must be
+    // restored, not whatever optimistic rotation a later edit captured.
+    type RotationEdit = { rotation: number; failed?: boolean; scope: string; previous?: RotationEdit; baseline: number };
+    const rotationEditsRef = useRef(new Map<string, RotationEdit>());
+
+    // Enrolled in the same begin/save/confirm/rollback journal as rating/like
+    // edits (see ratePhotos above) -- the sort index's patched row must only
+    // become an authoritative receipt once the backend write actually
+    // succeeds. Confirming it on the optimistic apply (as applyPhotoRotation
+    // used to do directly) let a reconciliation race adopt the pre-rotation
+    // value from the backend while this save was still in flight.
+    const savePhotoRotation = useCallback((filename: string, rotation: number, previous: number) => {
+        const norm = ((rotation % 360) + 360) % 360;
+        const scope = pendingEditScope();
+        const previousEdit = rotationEditsRef.current.get(filename);
+        const baseline = previousEdit ? previousEdit.baseline : previous;
+        const rotationEdit: RotationEdit = { rotation: norm, scope, previous: previousEdit, baseline };
+        rotationEditsRef.current.set(filename, rotationEdit);
+        const edit = beginPendingEdit('photo', filename, { rotation: norm });
+        void savePendingEdits([edit], () => setPhotoRotation(filename, norm))
+            .then(() => {
+                confirmPendingEdit(edit);
+                rotationEdit.previous = undefined;
+                // Unlike a plain POST wrapper, a confirmed rotation can only be
+                // observed once the backend's index/thumbnail rebuild for it
+                // publishes -- nudge the same bounded recovery path rating/
+                // like/rename use instead of relying on an already-idle poller.
+                if (edit.scope === pendingEditScope()) requestJobPoll();
+            })
+            .catch(() => {
+                rollbackPendingEdit(edit);
+                rotationEdit.failed = true;
+                if (edit.scope !== pendingEditScope() || rotationEditsRef.current.get(filename) !== rotationEdit) return;
+                let restore = rotationEdit.previous;
+                while (restore?.failed) restore = restore.previous;
+                const restoredRotation = restore ? restore.rotation : rotationEdit.baseline;
+                if (restore) rotationEditsRef.current.set(filename, restore);
+                else rotationEditsRef.current.delete(filename);
+                // Route through the journal overlay rather than applying
+                // restoredRotation directly: reconciliation may have since
+                // confirmed a newer authoritative rotation for this photo
+                // while this save was in flight; keep that over our fallback.
+                applyPhotoRotation(filename, applyPendingEdits('photo', filename, { rotation: restoredRotation }).rotation);
+                invalidateLocalSortIndex();
+                toast('Couldn’t save rotation', undefined, undefined, 'error');
+            });
+    }, [applyPhotoRotation, toast]);
 
     const adjustPeopleCountsForPhotos = useCallback((list: Photo[], delta: number) => {
         const counts = new Map<string, number>();
@@ -1524,7 +1690,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const { page, album } = await fetchAlbumPage(id, 0);
             if (stale()) return;
             setAlbumPhotos((prev) => ({ ...prev, [id]: page }));
-            if (album) setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...album } : a)));
+            if (album) setAlbums((prev) => prev.map((a) => (a.id === id ? applyPendingEdits('album', id, { ...a, ...album }) : a)));
         } catch {
             setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
         } finally {
@@ -1550,7 +1716,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const albumPhotosTotal = useCallback((id: string) => albumPaging[id]?.total, [albumPaging]);
     const albumPhotosHasMore = useCallback((id: string) => Boolean(albumPaging[id]?.hasMore), [albumPaging]);
 
-    const albumPhotosById = useCallback((id: string) => albumPhotos[id], [albumPhotos]);
+    const albumPhotosById = useCallback((id: string) => applyPendingPhotoCollection(albumPhotos[id]), [albumPhotos]);
     const isAlbumPhotosLoading = useCallback((id: string) => Boolean(albumPhotosLoadingIds[id]), [albumPhotosLoadingIds]);
 
     const createAlbum = useCallback(
@@ -1597,16 +1763,57 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [toast],
     );
 
+    // Tracks the rename transaction chain per album, same shape/reasoning as
+    // rotationEditsRef/personNameEditsRef above.
+    type AlbumNameEdit = { name: string; failed?: boolean; scope: string; previous?: AlbumNameEdit; baseline: string };
+    const albumNameEditsRef = useRef(new Map<string, AlbumNameEdit>());
+
     const renameAlbum = useCallback((id: string, name: string) => {
         const trimmed = name.trim();
         if (!trimmed) return;
-        const previous = albums.find((a) => a.id === id)?.name;
+        const scope = pendingEditScope();
+        // Same transaction chain as rotationEditsRef/personNameEditsRef:
+        // `previous`/`failed` let an overlapping failure walk back past other
+        // failed attempts instead of unconditionally reinstalling whichever
+        // name this particular edit happened to capture (which, for the
+        // second of two overlapping renames, is the first rename's still-
+        // unsaved optimistic name, not the real baseline); `baseline` carries
+        // the true pre-chain name through every edit so falling off the end
+        // of the chain restores it instead of that optimistic value.
+        const previousEdit = albumNameEditsRef.current.get(id);
+        const baseline = previousEdit ? previousEdit.baseline : albums.find((a) => a.id === id)?.name ?? trimmed;
+        const albumEdit: AlbumNameEdit = { name: trimmed, scope, previous: previousEdit, baseline };
+        albumNameEditsRef.current.set(id, albumEdit);
+        const edit = beginPendingEdit('album', id, { name: trimmed });
         setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: trimmed } : a)));
         invalidateLocalAlbumsIndex();
-        void post(`/albums/${encodeURIComponent(id)}/rename`, { name: trimmed }).then(() => {
+        void savePendingEdits([edit], () => post(`/albums/${encodeURIComponent(id)}/rename`, { name: trimmed })).then(() => {
+            confirmPendingEdit(edit);
+            albumEdit.previous = undefined;
+            if (edit.scope !== pendingEditScope()) return;
+            requestJobPoll();
             publishLibraryChange('album-renamed', ['albums'], { itemCount: 1 });
         }).catch(() => {
-            setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: previous ?? a.name } : a)));
+            rollbackPendingEdit(edit);
+            // Mark failed even if superseded, so a later overlapping rename's
+            // own failure handler knows to skip over this one when walking back.
+            albumEdit.failed = true;
+            if (edit.scope !== pendingEditScope() || albumNameEditsRef.current.get(id) !== albumEdit) return;
+            let restore = albumEdit.previous;
+            while (restore?.failed) restore = restore.previous;
+            const restoredName = restore ? restore.name : albumEdit.baseline;
+            if (restore) albumNameEditsRef.current.set(id, restore);
+            else albumNameEditsRef.current.delete(id);
+            // Route through the journal overlay rather than setting
+            // `restoredName` directly: reconciliation may have since learned
+            // a newer authoritative name for this album (e.g. another
+            // client's rename, confirmed via acceptSourceEdits) while this
+            // rename was in flight. applyPendingEdits keeps that authoritative
+            // value if the journal still has one, falling back to
+            // restoredName only when it doesn't -- without this, the sidebar
+            // (set directly here) could regress behind the detail view
+            // (which already reads through this same overlay).
+            setAlbums((prev) => prev.map((a) => (a.id === id ? applyPendingEdits('album', a.id, { ...a, name: restoredName }) : a)));
             toast('Couldn’t rename album', undefined, undefined, 'error');
         });
     }, [albums, toast]);
@@ -1729,7 +1936,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             for (let start = 0; start < ids.length; start += 50) {
                 const chunk = ids.slice(start, start + 50);
                 const encoded = encodeURIComponent(chunk.join(','));
-                const res = await get<PeoplePageResponse>(`/api/persons/page?ids=${encoded}&limit=${chunk.length}`);
+                const res = await readPeoplePage(`/api/persons/page?ids=${encoded}&limit=${chunk.length}`);
                 if (!res?.available || !Array.isArray(res.rows)) return { complete: false, indexed };
                 for (const row of res.rows) indexed.set(row.personId, row);
             }
@@ -1743,9 +1950,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, []);
 
     const fetchPeople = useCallback(async () => {
+        const read = ++peopleReadSequenceRef.current;
+        const fetchSequence = ++peopleFetchSequenceRef.current;
         setPeopleLoading(true);
         try {
-            const res = await get<PeoplePageResponse>(`/api/persons/page?offset=0&limit=${PEOPLE_PAGE}`);
+            const res = await readPeoplePage(`/api/persons/page?offset=0&limit=${PEOPLE_PAGE}`);
+            if (fetchSequence !== peopleFetchSequenceRef.current) return;
             if (!res?.available || !Array.isArray(res.rows)) {
                 // The server answered "index not ready": show the preparing bar and let it retry.
                 setPeopleHasMore(false);
@@ -1754,15 +1964,25 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 return;
             }
             const reconciliation = await reconcileDeletedPeople();
+            if (fetchSequence !== peopleFetchSequenceRef.current) return;
             const mapped = res.rows
                 .filter((row) => !deletedPeopleRef.current.has(row.personId))
                 .map(mapPersonRow)
+                .map((person) => reconcilePersonName(person, read))
                 .map(reconcilePersonFaceCount)
                 .filter((person) => person.name || (person.faceCount ?? 0) > 0);
             // Offset tracks rows consumed from the server, including hidden
             // tombstones, otherwise load-more would request overlapping rows.
-            peopleOffsetRef.current = res.rows.length;
-            setPeople(mapped);
+            peopleOffsetRef.current = res.consumedRows ?? res.rows.length;
+            setPeople((prev) => {
+                const present = new Set(mapped.map((person) => person.id));
+                const pending = prev.filter((person) => {
+                    const edit = personNameEditsRef.current.get(person.id);
+                    return edit && edit.scope === pendingEditScope() && edit.observedRead === undefined && !present.has(person.id)
+                        && !deletedPeopleRef.current.has(person.id) && (edit.name || (person.faceCount ?? 0) > 0);
+                });
+                return [...mapped, ...pending.map((person) => ({ ...person, name: personNameEditsRef.current.get(person.id)!.name }))];
+            });
             if (reconciliation.complete) {
                 const indexedDeleted = Array.from(reconciliation.indexed.values());
                 const deletedUnnamed = indexedDeleted.filter((row) => !row.isNamed).length;
@@ -1773,6 +1993,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setPeopleUnavailable(false);
             reportIndexBuilding('people', false);
         } catch {
+            if (fetchSequence !== peopleFetchSequenceRef.current) return;
             // Never fall back to fetching every cluster at once: show a "preparing" state and let the
             // user (or the next visit) retry the paged request.
             // A failed request (404/5xx/network) is not "building": don't claim the library is being prepared.
@@ -1781,19 +2002,23 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setPeopleUnavailable(true);
             reportIndexBuilding('people', false);
         } finally {
-            setPeopleLoading(false);
+            if (fetchSequence === peopleFetchSequenceRef.current) setPeopleLoading(false);
         }
-    }, [reconcileDeletedPeople, reconcilePersonFaceCount]);
+    }, [reconcileDeletedPeople, reconcilePersonFaceCount, reconcilePersonName]);
 
     const loadMorePeople = useCallback(() => {
         if (peopleLoadingMoreRef.current) return;
+        const read = ++peopleReadSequenceRef.current;
+        const fetchSequence = peopleFetchSequenceRef.current;
         peopleLoadingMoreRef.current = true;
-        void get<PeoplePageResponse>(`/api/persons/page?offset=${peopleOffsetRef.current}&limit=${PEOPLE_PAGE}`)
+        void readPeoplePage(`/api/persons/page?offset=${peopleOffsetRef.current}&limit=${PEOPLE_PAGE}`)
             .then((res) => {
+                if (fetchSequence !== peopleFetchSequenceRef.current) return;
                 const rawRows = Array.isArray(res?.rows) ? res.rows : [];
                 const rows = rawRows
                     .filter((row) => !deletedPeopleRef.current.has(row.personId))
                     .map(mapPersonRow)
+                    .map((person) => reconcilePersonName(person, read))
                     .map(reconcilePersonFaceCount)
                     .filter((person) => person.name || (person.faceCount ?? 0) > 0);
                 peopleOffsetRef.current += rawRows.length;
@@ -1805,37 +2030,41 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             })
             .catch(() => setPeopleHasMore(false))
             .finally(() => { peopleLoadingMoreRef.current = false; });
-    }, [reconcilePersonFaceCount]);
+    }, [reconcilePersonFaceCount, reconcilePersonName]);
 
     const searchPeople = useCallback(async (query: string, limit = 50): Promise<Person[]> => {
+        const read = ++peopleReadSequenceRef.current;
         try {
-            const res = await get<PeoplePageResponse>(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
+            const res = await readPeoplePage(`/api/persons/page?q=${encodeURIComponent(query)}&limit=${limit}`);
             return Array.isArray(res?.rows)
                 ? res.rows
                     .filter((row) => !deletedPeopleRef.current.has(row.personId))
                     .map(mapPersonRow)
+                    .map((person) => reconcilePersonName(person, read))
                     .map(reconcilePersonFaceCount)
                     .filter((person) => person.name || (person.faceCount ?? 0) > 0)
+                    .slice(0, limit)
                 : [];
         } catch {
             return [];
         }
-    }, [reconcilePersonFaceCount]);
+    }, [reconcilePersonFaceCount, reconcilePersonName]);
 
     // A deep link to a person who isn't in the loaded pages: fetch just that cluster.
     const ensurePerson = useCallback(async (id: string) => {
         if (deletedPeopleRef.current.has(id)) return;
+        const read = ++peopleReadSequenceRef.current;
         try {
-            const res = await get<PeoplePageResponse>(`/api/persons/page?ids=${encodeURIComponent(id)}&limit=1`);
+            const res = await readPeoplePage(`/api/persons/page?ids=${encodeURIComponent(id)}&limit=1`);
             const row = Array.isArray(res?.rows) ? res.rows[0] : undefined;
             if (row && !deletedPeopleRef.current.has(row.personId)) {
-                const person = reconcilePersonFaceCount(mapPersonRow(row));
+                const person = reconcilePersonFaceCount(reconcilePersonName(mapPersonRow(row), read));
                 setExtraPeople((prev) => ({ ...prev, [row.personId]: person }));
             }
         } catch {
             // the page shows "no longer exists"
         }
-    }, [reconcilePersonFaceCount]);
+    }, [reconcilePersonFaceCount, reconcilePersonName]);
 
     // No longer fetched unconditionally on app mount -- see the fetchAlbums
     // comment above; PeoplePage's own mount effect enqueues this instead.
@@ -1909,23 +2138,63 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const personPhotosTotal = useCallback((id: string) => personPaging[id]?.total, [personPaging]);
     const personPhotosHasMore = useCallback((id: string) => Boolean(personPaging[id]?.hasMore), [personPaging]);
 
-    const personPhotosById = useCallback((id: string) => personPhotos[id], [personPhotos]);
+    const personPhotosById = useCallback((id: string) => applyPendingPhotoCollection(personPhotos[id]), [personPhotos]);
 
     const renamePerson = useCallback((id: string, name: string) => {
         const trimmed = name.trim();
-        const previous = people.find((p) => p.id === id)?.name ?? null;
-        setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: trimmed || null } : p)));
-        setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: trimmed || null } } : prev));
+        const previousEdit = personNameEditsRef.current.get(id);
+        const serverName = previousEdit ? previousEdit.serverName : people.find((p) => p.id === id)?.name ?? extraPeople[id]?.name ?? null;
+        const edit: PersonNameEdit = { name: isNamedLabel(trimmed) ? trimmed : null, saved: false, scope: pendingEditScope(), previous: previousEdit, serverName };
+        personNameEditsRef.current.set(id, edit);
+        setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: edit.name } : p)));
+        setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: edit.name } } : prev));
         invalidateLocalPeopleIndex();
         void faceService.labelPerson(id, trimmed).then(() => {
+            if (edit.scope !== pendingEditScope()) return;
+            edit.saved = true;
+            edit.previous = undefined;
+            requestJobPoll();
             publishLibraryChange('person-renamed', ['people'], { itemCount: 1 });
         }).catch(() => {
-            setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: previous } : p)));
-            setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: previous } } : prev));
+            // Mark this edit failed even if a later overlapping rename has
+            // since superseded it -- that later edit's own failure handler
+            // walks `previous` and must know to skip over it rather than
+            // reinstalling a name that never saved either.
+            edit.failed = true;
+            if (edit.scope !== pendingEditScope() || personNameEditsRef.current.get(id) !== edit) return;
+            let restore = edit.previous;
+            while (restore?.failed) restore = restore.previous;
+            const restoredName = restore ? restore.name : serverName;
+            // A surviving predecessor that's already both saved and source-
+            // confirmed has nothing left to protect: background reconciliation
+            // already landed its (possibly newer, e.g. another client's rename)
+            // value straight into the journal, and fetchPeople's "keep a
+            // pending rename visible even once it drops off the current page"
+            // fallback below reads `edit.name` directly, bypassing
+            // applyPendingEdits -- leaving a confirmed-stale shadow entry
+            // here would let that fallback reinstate it indefinitely.
+            if (restore && !(restore.saved && hasSourceConfirmation('person', id, 'name'))) {
+                personNameEditsRef.current.set(id, restore);
+            } else {
+                personNameEditsRef.current.delete(id);
+            }
+            // faceService.labelPerson enrolls this rename in the shared
+            // pending-edits journal (beginPendingEdit('person', ...)): route
+            // through applyPendingEdits rather than setting `restoredName`
+            // directly, so that if background reconciliation already
+            // confirmed a newer authoritative name there (acceptSourceEdits,
+            // e.g. another client's concurrent rename), that wins over our
+            // shadow chain's necessarily-older snapshot.
+            const restorePerson = (person: Person): Person => {
+                const restored = applyPendingEdits('person', id, { ...person, name: restoredName }, undefined, edit.scope);
+                return { ...restored, name: isNamedLabel(restored.name ?? '') ? restored.name : null };
+            };
+            setPeople((prev) => prev.map((p) => (p.id === id ? restorePerson(p) : p)));
+            setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: restorePerson(prev[id]) } : prev));
             invalidateLocalPeopleIndex();
             toast('Couldn’t save name', undefined, undefined, 'error');
         });
-    }, [people, toast]);
+    }, [people, extraPeople, toast]);
 
     const mergePeople = useCallback(
         (sourceId: string, targetId: string) => {
@@ -2281,6 +2550,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             ratePhotos,
             toggleLike,
             applyPhotoRotation,
+            savePhotoRotation,
             deletePhotos,
             restorePhotos,
             restoreAllTrash,
@@ -2338,7 +2608,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore, fetchExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
-            clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos,
+            clearSelection, setSelectMode, openViewer, closeViewer, viewerStep, focusPhoto, ratePhotos, toggleLike, applyPhotoRotation, savePhotoRotation, deletePhotos,
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, fetchAlbums, openAlbum, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,

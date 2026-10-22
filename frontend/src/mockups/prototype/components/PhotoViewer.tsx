@@ -16,7 +16,7 @@ import {
 import { Menu, Stars, Spinner } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
 import { useStore, isVideoFilename } from '../store';
-import { useMainMedia, downloadPhoto, fetchPhotoMetadata, setPhotoRotation, preloadMediaAccessUrls } from '../media';
+import { useMainMedia, downloadPhoto, fetchPhotoMetadata, preloadMediaAccessUrls } from '../media';
 import type { PhotoMetadata } from '../media';
 
 const ZOOM_MIN = 1;
@@ -56,7 +56,7 @@ const formatShutterSpeed = (exposureTime?: string): string | null => {
 /** Full-screen photo viewer with a persistent action bar, prev/next, keyboard,
  *  rotate + zoom controls, an EXIF/location info panel, and on-demand full-res. */
 export const PhotoViewer: React.FC = () => {
-    const { viewer, photoById, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, applyPhotoRotation, deletePhotos, navigate, toast, route, registerPhotos } = useStore();
+    const { viewer, photoById, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, applyPhotoRotation, savePhotoRotation, deletePhotos, navigate, toast, route, registerPhotos } = useStore();
 
     const live = useMemo(
         () => (viewer ? viewer.ids.map((id) => photoById(id)).filter((p) => Boolean(p)) : []),
@@ -127,13 +127,11 @@ export const PhotoViewer: React.FC = () => {
         pendingRotationRef.current = null;
         // Persist to the store immediately (optimistic) so the grid and any
         // reopen reflect the new orientation, then write it through to the
-        // backend. On failure, revert the store to the saved-before value.
+        // backend via the store's pending-edits journal; on failure that save
+        // reverts the store to the saved-before value itself.
         applyPhotoRotation(pending.filename, pending.rotation);
-        void setPhotoRotation(pending.filename, pending.rotation).catch(() => {
-            applyPhotoRotation(pending.filename, pending.previous);
-            toast('Couldn’t save rotation', undefined, undefined, 'error');
-        });
-    }, [toast, applyPhotoRotation]);
+        savePhotoRotation(pending.filename, pending.rotation, pending.previous);
+    }, [applyPhotoRotation, savePhotoRotation]);
 
     // Reset transient view state whenever the active photo changes, flushing
     // any pending rotation for the photo being left (see flushPendingRotation).

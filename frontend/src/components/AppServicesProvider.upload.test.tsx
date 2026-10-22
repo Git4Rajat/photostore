@@ -384,6 +384,50 @@ describe('browser upload selection and startup', () => {
         expect(endSummaries()).toHaveLength(1);
     });
 
+    it('keeps polling after a transient failure and refreshes immediately on index completion', async () => {
+        mocks.pollAuthenticated = true;
+        const queued = { jobId: 'index-build-owner-people', kind: 'index_build', status: 'queued',
+            indexScope: 'people', title: 'People updating', message: '', updatedAt: new Date().toISOString() };
+        mocks.jobs.mockResolvedValueOnce([queued]).mockRejectedValueOnce(new Error('temporary status failure'))
+            .mockResolvedValueOnce([{ ...queued, status: 'done', updatedAt: new Date(Date.now() + 12000).toISOString() }])
+            .mockResolvedValue([]);
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        const refresh = vi.fn();
+        act(() => { services.registerDataRefreshHandler(refresh); });
+        await advance(0);
+        await advance(6000);
+        expect(mocks.jobs).toHaveBeenCalledTimes(2);
+        await advance(6001);
+        expect(mocks.jobs).toHaveBeenCalledTimes(3);
+        expect(refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows a queued job to become visible after a mutation nudge without focus or reload', async () => {
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        const refresh = vi.fn();
+        act(() => { services.registerDataRefreshHandler(refresh); });
+        mocks.pollAuthenticated = true;
+        const { requestJobPoll } = await vi.importActual<typeof import('../services/jobNotifications')>('../services/jobNotifications');
+        await act(async () => { requestJobPoll(); });
+        expect(mocks.jobs).toHaveBeenCalledTimes(1);
+        mocks.jobs.mockResolvedValue([{ jobId: 'index-build-owner-people', kind: 'index_build', status: 'done',
+            indexScope: 'people', title: 'People updated', message: '', updatedAt: new Date().toISOString() }]);
+        await advance(6001);
+        expect(refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('bounds empty mutation polling instead of keeping idle sessions polling forever', async () => {
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        mocks.pollAuthenticated = true;
+        const { requestJobPoll } = await vi.importActual<typeof import('../services/jobNotifications')>('../services/jobNotifications');
+        await act(async () => { requestJobPoll(); });
+        await advance(36000);
+        const calls = mocks.jobs.mock.calls.length;
+        expect(calls).toBeLessThanOrEqual(7);
+        await advance(60000);
+        expect(mocks.jobs).toHaveBeenCalledTimes(calls);
+    });
+
     it('keeps successful uploads successful when indexing or refresh handlers fail', async () => {
         mocks.postTools.mockRejectedValue(new Error('Indexer unavailable'));
         select(filesFor(1));

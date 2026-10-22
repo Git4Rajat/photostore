@@ -142,6 +142,7 @@ def people_page():
         'available': True,
         'rows': [{k: r.get(k) for k in ('personId', 'name', 'isNamed', 'faceCount', 'coverFaceId', 'coverFilename')} for r in window],
         'total': len(matches),
+        'sourceVersion': data.get('source_version'),
         'offset': offset,
         'hasMore': offset + len(window) < len(matches),
         'namedCount': named,
