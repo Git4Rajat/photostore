@@ -360,6 +360,7 @@ def label_person(person_id: str):
     person = _save_person_label(user_id, person_id, name)
     if person is None:
         return app.jsonify({'error': 'Not found'}), 404
+    app._apply_live_album_rename(user_id, person_id, name)
     queued = app.publish_person_label_intent(user_id, person_id, person)
     return app.jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': 0,
                         'propagateJobId': None, 'indexRefreshPending': not queued})
@@ -949,6 +950,15 @@ def undo_merge(merge_id: str):
     for person_id in affected_person_ids:
         app._update_person_rep_embedding(user_id, person_id)
     app._rebuild_metadata_faces_for_filenames(user_id, app._filenames_for_face_ids(user_id, list(affected_face_ids)))
+
+    # The merge drained (rather than redirected) any live album that was
+    # following a merged-away person, so each restored person -- base and
+    # merged alike -- needs its own resync here to pick its album back up
+    # with the just-restored faceIds, instead of leaving it empty until some
+    # unrelated later event touches that person again.
+    restored_person_ids = [str(entity['RowKey']) for entity in
+                            ([base] if base.get('RowKey') else []) + [m for m in merged if m.get('RowKey')]]
+    app._resync_person_rule_albums_for_many(user_id, restored_person_ids)
 
     try:
         app.merge_table_client.delete_entity(partition_key=user_id, row_key=merge_id)

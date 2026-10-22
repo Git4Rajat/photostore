@@ -454,6 +454,13 @@ def autocreate_albums():
             'publicExpiresAt': '',
             'accessCode': '',
         }
+        if rule == 'person':
+            # Stamps a live rule so later merges/renames/clustering keep this
+            # album's membership following the person instead of it staying
+            # the one-time snapshot every other smart-album type still is.
+            entity['ruleType'] = 'person'
+            entity['rulePersonId'] = candidate.get('personId') or ''
+            entity['ruleLabelSnapshot'] = candidate.get('personLabel') or ''
         try:
             app.album_store.set_all(entity, filenames)
         except app.album_store.AlbumTooLarge:

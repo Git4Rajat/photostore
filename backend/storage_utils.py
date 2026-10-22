@@ -876,6 +876,18 @@ DURABLE_INDEX_UPDATES = bool(os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip
 METADATA_INDEX_REQUEST_HOOK = None
 
 
+#  peopleIds/faces/faceCount are deliberately absent: a person-only change
+# (rename/merge/clustering) can never change which photo is picked as an
+# album's cover -- see metadata_updates_affect_album_covers below, shared
+# with the non-durable fallback in app.py's _update_metadata_entity_fields so
+# the two paths can't drift apart the way the old duplicated field lists did.
+_ALBUM_COVER_RELEVANT_FIELDS = {'rating', 'likes', 'exifData', 'clientLastModified', 'uploadDate', 'processing_state'}
+
+
+def metadata_updates_affect_album_covers(updates) -> bool:
+    return bool(updates) and bool(_ALBUM_COVER_RELEVANT_FIELDS.intersection(updates))
+
+
 def metadata_index_kinds(updates):
     """Dependencies of the actual projections, not a generic metadata fan-out."""
     fields = set(updates)
@@ -891,7 +903,7 @@ def metadata_index_kinds(updates):
         kinds.add('vector')
     if fields.intersection(_TAG_META_COLUMNS):
         kinds.add('tag_embedding')
-    if fields.intersection({'rating', 'likes', 'exifData', 'clientLastModified', 'uploadDate', 'processing_state'}):
+    if metadata_updates_affect_album_covers(fields):
         kinds.add('albums')
     return kinds
 
@@ -4664,7 +4676,7 @@ def _publish_skipped_sort_manifest(user_id: str, version: str, row_count: int) -
 
 
 def touch_user_search_indexes_state(
-    user_id: str, *, embedding_version: Optional[str] = None, filenames=None,
+    user_id: str, *, embedding_version: Optional[str] = None, filenames=None, touch_albums: bool = True,
 ) -> None:
     """Mark the vector, lexical, tag-embedding, and sort indexes stale for
     user_id, and (when filenames is given) record exactly which photos
@@ -4678,6 +4690,14 @@ def touch_user_search_indexes_state(
     touch_user_sort_index_dirty instead -- see metadata_updates_affect_sort_index --
     so they don't pay for a vector/lexical/tag-embedding rebuild too.
 
+    touch_albums: forwarded to touch_user_sort_index_state. Defaults to True
+    to keep every pre-existing call site's behavior unchanged; pass False
+    when the caller already knows (via metadata_updates_affect_album_covers)
+    that none of the changed fields can affect which photo an album picks as
+    its cover -- e.g. a person-only rename/merge/clustering update, which
+    still needs the sort index touched for other reasons but shouldn't force
+    an unrelated Albums index rebuild.
+
     Also touches the access index (blobName/thumbnailStatus/previewStatus --
     see that section below): every real write path that can change those
     fields (finalize, client-processing results, server-side EXIF fallback,
@@ -4689,7 +4709,7 @@ def touch_user_search_indexes_state(
     touch_user_lexical_index_state(user_id)
     touch_user_tag_embedding_index_state(user_id)
     if not sort_index_skipped(user_id):
-        touch_user_sort_index_state(user_id)
+        touch_user_sort_index_state(user_id, touch_albums=touch_albums)
     touch_user_access_index_state(user_id)
     if filenames:
         _mark_search_index_dirty_filenames(user_id, filenames if isinstance(filenames, (list, set, tuple)) else [filenames])

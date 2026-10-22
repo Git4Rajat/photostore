@@ -2206,6 +2206,9 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
         payload['purgeAt'] = _compute_trash_purge_at(deleted_at, TRASH_RETENTION_DAYS)
     if cover_thumbnail_url is not None:
         payload['coverThumbnailUrl'] = cover_thumbnail_url
+    rule_person_id = entity.get('rulePersonId')
+    if rule_person_id and str(entity.get('ruleType') or '') == 'person':
+        payload['rulePersonId'] = rule_person_id
     return payload
 
 
@@ -3374,7 +3377,10 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             if storage_utils_module.DURABLE_INDEX_UPDATES:
                 storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
             elif metadata_updates_affect_search_indexes(updates or {}):
-                touch_user_search_indexes_state(user_id, filenames=filename)
+                touch_user_search_indexes_state(
+                    user_id, filenames=filename,
+                    touch_albums=storage_utils_module.metadata_updates_affect_album_covers(updates or {}),
+                )
             elif metadata_updates_affect_sort_index(updates or {}):
                 touch_user_sort_index_dirty(user_id, [filename])
             return entity
@@ -5686,7 +5692,8 @@ def _remove_face_from_person(user_id: str, person_id: str, face_id: str) -> None
                 person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
             _remove_person_member(person_id, face_id)
         except Exception:
-            pass
+            return
+        _resync_person_rule_albums(user_id, person_id)
         return
     person['faceIds'] = json.dumps(face_ids)
     try:
@@ -5694,7 +5701,11 @@ def _remove_face_from_person(user_id: str, person_id: str, face_id: str) -> None
         _remove_person_member(person_id, face_id)
         _update_person_rep_embedding(user_id, person_id)
     except Exception:
-        pass
+        return
+    # Covers every caller of this primitive (confirm_face, the suggested-
+    # faces accept route, recluster/propagation's old-owner cleanup) -- not
+    # just the paths that happen to also call _remove_face_from_other_people.
+    _resync_person_rule_albums(user_id, person_id)
 
 
 def _remove_face_from_person_with_retry(
@@ -5802,6 +5813,8 @@ def _remove_face_from_other_people(
             deleted_people += 1
         elif outcome == 'updated':
             _update_person_rep_embedding(user_id, person_id)
+    if touched_people:
+        _resync_person_rule_albums_for_many(user_id, touched_people)
     return {'removed': removed, 'deletedPeople': deleted_people, 'touchedPeople': touched_people}
 
 
@@ -5864,6 +5877,11 @@ def _add_face_to_person(
     result = _update_person_entity_with_retry(user_id, person_id, _mutate)
     if result is not None:
         _add_person_member(user_id, person_id, face_id)
+        # Covers every caller of this primitive, not just the
+        # _assign_faces_to_people_incrementally dispatcher (which has its own
+        # hook for the engines that don't route through here) -- confirm_face
+        # and the suggested-faces accept route call this directly.
+        _resync_person_rule_albums(user_id, person_id)
     return result is not None
 
 
@@ -6163,8 +6181,12 @@ def _assign_faces_to_people_incrementally(user_id: str, filename: str, face_ids:
     if PEOPLE_ASSIGNMENT_ENGINE == 'faiss':
         if not face_ids:
             return {}, set()
-        return _get_live_faiss_assigner().assign(user_id, filename, face_ids)
-    return _assign_faces_to_people_incrementally_legacy(user_id, filename, face_ids)
+        assignments, created = _get_live_faiss_assigner().assign(user_id, filename, face_ids)
+    else:
+        assignments, created = _assign_faces_to_people_incrementally_legacy(user_id, filename, face_ids)
+    if assignments:
+        _resync_person_rule_albums_for_many(user_id, set(assignments.values()))
+    return assignments, created
 
 
 def _assign_faces_to_people_incrementally_legacy(user_id: str, filename: str, face_ids: List[str]) -> Tuple[Dict[str, str], set]:
@@ -7304,6 +7326,7 @@ def _apply_people_recluster_plan(user_id: str, plan: Dict) -> Dict:
     for person_id in touched_people:
         _update_person_rep_embedding(user_id, person_id)
     rebuild = _rebuild_metadata_faces_for_filenames(user_id, affected_files)
+    _resync_person_rule_albums_for_many(user_id, touched_people)
     return {'processed': processed, 'failed': failed, 'rebuiltMetadataFiles': rebuild.get('updatedFiles', 0)}
 
 
@@ -8607,6 +8630,10 @@ def _propagate_person_identity(
             _update_person_entity(user_id, person_id, {'faceIds': json.dumps(merged_ids)})
             _update_person_rep_embedding(user_id, person_id)
             _rebuild_metadata_faces_for_filenames(user_id, affected_files)
+            # This runs asynchronously after the merge request that kicked it
+            # off already returned, so without this hook a live album would
+            # miss any face this propagation pass reclaims.
+            _resync_person_rule_albums(user_id, person_id)
         result['autoAssigned'] = applied
         result['autoAssignedCount'] = len(applied)
 
@@ -8642,6 +8669,14 @@ def _album_filenames(entity: Dict) -> List[str]:
     return album_store.all_names(entity)
 
 
+def _mark_album_dirty(entity: Dict) -> None:
+    partition_key = str(entity.get('PartitionKey') or '')
+    touch_user_albums_index_state(partition_key)
+    row_key = str(entity.get('RowKey') or '')
+    if row_key:
+        mark_albums_dirty(partition_key, [row_key])
+
+
 def _save_album_entity(entity: Dict) -> None:
     if albums_table_client is None:
         return
@@ -8650,11 +8685,43 @@ def _save_album_entity(entity: Dict) -> None:
     # add/remove photos, share/revoke, autocreate) already runs through -- see
     # routes/albums.py -- so hooking the albums index's dirty-marking in here
     # once covers all of them without scattering the call across every route.
-    partition_key = str(entity.get('PartitionKey') or '')
-    touch_user_albums_index_state(partition_key)
-    row_key = str(entity.get('RowKey') or '')
-    if row_key:
-        mark_albums_dirty(partition_key, [row_key])
+    _mark_album_dirty(entity)
+
+
+def _update_album_entity_with_retry(
+    user_id: str, album_id: str, mutate_fn: Callable[[Dict], Optional[Dict]], *, max_attempts: int = 5,
+) -> Optional[Dict]:
+    """Read-modify-write an album entity using ETag optimistic concurrency --
+    same reasoning as _update_person_entity_with_retry. The live-person-album
+    resync/redirect/rename hooks run automatically and asynchronously off the
+    person-mutation pipeline, so they can race an interactive user action on
+    the very same album row (e.g. revoking a public share). An unconditional
+    upsert_entity of a snapshot read earlier would silently restore that
+    snapshot's stale isPublic/publicToken, undoing the user's concurrent
+    change. mutate_fn(album_dict) -> mutated dict, or None to skip the write
+    (the mutation turned out to be a no-op against the freshly-read row)."""
+    if albums_table_client is None:
+        return None
+    for _ in range(max_attempts):
+        try:
+            entity = albums_table_client.get_entity(partition_key=user_id, row_key=album_id)
+        except Exception:
+            return None
+        mutated = mutate_fn(dict(entity))
+        if mutated is None:
+            return None
+        try:
+            albums_table_client.update_entity(
+                mutated, etag=entity.metadata['etag'], match_condition=MatchConditions.IfNotModified,
+            )
+            _mark_album_dirty(mutated)
+            return mutated
+        except ResourceModifiedError:
+            continue  # someone else wrote first -- re-read and retry
+        except Exception:
+            return None
+    app.logger.warning('album entity update retries exhausted for %s/%s', user_id, album_id)
+    return None
 
 
 def _store_album_token_index(token: str, user_id: str, album_id: str) -> None:
@@ -8709,6 +8776,8 @@ def _hard_delete_album_now(user_id: str, album_id: str, existing: Optional[Dict]
     mark_albums_dirty(user_id, [album_id])
     return True
 
+
+PERSON_ALBUM_NAME_TEMPLATE = 'Person: {}'
 
 SMART_ALBUM_RULES = {
     'location': 'location',
@@ -8802,7 +8871,13 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
                 people_ids = []
             for person_id in dict.fromkeys(str(pid).strip() for pid in people_ids if str(pid).strip()):
                 label = person_names.get(person_id) or f'Person {person_id[:8]}'
-                _smart_album_group_push(groups, f'person:{person_id}', f'Person: {_smart_album_title(label)}', filename, capture_dt)
+                _smart_album_group_push(groups, f'person:{person_id}', PERSON_ALBUM_NAME_TEMPLATE.format(_smart_album_title(label)), filename, capture_dt)
+                # Carried alongside the group so autocreate_albums can stamp a
+                # live rule on the album it creates from this candidate --
+                # _smart_album_group_push itself stays rule-agnostic.
+                group = groups[f'person:{person_id}']
+                group['personId'] = person_id
+                group['personLabel'] = label
         elif rule == 'event-window':
             if capture_dt == datetime.min.replace(tzinfo=timezone.utc):
                 continue
@@ -8822,6 +8897,100 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
     else:
         candidates.sort(key=lambda item: (len(item['filenames']), item['latest'], item['name']), reverse=True)
     return candidates
+
+
+def _rule_albums_for_person(user_id: str, person_id: str) -> List[Dict]:
+    """Person-rule ('live') albums currently following person_id, scoped by
+    this user's partition. ruleType/deleted are filtered client-side since
+    those properties may be sparse/absent on older or non-rule albums."""
+    if albums_table_client is None or not person_id:
+        return []
+    try:
+        rows = list(albums_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and rulePersonId eq '{_escape_odata(person_id)}'"))
+    except Exception:
+        return []
+    return [r for r in rows if str(r.get('ruleType') or '') == 'person' and not _coerce_bool(r.get('deleted', False))]
+
+
+def _resync_person_rule_albums(user_id: str, person_id: str) -> None:
+    """Make every live album following person_id match its CURRENT faceIds
+    exactly (manual add/remove-photo edits are overridden by design -- "resync
+    always wins"). Cheap no-op (one partition-scoped Table query) when no
+    album follows this person, which is the common case for most people."""
+    rule_albums = _rule_albums_for_person(user_id, person_id)
+    if not rule_albums:
+        return
+    face_ids: List[str] = []
+    if person_table_client is not None:
+        try:
+            person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+        except ResourceNotFoundError:
+            face_ids = []   # the person is genuinely gone -- drain the album rather
+                            # than leaving it stuck with stale filenames.
+        except Exception:
+            # A transient read failure (throttling, network blip) is NOT proof
+            # the person is gone -- treating it as one would empty every live
+            # album following this person on every passing glitch. Leave
+            # membership untouched; the next trigger retries from scratch.
+            return
+        else:
+            try:
+                face_ids = json.loads(person.get('faceIds', '[]') or '[]')
+            except Exception:
+                face_ids = []
+    target = set(_filenames_for_face_ids(user_id, face_ids))
+    for album_row in rule_albums:
+        album_id = str(album_row.get('RowKey') or '')
+        if not album_id:
+            continue
+
+        def _mutate(entity: Dict, _album_id=album_id) -> Optional[Dict]:
+            current = set(album_store.all_names(entity))
+            to_remove, to_add = sorted(current - target), sorted(target - current)
+            if not to_remove and not to_add:
+                return None
+            if to_remove:
+                album_store.remove(entity, to_remove)
+            if to_add:
+                try:
+                    album_store.add(entity, to_add)
+                except album_store.AlbumTooLarge:
+                    app.logger.warning('Live person album %s/%s exceeds capacity; some matches dropped',
+                                        user_id, _album_id)
+            entity['updatedAt'] = datetime.now(timezone.utc).isoformat()
+            return entity
+
+        _update_album_entity_with_retry(user_id, album_id, _mutate)
+
+
+def _resync_person_rule_albums_for_many(user_id: str, person_ids) -> None:
+    for pid in dict.fromkeys(str(p) for p in person_ids if p):
+        _resync_person_rule_albums(user_id, pid)
+
+
+def _apply_live_album_rename(user_id: str, person_id: str, new_name: str) -> None:
+    """On a person rename, auto-update a live album's name to match -- but
+    only if the user hasn't manually renamed the album away from its last
+    auto-generated name (compared against the stored ruleLabelSnapshot).
+    Membership itself never changes on rename (faceIds are unaffected), so
+    there's no resync call here, just the name/snapshot update."""
+    for album_row in _rule_albums_for_person(user_id, person_id):
+        album_id = str(album_row.get('RowKey') or '')
+        if not album_id:
+            continue
+
+        def _mutate(entity: Dict) -> Optional[Dict]:
+            old_label = str(entity.get('ruleLabelSnapshot') or '')
+            expected_name = PERSON_ALBUM_NAME_TEMPLATE.format(_smart_album_title(old_label)) if old_label else None
+            if expected_name is not None and str(entity.get('name') or '') != expected_name:
+                return None   # user renamed the album away from the auto name -- leave it
+            entity['name'] = PERSON_ALBUM_NAME_TEMPLATE.format(_smart_album_title(new_name))
+            entity['ruleLabelSnapshot'] = new_name
+            entity['updatedAt'] = datetime.now(timezone.utc).isoformat()
+            return entity
+
+        _update_album_entity_with_retry(user_id, album_id, _mutate)
 
 
 EXPLORE_MAX_GROUPS = 24
@@ -11598,6 +11767,11 @@ def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bo
         _io_pool_map(lambda fid: _remove_person_member(person_id, fid), face_ids, workers=12)
     except Exception:
         pass
+    # The person row is gone, so _resync_person_rule_albums's not-found
+    # branch drains (rather than leaves stale) any live album that was
+    # following it -- otherwise nothing would ever touch person_id again to
+    # clear its membership.
+    _resync_person_rule_albums(user_id, person_id)
     if rebuild_metadata:
         _rebuild_metadata_faces_for_filenames(user_id, filenames)
     return {'deleted': True, 'facesUpdated': faces_updated, 'filenames': sorted(filenames)}
@@ -11814,6 +11988,20 @@ def _merge_persons_core(
         final_target_name = str(base_snapshot.get('name') or '')
     _write_merge_record(face_map, final_target_name)
 
+    # One hook covers both merge directions: person_id is always the
+    # survivor regardless of which side the caller named "target", and the
+    # face-reassignment loop above has already moved every merged-in face
+    # onto person_id by this point, so the resync below reflects the
+    # combined set either way (see the plan's §4.1 for the full reasoning).
+    # merge_ids were already deleted above, so this drains (rather than
+    # redirects) any live album that was following a merged-away person --
+    # the survivor's own live album, if it has one, picks up the combined
+    # faces via the resync call right after. Two people each having their
+    # own live album is not collapsed into one; the merged-away one just
+    # goes empty.
+    _resync_person_rule_albums_for_many(user_id, [str(m) for m in merge_ids])
+    _resync_person_rule_albums(user_id, person_id)
+
     return {'mergeId': merge_id}
 
 
@@ -11869,6 +12057,9 @@ def _mark_face_not_a_face(user_id: str, person_id: str, face_id: str) -> Dict:
         person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
         person_deleted = True
     _remove_person_member(person_id, face_id)
+    # This mutates person.faceIds directly rather than going through
+    # _remove_face_from_person/_add_face_to_person, so it needs its own hook.
+    _resync_person_rule_albums(user_id, person_id)
 
     if filename:
         _rebuild_metadata_faces_for_filename(user_id, filename)
@@ -11955,6 +12146,11 @@ def _delete_faces_bulk(user_id: str, face_ids: List[str]) -> Dict:
                 deleted_person_ids.append(person_id)
             except Exception:
                 pass
+
+    # Mirrors _mark_face_not_a_face per the module comment above; same reason
+    # it needs its own hook -- person.faceIds is mutated directly here, not
+    # through _remove_face_from_person.
+    _resync_person_rule_albums_for_many(user_id, person_face_removals.keys())
 
     if affected_filenames:
         _rebuild_metadata_faces_for_filenames(user_id, affected_filenames)
