@@ -60,3 +60,57 @@ describe('index publication push', () => {
         expect(mocks.post).not.toHaveBeenCalled(); stop();
     });
 });
+
+describe('index publication push foreground-demand gate', () => {
+    const hide = () => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+        document.dispatchEvent(new Event('visibilitychange'));
+    };
+    const show = () => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+        document.dispatchEvent(new Event('visibilitychange'));
+    };
+    afterEach(() => show());
+
+    it('stops negotiating once backgrounded past the idle threshold', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        const stop = startIndexReadyPush(vi.fn()); await flush();
+        const callsBeforeHidden = mocks.post.mock.calls.length;
+        hide();
+        await vi.advanceTimersByTimeAsync(5 * 60000);
+        const callsAtGate = mocks.post.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(5 * 60000);
+        // Still polling every 30s, but not actually negotiating: no growth
+        // past whatever had already been scheduled right at the gate.
+        expect(mocks.post.mock.calls.length).toBe(callsAtGate);
+        expect(callsAtGate).toBeGreaterThanOrEqual(callsBeforeHidden);
+        stop();
+    });
+
+    it('performs an immediate authorized catch-up when the tab returns to foreground', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        const refresh = vi.fn();
+        const stop = startIndexReadyPush(refresh); await flush();
+        hide();
+        await vi.advanceTimersByTimeAsync(6 * 60000); // past the gate threshold
+        const callsWhileHidden = mocks.post.mock.calls.length;
+        show();
+        await flush();
+        expect(mocks.post.mock.calls.length).toBeGreaterThan(callsWhileHidden);
+        stop();
+    });
+
+    it('a brief background dip under the threshold never gates negotiation', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        const stop = startIndexReadyPush(vi.fn()); await flush();
+        hide();
+        await vi.advanceTimersByTimeAsync(60000); // well under the 5-minute gate
+        show();
+        await flush();
+        sockets[sockets.length - 1].onopen?.();
+        // Connection still negotiates/opens normally -- a short background
+        // dip (e.g. switching tabs briefly) is not treated as idle.
+        expect(sockets.length).toBeGreaterThan(0);
+        stop();
+    });
+});

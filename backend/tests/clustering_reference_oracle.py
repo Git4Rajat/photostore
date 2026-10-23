@@ -7,14 +7,12 @@ identity relationships so comparing two equally wrong runs isn't sufficient.
 """
 import json
 
+from clustering_wave import canonical_order
+
 
 def canonical_work(harness, ids):
-    def key(face_id):
-        face = harness.faces.rows['u', face_id]
-        vector = json.loads(face['embedding'])
-        return (face['alignmentMethod'], face['embeddingVersion'], len(vector),
-                face['filename'], face_id)
-    return tuple(sorted(ids, key=key))
+    faces = {face_id: harness.faces.rows['u', face_id] for face_id in ids}
+    return tuple(canonical_order(faces))
 
 
 def assignment_snapshot(harness):

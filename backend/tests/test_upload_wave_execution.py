@@ -100,15 +100,23 @@ def test_advance_wave_promotes_a_waiting_successor_once_predecessor_is_ready(wor
 
 
 def test_advance_wave_leaves_a_waiting_successor_alone_while_predecessor_is_not_ready(world, monkeypatch):
+    """A successor can only be admitted once its predecessor has already
+    reached 'ready' (open_session reuses the still-collecting wave
+    otherwise), so this forces the predecessor back to a non-ready state
+    the way a future extra wave state (step 5/6's assignments_committed,
+    indexing) would -- not reachable via the public API in this shadow
+    module today, but promote_successor's guard must hold regardless."""
     store, work, table, work_table = world
     monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
     predecessor = store.open_session('p', 0)
     close(store, 'p', predecessor)
-    # Predecessor stays 'processing_pending' -- never evaluated to ready.
+    finish_scan(store, predecessor['waveId'])
 
     successor = store.open_session('s', 0)
     close(store, 's', successor)
     assert store.evaluate(successor['waveId'])['state'] == 'waiting_predecessor'
+
+    table.rows[store.partition, store.wave_key(predecessor['waveId'])]['state'] = 'processing'
 
     wave, dispatched = advance_wave(work, store, 'library-A', successor['waveId'])
     assert wave['state'] == 'waiting_predecessor' and dispatched == []

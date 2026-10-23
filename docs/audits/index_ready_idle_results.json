@@ -11,5 +11,14 @@
     "negotiateRequests": 3,
     "refreshCallbacks": 3
   },
-  "note": "Reproduces current timer-driven requests without user activity; not target idle-policy compliance."
+  "backgrounded": {
+    "scenario": "backgrounded",
+    "negotiateRequestsOverThirtyMinutes": 2
+  },
+  "returns": {
+    "scenario": "returns",
+    "negotiateRequestsWhileHidden": 2,
+    "negotiateRequestsImmediatelyOnReturn": 1
+  },
+  "note": "disabled/enabled reproduce timer-driven requests with no visibility signal (unchanged); backgrounded/returns exercise the foreground-demand gate added for step 7."
 }

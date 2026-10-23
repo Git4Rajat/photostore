@@ -12663,6 +12663,24 @@ def _incremental_assignment_skip_reason(metadata) -> Optional[str]:
     return 'face_not_ready'
 
 
+def _library_cut_over_to_waves(user_id: str) -> bool:
+    """True once this library has been explicitly migrated to wave-based
+    automatic clustering (docs/indexing-clustering-target-state.md's
+    delivery-sequence step 4, "per-library cutover"). Comma-separated env
+    list, same convention as INDEX_BUILD_ROLES. A real durable per-library
+    cutover record (and the wave dispatcher that would actually own these
+    faces -- see upload_wave_execution.py/clustering_wave.py's module
+    docstrings on what still has no real queue consumer) is follow-up infra
+    work; this is the code-level gate that prevents legacy and wave-based
+    automatic clustering from ever owning the same faces once a library is
+    listed here, so the two paths cannot both claim a photo's faces.
+    """
+    if os.getenv('UPLOAD_WAVE_EXECUTION_ENABLED', '').strip().lower() != 'true':
+        return False
+    cut_over = {name.strip() for name in os.getenv('UPLOAD_WAVE_CUTOVER_LIBRARIES', '').split(',') if name.strip()}
+    return user_id in cut_over
+
+
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
     """Queue face-to-person assignment for newly-detected faces, then queue a
     maintenance recluster if one's due.
@@ -12683,6 +12701,12 @@ def _queue_people_clustering_after_face_processing(user_id: str, filename: str, 
     """
     if not _people_features_available() or _incremental_assignment_skip_reason(metadata):
         return None
+    if _library_cut_over_to_waves(user_id):
+        # Automatic clustering for this library is now wave-owned (step 4);
+        # the legacy per-photo incremental buffer/maintenance trigger must
+        # not also claim these faces -- see the regression register's "old
+        # and new paths must never own the same work".
+        return {'status': 'wave_owned'}
 
     try:
         face_count = int(metadata.get('faceCount') or 0)

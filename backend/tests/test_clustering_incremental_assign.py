@@ -576,6 +576,36 @@ def test_partial_failed_pass_queues_only_persisted_embeddings(monkeypatch, store
     assert prepared == ([('photo.jpg', ['accepted-face'])] if expected else [])
 
 
+# 2026-10-23: a library cut over to wave-based automatic clustering (see
+# docs/indexing-clustering-target-state.md step 7, "per-library cutover")
+# must not also feed this legacy incremental buffer/maintenance trigger --
+# old and new paths must never own the same faces.
+def test_cut_over_library_skips_the_legacy_trigger_entirely(monkeypatch):
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
+    monkeypatch.setenv('UPLOAD_WAVE_CUTOVER_LIBRARIES', 'lib-A, lib-B')
+    queued = []
+    monkeypatch.setattr(app, '_buffer_incremental_assign_filename', lambda *args: queued.append(args))
+    result = app._queue_people_clustering_after_face_processing('lib-A', 'photo.jpg', {'faceCount': 1, 'face_status': 'done'})
+    assert result == {'status': 'wave_owned'} and queued == []
+
+
+@pytest.mark.parametrize('execution_enabled,cutover_libraries', [
+    ('false', 'lib-A'),  # Execution flag off: cutover list is irrelevant.
+    ('true', 'lib-B'),   # Execution on, but this library isn't listed.
+    ('true', ''),        # Execution on, nothing cut over yet.
+])
+def test_non_cut_over_library_still_uses_the_legacy_trigger(monkeypatch, execution_enabled, cutover_libraries):
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, 'PEOPLE_ASSIGNMENT_ENGINE', 'faiss')
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', execution_enabled)
+    monkeypatch.setenv('UPLOAD_WAVE_CUTOVER_LIBRARIES', cutover_libraries)
+    queued = []
+    monkeypatch.setattr(app, '_buffer_incremental_assign_filename', lambda *args: queued.append(args))
+    result = app._queue_people_clustering_after_face_processing('lib-A', 'photo.jpg', {'faceCount': 1, 'face_status': 'done'})
+    assert result == {'status': 'incremental_only'} and len(queued) == 1
+
+
 @pytest.mark.parametrize('metadata,reason', [
     (None, 'metadata_missing'),
     ({'face_status': 'done', 'processingIsolated': True}, 'processing_isolated'),

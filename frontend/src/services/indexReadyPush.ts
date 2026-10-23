@@ -3,6 +3,12 @@ import { getActiveLibraryFromToken } from './passwordAuthClient';
 import { isLikelyAuthenticated } from './jobNotifications';
 import { pendingEditScope } from './pendingEdits';
 
+// How long a backgrounded tab is still treated as foreground-active before
+// negotiation/reconnect stop -- see docs/audits/index_ready_idle_reproduction.cjs,
+// which reproduces the un-gated behavior this closes (this module previously
+// negotiated/reconnected on its own timers regardless of tab visibility).
+const FOREGROUND_IDLE_GATE_MS = 5 * 60000;
+
 // The push carries an invalidation only; index reads keep their normal authorization.
 export const startIndexReadyPush = (ready: () => void): (() => void) => {
     let stopped = false;
@@ -11,11 +17,29 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
     let retry = 1000;
     let generation = 0;
     let scope = pendingEditScope();
+    const hasVisibility = typeof document !== 'undefined' && typeof document.addEventListener === 'function';
+    let hiddenSince: number | null = hasVisibility && document.visibilityState === 'hidden' ? Date.now() : null;
+    // No visibility signal at all (non-browser context) behaves as always-
+    // foreground, unchanged from before this gate existed.
+    const isGated = () => hiddenSince !== null && Date.now() - hiddenSince >= FOREGROUND_IDLE_GATE_MS;
+    const onVisibilityChange = () => {
+        if (document.visibilityState === 'hidden') { hiddenSince = Date.now(); return; }
+        const wasGated = isGated();
+        hiddenSince = null;
+        if (wasGated) {
+            // Authorized catch-up on return: don't wait out whatever poll
+            // interval was already scheduled while backgrounded.
+            clearTimeout(timer);
+            void connect();
+        }
+    };
+    if (hasVisibility) document.addEventListener('visibilitychange', onVisibilityChange);
     const connect = async () => {
         const attempt = ++generation;
         const requestedScope = pendingEditScope();
         scope = requestedScope;
         try {
+            if (isGated()) { timer = setTimeout(() => void connect(), 30000); return; }
             if (!isLikelyAuthenticated() || !navigator.onLine) { timer = setTimeout(() => void connect(), 30000); return; }
             const result = await postTools<{ available: boolean; url?: string; libraryId?: string }>(
                 '/api/tools/index-events/negotiate', {},
@@ -67,5 +91,6 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
     return () => {
         stopped = true; generation += 1;
         clearTimeout(timer); clearInterval(scopeTimer); socket?.close();
+        if (hasVisibility) document.removeEventListener('visibilitychange', onVisibilityChange);
     };
 };
