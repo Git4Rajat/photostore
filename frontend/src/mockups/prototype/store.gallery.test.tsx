@@ -635,6 +635,34 @@ describe('index-backed gallery', () => {
         expect(mocks.albumsIndex).toHaveBeenCalledTimes(2);
         expect(store.albumsLoading).toBe(false);
     });
+
+    it('audit: a tombstoned album resolves to not-found instead of spinning forever', async () => {
+        // A distinct id from the standalone 'a1' tests below this describe
+        // block, which don't get this describe's beforeEach reset.
+        beginAlbumDelete('zz1');
+        render(<StoreProvider><Probe /><AlbumsPage /></StoreProvider>);
+        await act(async () => { store.navigate('albums', { albumId: 'zz1' }); });
+        await waitFor(() => expect(store.isAlbumMissing('zz1')).toBe(true));
+        expect(screen.queryByText('Opening album…')).toBeNull();
+        expect(screen.getByText('Album not found.')).toBeTruthy();
+        expect(mocks.get.mock.calls.some(([url]) => String(url).startsWith('/albums/zz1'))).toBe(false);
+    });
+
+    it('audit: rename/share/revoke are no-ops against a stale, already-tombstoned album', async () => {
+        mocks.albumsIndex.mockResolvedValue([{ albumId: 'zz2', name: 'Old', photoCount: 1, coverFilename: '' }]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums.some(a => a.id === 'zz2')).toBe(true);
+        // Simulates a cross-tab/device delete whose tombstone synced here
+        // (via the storage event listener) before this tab's own `albums`
+        // state was pruned by its next loadAlbums() pass.
+        beginAlbumDelete('zz2');
+        mocks.post.mockClear();
+        await act(async () => { store.renameAlbum('zz2', 'New name'); });
+        await act(async () => { await store.shareAlbum('zz2', { expiresInDays: 7 }); });
+        await act(async () => { await store.revokeAlbum('zz2'); });
+        expect(mocks.post).not.toHaveBeenCalled();
+    });
 });
 // Append this test to a copy of store.gallery.test.tsx to reuse its controlled service fixtures.
 it('opening an older album request cannot undo a successful rename', async () => {

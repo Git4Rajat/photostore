@@ -1743,7 +1743,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const openAlbum = useCallback(async (id: string) => {
         const scope = pendingEditScope();
         const deleted = () => hasAlbumDeleteTombstone(id, scope);
-        if (deleted()) return;
+        // A tombstoned id is still "not found" from the user's perspective --
+        // bailing without touching any of the three status flags would leave
+        // AlbumsPage's albumResolving permanently true (its effect only
+        // re-fires when albumResolving/explicitAlbumId change, neither of
+        // which this id's resolution would ever flip), stranding the user on
+        // the "Opening album…" spinner with no retry/back route.
+        const markGone = () => setAlbumNotFoundIds((prev) => (prev[id] ? prev : { ...prev, [id]: true }));
+        if (deleted()) { markGone(); return; }
         const seq = (albumLoadSeq.current[id] ?? 0) + 1;
         albumLoadSeq.current[id] = seq;
         const createTokens = albumCreateReadTokens(scope);
@@ -1754,7 +1761,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setAlbumOpenTerminalIds((prev) => (prev[id] ? { ...prev, [id]: false } : prev));
         try {
             const { page, album } = await fetchAlbumPage(id, 0);
-            if (stale() || deleted()) return;
+            if (stale()) return;
+            if (deleted()) { markGone(); return; }
             setAlbumPhotos((prev) => ({ ...prev, [id]: page }));
             if (album) {
                 // .map alone silently drops this fetch when `id` isn't already
@@ -1782,7 +1790,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 observeAlbumSourceRows([album], createTokens, scope);
             }
         } catch (error) {
-            if (stale() || deleted()) return;
+            if (stale()) return;
+            if (deleted()) { markGone(); return; }
             setAlbumPhotos((prev) => ({ ...prev, [id]: prev[id] ?? [] }));
             // Only a confirmed 404 means "this album doesn't exist" -- a
             // network/5xx failure must stay resolvable-by-retry, not flip to
@@ -1900,6 +1909,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const trimmed = name.trim();
         if (!trimmed) return;
         const scope = pendingEditScope();
+        // A stale cross-tab/cross-device view can still show an album
+        // another session already deleted (nothing proactively prunes
+        // `albums` state on a tombstone sync; that only happens on the next
+        // loadAlbums() pass) -- don't let a rename appear to succeed against it.
+        if (hasAlbumDeleteTombstone(id, scope)) return;
         // Same transaction chain as rotationEditsRef/personNameEditsRef:
         // `previous`/`failed` let an overlapping failure walk back past other
         // failed attempts instead of unconditionally reinstalling whichever
@@ -2080,6 +2094,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const deleteAlbum = useCallback((id: string) => { deleteAlbums([id]); }, [deleteAlbums]);
 
     const shareAlbum = useCallback(async (id: string, opts: { expiresInDays: number; accessCode?: string }) => {
+        if (hasAlbumDeleteTombstone(id, pendingEditScope())) return;
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/share`, {
                 enabled: true,
@@ -2097,6 +2112,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, [toast]);
 
     const revokeAlbum = useCallback(async (id: string) => {
+        if (hasAlbumDeleteTombstone(id, pendingEditScope())) return;
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/revoke`, {});
             setAlbums((prev) => prev.map((a) => (a.id === id

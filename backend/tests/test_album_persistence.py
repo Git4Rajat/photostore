@@ -107,3 +107,26 @@ def test_batch_delete_distinguishes_lookup_outages_from_missing_rows(monkeypatch
     assert payload['deletedAlbums'] == ['good']
     assert {error['albumId']: error['error'] for error in payload['albumErrors']} == {'outage': 'lookup failed', 'missing': 'Not found'}
     assert 'Album delete lookup failed' in caplog.text
+
+
+@pytest.mark.parametrize('handler_name,request_json', [
+    ('rename_album', {'name': 'New name'}),
+    ('share_album', {'enabled': True}),
+    ('revoke_album_share', None),
+])
+def test_mutations_reject_a_soft_deleted_album(monkeypatch, handler_name, request_json):
+    # A stale cross-tab/device view can still show an album another session
+    # already soft-deleted; rename/share/revoke must not succeed against it,
+    # matching get_album/delete_multiple_albums_people's existing 'deleted'
+    # check (see docs/audits/album-persistence-recheck3-2026-10-22.md).
+    from routes import albums as album_routes
+    table = FakeTable()
+    table.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'a1', 'name': 'Old', 'deleted': True})
+    monkeypatch.setattr(app, 'albums_table_client', table)
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app, '_albums_table_available', lambda: True)
+    handler = getattr(album_routes, handler_name)
+    with app.app.test_request_context('/albums/a1/x', method='POST', json=request_json):
+        response, status = handler('a1')
+    assert status == 404
+    assert table.rows[('u1', 'a1')]['name'] == 'Old', 'A rejected mutation must not alter the soft-deleted row'

@@ -322,7 +322,7 @@ def rename_album(album_id: str):
     if not app._albums_table_available():
         return app.jsonify({'error': 'Albums not configured'}), 503
     entity = app._load_album_entity(user_id, album_id)
-    if not entity:
+    if not entity or app._coerce_bool(entity.get('deleted')):
         return app.jsonify({'error': 'Album not found'}), 404
     data = app.request.get_json(silent=True) or {}
     name = (data.get('name') or '').strip()
@@ -513,7 +513,7 @@ def share_album(album_id: str):
     if not app._albums_table_available():
         return app.jsonify({'error': 'Albums not configured'}), 503
     entity = app._load_album_entity(user_id, album_id)
-    if not entity:
+    if not entity or app._coerce_bool(entity.get('deleted')):
         return app.jsonify({'error': 'Album not found'}), 404
 
     data = app.request.get_json(silent=True) or {}
@@ -561,7 +561,7 @@ def revoke_album_share(album_id: str):
     if not app._albums_table_available():
         return app.jsonify({'error': 'Albums not configured'}), 503
     entity = app._load_album_entity(user_id, album_id)
-    if not entity:
+    if not entity or app._coerce_bool(entity.get('deleted')):
         return app.jsonify({'error': 'Album not found'}), 404
 
     old_token = str(entity.get('publicToken') or '')
