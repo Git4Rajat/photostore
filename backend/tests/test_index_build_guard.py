@@ -81,9 +81,10 @@ def test_build_roles_still_build(monkeypatch):
     assert ran == ['lib-2'] and requested == []
 
 
-def test_role_defaults_only_cluster_and_vision_may_build():
-    for role, expected in (('cluster', True), ('vision', True), ('core', False), ('archive', False),
-                           ('recovery', False), ('upload', False), ('indexer', False)):
+def test_role_defaults_only_index_worker_may_build():
+    for role, expected in (('index-worker', True), ('cluster', False), ('vision', False),
+                           ('core', False), ('archive', False), ('recovery', False),
+                           ('upload', False), ('indexer', False)):
         assert (role in su._INDEX_BUILD_ROLES) is expected, role
 
 

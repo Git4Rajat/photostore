@@ -311,7 +311,9 @@ _VECTOR_INDEX_CACHE_LOCK = threading.RLock()
 # INDEX_CACHE_MAX_ENTRIES libraries per kind (oldest evicted). Processes that BUILD
 # indexes but never serve them keep none of the serve-only kinds.
 INDEX_CACHE_MAX_ENTRIES = int(os.getenv('INDEX_CACHE_MAX_ENTRIES', '2'))
-_BUILD_ROLE_NAMES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'cluster,vision,index-worker').split(',') if r.strip()}
+from index_ownership import configured_build_roles, catalog_publisher, model_tag_publisher
+
+_BUILD_ROLE_NAMES = configured_build_roles()
 _IS_BUILD_ROLE = os.getenv('APP_ROLE', 'core').strip().lower() in _BUILD_ROLE_NAMES
 
 
@@ -409,9 +411,9 @@ def _cache_image_name(library_id: str, anonymous_id: str, original_filename: str
 # --- Where index builds may run ------------------------------------------------------
 # Index builds scan whole partitions and hold embeddings; one OOM-crash-looped the
 # 1Gi `archive` replica (and would any serving process). Only configured build
-# roles may run them: index-worker in dedicated mode, cluster/vision in legacy
-# mode. Serving processes request the affected scope instead of scanning.
-_INDEX_BUILD_ROLES = {r.strip() for r in os.getenv('INDEX_BUILD_ROLES', 'cluster,vision,index-worker').split(',') if r.strip()}
+# roles may run them: only index-worker. Vision has a separate model-owned tag
+# artifact exception. Other processes request work instead of publishing.
+_INDEX_BUILD_ROLES = _BUILD_ROLE_NAMES.copy()
 _ROLE_MAY_BUILD_INDEXES = os.getenv('APP_ROLE', 'core').strip().lower() in _INDEX_BUILD_ROLES
 INDEX_BUILD_REQUEST_HOOK: Optional[Callable[..., object]] = None
 
@@ -2801,6 +2803,7 @@ def _merge_user_vector_index_snapshot(
     )
 
 
+@catalog_publisher
 def refresh_user_vector_index(
     user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
 ) -> Optional[VectorIndexSnapshot]:
@@ -3168,6 +3171,7 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
     )
 
 
+@catalog_publisher
 def refresh_user_people_embedding_index(
     user_id: str, *, source_version: Optional[str] = None,
 ) -> Optional[PeopleEmbeddingIndexSnapshot]:
@@ -3528,6 +3532,7 @@ def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str) 
     )
 
 
+@model_tag_publisher
 def refresh_user_tag_embedding_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[TagEmbeddingIndexSnapshot]:
     key = str(user_id or '').strip()
     if not key:
@@ -4116,6 +4121,7 @@ class ListingSink:
         except Exception:
             pass
 
+    @catalog_publisher
     def finish(self) -> None:
         self._fh.write(b']}')
         self._fh.close()
@@ -4141,6 +4147,7 @@ class ListingSink:
         invalidate_user_listing_index_cache(self.user_id)
 
 
+@catalog_publisher
 def stream_library_artifacts(user_id: str, source_version: Optional[str], sinks_factory) -> Optional[int]:
     """Run the single streaming pass. ``sinks_factory(source_version, workdir)``
     returns the sinks (objects with add(row) / finish() / abort()). Nothing is
@@ -4238,6 +4245,7 @@ def _fetch_rows_by_names(user_id: str, names: List[str], select: List[str]) -> D
     return out
 
 
+@catalog_publisher
 def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
     """Bring the library's search database up to date by publishing small DELTAS for the photos
     whose rows changed, instead of re-scanning and rebuilding the whole library.
@@ -4315,6 +4323,7 @@ SEARCH_DB_RECONCILE_MAX_NAMES = int(os.getenv('SEARCH_DB_RECONCILE_MAX_NAMES', '
 _RECONCILE_LAST: Dict[str, float] = {}
 
 
+@catalog_publisher
 def reconcile_search_db(user_id: str, *, force: bool = False) -> Dict[str, object]:
     """Explicit repair scan: relay source outboxes and mark missing catalog rows.
 
@@ -4362,6 +4371,7 @@ def reconcile_search_db(user_id: str, *, force: bool = False) -> Dict[str, objec
     return {'status': 'ok', 'missing': len(missing)}
 
 
+@catalog_publisher
 def refresh_user_lexical_artifacts(user_id: str, source_version: Optional[str] = None):
     """What the index primer runs for the 'lexical' kind: the app-level streaming
     build when registered, else the legacy full-snapshot refresh (tests only)."""
@@ -4839,6 +4849,7 @@ def _merge_user_lexical_index_snapshot(
     )
 
 
+@catalog_publisher
 def refresh_user_lexical_index(
     user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
 ) -> Optional[LexicalIndexSnapshot]:
@@ -5519,6 +5530,7 @@ def _refresh_rows_index_on_disk(
 
 
 
+@catalog_publisher
 def refresh_user_sort_index(
     user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
 ) -> Optional[LexicalIndexSnapshot]:
@@ -5921,6 +5933,7 @@ def _merge_user_access_index_snapshot(
     )
 
 
+@catalog_publisher
 def refresh_user_access_index(
     user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
 ) -> Optional[LexicalIndexSnapshot]:
@@ -6472,6 +6485,7 @@ def _incremental_albums_index_snapshot(
     )
 
 
+@catalog_publisher
 def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = None, affected_album_ids: Optional[set] = None) -> Optional[LexicalIndexSnapshot]:
     """Refresh albums index, optionally incrementally for specific albums.
 
@@ -7195,6 +7209,7 @@ def _incremental_people_index_snapshot_by_ids(
     )
 
 
+@catalog_publisher
 def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None, affected_person_ids: Optional[set] = None) -> Optional[LexicalIndexSnapshot]:
     """Refresh people index, optionally incrementally for specific people.
 
@@ -7411,6 +7426,7 @@ def get_user_people_index(
 _INDEX_PRIME_LOCKS = _KeyedLockRegistry()
 
 
+@catalog_publisher
 def prime_all_user_indexes_sequentially(
     user_id: str,
     *,
@@ -7722,6 +7738,7 @@ def _explore_summary_blob_client(user_id: str):
     return _get_blob_client(container_name, _explore_summary_blob_name(user_id))
 
 
+@catalog_publisher
 def store_explore_summary(user_id: str, payload: Dict[str, object]) -> None:
     """Persist the precomputed {sourceVersion, updatedAt, places, things}
     Explore summary. Best-effort: a storage hiccup just means /explore serves
@@ -7776,6 +7793,7 @@ def _timeline_summary_blob_client(user_id: str):
     return _get_blob_client(container_name, f'{_vector_index_blob_key(user_id)}-timeline.json')
 
 
+@catalog_publisher
 def store_timeline_summary(user_id: str, payload: Dict[str, object]) -> None:
     key = str(user_id or '').strip()
     client = _timeline_summary_blob_client(key) if key else None
@@ -10099,7 +10117,14 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
     try:
         for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
             _check_result_lease(current, owner)
-            if any(current.get(key) != baseline.get(key) for key in ('anonymousImageId', 'fileHash')):
+            # processingRevision is additive (storage_utils.finalize_uploaded_file
+            # stamps it once, immutably); rows written before it existed read as
+            # None on both sides and this check is a no-op for them. Folded into
+            # the same existing source-changed guard rather than a new kwarg --
+            # a real future reprocess/reupload would change this field exactly
+            # like anonymousImageId/fileHash do today.
+            if any(current.get(key) != baseline.get(key)
+                   for key in ('anonymousImageId', 'fileHash', 'processingRevision')):
                 raise RuntimeError('Processing source changed during result application.')
             touched_steps = {key[:-7] for key in fields if key.endswith('_status')}
             touched_steps.update(update['step'] for update in updates)
@@ -10227,6 +10252,14 @@ def finalize_uploaded_file(
     metadata.setdefault('uploadDate', datetime.now(timezone.utc).isoformat())
     metadata['fileHash'] = file_hash
     metadata['mimeType'] = content_type
+    # Immutable source-owned processing generation, stamped once at the same
+    # point fileHash/anonymousImageId are set. Never rewritten for the life
+    # of this photo identity; a real reprocess/reupload gets a fresh
+    # revision at its own finalize. Additive: nothing reads this yet except
+    # upload_wave_shadow.py's opt-in evidence qualification and the optional
+    # expected_processing_revision fencing kwarg below -- every existing
+    # caller that omits it is unaffected.
+    metadata.setdefault('processingRevision', uuid.uuid4().hex)
     apply_upload_hash_result(metadata, file_hash)
     metadata.setdefault('peopleIds', json.dumps([]))
 

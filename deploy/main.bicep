@@ -66,7 +66,8 @@ param clusterFileShareQuotaGiB int = 100
 @maxValue(1)
 param clusterMinReplicas int = 0
 
-@description('Run derived-index maintenance on the indexer queue sidecar. Disable only for a coordinated rollback to the legacy cluster worker.')
+@description('Required: run derived-index maintenance on the indexer queue sidecar. Cluster publishing is no longer supported.')
+@allowed([true])
 param dedicatedIndexWorker bool = true
 
 @description('Provision managed WebSocket notifications when library indexes are published.')

@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterator, List, Optional
 
 import index_files
+from index_ownership import catalog_publisher
 import perf_instrumentation
 import search_db
 import storage_utils as su
@@ -107,6 +108,7 @@ def bootstrap_needed(user_id: str) -> bool:
     return _building_state(manifest) is not None
 
 
+@catalog_publisher
 def bootstrap_library_build(
     user_id: str, *, on_progress: Optional[Callable[[Dict], None]] = None,
 ) -> Dict[str, object]:

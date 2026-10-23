@@ -133,8 +133,12 @@ def admin_rebuild_vector_index():
         data = app.request.get_json(silent=True) or {}
         if data.get('repair') is not True or data.get('confirm') != 'REBUILD_VECTOR_INDEX':
             return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
-        queued = app._enqueue_clustering_job(user_id, force=True, job_type='vector_index_rebuild')
-        return app.jsonify(app._clustering_queue_response(queued))
+        status = app.enqueue_index_build(user_id, reason='manual-vector-repair', scope='vector', coalesce=False)
+        accepted = status in ('queued', 'already_active')
+        return app.jsonify({
+            'success': accepted, 'queued': accepted, 'status': status,
+            'jobId': app._index_build_job_id(user_id) + '-vector' if accepted else None,
+        }), 202 if accepted else 503
     except Exception as exc:
         app.app.logger.exception('Admin vector index rebuild enqueue failed')
         return app.jsonify({'error': 'Admin vector index rebuild failed'}), 500
@@ -395,6 +399,15 @@ def admin_job_status():
         return app.jsonify({'status': 'unknown'})
     if str(row.get('userId') or '') != user_id:
         return app.jsonify({'status': 'unknown'})
+    if row.get('forwardedTo'):
+        # A legacy queue acknowledgement is a handoff, not a build receipt.
+        # Only follow one alias, within the authenticated library partition.
+        target = app._get_job_row(user_id, str(row['forwardedTo']))
+        if target is None:
+            return app.jsonify({'status': 'queued', 'result': None, 'error': None})
+        if str(target.get('userId') or '') != user_id or target.get('forwardedTo'):
+            return app.jsonify({'status': 'unknown'})
+        row = target
     result = row.get('result')
     if isinstance(result, str):
         try:

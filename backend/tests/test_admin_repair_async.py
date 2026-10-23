@@ -163,50 +163,51 @@ def test_worker_dispatch_handler_exception_is_caught_and_recorded_as_failed(env,
     assert row['status'] == 'failed'
 
 
-def test_vector_index_rebuild_route_enqueues_then_worker_populates_result(env, monkeypatch):
-    table, queue = env
-
-    class _FakeSnapshot:
-        row_keys = ['a', 'b', 'c']
-        source_version = 'v1'
-        embedding_version = 'adaface1'
-        updated_at = '2026-09-16T00:00:00+00:00'
-
-    monkeypatch.setattr(app, 'refresh_user_vector_index', lambda user_id, **kwargs: _FakeSnapshot())
-
+def test_vector_index_rebuild_route_uses_dedicated_worker(env, monkeypatch):
+    import storage_utils
+    from types import SimpleNamespace
+    from tests.test_index_priming import _dedicated_queue
+    _table, legacy_queue = env
+    queue = _dedicated_queue(monkeypatch)
+    monkeypatch.setenv('APP_ROLE', 'index-worker')
+    built = []
+    monkeypatch.setattr(storage_utils, 'refresh_user_vector_index',
+                        lambda uid, **kw: built.append(uid) or SimpleNamespace(
+                            row_keys=['a', 'b', 'c'], source_version='v1',
+                            embedding_version='adaface1', updated_at='2026-10-23T00:00:00Z'))
     with app.app.test_request_context(
         '/api/admin/vector-index/rebuild', method='POST',
         json={'repair': True, 'confirm': 'REBUILD_VECTOR_INDEX'},
     ):
-        response = admin_rebuild_vector_index()
+        response, status = admin_rebuild_vector_index()
     body = response.get_json()
-    assert body['status'] == 'queued'
-    job_id = body['jobId']
-    assert queue.messages[0]['type'] == 'vector_index_rebuild'
-
-    app._handle_clustering_queue_payload(queue.messages[0], job_id, 'owner', 'vector_index_rebuild')
-
-    with app.app.test_request_context(f'/api/admin/jobs/status?jobId={job_id}'):
+    assert status == 202 and body['status'] == 'queued'
+    assert not built and not legacy_queue.messages
+    payload = queue.sent[0]
+    assert payload['type'] == 'index_build' and payload['scope'] == 'vector'
+    app._handle_clustering_queue_payload(payload, body['jobId'], 'owner', 'index_build')
+    with app.app.test_request_context('/api/admin/jobs/status?jobId=' + body['jobId']):
         status_response = admin_job_status()
-    status_body = status_response.get_json()
-    assert status_body['status'] == 'done'
-    assert status_body['result']['status'] == 'rebuilt'
-    assert status_body['result']['rowCount'] == 3
+    assert status_response.get_json()['status'] == 'done'
+    assert status_response.get_json()['result']['rowCount'] == 3
+    assert status_response.get_json()['result']['status'] == 'rebuilt'
+    assert built == ['owner']
 
 
-def test_vector_index_rebuild_worker_handles_no_embeddings(env, monkeypatch):
-    table, queue = env
-    monkeypatch.setattr(app, 'refresh_user_vector_index', lambda user_id, **kwargs: None)
-
+def test_legacy_vector_repair_forwards_and_status_tracks_real_build(env, monkeypatch):
+    table, _queue = env
+    monkeypatch.setenv('APP_ROLE', 'cluster')
+    monkeypatch.setattr(app, 'refresh_user_vector_index',
+                        lambda *a, **kw: pytest.fail('cluster must not build vectors'))
+    monkeypatch.setattr(app, 'enqueue_index_build', lambda *a, **kw: 'queued')
     job_id = 'cluster:owner:vecempty'
     payload = {'jobId': job_id, 'user_id': 'owner', 'type': 'vector_index_rebuild'}
     app._handle_clustering_queue_payload(payload, job_id, 'owner', 'vector_index_rebuild')
-
-    row = table.get_entity('owner', job_id)
-    assert row['status'] == 'done'
-    result = json.loads(row['result'])
-    assert result['status'] == 'empty'
-    assert result['rowCount'] == 0
+    target = table.get_entity('owner', job_id)['forwardedTo']
+    for state in ('queued', 'running', 'failed', 'done'):
+        app._upsert_job_status(target, 'owner', 'index_build', state, indexScope='vector')
+        with app.app.test_request_context('/api/admin/jobs/status?jobId=' + job_id):
+            assert admin_job_status().get_json()['status'] == state
 
 
 def test_admin_job_status_unknown_for_missing_job(env):

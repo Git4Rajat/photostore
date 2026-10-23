@@ -4,11 +4,11 @@ import app
 from tests.fakes import FakeTable
 
 
-def test_album_mutation_during_legacy_build_has_followup_work(monkeypatch):
-    jobs, albums, dirty = FakeTable(), FakeTable(), FakeTable()
+def test_album_mutation_during_build_has_dedicated_followup_work(monkeypatch):
+    from tests.test_index_priming import _dedicated_queue
+    queue = _dedicated_queue(monkeypatch)
+    albums, dirty = FakeTable(), FakeTable()
     sent = []
-    monkeypatch.setattr(app, 'INDEX_MAINTENANCE_QUEUE_NAME', '')
-    monkeypatch.setattr(app, 'jobs_table_client', jobs)
     monkeypatch.setattr(app, 'albums_table_client', albums)
     monkeypatch.setattr(app, 'albums_dirty_set_table_client', dirty)
     monkeypatch.setattr(app, 'library_ops_queue_client', SimpleNamespace(send_message=lambda *a, **k: sent.append(a)))
@@ -22,7 +22,8 @@ def test_album_mutation_during_legacy_build_has_followup_work(monkeypatch):
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', publish_older_snapshot)
     app._run_index_build_job('u1', 'index-build-u1-albums', 'albums')
     assert app.get_dirty_albums('u1') == {'a1'}
-    assert sent, 'Newer dirty album work needs a follow-up wake after the active build'
+    assert queue.sent, 'Newer dirty album work needs a follow-up wake after the active build'
+    assert not sent
 
 
 

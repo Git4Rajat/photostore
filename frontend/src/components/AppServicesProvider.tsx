@@ -5,6 +5,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
+import { ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile } from '../services/uploadWaveSync';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
@@ -3220,6 +3221,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const pendingFinalizeTasks = new Set<Promise<void>>();
         const uploadPreparation = new UploadPreparationPipeline();
         let uploadEndReason: UploadEndReason = 'failed';
+        // Tracks this run's own terminal outcomes independent of
+        // uploadSessionStoreRef, which gets nulled by clearPersistedSession
+        // on a fully successful run before the `finally` block below runs --
+        // relying on that ref there would read every file back as whatever
+        // stale status `normalized`/`session` captured at the start.
+        const waveShadowFileOutcomes = new Map<string, Pick<PersistedUploadFile, 'status' | 'skippedDuplicate'>>();
         try {
             persistSession(normalized);
             const pendingFiles = normalized.files.filter((file) => (
@@ -3401,6 +3408,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         : getUploadErrorMessage(err, 'Upload failed for this file.'),
                     previewDataUrl,
                 });
+                waveShadowFileOutcomes.set(fileMeta.key, { status: 'failed', skippedDuplicate: false });
+                void resolveWaveShadowFile(session, { ...fileMeta, status: 'failed' });
                 updateNotification(notificationId, {
                     title: 'Upload in progress',
                     details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
@@ -3474,6 +3483,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         skippedDuplicate,
                         error: undefined,
                     });
+                    waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate });
+                    void resolveWaveShadowFile(session, { ...fileMeta, status: 'done', skippedDuplicate });
                     if (!skippedDuplicate) {
                         freshlyUploadedFilenamesRef.current.add(fileMeta.name);
                         if (!prepared.clientProcessing?.thumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
@@ -3923,6 +3934,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             setUploadError(message);
         } finally {
             uploadPreparation?.dispose();
+            // Best-effort, fire-and-forget (see uploadWaveSync.ts) -- resolves
+            // whatever this run didn't already resolve live (e.g. a Stop) and
+            // attempts to close the shadow session, regardless of how this
+            // run ended. Built from waveShadowFileOutcomes (this run's own
+            // record), not uploadSessionRef, which clearPersistedSession may
+            // already have nulled by the time this runs on a clean finish.
+            void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => finalizeWaveShadowSession({
+                ...normalized,
+                files: normalized.files.map((file) => ({ ...file, ...waveShadowFileOutcomes.get(file.key) })),
+            }));
             void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => batchTelemetry('end', {
                 uploaded: totalUploaded - previouslyUploaded - (totalSkippedDuplicates - previouslySkipped),
                 failed: totalFailed, duplicates: totalSkippedDuplicates - previouslySkipped,
@@ -4397,6 +4418,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let uploadRunStarted = false;
         try {
             persistSession(session);
+            // Best-effort, fire-and-forget -- see uploadWaveSync.ts. Never
+            // awaited and never allowed to affect the real upload path below.
+            void ensureWaveShadowSessionOpened(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
             uploadHandlesRef.current = keyedHandles;
             // Not awaited: the actual upload only needs uploadSourceFilesRef
@@ -4806,6 +4830,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
 
         persistSession(restored);
+        void ensureWaveShadowSessionOpened(restored);
         setPendingUploadSessionLive(restored);
         addNotification('Upload paused', `${plural(restored.files.filter((file) => file.status !== 'done').length, 'file')} need retry approval.`);
         if (!autoResumeAttemptedRef.current) {

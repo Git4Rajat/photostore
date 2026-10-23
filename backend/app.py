@@ -43,6 +43,7 @@ from auth_utils import validate_bearer_token as validate_entra_bearer_token
 import password_auth
 import email_utils
 import library_utils
+from index_ownership import catalog_publisher
 import processing_diagnostics
 from ipworker_metrics import Metrics as IpworkerMetrics, replica_identity, resource_sample
 from ordering_utils import (
@@ -744,7 +745,7 @@ CLUSTERING_WORKER_MAX_RETRIES = int(os.getenv('CLUSTERING_WORKER_MAX_RETRIES', '
 # run_clustering_worker), so a clean/download request gets picked up within
 # one poll cycle regardless of how deep the clustering queue is.
 LIBRARY_OPS_QUEUE_NAME = os.getenv('LIBRARY_OPS_QUEUE_NAME', 'photostore-library-ops')
-# Empty preserves legacy deployments until their indexer queue worker exists.
+# Explicit queue configuration is required; never fall back to cluster builds.
 INDEX_MAINTENANCE_QUEUE_NAME = os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip()
 INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME = os.getenv(
     'INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME', 'photostore-index-maintenance-deadletter')
@@ -5405,13 +5406,14 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
                     _attach_normalized_embeddings_batched(index, raw_reps, np)
                 return index
 
-        if not storage_utils_module.index_build_allowed():
+        if (not storage_utils_module.index_build_allowed()
+                and os.getenv('APP_ROLE', '').strip().lower() != 'cluster'):
             # Serving process (upload/backend/extras/...) with no durable blob yet:
             # do NOT scan every person row incl. its repEmbedding here -- at tens of
             # thousands of clusters that is what OOM-killed `extras`. Ask the worker
             # to build the blob and carry on with no index for now (callers treat an
             # empty index as "nothing to match against yet").
-            storage_utils_module.request_index_build(user_id)
+            storage_utils_module.request_index_build(user_id, kind='people_embedding')
             return []
 
         rows = _cached_person_rows_for_user(user_id)
@@ -5467,7 +5469,7 @@ def _load_people_embedding_index(user_id: str) -> List[Dict]:
             except Exception:
                 pass
         else:
-            storage_utils_module.request_index_build(user_id)
+            storage_utils_module.request_index_build(user_id, kind='people_embedding')
         return index
 
     return _people_embedding_index_cache.get(user_id, _build)
@@ -9112,6 +9114,7 @@ def _explore_places_and_things(user_id: str, rows=None) -> Dict[str, List[Dict]]
     return accumulator.finalize(user_id)
 
 
+@catalog_publisher
 def refresh_user_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
     """Recompute the Explore Places/Things summary and persist it as a small
     blob (store_explore_summary). Runs on the `tools` role right after it
@@ -9138,6 +9141,7 @@ def refresh_user_explore_summary(user_id: str) -> Optional[Dict[str, object]]:
     return payload
 
 
+@catalog_publisher
 def refresh_user_timeline_summary(user_id: str) -> Optional[Dict[str, object]]:
     """Standalone timeline refresh (a bounded-memory pass over the library). The
     index build normally feeds the same accumulator in its single streaming
@@ -9187,6 +9191,7 @@ class _TimelineSink:
         store_timeline_summary(self.user_id, self.accumulator.summary())
 
 
+@catalog_publisher
 def _finalize_library_summaries(user_id: str, db) -> None:
     """Explore (places/things) and the timeline, computed from the library's finished database --
     a local pass over its rows, no table scan. Run after a chunked first build and after each
@@ -9214,6 +9219,7 @@ def _refresh_library_summaries(user_id: str) -> None:
         worker_logger.exception('Library summaries refresh failed for %s', user_id)
 
 
+@catalog_publisher
 def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None):
     """The 'lexical' step of the index build, replacing the old full-snapshot
     refresh: ONE streaming pass over the table feeding the listing blob, the
@@ -10769,16 +10775,11 @@ def light_index_build_needed(user_id: str) -> bool:
 
 
 def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, coalesce: bool = True) -> str:
-    """Queue the library's index build on the always-awake `worker` role (library-
-    ops queue). Returns 'queued', 'already_active' or 'unavailable'.
+    """Persist scoped work for index-worker; missing configuration fails closed.
 
-    Builds used to run inside a blocking HTTP request on the scale-to-zero
-    `tools` app: ingress cuts requests at ~240s, after which nothing held the
-    replica open, so a scale-down (or OOM restart) mid-build orphaned the job
-    ("Job did not finish (worker restarted or timed out)"). As a queue message
-    the build has a renewed lease, retries, a dead-letter queue and SIGTERM
-    handling, and the outstanding message itself keeps KEDA from scaling the
-    worker away."""
+    Returns 'queued', 'already_active' or 'unavailable'. Library-ops and cluster
+    are never a fallback for failed/missing index queue publication.
+    """
     key = str(user_id or '').strip()
     if not key:
         return 'unavailable'
@@ -10803,43 +10804,8 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
         except Exception:
             worker_logger.exception('Maintenance intent/queue publication failed for %s', key)
             return 'unavailable'
-    light = scope != 'full'
-    if not light and _index_build_job_active(key):
-        return 'already_active'
-    if library_ops_queue_client is None:
-        return 'unavailable'
-    # Light (post-upload sort/access refresh) uses its own job row so it never
-    # masks or blocks a full build, and does not show as "library indexing".
-    job_id = _index_build_job_id(key) + (f'-{scope}' if light else '')
-    if light and _job_row_fresh_active(key, job_id):
-        return 'already_active'
-    # A build is a full streamed scan of the library, so an upload burst that
-    # keeps dirtying the indexes must not trigger back-to-back rebuilds: if one
-    # finished moments ago, deliver this message after the minimum interval
-    # instead (the queued job row dedupes everything that arrives meanwhile).
-    delay = max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)) if scope == 'dedup-idle' else 0
-    previous = _get_job_row(key, job_id) if jobs_table_client is not None else None
-    if coalesce and previous and str(previous.get('status') or '').lower() == 'done':
-        updated = _parse_iso_date(str(previous.get('updatedAt') or ''))
-        if updated is not None:
-            elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
-            minimum = INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS if scope == 'people' else INDEX_BUILD_MIN_INTERVAL_SECONDS
-            delay = max(delay, int(max(0, minimum - elapsed)))
-    _upsert_job_status(
-        job_id, key, INDEX_BUILD_JOB_TYPE, 'queued',
-        indexScope=scope,
-        result={'delayedSeconds': int(delay), 'reason': reason, 'scope': scope} if delay else None,
-    )
-    try:
-        library_ops_queue_client.send_message(json.dumps(
-            {'type': 'index_build', 'userId': key, 'jobId': job_id, 'reason': reason, 'scope': scope},
-            separators=(',', ':'),
-        ), visibility_timeout=delay or None)
-    except Exception:
-        worker_logger.exception('Failed to enqueue index build for %s', key)
-        _upsert_job_status(job_id, key, INDEX_BUILD_JOB_TYPE, 'failed', error='Could not queue the index build')
-        return 'unavailable'
-    return 'queued'
+    worker_logger.error('INDEX_MAINTENANCE_QUEUE_NAME is required; index request not sent to cluster')
+    return 'unavailable'
 
 
 def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery'):
@@ -11204,6 +11170,8 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     search-database build) runs, so /jobs/status never declares a live build
     dead -- and if the process really dies the heartbeat stops and the normal
     staleness sweep (plus queue redelivery) takes over."""
+    from index_ownership import require_catalog_owner
+    require_catalog_owner()
     import index_updates
     scope = index_updates.validate_scope(scope)
     started = time.monotonic()
@@ -11239,17 +11207,8 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
             if scope == 'dedup-idle':
                 if _is_upload_active(user_id):
                     # Durable delayed check survives browser crashes and worker restarts.
-                    if INDEX_MAINTENANCE_QUEUE_NAME:
-                        if enqueue_index_build(user_id, reason='upload-quiet', scope=scope) == 'unavailable':
-                            raise RuntimeError('Could not defer upload hash maintenance')
-                        _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'queued')
-                        return
-                    if library_ops_queue_client is None:
-                        raise RuntimeError('upload hash refresh queue is not configured')
-                    library_ops_queue_client.send_message(json.dumps({
-                        'type': 'index_build', 'userId': user_id, 'jobId': job_id,
-                        'scope': scope, 'reason': 'upload-quiet',
-                    }), visibility_timeout=max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)))
+                    if enqueue_index_build(user_id, reason='upload-quiet', scope=scope) == 'unavailable':
+                        raise RuntimeError('Could not defer upload hash maintenance')
                     _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'queued')
                     return
                 activity = {}
@@ -11293,9 +11252,19 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                         and not vision_utils.image_encoder_available()):
                     raise RuntimeError('Tag embedding maintenance requires the vision model owner')
                 refresher = getattr(storage_utils_module, f'refresh_user_{scope}_index')
-                if refresher(user_id) is None:
+                snapshot = refresher(user_id)
+                if snapshot is None:
                     raise RuntimeError(f'index build produced no {scope} index')
-                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+                result = None
+                if scope == 'vector':
+                    result = {
+                        'status': 'rebuilt' if snapshot.row_keys else 'empty',
+                        'userId': user_id, 'rowCount': len(snapshot.row_keys),
+                        'sourceVersion': snapshot.source_version,
+                        'embeddingVersion': snapshot.embedding_version,
+                        'updatedAt': snapshot.updated_at,
+                    }
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done', result=result)
                 return
             if scope != 'full':
                 kinds = index_updates.SCOPE_KINDS[scope]
@@ -11332,16 +11301,10 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                 if labels:
                     _ack_person_labels(user_id, labels)
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done', result=result)
-                # A mutation landing after this job captured its dirty-row
-                # snapshot (see docs/audits/album-persistence-2026-10-22.md
-                # finding #1) survives the conditional acknowledgement above
-                # -- the newer row keeps its own ETag -- but nothing then
-                # re-triggers processing of it. The dedicated-queue path
-                # self-heals this via the revision mismatch check in
-                # _run_index_maintenance_payload (`if newer: store.notify(...)`),
-                # but the legacy queue path has no equivalent. Recheck now
-                # that this job is marked done, so enqueue_index_build's
-                # already-active short-circuit no longer blocks a follow-up.
+                # Conditional acknowledgement preserves edits newer than our
+                # input snapshot. The maintenance ledger handles revisions of
+                # this scope; recheck both sets too, since legacy People
+                # producers can leave album work requiring a separate scope.
                 try:
                     if scope == 'people' and get_dirty_people(user_id):
                         enqueue_index_build(user_id, reason='dirty-recheck', scope='people', coalesce=False)
@@ -14917,17 +14880,21 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         _run_ipwork_release_check_job(user_id, job_id or _ipwork_release_check_job_id(user_id))
         return
 
-    if job_type == 'index_build':
-        if INDEX_MAINTENANCE_QUEUE_NAME and os.getenv('APP_ROLE') != 'index-worker':
-            # Drain old library-ops messages without running their builds here.
-            if enqueue_index_build(user_id, reason='legacy-index-handoff',
-                                   scope=str(payload.get('scope') or 'full')) == 'unavailable':
+    if job_type in ('index_build', 'vector_index_rebuild'):
+        scope = 'vector' if job_type == 'vector_index_rebuild' else str(payload.get('scope') or 'full')
+        if (job_type == 'vector_index_rebuild'
+                or os.getenv('APP_ROLE', 'core').strip().lower() != 'index-worker'
+                or not payload.get('maintenanceKey')):
+            # Forward legacy messages only after durable intent acceptance.
+            # Failure raises so the original queue receipt is not acknowledged.
+            if enqueue_index_build(user_id, reason='legacy-index-handoff', scope=scope) == 'unavailable':
                 raise RuntimeError('Index handoff unavailable')
-        elif payload.get('maintenanceKey'):
-            _run_index_maintenance_payload(payload)
+            target = _index_build_job_id(user_id) + (f'-{scope}' if scope != 'full' else '')
+            if job_id and job_id != target:
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done',
+                                   indexScope=scope, forwardedTo=target)
         else:
-            _run_index_build_job(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
-            _notify_index_ready(user_id, job_id or _index_build_job_id(user_id), str(payload.get('scope') or 'full'))
+            _run_index_maintenance_payload(payload)
         return
 
     if job_type == 'photo_soft_delete':
@@ -14998,35 +14965,6 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             worker_logger.exception('Admin repair action %s failed for %s', action, user_id)
             if job_id:
                 _upsert_job_status(job_id, user_id, 'people_admin_repair', 'failed', error='Repair action failed', action=action)
-        return
-
-    if job_type == 'vector_index_rebuild':
-        if job_id:
-            _upsert_job_status(job_id, user_id, 'vector_index_rebuild', 'running')
-        try:
-            snapshot = refresh_user_vector_index(user_id, force_full=True)
-            if snapshot is None:
-                result = {
-                    'status': 'empty',
-                    'userId': user_id,
-                    'rowCount': 0,
-                    'message': 'No face embeddings were available to rebuild a vector index.',
-                }
-            else:
-                result = {
-                    'status': 'rebuilt',
-                    'userId': user_id,
-                    'rowCount': len(snapshot.row_keys),
-                    'sourceVersion': snapshot.source_version,
-                    'embeddingVersion': snapshot.embedding_version,
-                    'updatedAt': snapshot.updated_at,
-                }
-            if job_id:
-                _upsert_job_status(job_id, user_id, 'vector_index_rebuild', 'done', result=result)
-        except Exception:
-            worker_logger.exception('Vector index rebuild failed for %s', user_id)
-            if job_id:
-                _upsert_job_status(job_id, user_id, 'vector_index_rebuild', 'failed', error='Vector index rebuild failed')
         return
 
     if not (job_type in _clustering_job_types() and _people_features_available()):
@@ -15866,6 +15804,8 @@ def _poll_clustering_queue_batch_once(queue_client, queue_name, max_retries,
 @processing_diagnostics.worker('indexer')
 def run_index_worker() -> None:
     """Dedicated indexer sidecar; never consumes face or library-clean jobs."""
+    from index_ownership import require_catalog_owner
+    require_catalog_owner()
     if not INDEX_MAINTENANCE_QUEUE_NAME:
         raise RuntimeError('INDEX_MAINTENANCE_QUEUE_NAME must be configured')
     if queue_service_client is None:
@@ -16892,28 +16832,14 @@ _INDEXER_REBUILD_TRIGGER_LOCK = threading.Lock()
 
 
 def _trigger_indexer_rebuild(user_id: str, reason: str = 'trigger', scope: str = 'full') -> None:
-    """Ask the `indexer` role (2vCPU/4Gi) to rebuild this user's derived indexes.
+    """Request scoped work on the dedicated index queue, with a short cooldown.
 
-    Direct service-to-service HTTP: the caller mints a normal session token for
-    the user (SESSION_SECRET is a shared secret across all container-app roles,
-    so indexer validates it through its usual _require_user_id) and POSTs the same
-    /api/tools/indexes/build the frontend uses. Fire-and-forget from THIS
-    caller's point of view -- it runs on its own daemon thread so vision/
-    core never block on it -- but the POST itself now blocks until indexer
-    finishes the build (see prime_all_user_indexes_sequentially's wait=True),
-    so the timeout here has to cover a full build, not just a request
-    round-trip; indexer's own single-flight prime lock + the index_build job row
-    dedupe overlapping triggers. No-op (silent) when INDEXER_INTERNAL_URL is
-    unset, so envs with no indexer rebuild wiring are unaffected.
-
-    Callers: vision (queue-drain / every 10k files) and the core API's
-    search-index/sort-index SAS-mint routes when they observe a dirty manifest
-    (replacing the per-GET background rebuild backend used to run in-process).
-    A short per-user cooldown keeps the every-~15s search-index poll from firing
-    a trigger on every request while an index sits dirty waiting to rebuild."""
+    The optional HTTP fallback asks indexer's API to persist the same intent;
+    neither the caller nor the HTTP handler builds catalog artifacts inline.
+    """
     indexer_url = os.getenv('INDEXER_INTERNAL_URL', '').strip()
     key = str(user_id or '').strip()
-    if not key or (not indexer_url and library_ops_queue_client is None):
+    if not key or (not indexer_url and index_maintenance_queue_client is None):
         return
     now = time.monotonic()
     cooldown_key = f'{key}|{scope}'   # a light trigger must not swallow a people/full one
@@ -16924,7 +16850,7 @@ def _trigger_indexer_rebuild(user_id: str, reason: str = 'trigger', scope: str =
         _INDEXER_REBUILD_TRIGGER_LAST[cooldown_key] = now
     # Preferred: queue the build on the worker (see enqueue_index_build). The
     # indexer HTTP path below is only the fallback when no queue is configured.
-    if library_ops_queue_client is not None:
+    if index_maintenance_queue_client is not None:
         try:
             if enqueue_index_build(key, reason=reason, scope=scope) != 'unavailable':
                 return

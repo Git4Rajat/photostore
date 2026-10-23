@@ -76,7 +76,8 @@ param clusterFileShareQuotaGiB int = 100
 @maxValue(1)
 param clusterMinReplicas int = 0
 
-@description('Move index maintenance to a dedicated queue consumer in the indexer app; legacy cluster messages are forwarded during rollout.')
+@description('Required: run index maintenance on the indexer sidecar; cluster only forwards legacy index messages.')
+@allowed([true])
 param dedicatedIndexWorker bool = true
 
 @description('Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback.')
@@ -398,8 +399,8 @@ resource indexPush 'Microsoft.SignalRService/webPubSub@2024-03-01' = if (enableI
 // Shared backend/worker environment variables.
 var backendEnv = [
   { name: 'INDEX_EVENTS_ENDPOINT', value: enableIndexPush ? 'https://${indexPush!.properties.hostName}' : '' }
-  { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: dedicatedIndexWorker ? 'photostore-index-maintenance' : '' }
-  { name: 'INDEX_BUILD_ROLES', value: dedicatedIndexWorker ? 'index-worker' : 'cluster,vision' }
+  { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: 'photostore-index-maintenance' }
+  { name: 'INDEX_BUILD_ROLES', value: 'index-worker' }
   { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
   { name: 'USE_MANAGED_IDENTITY', value: 'true' }
   // 'sas': browsers fetch media straight from blob storage via short-lived

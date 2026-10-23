@@ -405,6 +405,13 @@ def test_worker_rejects_isolation_before_external_mutations(worker_commit_ctx, m
     ({'ocr_status': 'done', 'ocrText': 'first result'}, 'step completed'),
     ({'anonymousImageId': 'replacement'}, 'source changed'),
     ({'fileHash': 'replacement'}, 'source changed'),
+    # A real reprocess/reupload would stamp a fresh processingRevision at its
+    # own finalize (storage_utils.finalize_uploaded_file) before this worker's
+    # in-flight commit lands -- same "source changed during application"
+    # fencing as anonymousImageId/fileHash above, now also covering the
+    # source-owned processing generation (see docs/indexing-clustering-
+    # target-state.md step 2, "processing completion authoritative").
+    ({'processingRevision': 'successor-generation'}, 'source changed'),
 ])
 def test_worker_conflict_preserves_completed_step_and_source_replacement(worker_commit_ctx, monkeypatch, change, expected):
     table = worker_commit_ctx

@@ -439,9 +439,11 @@ def test_tools_build_reports_not_building_when_queue_unavailable(monkeypatch, ro
     monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': 'unavailable')
 
     with app.app.test_request_context('/api/tools/indexes/build', method='POST'):
-        payload = tools_build_indexes().get_json()
+        response, status = tools_build_indexes()
+        payload = response.get_json()
+    assert status == 503
 
-    assert payload['ok'] is True and payload['building'] is False and payload['queued'] == 'unavailable'
+    assert payload['ok'] is False and payload['building'] is False and payload['queued'] == 'unavailable'
 
 
 def test_progress_callback_writes_running_then_done(monkeypatch):
@@ -571,28 +573,40 @@ class _FakeQueue:
         self.delays.append(visibility_timeout)
 
 
+def _dedicated_queue(monkeypatch, queue=None):
+    from tests.test_index_work import EtagTable
+    queue = queue or _FakeQueue()
+    monkeypatch.setattr(app, 'INDEX_MAINTENANCE_QUEUE_NAME', 'index-maintenance')
+    monkeypatch.setattr(app, 'index_maintenance_queue_client', queue)
+    monkeypatch.setattr(app, 'jobs_table_client', EtagTable())
+    return queue
+
+
 def test_enqueue_index_build_queues_once_and_marks_the_job(monkeypatch):
-    queue = _FakeQueue()
-    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
+    queue = _dedicated_queue(monkeypatch)
     monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
     rows = []
     monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: rows.append((job_id, status)))
 
     assert app.enqueue_index_build('lib-1', reason='x') == 'queued'
-    assert queue.sent == [{'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1', 'reason': 'x', 'scope': 'full'}]
+    assert len(queue.sent) == 1
+    assert queue.sent[0].items() >= {'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1', 'reason': 'x', 'scope': 'full'}.items()
+    assert queue.sent[0]['maintenanceKey'] and queue.sent[0]['intentRevision']
     assert rows == [('index-build-lib-1', 'queued')]
 
 
 def test_enqueue_index_build_dedupes_against_an_active_job(monkeypatch):
-    queue = _FakeQueue()
-    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
+    queue = _dedicated_queue(monkeypatch)
     monkeypatch.setattr(app, '_index_build_job_active', lambda uid: True)
-    assert app.enqueue_index_build('lib-1') == 'already_active' and queue.sent == []
+    assert app.enqueue_index_build('lib-1') == 'queued'
+    assert app.enqueue_index_build('lib-1') == 'already_active'
+    assert len(queue.sent) == 1
 
 
 def test_enqueue_index_build_unavailable_without_queue_or_on_send_failure(monkeypatch):
     monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
-    monkeypatch.setattr(app, 'library_ops_queue_client', None)
+    _dedicated_queue(monkeypatch)
+    monkeypatch.setattr(app, 'index_maintenance_queue_client', None)
     assert app.enqueue_index_build('lib-1') == 'unavailable'
 
     class _Boom:
@@ -600,9 +614,12 @@ def test_enqueue_index_build_unavailable_without_queue_or_on_send_failure(monkey
             raise RuntimeError('queue down')
 
     rows = []
-    monkeypatch.setattr(app, 'library_ops_queue_client', _Boom())
+    monkeypatch.setattr(app, 'index_maintenance_queue_client', _Boom())
     monkeypatch.setattr(app, '_upsert_job_status', lambda job_id, uid, jt, status, **f: rows.append(status))
-    assert app.enqueue_index_build('lib-1') == 'unavailable' and rows == ['queued', 'failed']
+    assert app.enqueue_index_build('lib-1') == 'unavailable' and rows == ['queued']
+    import index_work
+    intent = index_work.WorkStore(app.jobs_table_client)._get(index_work.WorkStore.key('lib-1', 'full'))
+    assert intent and not intent.get('failed')
     assert app.enqueue_index_build('') == 'unavailable'
 
 
@@ -658,7 +675,8 @@ def test_run_index_build_job_marks_failed_and_reraises_for_queue_retry(monkeypat
 
 
 def test_trigger_prefers_the_queue_over_the_tools_http_path(monkeypatch):
-    monkeypatch.setattr(app, 'library_ops_queue_client', _FakeQueue())
+    _dedicated_queue(monkeypatch)
+    monkeypatch.setattr(app, 'library_ops_queue_client', None)
     monkeypatch.setattr(app, '_INDEXER_REBUILD_TRIGGER_LAST', {})
     monkeypatch.setenv('INDEXER_INTERNAL_URL', 'https://indexer.example')
     seen = []
@@ -670,13 +688,15 @@ def test_trigger_prefers_the_queue_over_the_tools_http_path(monkeypatch):
 
 
 def test_worker_processes_an_index_build_message_and_acks_it(monkeypatch):
-    """End to end through the real message processor: an index_build message from
-    the library-ops queue runs the build job and is deleted only on success."""
+    monkeypatch.setenv('APP_ROLE', 'index-worker')
+    queue = _dedicated_queue(monkeypatch)
+    assert app.enqueue_index_build('lib-1') == 'queued'
+
     ran, deleted = [], []
     monkeypatch.setattr(app, '_run_index_build_job', lambda uid, jid, scope='full': ran.append((uid, jid)))
 
     class _Msg:
-        content = json.dumps({'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1'})
+        content = json.dumps(queue.sent[0])
         dequeue_count = 1
         id = 'm1'
         pop_receipt = 'r'
@@ -688,16 +708,19 @@ def test_worker_processes_an_index_build_message_and_acks_it(monkeypatch):
         def delete_message(self, msg):
             deleted.append(msg)
 
-    app._process_clustering_queue_message(_Msg(), _Q(), 'photostore-library-ops', 3)
+    app._process_clustering_queue_message(_Msg(), _Q(), 'index-maintenance', 3)
     assert ran == [('lib-1', 'index-build-lib-1')] and len(deleted) == 1
 
 
 def test_worker_leaves_the_message_for_redelivery_when_the_build_raises(monkeypatch):
+    monkeypatch.setenv('APP_ROLE', 'index-worker')
+    queue = _dedicated_queue(monkeypatch)
+    assert app.enqueue_index_build('lib-1') == 'queued'
     deleted = []
     monkeypatch.setattr(app, '_run_index_build_job', lambda uid, jid, scope='full': (_ for _ in ()).throw(RuntimeError('killed')))
 
     class _Msg:
-        content = json.dumps({'type': 'index_build', 'userId': 'lib-1', 'jobId': 'index-build-lib-1'})
+        content = json.dumps(queue.sent[0])
         dequeue_count = 1
         id = 'm1'
         pop_receipt = 'r'
@@ -709,33 +732,22 @@ def test_worker_leaves_the_message_for_redelivery_when_the_build_raises(monkeypa
         def delete_message(self, msg):
             deleted.append(msg)
 
-    app._process_clustering_queue_message(_Msg(), _Q(), 'photostore-library-ops', 3)
+    app._process_clustering_queue_message(_Msg(), _Q(), 'index-maintenance', 3)
     assert deleted == []  # not acked -> becomes visible again and is retried (bounded by max_retries)
 
 
-def test_enqueue_delays_a_rebuild_that_follows_a_finished_one(monkeypatch):
-    from datetime import datetime, timedelta, timezone
-    queue = _FakeQueue()
-    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
-    monkeypatch.setattr(app, 'jobs_table_client', object())
-    monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
-    monkeypatch.setattr(app, 'INDEX_BUILD_MIN_INTERVAL_SECONDS', 120)
+def test_enqueue_coalesces_source_edits_in_the_durable_queue(monkeypatch):
+    queue = _dedicated_queue(monkeypatch)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
-    finished = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
-    monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': finished})
-    assert app.enqueue_index_build('lib-1') == 'queued'
-    assert 80 <= queue.delays[-1] <= 90  # ~120s minus the 30s already elapsed
-
-    long_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-    monkeypatch.setattr(app, '_get_job_row', lambda pk, jid: {'status': 'done', 'updatedAt': long_ago})
-    assert app.enqueue_index_build('lib-1') == 'queued' and queue.delays[-1] is None  # immediate
+    assert app.enqueue_index_build('lib-1', reason='source-edit') == 'queued'
+    assert queue.delays == [2]
+    assert app.enqueue_index_build('lib-1', reason='source-edit') == 'already_active'
+    assert queue.delays == [2]
 
 
 def test_enqueue_can_bypass_delay_for_explicit_upload_refresh(monkeypatch):
     from datetime import datetime, timedelta, timezone
-    queue = _FakeQueue()
-    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
-    monkeypatch.setattr(app, 'jobs_table_client', object())
+    queue = _dedicated_queue(monkeypatch)
     monkeypatch.setattr(app, '_index_build_job_active', lambda uid: False)
     monkeypatch.setattr(app, 'INDEX_BUILD_MIN_INTERVAL_SECONDS', 120)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
@@ -757,9 +769,7 @@ def test_dirty_after_uploads_alone_does_not_need_a_full_build(monkeypatch):
 
 
 def test_light_scope_message_and_job_row_are_separate(monkeypatch):
-    q = _FakeQueue()
-    monkeypatch.setattr(app, 'library_ops_queue_client', q)
-    monkeypatch.setattr(app, 'jobs_table_client', None)
+    q = _dedicated_queue(monkeypatch)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
     assert app.enqueue_index_build('lib-1', reason='r', scope='light') == 'queued'
     assert q.sent[0]['scope'] == 'light' and q.sent[0]['jobId'] == 'index-build-lib-1-light'
@@ -883,9 +893,7 @@ def test_full_scope_bootstraps_only_a_library_without_a_database(monkeypatch):
 
 
 def test_each_scope_has_its_own_job_row_and_message(monkeypatch):
-    q = _FakeQueue()
-    monkeypatch.setattr(app, 'library_ops_queue_client', q)
-    monkeypatch.setattr(app, 'jobs_table_client', None)
+    q = _dedicated_queue(monkeypatch)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: None)
     for scope in ('light', 'people', 'full'):
         assert app.enqueue_index_build('lib-1', reason='r', scope=scope) == 'queued'

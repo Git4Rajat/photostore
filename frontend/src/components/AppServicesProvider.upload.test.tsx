@@ -866,3 +866,70 @@ describe('browser upload selection and startup', () => {
         expect(initFiles()).toHaveLength(0);
     });
 });
+
+// Connects the real upload path to the backend's opt-in shadow wave protocol
+// (backend/routes/upload_wave_shadow.py) -- see uploadWaveClient.ts/
+// uploadWaveSync.ts. These calls are entirely best-effort: they must never
+// block, delay, or fail the real upload, which the last test in this block
+// exercises directly.
+describe('upload wave shadow protocol wiring', () => {
+    const shadowCalls = (suffix: string) => mocks.postUpload.mock.calls
+        .filter(([url]) => typeof url === 'string' && url.startsWith('/upload/waves/shadow/') && url.endsWith(suffix));
+    const opens = () => mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/waves/shadow/sessions');
+
+    beforeEach(() => {
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
+            if (url.startsWith('/upload/waves/shadow/')) {
+                if (url.endsWith('/items')) return { manifestRevision: 'rev-items', registeredCount: payload.items.length };
+                if (url.endsWith('/resolve')) return { manifestRevision: 'rev-resolve' };
+                if (url.endsWith('/close')) return { state: 'closed' };
+                return { waveId: 'wave-1', manifestRevision: 'rev-open' };
+            }
+            return original(url, payload);
+        });
+    });
+
+    it('opens, registers, resolves, and closes the shadow session for a normal completed upload', async () => {
+        select(filesFor(2));
+        await advance(4000);
+        expect(opens()).toHaveLength(1);
+        expect(opens()[0][1]).toMatchObject({ declaredCount: 2 });
+        const registerCalls = shadowCalls('/items');
+        expect(registerCalls).toHaveLength(1);
+        expect(registerCalls[0][1].items).toHaveLength(2);
+        // Each file is resolved live as it finalizes, then defensively
+        // re-resolved (idempotently) when the session closes -- see
+        // finalizeWaveShadowSession's own comment for why.
+        const resolveCalls = shadowCalls('/resolve');
+        expect(resolveCalls.every(([, body]) => body.outcome === 'accepted')).toBe(true);
+        expect(resolveCalls).toHaveLength(4);
+        expect(new Set(resolveCalls.map(([, body]) => body.itemId)).size).toBe(2);
+        expect(shadowCalls('/close')).toHaveLength(1);
+    });
+
+    it('resolves a finalize failure as failed, not accepted', async () => {
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
+            if (url === '/upload/finalize-batch') throw new Error('finalize failed');
+            return original(url, payload);
+        });
+        select(filesFor(1));
+        for (let tick = 0; tick < 6; tick += 1) await advance(1000);
+        const resolveCalls = shadowCalls('/resolve');
+        expect(resolveCalls.some(([, body]) => body.outcome === 'failed')).toBe(true);
+    });
+
+    it('never affects the real upload path when the shadow API is unavailable', async () => {
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
+            if (url.startsWith('/upload/waves/shadow/')) throw new Error('shadow disabled');
+            return original(url, payload);
+        });
+        select(filesFor(2));
+        await advance(4000);
+        expect(finalizedFiles()).toHaveLength(2);
+        expect(services.uploading).toBe(false);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+});

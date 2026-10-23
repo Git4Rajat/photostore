@@ -91,6 +91,10 @@ def test_indexer_role_serves_only_tools_routes():
         '/api/tools/index-events/negotiate',
         '/api/tools/pending-edits/reconcile',
         '/api/tools/indexes/maintenance/<scope>',
+        # Opt-in shadow-wave diagnostic (disabled by default via
+        # UPLOAD_WAVE_SHADOW_ENABLED) -- see docs/indexing-clustering-
+        # target-state.md step 3, "validate real uploads in shadow mode".
+        '/api/tools/waves/shadow/<wave>/compare',
         # Manual counterparts to the automatic release/flush triggers.
         '/api/tools/ipwork/release',
         '/api/tools/cluster/flush',

@@ -13,6 +13,7 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableTransactionError
 
 import index_files
+from index_ownership import catalog_publisher
 import perf_instrumentation
 import storage_utils as su
 
@@ -104,6 +105,7 @@ def read_snapshot(user_id):
         return None, {}, True
 
 
+@catalog_publisher
 def rebuild_snapshot(user_id):
     """Stream one library's hash partition into a gzip file on the build worker."""
     table = su._CTX.get('hash_index_table_client')

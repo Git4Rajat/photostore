@@ -315,10 +315,8 @@ def test_refresh_route_reports_coalescing_or_retryable_queue_failure(world, monk
 
 
 def test_idle_fallback_is_delayed_and_coalesced(monkeypatch):
-    from tests.test_index_priming import _FakeQueue
-    queue = _FakeQueue()
-    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
-    monkeypatch.setattr(app, 'jobs_table_client', None)
+    from tests.test_index_priming import _dedicated_queue
+    queue = _dedicated_queue(monkeypatch)
     monkeypatch.setattr(app, '_job_row_fresh_active', lambda *a: False)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
     assert app.enqueue_index_build('lib', scope='dedup-idle', coalesce=False) == 'queued'
@@ -359,14 +357,13 @@ def test_idle_refresh_queue_failure_does_not_fail_uploaded_files(upload_env, mon
 
 
 def test_idle_fallback_reschedules_while_upload_is_active_without_scan(world, monkeypatch):
-    from tests.test_index_priming import _FakeQueue
+    from tests.test_index_priming import _dedicated_queue
     table, _ = world
-    queue, statuses = _FakeQueue(), []
-    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
+    queue, statuses = _dedicated_queue(monkeypatch), []
     monkeypatch.setattr(app, '_is_upload_active', lambda *a: True)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: statuses.append(a[3]))
     app._run_index_build_job('lib', 'index-build-lib-dedup-idle', 'dedup-idle')
-    assert statuses == ['running', 'queued'] and table.scans == 0
+    assert statuses == ['running', 'queued', 'queued'] and table.scans == 0
     assert queue.sent[0]['scope'] == 'dedup-idle' and queue.delays == [int(app.UPLOAD_ACTIVITY_WINDOW_SECONDS)]
 
 
@@ -421,10 +418,8 @@ def test_light_build_queues_dedup_without_inline_scan(world, monkeypatch):
 
 
 def test_dedup_queue_scope_has_its_own_coalesced_job(monkeypatch):
-    from tests.test_index_priming import _FakeQueue
-    queue = _FakeQueue()
-    monkeypatch.setattr(app, 'library_ops_queue_client', queue)
-    monkeypatch.setattr(app, 'jobs_table_client', None)
+    from tests.test_index_priming import _dedicated_queue
+    queue = _dedicated_queue(monkeypatch)
     monkeypatch.setattr(app, '_job_row_fresh_active', lambda *a: False)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
     assert app.enqueue_index_build('lib', scope='dedup', coalesce=False) == 'queued'

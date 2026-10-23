@@ -1,0 +1,15 @@
+{
+  "disabled": {
+    "available": false,
+    "observedMinutes": 6,
+    "negotiateRequests": 7,
+    "refreshCallbacks": 0
+  },
+  "enabled": {
+    "available": true,
+    "observedMinutes": 10,
+    "negotiateRequests": 3,
+    "refreshCallbacks": 3
+  },
+  "note": "Reproduces current timer-driven requests without user activity; not target idle-policy compliance."
+}

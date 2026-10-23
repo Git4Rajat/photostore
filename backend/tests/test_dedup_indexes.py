@@ -327,3 +327,33 @@ def test_fallback_filename_collision_still_works_without_index_table(no_index_ct
     storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='l' * 64)
     final_name = storage_utils._resolve_filename_for_upload('lib-B', 'vacation.jpg', 'm' * 64)
     assert final_name != 'vacation.jpg'
+
+
+def test_finalize_stamps_an_immutable_processing_revision(dedup_ctx):
+    """See docs/indexing-clustering-target-state.md step 2: each finalized
+    photo gets a real, source-owned processing generation -- not the
+    physical-identity/hash proxy upload_wave_shadow.py falls back to for
+    rows that predate this field."""
+    metadata, _, _ = dedup_ctx
+    storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='q' * 64)
+    revision = metadata.rows[('lib-A', 'vacation.jpg')]['processingRevision']
+    assert isinstance(revision, str) and re.fullmatch(r'[0-9a-f]{32}', revision)
+
+
+def test_finalize_assigns_distinct_revisions_per_photo(dedup_ctx):
+    metadata, _, _ = dedup_ctx
+    storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='r' * 64)
+    storage_utils.finalize_uploaded_file('lib-A', 'beach.jpg', 'image/jpeg', client_sha256='s' * 64)
+    revisions = {metadata.rows[('lib-A', name)]['processingRevision'] for name in ('vacation.jpg', 'beach.jpg')}
+    assert len(revisions) == 2
+
+
+def test_finalize_never_overwrites_an_already_stamped_revision(dedup_ctx, monkeypatch):
+    """get_or_create_metadata can return an existing row (e.g. a retried
+    finalize for the same filename); the revision stamped on first finalize
+    must stay immutable, never silently re-rolled on a later call."""
+    metadata, _, _ = dedup_ctx
+    storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='t' * 64)
+    first = metadata.rows[('lib-A', 'vacation.jpg')]['processingRevision']
+    storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='t' * 64)
+    assert metadata.rows[('lib-A', 'vacation.jpg')]['processingRevision'] == first

@@ -49,8 +49,8 @@ def test_enqueue_persists_scope_without_needing_a_delayed_result(monkeypatch, sc
             pass
 
     rows = []
-    monkeypatch.setattr(app, 'library_ops_queue_client', Queue())
-    monkeypatch.setattr(app, 'jobs_table_client', None)
+    from tests.test_index_priming import _dedicated_queue
+    _dedicated_queue(monkeypatch, Queue())
     monkeypatch.setattr(app, '_index_build_job_active', lambda _: False)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *args, **fields: rows.append(fields))
     assert app.enqueue_index_build('owner', scope=scope) == 'queued'

@@ -1202,3 +1202,8 @@ def processing_status():
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
     return response
+
+
+# The shadow protocol is explicitly feature-gated and never alters legacy intake.
+from routes.upload_wave_shadow import register_routes as _register_wave_shadow_routes
+_register_wave_shadow_routes(upload_bp)

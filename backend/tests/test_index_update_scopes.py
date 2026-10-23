@@ -12,6 +12,18 @@ import index_updates
 import storage_utils as su
 from routes import tools
 from tests.fakes import FakeTable
+from test_index_work import EtagTable
+
+
+@pytest.fixture
+def catalog_queue(monkeypatch):
+    sent = []
+    monkeypatch.setattr(app, 'INDEX_MAINTENANCE_QUEUE_NAME', 'index-maintenance')
+    monkeypatch.setattr(app, 'jobs_table_client', EtagTable())
+    monkeypatch.setattr(app, 'index_maintenance_queue_client', SimpleNamespace(
+        send_message=lambda body, **kw: sent.append(json.loads(body))))
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
+    return sent
 
 
 @pytest.mark.parametrize('kind,scope', [
@@ -127,7 +139,8 @@ def test_people_job_includes_albums_only_with_explicit_album_changes(worker, mon
 
 @pytest.mark.parametrize('scope', ['vector', 'tag_embedding', 'people_embedding'])
 def test_embedding_repair_does_not_build_gallery_or_hashes(worker, monkeypatch, scope):
-    refresh = Mock(return_value=object())
+    refresh = Mock(return_value=SimpleNamespace(
+        row_keys=[], source_version='v1', embedding_version='v1', updated_at='now'))
     monkeypatch.setattr(su, f'refresh_user_{scope}_index', refresh)
     app._run_index_build_job('library-A', 'job', scope)
     refresh.assert_called_once_with('library-A')
@@ -152,19 +165,8 @@ def test_invalid_producer_scope_does_not_write_a_job_or_message(monkeypatch):
     status.assert_not_called()
 
 
-def test_coalescing_is_isolated_by_library_and_scope(monkeypatch):
-    rows, sent = {}, []
-    monkeypatch.setattr(app, 'jobs_table_client', object())
-    monkeypatch.setattr(app, '_get_job_row', lambda library, job: rows.get((library, job)))
-
-    def status(job, library, job_type, state, **kwargs):
-        rows[(library, job)] = {
-            'status': state, 'updatedAt': app.datetime.now(app.timezone.utc).isoformat(), **kwargs,
-        }
-
-    monkeypatch.setattr(app, '_upsert_job_status', status)
-    monkeypatch.setattr(app, 'library_ops_queue_client', SimpleNamespace(
-        send_message=lambda body, **kw: sent.append(json.loads(body))))
+def test_coalescing_is_isolated_by_library_and_scope(catalog_queue):
+    sent = catalog_queue
     assert app.enqueue_index_build('library-A', scope='people') == 'queued'
     assert app.enqueue_index_build('library-A', scope='people') == 'already_active'
     assert app.enqueue_index_build('library-B', scope='people') == 'queued'
@@ -197,13 +199,9 @@ def test_http_fallback_preserves_explicit_scope_even_when_other_indexes_missing(
 @pytest.mark.parametrize('kind,scope', [
     ('people', 'people'), ('albums', 'albums'), ('lexical', 'search'), ('sort', 'sort'), ('all', 'full'),
 ])
-def test_manual_refresh_uses_supported_api_and_exact_scope(monkeypatch, kind, scope):
+def test_manual_refresh_uses_supported_api_and_exact_scope(monkeypatch, catalog_queue, kind, scope):
     monkeypatch.setattr(app, '_require_user_id', lambda: ('library-A', None))
-    sent = []
-    monkeypatch.setattr(app, 'library_ops_queue_client', SimpleNamespace(
-        send_message=lambda body, **kw: sent.append(json.loads(body))))
-    monkeypatch.setattr(app, 'jobs_table_client', None)
-    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
+    sent = catalog_queue
     monkeypatch.setattr(su, 'get_user_index_status_detailed', lambda uid: {'indexes': {}})
     with app.app.test_request_context('/api/tools/indexes/rebuild/test', method='POST'):
         _, status = tools.tools_rebuild_index(kind)

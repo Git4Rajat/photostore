@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import perf_instrumentation
+from index_ownership import catalog_publisher
 import search_utils
 from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
 
@@ -894,6 +895,7 @@ class SearchDbSink:
     def abort(self) -> None:
         self._builder.abort()
 
+    @catalog_publisher
     def finish(self) -> None:
         user_id = self.user_id
         data_name, manifest_name = _blob_names(user_id)
@@ -975,6 +977,7 @@ def _lineage(manifest: Dict) -> str:
     return str(manifest.get('lineage') or manifest.get('sourceVersion') or '')
 
 
+@catalog_publisher
 def publish_delta(
     user_id: str, upserts: List[Dict], deletes: List[str], *, building: Optional[Dict] = None,
 ) -> Optional[int]:
@@ -1117,6 +1120,7 @@ def _upload_database_file(user_id: str, db_path: str, label: str) -> None:
             pass
 
 
+@catalog_publisher
 def create_empty_base(user_id: str, building: Dict) -> str:
     """Publish an EMPTY database + manifest for a library that has none, so a resumable first build
     can append deltas to it and search works (on what has been indexed so far) from the first chunk.
@@ -1143,6 +1147,7 @@ def create_empty_base(user_id: str, building: Dict) -> str:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+@catalog_publisher
 def compact_database(user_id: str) -> Optional[Dict]:
     """Fold the delta log into a fresh base file -- WITHOUT touching the table.
 
@@ -1210,6 +1215,7 @@ def compact_database(user_id: str) -> Optional[Dict]:
     return updated
 
 
+@catalog_publisher
 def write_for_snapshot(user_id: str, snapshot) -> bool:
     """Build + upload the database from an in-memory snapshot (legacy/tests; the
     index build streams rows through SearchDbSink instead). Best-effort."""

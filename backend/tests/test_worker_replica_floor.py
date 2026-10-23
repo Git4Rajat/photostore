@@ -30,6 +30,7 @@ def test_bicep_worker_floor_matches_compiled_default():
 def test_dedicated_index_queue_wakes_an_isolated_single_publisher_sidecar():
     template = json.loads((Path(__file__).parents[2] / 'deploy' / 'azuredeploy.json').read_text())
     assert template['parameters']['dedicatedIndexWorker']['defaultValue'] is True
+    assert template['parameters']['dedicatedIndexWorker']['allowedValues'] == [True]
     module = next(r for r in template['resources'] if r['type'] == 'Microsoft.Resources/deployments')['properties']['template']
     indexer = next(r for r in module['resources'] if r.get('name') == "[variables('indexerAppName')]")
     spec = indexer['properties']['template']
