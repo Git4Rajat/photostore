@@ -25,8 +25,7 @@ def complete_publication(store, wave_id):
     ledger.record_receipt(ids['people'], output_generation='published-people-v1')
     # Simulate the future stage owner's transition after assignments and before
     # publication; the completion API itself cannot turn a ready wave complete.
-    store._commit(store._required('control'), [store._change(wave,
-        dict(wave, state='indexing', requiredPublicationId=frontier))])
+    store.commit_assignment(wave_id, frontier, manifest_digest=wave['manifestDigest'])
     return store.complete_indexing(wave_id, ledger)
 
 def test_execution_disabled_by_default(monkeypatch):
@@ -258,8 +257,7 @@ def test_publication_completion_and_receipt_are_atomic_and_replayable(world):
     ledger = ObligationLedger(EtagTable(), wave['waveId'], library=store.library,
                               frozen_revision=wave['frozenRevision'])
     frontier = ledger.record_required({})
-    store._commit(store._required('control'), [store._change(wave,
-        dict(wave, state='indexing', requiredPublicationId=frontier))])
+    store.commit_assignment(wave['waveId'], frontier, manifest_digest=wave['manifestDigest'])
     def crash():
         raise AzureError('before completion commit')
     table.before_commit = crash

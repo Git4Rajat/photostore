@@ -117,3 +117,19 @@ def test_incomplete_aggregate_cannot_leave_done_status_without_fields(blobs, mon
             lease_owner='owner', expected_processing_revision='rev', expected_processing_fence='attempt')
     row = metadata.get_entity('lib', 'photo.jpg')
     assert row['face_status'] == 'failed' and not row.get('artifactReceipt')
+
+
+def test_video_artifact_receipt_does_not_require_browser_owned_failed_steps(blobs):
+    from dataclasses import replace
+    from test_processing_completion import video_source
+    (metadata, _, _, _, fence), _ = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'))
+    row.update(video_source(), processingRevision=fence.revision, anonymousImageId=fence.photo,
+        processingGeneration=fence.generation)
+    metadata.rows['lib', 'clip.mp4'] = dict(row,
+        processing_lease_owner='owner', processingFence=fence.attempt,
+        processing_lease_expires_at=metadata.get_entity('lib', 'photo.jpg')['processing_lease_expires_at'])
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    with result_fence(replace(fence, filename='clip.mp4')):
+        reference = receipts.capture(storage_utils, row)
+    assert reference and json.loads(receipts._get('manifest!' + reference['id'])['payload'])['faceSnapshots'] == []

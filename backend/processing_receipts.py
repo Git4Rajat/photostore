@@ -62,13 +62,16 @@ class ArtifactReceipts:
             raise ValueError('Artifact capture requires a source attempt fence')
         fence.check()
         statuses = {step: metadata.get(step + '_status') for step in STEPS}
-        if any(status not in TERMINAL for status in statuses.values()):
+        from image_utils import is_video_file
+        from processing_generation import required_steps_for_media
+        required = required_steps_for_media(is_video_file(metadata['RowKey']))
+        if any(statuses[step] not in TERMINAL for step in required):
             return None
         derivatives = {kind: verify_receipt(storage, metadata, kind) for kind in ('thumbnail', 'preview')
-                       if statuses[kind] == 'done'}
+                       if statuses[kind] == 'done' and (kind in required or metadata.get(kind + 'Artifact'))}
         snapshot_ids = []
         lookup_generation = ''
-        if statuses['face'] in ('done', 'no_data'):
+        if 'face' in required and statuses['face'] in ('done', 'no_data'):
             table = storage._CTX.get('face_by_filename_table_client')
             if table is None:
                 raise ValueError('Complete face lookup required for artifact receipt')

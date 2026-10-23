@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from processing_completion import STEPS, StaleProcessingResult, check_revision, prepare_completion, relay_completion
 from test_metadata_write_concurrency import _RacyTable
@@ -29,6 +31,40 @@ def test_pending_intent_is_stable_and_exact_ack_does_not_requeue():
 def test_missing_or_unresolved_proof_never_emits_completion(change):
     row = source(); prepare_completion(row); row.update(change); prepare_completion(row)
     assert row['processingCompletionPending'] == ''
+
+
+def video_source():
+    """Exactly storage_utils.finalize_uploaded_file's video_status_overrides:
+    thumbnail/exif land at 'failed' (browser-owned, not itself a TERMINAL
+    value), the rest at 'skipped'. None of the seven are backend-required
+    for video (processing_generation.required_steps_for_media(True) == ())."""
+    row = source()
+    row['RowKey'] = 'clip.mp4'
+    row.update(preview_status='skipped', ocr_status='skipped', ai_vision_status='skipped',
+               face_status='skipped', map_detection_status='skipped',
+               thumbnail_status='failed', exif_status='failed')
+    return row
+
+
+def test_a_finalized_video_is_completion_eligible_despite_failed_thumbnail_and_exif():
+    row = video_source()
+    prepare_completion(row)
+    assert row['processingCompletionPending']
+    intent = json.loads(row['processingCompletionOutbox'])[0]
+    assert intent['requiredSteps'] == []
+    assert intent['stepProvenance']['thumbnail'] == 'not_required'
+    assert intent['stepProvenance']['exif'] == 'not_required'
+    assert intent['statuses']['thumbnail'] == 'failed'  # Reported as-is; not required to be TERMINAL.
+
+
+def test_video_eligibility_is_unaffected_by_a_genuinely_stuck_required_step():
+    """A video has no required backend steps at all, so even an injected
+    'running'/leased step (which would block an image) doesn't block it --
+    confirms eligibility truly depends on `required`, not on every step."""
+    row = video_source()
+    row['ocr_status'] = 'running'  # Not required for video; must not block.
+    prepare_completion(row)
+    assert row['processingCompletionPending']
 
 
 def test_lost_notification_remains_recoverable_and_duplicate_delivery_is_safe():

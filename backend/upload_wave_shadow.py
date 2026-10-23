@@ -9,6 +9,8 @@ import math
 from azure.core.exceptions import ResourceNotFoundError
 
 from storage_utils import BROWSER_PROCESSING_STEPS as STEPS
+from processing_generation import required_steps_for_media
+from image_utils import is_video_file
 from upload_waves import MAX_PAGE, Conflict, digest
 
 TERMINAL = {'done', 'no_data', 'skipped', 'unsupported'}
@@ -39,7 +41,8 @@ def resolve_source(store, metadata_table, session, item, outcome, filename):
     row = metadata_table.get_entity(store.library, filename)
     photo, revision, _qualified = source_identity(row)
     return store.resolve(session, item, outcome=outcome, filename=filename,
-                         photo_id=photo, processing_revision=revision, required_steps=STEPS)
+                         photo_id=photo, processing_revision=revision,
+                         required_steps=required_steps_for_media(is_video_file(filename)))
 
 
 def observe_source(store, member, metadata_table, face_table, face_ids):

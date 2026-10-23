@@ -10271,6 +10271,26 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
                                'processingFence', 'processingGeneration')):
                 from processing_completion import StaleProcessingResult
                 raise StaleProcessingResult('Processing source changed during result application.')
+            # The check above only catches a MUTATION of the row's own
+            # generation between baseline and this attempt -- it cannot
+            # catch a deployment-wide model/policy version bump that
+            # happened before this claim/attempt even started (baseline
+            # would already carry the same now-stale generation, so it
+            # would match `current` and pass silently). Gated behind
+            # enforcement_enabled(): an ordinary, routine model-version bump
+            # already happens independently of this feature (see
+            # FACE_CLUSTER_EMBEDDING_VERSION's own revision history in
+            # app.py) and must not start rejecting unrelated in-flight
+            # commits while live cutover is disabled. Only checked when the
+            # row already carries a generation at all -- a legacy/
+            # unmigrated row with none is unaffected (see processing_
+            # generation.is_superseded's own "missing provenance" handling).
+            if current.get('processingGeneration'):
+                import processing_generation
+                if (processing_generation.enforcement_enabled()
+                        and processing_generation.is_superseded(current, is_video=is_video_file(filename))):
+                    from processing_completion import StaleProcessingResult
+                    raise StaleProcessingResult('Processing model/policy contract changed during result application.')
             touched_steps = {key[:-7] for key in fields if key.endswith('_status')}
             touched_steps.update(update['step'] for update in updates)
             if any(_step_locked_done(current, step) and not _step_locked_done(baseline, step)

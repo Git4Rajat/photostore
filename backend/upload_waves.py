@@ -79,7 +79,8 @@ class ShadowWaves:
         new = dict(control or self._row('control', revision='', collectingWaveId='', tailWaveId=''))
         if advance:
             new.update(revision=uuid.uuid4().hex, updatedAt=self.clock())
-        self.table.submit_transaction([self._change(control, new), *changes])
+        from execution_lease import guard_operations
+        self.table.submit_transaction([self._change(control, new), *changes, *guard_operations(self)])
 
     def _retry(self, action):
         for attempt in range(MAX_RETRIES):
@@ -243,7 +244,9 @@ class ShadowWaves:
             if (not all(isinstance(value, str) and 0 < len(value) <= 1024
                         for value in (photo_id, processing_revision, filename))):
                 raise ValueError('Accepted items require immutable photo/revision identity')
-            if (not isinstance(required_steps, (list, tuple)) or not 0 < len(required_steps) <= 16
+            from image_utils import is_video_file
+            if (not isinstance(required_steps, (list, tuple)) or not 0 <= len(required_steps) <= 16
+                    or (not required_steps and not is_video_file(filename))
                     or any(not isinstance(step, str) or not re.fullmatch(r'[a-z_]{1,32}', step)
                            for step in required_steps)):
                 raise ValueError('Accepted items require a processing step policy')
@@ -368,6 +371,37 @@ class ShadowWaves:
             return next_wave
         return self._retry(run)
 
+    def commit_assignment(self, wave_id, required_publication_id, *, manifest_digest):
+        """Commits the cluster consumer's handoff: the frozen (ready) wave's
+        transition to 'indexing', binding the exact obligation-set id it
+        captured via wave_publication.ObligationLedger.record_required, and
+        durably releasing the indexer's stage outbox in the SAME transaction
+        (same partition as the wave row, unlike the obligation manifest
+        itself, which lives in its own partition and cannot share this
+        transaction -- callers must call record_required first and pass its
+        result here; a crash between those two calls leaves the wave in
+        'ready', so the cluster consumer safely retries both idempotently).
+        """
+        identifier(wave_id)
+        def run():
+            control = self._required('control')
+            wave = self._required(self.wave_key(wave_id))
+            if wave['state'] == 'indexing' and wave.get('requiredPublicationId') == required_publication_id:
+                return dict(wave)
+            if wave['state'] != 'ready':
+                raise Conflict('Only a frozen (ready) wave can commit its assignment')
+            if wave.get('manifestDigest') != manifest_digest:
+                raise Conflict('Assignment input no longer matches the frozen manifest')
+            outbox = self._row(f'shadow-index!{wave_id}', waveId=wave_id,
+                inputRevision=required_publication_id, destination='index',
+                dispatchable=False, createdAt=self.clock())
+            next_wave = dict(wave, state='indexing', requiredPublicationId=required_publication_id,
+                             indexPendingKey=outbox['RowKey'], stateEnteredAt=self.clock(),
+                             lastProgressAt=self.clock(), updatedAt=self.clock())
+            self._commit(control, [self._change(wave, next_wave), ('create', outbox)])
+            return next_wave
+        return self._retry(run)
+
     def complete_indexing(self, wave_id, ledger):
         """Commit exact publication coverage and predecessor completion together.
 
@@ -399,12 +433,16 @@ class ShadowWaves:
     @staticmethod
     def outbox_eligible(wave, outbox):
         if outbox.get('destination') == 'vision':
-            return (wave['state'] == 'processing_pending'
+            return (wave['state'] in ('processing_pending', 'processing')
                     and wave.get('visionPendingKey') == outbox['RowKey']
                     and wave['intakeEpoch'] == outbox.get('intakeEpoch'))
         if outbox.get('destination') == 'cluster':
             return (wave['state'] == 'ready'
                     and wave.get('frozenRevision') == outbox.get('inputRevision'))
+        if outbox.get('destination') == 'index':
+            return (wave['state'] == 'indexing'
+                    and wave.get('indexPendingKey') == outbox['RowKey']
+                    and wave.get('requiredPublicationId') == outbox.get('inputRevision'))
         return False
 
     def set_dispatchable(self, key, *, dispatchable=True):
@@ -522,8 +560,9 @@ class ShadowWaves:
                     changes.append(('create', outbox))
                     next_control = dict(control, collectingWaveId='', revision=uuid.uuid4().hex,
                                         updatedAt=self.clock())
+                    from execution_lease import guard_operations
                     self.table.submit_transaction([self._change(control, next_control),
-                        self._change(wave, next_wave), *changes])
+                        self._change(wave, next_wave), *changes, *guard_operations(self)])
                     return next_wave
                 next_wave.update(state='processing', evaluation='')
                 if wave['state'] != 'processing':

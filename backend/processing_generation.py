@@ -41,16 +41,56 @@ REQUIRED_STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detec
 PROCESSING_POLICY_VERSION = os.getenv('PROCESSING_POLICY_VERSION', '1').strip()
 
 
+def enforcement_enabled():
+    """Gates every NEW rejection/reset behavior this module enables beyond
+    passively stamping/reading fields: the commit-time staleness check
+    (storage_utils._commit_worker_processing_results) and full-contract
+    forced-reprocess supersession (app._enqueue_processing_steps). Off by
+    default so an ordinary, routine model-version bump (these already
+    happen independently of this feature -- see FACE_CLUSTER_EMBEDDING_
+    VERSION's own revision history) cannot start rejecting unrelated
+    in-flight commits while live cutover is disabled. Allocation/stamping
+    of processingGeneration itself is NOT gated by this -- it is purely
+    additive metadata, same as processingRevision before it.
+    """
+    return os.getenv('PROCESSING_GENERATION_ENFORCEMENT_ENABLED', '').strip().lower() == 'true'
+
+
 def required_steps_for_media(is_video):
     return () if is_video else REQUIRED_STEPS
 
 
 def _face_embedding_allowed_versions():
     return {version for version in {
-        os.getenv('FACE_CLUSTER_EMBEDDING_VERSION', '').strip(),
+        (os.getenv('FACE_CLUSTER_EMBEDDING_VERSION') or 'browser-adaface-ir101-v1-fixed').strip(),
         os.getenv('IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION',
                    'adaface-ir101-webface4m-512d-v1+mediapipe-landmark-478').strip(),
     } if version}
+
+
+# vision_utils.py's own get_text_embedding_version()/_load_model() cannot be
+# called here: it imports torch/open_clip at module scope and lazily loads
+# real model weights, exactly the heavy dependency graph this leaf module
+# must stay free of (see the module docstring). This mirrors its env-
+# configured model identity instead of its runtime-detected fallback --
+# if torch/open_clip are genuinely unavailable in a Vision-capable
+# deployment, vision_utils falls back to 'hashing-v1', which this contract
+# cannot observe without importing torch itself. Treated as an accepted,
+# documented gap, not a silent inaccuracy.
+def _photo_embedding_version():
+    model = os.getenv('OPENCLIP_MODEL', 'ViT-B-32-quickgelu').strip()
+    pretrained = os.getenv('OPENCLIP_PRETRAINED', 'openai').strip()
+    return f'openclip:{model}:{pretrained}'
+
+
+# No existing allow-list constant covers the OCR/AI-vision/map-detection
+# pipeline's taxonomy the way _face_embedding_allowed_versions() does for
+# faces (see processing_completion.py's PROVENANCE comment) -- empty by
+# default (not tracked) rather than inventing an unenforced value. Setting
+# this does not yet make anything cross-check a Vision result's own
+# modelTaxonomyVersion against it; see the remaining release gates.
+def _vision_taxonomy_version():
+    return os.getenv('VISION_MODEL_TAXONOMY_VERSION', '').strip()
 
 
 def current_contract():
@@ -59,6 +99,8 @@ def current_contract():
     env var, rather than when a specific photo's source bytes change."""
     return {
         'faceEmbeddingVersions': sorted(_face_embedding_allowed_versions()),
+        'photoEmbeddingVersion': _photo_embedding_version(),
+        'visionTaxonomyVersion': _vision_taxonomy_version(),
         'policyVersion': PROCESSING_POLICY_VERSION,
     }
 

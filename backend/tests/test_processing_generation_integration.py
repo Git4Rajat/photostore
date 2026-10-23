@@ -77,20 +77,57 @@ def test_supersede_raises_for_a_missing_photo(metadata):
         storage_utils.supersede_processing_generation('lib-A', 'missing.jpg')
 
 
-def test_forced_reenqueue_allocates_a_new_generation(metadata, monkeypatch):
-    _seed_row(metadata, 'lib-A', 'photo.jpg', face_status='done')
+def test_forced_full_reprocess_allocates_a_new_generation_when_enforcement_is_on(metadata, monkeypatch):
+    monkeypatch.setenv('PROCESSING_GENERATION_ENFORCEMENT_ENABLED', 'true')
+    _seed_row(metadata, 'lib-A', 'photo.jpg', **{step + '_status': 'done' for step in storage_utils.BROWSER_PROCESSING_STEPS})
     monkeypatch.setattr(app, '_get_metadata_entity',
                         lambda uid, name: metadata.get_entity(uid, name))
     original_generation = metadata.rows[('lib-A', 'photo.jpg')]['processingGeneration']
     original_revision = metadata.rows[('lib-A', 'photo.jpg')]['processingRevision']
-    results = app._enqueue_processing_steps('lib-A', 'photo.jpg', ['face'], force=True)
-    assert results['face']['status'] == 'queued'
+    results = app._enqueue_processing_steps('lib-A', 'photo.jpg', list(storage_utils.BROWSER_PROCESSING_STEPS), force=True)
+    assert all(result['status'] == 'queued' for result in results.values())
     stored = metadata.rows[('lib-A', 'photo.jpg')]
     assert stored['processingRevision'] != original_revision
-    assert stored['face_status'] == 'queued'
     # Same live contract/photo/source -- the generation ID is unchanged,
     # confirming this is a real reallocation (new revision), not a no-op.
     assert stored['processingGeneration'] == original_generation
+
+
+def test_forced_partial_reprocess_never_resets_or_strands_unrelated_steps(metadata, monkeypatch):
+    """Enforced partial force is rejected without touching old status/proof.
+    Full reprocess remains available; disabled-mode legacy behavior remains.
+    """
+    monkeypatch.setenv('PROCESSING_GENERATION_ENFORCEMENT_ENABLED', 'true')
+    _seed_row(metadata, 'lib-A', 'photo.jpg', **{step + '_status': 'done' for step in storage_utils.BROWSER_PROCESSING_STEPS})
+    monkeypatch.setattr(app, '_get_metadata_entity',
+                        lambda uid, name: metadata.get_entity(uid, name))
+    original = dict(metadata.rows[('lib-A', 'photo.jpg')])
+    results = app._enqueue_processing_steps('lib-A', 'photo.jpg', ['face'], force=True)
+    assert results['face']['reason'] == 'partial_force_requires_full_reprocess'
+    stored = metadata.rows[('lib-A', 'photo.jpg')]
+    assert stored['processingRevision'] == original['processingRevision']
+    assert stored['processingGeneration'] == original['processingGeneration']
+    assert stored['face_status'] == 'done'
+    # Every OTHER required step must remain exactly as it was -- 'done',
+    # not reset to 'pending' with no queued work behind it.
+    untouched = set(storage_utils.BROWSER_PROCESSING_STEPS) - {'face'}
+    assert all(stored[step + '_status'] == 'done' for step in untouched)
+
+
+def test_forced_full_reprocess_is_a_noop_while_enforcement_is_disabled(metadata, monkeypatch):
+    """Default (enforcement disabled): force=True behaves exactly as it did
+    before processing_generation.py existed -- no generation reallocation
+    at all, even when every required step is named."""
+    monkeypatch.delenv('PROCESSING_GENERATION_ENFORCEMENT_ENABLED', raising=False)
+    _seed_row(metadata, 'lib-A', 'photo.jpg', **{step + '_status': 'done' for step in storage_utils.BROWSER_PROCESSING_STEPS})
+    monkeypatch.setattr(app, '_get_metadata_entity',
+                        lambda uid, name: metadata.get_entity(uid, name))
+    original = dict(metadata.rows[('lib-A', 'photo.jpg')])
+    results = app._enqueue_processing_steps('lib-A', 'photo.jpg', list(storage_utils.BROWSER_PROCESSING_STEPS), force=True)
+    assert all(result['status'] == 'queued' for result in results.values())
+    stored = metadata.rows[('lib-A', 'photo.jpg')]
+    assert stored['processingRevision'] == original['processingRevision']
+    assert stored['processingGeneration'] == original['processingGeneration']
 
 
 def test_ordinary_retry_never_allocates_a_new_generation_or_revision(metadata, monkeypatch):

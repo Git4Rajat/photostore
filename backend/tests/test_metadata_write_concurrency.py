@@ -413,6 +413,12 @@ def test_worker_rejects_isolation_before_external_mutations(worker_commit_ctx, m
     # source-owned processing generation (see docs/indexing-clustering-
     # target-state.md step 2, "processing completion authoritative").
     ({'processingRevision': 'successor-generation'}, 'source changed'),
+    # Acceptance scenario: a model/policy upgrade mid-flight forces a fresh
+    # processing generation (storage_utils.supersede_processing_generation)
+    # for this exact photo before this worker's in-flight commit lands --
+    # the old generation's result must be rejected, never silently accepted
+    # as if it matched the new contract.
+    ({'processingGeneration': 'f' * 64}, 'source changed'),
 ])
 def test_worker_conflict_preserves_completed_step_and_source_replacement(worker_commit_ctx, monkeypatch, change, expected):
     table = worker_commit_ctx
@@ -426,6 +432,39 @@ def test_worker_conflict_preserves_completed_step_and_source_replacement(worker_
     stored = table.rows[('u1', 'a.jpg')]
     assert all(stored[key] == value for key, value in change.items())
     assert stored['processing_lease_owner'] == 'worker-A'
+
+
+def test_deployment_model_bump_rejects_an_in_flight_result_with_no_row_mutation(worker_commit_ctx, monkeypatch):
+    """The parametrized case above mutates the row's processingGeneration
+    directly to prove the baseline-vs-current fence catches a changed
+    generation. This proves the DEPLOYMENT case: nothing touches the row at
+    all -- only the live model-version env var changes, before this
+    worker's claim/apply even starts -- and the independent is_superseded
+    check at commit time still rejects it. Gated behind
+    PROCESSING_GENERATION_ENFORCEMENT_ENABLED; disabled is covered by
+    test_processing_generation_integration.py's ordinary-retry case."""
+    monkeypatch.setenv('PROCESSING_GENERATION_ENFORCEMENT_ENABLED', 'true')
+    table = worker_commit_ctx
+    from processing_generation import allocate_generation
+    row = table.rows['u1', 'a.jpg']
+    row.update(anonymousImageId='photo', fileHash='a' * 64, processingRevision='rev-1')
+    row.update(allocate_generation('rev-1', photo_id='photo', file_hash='a' * 64, is_video=False))
+    monkeypatch.setenv('FACE_CLUSTER_EMBEDDING_VERSION', 'a-brand-new-model-v2')
+    with pytest.raises(RuntimeError, match='model/policy contract changed'):
+        _apply_worker()
+    assert table.rows[('u1', 'a.jpg')]['processing_lease_owner'] == 'worker-A'
+
+
+def test_deployment_model_bump_is_inert_while_enforcement_is_disabled(worker_commit_ctx, monkeypatch):
+    monkeypatch.delenv('PROCESSING_GENERATION_ENFORCEMENT_ENABLED', raising=False)
+    table = worker_commit_ctx
+    from processing_generation import allocate_generation
+    row = table.rows['u1', 'a.jpg']
+    row.update(anonymousImageId='photo', fileHash='a' * 64, processingRevision='rev-1')
+    row.update(allocate_generation('rev-1', photo_id='photo', file_hash='a' * 64, is_video=False))
+    monkeypatch.setenv('FACE_CLUSTER_EMBEDDING_VERSION', 'a-brand-new-model-v2')
+    result = _apply_worker()
+    assert result['ocr_status'] == 'done'
 
 
 @pytest.mark.parametrize('lost_response', [False, True])

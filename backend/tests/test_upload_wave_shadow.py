@@ -360,3 +360,19 @@ def test_reconcile_retries_source_completion_delivery_without_running_stage_work
     received = store._page('source-completion!')
     assert len(received) == 1 and received[0]['completionQualified'] is False
     assert not any(row.get('dispatchable') for row in table.rows.values())
+
+
+def test_video_admission_and_observation_share_the_empty_backend_contract():
+    from test_processing_completion import video_source
+    table = AtomicTable(); store = ShadowWaves(table, 'lib')
+    row = video_source()
+    table.submit_transaction([('create', row)])
+    session = store.open_session('video', 1)
+    store.register('video', [{'itemId': 'i', 'filename': 'clip.mp4'}])
+    resolved = resolve_source(store, table, 'video', 'i', 'accepted', 'clip.mp4')
+    close(store, 'video', resolved)
+    member = store._page(f"e!{session['waveId']}!m!")[0]
+    assert json.loads(member['requiredSteps']) == []
+    observation = observe_source(store, member, table, None,
+        lambda *a: pytest.fail('video should not require a face lookup'))
+    assert observation['outcome'] == 'settled'

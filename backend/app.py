@@ -4268,16 +4268,19 @@ def _enqueue_processing_steps(
     if entity.get('processingIsolated') is True:
         return {step: {'status': 'skipped', 'reason': 'upload_only_benchmark'} for step in steps}
 
-    if force:
-        # Forced reprocessing is an explicit supersession, not an ordinary
-        # retry: it must allocate a fresh processing generation/contract
-        # (see processing_generation.py) so a stale in-flight result from
-        # the old generation is fenced out rather than silently accepted.
-        try:
-            entity = storage_utils_module.supersede_processing_generation(user_id, filename)
-        except Exception:
-            app.logger.exception('Forced reprocess could not allocate a new processing generation for %s/%s', user_id, filename)
-            return {step: {'status': 'error', 'reason': 'generation_allocation_failed'} for step in steps}
+    import processing_generation
+    if force and processing_generation.enforcement_enabled():
+        # Partial forced reprocessing needs explicit carry-forward receipts.
+        # Reject it in enforced mode rather than reuse the old proof identity.
+        required = set(processing_generation.REQUIRED_STEPS)
+        if not required.issubset(steps):
+            return {step: {'status': 'error', 'reason': 'partial_force_requires_full_reprocess'} for step in steps}
+        if required and required.issubset(steps):
+            try:
+                entity = storage_utils_module.supersede_processing_generation(user_id, filename)
+            except Exception:
+                app.logger.exception('Forced reprocess could not allocate a new processing generation for %s/%s', user_id, filename)
+                return {step: {'status': 'error', 'reason': 'generation_allocation_failed'} for step in steps}
 
     visibility_timeout = max(0, min(int(visibility_timeout or 0), 7 * 24 * 60 * 60))
     for step in steps:

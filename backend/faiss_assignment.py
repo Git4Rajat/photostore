@@ -620,6 +620,28 @@ class FaissAssigner:
             raise ValueError('Legacy person faceIds exceeds 60 KiB; refusing truncation')
         return encoded
 
+    def choose_person(self, user_id, face_id, vector, tier, version, runtime,
+                      validator, person_lookup):
+        """Shared ordered matching rule for legacy and journaled wave execution.
+
+        This computes a choice only. Callers own persistence and runtime replay.
+        """
+        deterministic_id = self.person_id(user_id, face_id)
+        person = person_lookup(deterministic_id)
+        is_new = False
+        if person is None:
+            best, second, matched_id = runtime.best_two(vector, tier, version, validator)
+            if (matched_id is not None and best >= self.config.threshold
+                    and best - second >= self.config.margin):
+                person = person_lookup(matched_id)
+                if person is None:
+                    raise RuntimeError('Matched person disappeared before persistence')
+            else:
+                is_new = True
+                person = {'PartitionKey': user_id, 'RowKey': deterministic_id, 'name': '',
+                          'createdAt': datetime.now(timezone.utc).isoformat(), 'faceIds': '[]'}
+        return dict(person), is_new
+
     def assign(self, user_id, filename, face_ids, *, _guard=None,
                _prefetched=None, _defer_checkpoint=False, _stage=None):
         if not isinstance(user_id, str) or not user_id:
@@ -681,30 +703,14 @@ class FaissAssigner:
                     _LOGGER.info('faiss delta compaction user=%s elapsed_ms=%d', user_id,
                                  int((time.monotonic() - rebuild_started) * 1000))
                     guard.check()
-                deterministic_id = self.person_id(user_id, face_id)
-                person = (dict(_stage['persons'][deterministic_id])
-                          if _stage is not None and deterministic_id in _stage['persons']
-                          else _point(self.person_table, user_id, deterministic_id))
-                is_new = False
-                if person is None:
-                    search_started = time.monotonic()
-                    best, second, matched_id = runtime.best_two(
-                        vector, tier, version, self._validator(user_id, tier, version, stats, _stage))
-                    search_ms += int((time.monotonic() - search_started) * 1000)
-                    if (matched_id is not None and best >= self.config.threshold
-                            and best - second >= self.config.margin):
-                        # Read the matched row directly, not a helper/summary cache.
-                        person = (dict(_stage['persons'][matched_id])
-                                  if _stage is not None and matched_id in _stage['persons']
-                                  else _point(self.person_table, user_id, matched_id))
-                        if person is None:
-                            raise RuntimeError('Matched person disappeared before persistence')
-                    else:
-                        is_new = True
-                        person = {'PartitionKey': user_id, 'RowKey': deterministic_id,
-                                  'name': '',
-                                  'createdAt': datetime.now(timezone.utc).isoformat(),
-                                  'faceIds': '[]'}
+                search_started = time.monotonic()
+                def person_lookup(person_id):
+                    return (dict(_stage['persons'][person_id])
+                            if _stage is not None and person_id in _stage['persons']
+                            else _point(self.person_table, user_id, person_id))
+                person, is_new = self.choose_person(user_id, face_id, vector, tier, version,
+                    runtime, self._validator(user_id, tier, version, stats, _stage), person_lookup)
+                search_ms += int((time.monotonic() - search_started) * 1000)
                 person_id = person['RowKey']
                 person['faceIds'] = self._membership(person, face_id)
                 # Keep the first valid source exemplar, never mix/average tiers.
